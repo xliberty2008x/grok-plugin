@@ -31,6 +31,8 @@ let root;
 try { root = workspaceRoot(path.resolve(cwd)); } catch { process.exit(0); }
 if (hasForeignActiveProvider(root, eventHost.sessionId)) process.exit(0);
 const active = listJobs(root).filter((job) => !terminal(job));
+// Intentional: warn about active companion jobs, but the enabled stop gate proceeds to
+// review without waiting (SPEC §13.3 / PLAN WP6). Only the disabled gate exits here.
 if (active.length) process.stderr.write(`Grok Companion: ${active.length} job(s) still active.\n`);
 if (!config(root).stopReviewGate) {
   process.exit(0);

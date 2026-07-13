@@ -149,3 +149,56 @@ test("cancellation markers are private and retention keeps active plus newest te
     else process.env.CLAUDE_PLUGIN_DATA = previous;
   }
 });
+
+test("retain never prunes unclean review jobs while empty-target skips stay eligible", () => {
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = tempDir("grok-state-data-");
+  try {
+    const root = initRepo();
+    const uncleanId = generateId("review");
+    const emptyTargetId = generateId("review");
+    const normalId = generateId("task");
+
+    // Unclean review: providerSessionDeleted false and not empty-target → permanent retention.
+    writeJob(root, job(uncleanId, {
+      kind: "review",
+      jobClass: "review",
+      status: "completed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      result: {
+        review: { verdict: "pass", summary: "fixture", findings: [] },
+        providerSessionDeleted: false,
+        privacyWarning: "Isolated review home retained"
+      }
+    }));
+    // Empty-target skip uses the same providerSessionDeleted flag but remains eligible for prune.
+    writeJob(root, job(emptyTargetId, {
+      kind: "review",
+      jobClass: "review",
+      status: "completed",
+      createdAt: "2026-01-02T00:00:00.000Z",
+      result: {
+        review: { verdict: "pass", summary: "No changes in the selected review target.", findings: [] },
+        providerSessionDeleted: false,
+        skipped: true,
+        skipReason: "empty-target"
+      }
+    }));
+    writeJob(root, job(normalId, {
+      status: "completed",
+      createdAt: "2026-01-03T00:00:00.000Z"
+    }));
+
+    // Keep one terminal slot: newest eligible terminal job survives; unclean is never eligible.
+    retain(root, 1);
+    const retained = listJobs(root);
+    const retainedIds = new Set(retained.map((item) => item.id));
+    assert.equal(retainedIds.has(uncleanId), true, "unclean review with providerSessionDeleted false must never be pruned");
+    assert.equal(retainedIds.has(normalId), true, "newest normal terminal job fills the retention limit");
+    assert.equal(retainedIds.has(emptyTargetId), false, "empty-target skip remains eligible for normal terminal pruning");
+    assert.equal(retained.length, 2);
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_PLUGIN_DATA;
+    else process.env.CLAUDE_PLUGIN_DATA = previous;
+  }
+});

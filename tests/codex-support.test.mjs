@@ -25,7 +25,8 @@ import {
   selectJob,
   writeJob
 } from "../plugins/grok/scripts/lib/state.mjs";
-import { initRepo, runCompanion } from "./helpers.mjs";
+import { initRepo, runCodexCompanion, runCompanion } from "./helpers.mjs";
+import { installFakeGrok } from "./fake-grok.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "grok");
@@ -95,6 +96,10 @@ test("Codex host detection honors normalized overrides and uses a Codex data fal
     kind: "claude-code",
     sessionId: "legacy-session"
   });
+  assert.deepEqual(hostContext({}), {
+    kind: "cli",
+    sessionId: null
+  });
   assert.equal(hostCommand("setup", "", { CODEX_THREAD_ID: "codex-thread" }), "$grok:setup");
   assert.equal(hostCommand("status", "job-123", { CODEX_THREAD_ID: "codex-thread" }), "$grok:status job-123");
   assert.equal(hostCommand("setup", "", { GROK_COMPANION_CLAUDE_SESSION_ID: "claude-session" }), "/grok:setup");
@@ -114,6 +119,38 @@ test("Codex host detection honors normalized overrides and uses a Codex data fal
     }),
     path.join(home, "normalized-data")
   );
+});
+
+test("Codex wrapper without host markers falls through to cli identity", () => {
+  const root = initRepo();
+  const fake = installFakeGrok(tempDir("fake-grok-codex-host-"));
+  const pluginData = tempDir("grok-codex-host-data-");
+  const env = {
+    ...process.env,
+    GROK_BIN: fake.binary,
+    GROK_AUTH_PATH: fake.authPath,
+    GROK_COMPANION_PLUGIN_DATA: pluginData,
+    HOME: tempDir("grok-codex-host-home-")
+  };
+  for (const key of [
+    "CODEX_THREAD_ID",
+    "GROK_COMPANION_HOST",
+    "GROK_COMPANION_HOST_SESSION_ID",
+    "GROK_COMPANION_CLAUDE_SESSION_ID",
+    "CLAUDE_PLUGIN_DATA",
+    "CLAUDE_PROJECT_DIR",
+    "PLUGIN_DATA"
+  ]) {
+    delete env[key];
+  }
+
+  const result = runCodexCompanion(["review", "--scope", "working-tree", "--json"], { cwd: root, env });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const job = JSON.parse(result.stdout);
+  assert.equal(job.host.kind, "cli");
+  assert.equal(job.host.sessionId, null);
+  assert.equal(job.result.skipped, true);
+  assert.equal(job.result.skipReason, "empty-target");
 });
 
 test("legacy Claude and schema-2 host records remain isolated by host kind and session", (t) => {
@@ -402,8 +439,13 @@ test("Codex manifest, marketplace, public skills, hooks, and wrapper form one in
   assert.match(defaultHooks.hooks.Stop[0].hooks[0].command, /\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/stop-review-gate-hook\.mjs/);
 
   const wrapper = read("plugins/grok/scripts/grok-codex.mjs");
-  assert.match(wrapper, /GROK_COMPANION_HOST\s*\|\|=\s*process\.env\.CODEX_THREAD_ID/);
-  assert.match(wrapper, /GROK_COMPANION_CLAUDE_SESSION_ID[\s\S]*"claude-code"/);
+  // Source contract: only set host when unset (preserve explicit), claim codex only under CODEX_THREAD_ID,
+  // and never default to "codex" via ||= / ternary fallthrough. No-host → cli is covered by the runtime test above.
+  assert.match(wrapper, /if\s*\(\s*!process\.env\.GROK_COMPANION_HOST\s*\)\s*\{/);
+  assert.match(wrapper, /if\s*\(\s*process\.env\.CODEX_THREAD_ID\s*\)\s*process\.env\.GROK_COMPANION_HOST\s*=\s*"codex"\s*;/);
+  assert.match(wrapper, /GROK_COMPANION_CLAUDE_SESSION_ID[\s\S]*process\.env\.GROK_COMPANION_HOST\s*=\s*"claude-code"/);
+  assert.doesNotMatch(wrapper, /GROK_COMPANION_HOST\s*\|\|=/);
+  assert.doesNotMatch(wrapper, /:\s*"codex"\s*;?\s*$/m);
   assert.match(wrapper, /GROK_COMPANION_HOST_SESSION_ID\s*\|\|=\s*process\.env\.CODEX_THREAD_ID/);
   assert.match(wrapper, /GROK_COMPANION_PLUGIN_DATA\s*\|\|=/);
   assert.match(wrapper, /await import\("\.\/grok-companion\.mjs"\)/);

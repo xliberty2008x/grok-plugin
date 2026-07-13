@@ -63,6 +63,28 @@ export function unregisterProviderGuard(workspaceRoot, marker) {
   }
 }
 
+export function loadProviderGuard(workspaceRoot, marker) {
+  try {
+    return JSON.parse(fs.readFileSync(guardFile(workspaceRoot, marker), "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+// Prefer the job-recorded provider identity. During the guard-created /
+// providerProcess-missing window, fall back to the authenticated guard record
+// while preserving import vs provider identityKind for ownership checks.
+export function resolveProviderCleanupTarget(workspaceRoot, job) {
+  if (job.providerProcess?.pid) return { identity: job.providerProcess, kind: "provider" };
+  const guard = loadProviderGuard(workspaceRoot, job.id);
+  if (!guard?.providerProcess?.pid) return { identity: null, kind: "provider" };
+  return {
+    identity: guard.providerProcess,
+    kind: guard.identityKind === "import" ? "import" : "provider"
+  };
+}
+
 export function hasForeignActiveProvider(workspaceRoot, owner = null) {
   const directory = workspaceDirectory(workspaceRoot);
   let names;

@@ -36,6 +36,29 @@ export function processGroupAlive(processGroupId) {
   }
 }
 
+// True only when the complete owned process tree is verified gone.
+// Ordering is fail-closed and inviolable: while processGroupAlive(pgid) is true,
+// never report gone merely because the leader start token is missing or different.
+// Token / ESRCH / zombie checks run only after the recorded group is empty.
+// Absent identity is treated as gone so null records and empty-target cleanup
+// still proceed. Windows is never "gone" (unsupported process identity).
+// Token mismatch is never permission to clean credentials or remove guards.
+export function processGroupGone(identity) {
+  if (!identity?.pid) return true;
+  if (process.platform === "win32") return false;
+  // Live recorded group ⇒ not gone, regardless of leader PID reuse or token state.
+  if (identity.processGroupId && processGroupAlive(identity.processGroupId)) return false;
+  if (!identity.startToken) {
+    try {
+      process.kill(identity.pid, 0);
+      return false;
+    } catch (error) {
+      return error.code === "ESRCH";
+    }
+  }
+  return processStartToken(identity.pid) !== identity.startToken || processIsZombie(identity.pid);
+}
+
 export function processCommand(pid) {
   if (!Number.isInteger(Number(pid)) || Number(pid) <= 0 || process.platform === "win32") return "";
   const run = ps(["-o", "command=", "-p", String(pid)]);

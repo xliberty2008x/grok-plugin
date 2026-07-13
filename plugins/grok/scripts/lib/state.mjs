@@ -88,7 +88,10 @@ export function listJobs(root) {
 }
 
 export function retain(root, limit = 50) {
-  const jobs = listJobs(root), terminalJobs = jobs.filter((job) => terminal(job) && !(job.jobClass === "review" && job.result?.providerSessionDeleted === false)), removable = terminalJobs.slice(Math.max(0, limit - jobs.filter((x) => !terminal(x)).length));
+  // Keep review jobs whose isolated homes were not cleaned, except explicit empty-target skips
+  // (no provider session or home was ever created for those).
+  const needsPrivacyRetention = (job) => job.jobClass === "review" && job.result?.providerSessionDeleted === false && job.result?.skipReason !== "empty-target";
+  const jobs = listJobs(root), terminalJobs = jobs.filter((job) => terminal(job) && !needsPrivacyRetention(job)), removable = terminalJobs.slice(Math.max(0, limit - jobs.filter((x) => !terminal(x)).length));
   for (const job of removable) for (const file of [jobFile(root, job.id), logFile(root, job.id), cancelFile(root, job.id)]) try { fs.unlinkSync(file); } catch (e) { if (e.code !== "ENOENT") throw e; }
 }
 

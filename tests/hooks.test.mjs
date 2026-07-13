@@ -16,6 +16,7 @@ import {
 } from "../plugins/grok/scripts/lib/state.mjs";
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import { identityMatches, processGroupAlive, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
+import { hasForeignActiveProvider, registerProviderGuard, unregisterProviderGuard } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
 import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 import { readCodexSessionMetadata } from "../plugins/grok/scripts/lib/host.mjs";
 import { COMPANION, ROOT, initRepo, run, tempDir, testEnvironment, waitFor } from "./helpers.mjs";
@@ -280,6 +281,542 @@ test("SessionEnd verifies whole process-group shutdown before removing a termina
   assert.equal(completed.code, 0, completed.stderr);
   await waitFor(() => !processGroupAlive(child.pid));
   withPluginData(pluginData, () => assert.throws(() => readJob(root, id), (error) => error.code === "E_JOB_NOT_FOUND"));
+});
+
+test("SessionEnd signals a verified process group after the leader exits during cancel wait", { skip: process.platform === "win32" }, async (t) => {
+  // Ownership is snapshotted at T0 with a live leader. Only the leader exits during the
+  // graceful cancel window while a same-group descendant remains; controller-owned
+  // termination must still TERM/KILL the full group, then remove job and guard state.
+  const root = fs.realpathSync(initRepo());
+  const pluginData = tempDir("grok-hook-data-");
+  const id = generateId("task");
+  const leader = spawn(process.execPath, [
+    "-e",
+    [
+      "const {spawn}=require('node:child_process');",
+      "process.on('SIGTERM',()=>{});",
+      "const child=spawn(process.execPath,['-e',\"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)\"],{stdio:'ignore'});",
+      "child.unref();",
+      "console.log('ready');",
+      "setInterval(()=>{},1000);"
+    ].join(""),
+    "agent",
+    id,
+    "stdio"
+  ], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  const processGroupId = leader.pid;
+  t.after(() => {
+    try { process.kill(-processGroupId, "SIGKILL"); } catch {}
+    try { unregisterProviderGuard(root, id); } catch {}
+  });
+  await new Promise((resolve, reject) => {
+    leader.once("error", reject);
+    leader.stdout.once("data", resolve);
+  });
+  const identity = { pid: leader.pid, startToken: processStartToken(leader.pid), processGroupId };
+  assert.equal(identityMatches(identity, id, "provider"), true, "T0 ownership requires a live matching leader");
+  assert.equal(processGroupAlive(processGroupId), true);
+
+  withPluginData(pluginData, () => {
+    writeJob(root, record(id, "session-a", "running", {
+      providerProcess: identity,
+      workerProcess: { nonce: "session-end-leader-exit-nonce" }
+    }));
+    registerProviderGuard(root, id, identity, "session-a");
+  });
+  assert.equal(hasForeignActiveProvider(root, "other-session"), true, "fixture guard must be live before SessionEnd");
+
+  const running = spawnHook(
+    SESSION_HOOK,
+    "SessionEnd",
+    { cwd: root, session_id: "session-a" },
+    { cwd: root, env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData } }
+  );
+
+  // Cancel marker is written after T0 ownership snapshot and starts the graceful wait window.
+  await waitFor(() => withPluginData(pluginData, () => fs.existsSync(cancelFile(root, id))));
+  assert.equal(processStartToken(leader.pid), identity.startToken, "leader must still be live when cancel wait begins");
+
+  // Kill only the leader; same-group descendant must remain until SessionEnd signals the group.
+  try { process.kill(leader.pid, "SIGKILL"); } catch {}
+  await waitFor(() => processStartToken(leader.pid) === null && processGroupAlive(processGroupId), { timeoutMs: 5000 });
+  assert.equal(processGroupAlive(processGroupId), true, "descendant must remain after leader-only exit");
+
+  // End the graceful wait early so terminateOwned runs while the leader is already dead.
+  withPluginData(pluginData, () => updateJob(root, id, (job) => {
+    job.status = "cancelled";
+    job.phase = "cancelled";
+    return job;
+  }));
+
+  const completed = await running.completed;
+  assert.equal(completed.code, 0, completed.stderr);
+  await waitFor(() => !processGroupAlive(processGroupId), { timeoutMs: 5000 });
+  withPluginData(pluginData, () => {
+    assert.throws(() => readJob(root, id), (error) => error.code === "E_JOB_NOT_FOUND");
+  });
+  // Unowned callers must see no residual guard once SessionEnd removed job/guard state.
+  assert.equal(hasForeignActiveProvider(root, null), false, "SessionEnd must remove provider guard after verified group teardown");
+});
+
+test("SessionEnd fails closed when ownership was never established for a live group", { skip: process.platform === "win32" }, async (t) => {
+  const root = fs.realpathSync(initRepo());
+  const pluginData = tempDir("grok-hook-data-");
+  const id = generateId("task");
+  // Live process whose command does not match provider identity → ownership never established.
+  const child = spawn(process.execPath, [
+    "-e",
+    "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);",
+    "unrelated-process",
+    id
+  ], { detached: true, stdio: "ignore" });
+  t.after(() => { try { process.kill(-child.pid, "SIGKILL"); } catch {} });
+  await waitFor(() => processStartToken(child.pid));
+  const identity = { pid: child.pid, startToken: processStartToken(child.pid), processGroupId: child.pid };
+  assert.equal(identityMatches(identity, id, "provider"), false);
+  assert.equal(processGroupAlive(child.pid), true);
+
+  withPluginData(pluginData, () => writeJob(root, record(id, "session-a", "completed", {
+    providerProcess: identity,
+    workerProcess: null
+  })));
+
+  const result = hook(
+    SESSION_HOOK,
+    "SessionEnd",
+    { cwd: root, session_id: "session-a" },
+    { cwd: root, env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData } }
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /process cleanup could not be verified/i);
+  assert.equal(processGroupAlive(child.pid), true, "must not signal a never-owned live group");
+  withPluginData(pluginData, () => {
+    const job = readJob(root, id);
+    assert.equal(job.status, "failed");
+    assert.equal(job.error?.code, "E_PROCESS_IDENTITY");
+    assert.match(job.error?.message || "", /could not verify complete process-group shutdown/i);
+  });
+});
+
+test("SessionEnd refuses to signal a replaced leader PID after ownership snapshot", { skip: process.platform === "win32" }, async (t) => {
+  // Deterministic leader-replacement seam: T0 ownership matches a live provider leader.
+  // After the ownership snapshot, rewrite the job so the recorded PID/PGID points at an
+  // unrelated live process (own group) while the recorded start token is forged to a
+  // value that cannot equal that process's live token. Do not compare two real ps lstart
+  // values: macOS lstart has one-second resolution, so co-spawned processes can share a
+  // token. terminateOwned must fail closed: never kill(-pgid) the replacement; retain
+  // job/guard/home evidence with E_PROCESS_IDENTITY.
+  const root = fs.realpathSync(initRepo());
+  const pluginData = tempDir("grok-hook-data-");
+  const id = generateId("task");
+  const original = spawn(process.execPath, [
+    "-e",
+    "process.on('SIGTERM',()=>{}); console.log('ready'); setInterval(()=>{},1000);",
+    "agent",
+    id,
+    "stdio"
+  ], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  let replacement = null;
+  t.after(() => {
+    try { process.kill(-original.pid, "SIGKILL"); } catch {}
+    if (replacement?.pid) try { process.kill(-replacement.pid, "SIGKILL"); } catch {}
+    try { unregisterProviderGuard(root, id); } catch {}
+  });
+  await new Promise((resolve, reject) => {
+    original.once("error", reject);
+    original.stdout.once("data", resolve);
+  });
+  const originalIdentity = {
+    pid: original.pid,
+    startToken: processStartToken(original.pid),
+    processGroupId: original.pid
+  };
+  assert.equal(identityMatches(originalIdentity, id, "provider"), true, "T0 ownership requires a live matching leader");
+
+  // Unrelated live process that would die if SessionEnd signalled its process group.
+  replacement = spawn(process.execPath, [
+    "-e",
+    "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);",
+    "replacement-unrelated",
+    id
+  ], { detached: true, stdio: "ignore" });
+  const replacementToken = await waitFor(() => processStartToken(replacement.pid));
+  assert.ok(replacementToken);
+
+  const reviewHome = withPluginData(pluginData, () => {
+    const home = path.join(workspaceState(root), "review-homes", id);
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(home, "retained.txt"), "privacy-evidence\n", { mode: 0o600 });
+    writeJob(root, record(id, "session-a", "running", {
+      kind: "review",
+      jobClass: "review",
+      providerProcess: originalIdentity,
+      workerProcess: { nonce: "session-end-replaced-leader-nonce" },
+      result: {
+        review: { verdict: "pass", summary: "fixture", findings: [] },
+        providerSessionDeleted: false,
+        privacyWarning: "prior privacy evidence"
+      }
+    }));
+    registerProviderGuard(root, id, originalIdentity, "session-a");
+    return home;
+  });
+  assert.equal(hasForeignActiveProvider(root, "other-session"), true, "fixture guard must be live before SessionEnd");
+
+  const running = spawnHook(
+    SESSION_HOOK,
+    "SessionEnd",
+    { cwd: root, session_id: "session-a" },
+    { cwd: root, env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData } }
+  );
+
+  await waitFor(() => withPluginData(pluginData, () => fs.existsSync(cancelFile(root, id))));
+  assert.equal(processStartToken(original.pid), originalIdentity.startToken, "original leader must still be live at cancel");
+
+  // After T0 ownership snapshot: point identity at the live replacement with a forged
+  // recorded token so classification always sees leaderReplaced (live ≠ recorded).
+  const replacedIdentity = {
+    pid: replacement.pid,
+    startToken: `${replacementToken}|forged-replaced-leader`,
+    processGroupId: replacement.pid
+  };
+  assert.notEqual(processStartToken(replacedIdentity.pid), replacedIdentity.startToken, "forged token must mismatch the live replacement");
+  assert.equal(processGroupAlive(replacedIdentity.processGroupId), true);
+
+  withPluginData(pluginData, () => updateJob(root, id, (job) => {
+    job.providerProcess = replacedIdentity;
+    job.status = "cancelled";
+    job.phase = "cancelled";
+    return job;
+  }));
+
+  const completed = await running.completed;
+  assert.equal(completed.code, 0, completed.stderr);
+  assert.match(completed.stderr, /process cleanup could not be verified/i);
+
+  // Replacement must never receive a group signal.
+  assert.equal(processGroupAlive(replacement.pid), true, "must not signal -pgid of a replaced leader");
+  assert.equal(processStartToken(replacement.pid), replacementToken, "replacement start token must be unchanged");
+  assert.equal(processGroupAlive(original.pid), true, "original leader is not the signal target after rewrite");
+
+  withPluginData(pluginData, () => {
+    const job = readJob(root, id);
+    assert.equal(job.status, "failed");
+    assert.equal(job.error?.code, "E_PROCESS_IDENTITY");
+    assert.match(job.error?.message || "", /could not verify complete process-group shutdown/i);
+    assert.equal(job.result?.privacyWarning, "prior privacy evidence", "token mismatch must not clear privacy evidence");
+    assert.equal(job.result?.providerSessionDeleted, false);
+  });
+  assert.equal(hasForeignActiveProvider(root, "other-session"), true, "guard must be retained after ownership failure");
+  assert.equal(fs.existsSync(path.join(reviewHome, "retained.txt")), true, "isolated home must be retained");
+});
+
+test("SessionEnd cancel uses workerAuthorization when workerProcess is null", async () => {
+  // Launch window: workerAuthorization is persisted before workerProcess exists.
+  // SessionEnd must request cancel with that nonce rather than skipping the job.
+  const root = fs.realpathSync(initRepo());
+  const pluginData = tempDir("grok-hook-data-");
+  const id = generateId("task");
+  const authNonce = "session-end-launch-window-nonce";
+  withPluginData(pluginData, () => writeJob(root, record(id, "session-a", "running", {
+    workerAuthorization: authNonce,
+    workerProcess: null,
+    providerProcess: null
+  })));
+
+  const running = spawnHook(
+    SESSION_HOOK,
+    "SessionEnd",
+    { cwd: root, session_id: "session-a" },
+    { cwd: root, env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData } }
+  );
+
+  let markerContents = null;
+  await waitFor(() => withPluginData(pluginData, () => {
+    const marker = cancelFile(root, id);
+    if (!fs.existsSync(marker)) return false;
+    markerContents = fs.readFileSync(marker, "utf8");
+    return true;
+  }));
+  assert.equal(markerContents, `${authNonce}\n`);
+
+  withPluginData(pluginData, () => updateJob(root, id, (job) => {
+    job.status = "cancelled";
+    job.phase = "cancelled";
+    return job;
+  }));
+
+  const completed = await running.completed;
+  assert.equal(completed.code, 0, completed.stderr);
+  withPluginData(pluginData, () => {
+    assert.throws(() => readJob(root, id), (error) => error.code === "E_JOB_NOT_FOUND");
+  });
+});
+
+test("SessionEnd uses provider guard when providerProcess is missing and group is gone", { skip: process.platform === "win32" }, () => {
+  // Guard-created / providerProcess-missing window: job never recorded providerProcess, but
+  // the authenticated guard has a dead identity. SessionEnd must resolve the guard, verify
+  // the group is gone, then unregister and remove the job/home — not treat null as unowned.
+  const root = fs.realpathSync(initRepo());
+  const pluginData = tempDir("grok-hook-data-");
+  const id = generateId("review");
+  const deadIdentity = { pid: 999999996, startToken: "dead-session-end-provider", processGroupId: 999999996 };
+  const reviewHome = withPluginData(pluginData, () => {
+    const home = path.join(workspaceState(root), "review-homes", id);
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(home, "marker"), "session-end-guard-gone\n", { mode: 0o600 });
+    writeJob(root, record(id, "session-a", "completed", {
+      kind: "review",
+      jobClass: "review",
+      providerProcess: null,
+      workerProcess: null,
+      result: {
+        review: { verdict: "pass", summary: "fixture", findings: [] },
+        providerSessionDeleted: false,
+        privacyWarning: "earlier-cleanup-failed"
+      }
+    }));
+    registerProviderGuard(root, id, deadIdentity, "session-a");
+    return home;
+  });
+  assert.equal(hasForeignActiveProvider(root, "other-session"), true, "fixture guard must be registered");
+
+  try {
+    const result = hook(
+      SESSION_HOOK,
+      "SessionEnd",
+      { cwd: root, session_id: "session-a" },
+      { cwd: root, env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData } }
+    );
+    assert.equal(result.status, 0, result.stderr);
+    withPluginData(pluginData, () => {
+      assert.throws(() => readJob(root, id), (error) => error.code === "E_JOB_NOT_FOUND");
+    });
+    assert.equal(hasForeignActiveProvider(root, null), false, "SessionEnd must remove provider guard after verified teardown");
+    assert.equal(fs.existsSync(reviewHome), false, "isolated home must be removed after verified teardown");
+  } finally {
+    try { unregisterProviderGuard(root, id); } catch {}
+  }
+});
+
+test("SessionEnd preserves guard and home when guard-only identity is live/unverifiable", { skip: process.platform === "win32" }, async (t) => {
+  // Same window with a live guard-backed group and null job.providerProcess. The pre-fix path
+  // treated null as gone and unregistered/cleaned while the provider group was still live.
+  // Fail closed: no signal, retain job/guard/home.
+  const root = fs.realpathSync(initRepo());
+  const pluginData = tempDir("grok-hook-data-");
+  const id = generateId("review");
+  const provider = spawn(process.execPath, [
+    "-e",
+    "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);"
+  ], { detached: true, stdio: "ignore" });
+  t.after(() => {
+    try { process.kill(-provider.pid, "SIGKILL"); } catch {}
+    try { unregisterProviderGuard(root, id); } catch {}
+  });
+  await waitFor(() => processGroupAlive(provider.pid), { timeoutMs: 5000 });
+  // Synthetic token: live group cannot be verified for ownership → terminate must fail closed.
+  const identity = { pid: provider.pid, startToken: "unverified-session-end-guard-token", processGroupId: provider.pid };
+
+  const reviewHome = withPluginData(pluginData, () => {
+    const home = path.join(workspaceState(root), "review-homes", id);
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(home, "retained.txt"), "session-end-guard-live\n", { mode: 0o600 });
+    writeJob(root, record(id, "session-a", "completed", {
+      kind: "review",
+      jobClass: "review",
+      providerProcess: null,
+      workerProcess: null,
+      result: {
+        review: { verdict: "pass", summary: "fixture", findings: [] },
+        providerSessionDeleted: false,
+        privacyWarning: "prior-privacy-signal"
+      }
+    }));
+    registerProviderGuard(root, id, identity, "session-a");
+    return home;
+  });
+  assert.equal(processGroupAlive(provider.pid), true);
+  assert.equal(hasForeignActiveProvider(root, "other-session"), true, "fixture guard must be live before SessionEnd");
+
+  const result = hook(
+    SESSION_HOOK,
+    "SessionEnd",
+    { cwd: root, session_id: "session-a" },
+    { cwd: root, env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData } }
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /process cleanup could not be verified/i);
+  assert.equal(processGroupAlive(provider.pid), true, "must not signal an unverifiable live process group");
+  withPluginData(pluginData, () => {
+    const job = readJob(root, id);
+    assert.equal(job.status, "failed");
+    assert.equal(job.error?.code, "E_PROCESS_IDENTITY");
+    assert.match(job.error?.message || "", /could not verify complete process-group shutdown/i);
+    assert.equal(job.result?.privacyWarning, "prior-privacy-signal", "must not clear privacy evidence");
+    assert.equal(job.result?.providerSessionDeleted, false);
+  });
+  assert.equal(hasForeignActiveProvider(root, "other-session"), true, "guard must be retained after ownership failure");
+  assert.equal(fs.existsSync(path.join(reviewHome, "retained.txt")), true, "isolated home must be retained");
+});
+
+test("SessionEnd refuses to signal a replaced leader when only the provider guard holds identity", { skip: process.platform === "win32" }, async (t) => {
+  // Guard-only replaced-leader seam: T0 ownership matches a live provider via the guard while
+  // job.providerProcess is null. After the ownership snapshot, rewrite the guard so the
+  // recorded PID/PGID points at an unrelated live process with a forged start token.
+  // terminateOwned must fail closed: never kill(-pgid) the replacement; retain job/guard/home.
+  const root = fs.realpathSync(initRepo());
+  const pluginData = tempDir("grok-hook-data-");
+  const id = generateId("task");
+  const original = spawn(process.execPath, [
+    "-e",
+    "process.on('SIGTERM',()=>{}); console.log('ready'); setInterval(()=>{},1000);",
+    "agent",
+    id,
+    "stdio"
+  ], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  let replacement = null;
+  t.after(() => {
+    try { process.kill(-original.pid, "SIGKILL"); } catch {}
+    if (replacement?.pid) try { process.kill(-replacement.pid, "SIGKILL"); } catch {}
+    try { unregisterProviderGuard(root, id); } catch {}
+  });
+  await new Promise((resolve, reject) => {
+    original.once("error", reject);
+    original.stdout.once("data", resolve);
+  });
+  const originalIdentity = {
+    pid: original.pid,
+    startToken: processStartToken(original.pid),
+    processGroupId: original.pid
+  };
+  assert.equal(identityMatches(originalIdentity, id, "provider"), true, "T0 ownership requires a live matching leader");
+
+  replacement = spawn(process.execPath, [
+    "-e",
+    "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);",
+    "replacement-unrelated",
+    id
+  ], { detached: true, stdio: "ignore" });
+  const replacementToken = await waitFor(() => processStartToken(replacement.pid));
+  assert.ok(replacementToken);
+
+  const reviewHome = withPluginData(pluginData, () => {
+    const home = path.join(workspaceState(root), "review-homes", id);
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(home, "retained.txt"), "guard-only-replaced\n", { mode: 0o600 });
+    writeJob(root, record(id, "session-a", "running", {
+      kind: "review",
+      jobClass: "review",
+      providerProcess: null,
+      workerProcess: { nonce: "session-end-guard-replaced-nonce" },
+      result: {
+        review: { verdict: "pass", summary: "fixture", findings: [] },
+        providerSessionDeleted: false,
+        privacyWarning: "prior privacy evidence"
+      }
+    }));
+    registerProviderGuard(root, id, originalIdentity, "session-a");
+    return home;
+  });
+  assert.equal(hasForeignActiveProvider(root, "other-session"), true, "fixture guard must be live before SessionEnd");
+
+  const running = spawnHook(
+    SESSION_HOOK,
+    "SessionEnd",
+    { cwd: root, session_id: "session-a" },
+    { cwd: root, env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData } }
+  );
+
+  await waitFor(() => withPluginData(pluginData, () => fs.existsSync(cancelFile(root, id))));
+  assert.equal(processStartToken(original.pid), originalIdentity.startToken, "original leader must still be live at cancel");
+
+  // After T0 ownership snapshot: point guard identity at the live replacement with a forged
+  // recorded token so classification always sees leaderReplaced (live ≠ recorded).
+  const replacedIdentity = {
+    pid: replacement.pid,
+    startToken: `${replacementToken}|forged-guard-replaced-leader`,
+    processGroupId: replacement.pid
+  };
+  assert.notEqual(processStartToken(replacedIdentity.pid), replacedIdentity.startToken, "forged token must mismatch the live replacement");
+  assert.equal(processGroupAlive(replacedIdentity.processGroupId), true);
+
+  withPluginData(pluginData, () => {
+    registerProviderGuard(root, id, replacedIdentity, "session-a");
+    updateJob(root, id, (job) => {
+      job.status = "cancelled";
+      job.phase = "cancelled";
+      return job;
+    });
+  });
+
+  const completed = await running.completed;
+  assert.equal(completed.code, 0, completed.stderr);
+  assert.match(completed.stderr, /process cleanup could not be verified/i);
+
+  assert.equal(processGroupAlive(replacement.pid), true, "must not signal -pgid of a replaced leader");
+  assert.equal(processStartToken(replacement.pid), replacementToken, "replacement start token must be unchanged");
+  assert.equal(processGroupAlive(original.pid), true, "original leader is not the signal target after guard rewrite");
+
+  withPluginData(pluginData, () => {
+    const job = readJob(root, id);
+    assert.equal(job.status, "failed");
+    assert.equal(job.error?.code, "E_PROCESS_IDENTITY");
+    assert.match(job.error?.message || "", /could not verify complete process-group shutdown/i);
+    assert.equal(job.result?.privacyWarning, "prior privacy evidence", "token mismatch must not clear privacy evidence");
+    assert.equal(job.result?.providerSessionDeleted, false);
+  });
+  assert.equal(hasForeignActiveProvider(root, "other-session"), true, "guard must be retained after ownership failure");
+  assert.equal(fs.existsSync(path.join(reviewHome, "retained.txt")), true, "isolated home must be retained");
+});
+
+test("SessionEnd appends cleanup privacyWarning without replacing prior evidence", () => {
+  const root = fs.realpathSync(initRepo());
+  const pluginData = tempDir("grok-hook-data-");
+  const id = generateId("review");
+  const home = withPluginData(pluginData, () => {
+    const reviewHome = path.join(workspaceState(root), "review-homes", id);
+    fs.mkdirSync(reviewHome, { recursive: true, mode: 0o700 });
+    const nest = path.join(reviewHome, "undeletable-cleanup");
+    fs.mkdirSync(nest, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(nest, "locked"), "locked\n", { mode: 0o600 });
+    fs.chmodSync(nest, 0o000);
+    writeJob(root, record(id, "session-a", "completed", {
+      kind: "review",
+      jobClass: "review",
+      providerProcess: null,
+      workerProcess: null,
+      result: {
+        review: { verdict: "pass", summary: "fixture", findings: [] },
+        providerSessionDeleted: false,
+        privacyWarning: "prior-privacy-signal"
+      }
+    }));
+    return reviewHome;
+  });
+
+  try {
+    const result = hook(
+      SESSION_HOOK,
+      "SessionEnd",
+      { cwd: root, session_id: "session-a" },
+      { cwd: root, env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData } }
+    );
+    assert.equal(result.status, 0, result.stderr);
+    withPluginData(pluginData, () => {
+      const job = readJob(root, id);
+      assert.equal(job.result.providerSessionDeleted, false);
+      assert.match(job.result.privacyWarning, /^prior-privacy-signal; /);
+      assert.ok(job.result.privacyWarning.length > "prior-privacy-signal; ".length);
+      assert.equal(fs.existsSync(home), true, "failed cleanup must retain the isolated review home");
+    });
+  } finally {
+    withPluginData(pluginData, () => {
+      const nest = path.join(home, "undeletable-cleanup");
+      try { fs.chmodSync(nest, 0o700); } catch {}
+      try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
+    });
+  }
 });
 
 test("disabled stop gate does not invoke Grok and only reports active work", () => {

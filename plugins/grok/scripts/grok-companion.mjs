@@ -9,13 +9,13 @@ import { fileURLToPath } from "node:url";
 import { splitArgs, parseArgs } from "./lib/args.mjs";
 import { CompanionError, asErrorPayload, exitCodeFor } from "./lib/errors.mjs";
 import { collectContext, resolveTarget, integritySnapshot, assertUnchanged } from "./lib/git-review.mjs";
-import { childEnvironment, cleanupReviewEnvironment, discoverGrok, ensureChildExit, probe, runProvider, runStructuredReview, grokVersion, processStartToken } from "./lib/grok-provider.mjs";
+import { assertProviderPlatform, childEnvironment, cleanupReviewEnvironment, discoverGrok, ensureChildExit, probe, runProvider, runStructuredReview, grokVersion, processStartToken } from "./lib/grok-provider.mjs";
 import { profileFor, sameSecurityProfile } from "./lib/profiles.mjs";
 import { config, setConfig, generateId, writeJob, updateJob, listJobs, readJob, selectJob, requestCancel, isCancelRequested, terminal, now, retain, logFile } from "./lib/state.mjs";
 import { workspaceRoot, workspaceState } from "./lib/workspace.mjs";
 import { redact, redactText } from "./lib/redact.mjs";
-import { hasGrokAncestor, identityMatches, processGroupAlive, processIsZombie } from "./lib/process-control.mjs";
-import { hasForeignActiveProvider, registerProviderGuard, unregisterProviderGuard } from "./lib/recursion-guard.mjs";
+import { hasGrokAncestor, identityMatches, processGroupAlive, processGroupGone, processIsZombie } from "./lib/process-control.mjs";
+import { hasForeignActiveProvider, registerProviderGuard, resolveProviderCleanupTarget, unregisterProviderGuard } from "./lib/recursion-guard.mjs";
 import { hostCommand, hostContext, pluginDataRoot, readCodexSessionMetadata, sameHostSession } from "./lib/host.mjs";
 import { codexTranscriptToClaude, createAnonymousTranscript, disposeConvertedTranscript, openTranscriptSource, readTranscriptSnapshot } from "./lib/transcript.mjs";
 
@@ -52,15 +52,51 @@ function workerEnvironment(nonce) {
   return env;
 }
 
+function applyReviewPrivacy(result, cleanup, retentionNote = null) {
+  const next = { ...(result || {}) };
+  if (cleanup) {
+    next.providerSessionDeleted = cleanup.ok;
+    if (cleanup.warning) {
+      // Additive: retain prior evidence when another cleanup attempt fails.
+      next.privacyWarning = [next.privacyWarning, cleanup.warning].filter(Boolean).join("; ");
+    } else if (cleanup.ok) {
+      // Successful later re-cleanup deliberately clears a prior privacy warning.
+      delete next.privacyWarning;
+    }
+    return next;
+  }
+  if (retentionNote) {
+    next.providerSessionDeleted = false;
+    next.privacyWarning = [next.privacyWarning, retentionNote].filter(Boolean).join("; ");
+  }
+  return next;
+}
+
+async function terminateProviderCleanupTarget(root, job) {
+  const { identity, kind } = resolveProviderCleanupTarget(root, job);
+  await terminateVerified(identity, job.id, kind);
+  // Only allow guard/home teardown after the original process group is verified gone.
+  // Absent identity remains fail-open (nothing to signal); live/unverifiable groups fail closed.
+  if (identity && !processGroupGone(identity)) {
+    throw new CompanionError("E_PROCESS_IDENTITY", `Could not verify complete process-group shutdown for provider ${identity.pid}.`, {
+      pid: identity.pid,
+      processGroupId: identity.processGroupId ?? null
+    });
+  }
+  return identity;
+}
+
 async function recoverActiveJobs(root) {
-  for (const job of listJobs(root).filter((candidate) => terminal(candidate) && candidate.jobClass === "review" && candidate.result?.providerSessionDeleted === false)) {
-    if (job.providerProcess?.startToken && processStartToken(job.providerProcess.pid) === job.providerProcess.startToken) continue;
+  for (const job of listJobs(root).filter((candidate) => terminal(candidate) && candidate.jobClass === "review" && candidate.result?.providerSessionDeleted === false && candidate.result?.skipReason !== "empty-target")) {
+    // Fail closed: require the complete owned provider process group to be gone
+    // (not merely a dead leader). Mirrors SessionEnd processGroupGone semantics.
+    // Use guard identity when providerProcess was never recorded on the job.
+    const { identity: providerIdentity } = resolveProviderCleanupTarget(root, job);
+    if (!processGroupGone(providerIdentity)) continue;
     try { unregisterProviderGuard(root, job.id); } catch {}
     const cleanup = cleanupReviewEnvironment(stateDir(root), job.id);
     updateJob(root, job.id, (current) => {
-      current.result = { ...(current.result || {}), providerSessionDeleted: cleanup.ok };
-      if (cleanup.warning) current.result.privacyWarning = cleanup.warning;
-      else delete current.result.privacyWarning;
+      current.result = applyReviewPrivacy(current.result, cleanup);
       return current;
     });
   }
@@ -73,7 +109,7 @@ async function recoverActiveJobs(root) {
     const workerMayStillBeStarting = workerTokenMatches && !processIsZombie(job.workerProcess.pid);
     if (workerMayStillBeStarting && Date.now() - Date.parse(job.updatedAt || job.startedAt || job.createdAt) < 1500) continue;
     let cleanupError = null;
-    try { await terminateVerified(job.providerProcess, job.id, "provider"); } catch (error) { cleanupError = error; }
+    try { await terminateProviderCleanupTarget(root, job); } catch (error) { cleanupError = error; }
     if (!cleanupError) try { unregisterProviderGuard(root, job.id); } catch {}
     const cleanup = !cleanupError && job.jobClass === "review" ? cleanupReviewEnvironment(stateDir(root), job.id) : null;
     updateJob(root, job.id, (current) => {
@@ -88,8 +124,10 @@ async function recoverActiveJobs(root) {
       current.error = cleanupError ? redact(asErrorPayload(cleanupError)) : { code: "E_WORKER_LOST", message: "The background worker disappeared; the prompt was not replayed." };
       current.summary = current.error.message;
       if (cleanup) {
-        current.result = { ...(current.result || {}), providerSessionDeleted: cleanup.ok };
-        if (cleanup.warning) current.result.privacyWarning = cleanup.warning;
+        current.result = applyReviewPrivacy(current.result, cleanup);
+      } else if (current.jobClass === "review" && cleanupError) {
+        // Process termination failed: isolated home was not safely removed; keep additive privacy evidence.
+        current.result = applyReviewPrivacy(current.result, null, "Isolated review home retained because process cleanup could not be verified.");
       }
       return current;
     });
@@ -98,6 +136,8 @@ async function recoverActiveJobs(root) {
 
 async function terminateVerified(identity, marker, kind) {
   if (!identity) return false;
+  // Defense in depth: unsupported platforms must surface E_CAPABILITY before identity failures.
+  assertProviderPlatform();
   if (!identity.startToken) throw new CompanionError("E_PROCESS_IDENTITY", `Refusing to signal process ${identity.pid} without a start token.`, { pid: identity.pid });
   const current = processStartToken(identity.pid);
   const groupAlive = Boolean(identity.processGroupId && process.platform !== "win32" && processGroupAlive(identity.processGroupId));
@@ -120,12 +160,25 @@ function baseRecord({ id, kind, root, profile, title, request, write, model, eff
   return { schemaVersion: 2, id, kind, jobClass: kind.includes("review") ? "review" : "task", title, summary: "Queued", write, status: "queued", phase: "queued", workspaceRoot: root, host: currentHost(), grokSessionId: null, createdAt: timestamp, startedAt: null, updatedAt: timestamp, completedAt: null, workerProcess: null, providerProcess: null, profile, model: model || null, effort: effort || null, logFile: logFile(root, id), progress: null, request, result: null, error: null };
 }
 
+function renderReviewSession(job) {
+  if (job.grokSessionId) {
+    return `Grok session: ${job.grokSessionId}${job.result?.providerSessionDeleted ? " (deleted after review)" : ""}`;
+  }
+  if (job.result?.skipped && job.result?.skipReason === "empty-target") {
+    return "Grok session: not started (empty target)";
+  }
+  if (job.result?.providerSessionDeleted === false && job.result?.privacyWarning) {
+    return "Grok session: not created (isolated home retained)";
+  }
+  return "Grok session: not created";
+}
+
 function renderReview(job) {
   const review = job.result?.review;
   if (!review) return renderJob(job);
   const lines = [`Grok ${job.kind} ${job.id}`, `Verdict: ${review.verdict}`, "", review.summary];
   for (const f of review.findings) lines.push("", `[${f.severity.toUpperCase()}] ${f.title}${f.file ? ` (${f.file}${f.line ? `:${f.line}` : ""})` : ""}`, f.body);
-  lines.push("", `Grok session: ${job.grokSessionId ? `${job.grokSessionId}${job.result?.providerSessionDeleted ? " (deleted after review)" : ""}` : "deleted after review"}`);
+  lines.push("", renderReviewSession(job));
   return lines.join("\n");
 }
 
@@ -242,7 +295,14 @@ async function handleReview(command, raw) {
   const id = generateId(kind), profile = profileFor(kind);
   const job = baseRecord({ id, kind, root, profile, title: `${kind}: ${target.label}`, request: { prompt, target }, write: false });
   if (context.empty) {
-    job.status = "completed"; job.phase = "done"; job.startedAt = job.createdAt; job.completedAt = now(); job.summary = "pass: no changes in the selected review target"; job.request = { target, prompt: null }; job.result = { review: { verdict: "pass", summary: "No changes in the selected review target.", findings: [] }, providerSessionDeleted: true };
+    job.status = "completed"; job.phase = "done"; job.startedAt = job.createdAt; job.completedAt = now(); job.summary = "pass: no changes in the selected review target"; job.request = { target, prompt: null };
+    // Empty targets never invoke Grok; do not claim a provider session was deleted.
+    job.result = {
+      review: { verdict: "pass", summary: "No changes in the selected review target.", findings: [] },
+      providerSessionDeleted: false,
+      skipped: true,
+      skipReason: "empty-target"
+    };
     writeJob(root, job);
     out(options.json ? job : renderReview(job), options.json);
     return;
@@ -302,16 +362,19 @@ async function handleResult(raw) {
 
 async function handleCancel(raw) {
   const { options, positionals } = parseArgs(argvFrom(raw), { values: ["cwd"], booleans: ["json"] }); const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd()); await recoverActiveJobs(root); const job = selectJob(root, { id: positionals[0], host: currentHost(), active: !positionals[0] });
-  if (!terminal(job)) requestCancel(root, job.id, job.workerProcess?.nonce || "");
+  // Launch window: workerAuthorization is persisted before workerProcess exists.
+  // Prefer the live worker nonce; fall back to the authenticated launch nonce; fail closed if neither.
+  if (!terminal(job)) requestCancel(root, job.id, job.workerProcess?.nonce || job.workerAuthorization || "");
   const deadline = Date.now() + 10000; let current = readJob(root, job.id); while (!terminal(current) && Date.now() < deadline) { await new Promise((r) => setTimeout(r, 200)); current = readJob(root, job.id); }
   if (!terminal(current)) {
-    await terminateVerified(current.providerProcess, current.id, "provider");
+    await terminateProviderCleanupTarget(root, current);
     try { unregisterProviderGuard(root, current.id); } catch {}
     await terminateVerified(current.workerProcess, current.id, "worker");
     const cleanup = current.jobClass === "review" ? cleanupReviewEnvironment(stateDir(root), current.id) : null;
     current = updateJob(root, current.id, (value) => {
       value.status = "cancelled"; value.phase = "cancelled"; value.completedAt = now(); value.error = { code: "E_CANCELLED", message: "Grok job was force-cancelled after the graceful timeout." }; value.summary = value.error.message;
-      if (cleanup) { value.result = { ...(value.result || {}), providerSessionDeleted: cleanup.ok }; if (cleanup.warning) value.result.privacyWarning = cleanup.warning; }
+      // Additive/clearing privacy: success clears a stale warning; failure appends without erasing prior evidence.
+      if (cleanup) value.result = applyReviewPrivacy(value.result, cleanup);
       return value;
     });
   }
@@ -337,6 +400,8 @@ function shellWord(value) {
 }
 
 async function runImportProcess({ binary, root, transcriptFd, alias, leaderSocket, marker, signal, timeoutMs = 120000, maxOutputBytes = 8 * 1024 * 1024 }) {
+  // Hard-gate before spawn / identity: Windows must report E_CAPABILITY, not E_PROCESS_IDENTITY.
+  assertProviderPlatform();
   const child = spawn(binary, ["import", "--json", "--leader-socket", leaderSocket, alias], {
     cwd: root,
     env: childEnvironment({ GROK_COMPANION_JOB_MARKER: marker }),
@@ -466,7 +531,9 @@ async function handleTransfer(raw) {
     delete: deleteParts.map(shellWord).join(" ")
   };
   if (cleanupWarnings.length) {
-    // Import succeeded: keep session identity and resume/delete guidance so the provider session is not orphaned.
+    // Privacy contract fails closed: successful import with residual private transfer artifacts
+    // must not exit 0. Session resume/delete details are returned in error.details so the
+    // imported provider session is not orphaned while leftover private descriptors stay explicit.
     throw new CompanionError(
       "E_STATE",
       `Imported ${label} transcript into Grok session ${id}, but private alias or descriptor cleanup failed. Resume with \`${result.resume}\` or delete with \`${result.delete}\`, then remove leftover transfer artifacts.`,

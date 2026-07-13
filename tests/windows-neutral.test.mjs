@@ -4,8 +4,20 @@ import test from "node:test";
 import { normalizeUpdate } from "../plugins/grok/scripts/lib/acp-client.mjs";
 import { parseArgs } from "../plugins/grok/scripts/lib/args.mjs";
 import { CompanionError, exitCodeFor } from "../plugins/grok/scripts/lib/errors.mjs";
+import { assertProviderPlatform, ensureChildExit } from "../plugins/grok/scripts/lib/grok-provider.mjs";
 import { profileFor, sameSecurityProfile } from "../plugins/grok/scripts/lib/profiles.mjs";
 import { redactText } from "../plugins/grok/scripts/lib/redact.mjs";
+
+async function withPlatform(platform, fn) {
+  const original = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: platform, configurable: true, enumerable: true, writable: true });
+  try {
+    return await fn();
+  } finally {
+    if (original) Object.defineProperty(process, "platform", original);
+    else delete process.platform;
+  }
+}
 
 test("provider-neutral argument and redaction contracts", () => {
   assert.deepEqual(
@@ -38,4 +50,20 @@ test("provider-neutral ACP event normalization does not require a Grok executabl
   );
   assert.equal(normalizeUpdate({ sessionUpdate: "usage_update", tokens: 10 }).type, "usage");
   assert.equal(normalizeUpdate({ futureEvent: true }).type, "unknown");
+});
+
+test("Windows provider platform guard reports E_CAPABILITY rather than process identity", async () => {
+  assert.throws(
+    () => assertProviderPlatform("win32"),
+    (error) => error instanceof CompanionError && error.code === "E_CAPABILITY" && /Windows/i.test(error.message)
+  );
+  assert.doesNotThrow(() => assertProviderPlatform("darwin"));
+  assert.doesNotThrow(() => assertProviderPlatform("linux"));
+
+  await withPlatform("win32", async () => {
+    await assert.rejects(
+      () => ensureChildExit({ pid: 1 }, { pid: 1, startToken: null, processGroupId: null }),
+      (error) => error instanceof CompanionError && error.code === "E_CAPABILITY" && error.code !== "E_PROCESS_IDENTITY"
+    );
+  });
 });

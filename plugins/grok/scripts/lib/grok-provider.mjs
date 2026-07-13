@@ -15,13 +15,41 @@ export { processStartToken } from "./process-control.mjs";
 
 const MIN_VERSION = [0, 2, 99];
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-const REVIEW_SCHEMA = { type: "object", additionalProperties: false, required: ["verdict", "summary", "findings"], properties: { verdict: { enum: ["pass", "needs_changes"] }, summary: { type: "string", minLength: 1 }, findings: { type: "array", items: { type: "object", additionalProperties: false, required: ["severity", "title", "body"], properties: { severity: { enum: ["critical", "high", "medium", "low", "info"] }, title: { type: "string", minLength: 1 }, body: { type: "string", minLength: 1 }, file: { type: ["string", "null"] }, line: { type: ["integer", "null"], minimum: 1 } } } } } };
-REVIEW_SCHEMA.properties.verdict.description = "Use pass only when findings is empty; use needs_changes only when findings contains at least one actionable defect.";
-REVIEW_SCHEMA.properties.findings.description = "Empty for a pass verdict; otherwise contain at least one actionable defect.";
+// Provider-compatible shape only: no allOf / if-then. Conditional verdict↔findings rules are
+// enforced by validateReview(), one same-session repair, and the review prompts.
+export const REVIEW_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["verdict", "summary", "findings"],
+  properties: {
+    verdict: {
+      enum: ["pass", "needs_changes"],
+      description: "pass means zero findings (example: {\"verdict\":\"pass\",\"findings\":[]}); needs_changes means at least one finding (example: needs_changes with one or more findings entries)."
+    },
+    summary: { type: "string", minLength: 1 },
+    findings: {
+      type: "array",
+      description: "Must be empty when verdict is pass; must contain at least one actionable defect when verdict is needs_changes.",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["severity", "title", "body"],
+        properties: {
+          severity: { enum: ["critical", "high", "medium", "low", "info"] },
+          title: { type: "string", minLength: 1 },
+          body: { type: "string", minLength: 1 },
+          file: { type: ["string", "null"] },
+          line: { type: ["integer", "null"], minimum: 1 }
+        }
+      }
+    }
+  }
+};
 const ALLOW_ENV = new Set(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "COLORTERM", "NO_COLOR", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "SystemRoot", "ComSpec", "PATHEXT"]);
 
-export function assertProviderPlatform() {
-  if (process.platform === "win32") {
+/** Hard-gate for every provider execution entry. Prefer this over process-identity errors on unsupported platforms. */
+export function assertProviderPlatform(platform = process.platform) {
+  if (platform === "win32") {
     throw new CompanionError("E_CAPABILITY", "Grok provider execution is disabled on Windows until process identity and forced-cleanup behavior are authenticated end to end. Provider-neutral validation remains available.");
   }
 }
@@ -324,6 +352,8 @@ export async function openProvider({ root, profile, model = null, effort = null,
 }
 
 export async function ensureChildExit(child, identity, { naturalExitMs = 750 } = {}) {
+  // Defense in depth: unsupported platforms must surface E_CAPABILITY before identity failures.
+  assertProviderPlatform();
   if (!identity?.pid || child.pid !== identity.pid || !identity.startToken) throw new CompanionError("E_PROCESS_IDENTITY", "Refusing to clean up an unverified Grok process tree.", { pid: identity?.pid || child.pid || null });
   if (process.platform !== "win32" && identity.processGroupId !== identity.pid) throw new CompanionError("E_PROCESS_IDENTITY", "Refusing to clean up a Grok process outside its owned process group.", { pid: identity.pid, processGroupId: identity.processGroupId });
   const initialToken = processStartToken(identity.pid);

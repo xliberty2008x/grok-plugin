@@ -5,6 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import { spawn } from "node:child_process";
 import { processGroupAlive, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
+import { hasForeignActiveProvider, registerProviderGuard, unregisterProviderGuard } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
+import { generateId } from "../plugins/grok/scripts/lib/state.mjs";
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import {
@@ -34,7 +36,14 @@ function parseError(result, code) {
 function fixture(config = {}) {
   const fake = installFakeGrok(tempDir("fake-grok-runtime-"), config);
   const pluginData = tempDir("grok-runtime-data-");
-  return { fake, pluginData, env: testEnvironment({ fake, pluginData }) };
+  const env = testEnvironment({ fake, pluginData });
+  // Strip host companion markers so CLI under test is not refused as nested recursion
+  // when this suite is itself launched from a Grok Companion rescue session.
+  delete env.GROK_COMPANION_CHILD;
+  delete env.GROK_COMPANION_JOB_MARKER;
+  delete env.GROK_AGENT;
+  delete env.GROK_LEADER_SOCKET;
+  return { fake, pluginData, env };
 }
 
 test("setup validates headless isolation before enabling the stop gate", () => {
@@ -95,6 +104,26 @@ function persistedJobs(pluginData) {
     });
   });
 }
+
+test("empty review target records a skipped empty-target result without claiming session deletion", () => {
+  const root = initRepo();
+  const { env } = fixture();
+  const result = runCompanion(["review", "--scope", "working-tree", "--json"], { cwd: root, env });
+  const job = parseJson(result);
+  assert.equal(job.status, "completed");
+  assert.equal(job.phase, "done");
+  assert.equal(job.grokSessionId, null);
+  assert.equal(job.result.skipped, true);
+  assert.equal(job.result.skipReason, "empty-target");
+  assert.equal(job.result.providerSessionDeleted, false);
+  assert.equal(job.result.review.verdict, "pass");
+  assert.deepEqual(job.result.review.findings, []);
+
+  const human = runCompanion(["result", job.id], { cwd: root, env });
+  assert.equal(human.status, 0, human.stderr);
+  assert.match(human.stdout, /Grok session: not started \(empty target\)/);
+  assert.equal(human.stdout.includes("deleted after review"), false);
+});
 
 test("runtime review validates structured output, preserves workspace integrity, and deletes provider session", () => {
   const root = initRepo();
@@ -295,6 +324,505 @@ test("task results redact provider secrets in immediate, stored, JSON, and human
   }
 });
 
+function seedWorkspace(root, env) {
+  parseJson(runCompanion(["review", "--scope", "working-tree", "--json"], { cwd: root, env }));
+  const jobs = persistedJobs(env.CLAUDE_PLUGIN_DATA);
+  assert.ok(jobs.length >= 1);
+  return path.dirname(path.dirname(jobs[0].logFile));
+}
+
+function writeSeededJob(stateRoot, job) {
+  fs.writeFileSync(path.join(stateRoot, "jobs", `${job.id}.json`), `${JSON.stringify(job, null, 2)}\n`, { mode: 0o600 });
+  fs.writeFileSync(job.logFile, "", { mode: 0o600 });
+}
+
+test("cancel during worker launch window uses workerAuthorization when workerProcess is null", async () => {
+  // Launch window: startJob persists workerAuthorization before workerProcess exists.
+  // requestCancel must use that authenticated nonce rather than throwing E_PROCESS_IDENTITY.
+  const root = fs.realpathSync(initRepo());
+  const { pluginData, env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("task");
+  const authNonce = crypto.randomBytes(16).toString("hex");
+  const stamped = new Date().toISOString();
+  const jobPath = path.join(stateRoot, "jobs", `${id}.json`);
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "task",
+    jobClass: "task",
+    title: "task: launch-window cancel fixture",
+    summary: "Queued",
+    write: false,
+    status: "queued",
+    phase: "queued",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    workerAuthorization: authNonce,
+    workerProcess: null,
+    providerProcess: null,
+    profile: { id: "rescue-read-v2", transport: "acp" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null, promptDigest: "abc" },
+    result: null,
+    error: null
+  });
+
+  const canceling = spawnCompanion(["cancel", id, "--json"], { cwd: root, env });
+  const marker = path.join(stateRoot, "jobs", `${id}.cancel`);
+  await waitFor(() => fs.existsSync(marker), { timeoutMs: 5000 });
+  assert.equal(fs.readFileSync(marker, "utf8"), `${authNonce}\n`);
+
+  // End the graceful wait early: the launch-window worker never started.
+  // Write the job file directly so we do not depend on process.env plugin-data routing.
+  const current = JSON.parse(fs.readFileSync(jobPath, "utf8"));
+  current.status = "cancelled";
+  current.phase = "cancelled";
+  current.completedAt = new Date().toISOString();
+  current.error = { code: "E_CANCELLED", message: "cancelled during launch window" };
+  current.summary = current.error.message;
+  current.updatedAt = current.completedAt;
+  fs.writeFileSync(jobPath, `${JSON.stringify(current, null, 2)}\n`, { mode: 0o600 });
+
+  const completed = await canceling.completed;
+  assert.equal(completed.code, 0, completed.stderr || completed.stdout);
+  const cancelled = JSON.parse(completed.stdout);
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(fs.readFileSync(marker, "utf8"), `${authNonce}\n`);
+});
+
+test("cancel fails closed when neither workerProcess nonce nor workerAuthorization exists", () => {
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("task");
+  const stamped = new Date().toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "task",
+    jobClass: "task",
+    title: "task: missing-nonce cancel fixture",
+    summary: "Queued",
+    write: false,
+    status: "queued",
+    phase: "queued",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    workerAuthorization: null,
+    workerProcess: null,
+    providerProcess: null,
+    profile: { id: "rescue-read-v2", transport: "acp" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null },
+    result: null,
+    error: null
+  });
+
+  const failed = runCompanion(["cancel", id, "--json"], { cwd: root, env });
+  parseError(failed, "E_PROCESS_IDENTITY");
+  assert.equal(fs.existsSync(path.join(stateRoot, "jobs", `${id}.cancel`)), false);
+});
+
+test("lost-worker recovery uses provider guard when providerProcess is missing and group is gone", { skip: process.platform === "win32" }, () => {
+  // Guard-created / providerProcess-missing window: job never recorded providerProcess, but
+  // registerProviderGuard persisted an identity that is already gone. Recovery must load the
+  // guard, verify the group is gone, then unregister and clean the isolated home.
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("review");
+  const isolatedHome = path.join(stateRoot, "review-homes", id);
+  fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(isolatedHome, "marker"), "guard-window\n", { mode: 0o600 });
+
+  const deadIdentity = { pid: 999999998, startToken: "dead-provider-token", processGroupId: 999999998 };
+  const stamped = new Date(Date.now() - 60_000).toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: guard-only provider cleanup",
+    summary: "Running",
+    write: false,
+    status: "running",
+    phase: "prompting",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    completedAt: null,
+    workerProcess: { pid: 999999999, startToken: "dead-worker-token", nonce: "n", processGroupId: 999999999, commandMarker: id },
+    providerProcess: null,
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null, target: { mode: "working-tree", label: "fixture", base: null } },
+    result: { privacyWarning: "prior-privacy-signal" },
+    error: null
+  });
+  registerProviderGuard(root, id, deadIdentity, env.GROK_COMPANION_HOST_SESSION_ID);
+
+  try {
+    const recovered = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
+    assert.equal(recovered.status, "failed");
+    assert.equal(recovered.error.code, "E_WORKER_LOST");
+    assert.equal(hasForeignActiveProvider(root, null), false, "guard must be removed after verified teardown");
+    assert.equal(fs.existsSync(isolatedHome), false, "isolated home must be removed after verified teardown");
+    assert.equal(recovered.result?.providerSessionDeleted, true);
+  } finally {
+    try { unregisterProviderGuard(root, id); } catch {}
+  }
+});
+
+test("lost-worker recovery preserves guard and home when guard identity is live/unverifiable", { skip: process.platform === "win32" }, async (t) => {
+  // Same window, but the guard points at a live process group. Without the guard fallback the
+  // old path treated null providerProcess as "nothing to terminate" and unregistered/cleaned.
+  // Fail closed: retain guard, home, and privacy evidence with E_PROCESS_IDENTITY.
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("review");
+  const isolatedHome = path.join(stateRoot, "review-homes", id);
+  fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(isolatedHome, "retained.txt"), "privacy-evidence\n", { mode: 0o600 });
+
+  const provider = spawn(process.execPath, [
+    "-e",
+    "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);"
+  ], { detached: true, stdio: "ignore" });
+  t.after(() => {
+    try { process.kill(-provider.pid, "SIGKILL"); } catch {}
+    try { unregisterProviderGuard(root, id); } catch {}
+  });
+  await waitFor(() => processGroupAlive(provider.pid), { timeoutMs: 5000 });
+  // Synthetic token: live group cannot be verified for ownership → terminate must fail closed.
+  const identity = { pid: provider.pid, startToken: "unverified-live-provider-token", processGroupId: provider.pid };
+
+  const stamped = new Date(Date.now() - 60_000).toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: unverifiable guard-only provider",
+    summary: "Running",
+    write: false,
+    status: "running",
+    phase: "prompting",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    completedAt: null,
+    workerProcess: { pid: 999999999, startToken: "dead-worker-token", nonce: "n", processGroupId: 999999999, commandMarker: id },
+    providerProcess: null,
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null, target: { mode: "working-tree", label: "fixture", base: null } },
+    result: { privacyWarning: "prior-privacy-signal" },
+    error: null
+  });
+  registerProviderGuard(root, id, identity, env.GROK_COMPANION_HOST_SESSION_ID);
+  assert.equal(processGroupAlive(provider.pid), true);
+
+  const recovered = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
+  assert.equal(recovered.status, "failed");
+  assert.equal(recovered.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(processGroupAlive(provider.pid), true, "must not tear down an unverifiable live process group");
+  assert.equal(hasForeignActiveProvider(root, null), true, "guard must be retained");
+  assert.equal(fs.existsSync(path.join(isolatedHome, "retained.txt")), true, "isolated home must be retained");
+  assert.equal(recovered.result?.providerSessionDeleted, false);
+  assert.match(recovered.result?.privacyWarning || "", /prior-privacy-signal/);
+  assert.match(recovered.result?.privacyWarning || "", /Isolated review home retained/);
+});
+
+test("force-cancel uses provider guard when providerProcess is missing", { skip: process.platform === "win32" }, async (t) => {
+  // Force-cancel path after graceful timeout: providerProcess never recorded, guard has a dead
+  // identity (verified gone). Cancel must still load the guard, unregister, and clean the home.
+  // Queued+young avoids recoverActiveJobs stealing the job before the force path runs.
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("review");
+  const isolatedHome = path.join(stateRoot, "review-homes", id);
+  fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(isolatedHome, "marker"), "force-cancel-guard\n", { mode: 0o600 });
+  const workerNonce = crypto.randomBytes(16).toString("hex");
+  const deadIdentity = { pid: 999999997, startToken: "dead-provider-token", processGroupId: 999999997 };
+  const stamped = new Date().toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: force-cancel guard-only provider",
+    summary: "Queued",
+    write: false,
+    status: "queued",
+    phase: "queued",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    workerAuthorization: workerNonce,
+    workerProcess: null,
+    providerProcess: null,
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null, target: { mode: "working-tree", label: "fixture", base: null } },
+    result: null,
+    error: null
+  });
+  registerProviderGuard(root, id, deadIdentity, env.GROK_COMPANION_HOST_SESSION_ID);
+  t.after(() => { try { unregisterProviderGuard(root, id); } catch {} });
+
+  const cancelled = parseJson(runCompanion(["cancel", id, "--json"], {
+    cwd: root,
+    env,
+    timeout: 20000
+  }));
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.error.code, "E_CANCELLED");
+  assert.match(cancelled.error.message, /force-cancelled/i);
+  assert.equal(fs.readFileSync(path.join(stateRoot, "jobs", `${id}.cancel`), "utf8"), `${workerNonce}\n`);
+  assert.equal(hasForeignActiveProvider(root, null), false, "guard must be removed after force-cancel teardown");
+  assert.equal(fs.existsSync(isolatedHome), false, "isolated home must be removed after force-cancel teardown");
+  assert.equal(cancelled.result?.providerSessionDeleted, true);
+});
+
+test("force-cancel successful home cleanup clears prior privacy warning", { skip: process.platform === "win32" }, async (t) => {
+  // Force-cancel path must use applyReviewPrivacy: a successful later cleanup clears a stale
+  // privacyWarning rather than leaving it on the cancelled job.
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("review");
+  const isolatedHome = path.join(stateRoot, "review-homes", id);
+  fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(isolatedHome, "marker"), "force-cancel-clear\n", { mode: 0o600 });
+  const workerNonce = crypto.randomBytes(16).toString("hex");
+  const deadIdentity = { pid: 999999995, startToken: "dead-provider-token", processGroupId: 999999995 };
+  const stamped = new Date().toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: force-cancel privacy clear",
+    summary: "Queued",
+    write: false,
+    status: "queued",
+    phase: "queued",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    workerAuthorization: workerNonce,
+    workerProcess: null,
+    providerProcess: null,
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null, target: { mode: "working-tree", label: "fixture", base: null } },
+    result: {
+      review: { verdict: "pass", summary: "fixture", findings: [] },
+      providerSessionDeleted: false,
+      privacyWarning: "earlier-cleanup-failed"
+    },
+    error: null
+  });
+  registerProviderGuard(root, id, deadIdentity, env.GROK_COMPANION_HOST_SESSION_ID);
+  t.after(() => { try { unregisterProviderGuard(root, id); } catch {} });
+
+  const cancelled = parseJson(runCompanion(["cancel", id, "--json"], {
+    cwd: root,
+    env,
+    timeout: 20000
+  }));
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.error.code, "E_CANCELLED");
+  assert.match(cancelled.error.message, /force-cancelled/i);
+  assert.equal(fs.existsSync(isolatedHome), false, "isolated home must be removed after successful force-cancel cleanup");
+  assert.equal(cancelled.result?.providerSessionDeleted, true);
+  assert.equal(cancelled.result?.privacyWarning, undefined, "successful cleanup must clear stale privacyWarning");
+  assert.equal(cancelled.result?.review?.verdict, "pass", "prior review evidence must remain");
+});
+
+test("force-cancel failed home cleanup appends privacyWarning without erasing prior evidence", { skip: process.platform === "win32" }, async (t) => {
+  // Force-cancel path must use applyReviewPrivacy: failed home cleanup appends a warning and
+  // keeps prior privacy evidence rather than replacing the result object wholesale.
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("review");
+  const isolatedHome = path.join(stateRoot, "review-homes", id);
+  fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  const nest = path.join(isolatedHome, "undeletable-cleanup");
+  fs.mkdirSync(nest, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(nest, "locked"), "locked\n", { mode: 0o600 });
+  fs.chmodSync(nest, 0o000);
+  const workerNonce = crypto.randomBytes(16).toString("hex");
+  const deadIdentity = { pid: 999999994, startToken: "dead-provider-token", processGroupId: 999999994 };
+  const stamped = new Date().toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: force-cancel privacy append",
+    summary: "Queued",
+    write: false,
+    status: "queued",
+    phase: "queued",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    workerAuthorization: workerNonce,
+    workerProcess: null,
+    providerProcess: null,
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null, target: { mode: "working-tree", label: "fixture", base: null } },
+    result: {
+      review: { verdict: "pass", summary: "fixture", findings: [] },
+      providerSessionDeleted: false,
+      privacyWarning: "prior-privacy-signal"
+    },
+    error: null
+  });
+  registerProviderGuard(root, id, deadIdentity, env.GROK_COMPANION_HOST_SESSION_ID);
+  t.after(() => {
+    try { unregisterProviderGuard(root, id); } catch {}
+    try { fs.chmodSync(nest, 0o700); } catch {}
+    try { fs.rmSync(isolatedHome, { recursive: true, force: true }); } catch {}
+  });
+
+  try {
+    const cancelled = parseJson(runCompanion(["cancel", id, "--json"], {
+      cwd: root,
+      env,
+      timeout: 20000
+    }));
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(cancelled.error.code, "E_CANCELLED");
+    assert.match(cancelled.error.message, /force-cancelled/i);
+    assert.equal(fs.existsSync(isolatedHome), true, "failed cleanup must retain the isolated review home");
+    assert.equal(cancelled.result?.providerSessionDeleted, false);
+    assert.match(cancelled.result?.privacyWarning || "", /^prior-privacy-signal; /);
+    assert.ok((cancelled.result?.privacyWarning || "").length > "prior-privacy-signal; ".length);
+    assert.equal(cancelled.result?.review?.verdict, "pass", "prior review evidence must remain");
+  } finally {
+    try { fs.chmodSync(nest, 0o700); } catch {}
+  }
+});
+
+test("force-cancel preserves guard and home when guard identity is live/unverifiable", { skip: process.platform === "win32" }, async (t) => {
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("review");
+  const isolatedHome = path.join(stateRoot, "review-homes", id);
+  fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(isolatedHome, "retained.txt"), "force-cancel-privacy\n", { mode: 0o600 });
+  const workerNonce = crypto.randomBytes(16).toString("hex");
+
+  const provider = spawn(process.execPath, [
+    "-e",
+    "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);"
+  ], { detached: true, stdio: "ignore" });
+  t.after(() => {
+    try { process.kill(-provider.pid, "SIGKILL"); } catch {}
+    try { unregisterProviderGuard(root, id); } catch {}
+  });
+  await waitFor(() => processGroupAlive(provider.pid), { timeoutMs: 5000 });
+  const identity = { pid: provider.pid, startToken: "unverified-live-provider-token", processGroupId: provider.pid };
+  const stamped = new Date().toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: force-cancel live guard-only provider",
+    summary: "Queued",
+    write: false,
+    status: "queued",
+    phase: "queued",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    workerAuthorization: workerNonce,
+    workerProcess: null,
+    providerProcess: null,
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null, target: { mode: "working-tree", label: "fixture", base: null } },
+    result: { privacyWarning: "prior-privacy-signal" },
+    error: null
+  });
+  registerProviderGuard(root, id, identity, env.GROK_COMPANION_HOST_SESSION_ID);
+
+  const failed = runCompanion(["cancel", id, "--json"], { cwd: root, env, timeout: 20000 });
+  parseError(failed, "E_PROCESS_IDENTITY");
+  assert.equal(fs.readFileSync(path.join(stateRoot, "jobs", `${id}.cancel`), "utf8"), `${workerNonce}\n`);
+  assert.equal(processGroupAlive(provider.pid), true, "must not tear down an unverifiable live process group");
+  assert.equal(hasForeignActiveProvider(root, null), true, "guard must be retained after force-cancel failure");
+  assert.equal(fs.existsSync(path.join(isolatedHome, "retained.txt")), true, "isolated home must be retained");
+  const job = JSON.parse(fs.readFileSync(path.join(stateRoot, "jobs", `${id}.json`), "utf8"));
+  assert.equal(job.status, "queued", "force-cancel must not mark cancelled when provider cleanup fails closed");
+});
+
 test("background cancellation writes a marker, sends ACP cancel, and reaches cancelled once", async () => {
   const root = initRepo();
   const { fake, env } = fixture({ cancelMode: "wait" });
@@ -490,6 +1018,204 @@ test("lost-worker recovery terminates headless review and removes its isolated h
   } finally {
     try { process.kill(-running.providerProcess.processGroupId, "SIGKILL"); } catch {}
     fs.rmSync(path.join(pluginData, "state"), { recursive: true, force: true });
+  }
+});
+
+test("lost-worker recovery retains privacy evidence when provider terminate cannot verify cleanup", { skip: process.platform === "win32" }, () => {
+  const root = initRepo();
+  const { pluginData, env } = fixture();
+  // Seed workspace state by creating one empty-target job first.
+  parseJson(runCompanion(["review", "--scope", "working-tree", "--json"], { cwd: root, env }));
+  const jobs = persistedJobs(pluginData);
+  assert.ok(jobs.length >= 1);
+  const stateRoot = path.dirname(path.dirname(jobs[0].logFile));
+  const id = `review-${crypto.randomBytes(12).toString("hex")}`;
+  const isolatedHome = path.join(stateRoot, "review-homes", id);
+  fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(isolatedHome, "marker"), "retained\n", { mode: 0o600 });
+  const stamped = new Date(Date.now() - 60_000).toISOString();
+  const job = {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: retained privacy fixture",
+    summary: "Running",
+    write: false,
+    status: "running",
+    phase: "prompting",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    completedAt: null,
+    workerProcess: { pid: 999999999, startToken: "dead-worker-token", nonce: "n", processGroupId: 999999999, commandMarker: id },
+    providerProcess: { pid: 1, startToken: null, processGroupId: null },
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null, target: { mode: "working-tree", label: "fixture", base: null } },
+    result: { privacyWarning: "prior-privacy-signal" },
+    error: null
+  };
+  fs.writeFileSync(path.join(stateRoot, "jobs", `${id}.json`), `${JSON.stringify(job, null, 2)}\n`, { mode: 0o600 });
+  fs.writeFileSync(job.logFile, "", { mode: 0o600 });
+
+  const recovered = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
+  assert.equal(recovered.status, "failed");
+  assert.equal(recovered.result.providerSessionDeleted, false);
+  assert.match(recovered.result.privacyWarning, /prior-privacy-signal/);
+  assert.match(recovered.result.privacyWarning, /Isolated review home retained/);
+  assert.equal(fs.existsSync(isolatedHome), true);
+});
+
+test("successful later review re-cleanup clears prior privacy warning", () => {
+  const root = initRepo();
+  const { pluginData, env } = fixture();
+  parseJson(runCompanion(["review", "--scope", "working-tree", "--json"], { cwd: root, env }));
+  const jobs = persistedJobs(pluginData);
+  assert.ok(jobs.length >= 1);
+  const stateRoot = path.dirname(path.dirname(jobs[0].logFile));
+  const id = `review-${crypto.randomBytes(12).toString("hex")}`;
+  const isolatedHome = path.join(stateRoot, "review-homes", id);
+  fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(isolatedHome, "marker"), "to-remove\n", { mode: 0o600 });
+  const stamped = new Date().toISOString();
+  const job = {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: recleanup fixture",
+    summary: "pass: fixture",
+    write: false,
+    status: "completed",
+    phase: "done",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    completedAt: stamped,
+    workerProcess: null,
+    providerProcess: null,
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null, target: { mode: "working-tree", label: "fixture", base: null } },
+    result: {
+      review: { verdict: "pass", summary: "fixture", findings: [] },
+      providerSessionDeleted: false,
+      privacyWarning: "earlier-cleanup-failed"
+    },
+    error: null
+  };
+  fs.writeFileSync(path.join(stateRoot, "jobs", `${id}.json`), `${JSON.stringify(job, null, 2)}\n`, { mode: 0o600 });
+  fs.writeFileSync(job.logFile, "", { mode: 0o600 });
+
+  const cleaned = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
+  assert.equal(cleaned.status, "completed");
+  assert.equal(cleaned.result.providerSessionDeleted, true);
+  assert.equal(cleaned.result.privacyWarning, undefined);
+  assert.equal(fs.existsSync(isolatedHome), false);
+});
+
+test("terminal re-cleanup retains privacy until the full provider process group is gone", { skip: process.platform === "win32" }, async () => {
+  const root = initRepo();
+  const { pluginData, env } = fixture();
+  parseJson(runCompanion(["review", "--scope", "working-tree", "--json"], { cwd: root, env }));
+  const jobs = persistedJobs(pluginData);
+  assert.ok(jobs.length >= 1);
+  const stateRoot = path.dirname(path.dirname(jobs[0].logFile));
+  const id = `review-${crypto.randomBytes(12).toString("hex")}`;
+  const isolatedHome = path.join(stateRoot, "review-homes", id);
+  fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(isolatedHome, "marker"), "group-retained\n", { mode: 0o600 });
+
+  // Detached leader starts a same-group descendant then exits → live group, no live leader.
+  const leader = spawn(process.execPath, ["-e", [
+    "const { spawn } = require('node:child_process');",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: false, stdio: 'ignore' });",
+    "child.unref();",
+    "setTimeout(() => process.exit(0), 100);"
+  ].join("")], { detached: true, stdio: "ignore" });
+  leader.unref();
+  const processGroupId = leader.pid;
+  const leaderPid = leader.pid;
+  try {
+    await waitFor(() => processStartToken(leaderPid) === null && processGroupAlive(processGroupId), { timeoutMs: 5000 });
+    assert.equal(processGroupAlive(processGroupId), true);
+    assert.equal(processStartToken(leaderPid), null);
+
+    const stamped = new Date(Date.now() - 60_000).toISOString();
+    const job = {
+      schemaVersion: 2,
+      id,
+      kind: "review",
+      jobClass: "review",
+      title: "review: live-group recleanup fixture",
+      summary: "Running",
+      write: false,
+      status: "running",
+      phase: "prompting",
+      workspaceRoot: root,
+      host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+      grokSessionId: null,
+      createdAt: stamped,
+      startedAt: stamped,
+      updatedAt: stamped,
+      completedAt: null,
+      workerProcess: { pid: 999999999, startToken: "dead-worker-token", nonce: "n", processGroupId: 999999999, commandMarker: id },
+      providerProcess: { pid: leaderPid, startToken: "dead-leader-token", processGroupId },
+      profile: { id: "review", transport: "headless" },
+      model: null,
+      effort: null,
+      logFile: path.join(stateRoot, "jobs", `${id}.log`),
+      progress: null,
+      request: { prompt: null, target: { mode: "working-tree", label: "fixture", base: null } },
+      result: { privacyWarning: "prior-privacy-signal" },
+      error: null
+    };
+    fs.writeFileSync(path.join(stateRoot, "jobs", `${id}.json`), `${JSON.stringify(job, null, 2)}\n`, { mode: 0o600 });
+    fs.writeFileSync(job.logFile, "", { mode: 0o600 });
+
+    // Recovery 1: lost worker + dead leader with live group → fail closed privacy retention.
+    const first = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
+    assert.equal(first.status, "failed");
+    assert.equal(first.error.code, "E_PROCESS_IDENTITY");
+    assert.equal(first.result.providerSessionDeleted, false);
+    assert.match(first.result.privacyWarning, /prior-privacy-signal/);
+    assert.match(first.result.privacyWarning, /Isolated review home retained/);
+    assert.equal(fs.existsSync(isolatedHome), true);
+    assert.equal(processGroupAlive(processGroupId), true);
+
+    // Recovery 2: terminal re-cleanup must still refuse while the group remains live.
+    const second = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
+    assert.equal(second.status, "failed");
+    assert.equal(second.result.providerSessionDeleted, false);
+    assert.match(second.result.privacyWarning, /prior-privacy-signal/);
+    assert.match(second.result.privacyWarning, /Isolated review home retained/);
+    assert.equal(fs.existsSync(isolatedHome), true);
+    assert.equal(processGroupAlive(processGroupId), true);
+
+    // After the full owned group is gone, a later recovery cleans and clears as intended.
+    try { process.kill(-processGroupId, "SIGKILL"); } catch {}
+    await waitFor(() => !processGroupAlive(processGroupId), { timeoutMs: 5000 });
+
+    const cleaned = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
+    assert.equal(cleaned.status, "failed");
+    assert.equal(cleaned.result.providerSessionDeleted, true);
+    assert.equal(cleaned.result.privacyWarning, undefined);
+    assert.equal(fs.existsSync(isolatedHome), false);
+  } finally {
+    try { process.kill(-processGroupId, "SIGKILL"); } catch {}
   }
 });
 

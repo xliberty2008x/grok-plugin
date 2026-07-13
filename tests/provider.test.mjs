@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { normalizeUpdate } from "../plugins/grok/scripts/lib/acp-client.mjs";
 import {
@@ -17,6 +18,7 @@ import {
   runHeadless,
   runProvider,
   runStructuredReview,
+  REVIEW_SCHEMA,
   validateReview
 } from "../plugins/grok/scripts/lib/grok-provider.mjs";
 import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
@@ -302,6 +304,33 @@ test("review validation rejects verdict and finding-count contradictions", () =>
     (error) => error?.code === "E_SCHEMA"
   );
   assert.equal(validateReview({ verdict: "pass", summary: "No defects found.", findings: [] }).verdict, "pass");
+});
+
+test("runtime review schema stays in the provider-supported subset without conditional allOf", () => {
+  assert.equal(Object.hasOwn(REVIEW_SCHEMA, "allOf"), false);
+  assert.equal(Object.hasOwn(REVIEW_SCHEMA, "if"), false);
+  assert.equal(Object.hasOwn(REVIEW_SCHEMA, "then"), false);
+  assert.equal(REVIEW_SCHEMA.type, "object");
+  assert.deepEqual(REVIEW_SCHEMA.required, ["verdict", "summary", "findings"]);
+  assert.match(REVIEW_SCHEMA.properties.verdict.description, /pass means zero findings/i);
+  assert.match(REVIEW_SCHEMA.properties.verdict.description, /needs_changes means at least one finding/i);
+  assert.match(REVIEW_SCHEMA.properties.findings.description, /empty when verdict is pass/i);
+  assert.match(REVIEW_SCHEMA.properties.findings.description, /at least one actionable defect when verdict is needs_changes/i);
+  // Serialized form passed to --json-schema must remain free of conditional keywords.
+  const serialized = JSON.stringify(REVIEW_SCHEMA);
+  assert.equal(serialized.includes('"allOf"'), false);
+  assert.equal(serialized.includes('"if"'), false);
+  assert.equal(serialized.includes('"then"'), false);
+});
+
+test("review and adversarial-review prompts encode pass and needs_changes finding rules", () => {
+  const promptsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../plugins/grok/prompts");
+  const review = fs.readFileSync(path.join(promptsDir, "review.md"), "utf8");
+  const adversarial = fs.readFileSync(path.join(promptsDir, "adversarial-review.md"), "utf8");
+  for (const text of [review, adversarial]) {
+    assert.match(text, /Use `pass` only with an empty `findings` array/);
+    assert.match(text, /Use `needs_changes` only when\s*`findings` contains at least one actionable defect/);
+  }
 });
 
 test("isolated headless reviews redact opaque cached credentials from diagnostics and results", async () => {

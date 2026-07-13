@@ -6,8 +6,8 @@ import process from "node:process";
 import { listJobs, requestCancel, terminal, removeJob, updateJob, now } from "./lib/state.mjs";
 import { workspaceRoot, workspaceState } from "./lib/workspace.mjs";
 import { cleanupReviewEnvironment } from "./lib/grok-provider.mjs";
-import { hasGrokAncestor, identityMatches, processGroupAlive, processIsZombie, processStartToken } from "./lib/process-control.mjs";
-import { hasForeignActiveProvider, unregisterProviderGuard } from "./lib/recursion-guard.mjs";
+import { hasGrokAncestor, identityMatches, processGroupAlive, processGroupGone, processIsZombie, processStartToken } from "./lib/process-control.mjs";
+import { hasForeignActiveProvider, resolveProviderCleanupTarget, unregisterProviderGuard } from "./lib/recursion-guard.mjs";
 import { pluginDataRoot, sameHostSession, writeCodexSessionMetadata } from "./lib/host.mjs";
 
 if (process.env.GROK_COMPANION_CHILD === "1" || process.env.GROK_COMPANION_JOB_MARKER || process.env.GROK_AGENT || process.env.GROK_LEADER_SOCKET || hasGrokAncestor()) process.exit(0);
@@ -20,31 +20,74 @@ async function readInput() {
 
 function shellQuote(value) { return `'${String(value).replace(/'/g, `'"'"'`)}'`; }
 
-function groupGone(identity) {
-  if (!identity?.pid) return true;
-  if (identity.processGroupId && process.platform !== "win32" && processGroupAlive(identity.processGroupId)) return false;
-  if (!identity.startToken) {
-    try { process.kill(identity.pid, 0); return false; }
-    catch (error) { return error.code === "ESRCH"; }
-  }
-  return processStartToken(identity.pid) !== identity.startToken || processIsZombie(identity.pid);
-}
-
+// Controller-owned termination after a T0 ownership snapshot.
+//
+// Leader classification (Unix):
+//   same      — live non-zombie leader whose start token still matches
+//   missing   — no live token at the recorded PID, or only a zombie
+//   replaced  — live process at the recorded PID with a different start token
+//
+// Signal policy after ownershipEstablished:
+//   same + identityMatches → may signal -processGroupId
+//   missing + continuously live recorded group → may signal -processGroupId
+//     (orphan descendants; kernel still binds the original PGID)
+//   replaced → never signal -processGroupId; fail closed (ownership error)
+//
+// Portable kernels share the PID/PGID number space and expose no process-group
+// generation counter. Residual TOCTOU remains between a liveness recheck and
+// kill(-pgid) after full original-group exit and PGID recycle; recheck before
+// TERM and before KILL, treat ESRCH / already-gone as success, and prefer
+// retention over wrong-group signal or premature credential cleanup.
+// Never-established ownership and crash-recovery (persisted-only) paths stay
+// fail-closed elsewhere; token mismatch is never permission to clean state.
 async function terminateOwned(identity, marker, kind, ownershipEstablished) {
-  if (groupGone(identity)) return;
-  if (!ownershipEstablished || !identityMatches(identity, marker, kind)) throw new Error(`Ownership of ${kind} process ${identity.pid} could not be verified.`);
-  const target = identity.processGroupId && process.platform !== "win32" ? -identity.processGroupId : identity.pid;
+  if (processGroupGone(identity)) return;
+  if (!ownershipEstablished) {
+    throw new Error(`Ownership of ${kind} process ${identity?.pid} could not be verified.`);
+  }
+
+  const token = identity?.startToken ? processStartToken(identity.pid) : null;
+  const leaderSame = Boolean(
+    identity?.startToken
+    && token === identity.startToken
+    && !processIsZombie(identity.pid)
+  );
+  // Live occupant with a different birth token ⇒ original PGID cannot still be
+  // ours under the shared PID/PGID model; processGroupAlive would refer to a
+  // recycled group. Fail closed; retain job, guard, home, and privacy evidence.
+  const leaderReplaced = Boolean(token && identity?.startToken && token !== identity.startToken);
+
+  if (leaderReplaced) {
+    throw new Error(`Ownership of ${kind} process ${identity.pid} could not be verified.`);
+  }
+  if (leaderSame && !identityMatches(identity, marker, kind)) {
+    throw new Error(`Ownership of ${kind} process ${identity.pid} could not be verified.`);
+  }
+
+  const useGroup = Boolean(identity.processGroupId && process.platform !== "win32");
   const waitGone = async (timeoutMs) => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (groupGone(identity)) return true;
+      if (processGroupGone(identity)) return true;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    return groupGone(identity);
+    return processGroupGone(identity);
   };
-  try { process.kill(target, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+  // Recheck group liveness immediately before each signal. ESRCH and already-gone
+  // are success; never use a positive identity.pid target when the leader is missing.
+  const signalIfStillLive = (sig) => {
+    if (processGroupGone(identity)) return;
+    if (useGroup) {
+      if (!processGroupAlive(identity.processGroupId)) return;
+      try { process.kill(-identity.processGroupId, sig); } catch (error) { if (error.code !== "ESRCH") throw error; }
+      return;
+    }
+    try { process.kill(identity.pid, sig); } catch (error) { if (error.code !== "ESRCH") throw error; }
+  };
+
+  signalIfStillLive("SIGTERM");
   if (await waitGone(1000)) return;
-  try { process.kill(target, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+  signalIfStillLive("SIGKILL");
   if (!await waitGone(1000)) throw new Error(`The ${kind} process group remained active after SIGKILL.`);
 }
 
@@ -87,12 +130,19 @@ if (phase === "SessionEnd" && hostSessionId) {
   let root;
   try { root = workspaceRoot(path.resolve(cwd)); } catch { process.exit(0); }
   const owned = listJobs(root).filter((job) => sameHostSession(job, { kind: "claude-code", sessionId: hostSessionId }));
+  // T0: snapshot ownership on the resolved provider identity (job first, guard fallback
+  // preserving identityKind) and the worker identity before any cancel/terminate races.
   const verified = new Map();
-  for (const job of owned) for (const kind of ["provider", "worker"]) {
-    const identity = job[`${kind}Process`];
-    verified.set(`${job.id}:${kind}`, Boolean(identity && identityMatches(identity, job.id, kind)));
+  for (const job of owned) {
+    const { identity: providerIdentity, kind: providerKind } = resolveProviderCleanupTarget(root, job);
+    verified.set(`${job.id}:provider`, Boolean(providerIdentity && identityMatches(providerIdentity, job.id, providerKind)));
+    verified.set(`${job.id}:worker`, Boolean(job.workerProcess && identityMatches(job.workerProcess, job.id, "worker")));
   }
-  for (const job of owned) if (!terminal(job) && job.workerProcess?.nonce) { try { requestCancel(root, job.id, job.workerProcess.nonce); } catch {} }
+  // Prefer live worker nonce; fall back to the launch-window workerAuthorization; skip (fail closed) if neither.
+  for (const job of owned) {
+    const nonce = job.workerProcess?.nonce || job.workerAuthorization;
+    if (!terminal(job) && nonce) { try { requestCancel(root, job.id, nonce); } catch {} }
+  }
   const deadline = Date.now() + 4000;
   while (owned.some((job) => { try { return !terminal(listJobs(root).find((x) => x.id === job.id)); } catch { return false; } }) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
   const cleanupFailures = new Map();
@@ -100,8 +150,9 @@ if (phase === "SessionEnd" && hostSessionId) {
     const job = listJobs(root).find((candidate) => candidate.id === original.id);
     if (!job) return;
     try {
+      const { identity: providerIdentity, kind: providerKind } = resolveProviderCleanupTarget(root, job);
       await Promise.all([
-        terminateOwned(job.providerProcess, job.id, "provider", verified.get(`${job.id}:provider`)),
+        terminateOwned(providerIdentity, job.id, providerKind, verified.get(`${job.id}:provider`)),
         terminateOwned(job.workerProcess, job.id, "worker", verified.get(`${job.id}:worker`))
       ]);
     } catch (error) { cleanupFailures.set(job.id, error); }
@@ -109,7 +160,10 @@ if (phase === "SessionEnd" && hostSessionId) {
   for (const original of owned) {
     let job = listJobs(root).find((candidate) => candidate.id === original.id);
     if (!job) continue;
-    const allGone = groupGone(job.providerProcess) && groupGone(job.workerProcess);
+    // allGone must use the same resolved provider identity so a null job.providerProcess
+    // never snapshots "gone" while a live guard-backed group still exists.
+    const { identity: providerIdentity } = resolveProviderCleanupTarget(root, job);
+    const allGone = processGroupGone(providerIdentity) && processGroupGone(job.workerProcess);
     const cleanupFailure = cleanupFailures.get(job.id);
     if (cleanupFailure || !allGone) {
       try {
@@ -132,7 +186,7 @@ if (phase === "SessionEnd" && hostSessionId) {
       try { unregisterProviderGuard(root, job.id); } catch {}
       const cleanup = job.jobClass === "review" ? cleanupReviewEnvironment(workspaceState(root), job.id) : { ok: true };
       if (cleanup.ok) { try { removeJob(root, job.id); } catch {} }
-      else { try { updateJob(root, job.id, (value) => { value.result = { ...(value.result || {}), providerSessionDeleted: false, privacyWarning: cleanup.warning }; return value; }); } catch {} }
+      else { try { updateJob(root, job.id, (value) => { value.result = { ...(value.result || {}), providerSessionDeleted: false, privacyWarning: [value.result?.privacyWarning, cleanup.warning].filter(Boolean).join("; ") }; return value; }); } catch {} }
     }
   }
 }

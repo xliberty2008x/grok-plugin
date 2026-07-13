@@ -4,11 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
-process.env.GROK_COMPANION_HOST ||= process.env.CODEX_THREAD_ID
-  ? "codex"
-  : process.env.GROK_COMPANION_CLAUDE_SESSION_ID || process.env.CLAUDE_PLUGIN_DATA || process.env.CLAUDE_PROJECT_DIR
-    ? "claude-code"
-    : "codex";
+// Claim codex only with a real Codex thread identity. Preserve an explicit host or
+// Claude markers; otherwise leave unset so hostContext falls through to cli.
+if (!process.env.GROK_COMPANION_HOST) {
+  if (process.env.CODEX_THREAD_ID) process.env.GROK_COMPANION_HOST = "codex";
+  else if (process.env.GROK_COMPANION_CLAUDE_SESSION_ID || process.env.CLAUDE_PLUGIN_DATA || process.env.CLAUDE_PROJECT_DIR) {
+    process.env.GROK_COMPANION_HOST = "claude-code";
+  }
+}
 process.env.GROK_COMPANION_HOST_SESSION_ID ||= process.env.CODEX_THREAD_ID
   || process.env.GROK_COMPANION_CLAUDE_SESSION_ID
   || "";

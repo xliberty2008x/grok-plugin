@@ -118,6 +118,8 @@ Enable or disable the optional stop-time review gate per workspace:
 /grok:setup --disable-review-gate
 ```
 
+When the gate is disabled, active companion jobs produce a warning only. When it is enabled, the gate still warns about active jobs but proceeds directly to the stop review without waiting for them to finish.
+
 ## Execution and security model
 
 - Every job runs in its own Grok process and receives a unique leader-socket path. The plugin does not use a shared Grok leader.
