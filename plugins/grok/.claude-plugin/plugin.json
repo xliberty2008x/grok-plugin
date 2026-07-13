@@ -1,0 +1,6 @@
+{
+  "name": "grok",
+  "version": "0.1.0",
+  "description": "Delegate tasks and read-only reviews to the official Grok Build CLI.",
+  "author": { "name": "grok-plugin community maintainers" }
+}

@@ -1,6 +1,6 @@
 # Grok Companion Plugin Technical Specification
 
-Status: Planning baseline (implementation not started)
+Status: Implemented release candidate; macOS authenticated gate passed, cross-platform gates incomplete
 
 Target release: `0.1.0`
 
@@ -26,7 +26,7 @@ It MUST provide behavioral parity with the pinned OpenAI reference under a Grok-
 - An optional stop-time review gate.
 - Read-only review and write-capable task profiles.
 
-Behavioral parity does not require identical provider internals. Grok ACP replaces Codex app-server, and plugin-owned prompts replace provider functions that Grok does not publicly expose.
+Behavioral parity does not require identical provider internals. Headless Grok replaces Codex review execution, ACP v1 replaces Codex app-server for resumable tasks, and plugin-owned prompts replace provider functions that Grok does not publicly expose.
 
 ## 3. Scope
 
@@ -44,10 +44,11 @@ Behavioral parity does not require identical provider internals. Grok ACP replac
   - `/grok:cancel`
 - A `grok:grok-rescue` Claude subagent.
 - Grok Build execution through the local `grok` binary.
-- ACP v1 over `grok agent stdio` as the primary transport.
+- Headless `grok --agent explore` execution for normal, adversarial, and stop reviews.
+- ACP v1 over `grok agent stdio` for resumable rescue tasks.
 - Persistent job metadata, logs, results, and Grok session IDs.
 - Claude `SessionStart`, `SessionEnd`, and optional `Stop` hooks.
-- macOS, Linux, and Windows support.
+- macOS provider qualification and provider-neutral Linux/macOS/Windows CI.
 - Apache-2.0-compatible reuse of upstream provider-neutral code.
 
 ### 3.2 Out of scope
@@ -61,6 +62,7 @@ Behavioral parity does not require identical provider internals. Grok ACP replac
 - Automatic fallback to Claude when Grok fails.
 - Native Grok review behavior unless xAI publishes and supports such an API.
 - A shared long-lived Grok broker in v0.1.
+- Windows provider process execution or process-control support in v0.1. Windows remains provider-unverified until authenticated lifecycle and PID-ownership evidence exists.
 
 ## 4. Package identity
 
@@ -90,7 +92,7 @@ The plugin MUST use `.claude-plugin/marketplace.json` and `plugins/grok/.claude-
 - Git available on `PATH` for repository operations.
 - Claude Code with marketplace plugin support.
 - The official Grok Build CLI.
-- A valid Grok authentication method accepted by the local CLI.
+- A usable cached Grok login created by `grok login`. Environment-key-only authentication such as `XAI_API_KEY` is unsupported for tool-using jobs in v0.1.
 - npm is optional and used only when the user explicitly approves installation.
 
 Grok binary discovery order:
@@ -101,9 +103,9 @@ Grok binary discovery order:
 
 The selected path MUST resolve to an executable regular file. It MUST be invoked directly with an argument array and `shell: false`.
 
-The provisional compatibility test matrix is Grok CLI 0.2.93 and 0.2.99. This is a test target, not a support claim. The minimum supported version MUST be fixed only after ACP, sandbox, cancellation, and import contract tests pass.
+The runtime SHALL reject Grok CLI versions older than 0.2.99. This floor is required because 0.2.99 advertises the isolated ACP `--agent-profile`, `--no-leader`, and custom leader-socket contracts used by this release. The authenticated 10-case macOS release matrix passed with Grok Build 0.2.99 on July 13, 2026. A wider supported range MUST NOT be published until the release suite passes against each claimed endpoint.
 
-Models and reasoning-effort values MUST be derived from Grok's advertised capabilities. The plugin MUST NOT hardcode a "latest" model or silently substitute a requested model.
+Task model IDs and transfer model selection MUST be derived from Grok's advertised capabilities. Public rescue/transfer effort syntax is limited to `low`, `medium`, and `high`; transfer additionally checks advertised efforts when Grok supplies them. The plugin MUST NOT hardcode a "latest" model or silently substitute a requested model.
 
 ## 6. Architecture
 
@@ -115,7 +117,7 @@ The implementation SHALL contain these boundaries:
 
 3. **Companion runtime:** Parses arguments, resolves review targets, starts jobs, renders output, and manages state.
 
-4. **Grok provider adapter:** Owns binary discovery, ACP lifecycle, authentication status, model configuration, streaming events, session loading, and cancellation.
+4. **Grok provider adapter:** Owns binary discovery, headless review execution, ACP task lifecycle, authentication status, model configuration, session loading, and transport-specific cancellation.
 
 5. **Job store:** Persists repository-scoped jobs, logs, results, and configuration atomically.
 
@@ -132,8 +134,9 @@ flowchart LR
     H["Session and Stop hooks"] --> R
     R --> J["Atomic job store"]
     R --> P["Grok provider adapter"]
-    P --> A["Per-job grok agent stdio process"]
-    A --> S["Persistent Grok ACP session"]
+    P --> V["Headless explore review"]
+    P --> A["ACP task process"]
+    A --> S["Resumable Grok ACP session"]
     R --> I["grok import"]
 ```
 
@@ -145,110 +148,132 @@ A shared Grok process MUST NOT be used in v0.1 because Grok sandbox selection is
 
 | Job kind | Sandbox | Permissions | Web search | Subagents |
 |---|---|---|---|---|
-| Normal review | `read-only` | Non-interactive, no edits | Disabled | Disabled |
-| Adversarial review | `read-only` | Non-interactive, no edits | Disabled | Disabled |
-| Stop review | `read-only` | Non-interactive, no edits | Disabled | Disabled |
-| Read-only rescue | `read-only` | Non-interactive | Request-dependent | Initially disabled |
-| Write rescue | `workspace` or stricter compatible mode | Unattended inside sandbox | Request-dependent | Allowed only after recursion tests pass |
+| Normal review | isolated custom profile extending `strict` | Headless; context-only; no repository tools or edits | Disabled | Disabled |
+| Adversarial review | isolated custom profile extending `strict` | Headless; context-only; no repository tools or edits | Disabled | Disabled |
+| Stop review | isolated custom profile extending `strict` | Headless; no repository tools or edits | Disabled | Disabled |
+| Read-only rescue | `read-only` | Isolated ACP home; plugin profile allowlists only read, list, and grep; bare shell/edit/write denies | Disabled | Disabled |
+| Write rescue | `workspace` | Unattended inside sandbox | Disabled | Disabled |
 
 A requested write job MUST fail with an actionable policy error if the installed or managed Grok configuration cannot permit unattended workspace changes. It MUST NOT silently downgrade to a read-only run.
 
-Review processes MAY write Grok's own session or cache data where the Grok sandbox permits it, but MUST NOT change the reviewed repository.
+Review processes MAY write only their isolated review home and other locations allowed by Grok's effective sandbox. The plugin MUST remove the isolated review home after completion on a best-effort basis, and the review MUST NOT change the reviewed repository.
 
 Write processes MAY also write Grok-owned session, cache, and temporary locations explicitly allowed by the selected sandbox. User-project changes MUST remain inside the canonical workspace, and arbitrary sibling, parent, or home-directory writes are forbidden.
 
-## 8. ACP provider contract
+## 8. Provider transport contracts
 
 ### 8.1 Internal provider interface
 
-The runtime SHALL depend on a provider-neutral interface equivalent to:
+The runtime SHALL keep provider-specific process and protocol details behind operations equivalent to:
 
 ```text
 checkAvailability()
-getAuthStatus()
-getCapabilities()
-createSession(options)
-loadSession(sessionId, options)
-runTurn(session, prompt, callbacks)
-cancelTurn(session)
-deleteSession(sessionId)
+probeTaskCapabilities()
+runStructuredReview(options)
+runTask(options)
+cleanupReviewEnvironment(jobId)
 importClaudeSession(path)
-formatResumeCommand(sessionId)
-shutdown()
+formatResumeCommand(sessionId, model, effort)
 ```
 
 Provider-specific protocol details MUST remain behind this interface.
 
-### 8.2 Transport lifecycle
+### 8.2 Transport selection and leader isolation
 
-The primary transport is JSON-RPC 2.0 over stdio using:
+Transport selection is fixed by profile before any prompt is sent:
 
-```text
-grok agent stdio --no-leader
-```
+- Normal, adversarial, and stop reviews use headless Grok with the `explore` agent.
+- Read-only and write-capable rescue tasks use ACP v1 over `grok agent stdio`.
+- Transcript transfer uses `grok import --json` and neither review nor ACP prompt transport.
 
-The v0.1 adapter MUST request `--no-leader` to isolate the per-job process from a shared Grok leader. Setup MUST verify the flag before declaring ACP ready. If a candidate Grok version lacks the flag or does not honor the isolation contract, it is unsupported for v0.1. Sandbox, permission, web-search, tool, and subagent restrictions MUST be supplied as process-start arguments appropriate to the execution profile.
+Every provider process MUST receive a unique `--leader-socket <path>` beneath the workspace state directory. ACP processes MUST also pass the advertised `agent --no-leader` flag and MUST NOT attach jobs to a shared leader. Sandbox, permission, web-search, MCP, memory, planning, and subagent restrictions MUST be supplied as process-start arguments and a plugin-owned ACP agent profile appropriate to the execution profile. Root `--tools` and `--disallowed-tools` flags MUST NOT be treated as ACP enforcement because Grok 0.2.99 documents them as headless-only.
+
+There is no automatic transport fallback in v0.1. A review failure MUST NOT be retried through ACP, and an ACP task MUST NOT be replayed through headless mode.
+
+### 8.3 Headless review lifecycle
+
+The adapter SHALL:
+
+1. Create a private per-review home beneath plugin state.
+2. Create a custom sandbox profile extending Grok's `strict` profile.
+3. Write the review prompt through an immediately unlinked mode-`0600` descriptor and pass `/dev/fd/3` or `/proc/self/fd/3` with `--prompt-file`; prompt bodies MUST NOT be placed in process arguments or survive as named files.
+4. Assign a UUID session ID explicitly and require the response to return that same ID.
+5. Run the `explore` agent with repository editing, shell, repository-read, web, MCP, memory, planning, and subagent tools unavailable. Review evidence is the context collected by the plugin.
+6. Request JSON-Schema output for normal and adversarial reviews, or JSON text output for the stop gate.
+7. Enforce cancellation and a bounded timeout with process-group termination.
+8. Parse output and validate the expected contract; the anonymous prompt descriptor closes with the provider process.
+9. Remove the isolated review home after the job finishes on a best-effort basis.
+
+Normal and adversarial reviews MAY make one schema-repair turn by resuming the same isolated session. The repair MUST NOT create a second unrelated provider session.
+
+### 8.4 ACP task lifecycle
+
+ACP uses JSON-RPC 2.0 over stdio with `grok agent stdio`.
 
 The adapter MUST:
 
 1. Spawn Grok without a shell.
-2. Keep protocol stdout separate from diagnostics.
-3. Send ACP `initialize`.
-4. Require ACP protocol version 1 or a compatible negotiated version.
-5. Inspect advertised authentication methods and capabilities.
-6. Create a session or load a stored session.
-7. Apply requested model and effort using advertised configuration options.
-8. Send the task through `session/prompt`.
-9. Consume `session/update` notifications until the prompt response completes.
-10. Record the Grok session ID immediately.
-11. Normalize the final stop reason and provider output.
-12. Shut down the child cleanly.
+2. Create or reuse the profile-specific mode-private task home. Before copying authentication, require a cached login and, when its latest finite expiry is less than 45 minutes away, invoke the normal CLI to refresh it and revalidate the expiry. Refresh the sanitized isolated credential atomically, write an extension-disabling configuration, and inspect isolation. Builtin capabilities and provider-bundled skills are permitted only when each bundled skill's real path remains beneath either `<isolated GROK_HOME>/skills/` or `<isolated GROK_HOME>/bundled/skills/`; any external hook, skill, plugin, MCP server, or non-builtin agent fails isolation.
+3. Launch a checked-in `--agent-profile` with `injectDefaultTools: false`. Security-contract version 2 MUST include the SHA-256 `agentProfileDigest`, verify it again immediately before spawn, and require the same digest on resume. Disable repository instructions, web, MCP, subagents, memory, planning, LSP, image, and user-interaction capabilities.
+4. Keep protocol stdout separate from diagnostics.
+5. Send ACP `initialize` and require protocol version 1.
+6. Inspect advertised authentication methods and capabilities.
+7. Create a session or load a stored session only from the same profile-specific home.
+8. Reject a requested model that is not advertised by Grok and forward an accepted requested effort without silently substituting another value.
+9. Send the task through `session/prompt`.
+10. Consume `session/update` notifications until the prompt response completes.
+11. Record the Grok session ID immediately.
+12. Normalize the final stop reason and provider output.
+13. Close ACP and verify that the complete detached process group exits, escalating from `SIGTERM` to `SIGKILL`; unregister the active-provider guard only after verification.
+
+The contract-version-2 ACP `toolConfig` profiles are exact:
+
+- Read-only contains only `GrokBuild:read_file`, `GrokBuild:list_dir`, and `GrokBuild:grep`.
+- Write contains only `GrokBuild:run_terminal_cmd`, `GrokBuild:read_file`, `GrokBuild:list_dir`, `GrokBuild:grep`, `GrokBuild:search_replace`, `GrokBuild:todo_write`, `GrokBuild:kill_task`, and `GrokBuild:get_task_output`. `GrokBuild:run_terminal_cmd` MUST set `enabled_background: true`, `auto_background_on_timeout: false`, and `allow_background_operator: false`; the profile instruction still prohibits background commands. `kill_task` and `get_task_output` are the only task-manager tools.
 
 Unknown well-formed ACP events MUST NOT crash an otherwise valid run. Before persistence, every provider event—including unknown events—MUST pass through recursive key-based and exact-value redaction. The job log may retain the resulting redacted original event; truly raw protocol payloads remain in memory only and MUST NOT be written by default.
 
-### 8.3 Capabilities
+### 8.5 Capabilities
 
 Before using a feature, the adapter MUST verify the associated capability:
 
 - Session continuation requires advertised session-loading support.
-- Requested model or effort configuration requires the relevant advertised option.
+- A requested task model requires an advertised model ID.
+- Transfer model and effort qualification uses the model/effort menu advertised by ACP setup probing.
 - Transcript transfer uses the Grok CLI import command and does not assume an ACP import extension.
 - Unsupported requested features fail explicitly.
 
 Configuration option identifiers MUST be discovered from session state. They MUST NOT be assumed to remain stable between Grok versions.
 
-### 8.4 Authentication
+### 8.6 Authentication
 
 Background jobs MUST NOT start interactive authentication.
 
-If ACP or the CLI reports missing or expired authentication, the job SHALL fail with `E_AUTH_REQUIRED` and direct the user to `/grok:setup`.
+If ACP, headless Grok, or the CLI reports missing or expired authentication, the job SHALL fail with `E_AUTH_REQUIRED` and direct the user to `/grok:setup`.
 
-`/grok:setup` MAY guide the user through official Grok login methods, but MUST NOT print or persist credentials.
+`/grok:setup` MAY guide the user through `grok login`, but MUST NOT print credentials. Its ACP isolation probe MAY create one mode-`0600` sanitized credential copy inside the transient review home; that copy and home MUST be removed when setup finishes, including failure paths.
 
-### 8.5 Event normalization
+Headless reviews use an isolated home so their session data does not enter a resumable store. Rescue tasks use separate persistent read/write homes beneath plugin state so external configuration cannot enter ACP and sessions cannot cross privilege profiles. Tool-using jobs require cached authentication created by `grok login`; environment-key-only authentication is unsupported. Authentication with a finite expiry under 45 minutes MUST trigger an automatic refresh through the normal CLI before any isolated copy is created, and MUST fail with `E_AUTH_REQUIRED` if sufficient validity cannot be established. Any cached authentication material made available inside these homes MUST remain mode `0600`, MUST NOT enter job JSON or logs, and its exact opaque value MUST be registered only in memory for redaction. Review copies MUST be removed with the isolated review home; rescue copies are refreshed atomically and are removed when the user removes workspace plugin state.
 
-Provider events SHALL be normalized into:
+### 8.7 Event normalization
+
+ACP session updates SHALL be normalized into:
 
 ```text
 message
 plan
-tool-call-start
-tool-call-update
+tool
 usage
-session-created
-phase
-warning
-provider-error
-completed
+unknown
 ```
 
-Normalized events include a timestamp and MAY include a human-readable progress message, session ID, usage, tool metadata, and the original well-formed event.
+The job runtime MAY additionally log its own `provider`, `session`, and redacted `diagnostic` events. Event timestamps are added by the job logger rather than the ACP normalizer.
 
 Raw events are diagnostic data and MUST NOT be treated as trusted command input.
 
-### 8.6 Cancellation
+### 8.8 Cancellation
 
-Cancellation SHALL follow this order:
+ACP task cancellation SHALL follow this order:
 
 1. Mark cancellation requested in persistent state.
 2. Send ACP `session/cancel`.
@@ -259,13 +284,11 @@ Cancellation SHALL follow this order:
 
 Cancellation MUST be idempotent. It MUST target only the selected job.
 
+Normal completion, cancellation, timeout, provider error, callback failure, and import completion MUST all verify that the entire owned detached process group is gone, not merely its leader PID. A live leader MUST match its recorded start token and job-bound command marker before signalling. Controller-owned children MAY be cleaned after their leader exits because ownership was established at spawn; crash recovery with only persisted identity MUST fail closed if the leader is gone while its process group remains live. The active-provider guard MUST remain when shutdown cannot be verified.
+
 For background jobs, the cancel command SHALL create an atomic per-job cancellation marker. The owning worker observes the marker and performs provider-level cancellation before process termination.
 
-### 8.7 Headless fallback
-
-A `streaming-json` headless adapter MAY be implemented as a compatibility fallback only after it passes the same sandbox, session, cancellation, and output contract tests.
-
-Fallback selection MUST occur before a prompt is sent. The runtime MUST NOT retry a possibly executed write task through a second transport because doing so could duplicate changes.
+Headless review cancellation has no ACP notification. The worker SHALL observe the same marker, send `SIGTERM` to the verified review process group, and escalate to `SIGKILL` after a bounded grace period.
 
 Direct xAI API fallback is prohibited in v0.1.
 
@@ -291,22 +314,21 @@ Both review commands SHALL share these rules:
 - `--scope branch` selects a branch comparison.
 - `--scope auto` selects the working tree when dirty and otherwise selects a branch comparison.
 - Branch auto-detection order:
-  1. `refs/remotes/origin/HEAD`
-  2. local or remote `main`
-  3. local or remote `master`
-  4. local or remote `trunk`
+  1. the symbolic `origin/HEAD`, when present
+  2. `origin/main`, `origin/master`, or `origin/trunk`
+  3. local `main`, `master`, or `trunk`
 - Failure to detect a branch requires `--base <ref>` or `--scope working-tree`.
 - Branch review uses the merge base with `HEAD`.
 - Git commands MUST run with `shell: false`.
 - Ignored files are excluded.
 - Untracked text files are reviewable work.
-- Broken links, directories, binaries, and individually oversized untracked files are identified but not inlined.
+- Symlinks and directories are identified; binary files are represented by byte size and full SHA-256.
 
-For parity with the upstream collection policy:
+For the implemented tool-free collection policy:
 
-- Inline full diffs only for at most two changed files and at most 256 KiB of diff content.
-- Inline at most 24 KiB per untracked text file.
-- For larger targets, provide metadata and allow Grok to inspect the target using the read-only execution profile.
+- Inline the complete selected branch diff or staged, unstaged, and untracked working-tree evidence up to an 8 MiB total context limit.
+- Reject an individual untracked text file above 1 MiB with `E_REVIEW_TOO_LARGE`.
+- Reject any target above the total limit with `E_REVIEW_TOO_LARGE`. Because the review profile has no repository tools, the runtime MUST fail explicitly rather than omit staged or unstaged diff content.
 
 Repository content MUST be treated as untrusted review evidence, not as instructions to the agent.
 
@@ -318,17 +340,17 @@ Repository content MUST be treated as untrusted review evidence, not as instruct
 /grok:setup [--enable-review-gate|--disable-review-gate]
 ```
 
-It MUST report:
+The implemented setup check MUST report:
 
-- Node and Git readiness.
 - Grok executable path and version.
 - ACP initialization readiness.
 - Authentication readiness without credential material.
 - Session-loading capability.
 - Available model and effort configuration.
-- Read-only and write-profile compatibility.
 - Review-gate state.
 - Warnings and actionable next steps.
+
+Setup readiness covers CLI discovery, version, `grok models`, required headless-review flags, ACP `--agent-profile`/`--no-leader`/leader-socket flags, and an isolated `grok inspect --json` check. The inspection permits builtin capabilities and provider-bundled skills rooted beneath either `<isolated GROK_HOME>/skills/` or `<isolated GROK_HOME>/bundled/skills/` while proving that no external hook, skill, plugin, MCP server, or non-builtin agent loaded. Setup also checks the ACP capabilities used by rescue and transfer and removes its transient isolated credential copy and review home before returning. It does not execute a model-backed review or task, qualify process control for the operating system, or prove write-profile confinement. Documentation MUST NOT present `ready: true` as a full release or platform certification.
 
 If Grok is unavailable and npm is available, Claude MAY ask exactly once whether to run `npm install -g @xai-official/grok`. The confirmation MUST display that exact package and command. The official curl installer MAY be shown as a manual alternative, but MUST NOT run without explicit approval.
 
@@ -376,33 +398,23 @@ Both normal and adversarial review SHALL produce the same canonical structured p
 
 ```json
 {
-  "verdict": "approve | needs-attention",
+  "verdict": "pass | needs_changes",
   "summary": "non-empty string",
   "findings": [
     {
-      "severity": "critical | high | medium | low",
+      "severity": "critical | high | medium | low | info",
       "title": "non-empty string",
       "body": "non-empty string",
-      "file": "repository-relative path",
-      "line_start": 1,
-      "line_end": 1,
-      "confidence": 0.0,
-      "recommendation": "string"
+      "file": "repository-relative path or null",
+      "line": 1
     }
-  ],
-  "next_steps": ["non-empty string"]
+  ]
 }
 ```
 
-Additional properties are forbidden. `line_end` MUST be greater than or equal to `line_start`.
+The root requires `verdict`, `summary`, and `findings`; each finding requires `severity`, `title`, and `body`. `file` and `line` are optional and MAY be `null`. Additional properties are forbidden. A non-null line MUST be a positive integer.
 
-Location semantics are:
-
-- Added and modified files use the post-change repository-relative path and post-change line numbers.
-- Renamed files use the post-change path and post-change line numbers.
-- Deleted files use the pre-change path and pre-change line numbers; the finding body MUST state that the file is deleted.
-- The path MUST belong to the collected review target, even when it no longer exists in the worktree.
-- Where the referenced side is available, the range MUST fit that side's line count. For metadata-only large targets, validation MAY be limited to positive ordered lines plus target membership.
+The validator checks shape and positive line numbers. It does not independently prove that a returned path belongs to the selected target or that a line exists in the referenced revision. Paths and locations are provider claims and MUST be rendered without upgrading them into independently verified facts.
 
 Malformed structured output receives at most one same-session repair prompt. A second validation failure produces `E_SCHEMA` and MUST NOT be presented as a valid review. Human output for both review modes SHALL be rendered deterministically from the validated payload.
 
@@ -442,7 +454,8 @@ Claude MUST NOT take over the task after Grok fails.
 ### 11.6 `/grok:transfer`
 
 ```text
-/grok:transfer [--source <claude-jsonl>]
+/grok:transfer [--source <claude-jsonl>] [--model <id>]
+  [--effort low|medium|high]
 ```
 
 The source is the current transcript path captured by `SessionStart`, or an explicit override.
@@ -452,10 +465,16 @@ The runtime MUST:
 - Require a regular `.jsonl` file.
 - Resolve the real path.
 - Require the resolved path to remain under `~/.claude/projects`.
-- Invoke `grok import --json` without a shell.
+- Open the canonical path with no-follow semantics, then require the descriptor's post-open device and inode to match a fresh stat of that canonical path.
+- Pass the already validated source file descriptor directly as child descriptor 3 through a short-lived `.jsonl` alias; MUST NOT create a plugin-owned transcript copy.
+- Invoke `grok import --json` asynchronously without a shell, in a new process group, with bounded stdout/stderr, timeout and signal cancellation, and verified group cleanup on every exit path.
 - Parse returned NDJSON defensively.
 - Preserve redacted import diagnostics; unredacted NDJSON remains in memory only.
-- Return the imported Grok session ID and `grok --resume <session-id>`.
+- Probe ACP models and select the requested advertised model or the first available advertised model.
+- Reject a requested effort when the selected model advertises efforts and does not include it.
+- Return the imported Grok session ID, selected model, requested effort, and a model-qualified `grok --model <id> [--reasoning-effort <effort>] --resume <session-id>` command.
+
+Model qualification is mandatory because Grok Build 0.2.99 can import a Claude transcript under a legacy placeholder model; resuming without an available explicit model can return an empty result.
 
 The transcript body MUST NOT be copied into job state or logs.
 
@@ -474,12 +493,12 @@ Rules:
 - An explicit ID resolves any job in the current repository.
 - Without an ID, render one compact Markdown table.
 - With an ID, return the complete status.
-- `--wait` requires an explicit job ID.
+- `--wait` applies only when an explicit job ID is present.
 - Default wait timeout is 240,000 ms.
-- Default internal polling interval is 2,000 ms.
-- A wait timeout returns the latest snapshot with `waitTimedOut: true` and does not cancel the job.
+- The maximum requested timeout is 900,000 ms and the internal polling interval is 250 ms.
+- A wait timeout returns the latest job snapshot and does not cancel the job; the current record has no separate `waitTimedOut` field.
 
-Status includes ID, kind, status, phase, elapsed or duration, summary, Grok session ID when known, and follow-up commands.
+Human status includes ID, kind, status, phase, and summary. An explicit task may also include the Grok session ID, direct resume command, stored text, or error. Internal `--json` output returns the stored job record or list of records.
 
 ### 11.8 `/grok:result`
 
@@ -490,7 +509,7 @@ Status includes ID, kind, status, phase, elapsed or duration, summary, Grok sess
 - Explicit IDs are repository-scoped.
 - Without an ID, select the newest eligible finished job visible to the current Claude session.
 - Active jobs return an actionable "still running" result.
-- Output includes the complete stored payload, error details, artifacts, touched files, Grok session ID, and resume command.
+- Output includes the stored result or error and the Grok session ID/resume command when present. The current job model does not collect a separate artifact or touched-file inventory.
 - Claude MUST NOT summarize the output.
 
 ### 11.9 `/grok:cancel`
@@ -502,24 +521,31 @@ Status includes ID, kind, status, phase, elapsed or duration, summary, Grok sess
 - Without an ID, select the newest active job in the current Claude session.
 - Explicit IDs are repository-scoped.
 - A completed, failed, or already cancelled job returns its current terminal state without changing it.
-- Cancellation follows Section 8.6.
+- Cancellation follows Section 8.8.
 
 ## 12. Job persistence
 
 ### 12.1 Location and atomicity
 
-State SHALL be stored beneath `CLAUDE_PLUGIN_DATA`:
+State SHALL be stored beneath `CLAUDE_PLUGIN_DATA`, or beneath `~/.claude/plugins/data/grok/` when that environment variable is absent:
 
 ```text
 state/<workspace-slug>-<workspace-hash>/
 ├── config.json
-├── index.json
 ├── jobs/
 │   ├── <job-id>.json
 │   ├── <job-id>.log
 │   └── <job-id>.cancel
-└── locks/
+├── locks/
+├── review-homes/
+├── task-homes/
+│   ├── rescue-read-v2/
+│   └── rescue-write-v2/
+├── imports/
+└── leader-*.sock
 ```
+
+There is no `index.json` in v0.1. Job listing scans the per-job JSON records.
 
 The workspace identity is derived from the canonical Git root, or canonical current directory where Git is unavailable for setup. Hashing SHALL use SHA-256 over the canonical absolute path.
 
@@ -545,7 +571,7 @@ The persisted record SHALL include:
   "summary": "string",
   "write": false,
   "status": "queued | running | completed | failed | cancelled",
-  "phase": "queued | starting | authenticating | creating-session | loading-session | prompting | validating | finalizing | done | failed | cancelled",
+  "phase": "queued | starting | creating-session | prompting | finalizing | done | failed | cancelled",
   "workspaceRoot": "canonical absolute path",
   "claudeSessionId": "string or null",
   "grokSessionId": "string or null",
@@ -566,8 +592,9 @@ The persisted record SHALL include:
     "processGroupId": "integer or null"
   },
   "profile": {
-    "id": "review-v1 | adversarial-review-v1 | stop-review-v1 | rescue-read-v1 | rescue-write-v1",
-    "contractVersion": 1,
+    "id": "review-v1 | adversarial-review-v1 | stop-review-v1 | rescue-read-v2 | rescue-write-v2",
+    "contractVersion": 2,
+    "agentProfileDigest": "SHA-256 hex for an ACP profile, otherwise null",
     "transport": "acp | headless",
     "sandbox": "effective provider sandbox",
     "permissionMode": "effective provider permission mode",
@@ -575,7 +602,7 @@ The persisted record SHALL include:
     "deniedTools": ["tool-id"],
     "webSearch": false,
     "subagents": false,
-    "noLeader": true,
+    "isolatedLeader": true,
     "grokVersion": "observed version"
   },
   "model": "string or null",
@@ -594,13 +621,23 @@ The persisted record SHALL include:
 
 Unknown fields MUST be preserved when reading and rewriting newer records.
 
-The profile object MUST record effective values after capability negotiation, not merely requested values. Resume MUST compare the sandbox, permission mode, tool restrictions, web-search setting, subagent setting, isolation setting, transport guarantees, and profile contract version. A mismatch requires a fresh session. The recorded Grok version is diagnostic; a different binary version MAY resume only when it can reproduce the stored security contract.
+The profile object MUST record effective values after capability negotiation, not merely requested values. For ACP profiles, contract version 2 MUST record the checked-in agent profile's SHA-256 `agentProfileDigest`; the runtime verifies that digest before spawn. Resume MUST compare the sandbox, permission mode, tool restrictions, web-search setting, subagent setting, isolation setting, transport guarantees, profile contract version, and agent-profile digest. A mismatch requires a fresh session. The recorded Grok version is diagnostic; a different binary version MAY resume only when it can reproduce the stored security contract.
 
-PIDs alone are not process identity. Before signalling a worker or process group, cancellation and lifecycle cleanup MUST verify the stored OS-specific start token and the job-bound command marker. The worker nonce MUST contain at least 128 bits of randomness and be used for the cancellation-control handshake. If ownership cannot be verified, the runtime MUST NOT signal the PID; it records `E_PROCESS_IDENTITY` and reports manual cleanup guidance.
+PIDs alone are not process identity. Before signalling a worker or process group, cancellation and lifecycle cleanup MUST verify the stored OS-specific start token and the job-bound command marker. The worker nonce MUST contain at least 128 bits of randomness and be used for the cancellation-control handshake. If ownership or complete process-group shutdown cannot be verified, the runtime MUST NOT signal an unverified PID or remove its guard/state; it records `E_PROCESS_IDENTITY` and reports manual cleanup guidance.
 
 Credentials MUST never be recorded. A background request MAY contain the free-form prompt only until the worker claims it. The worker MUST then clear the prompt atomically. A lost worker is marked failed and MUST NOT be replayed automatically, because replay could duplicate edits.
 
-Stale `queued` or `running` jobs whose process no longer exists SHALL be recovered as failed with `E_WORKER_LOST`.
+Stale `queued` or `running` jobs whose worker no longer exists SHALL be recovered as failed with `E_WORKER_LOST` only when provider cleanup is absent or verified. If a provider leader is gone while its recorded process group remains live, or ownership otherwise cannot be verified, recovery SHALL instead record `E_PROCESS_IDENTITY` and retain the active-provider guard and job state.
+
+### 12.3 User-directed state removal
+
+Documentation MUST distinguish plugin state from Grok's provider session store:
+
+1. The user SHOULD cancel or wait for active jobs and close Claude sessions using the plugin.
+2. The user MAY remove one canonical workspace directory beneath `CLAUDE_PLUGIN_DATA/state/` or the fallback `~/.claude/plugins/data/grok/state/`.
+3. After uninstalling the plugin and confirming that no companion job is active, the user MAY remove the complete fallback `~/.claude/plugins/data/grok/` directory.
+4. Removing workspace plugin state removes isolated rescue homes and their resumable task sessions; it does not remove imported sessions from `~/.grok/sessions`.
+5. Imported sessions are listed with `grok sessions list` and individually removed with `grok sessions delete <session-id>`; rescue sessions are continued through `/grok:rescue --resume`.
 
 ## 13. Claude lifecycle hooks
 
@@ -620,9 +657,10 @@ The hook SHALL:
 
 - Find active jobs owned by the ending Claude session.
 - Request graceful cancellation.
-- Terminate remaining owned process trees.
+- Verify worker and provider ownership, terminate remaining owned process groups with bounded `SIGTERM`-to-`SIGKILL` escalation, and verify that each complete group is gone.
 - Leave jobs from other Claude sessions untouched.
-- Remove terminal records and job artifacts owned by the ending Claude session after cleanup.
+- Remove terminal records, guards, and job artifacts owned by the ending Claude session only after complete group shutdown is verified.
+- If ownership or group shutdown cannot be verified, record `E_PROCESS_IDENTITY`, emit manual-inspection guidance, and retain the guard and job state.
 
 ### 13.3 Stop gate
 
@@ -631,16 +669,16 @@ The gate is disabled by default.
 When enabled:
 
 - It passes the Stop hook's immediately preceding assistant message to the review prompt as the scope signal.
-- The prompt determines whether that message claims repository edits and, if so, inspects the current repository to verify completion. Status, setup, summaries, and prior review output should produce `ALLOW:` when they do not claim edits.
-- The gate does not maintain a per-turn filesystem snapshot and therefore cannot cryptographically attribute current diffs to one Claude turn. Documentation MUST describe this as the same best-effort verification model used by the reference plugin.
+- The prompt determines whether that message claims repository edits. Status, setup, summaries, and prior review output should produce `ALLOW:` when they do not claim edits.
+- The current stop gate receives plugin-collected current Git evidence and takes an integrity snapshot before and after Grok runs. It therefore detects mutation during the gate, but still cannot cryptographically attribute current changes to one historical Claude turn and MUST be documented as advisory. Users requiring a structured repository verdict SHOULD run `/grok:review --wait`.
 - It has a 15-minute timeout.
 - The first result line MUST begin with `ALLOW:` or `BLOCK:`.
 - `ALLOW:` permits stop.
 - `BLOCK:` emits a Claude Code block decision.
 - Empty, malformed, invalid, failed, or timed-out review output blocks with remediation guidance.
-- A missing Grok executable or unsupported ACP runtime logs setup guidance and does not trap the Claude session.
+- A missing Grok executable or unsupported Grok version logs setup guidance and does not trap the Claude session.
 - Authentication, provider, malformed-output, and timeout failures block once the runtime has passed the availability check.
-- Another running task produces a warning but does not by itself block.
+- When the gate is disabled, another running task produces a warning but does not block. The implemented enabled gate proceeds directly to the stop review.
 - The stop review uses a separate read-only Grok process.
 
 ## 14. Recursion prevention
@@ -665,16 +703,16 @@ This behavior requires an end-to-end regression test before release.
 
 Protected assets include repository integrity, user files outside the workspace, Claude transcripts, Grok credentials, environment secrets, state integrity, and process ownership.
 
-The Grok child environment MUST be built from a minimal cross-platform allowlist rather than by cloning `process.env`. The baseline allowlist is `PATH`; `HOME`, `USER`, `LOGNAME`, and `SHELL` where present; `TMPDIR`, `TMP`, and `TEMP`; `LANG` and `LC_*`; `TERM`, `COLORTERM`, and `NO_COLOR`; and, on Windows, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `APPDATA`, `LOCALAPPDATA`, `SystemRoot`, `ComSpec`, and `PATHEXT`. It also includes `GROK_COMPANION_CHILD=1` and only the authentication variable required by the selected Grok auth method. Claude plugin/session variables, proxy variables, and unrelated project credentials MUST NOT be inherited unless a later reviewed specification explicitly adds them.
+The Grok child environment MUST be built from a minimal cross-platform allowlist rather than by cloning `process.env`. The baseline allowlist is `PATH`; `HOME`, `USER`, `LOGNAME`, and `SHELL` where present; `TMPDIR`, `TMP`, and `TEMP`; `LANG` and `LC_*`; `TERM`, `COLORTERM`, and `NO_COLOR`; and, on Windows, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `APPDATA`, `LOCALAPPDATA`, `SystemRoot`, `ComSpec`, and `PATHEXT`. It also includes `GROK_COMPANION_CHILD=1` and reviewed isolation-control variables. Authentication variables are not inherited; tool-using jobs receive only the sanitized cached-auth file inside their isolated home. Claude plugin/session variables, proxy variables, and unrelated project credentials MUST NOT be inherited unless a later reviewed specification explicitly adds them.
 
-Cached or device/browser authentication is preferred for tool-using jobs. Environment-key authentication such as `XAI_API_KEY` MAY be enabled only if the feasibility gate proves that Grok does not expose that value to model-invoked tools or command subprocesses. Otherwise setup MUST reject that auth mode for tool-using jobs and explain how to use a safer cached login. No general-purpose `--pass-env` mechanism is included in v0.1.
+Cached device/browser authentication created by `grok login` is required for tool-using jobs. Environment-key-only authentication such as `XAI_API_KEY` is unsupported in v0.1 and MUST NOT be inherited by Grok or its tool subprocesses. Setup MUST reject that mode and explain how to create a cached login. No general-purpose `--pass-env` mechanism is included in v0.1.
 
 The implementation MUST:
 
 - Spawn Git, Node, and Grok without a shell.
 - Validate and canonicalize all filesystem paths.
-- Prevent symlink escape for transcript imports.
-- Never serialize plugin-managed authentication material, including `XAI_API_KEY`, authorization headers, cached tokens, or ACP authentication payloads.
+- Prevent symlink escape for transcript imports and bind each opened transcript descriptor to its canonical path with a post-open device/inode comparison before passing it as child fd 3.
+- Never serialize authentication material into job records, logs, rendered output, or import artifacts. Mode-`0600` sanitized cached-auth files are permitted only inside isolated review/task homes. Near-expiry cached authentication MUST be refreshed through the normal CLI before copying. Setup and review copies MUST be removed with the transient review home; task copies remain only with isolated resumable task state. Every copied opaque access value MUST be held in memory as an exact redaction sentinel and MUST NOT itself be serialized.
 - Redact sensitive-key fields and exact known secret values recursively before persistence or rendering.
 - Apply best-effort pattern redaction to other provider text, while documenting that Grok tool output can contain repository data the plugin cannot reliably classify as secret.
 - Keep provider protocol data separate from command output.
@@ -684,12 +722,12 @@ The implementation MUST:
 - Scope cancellation and cleanup by workspace and Claude session.
 - Reject unsafe state paths and malformed job IDs.
 - Honor Grok enterprise and managed restrictions.
-- Document that Grok and commands it runs may receive the invoking process environment.
+- Document that Grok receives a restricted environment allowlist and that model-invoked commands inherit that restricted child environment.
 - Document platform limitations, including child-process network restrictions not enforced on macOS.
 
 A review integrity snapshot SHALL capture, before and after the provider run:
 
-- The current `HEAD` and relevant ref object IDs.
+- The current `HEAD`.
 - The semantic index tree and a hash of the staged binary diff.
 - A hash of the tracked worktree binary diff, including mode and symlink changes.
 - The NUL-delimited untracked path set and a content hash for every existing untracked regular file or symlink in that set.
@@ -722,6 +760,7 @@ Resuming a session MUST NOT weaken or change its stored security profile. A requ
 | `E_IMPORT_SOURCE` | Unsafe or invalid transcript source |
 | `E_IMPORT_RESULT` | Import did not produce a usable session ID |
 | `E_STATE` | State read, write, or lock failure |
+| `E_SECURITY_PROFILE` | The checked-in ACP agent profile no longer matches its recorded digest |
 | `E_WORKER_LOST` | Recorded worker disappeared |
 | `E_PROCESS_IDENTITY` | A recorded PID could not be proven to belong to the job |
 | `E_RECURSION` | Nested companion invocation refused |
@@ -734,26 +773,29 @@ Internal exit codes SHOULD distinguish success, usage, prerequisite/authenticati
 ## 17. Compatibility and privacy policy
 
 - ACP features are capability-negotiated rather than version-assumed.
-- A requested model, effort, sandbox, or resume feature MUST fail clearly when unavailable.
+- A requested model, transfer effort, sandbox, or resume feature MUST fail clearly when the implemented capability checks reject it.
 - Unknown provider events are retained and ignored safely.
 - No automatic mid-task transport retry is allowed.
 - State records are versioned and forward-tolerant.
 - CI SHALL test Node 18.18 and Node 22.
-- CI SHALL run on Linux, macOS, and Windows.
+- Provider-neutral CI SHALL run on Linux, macOS, and Windows. The POSIX fake-provider suite SHALL run on Linux and macOS until a genuine Windows `shell: false` provider fixture exists.
 - Real Grok quota-consuming tests are opt-in or scheduled, never required on untrusted pull requests.
 - Before an operating system is listed as supported, an authenticated release test on that OS MUST demonstrate read-only immutability, write confinement, cancellation/process cleanup, session resume, and recursion prevention against a release-candidate Grok version. The repository SHALL record the OS, Grok version, date, and pass/fail result without credentials. If this evidence is unavailable for an OS, v0.1 documentation and setup MUST classify that OS as unverified rather than supported.
-- Release notes MUST list the oldest and newest Grok CLI versions actually tested.
+- The authenticated macOS Grok Build 0.2.99 release matrix passed on July 13, 2026 and is recorded in `tests/e2e-results/`. Linux provider execution remains authenticated-provider-unverified. Windows provider execution and process control are unsupported in v0.1 until a trustworthy process-start identity and authenticated lifecycle evidence exist.
+- Release notes MUST identify 0.2.99 as both the enforced floor and current authenticated version, without claiming untested newer versions are qualified.
 - Job prompts, provider output, reasoning summaries, commands, and file paths are potentially sensitive local data.
 - Documentation MUST state where these records live and how users can remove them.
-- The compact job index MUST not contain credentials or full Claude transcript bodies.
+- Job records and logs MUST not contain credentials or full Claude transcript bodies.
 
-Although the CLI runs locally, Grok model requests are processed through Grok/xAI services according to the user's account and enterprise policy. Before the first provider run, setup and project documentation MUST clearly disclose that task prompts, repository content selected by Grok tools, command output, and imported Claude transcript context may be transmitted to and processed by that service. The plugin MUST NOT describe provider execution as local-only.
+Although the CLI runs locally, Grok model requests are processed through Grok/xAI services according to the user's account and enterprise policy. Before the first provider run, setup and project documentation MUST clearly disclose that task prompts, review context collected by the plugin, repository content selected by Grok task tools, command output, and imported Claude transcript context may be transmitted to and processed by that service. The plugin MUST NOT describe provider execution as local-only.
 
-Grok owns a separate session store under `~/.grok/sessions`. Removing plugin job state, cancelling a job, or ending a Claude session does not inherently delete those provider sessions.
+Grok owns the normal imported-session store under `~/.grok/sessions`. Rescue sessions live in isolated read/write homes beneath workspace plugin state; cancelling a job or ending a Claude session does not inherently delete them, but removing that workspace state does.
 
-- Normal review, adversarial review, and stop-review sessions have no resume contract. After safely storing their result, the runtime MUST attempt `grok sessions delete <session-id>` without a shell. Cleanup failure produces a privacy warning but does not invalidate an otherwise valid stored result.
-- Rescue and imported sessions persist intentionally so users can resume them.
-- Documentation MUST explain `grok sessions list` and `grok sessions delete <session-id>` and distinguish provider-session cleanup from plugin-state cleanup.
+The runtime MAY keep transient active-provider guards in a mode-private operating-system temporary directory to prevent recursion when a provider tool runner strips environment markers or breaks process ancestry. A guard MUST contain no prompt, result, credential, or plaintext workspace/session identifier; it MUST use hashed ownership plus a random job marker and verified process identity, and MUST be removed only on normal completion or recovery after the recorded process group is verified gone. A live recorded group with an absent or unverifiable leader remains a conflict and retains its guard.
+
+- Normal review, adversarial review, and stop-review sessions have no user resume contract. They run with isolated homes beneath plugin state; recursive removal of that home is the session-cleanup mechanism instead of `grok sessions delete` against the user's normal store. A normal or adversarial job cleanup failure produces a privacy warning but does not invalidate an otherwise valid stored result.
+- Rescue and imported sessions persist intentionally so users can resume them, but in different stores.
+- Documentation MUST explain plugin-state removal for rescue sessions and `grok sessions list` / `grok sessions delete <session-id>` for imported sessions, and MUST distinguish both from ephemeral review homes.
 
 ## 18. Test requirements
 
@@ -770,7 +812,7 @@ Grok owns a separate session store under `~/.grok/sessions`. Removing plugin job
 - Import-path validation and NDJSON parsing.
 - Recursion-marker behavior.
 
-### 18.2 Fake ACP integration tests
+### 18.2 Fake-provider integration tests
 
 A deterministic fake `grok` executable SHALL cover:
 
@@ -779,6 +821,7 @@ A deterministic fake `grok` executable SHALL cover:
 - Session new and session load.
 - Advertised configuration options.
 - Message, plan, tool, usage, and unknown updates.
+- Headless prompt-file invocation, explicit session IDs, JSON output, and JSON-Schema output.
 - Normal completion and stop reasons.
 - Malformed JSON-RPC.
 - Child stderr.
@@ -793,10 +836,11 @@ A deterministic fake `grok` executable SHALL cover:
 - Write jobs cannot escape the workspace plus documented Grok-owned state and temporary paths.
 - Shell metacharacters remain literal arguments.
 - Hostile branch names do not execute commands.
-- Transcript symlink escape is rejected.
+- Transcript symlink escape is rejected, and a post-open device/inode mismatch fails before fd 3 inheritance.
 - State symlink and path traversal are rejected.
-- Synthetic plugin-managed keys, authorization values, cached-token fixtures, and seeded secret sentinels never appear in stdout, stderr snapshots, state, or logs.
-- SessionEnd kills only the current Claude session's jobs.
+- Synthetic keys, authorization values, cached-token fixtures (including opaque non-pattern keys), and seeded secret sentinels never appear in stdout, stderr snapshots, job records, or logs; near-expiry cached authentication is refreshed before copying, the transient setup/review credential copy is removed on every tested lifecycle path, and task-home credentials remain mode `0600`.
+- Contract-version-2 ACP profiles expose only their exact `GrokBuild:*` `toolConfig`, reject a changed `agentProfileDigest` on resume/spawn, allow only isolated provider-bundled skills, and reject external extensions.
+- SessionEnd kills only the current Claude session's complete owned process groups; unverifiable cleanup records `E_PROCESS_IDENTITY` and retains the guard and job state.
 - A forged or reused PID without the matching start token, nonce handshake, and command marker is never signalled.
 - Nested Grok invocation is refused.
 
@@ -823,7 +867,7 @@ With `GROK_E2E=1` and valid authentication:
 - Cancellation of a long-running task.
 - Claude transcript import and Grok session resume.
 
-The release candidate SHALL run the sandbox, cancellation, resume, and recursion subset on every operating system claimed as supported. These authenticated runs may be manual or protected CI, but their non-secret result metadata MUST be recorded.
+The release candidate SHALL run the sandbox, cancellation, resume, recursion, headless-review, and stop-gate subset on every operating system claimed as supported. These authenticated runs may be manual or protected CI, but their non-secret result metadata MUST be recorded. The macOS 0.2.99 matrix passed all 10 cases on July 13, 2026; Linux and Windows remain outside the provider-supported set for v0.1.
 
 ## 19. Release acceptance criteria
 
@@ -837,10 +881,11 @@ Version 0.1.0 is releasable only when:
 - Resume is scoped to the correct workspace and Claude session.
 - Transfer returns a usable Grok session ID.
 - Stop-gate allow, block, and failure behavior is correct.
-- Models and effort values are capability-derived.
+- Requested task models and transfer model/effort qualification follow the implemented capability rules without silent model substitution.
 - Recursion prevention passes a real integration test.
-- No plugin-managed authentication material or seeded secret sentinel appears in state, logs, or output.
-- Linux, macOS, and Windows CI pass.
+- No authentication material or seeded secret sentinel appears in job records, logs, or output; environment-key-only authentication is unsupported, near-expiry cached authentication is refreshed before copying, transient setup/review authentication is removed on every lifecycle path, and persistent isolated-task copies remain private, sanitized, and mode `0600`.
+- Provider-neutral Linux, macOS, and Windows CI pass, and the full POSIX fake-provider suite passes on Linux and macOS.
+- Every operating system described as provider-supported has authenticated lifecycle evidence; Windows remains explicitly unsupported/provider-unverified until that evidence and safe process ownership exist.
 - Package, plugin, marketplace, lockfile, and changelog versions match.
 - Apache-2.0 license, NOTICE, upstream attribution, and per-file modification notices are present.
 - The external processing and local/provider-session data boundaries are disclosed before first use.

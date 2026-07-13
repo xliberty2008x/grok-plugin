@@ -1,0 +1,16 @@
+# Development and CI inputs are not part of the plugin distribution.
+/.github/
+/tests/
+/scripts/
+/PLAN.md
+/SPEC.md
+
+# Local artifacts (also covered by .gitignore).
+node_modules/
+/coverage/
+/dist/
+/build/
+*.log
+*.pid
+.env
+.env.*
