@@ -48,6 +48,9 @@ function workerEnvironment(nonce) {
   if (host.sessionId) env.GROK_COMPANION_HOST_SESSION_ID = host.sessionId;
   env.GROK_COMPANION_PLUGIN_DATA = pluginDataRoot();
   if (process.env.GROK_BIN) env.GROK_BIN = process.env.GROK_BIN;
+  // The trusted detached worker must be able to locate a configured credential so it can
+  // sanitize/copy it into the isolated task home. Provider children still receive only GROK_HOME.
+  if (process.env.GROK_AUTH_PATH) env.GROK_AUTH_PATH = process.env.GROK_AUTH_PATH;
   env.GROK_COMPANION_WORKER_NONCE = nonce;
   return env;
 }
