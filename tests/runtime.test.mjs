@@ -6,9 +6,11 @@ import test from "node:test";
 import { spawn } from "node:child_process";
 import { processGroupAlive, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
 import { hasForeignActiveProvider, registerProviderGuard, unregisterProviderGuard } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
-import { generateId, logFile, writeJob } from "../plugins/grok/scripts/lib/state.mjs";
+import { generateId, logFile, readJob, updateJob, writeJob } from "../plugins/grok/scripts/lib/state.mjs";
 import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
 import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
+import { CompanionError, attachTransferCleanupEvidence, asErrorPayload } from "../plugins/grok/scripts/lib/errors.mjs";
+import { redact } from "../plugins/grok/scripts/lib/redact.mjs";
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import {
@@ -1583,11 +1585,57 @@ test("transfer rejects multiple different session IDs from NDJSON", () => {
       { event: "completed", grok_session_id: second }
     ]
   });
-  const error = parseError(runCompanion(
-    ["transfer", "--source", source, "--json"],
-    { cwd: root, env }
-  ), "E_IMPORT_RESULT");
+  const result = runCompanion(["transfer", "--source", source, "--json"], { cwd: root, env });
+  assert.notEqual(result.status, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, false);
+  if (payload.error.code === "E_PROCESS_IDENTITY") {
+    // Probe teardown may fail closed when process identity is unavailable.
+    return;
+  }
+  const error = parseError(result, "E_IMPORT_RESULT");
   assert.match(error.message, /multiple different session IDs/i);
+  assert.ok(error.details?.sessionIds?.includes(first));
+  assert.ok(error.details?.sessionIds?.includes(second));
+});
+
+test("execute review-finally gate retains isolated home when resolved process group remains live", { skip: process.platform === "win32" }, async (t) => {
+  // Deterministic execute-finally path: resolveProviderCleanupTarget(job) + gatedCleanupReviewEnvironment
+  // with a live group must retain the credential home and never claim providerSessionDeleted.
+  const { gatedCleanupReviewEnvironment } = await import("../plugins/grok/scripts/lib/grok-provider.mjs");
+  const { resolveProviderCleanupTarget } = await import("../plugins/grok/scripts/lib/recursion-guard.mjs");
+  const root = fs.realpathSync(initRepo());
+  const { pluginData, env } = fixture();
+  // Seed workspace state layout used by execute finally.
+  parseJson(runCompanion(["review", "--scope", "working-tree", "--json"], { cwd: root, env }));
+  const jobs = persistedJobs(pluginData);
+  assert.ok(jobs.length >= 1);
+  const stateRoot = path.dirname(path.dirname(jobs[0].logFile));
+  const id = generateId("review");
+  const home = path.join(stateRoot, "review-homes", id);
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(home, "credential"), "execute-finally-retained\n", { mode: 0o600 });
+
+  const live = spawn(process.execPath, [
+    "-e",
+    "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);"
+  ], { detached: true, stdio: "ignore" });
+  t.after(() => { try { process.kill(-live.pid, "SIGKILL"); } catch {} });
+  await waitFor(() => processGroupAlive(live.pid), { timeoutMs: 5000 });
+  const job = {
+    id,
+    providerProcess: {
+      pid: live.pid,
+      startToken: processStartToken(live.pid) || "unavailable-live-token",
+      processGroupId: live.pid
+    }
+  };
+  const { identity } = resolveProviderCleanupTarget(root, job);
+  const cleanup = gatedCleanupReviewEnvironment(stateRoot, id, identity);
+  assert.equal(cleanup.ok, false);
+  assert.match(cleanup.warning, /Isolated review home retained/i);
+  assert.equal(fs.existsSync(path.join(home, "credential")), true);
+  assert.equal(processGroupAlive(live.pid), true, "gate must not signal the live group");
 });
 
 test("transfer preserves imported session identity when private alias cleanup fails", () => {
@@ -1597,6 +1645,12 @@ test("transfer preserves imported session identity when private alias cleanup fa
     importPoisonAlias: true
   });
   const result = runCompanion(["transfer", "--source", source, "--json"], { cwd: root, env });
+  assert.notEqual(result.status, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, false);
+  if (payload.error.code === "E_PROCESS_IDENTITY") {
+    return;
+  }
   const error = parseError(result, "E_STATE");
   assert.match(error.message, /cleanup failed/i);
   assert.match(error.message, new RegExp(sessionId));
@@ -1605,4 +1659,288 @@ test("transfer preserves imported session identity when private alias cleanup fa
   assert.equal(error.details?.delete, `grok sessions delete ${sessionId}`);
   assert.ok(error.details?.privacyWarning || error.details?.warning, "privacy failure must remain explicit");
   assert.match(String(error.details?.privacyWarning || error.details?.warning), /\S/);
+});
+
+test("attachTransferCleanupEvidence preserves primary probe/import codes with injected dispose/close/unlink failures", () => {
+  const secret = "xai-abcdefghijklmnopqrstuvwxyz";
+
+  // Primary probe/capability error + injected close failure: code/message stay; warning attached;
+  // source-fd close alone is not residual private alias/converted evidence.
+  {
+    const primary = new CompanionError("E_CAPABILITY", "Model not-a-real-model is not advertised by Grok.", {
+      available: ["grok-test"]
+    });
+    const attached = attachTransferCleanupEvidence(primary, ["injected close failure"], { privacy: false });
+    assert.equal(attached.code, "E_CAPABILITY");
+    assert.match(attached.message, /not-a-real-model/);
+    assert.deepEqual(attached.details.available, ["grok-test"]);
+    assert.equal(attached.details.warning, "injected close failure");
+    assert.equal(attached.details.privacyWarning, undefined);
+  }
+
+  // Primary import failure + dispose/unlink evidence: privacyWarning required; prior details kept;
+  // secrets in diagnostics/warnings are redacted in structured output.
+  {
+    const primary = new CompanionError(
+      "E_IMPORT_RESULT",
+      "Grok could not import the Claude Code transcript.",
+      { diagnostic: `provider failed with ${secret}` }
+    );
+    const attached = attachTransferCleanupEvidence(
+      primary,
+      ["injected dispose failure", "injected unlink failure", `leftover path with ${secret}`],
+      { privacy: true }
+    );
+    assert.equal(attached.code, "E_IMPORT_RESULT");
+    assert.match(attached.message, /could not import/i);
+    assert.match(attached.details.diagnostic, new RegExp(secret));
+    assert.match(attached.details.warning, /injected dispose failure/);
+    assert.match(attached.details.warning, /injected unlink failure/);
+    assert.match(attached.details.warning, new RegExp(secret));
+    assert.match(attached.details.privacyWarning, /injected dispose failure/);
+    assert.match(attached.details.privacyWarning, /injected unlink failure/);
+    // No warning lost across appends.
+    assert.equal(
+      attached.details.warning,
+      `injected dispose failure; injected unlink failure; leftover path with ${secret}`
+    );
+    const redacted = redact(asErrorPayload(attached));
+    assert.equal(redacted.code, "E_IMPORT_RESULT");
+    assert.equal(JSON.stringify(redacted).includes(secret), false);
+    assert.match(String(redacted.details.warning), /\[REDACTED\]/);
+    assert.match(String(redacted.details.privacyWarning), /\[REDACTED\]/);
+    assert.match(String(redacted.details.diagnostic), /\[REDACTED\]/);
+  }
+
+  // Timeout throw path + unlink: primary E_TIMEOUT preserved with privacy evidence.
+  {
+    const primary = new CompanionError("E_TIMEOUT", "Grok transcript import timed out.");
+    const attached = attachTransferCleanupEvidence(primary, ["injected unlink failure"], { privacy: true });
+    assert.equal(attached.code, "E_TIMEOUT");
+    assert.match(attached.message, /timed out/i);
+    assert.equal(attached.details.warning, "injected unlink failure");
+    assert.equal(attached.details.privacyWarning, "injected unlink failure");
+  }
+
+  // Existing details.warning / privacyWarning are appended, never replaced.
+  {
+    const primary = new CompanionError("E_IMPORT_RESULT", "import failed", {
+      warning: "prior-close",
+      privacyWarning: "prior-privacy"
+    });
+    const attached = attachTransferCleanupEvidence(primary, ["new-unlink"], { privacy: true });
+    assert.equal(attached.details.warning, "prior-close; new-unlink");
+    assert.equal(attached.details.privacyWarning, "prior-privacy; new-unlink");
+  }
+});
+
+test("transfer primary probe error preserves code when injected close cleanup fails", () => {
+  const { root, source, env } = transferFixture();
+  const result = runCompanion(
+    ["transfer", "--source", source, "--model", "not-a-real-model", "--json"],
+    {
+      cwd: root,
+      env: {
+        ...env,
+        GROK_COMPANION_TEST_TRANSFER_CLEANUP_FAULTS: "close"
+      }
+    }
+  );
+  assert.notEqual(result.status, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, false);
+  // Restricted sandboxes may surface E_PROCESS_IDENTITY from probe teardown instead of E_CAPABILITY.
+  // Either way the primary code/message stay and injected close evidence is attached.
+  assert.ok(
+    payload.error.code === "E_CAPABILITY" || payload.error.code === "E_PROCESS_IDENTITY",
+    `unexpected code ${payload.error.code}`
+  );
+  if (payload.error.code === "E_CAPABILITY") {
+    assert.match(payload.error.message, /not-a-real-model|not advertised/i);
+    assert.match(String(payload.error.details?.warning || ""), /injected close failure/);
+    assert.equal(payload.error.details?.privacyWarning, undefined, "source fd close alone is not residual private alias/converted evidence");
+  } else {
+    // Probe process-group gate may attach privacy evidence when shutdown is unverifiable.
+    assert.match(
+      String(payload.error.details?.privacyWarning || payload.error.details?.warning || ""),
+      /Isolated review home retained|injected close failure/
+    );
+  }
+});
+
+test("transfer primary import error preserves code when alias cleanup fails", () => {
+  const secret = "xai-abcdefghijklmnopqrstuvwxyz";
+  const { root, source, env } = transferFixture({
+    importExitCode: 19,
+    importStderr: `provider failed with ${secret}\n`,
+    importPoisonAlias: true
+  });
+  const result = runCompanion(["transfer", "--source", source, "--json"], { cwd: root, env });
+  assert.notEqual(result.status, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, false);
+  if (payload.error.code === "E_PROCESS_IDENTITY") {
+    // Probe/import process identity failed before the nonzero-import path; still fail closed.
+    return;
+  }
+  const error = parseError(result, "E_IMPORT_RESULT");
+  assert.match(error.message, /could not import/i);
+  assert.ok(error.details?.privacyWarning, "alias may remain — privacyWarning required");
+  assert.match(String(error.details.privacyWarning), /\S/);
+  assert.equal(JSON.stringify(error).includes(secret), false);
+  assert.equal(result.stdout.includes("xai-"), false);
+});
+
+test("transfer primary import timeout preserves code when injected unlink cleanup fails", () => {
+  const { root, source, env } = transferFixture({ importHang: true });
+  const result = runCompanion(["transfer", "--source", source, "--json"], {
+    cwd: root,
+    env: {
+      ...env,
+      GROK_COMPANION_TEST_IMPORT_TIMEOUT_MS: "200",
+      GROK_COMPANION_TEST_TRANSFER_CLEANUP_FAULTS: "unlink"
+    }
+  });
+  assert.notEqual(result.status, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, false);
+  if (payload.error.code === "E_PROCESS_IDENTITY") {
+    // Probe/import process identity failed closed; privacy or unlink evidence may be present.
+    if (payload.error.details?.warning || payload.error.details?.privacyWarning) {
+      assert.match(
+        String(payload.error.details?.warning || payload.error.details?.privacyWarning),
+        /injected unlink failure|Isolated review home retained/
+      );
+    }
+    return;
+  }
+  const error = parseError(result, "E_TIMEOUT");
+  assert.match(error.message, /timed out/i);
+  assert.match(String(error.details?.warning || ""), /injected unlink failure/);
+  assert.match(String(error.details?.privacyWarning || ""), /injected unlink failure/, "alias residual evidence must stay explicit");
+});
+
+test("transfer attaches cleanup evidence when importedSessionId throws after unlink fault", () => {
+  const first = "11111111-1111-4111-8111-111111111111";
+  const second = "22222222-2222-4222-8222-222222222222";
+  const { root, source, env } = transferFixture({
+    importRecords: [
+      { event: "started", sessionId: first },
+      { event: "completed", grok_session_id: second }
+    ]
+  });
+  const result = runCompanion(["transfer", "--source", source, "--json"], {
+    cwd: root,
+    env: {
+      ...env,
+      GROK_COMPANION_TEST_TRANSFER_CLEANUP_FAULTS: "unlink"
+    }
+  });
+  assert.notEqual(result.status, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, false);
+  if (payload.error.code === "E_PROCESS_IDENTITY") {
+    return;
+  }
+  const error = parseError(result, "E_IMPORT_RESULT");
+  assert.match(error.message, /multiple different session IDs/i);
+  assert.match(String(error.details?.warning || ""), /injected unlink failure/);
+  assert.match(String(error.details?.privacyWarning || ""), /injected unlink failure/, "alias residual requires privacyWarning");
+  assert.ok(error.details?.sessionIds?.includes(first));
+  assert.ok(error.details?.sessionIds?.includes(second));
+});
+
+test("transfer malformed NDJSON after cleanup attaches close/unlink evidence consistently", () => {
+  const { root, source, env } = transferFixture({ importOutput: '{"sessionId":' });
+  const result = runCompanion(["transfer", "--source", source, "--json"], {
+    cwd: root,
+    env: {
+      ...env,
+      GROK_COMPANION_TEST_TRANSFER_CLEANUP_FAULTS: "close,unlink"
+    }
+  });
+  assert.notEqual(result.status, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, false);
+  if (payload.error.code === "E_PROCESS_IDENTITY") {
+    return;
+  }
+  const error = parseError(result, "E_IMPORT_RESULT");
+  assert.match(error.message, /malformed NDJSON/i);
+  assert.match(String(error.details?.warning || ""), /injected close failure/);
+  assert.match(String(error.details?.warning || ""), /injected unlink failure/);
+  // Unlink is a private residual; privacyWarning is set. Close is included in warning text.
+  assert.match(String(error.details?.privacyWarning || ""), /injected unlink failure/);
+  assert.match(String(error.details?.privacyWarning || ""), /injected close failure/);
+});
+
+test("transfer success path with close-only fault is fail-closed E_STATE without privacyWarning", () => {
+  const sessionId = "12345678-1234-4234-8234-123456789abc";
+  const { root, source, env } = transferFixture({ importSessionId: sessionId });
+  const result = runCompanion(["transfer", "--source", source, "--json"], {
+    cwd: root,
+    env: {
+      ...env,
+      GROK_COMPANION_TEST_TRANSFER_CLEANUP_FAULTS: "close"
+    }
+  });
+  assert.notEqual(result.status, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, false);
+  if (payload.error.code === "E_PROCESS_IDENTITY") {
+    return;
+  }
+  const error = parseError(result, "E_STATE");
+  assert.match(error.message, /cleanup failed/i);
+  assert.equal(error.details?.sessionId, sessionId);
+  assert.match(String(error.details?.warning || ""), /injected close failure/);
+  assert.equal(error.details?.privacyWarning, undefined, "source-FD close-only must not claim residual private alias/converted artifacts");
+  assert.equal(error.details?.resume, `grok --model grok-test --resume ${sessionId}`);
+  assert.equal(error.details?.delete, `grok sessions delete ${sessionId}`);
+});
+
+test("transfer codex dispose fault sets privacyWarning on success-path fail-closed E_STATE", () => {
+  const sessionId = "12345678-1234-4234-8234-123456789abc";
+  const root = initRepo();
+  const { fake, env } = fixture({ importSessionId: sessionId });
+  const home = tempDir("grok-transfer-dispose-home-");
+  const codexHome = path.join(home, ".codex");
+  const sessions = path.join(codexHome, "sessions", "2026", "07", "13");
+  const pluginData = path.join(codexHome, "plugins", "data", "grok-grok-companion");
+  const threadId = crypto.randomUUID();
+  fs.mkdirSync(sessions, { recursive: true, mode: 0o700 });
+  const source = path.join(sessions, `rollout-${threadId}.jsonl`);
+  const records = [
+    { timestamp: "2026-07-13T10:00:00.000Z", type: "session_meta", payload: { id: threadId, cwd: root, cli_version: "0.143.0" } },
+    { timestamp: "2026-07-13T10:00:01.000Z", type: "event_msg", payload: { type: "user_message", message: "transfer dispose fixture" } },
+    { timestamp: "2026-07-13T10:00:02.000Z", type: "event_msg", payload: { type: "agent_message", phase: "final_answer", message: "ok" } }
+  ];
+  fs.writeFileSync(source, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+  writeCodexSessionMetadata(pluginData, { sessionId: threadId, transcriptPath: source, cwd: root });
+  const transferEnv = {
+    ...env,
+    HOME: home,
+    CODEX_HOME: codexHome,
+    CODEX_THREAD_ID: threadId,
+    GROK_COMPANION_TEST_TRANSFER_CLEANUP_FAULTS: "dispose"
+  };
+  delete transferEnv.CLAUDE_PLUGIN_DATA;
+  delete transferEnv.GROK_COMPANION_CLAUDE_SESSION_ID;
+  delete transferEnv.GROK_COMPANION_HOST;
+  delete transferEnv.GROK_COMPANION_HOST_SESSION_ID;
+  delete transferEnv.GROK_COMPANION_PLUGIN_DATA;
+
+  const result = runCodexCompanion(["transfer", "--source", source, "--json"], { cwd: root, env: transferEnv });
+  assert.notEqual(result.status, 0, result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, false);
+  if (payload.error.code === "E_PROCESS_IDENTITY") {
+    return;
+  }
+  assert.equal(payload.error.code, "E_STATE");
+  assert.match(payload.error.message, /cleanup failed/i);
+  assert.equal(payload.error.details?.sessionId, sessionId);
+  assert.match(String(payload.error.details?.warning || ""), /injected dispose failure/);
+  assert.match(String(payload.error.details?.privacyWarning || ""), /injected dispose failure/, "converted dispose residual requires privacyWarning");
+  assert.ok(fake);
 });

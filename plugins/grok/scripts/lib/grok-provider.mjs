@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { AcpClient } from "./acp-client.mjs";
 import { CompanionError } from "./errors.mjs";
 import { redact, redactText } from "./redact.mjs";
-import { processGroupAlive, processStartToken } from "./process-control.mjs";
+import { processGroupAlive, processGroupGone, processStartToken } from "./process-control.mjs";
 import { registerProviderGuard, unregisterProviderGuard } from "./recursion-guard.mjs";
 import { hostCommand, hostContext } from "./host.mjs";
 
@@ -178,6 +178,18 @@ export function cleanupReviewEnvironment(stateDir, jobMarker) {
   catch (error) { return { ok: false, warning: redactText(error.message) }; }
 }
 
+/**
+ * Remove an isolated review home only after the resolved provider process group is verified gone.
+ * While a recorded group remains live or shutdown is unverifiable, retain the home and report a
+ * privacy warning so callers never mark providerSessionDeleted true against a live credential.
+ */
+export function gatedCleanupReviewEnvironment(stateDir, jobMarker, identity) {
+  if (identity && !processGroupGone(identity)) {
+    return { ok: false, warning: "Isolated review home retained because process cleanup could not be verified." };
+  }
+  return cleanupReviewEnvironment(stateDir, jobMarker);
+}
+
 function privateDirectory(directory) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const stat = fs.lstatSync(directory);
@@ -303,6 +315,61 @@ export function validateReview(value) {
   return value;
 }
 
+/**
+ * Select an ACP session/request_permission option using exact protocol semantics.
+ * Write profiles may only accept allow-once; read-only profiles only reject/deny.
+ * Labels/names are never trusted. allow-always / allow-session are never selected.
+ * Conflicting kind/optionId pairs (e.g. kind allow_once with optionId allow-always)
+ * are rejected on both exact and legacy branches.
+ */
+export function selectAcpPermissionOption(options, { write = false } = {}) {
+  const list = Array.isArray(options) ? options.filter((option) => option && typeof option === "object") : [];
+  const kindOf = (option) => String(option.kind || "");
+  const idOf = (option) => String(option.optionId || "");
+  const isAllowAlwaysOrSession = (option) => {
+    const kind = kindOf(option);
+    const id = idOf(option);
+    return kind === "allow_always" || kind === "allow-always" || kind === "allow_session" || kind === "allow-session"
+      || id === "allow_always" || id === "allow-always" || id === "allow_session" || id === "allow-session";
+  };
+  const isAnyAllow = (option) => {
+    if (isAllowAlwaysOrSession(option)) return true;
+    const kind = kindOf(option);
+    const id = idOf(option);
+    return kind === "allow_once" || kind === "allow-once"
+      || id === "allow-once" || id === "allow_once";
+  };
+  const isAllowOnce = (option) => {
+    // Non-empty optionId required (protocol answers with optionId; UUID ids + kind allow_once ok).
+    // Reject when either field signals allow-always/session; accept allow-once hyphen/underscore forms.
+    if (!idOf(option) || isAllowAlwaysOrSession(option)) return false;
+    const kind = kindOf(option);
+    const id = idOf(option);
+    return kind === "allow_once" || kind === "allow-once"
+      || id === "allow-once" || id === "allow_once";
+  };
+  const isRejectOrDeny = (option) => {
+    if (!idOf(option) || isAnyAllow(option)) return false;
+    const kind = kindOf(option);
+    const id = idOf(option);
+    // Exact reject/deny forms.
+    if (kind === "reject_once" || kind === "reject_always" || kind === "deny"
+      || id === "reject-once" || id === "reject-always" || id === "deny") return true;
+    // Legacy hyphen/underscore variants.
+    return kind === "reject-once" || kind === "reject-always" || kind === "deny_once" || kind === "deny-once"
+      || id === "reject_once" || id === "reject_always" || id === "deny_once" || id === "deny-once";
+  };
+
+  if (write) {
+    // Write may select only a nonpersistent allow-once option; reject any allow-always/session
+    // signal in either kind or optionId on both exact and legacy matches.
+    return list.find((option) => isAllowOnce(option)) || null;
+  }
+
+  // Read-only: never return an allow option even when kind says reject/deny.
+  return list.find((option) => isRejectOrDeny(option)) || null;
+}
+
 export async function openProvider({ root, profile, model = null, effort = null, stateDir, jobMarker = "probe", environment = null, knownSecrets = environment?.knownSecrets || [], onEvent = () => {} }) {
   assertProviderPlatform();
   const binary = discoverGrok(), version = grokVersion(binary);
@@ -313,10 +380,7 @@ export async function openProvider({ root, profile, model = null, effort = null,
   try { registerProviderGuard(root, safeMarker, processIdentity, hostContext().sessionId); }
   catch (error) { await ensureChildExit(child, processIdentity); throw error; }
   const permissionPolicy = (params) => {
-    const options = Array.isArray(params?.options) ? params.options : [];
-    const writing = profile.id === "rescue-write-v2";
-    const pattern = writing ? /allow.*once|once.*allow/i : /reject|deny/i;
-    const selected = options.find((option) => pattern.test(`${option?.kind || ""} ${option?.name || ""} ${option?.optionId || ""}`));
+    const selected = selectAcpPermissionOption(params?.options, { write: profile.id === "rescue-write-v2" });
     return selected?.optionId ? { outcome: { outcome: "selected", optionId: selected.optionId } } : { outcome: { outcome: "cancelled" } };
   };
   const client = new AcpClient(child, { timeoutMs: 30000, permissionPolicy, knownSecrets });
@@ -603,8 +667,29 @@ export async function probe(root, stateDir) {
         shutdownError = error;
       }
     }
-    const cleanup = cleanupReviewEnvironment(stateDir, marker);
-    if (!cleanup.ok) throw new CompanionError("E_STATE", "Could not remove the setup review-isolation probe.", { warning: cleanup.warning });
+    // Never delete the isolated credential home while the recorded process group remains live
+    // or shutdown is unverifiable. Preserve the guard (unregister only after verified exit)
+    // and keep the primary shutdown error when present.
+    const cleanup = gatedCleanupReviewEnvironment(stateDir, marker, provider?.process || null);
+    if (!cleanup.ok) {
+      if (shutdownError) {
+        const details = shutdownError.details && typeof shutdownError.details === "object" && !Array.isArray(shutdownError.details)
+          ? { ...shutdownError.details }
+          : {};
+        details.privacyWarning = [details.privacyWarning, cleanup.warning].filter(Boolean).join("; ");
+        if (shutdownError instanceof CompanionError) shutdownError.details = details;
+        else shutdownError.details = details;
+        throw shutdownError;
+      }
+      if (provider?.process && !processGroupGone(provider.process)) {
+        throw new CompanionError("E_PROCESS_IDENTITY", "Could not verify complete process-group shutdown for the setup review-isolation probe.", {
+          pid: provider.process.pid,
+          processGroupId: provider.process.processGroupId ?? null,
+          privacyWarning: cleanup.warning
+        });
+      }
+      throw new CompanionError("E_STATE", "Could not remove the setup review-isolation probe.", { warning: cleanup.warning });
+    }
     if (shutdownError) throw shutdownError;
   }
 }

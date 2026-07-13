@@ -5,14 +5,14 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { config, generateId, listJobs, logFile, now, removeJob, terminal, updateJob, writeJob } from "./lib/state.mjs";
+import { config, generateId, listJobs, logFile, now, readJob, removeJob, terminal, updateJob, writeJob } from "./lib/state.mjs";
 import { workspaceRoot, workspaceState } from "./lib/workspace.mjs";
 import { profileFor } from "./lib/profiles.mjs";
-import { runProvider, cleanupReviewEnvironment, discoverGrok, grokVersion, assertProviderPlatform } from "./lib/grok-provider.mjs";
+import { runProvider, gatedCleanupReviewEnvironment, discoverGrok, grokVersion, assertProviderPlatform } from "./lib/grok-provider.mjs";
 import { collectContext, resolveTarget, integritySnapshot, assertUnchanged } from "./lib/git-review.mjs";
 import { redactText } from "./lib/redact.mjs";
 import { hasGrokAncestor, processStartToken } from "./lib/process-control.mjs";
-import { hasForeignActiveProvider } from "./lib/recursion-guard.mjs";
+import { hasForeignActiveProvider, resolveProviderCleanupTarget } from "./lib/recursion-guard.mjs";
 import { hostCommand, hostContext } from "./lib/host.mjs";
 
 if (process.env.GROK_COMPANION_CHILD === "1" || process.env.GROK_COMPANION_JOB_MARKER || process.env.GROK_AGENT || process.env.GROK_LEADER_SOCKET || hasGrokAncestor()) process.exit(0);
@@ -117,7 +117,16 @@ try {
   providerFailure = error;
   response = { decision: "block", reason: `Grok stop review failed: ${redactText(error.message)}. Run ${hostCommand("setup")} and retry.` };
 } finally {
-  const cleanup = cleanupReviewEnvironment(workspaceState(root), jobMarker);
+  // Gate credential-home removal on the resolved job/guard process group (same semantics as
+  // execute finally / SessionEnd). Never mark providerSessionDeleted while the group is live.
+  let cleanupIdentity = null;
+  if (jobWritten) {
+    try {
+      const latest = readJob(root, jobMarker);
+      cleanupIdentity = resolveProviderCleanupTarget(root, latest).identity;
+    } catch {}
+  }
+  const cleanup = gatedCleanupReviewEnvironment(workspaceState(root), jobMarker, cleanupIdentity);
   if (!cleanup.ok) {
     const cleanupNote = `Isolated credential environment cleanup failed: ${cleanup.warning}.`;
     if (response?.reason) {
@@ -134,8 +143,18 @@ try {
         job.phase = job.status === "completed" ? "done" : "failed";
         job.completedAt = now();
         job.summary = response?.reason || "Stop review allowed completion.";
-        job.result = { decision: response?.decision || "allow", text: redactText(providerText), providerSessionDeleted: cleanup.ok };
-        if (cleanup.warning) job.result.privacyWarning = cleanup.warning;
+        // Additive privacy: keep prior result fields, set providerSessionDeleted from the gate.
+        job.result = {
+          ...(job.result || {}),
+          decision: response?.decision || "allow",
+          text: redactText(providerText),
+          providerSessionDeleted: cleanup.ok
+        };
+        if (cleanup.warning) {
+          job.result.privacyWarning = [job.result.privacyWarning, cleanup.warning].filter(Boolean).join("; ");
+        } else if (cleanup.ok) {
+          delete job.result.privacyWarning;
+        }
         if (providerFailure) job.error = { code: providerFailure.code || "E_PROVIDER_EXIT", message: redactText(providerFailure.message) };
         return job;
       });

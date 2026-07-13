@@ -9,6 +9,16 @@ import { fileURLToPath } from "node:url";
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 
+/** True when this file is the process entrypoint (realpath-safe for macOS /var vs /private/var). */
+function isMainModule() {
+  if (!process.argv[1]) return false;
+  try {
+    return fs.realpathSync(path.resolve(process.argv[1])) === fs.realpathSync(THIS_FILE);
+  } catch {
+    return path.resolve(process.argv[1]) === THIS_FILE;
+  }
+}
+
 function readJson(file, fallback = {}) {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8"));
@@ -105,10 +115,12 @@ async function serveAcp(binary, config) {
           method: "session/request_permission",
           params: {
             sessionId: "fake-session-00000001",
-            options: [
-              { optionId: "allow-once", kind: "allow_once", name: "Allow once" },
-              { optionId: "reject-once", kind: "reject_once", name: "Reject once" }
-            ]
+            options: Array.isArray(config.permissionOptions)
+              ? config.permissionOptions
+              : [
+                  { optionId: "allow-once", kind: "allow_once", name: "Allow once" },
+                  { optionId: "reject-once", kind: "reject_once", name: "Reject once" }
+                ]
           }
         });
       }
@@ -299,18 +311,25 @@ async function serveHeadless(binary, config, args) {
 }
 
 async function main() {
-  const binary = path.resolve(process.argv[1]);
+  // Prefer realpath so config/log files resolve under macOS /var → /private/var.
+  let binary = path.resolve(process.argv[1]);
+  try { binary = fs.realpathSync(binary); } catch {}
   const config = configFor(binary);
+  // installFakeGrok writes `${argvPath}.config.json`; fall back when realpath form differs.
+  const configFromArgv = !Object.keys(config).length && process.argv[1]
+    ? configFor(path.resolve(process.argv[1]))
+    : null;
+  const effective = configFromArgv && Object.keys(configFromArgv).length ? configFromArgv : config;
   const args = process.argv.slice(2);
-  appendLog(config, { event: "argv", args });
+  appendLog(effective, { event: "argv", args });
 
   if (args[0] === "--version") {
-    process.stdout.write(`grok ${config.version ?? "0.2.99"}\n`);
+    process.stdout.write(`grok ${effective.version ?? "0.2.99"}\n`);
     return;
   }
 
   if (args[0] === "--help") {
-    process.stdout.write(config.helpText ?? "Usage: grok [--prompt-file FILE] [--json-schema SCHEMA] [--tools TOOLS] [--disallowed-tools TOOLS] [--sandbox PROFILE]\n");
+    process.stdout.write(effective.helpText ?? "Usage: grok [--prompt-file FILE] [--json-schema SCHEMA] [--tools TOOLS] [--disallowed-tools TOOLS] [--sandbox PROFILE]\n");
     return;
   }
 
@@ -320,9 +339,9 @@ async function main() {
   }
 
   if (args[0] === "inspect" && args[1] === "--json") {
-    appendLog(config, { event: "inspect-environment", home: process.env.HOME, grokHome: process.env.GROK_HOME, config: process.env.GROK_HOME && fs.existsSync(path.join(process.env.GROK_HOME, "config.toml")) ? fs.readFileSync(path.join(process.env.GROK_HOME, "config.toml"), "utf8") : null });
-    let inspectValue = config.inspectValue;
-    if (!inspectValue && config.inspectBundledSkill && process.env.GROK_HOME) {
+    appendLog(effective, { event: "inspect-environment", home: process.env.HOME, grokHome: process.env.GROK_HOME, config: process.env.GROK_HOME && fs.existsSync(path.join(process.env.GROK_HOME, "config.toml")) ? fs.readFileSync(path.join(process.env.GROK_HOME, "config.toml"), "utf8") : null });
+    let inspectValue = effective.inspectValue;
+    if (!inspectValue && effective.inspectBundledSkill && process.env.GROK_HOME) {
       const skills = [
         ["bundled-test", path.join(process.env.GROK_HOME, "skills", "bundled-test", "SKILL.md")],
         ["downloaded-test", path.join(process.env.GROK_HOME, "bundled", "skills", "downloaded-test", "SKILL.md")]
@@ -338,14 +357,14 @@ async function main() {
   }
 
   if (args[0] === "models") {
-    if (config.authError) { process.stderr.write(config.authError); process.exitCode = 1; }
+    if (effective.authError) { process.stderr.write(effective.authError); process.exitCode = 1; }
     else process.stdout.write("You are logged in with fake auth.\n");
     return;
   }
 
   if (args[0] === "sessions" && args[1] === "delete") {
-    appendLog(config, { event: "delete-session", sessionId: args[2] ?? null });
-    if (config.deleteSessionFails) {
+    appendLog(effective, { event: "delete-session", sessionId: args[2] ?? null });
+    if (effective.deleteSessionFails) {
       process.stderr.write("delete failed with xai-FAKESECRET000000\n");
       process.exitCode = 1;
     }
@@ -353,20 +372,29 @@ async function main() {
   }
 
   if (args[0] === "import") {
+    // Hang before alias I/O so the fixture deterministically outlives parent
+    // GROK_COMPANION_TEST_IMPORT_TIMEOUT_MS until the parent signals this process.
+    if (effective.importHang) {
+      appendLog(effective, { event: "import-hang" });
+      await new Promise(() => {
+        setInterval(() => {}, 60_000);
+      });
+      return;
+    }
     const alias = args.at(-1);
     const input = fs.readFileSync(alias);
-    appendLog(config, { event: "import-input", alias, bytes: input.length, sha256: crypto.createHash("sha256").update(input).digest("hex"), sourceInArgv: args.some((arg) => arg === config.expectedSourcePath) });
-    if (config.importSpawnStubbornDescendant) stubbornDescendant(config, "import");
-    if (config.importStderr) process.stderr.write(String(config.importStderr));
-    if (Object.hasOwn(config, "importOutput")) {
-      process.stdout.write(String(config.importOutput));
-    } else if (Array.isArray(config.importRecords)) {
-      for (const record of config.importRecords) process.stdout.write(`${JSON.stringify(record)}\n`);
+    appendLog(effective, { event: "import-input", alias, bytes: input.length, sha256: crypto.createHash("sha256").update(input).digest("hex"), sourceInArgv: args.some((arg) => arg === effective.expectedSourcePath) });
+    if (effective.importSpawnStubbornDescendant) stubbornDescendant(effective, "import");
+    if (effective.importStderr) process.stderr.write(String(effective.importStderr));
+    if (Object.hasOwn(effective, "importOutput")) {
+      process.stdout.write(String(effective.importOutput));
+    } else if (Array.isArray(effective.importRecords)) {
+      for (const record of effective.importRecords) process.stdout.write(`${JSON.stringify(record)}\n`);
     } else {
-      const id = config.importSessionId ?? "12345678-1234-1234-1234-123456789abc";
+      const id = effective.importSessionId ?? "12345678-1234-1234-1234-123456789abc";
       process.stdout.write(`${JSON.stringify({ sessionId: id })}\n`);
     }
-    if (config.importPoisonAlias) {
+    if (effective.importPoisonAlias) {
       // Replace the private descriptor alias with a non-empty directory so post-import unlink fails.
       try { fs.unlinkSync(alias); } catch {}
       try {
@@ -374,12 +402,12 @@ async function main() {
         fs.writeFileSync(path.join(alias, "poison"), "import alias cleanup must fail\n", { mode: 0o600 });
       } catch {}
     }
-    if (config.importExitCode) process.exitCode = config.importExitCode;
+    if (effective.importExitCode) process.exitCode = effective.importExitCode;
     return;
   }
 
   if (args.includes("--single") || args.includes("--prompt-file")) {
-    await serveHeadless(binary, config, args);
+    await serveHeadless(binary, effective, args);
     return;
   }
 
@@ -389,7 +417,7 @@ async function main() {
     return;
   }
 
-  await serveAcp(binary, config);
+  await serveAcp(binary, effective);
 }
 
 export function installFakeGrok(directory, config = {}) {
@@ -426,7 +454,7 @@ export function readFakeLog(file) {
   }
 }
 
-if (path.resolve(process.argv[1] ?? "") === THIS_FILE) {
+if (isMainModule()) {
   main().catch((error) => {
     process.stderr.write(`${error?.stack || error}\n`);
     process.exitCode = 1;

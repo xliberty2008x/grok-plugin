@@ -14,18 +14,21 @@ import {
   processStartToken,
   probe,
   cleanupReviewEnvironment,
+  gatedCleanupReviewEnvironment,
   ensureChildExit,
   runHeadless,
   runProvider,
   runStructuredReview,
   REVIEW_SCHEMA,
+  selectAcpPermissionOption,
   validateReview
 } from "../plugins/grok/scripts/lib/grok-provider.mjs";
 import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
-import { hasForeignActiveProvider } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
-import { processGroupAlive } from "../plugins/grok/scripts/lib/process-control.mjs";
+import { hasForeignActiveProvider, registerProviderGuard, unregisterProviderGuard } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
+import { processGroupAlive, processGroupGone } from "../plugins/grok/scripts/lib/process-control.mjs";
+import { CompanionError } from "../plugins/grok/scripts/lib/errors.mjs";
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
-import { initRepo, tempDir } from "./helpers.mjs";
+import { initRepo, tempDir, waitFor } from "./helpers.mjs";
 
 async function withFake(config, callback) {
   const fixture = installFakeGrok(tempDir("fake-grok-bin-"), config);
@@ -257,6 +260,229 @@ test("ACP permission requests are answered without deadlock under the selected s
     await runProvider({ root, profile: profileFor("task", true), prompt: "implement", stateDir: tempDir("provider-state-") });
     const response = readFakeLog(fake.logFile).find((entry) => entry.event === "rpc" && entry.message.id === "fake-permission-request" && entry.message.result);
     assert.equal(response.message.result.outcome.optionId, "allow-once");
+  });
+});
+
+test("selectAcpPermissionOption uses exact allow-once / reject semantics and ignores misleading labels", () => {
+  const reordered = [
+    { optionId: "allow-always", kind: "allow_always", name: "Allow once" },
+    { optionId: "allow-session", kind: "allow_session", name: "Allow once for this turn" },
+    { optionId: "reject-once", kind: "reject_once", name: "Allow write forever" },
+    { optionId: "allow-once", kind: "allow_once", name: "Reject once" }
+  ];
+  assert.equal(selectAcpPermissionOption(reordered, { write: true })?.optionId, "allow-once");
+  assert.equal(selectAcpPermissionOption(reordered, { write: false })?.optionId, "reject-once");
+
+  // Write must never fall back to allow-always/session when allow-once is absent.
+  const persistentOnly = [
+    { optionId: "allow-always", kind: "allow_always", name: "Allow once" },
+    { optionId: "allow-session", kind: "allow_session", name: "Allow once now" },
+    { optionId: "reject-once", kind: "reject_once", name: "Reject once" }
+  ];
+  assert.equal(selectAcpPermissionOption(persistentOnly, { write: true }), null);
+  assert.equal(selectAcpPermissionOption(persistentOnly, { write: false })?.optionId, "reject-once");
+
+  // Read-only never grants even when allow-once is first with a reject-like label.
+  const grantFirst = [
+    { optionId: "allow-once", kind: "allow_once", name: "Reject once" },
+    { optionId: "allow-always", kind: "allow_always", name: "Deny" },
+    { optionId: "reject-once", kind: "reject_once", name: "Allow once" }
+  ];
+  assert.equal(selectAcpPermissionOption(grantFirst, { write: false })?.optionId, "reject-once");
+  assert.equal(selectAcpPermissionOption(grantFirst, { write: true })?.optionId, "allow-once");
+
+  // Narrow legacy underscore/hyphen compatibility only — still never allow-always.
+  assert.equal(
+    selectAcpPermissionOption([{ optionId: "allow_once", kind: "allow-once", name: "Allow always" }], { write: true })?.optionId,
+    "allow_once"
+  );
+  assert.equal(
+    selectAcpPermissionOption([{ optionId: "reject_once", kind: "reject-once", name: "Allow once" }], { write: false })?.optionId,
+    "reject_once"
+  );
+});
+
+test("selectAcpPermissionOption rejects conflicting kind/optionId pairs on exact and legacy paths", () => {
+  // Write must never select a persistent grant when kind says allow_once.
+  assert.equal(
+    selectAcpPermissionOption([{ optionId: "allow-always", kind: "allow_once", name: "Allow once" }], { write: true }),
+    null
+  );
+  assert.equal(
+    selectAcpPermissionOption([{ optionId: "allow-session", kind: "allow_once", name: "Allow once" }], { write: true }),
+    null
+  );
+  // Legacy underscore optionId with always/session kind.
+  assert.equal(
+    selectAcpPermissionOption([{ optionId: "allow_once", kind: "allow_always", name: "Allow once" }], { write: true }),
+    null
+  );
+  // Write still accepts UUID optionId with exact allow_once kind.
+  assert.equal(
+    selectAcpPermissionOption([{ optionId: "opt-uuid-allow", kind: "allow_once", name: "Allow once" }], { write: true })?.optionId,
+    "opt-uuid-allow"
+  );
+
+  // Read-only must never return an allow optionId even when kind is reject/deny.
+  assert.equal(
+    selectAcpPermissionOption([{ optionId: "allow-once", kind: "reject_once", name: "Reject once" }], { write: false }),
+    null
+  );
+  assert.equal(
+    selectAcpPermissionOption([{ optionId: "allow-once", kind: "deny", name: "Deny" }], { write: false }),
+    null
+  );
+  // Read-only still selects a coherent reject option when a conflicting allow is present.
+  assert.equal(
+    selectAcpPermissionOption([
+      { optionId: "allow-once", kind: "reject_once", name: "Reject once" },
+      { optionId: "reject-once", kind: "reject_once", name: "Reject" }
+    ], { write: false })?.optionId,
+    "reject-once"
+  );
+});
+
+test("ACP permission hardening selects only allow-once for write and never grants read-only", async (t) => {
+  // Deterministic pure coverage of selection is above. Integration path exercises the ACP
+  // permissionPolicy wiring; restricted sandboxes that cannot form process identity must
+  // skip explicitly rather than silently pass.
+  const misleadingOptions = [
+    { optionId: "allow-always", kind: "allow_always", name: "Allow once" },
+    { optionId: "allow-session", kind: "allow_session", name: "Allow once" },
+    { optionId: "allow-once", kind: "allow_once", name: "Allow for the whole session" },
+    { optionId: "reject-once", kind: "reject_once", name: "Allow write tools" }
+  ];
+
+  const runOrSkipIdentity = async (fn) => {
+    try {
+      await fn();
+    } catch (error) {
+      if (error?.code === "E_PROCESS_IDENTITY") {
+        t.skip("process identity unavailable in this environment (E_PROCESS_IDENTITY)");
+        return;
+      }
+      throw error;
+    }
+  };
+
+  await runOrSkipIdentity(async () => {
+    await withFake({ permissionRequest: true, permissionOptions: misleadingOptions }, async (fake) => {
+      const root = initRepo();
+      await runProvider({ root, profile: profileFor("task", true), prompt: "implement", stateDir: tempDir("provider-state-") });
+      const response = readFakeLog(fake.logFile).find((entry) => entry.event === "rpc" && entry.message.id === "fake-permission-request" && entry.message.result);
+      assert.equal(response.message.result.outcome.optionId, "allow-once");
+    });
+  });
+
+  await runOrSkipIdentity(async () => {
+    await withFake({ permissionRequest: true, permissionOptions: misleadingOptions }, async (fake) => {
+      const root = initRepo();
+      await runProvider({ root, profile: profileFor("task", false), prompt: "inspect", stateDir: tempDir("provider-state-") });
+      const response = readFakeLog(fake.logFile).find((entry) => entry.event === "rpc" && entry.message.id === "fake-permission-request" && entry.message.result);
+      assert.equal(response.message.result.outcome.optionId, "reject-once");
+    });
+  });
+
+  // Read-only cancels rather than granting when only allow options are offered.
+  await runOrSkipIdentity(async () => {
+    await withFake({
+      permissionRequest: true,
+      permissionOptions: [
+        { optionId: "allow-always", kind: "allow_always", name: "Reject once" },
+        { optionId: "allow-once", kind: "allow_once", name: "Deny" },
+        { optionId: "allow-session", kind: "allow_session", name: "Reject" }
+      ]
+    }, async (fake) => {
+      const root = initRepo();
+      await runProvider({ root, profile: profileFor("task", false), prompt: "inspect", stateDir: tempDir("provider-state-") });
+      const response = readFakeLog(fake.logFile).find((entry) => entry.event === "rpc" && entry.message.id === "fake-permission-request" && entry.message.result);
+      assert.equal(response.message.result.outcome.outcome, "cancelled");
+    });
+  });
+});
+
+test("gatedCleanupReviewEnvironment retains home while process group is live and cleans when gone", { skip: process.platform === "win32" }, async (t) => {
+  const state = tempDir("gated-cleanup-");
+  const marker = "review-gate-live";
+  const home = path.join(state, "review-homes", marker);
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(home, "credential"), "isolated\n", { mode: 0o600 });
+
+  const child = spawn(process.execPath, [
+    "-e",
+    "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);"
+  ], { detached: true, stdio: "ignore" });
+  t.after(() => { try { process.kill(-child.pid, "SIGKILL"); } catch {} });
+  await waitFor(() => processGroupAlive(child.pid), { timeoutMs: 5000 });
+  // processStartToken may be unavailable in restricted sandboxes; processGroupAlive is enough
+  // for the gate (live group ⇒ not gone regardless of token).
+  const identity = {
+    pid: child.pid,
+    startToken: processStartToken(child.pid) || "unavailable-start-token",
+    processGroupId: child.pid
+  };
+  assert.equal(processGroupGone(identity), false);
+
+  // Live group: must not delete the isolated credential home.
+  const retained = gatedCleanupReviewEnvironment(state, marker, identity);
+  assert.equal(retained.ok, false);
+  assert.match(retained.warning, /process cleanup could not be verified/i);
+  assert.equal(fs.existsSync(path.join(home, "credential")), true);
+
+  try { process.kill(-child.pid, "SIGKILL"); } catch {}
+  await waitFor(() => processGroupGone(identity), { timeoutMs: 5000 });
+  const cleaned = gatedCleanupReviewEnvironment(state, marker, identity);
+  assert.equal(cleaned.ok, true);
+  assert.equal(fs.existsSync(home), false);
+
+  // Absent identity is fail-open (nothing to verify).
+  const marker2 = "review-gate-absent";
+  const home2 = path.join(state, "review-homes", marker2);
+  fs.mkdirSync(home2, { recursive: true, mode: 0o700 });
+  assert.equal(gatedCleanupReviewEnvironment(state, marker2, null).ok, true);
+  assert.equal(fs.existsSync(home2), false);
+});
+
+test("setup probe path retains isolated home when process-group shutdown fails", { skip: process.platform === "win32" }, async (t) => {
+  // Mirrors probe finally: ensureChildExit identity failure leaves the group live; gated cleanup
+  // must retain the home, keep the guard, and surface privacy evidence without claiming deletion.
+  await withFake({}, async () => {
+    const root = initRepo();
+    const state = tempDir("probe-gate-state-");
+    const marker = "setup-probe-live-gate";
+    const home = path.join(state, "review-homes", marker);
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(home, "auth.json"), "{\"token\":\"x\"}\n", { mode: 0o600 });
+
+    const child = spawn(process.execPath, [
+      "-e",
+      "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);"
+    ], { detached: true, stdio: "ignore" });
+    t.after(() => {
+      try { process.kill(-child.pid, "SIGKILL"); } catch {}
+      try { unregisterProviderGuard(root, marker); } catch {}
+    });
+    await waitFor(() => processGroupAlive(child.pid), { timeoutMs: 5000 });
+    const startToken = processStartToken(child.pid) || "unavailable-start-token";
+    const identity = { pid: child.pid, startToken, processGroupId: child.pid };
+    registerProviderGuard(root, marker, identity, "probe-session");
+
+    // Forged start token: ensureChildExit refuses to signal and leaves the group live when a token
+    // is available. When tokens are unavailable, still exercise the gated cleanup retain path.
+    if (processStartToken(child.pid)) {
+      await assert.rejects(
+        () => ensureChildExit(child, { ...identity, startToken: `${startToken}|forged` }, { naturalExitMs: 0 }),
+        (error) => error instanceof CompanionError && error.code === "E_PROCESS_IDENTITY"
+      );
+    }
+    assert.equal(processGroupAlive(child.pid), true);
+    assert.equal(processGroupGone(identity), false);
+
+    const cleanup = gatedCleanupReviewEnvironment(state, marker, identity);
+    assert.equal(cleanup.ok, false);
+    assert.match(cleanup.warning, /Isolated review home retained/i);
+    assert.equal(fs.existsSync(path.join(home, "auth.json")), true);
+    assert.equal(hasForeignActiveProvider(root, "other-session"), true, "guard must remain after unverifiable shutdown");
   });
 });
 

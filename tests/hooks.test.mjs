@@ -819,6 +819,47 @@ test("SessionEnd appends cleanup privacyWarning without replacing prior evidence
   }
 });
 
+test("stop-review gate retains isolated home when resolved process group remains live", { skip: process.platform === "win32" }, async (t) => {
+  // Deterministic stop-review finally path: resolveProviderCleanupTarget + gatedCleanupReviewEnvironment
+  // with a live group must retain the credential home (same gate used by the hook finally block).
+  const { gatedCleanupReviewEnvironment } = await import("../plugins/grok/scripts/lib/grok-provider.mjs");
+  const { resolveProviderCleanupTarget } = await import("../plugins/grok/scripts/lib/recursion-guard.mjs");
+  const root = fs.realpathSync(initRepo());
+  const pluginData = tempDir("grok-hook-data-");
+  const id = generateId("stop-review");
+  const home = withPluginData(pluginData, () => {
+    const dir = path.join(workspaceState(root), "review-homes", id);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(dir, "credential"), "stop-review-retained\n", { mode: 0o600 });
+    return dir;
+  });
+
+  const live = spawn(process.execPath, [
+    "-e",
+    "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);"
+  ], { detached: true, stdio: "ignore" });
+  t.after(() => { try { process.kill(-live.pid, "SIGKILL"); } catch {} });
+  await waitFor(() => processGroupAlive(live.pid), { timeoutMs: 5000 });
+
+  withPluginData(pluginData, () => writeJob(root, record(id, "stop-gate-live-group", "running", {
+    kind: "stop-review",
+    jobClass: "review",
+    providerProcess: {
+      pid: live.pid,
+      startToken: processStartToken(live.pid) || "unavailable-live-token",
+      processGroupId: live.pid
+    }
+  })));
+
+  const job = withPluginData(pluginData, () => readJob(root, id));
+  const { identity } = resolveProviderCleanupTarget(root, job);
+  const cleanup = withPluginData(pluginData, () => gatedCleanupReviewEnvironment(workspaceState(root), id, identity));
+  assert.equal(cleanup.ok, false);
+  assert.match(cleanup.warning, /Isolated review home retained/i);
+  assert.equal(withPluginData(pluginData, () => fs.existsSync(path.join(home, "credential"))), true);
+  assert.equal(processGroupAlive(live.pid), true, "gate must not signal the live group");
+});
+
 test("disabled stop gate does not invoke Grok and only reports active work", () => {
   const root = fs.realpathSync(initRepo());
   const pluginData = tempDir("grok-hook-data-");

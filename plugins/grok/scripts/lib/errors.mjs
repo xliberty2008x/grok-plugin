@@ -7,6 +7,33 @@ export class CompanionError extends Error {
   }
 }
 
+/**
+ * Attach transfer cleanup evidence to a primary error without replacing its code/message.
+ * When a private converted transcript or import alias may remain, set privacyWarning.
+ */
+export function attachTransferCleanupEvidence(error, cleanupWarnings, { privacy = false } = {}) {
+  const warnings = (Array.isArray(cleanupWarnings) ? cleanupWarnings : [])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  if (!warnings.length) return error;
+  const text = warnings.join("; ");
+  const baseDetails = error?.details && typeof error.details === "object" && !Array.isArray(error.details)
+    ? { ...error.details }
+    : {};
+  const append = (prior) => (prior ? `${prior}; ${text}` : text);
+  baseDetails.warning = append(baseDetails.warning);
+  if (privacy) baseDetails.privacyWarning = append(baseDetails.privacyWarning);
+  if (error instanceof CompanionError) {
+    error.details = baseDetails;
+    return error;
+  }
+  if (error && typeof error === "object") {
+    error.details = baseDetails;
+    return error;
+  }
+  return new CompanionError("E_PROVIDER_EXIT", String(error), baseDetails);
+}
+
 export function asErrorPayload(error) {
   return {
     code: error?.code || "E_PROVIDER_EXIT",

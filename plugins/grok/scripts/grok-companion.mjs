@@ -7,9 +7,9 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { splitArgs, parseArgs } from "./lib/args.mjs";
-import { CompanionError, asErrorPayload, exitCodeFor } from "./lib/errors.mjs";
+import { CompanionError, asErrorPayload, attachTransferCleanupEvidence, exitCodeFor } from "./lib/errors.mjs";
 import { collectContext, resolveTarget, integritySnapshot, assertUnchanged } from "./lib/git-review.mjs";
-import { assertProviderPlatform, childEnvironment, cleanupReviewEnvironment, discoverGrok, ensureChildExit, probe, runProvider, runStructuredReview, grokVersion, processStartToken } from "./lib/grok-provider.mjs";
+import { assertProviderPlatform, childEnvironment, cleanupReviewEnvironment, gatedCleanupReviewEnvironment, discoverGrok, ensureChildExit, probe, runProvider, runStructuredReview, grokVersion, processStartToken } from "./lib/grok-provider.mjs";
 import { profileFor, sameSecurityProfile } from "./lib/profiles.mjs";
 import { config, setConfig, generateId, writeJob, updateJob, listJobs, readJob, selectJob, requestCancel, isCancelRequested, terminal, now, retain, logFile } from "./lib/state.mjs";
 import { workspaceRoot, workspaceState } from "./lib/workspace.mjs";
@@ -220,8 +220,15 @@ async function execute(root, id) {
     updateJob(root, id, (current) => { current.phase = "finalizing"; current.error = redact(asErrorPayload(error)); current.summary = redactText(error.message); return current; });
   } finally {
     if (job.jobClass === "review") {
-      const cleanup = cleanupReviewEnvironment(stateDir(root), id);
-      updateJob(root, id, (value) => { value.result = { ...(value.result || {}), providerSessionDeleted: cleanup.ok }; if (cleanup.warning) value.result.privacyWarning = cleanup.warning; return value; });
+      // Gate on the resolved job/guard-backed process group: never delete an isolated credential
+      // home or claim providerSessionDeleted while the group remains live or unverifiable.
+      const latest = readJob(root, id);
+      const { identity } = resolveProviderCleanupTarget(root, latest);
+      const cleanup = gatedCleanupReviewEnvironment(stateDir(root), id, identity);
+      updateJob(root, id, (value) => {
+        value.result = applyReviewPrivacy(value.result, cleanup);
+        return value;
+      });
     }
     updateJob(root, id, (current) => {
       current.status = terminalError ? (terminalError.code === "E_CANCELLED" ? "cancelled" : "failed") : "completed";
@@ -392,8 +399,28 @@ function importedSessionId(output) {
       if (typeof value?.[key] === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value[key])) ids.add(value[key]);
     }
   }
-  if (ids.size > 1) throw new CompanionError("E_IMPORT_RESULT", "Grok import returned multiple different session IDs.");
+  if (ids.size > 1) {
+    throw new CompanionError("E_IMPORT_RESULT", "Grok import returned multiple different session IDs.", {
+      sessionIds: [...ids]
+    });
+  }
   return ids.values().next().value || null;
+}
+
+/**
+ * Shared post-finally transfer cleanup evidence.
+ * Source-FD close-only failures are warning-only; converted/alias residuals also set privacyWarning.
+ */
+function transferCleanupDetails(cleanupWarnings, { privacy = false } = {}) {
+  const warnings = (Array.isArray(cleanupWarnings) ? cleanupWarnings : [])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  if (!warnings.length) return undefined;
+  const text = warnings.join("; ");
+  return {
+    warning: text,
+    ...(privacy ? { privacyWarning: text } : {})
+  };
 }
 
 function shellWord(value) {
@@ -404,6 +431,9 @@ function shellWord(value) {
 async function runImportProcess({ binary, root, transcriptFd, alias, leaderSocket, marker, signal, timeoutMs = 120000, maxOutputBytes = 8 * 1024 * 1024 }) {
   // Hard-gate before spawn / identity: Windows must report E_CAPABILITY, not E_PROCESS_IDENTITY.
   assertProviderPlatform();
+  // Test-only timeout override for deterministic cancel/timeout throw-path fixtures.
+  const testTimeout = Number(process.env.GROK_COMPANION_TEST_IMPORT_TIMEOUT_MS);
+  if (Number.isFinite(testTimeout) && testTimeout > 0) timeoutMs = testTimeout;
   const child = spawn(binary, ["import", "--json", "--leader-socket", leaderSocket, alias], {
     cwd: root,
     env: childEnvironment({ GROK_COMPANION_JOB_MARKER: marker }),
@@ -460,6 +490,16 @@ async function runImportProcess({ binary, root, transcriptFd, alias, leaderSocke
   return { status: code, signal: exitSignal, stdout, stderr };
 }
 
+/**
+ * Test-only faults: GROK_COMPANION_TEST_TRANSFER_CLEANUP_FAULTS=close,dispose,unlink
+ * Injects cleanup evidence while still performing real close/dispose/unlink.
+ */
+function transferCleanupFaults() {
+  const raw = process.env.GROK_COMPANION_TEST_TRANSFER_CLEANUP_FAULTS;
+  if (!raw) return new Set();
+  return new Set(String(raw).split(",").map((part) => part.trim()).filter(Boolean));
+}
+
 async function handleTransfer(raw) {
   const { options } = parseArgs(argvFrom(raw), { values: ["source", "cwd", "model", "effort"], booleans: ["json"] });
   validateModelEffort(options);
@@ -472,8 +512,10 @@ async function handleTransfer(raw) {
     throw new CompanionError("E_IMPORT_SOURCE", `No host transcript path is available. ${guidance}`);
   }
   const opened = openTranscriptSource(source);
-  let importAlias = null, run, importFd = opened.fd, convertedFile = null;
+  let importAlias = null, run, importFd = opened.fd, convertedFile = null, primaryError = null;
   const cleanupWarnings = [];
+  let convertedCleanupFailed = false;
+  let aliasCleanupFailed = false;
   const controller = new AbortController();
   const abort = () => controller.abort();
   process.once("SIGINT", abort);
@@ -502,25 +544,81 @@ async function handleTransfer(raw) {
     const leaderSocket = path.join(stateDir(root), `leader-${marker}.sock`);
     run = await runImportProcess({ binary, root, transcriptFd: importFd, alias: importAlias, leaderSocket, marker, signal: controller.signal });
     run.selectedModel = selected.id;
+  } catch (error) {
+    // Preserve the primary probe/conversion/import error; finally still runs cleanup and may
+    // attach cleanupWarnings without replacing this code/message.
+    primaryError = error;
   } finally {
     process.removeListener("SIGINT", abort);
     process.removeListener("SIGTERM", abort);
+    const faults = transferCleanupFaults();
+    // Test-only faults inject cleanup evidence while still performing real close/dispose/unlink
+    // so fixture processes do not leak descriptors. Production never sets the env var.
     if (importFd !== opened.fd) {
+      if (faults.has("dispose")) {
+        cleanupWarnings.push("injected dispose failure");
+        convertedCleanupFailed = true;
+      }
       const cleanup = disposeConvertedTranscript({ fd: importFd, file: convertedFile });
-      if (!cleanup.ok) cleanupWarnings.push(cleanup.warning);
+      if (!cleanup.ok) {
+        cleanupWarnings.push(cleanup.warning);
+        convertedCleanupFailed = true;
+      }
     }
+    if (faults.has("close")) cleanupWarnings.push("injected close failure");
     try { fs.closeSync(opened.fd); } catch (error) { cleanupWarnings.push(error.message); }
-    if (importAlias) try { fs.unlinkSync(importAlias); } catch (error) { if (error.code !== "ENOENT") cleanupWarnings.push(error.message); }
+    if (importAlias) {
+      if (faults.has("unlink")) {
+        cleanupWarnings.push("injected unlink failure");
+        aliasCleanupFailed = true;
+      }
+      try { fs.unlinkSync(importAlias); }
+      catch (error) {
+        if (error.code !== "ENOENT") {
+          cleanupWarnings.push(error.message);
+          aliasCleanupFailed = true;
+        }
+      }
+    }
+  }
+  const privacy = convertedCleanupFailed || aliasCleanupFailed;
+  if (primaryError) {
+    throw attachTransferCleanupEvidence(primaryError, cleanupWarnings, { privacy });
   }
   if (!run) {
-    if (cleanupWarnings.length) throw new CompanionError("E_STATE", "Could not completely remove the private transcript transfer artifacts.", { warning: cleanupWarnings.join("; ") });
+    if (cleanupWarnings.length) {
+      throw new CompanionError(
+        "E_STATE",
+        "Could not completely remove the private transcript transfer artifacts.",
+        transferCleanupDetails(cleanupWarnings, { privacy })
+      );
+    }
     throw new CompanionError("E_IMPORT_RESULT", "Grok transcript import did not complete.");
   }
   if (run.status !== 0) {
-    if (cleanupWarnings.length) throw new CompanionError("E_IMPORT_RESULT", `Grok could not import the ${opened.format === "codex" ? "Codex" : "Claude Code"} transcript.`, { diagnostic: redactText(run.stderr || run.stdout), privacyWarning: cleanupWarnings.join("; ") });
-    throw new CompanionError("E_IMPORT_RESULT", `Grok could not import the ${opened.format === "codex" ? "Codex" : "Claude Code"} transcript.`, { diagnostic: redactText(run.stderr || run.stdout) });
+    throw new CompanionError(
+      "E_IMPORT_RESULT",
+      `Grok could not import the ${opened.format === "codex" ? "Codex" : "Claude Code"} transcript.`,
+      {
+        diagnostic: redactText(run.stderr || run.stdout),
+        ...transferCleanupDetails(cleanupWarnings, { privacy })
+      }
+    );
   }
-  const id = importedSessionId(run.stdout); if (!id) throw new CompanionError("E_IMPORT_RESULT", "Grok import succeeded but returned no usable session ID.", cleanupWarnings.length ? { privacyWarning: cleanupWarnings.join("; ") } : undefined);
+  let id;
+  try {
+    id = importedSessionId(run.stdout);
+  } catch (error) {
+    // Parser throws (malformed NDJSON / multiple IDs) after cleanup ran — attach residual evidence.
+    throw attachTransferCleanupEvidence(error, cleanupWarnings, { privacy });
+  }
+  if (!id) {
+    throw attachTransferCleanupEvidence(
+      new CompanionError("E_IMPORT_RESULT", "Grok import succeeded but returned no usable session ID."),
+      cleanupWarnings,
+      { privacy }
+    );
+  }
   const resumeParts = ["grok", "--model", run.selectedModel];
   if (options.effort) resumeParts.push("--reasoning-effort", options.effort);
   resumeParts.push("--resume", id);
@@ -536,15 +634,14 @@ async function handleTransfer(raw) {
     delete: deleteParts.map(shellWord).join(" ")
   };
   if (cleanupWarnings.length) {
-    // Privacy contract fails closed: successful import with residual private transfer artifacts
-    // must not exit 0. Session resume/delete details are returned in error.details so the
-    // imported provider session is not orphaned while leftover private descriptors stay explicit.
+    // Fail closed on any cleanup residual (including source-FD close-only). Session resume/delete
+    // details keep the imported provider session from being orphaned. privacyWarning is set only
+    // when converted/alias residuals may remain — close-only is warning-only.
     throw new CompanionError(
       "E_STATE",
       `Imported ${label} transcript into Grok session ${id}, but private alias or descriptor cleanup failed. Resume with \`${result.resume}\` or delete with \`${result.delete}\`, then remove leftover transfer artifacts.`,
       {
-        warning: cleanupWarnings.join("; "),
-        privacyWarning: cleanupWarnings.join("; "),
+        ...transferCleanupDetails(cleanupWarnings, { privacy }),
         sessionId: result.sessionId,
         source: result.source,
         sourceFormat: result.sourceFormat,
