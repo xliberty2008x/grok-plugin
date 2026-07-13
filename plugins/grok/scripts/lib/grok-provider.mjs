@@ -9,12 +9,15 @@ import { CompanionError } from "./errors.mjs";
 import { redact, redactText } from "./redact.mjs";
 import { processGroupAlive, processStartToken } from "./process-control.mjs";
 import { registerProviderGuard, unregisterProviderGuard } from "./recursion-guard.mjs";
+import { hostCommand, hostContext } from "./host.mjs";
 
 export { processStartToken } from "./process-control.mjs";
 
 const MIN_VERSION = [0, 2, 99];
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const REVIEW_SCHEMA = { type: "object", additionalProperties: false, required: ["verdict", "summary", "findings"], properties: { verdict: { enum: ["pass", "needs_changes"] }, summary: { type: "string", minLength: 1 }, findings: { type: "array", items: { type: "object", additionalProperties: false, required: ["severity", "title", "body"], properties: { severity: { enum: ["critical", "high", "medium", "low", "info"] }, title: { type: "string", minLength: 1 }, body: { type: "string", minLength: 1 }, file: { type: ["string", "null"] }, line: { type: ["integer", "null"], minimum: 1 } } } } } };
+REVIEW_SCHEMA.properties.verdict.description = "Use pass only when findings is empty; use needs_changes only when findings contains at least one actionable defect.";
+REVIEW_SCHEMA.properties.findings.description = "Empty for a pass verdict; otherwise contain at least one actionable defect.";
 const ALLOW_ENV = new Set(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "COLORTERM", "NO_COLOR", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "SystemRoot", "ComSpec", "PATHEXT"]);
 
 export function assertProviderPlatform() {
@@ -28,7 +31,7 @@ function which(name) { const run = spawnSync(process.platform === "win32" ? "whe
 
 export function discoverGrok() {
   for (const candidate of [process.env.GROK_BIN, which("grok"), path.join(os.homedir(), ".grok", "bin", process.platform === "win32" ? "grok.exe" : "grok")]) if (candidate && executable(candidate)) return fs.realpathSync(candidate);
-  throw new CompanionError("E_GROK_NOT_FOUND", "Grok Build CLI was not found. Install it with `npm install -g @xai-official/grok`, then run `/grok:setup`.");
+  throw new CompanionError("E_GROK_NOT_FOUND", `Grok Build CLI was not found. Install it with \`npm install -g @xai-official/grok\`, then run ${hostCommand("setup")}.`);
 }
 
 export function grokVersion(binary = discoverGrok()) {
@@ -81,15 +84,15 @@ function safeMarker(value) { return String(value).replace(/[^a-zA-Z0-9._-]/g, "-
 function ensureFreshCachedCredential(source, minimumValidityMs = 45 * 60 * 1000) {
   let parsed;
   try { parsed = JSON.parse(fs.readFileSync(source, "utf8")); }
-  catch { throw new CompanionError("E_AUTH_REQUIRED", "Grok cached authentication is unreadable. Run `grok login`, then `/grok:setup`."); }
+  catch { throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication is unreadable. Run \`grok login\`, then ${hostCommand("setup")}.`); }
   const expiries = Object.values(parsed || {}).flatMap((entry) => entry && typeof entry === "object" && typeof entry.key === "string" && entry.key.length >= 16 && entry.expires_at ? [Date.parse(entry.expires_at)] : []).filter(Number.isFinite);
   if (!expiries.length || Math.max(...expiries) - Date.now() >= minimumValidityMs) return;
   const refreshed = spawnSync(discoverGrok(), ["models"], { encoding: "utf8", shell: false, timeout: 30000, env: childEnvironment() });
-  if (refreshed.status !== 0 || refreshed.error) throw new CompanionError("E_AUTH_REQUIRED", "Grok cached authentication could not be refreshed. Run `grok login`, then `/grok:setup`.");
+  if (refreshed.status !== 0 || refreshed.error) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication could not be refreshed. Run \`grok login\`, then ${hostCommand("setup")}.`);
   try { parsed = JSON.parse(fs.readFileSync(source, "utf8")); }
-  catch { throw new CompanionError("E_AUTH_REQUIRED", "Grok cached authentication is unreadable after refresh. Run `grok login`, then `/grok:setup`."); }
+  catch { throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication is unreadable after refresh. Run \`grok login\`, then ${hostCommand("setup")}.`); }
   const refreshedExpiries = Object.values(parsed || {}).flatMap((entry) => entry && typeof entry === "object" && typeof entry.key === "string" && entry.key.length >= 16 && entry.expires_at ? [Date.parse(entry.expires_at)] : []).filter(Number.isFinite);
-  if (refreshedExpiries.length && Math.max(...refreshedExpiries) - Date.now() < minimumValidityMs) throw new CompanionError("E_AUTH_REQUIRED", "Grok cached authentication expires too soon for an isolated job. Run `grok login`, then `/grok:setup`.");
+  if (refreshedExpiries.length && Math.max(...refreshedExpiries) - Date.now() < minimumValidityMs) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication expires too soon for an isolated job. Run \`grok login\`, then ${hostCommand("setup")}.`);
 }
 
 function writeReviewCredential(source, destination, { refresh = false } = {}) {
@@ -100,16 +103,16 @@ function writeReviewCredential(source, destination, { refresh = false } = {}) {
       const key = Object.values(existing || {}).find((entry) => entry && typeof entry === "object" && typeof entry.key === "string" && entry.key.length >= 16)?.key;
       if (key) return key;
     } catch {}
-    throw new CompanionError("E_AUTH_REQUIRED", "The isolated Grok credential is unreadable. Run `grok login`, then `/grok:setup`.");
+    throw new CompanionError("E_AUTH_REQUIRED", `The isolated Grok credential is unreadable. Run \`grok login\`, then ${hostCommand("setup")}.`);
   }
   const stat = fs.statSync(source);
-  if (!stat.isFile() || stat.size <= 0 || stat.size > 2 * 1024 * 1024) throw new CompanionError("E_AUTH_REQUIRED", "Grok cached authentication is unavailable. Run `grok login`, then `/grok:setup`.");
+  if (!stat.isFile() || stat.size <= 0 || stat.size > 2 * 1024 * 1024) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication is unavailable. Run \`grok login\`, then ${hostCommand("setup")}.`);
   let parsed;
   try { parsed = JSON.parse(fs.readFileSync(source, "utf8")); }
-  catch { throw new CompanionError("E_AUTH_REQUIRED", "Grok cached authentication is unreadable. Run `grok login`, then `/grok:setup`."); }
+  catch { throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication is unreadable. Run \`grok login\`, then ${hostCommand("setup")}.`); }
   const candidates = Object.entries(parsed || {}).filter(([, entry]) => entry && typeof entry === "object" && typeof entry.key === "string" && entry.key.length >= 16);
   const selected = candidates.sort(([, left], [, right]) => String(right.expires_at || "").localeCompare(String(left.expires_at || "")))[0];
-  if (!selected) throw new CompanionError("E_AUTH_REQUIRED", "Grok cached authentication contains no usable session. Run `grok login`, then `/grok:setup`.");
+  if (!selected) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication contains no usable session. Run \`grok login\`, then ${hostCommand("setup")}.`);
   const [account, entry] = selected;
   const isolated = { key: entry.key, auth_mode: entry.auth_mode || "oauth", create_time: entry.create_time || new Date().toISOString(), user_id: "", email: "", first_name: "", last_name: "", profile_image_asset_id: "", principal_type: entry.principal_type || "", principal_id: entry.principal_id || "", team_id: entry.team_id || "", coding_data_retention_opt_out: Boolean(entry.coding_data_retention_opt_out), refresh_token: "", expires_at: entry.expires_at || "", oidc_issuer: entry.oidc_issuer || "", oidc_client_id: entry.oidc_client_id || "" };
   const temporary = `${destination}.tmp-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
@@ -172,7 +175,7 @@ export function taskEnvironment(stateDir, root, profile) {
   privateDirectory(grokHome);
   atomicPrivateFile(path.join(grokHome, "config.toml"), `[skills]\nignore = [${JSON.stringify(fs.realpathSync(root))}]\n\n[subagents]\nenabled = false\n\n[features]\nlsp_tools = false\n`);
   const authPath = process.env.GROK_AUTH_PATH || path.join(os.homedir(), ".grok", "auth.json");
-  if (!fs.existsSync(authPath)) throw new CompanionError("E_AUTH_REQUIRED", "Grok cached authentication is unavailable. Run `grok login`, then `/grok:setup`.");
+  if (!fs.existsSync(authPath)) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication is unavailable. Run \`grok login\`, then ${hostCommand("setup")}.`);
   ensureFreshCachedCredential(authPath);
   const knownSecrets = [writeReviewCredential(authPath, path.join(grokHome, "auth.json"), { refresh: true })];
   const env = childEnvironment({
@@ -254,8 +257,14 @@ function extractJson(text) {
 
 export function validateReview(value) {
   const rootKeys = value && typeof value === "object" && !Array.isArray(value) ? Object.keys(value) : [];
-  const ok = value && rootKeys.every((key) => ["verdict", "summary", "findings"].includes(key)) && ["pass", "needs_changes"].includes(value.verdict) && typeof value.summary === "string" && value.summary.trim() && Array.isArray(value.findings) && value.findings.every((f) => f && typeof f === "object" && !Array.isArray(f) && Object.keys(f).every((key) => ["severity", "title", "body", "file", "line"].includes(key)) && ["critical", "high", "medium", "low", "info"].includes(f.severity) && typeof f.title === "string" && f.title.trim() && typeof f.body === "string" && f.body.trim() && (f.file === undefined || f.file === null || typeof f.file === "string") && (f.line === undefined || f.line === null || Number.isInteger(f.line) && f.line >= 1));
-  if (!ok) throw new CompanionError("E_SCHEMA", "Grok review output did not match the required schema.");
+  const ok = value && rootKeys.every((key) => ["verdict", "summary", "findings"].includes(key)) && ["pass", "needs_changes"].includes(value.verdict) && typeof value.summary === "string" && value.summary.trim() && Array.isArray(value.findings) && ((value.verdict === "pass" && value.findings.length === 0) || (value.verdict === "needs_changes" && value.findings.length > 0)) && value.findings.every((f) => f && typeof f === "object" && !Array.isArray(f) && Object.keys(f).every((key) => ["severity", "title", "body", "file", "line"].includes(key)) && ["critical", "high", "medium", "low", "info"].includes(f.severity) && typeof f.title === "string" && f.title.trim() && typeof f.body === "string" && f.body.trim() && (f.file === undefined || f.file === null || typeof f.file === "string") && (f.line === undefined || f.line === null || Number.isInteger(f.line) && f.line >= 1));
+  if (!ok) throw new CompanionError("E_SCHEMA", "Grok review output did not match the required schema.", {
+    rootKeys: rootKeys.filter((key) => ["verdict", "summary", "findings"].includes(key)),
+    hasUnknownRootKeys: rootKeys.some((key) => !["verdict", "summary", "findings"].includes(key)),
+    verdict: ["pass", "needs_changes"].includes(value?.verdict) ? value.verdict : typeof value?.verdict,
+    summaryType: typeof value?.summary,
+    findingsCount: Array.isArray(value?.findings) ? value.findings.length : null
+  });
   return value;
 }
 
@@ -266,7 +275,7 @@ export async function openProvider({ root, profile, model = null, effort = null,
   const leaderSocket = path.join(stateDir, `leader-${safeMarker}-${process.pid}-${Date.now()}.sock`);
   const child = spawn(binary, spawnArgs({ root, profile, model, effort, leaderSocket }), { cwd: root, env: { ...(environment?.env || childEnvironment()), GROK_COMPANION_JOB_MARKER: safeMarker }, shell: false, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
   const processIdentity = { pid: child.pid, startToken: processStartToken(child.pid), processGroupId: process.platform === "win32" ? null : child.pid };
-  try { registerProviderGuard(root, safeMarker, processIdentity, process.env.GROK_COMPANION_CLAUDE_SESSION_ID); }
+  try { registerProviderGuard(root, safeMarker, processIdentity, hostContext().sessionId); }
   catch (error) { await ensureChildExit(child, processIdentity); throw error; }
   const permissionPolicy = (params) => {
     const options = Array.isArray(params?.options) ? params.options : [];
@@ -291,7 +300,7 @@ export async function openProvider({ root, profile, model = null, effort = null,
   let initialized;
   try {
     if (eventError) throw eventError;
-    initialized = await client.request("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } }, clientInfo: { name: "grok-companion", version: "0.1.0" } });
+    initialized = await client.request("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } }, clientInfo: { name: "grok-companion", version: "0.2.0" } });
     if (eventError) throw eventError;
   } catch (error) {
     client.close(); await ensureChildExit(child, processIdentity); unregisterProviderGuard(root, safeMarker); throw eventError || error;
@@ -374,7 +383,7 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
     fs.closeSync(promptFd);
   }
   const identity = { pid: child.pid, startToken: processStartToken(child.pid), processGroupId: process.platform === "win32" ? null : child.pid };
-  try { registerProviderGuard(root, marker, identity, process.env.GROK_COMPANION_CLAUDE_SESSION_ID); }
+  try { registerProviderGuard(root, marker, identity, hostContext().sessionId); }
   catch (error) { await ensureChildExit(child, identity); cleanupReviewEnvironment(stateDir, marker); throw error; }
   let stdout = "", stdoutBytes = 0, stderr = "", terminationReason = null, forceTimer = null, eventError = null;
   const MAX_OUTPUT = maxOutputBytes;
@@ -420,7 +429,7 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
   if (terminationReason === "output") throw new CompanionError("E_OUTPUT_LIMIT", `Grok headless output exceeded ${MAX_OUTPUT} bytes.`);
   if (code !== 0) {
     const diagnostic = redactText(stderr || stdout, isolation.knownSecrets).slice(-8000);
-    if (/login|auth|unauthori[sz]ed|401/i.test(diagnostic)) throw new CompanionError("E_AUTH_REQUIRED", "Grok authentication is required. Run `grok login`, then `/grok:setup`.", { diagnostic });
+    if (/login|auth|unauthori[sz]ed|401/i.test(diagnostic)) throw new CompanionError("E_AUTH_REQUIRED", `Grok authentication is required. Run \`grok login\`, then ${hostCommand("setup")}.`, { diagnostic });
     throw new CompanionError("E_PROVIDER_EXIT", `Grok headless review exited (${code ?? signal}).`, { code, signal, diagnostic });
   }
   let payload;
@@ -459,7 +468,7 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
     if (cancelled || result?.stopReason === "cancelled") throw new CompanionError("E_CANCELLED", "Grok job was cancelled.");
     return { sessionId, text: redactText(text.trim(), environment?.knownSecrets || []), stopReason: result?.stopReason || "end_turn", provider: { version: provider.version, process: provider.process }, capabilities: provider.initialized };
   } catch (error) {
-    if (/auth|login|unauthori[sz]ed|no auth method/i.test(`${error?.message || ""} ${error?.details?.data || ""}`)) throw new CompanionError("E_AUTH_REQUIRED", "Grok authentication is unavailable or expired. Run `grok login`, then `/grok:setup`.");
+    if (/auth|login|unauthori[sz]ed|no auth method/i.test(`${error?.message || ""} ${error?.details?.data || ""}`)) throw new CompanionError("E_AUTH_REQUIRED", `Grok authentication is unavailable or expired. Run \`grok login\`, then ${hostCommand("setup")}.`);
     throw provider.eventError() || error;
   } finally {
     if (poll) clearInterval(poll);
@@ -475,7 +484,7 @@ export async function runStructuredReview(options) {
   let run = await execute(options), parsed = run.structuredOutput ?? extractJson(run.text);
   try { return { ...run, review: validateReview(parsed) }; }
   catch (firstError) {
-    const repair = await execute({ ...options, resumeSessionId: run.sessionId, prompt: "Your previous response was not valid review JSON. Return only one JSON object matching the required schema, preserving your findings." });
+    const repair = await execute({ ...options, resumeSessionId: run.sessionId, prompt: "Your previous response was not valid review JSON. Return only one JSON object matching the required schema. Use verdict pass with an empty findings array when there are no actionable defects. Use verdict needs_changes only with at least one actionable finding. Preserve any substantive findings, but do not preserve a contradictory verdict." });
     parsed = repair.structuredOutput ?? extractJson(repair.text);
     return { ...repair, review: validateReview(parsed) };
   }
@@ -502,7 +511,7 @@ export async function probe(root, stateDir) {
   const missingAgentFlags = requiredAgentFlags.filter((flag) => !agentHelpText.includes(flag));
   if (agentHelp.status !== 0 || missingAgentFlags.length) throw new CompanionError("E_CAPABILITY", "Grok does not advertise the required isolated ACP agent flags.", { missing: missingAgentFlags });
   const auth = spawnSync(binary, ["models"], { encoding: "utf8", shell: false, timeout: 30000, env: childEnvironment() });
-  if (auth.status !== 0) throw new CompanionError("E_AUTH_REQUIRED", "Grok authentication is unavailable or expired. Run `grok login`, then retry `/grok:setup`.", { diagnostic: redactText(auth.stderr || auth.stdout).slice(-2000) });
+  if (auth.status !== 0) throw new CompanionError("E_AUTH_REQUIRED", `Grok authentication is unavailable or expired. Run \`grok login\`, then retry ${hostCommand("setup")}.`, { diagnostic: redactText(auth.stderr || auth.stdout).slice(-2000) });
   const marker = `setup-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
   const isolation = reviewEnvironment(stateDir, marker);
   let provider = null;

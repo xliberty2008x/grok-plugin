@@ -96,8 +96,10 @@ function versionChecks() {
   const packageJson = readJson("package.json");
   const packageLock = readJson("package-lock.json");
   const marketplace = readJson(".claude-plugin/marketplace.json");
+  const codexMarketplace = readJson(".agents/plugins/marketplace.json");
   const pluginManifest = readJson("plugins/grok/.claude-plugin/plugin.json");
-  if (!packageJson || !packageLock || !marketplace || !pluginManifest) return;
+  const codexPluginManifest = readJson("plugins/grok/.codex-plugin/plugin.json");
+  if (!packageJson || !packageLock || !marketplace || !codexMarketplace || !pluginManifest || !codexPluginManifest) return;
 
   const version = packageJson.version;
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(String(version))) {
@@ -108,12 +110,17 @@ function versionChecks() {
   const pluginEntry = Array.isArray(marketplace.plugins)
     ? marketplace.plugins.find((entry) => entry?.name === "grok")
     : null;
+  const codexPluginEntry = Array.isArray(codexMarketplace.plugins)
+    ? codexMarketplace.plugins.find((entry) => entry?.name === "grok")
+    : null;
   const values = [
     ["package-lock.json top-level version", packageLock.version],
     ["package-lock.json root package version", packageLock.packages?.[""]?.version],
     ["marketplace metadata version", marketplace.metadata?.version],
     ["marketplace grok plugin version", pluginEntry?.version],
-    ["plugin manifest version", pluginManifest.version]
+    ["Claude plugin manifest version", pluginManifest.version],
+    ["Codex marketplace grok plugin version", codexPluginEntry?.version],
+    ["Codex plugin manifest version", codexPluginManifest.version]
   ];
   for (const [label, value] of values) {
     if (value !== version) problem(`${label} (${value ?? "missing"}) does not match package version ${version}.`);
@@ -125,7 +132,7 @@ function versionChecks() {
   }
 
   const pluginNotice = readText("plugins/grok/NOTICE");
-  if (pluginNotice != null && !pluginNotice.includes(`Grok Companion for Claude Code ${version}`)) {
+  if (pluginNotice != null && !pluginNotice.includes(`Grok Companion for Claude Code and Codex ${version}`)) {
     problem(`Plugin NOTICE does not identify release ${version}.`, "plugins/grok/NOTICE");
   }
 
@@ -151,6 +158,7 @@ if (!versionsOnly) {
     "package.json",
     "package-lock.json",
     ".claude-plugin/marketplace.json",
+    ".agents/plugins/marketplace.json",
     ".github/workflows/ci.yml",
     "scripts/validate.mjs",
     "scripts/bump-version.mjs",
@@ -158,6 +166,7 @@ if (!versionsOnly) {
     "tests/e2e-results/macos-0.2.99-2026-07-13.json",
     "tests/windows-neutral.test.mjs",
     "plugins/grok/.claude-plugin/plugin.json",
+    "plugins/grok/.codex-plugin/plugin.json",
     "plugins/grok/CHANGELOG.md",
     "plugins/grok/LICENSE",
     "plugins/grok/NOTICE",
@@ -165,21 +174,26 @@ if (!versionsOnly) {
     "plugins/grok/provider-agents/rescue-read.md",
     "plugins/grok/provider-agents/rescue-write.md",
     "plugins/grok/hooks/hooks.json",
+    "plugins/grok/hooks/claude-hooks.json",
     "plugins/grok/prompts/review.md",
     "plugins/grok/prompts/adversarial-review.md",
     "plugins/grok/prompts/stop-review-gate.md",
     "plugins/grok/schemas/review-output.schema.json",
     "plugins/grok/scripts/grok-companion.mjs",
+    "plugins/grok/scripts/grok-codex.mjs",
     "plugins/grok/scripts/session-lifecycle-hook.mjs",
     "plugins/grok/scripts/stop-review-gate-hook.mjs",
     "plugins/grok/scripts/lib/process-control.mjs",
     "plugins/grok/scripts/lib/recursion-guard.mjs",
+    "plugins/grok/scripts/lib/host.mjs",
+    "plugins/grok/scripts/lib/transcript.mjs",
     "plugins/grok/skills/grok-cli-runtime/SKILL.md",
     "plugins/grok/skills/grok-result-handling/SKILL.md",
     "plugins/grok/skills/grok-prompting/SKILL.md"
   ];
   const commandNames = ["setup", "review", "adversarial-review", "rescue", "transfer", "status", "result", "cancel"];
   for (const name of commandNames) required.push(`plugins/grok/commands/${name}.md`);
+  for (const name of commandNames) required.push(`plugins/grok/skills/${name}/SKILL.md`);
   for (const file of required) requiredFile(file);
 
   const packageJson = readJson("package.json");
@@ -194,7 +208,9 @@ if (!versionsOnly) {
   }
 
   const marketplace = readJson(".claude-plugin/marketplace.json");
+  const codexMarketplace = readJson(".agents/plugins/marketplace.json");
   const pluginManifest = readJson("plugins/grok/.claude-plugin/plugin.json");
+  const codexPluginManifest = readJson("plugins/grok/.codex-plugin/plugin.json");
   if (marketplace) {
     if (marketplace.name !== "grok-companion") problem("Marketplace name must be grok-companion.", ".claude-plugin/marketplace.json");
     if (!Array.isArray(marketplace.plugins)) problem("Marketplace plugins must be an array.", ".claude-plugin/marketplace.json");
@@ -209,10 +225,28 @@ if (!versionsOnly) {
     }
   }
   if (pluginManifest?.name !== "grok") problem("Plugin manifest name must be grok.", "plugins/grok/.claude-plugin/plugin.json");
+  if (
+    !Array.isArray(pluginManifest?.hooks)
+    || pluginManifest.hooks.length !== 2
+    || pluginManifest.hooks[0] !== "./hooks/hooks.json"
+    || pluginManifest.hooks[1] !== "./hooks/claude-hooks.json"
+  ) {
+    problem("Claude plugin manifest must load the shared and Claude-only hooks files.", "plugins/grok/.claude-plugin/plugin.json");
+  }
+  if (codexMarketplace) {
+    if (codexMarketplace.name !== "grok-companion") problem("Codex marketplace name must be grok-companion.", ".agents/plugins/marketplace.json");
+    const entries = Array.isArray(codexMarketplace.plugins) ? codexMarketplace.plugins.filter((entry) => entry?.name === "grok") : [];
+    if (entries.length !== 1) problem("Codex marketplace must contain exactly one grok plugin entry.", ".agents/plugins/marketplace.json");
+    const entry = entries[0];
+    if (entry?.source?.source !== "local" || entry?.source?.path !== "./plugins/grok") problem("Codex marketplace must use the local ./plugins/grok source.", ".agents/plugins/marketplace.json");
+    if (entry?.policy?.installation !== "AVAILABLE" || entry?.policy?.authentication !== "ON_INSTALL") problem("Codex marketplace policy must use AVAILABLE and ON_INSTALL.", ".agents/plugins/marketplace.json");
+  }
+  if (codexPluginManifest?.name !== "grok") problem("Codex plugin manifest name must be grok.", "plugins/grok/.codex-plugin/plugin.json");
+  if (codexPluginManifest?.skills !== "./skills/") problem("Codex plugin manifest must expose ./skills/.", "plugins/grok/.codex-plugin/plugin.json");
 
   const hooks = readJson("plugins/grok/hooks/hooks.json");
   if (hooks) {
-    for (const event of ["SessionStart", "SessionEnd", "Stop"]) {
+    for (const event of ["SessionStart", "Stop"]) {
       const definitions = hooks.hooks?.[event];
       if (!Array.isArray(definitions) || definitions.length === 0) {
         problem(`Hook event ${event} is missing.`, "plugins/grok/hooks/hooks.json");
@@ -233,6 +267,12 @@ if (!versionsOnly) {
         }
       }
     }
+    if (hooks.hooks?.SessionEnd) problem("Default hooks must not declare unsupported Codex SessionEnd.", "plugins/grok/hooks/hooks.json");
+  }
+  const claudeHooks = readJson("plugins/grok/hooks/claude-hooks.json");
+  if (claudeHooks) {
+    if (!Array.isArray(claudeHooks.hooks?.SessionEnd) || claudeHooks.hooks.SessionEnd.length !== 1) problem("Claude supplemental hooks must declare exactly one SessionEnd group.", "plugins/grok/hooks/claude-hooks.json");
+    for (const event of Object.keys(claudeHooks.hooks || {})) if (event !== "SessionEnd") problem("Claude supplemental hooks may contain only SessionEnd.", "plugins/grok/hooks/claude-hooks.json");
   }
 
   const schema = readJson("plugins/grok/schemas/review-output.schema.json");
@@ -259,6 +299,28 @@ if (!versionsOnly) {
     if (!/^description:\s*\S+/m.test(text)) problem("Command frontmatter must include a description.", file);
     if (!/modified|adapted/i.test(text) || !/openai\/codex-plugin-cc/i.test(text)) {
       problem("Adapted command must carry a prominent modification notice naming openai/codex-plugin-cc.", file);
+    }
+  }
+  for (const name of commandNames) {
+    const file = `plugins/grok/skills/${name}/SKILL.md`;
+    const text = readText(file, { required: false });
+    if (text == null) continue;
+    if (!new RegExp(`name:\\s*${name}\\b`).test(text)) problem(`Codex skill name must be ${name}.`, file);
+    if (!text.includes("../../scripts/grok-codex.mjs")) problem("Codex skill must resolve the bundled Codex runtime relative to SKILL.md.", file);
+    if (/CLAUDE_PLUGIN_ROOT|\/grok:/.test(text)) problem("Codex skill contains a Claude-only invocation path.", file);
+    if (!/^user-invocable:\s*false$/m.test(text)) problem("Codex facade must be hidden from Claude Code's duplicate user command discovery.", file);
+    const metadataFile = `plugins/grok/skills/${name}/agents/openai.yaml`;
+    const metadata = readText(metadataFile);
+    if (metadata != null) {
+      if (!metadata.includes(`$grok:${name}`)) problem("Codex skill metadata default prompt must name its qualified skill.", metadataFile);
+      if (!/^\s*allow_implicit_invocation:\s*true$/m.test(metadata)) problem("Public Codex skill must permit implicit invocation.", metadataFile);
+    }
+  }
+  for (const name of ["grok-cli-runtime", "grok-prompting", "grok-result-handling"]) {
+    const metadataFile = `plugins/grok/skills/${name}/agents/openai.yaml`;
+    const metadata = readText(metadataFile);
+    if (metadata != null && !/^\s*allow_implicit_invocation:\s*false$/m.test(metadata)) {
+      problem("Claude-internal skill must not be injected implicitly into Codex.", metadataFile);
     }
   }
 
@@ -295,12 +357,13 @@ if (!versionsOnly) {
     ...walk("plugins/grok/prompts"),
     ...walk("plugins/grok/scripts"),
     absolute(".claude-plugin/marketplace.json"),
-    absolute("plugins/grok/.claude-plugin/plugin.json")
+    absolute(".agents/plugins/marketplace.json"),
+    absolute("plugins/grok/.claude-plugin/plugin.json"),
+    absolute("plugins/grok/.codex-plugin/plugin.json")
   ].filter((file) => fs.existsSync(file) && fs.statSync(file).isFile());
   const stalePatterns = [
     [/\/codex:/i, "Codex slash-command namespace"],
     [/\bcodex-companion\b/i, "Codex companion identifier"],
-    [/\bCODEX_PLUGIN_[A-Z0-9_]+\b/, "Codex environment identifier"],
     [/\bOPENAI_API_KEY\b/, "OpenAI credential identifier"],
     [/\bgpt-\d/i, "OpenAI model identifier"]
   ];

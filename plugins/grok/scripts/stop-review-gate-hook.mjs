@@ -13,6 +13,7 @@ import { collectContext, resolveTarget, integritySnapshot, assertUnchanged } fro
 import { redactText } from "./lib/redact.mjs";
 import { hasGrokAncestor, processStartToken } from "./lib/process-control.mjs";
 import { hasForeignActiveProvider } from "./lib/recursion-guard.mjs";
+import { hostCommand, hostContext } from "./lib/host.mjs";
 
 if (process.env.GROK_COMPANION_CHILD === "1" || process.env.GROK_COMPANION_JOB_MARKER || process.env.GROK_AGENT || process.env.GROK_LEADER_SOCKET || hasGrokAncestor()) process.exit(0);
 
@@ -20,10 +21,15 @@ let raw = "";
 for await (const chunk of process.stdin) raw += chunk;
 let event = {};
 try { event = raw.trim() ? JSON.parse(raw) : {}; } catch {}
+if (event.stop_hook_active === true) process.exit(0);
 const cwd = event.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+const eventSessionId = event.session_id || event.sessionId || process.env.GROK_COMPANION_HOST_SESSION_ID || process.env.GROK_COMPANION_CLAUDE_SESSION_ID || null;
+process.env.GROK_COMPANION_HOST ||= process.env.PLUGIN_ROOT ? "codex" : "claude-code";
+if (eventSessionId) process.env.GROK_COMPANION_HOST_SESSION_ID ||= eventSessionId;
+const eventHost = hostContext();
 let root;
 try { root = workspaceRoot(path.resolve(cwd)); } catch { process.exit(0); }
-if (hasForeignActiveProvider(root, event.session_id || event.sessionId || process.env.GROK_COMPANION_CLAUDE_SESSION_ID || null)) process.exit(0);
+if (hasForeignActiveProvider(root, eventHost.sessionId)) process.exit(0);
 const active = listJobs(root).filter((job) => !terminal(job));
 if (active.length) process.stderr.write(`Grok Companion: ${active.length} job(s) still active.\n`);
 if (!config(root).stopReviewGate) {
@@ -31,7 +37,7 @@ if (!config(root).stopReviewGate) {
 }
 
 try { assertProviderPlatform(); grokVersion(discoverGrok()); }
-catch (error) { process.stderr.write(`Grok Companion stop gate unavailable: ${error.message} Run /grok:setup.\n`); process.exit(0); }
+catch (error) { process.stderr.write(`Grok Companion stop gate unavailable: ${error.message} Run ${hostCommand("setup")}.\n`); process.exit(0); }
 
 const previous = String(event.last_assistant_message || event.lastAssistantMessage || event.assistant_message || "").slice(-256 * 1024);
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -50,7 +56,7 @@ try {
   const before = integritySnapshot(root);
   const timestamp = now();
   writeJob(root, {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: jobMarker,
     kind: "stop-review",
     jobClass: "review",
@@ -60,7 +66,7 @@ try {
     status: "running",
     phase: "starting",
     workspaceRoot: root,
-    claudeSessionId: event.session_id || event.sessionId || process.env.GROK_COMPANION_CLAUDE_SESSION_ID || null,
+    host: eventHost,
     grokSessionId: null,
     createdAt: timestamp,
     startedAt: timestamp,
@@ -88,12 +94,12 @@ try {
   assertUnchanged(before, integritySnapshot(root));
   const first = result.text.split(/\r?\n/).find((line) => line.trim())?.trim() || "";
   if (!first.startsWith("ALLOW:")) {
-    const reason = first.startsWith("BLOCK:") ? first.slice(6).trim() : "Grok returned malformed stop-gate output. Run /grok:review --wait, address findings, then retry.";
+    const reason = first.startsWith("BLOCK:") ? first.slice(6).trim() : `Grok returned malformed stop-gate output. Run ${hostCommand("review", "--wait")}, address findings, then retry.`;
     response = { decision: "block", reason: redactText(reason) };
   }
 } catch (error) {
   providerFailure = error;
-  response = { decision: "block", reason: `Grok stop review failed: ${redactText(error.message)}. Run /grok:setup and retry.` };
+  response = { decision: "block", reason: `Grok stop review failed: ${redactText(error.message)}. Run ${hostCommand("setup")} and retry.` };
 } finally {
   const cleanup = cleanupReviewEnvironment(workspaceState(root), jobMarker);
   if (!cleanup.ok) response = { decision: "block", reason: `Grok stop review could not remove its isolated credential environment: ${cleanup.warning}.` };

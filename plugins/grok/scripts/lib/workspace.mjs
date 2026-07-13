@@ -1,9 +1,9 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { CompanionError } from "./errors.mjs";
+import { pluginDataRoot } from "./host.mjs";
 
 export function git(cwd, args, { allowFailure = false, encoding = "utf8", maxBuffer = 8 * 1024 * 1024 } = {}) {
   const run = spawnSync("git", args, { cwd, encoding, maxBuffer, shell: false });
@@ -22,7 +22,7 @@ export function workspaceRoot(cwd = process.cwd(), required = true) {
 }
 
 export function workspaceState(root) {
-  const pluginData = process.env.CLAUDE_PLUGIN_DATA || path.join(os.homedir(), ".claude", "plugins", "data", "grok");
+  const pluginData = pluginDataRoot();
   const hash = crypto.createHash("sha256").update(root).digest("hex").slice(0, 16);
   const slug = path.basename(root).replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 40) || "workspace";
   return path.join(pluginData, "state", `${slug}-${hash}`);

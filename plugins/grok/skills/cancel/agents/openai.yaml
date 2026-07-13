@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grok Cancel"
+  short_description: "Cancel one active Grok Companion job"
+  default_prompt: "Use $grok:cancel to cancel the active Grok job."
+policy:
+  allow_implicit_invocation: true

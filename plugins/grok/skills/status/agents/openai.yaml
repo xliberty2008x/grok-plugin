@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grok Status"
+  short_description: "Inspect Grok Companion job status"
+  default_prompt: "Use $grok:status to show my current Grok jobs."
+policy:
+  allow_implicit_invocation: true

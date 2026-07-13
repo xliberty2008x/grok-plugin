@@ -4,6 +4,7 @@ import path from "node:path";
 import { CompanionError } from "./errors.mjs";
 import { processIsZombie, processStartToken } from "./process-control.mjs";
 import { workspaceState, assertSafeJobId } from "./workspace.mjs";
+import { sameHostSession } from "./host.mjs";
 
 const ACTIVE = new Set(["queued", "running"]);
 const LOCK_OWNER_START_TOKEN = processStartToken(process.pid);
@@ -91,10 +92,14 @@ export function retain(root, limit = 50) {
   for (const job of removable) for (const file of [jobFile(root, job.id), logFile(root, job.id), cancelFile(root, job.id)]) try { fs.unlinkSync(file); } catch (e) { if (e.code !== "ENOENT") throw e; }
 }
 
-export function selectJob(root, { id, claudeSessionId, active, finished, allSessions = false } = {}) {
+export function selectJob(root, { id, host, claudeSessionId, active, finished, allSessions = false } = {}) {
   if (id) return readJob(root, id);
-  const match = listJobs(root).filter((job) => (allSessions || !claudeSessionId || job.claudeSessionId === claudeSessionId) && (!active || ACTIVE.has(job.status)) && (!finished || terminal(job)));
-  if (!match.length) throw new CompanionError("E_JOB_NOT_FOUND", "No matching Grok job was found in this Claude session.");
+  const selectedHost = host || (claudeSessionId ? { kind: "claude-code", sessionId: claudeSessionId } : null);
+  if (!allSessions && !selectedHost?.sessionId) {
+    throw new CompanionError("E_JOB_NOT_FOUND", "Current host session identity is unavailable; provide an explicit job ID instead of using implicit selection.");
+  }
+  const match = listJobs(root).filter((job) => (allSessions || sameHostSession(job, selectedHost)) && (!active || ACTIVE.has(job.status)) && (!finished || terminal(job)));
+  if (!match.length) throw new CompanionError("E_JOB_NOT_FOUND", "No matching Grok job was found in this host session.");
   return match[0];
 }
 

@@ -2,7 +2,6 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
@@ -17,19 +16,21 @@ import { workspaceRoot, workspaceState } from "./lib/workspace.mjs";
 import { redact, redactText } from "./lib/redact.mjs";
 import { hasGrokAncestor, identityMatches, processGroupAlive, processIsZombie } from "./lib/process-control.mjs";
 import { hasForeignActiveProvider, registerProviderGuard, unregisterProviderGuard } from "./lib/recursion-guard.mjs";
+import { hostCommand, hostContext, pluginDataRoot, readCodexSessionMetadata, sameHostSession } from "./lib/host.mjs";
+import { codexTranscriptToClaude, createAnonymousTranscript, disposeConvertedTranscript, openTranscriptSource, readTranscriptSnapshot } from "./lib/transcript.mjs";
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = path.resolve(path.dirname(SCRIPT), "..");
-const SESSION_ENV = "GROK_COMPANION_CLAUDE_SESSION_ID";
 const VALID_EFFORTS = new Set(["low", "medium", "high"]);
 
 function usage() {
-  return ["Usage:", "  grok-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]", "  grok-companion.mjs review|adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]", "  grok-companion.mjs task [--wait|--background] [--write] [--resume|--fresh] [--model <id>] [--effort low|medium|high] <task>", "  grok-companion.mjs transfer [--source <claude-jsonl>] [--json]", "  grok-companion.mjs status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--json]", "  grok-companion.mjs result [job-id] [--json]", "  grok-companion.mjs cancel [job-id] [--json]"].join("\n");
+  return ["Usage:", "  grok-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]", "  grok-companion.mjs review|adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]", "  grok-companion.mjs task [--wait|--background] [--write] [--resume|--fresh] [--model <id>] [--effort low|medium|high] <task>", "  grok-companion.mjs transfer [--source <claude-or-codex-jsonl>] [--json]", "  grok-companion.mjs status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--json]", "  grok-companion.mjs result [job-id] [--json]", "  grok-companion.mjs cancel [job-id] [--json]"].join("\n");
 }
 
 function argvFrom(raw) { return raw.length === 1 && /\s/.test(raw[0]) ? splitArgs(raw[0]) : raw; }
 function out(value, json = false) { process.stdout.write(`${json ? JSON.stringify(value, null, 2) : value}\n`); }
-function sessionId() { return process.env[SESSION_ENV] || null; }
+function currentHost() { return hostContext(); }
+function sessionId() { return currentHost().sessionId; }
 function stateDir(root) { return workspaceState(root); }
 function loadTemplate(name, values) {
   const text = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", `${name}.md`), "utf8");
@@ -42,7 +43,11 @@ function workerEnvironment(nonce) {
   const env = {};
   const allowed = new Set(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "COLORTERM", "NO_COLOR", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "SystemRoot", "ComSpec", "PATHEXT"]);
   for (const [key, value] of Object.entries(process.env)) if ((allowed.has(key) || key.startsWith("LC_")) && value != null) env[key] = value;
-  for (const key of ["CLAUDE_PLUGIN_DATA", SESSION_ENV, "GROK_BIN"]) if (process.env[key]) env[key] = process.env[key];
+  const host = currentHost();
+  env.GROK_COMPANION_HOST = host.kind;
+  if (host.sessionId) env.GROK_COMPANION_HOST_SESSION_ID = host.sessionId;
+  env.GROK_COMPANION_PLUGIN_DATA = pluginDataRoot();
+  if (process.env.GROK_BIN) env.GROK_BIN = process.env.GROK_BIN;
   env.GROK_COMPANION_WORKER_NONCE = nonce;
   return env;
 }
@@ -72,6 +77,9 @@ async function recoverActiveJobs(root) {
     if (!cleanupError) try { unregisterProviderGuard(root, job.id); } catch {}
     const cleanup = !cleanupError && job.jobClass === "review" ? cleanupReviewEnvironment(stateDir(root), job.id) : null;
     updateJob(root, job.id, (current) => {
+      // The worker can finish between the liveness check above and this locked
+      // update. Never turn that freshly completed record into E_WORKER_LOST.
+      if (terminal(current)) return current;
       const prompt = current.request?.prompt;
       if (typeof prompt === "string") current.request = { ...current.request, prompt: null, promptDigest: crypto.createHash("sha256").update(prompt).digest("hex") };
       current.status = "failed";
@@ -109,7 +117,7 @@ async function terminateVerified(identity, marker, kind) {
 
 function baseRecord({ id, kind, root, profile, title, request, write, model, effort }) {
   const timestamp = now();
-  return { schemaVersion: 1, id, kind, jobClass: kind.includes("review") ? "review" : "task", title, summary: "Queued", write, status: "queued", phase: "queued", workspaceRoot: root, claudeSessionId: sessionId(), grokSessionId: null, createdAt: timestamp, startedAt: null, updatedAt: timestamp, completedAt: null, workerProcess: null, providerProcess: null, profile, model: model || null, effort: effort || null, logFile: logFile(root, id), progress: null, request, result: null, error: null };
+  return { schemaVersion: 2, id, kind, jobClass: kind.includes("review") ? "review" : "task", title, summary: "Queued", write, status: "queued", phase: "queued", workspaceRoot: root, host: currentHost(), grokSessionId: null, createdAt: timestamp, startedAt: null, updatedAt: timestamp, completedAt: null, workerProcess: null, providerProcess: null, profile, model: model || null, effort: effort || null, logFile: logFile(root, id), progress: null, request, result: null, error: null };
 }
 
 function renderReview(job) {
@@ -123,7 +131,7 @@ function renderReview(job) {
 
 function renderJob(job) {
   const lines = [`Job: ${job.id}`, `Kind: ${job.kind}`, `Status: ${job.status}`, `Phase: ${job.phase}`, `Summary: ${job.summary || "-"}`];
-  if (job.grokSessionId) lines.push(`Grok session: ${job.grokSessionId}`, "Resume through Claude: /grok:rescue --resume <next task>");
+  if (job.grokSessionId) lines.push(`Grok session: ${job.grokSessionId}`, `Resume through this host: ${hostCommand("rescue", "--resume <next task>")}`);
   if (job.result?.text) lines.push("", job.result.text);
   if (job.error) lines.push("", `${job.error.code}: ${job.error.message}`);
   return lines.join("\n");
@@ -213,19 +221,19 @@ async function handleSetup(raw) {
   try { runtime = await probe(root, stateDir(root)); } catch (error) { runtime = { ready: false, error: asErrorPayload(error) }; }
   if (options["enable-review-gate"] && !runtime.error) setConfig(root, { stopReviewGate: true });
   const nextSteps = !runtime.error
-    ? ["Run `/grok:review --wait` or `/grok:rescue <task>`."]
+    ? [`Run ${hostCommand("review", "--wait")} or ${hostCommand("rescue", "<task>")}.`]
     : runtime.error.code === "E_GROK_NOT_FOUND"
       ? ["Install with `npm install -g @xai-official/grok`, then retry."]
       : runtime.error.code === "E_AUTH_REQUIRED"
         ? ["Authenticate with `grok login`, then retry."]
         : ["Update to a compatible Grok CLI and review the reported capability or platform limitation before retrying."];
-  const result = { ready: !runtime.error, grok: runtime, config: config(root), disclosure: "Grok/xAI may process task prompts, selected repository content, command output, and imported Claude transcript context. ACP task sessions and a sanitized cached access credential remain in isolated read/write homes under this workspace's private plugin state; imported sessions remain under ~/.grok/sessions. Each headless review uses a private per-job home and removes it on completion or verified crash recovery.", nextSteps };
+  const result = { ready: !runtime.error, grok: runtime, config: config(root), disclosure: "Grok/xAI may process task prompts, selected repository content, command output, and imported Claude Code or privacy-filtered Codex transcript context. ACP task sessions and a sanitized cached access credential remain in isolated read/write homes under this workspace's private plugin state; imported sessions remain under ~/.grok/sessions. Each headless review uses a private per-job home and removes it on completion or verified crash recovery.", nextSteps };
   out(options.json ? result : [`Grok Companion: ${result.ready ? "ready" : "not ready"}`, result.disclosure, ...(result.grok.version ? [`Grok ${result.grok.version}; ACP v${result.grok.protocolVersion}`, `Models: ${result.grok.models.map((x) => x.id).join(", ")}`] : [result.grok.error?.message]), `Stop gate: ${result.config.stopReviewGate ? "enabled" : "disabled"}`, ...result.nextSteps].join("\n"), options.json);
 }
 
 async function handleReview(command, raw) {
   const { options, positionals } = parseArgs(argvFrom(raw), { values: ["base", "scope", "cwd"], booleans: ["wait", "background", "json"] });
-  if (command === "review" && positionals.length) throw new CompanionError("E_USAGE", "Use /grok:adversarial-review for custom focus text.");
+  if (command === "review" && positionals.length) throw new CompanionError("E_USAGE", `Use ${hostCommand("adversarial-review")} for custom focus text.`);
   if (options.wait && options.background) throw new CompanionError("E_USAGE", "Choose --wait or --background.");
   const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd());
   const target = resolveTarget(root, { scope: options.scope || "auto", base: options.base || null });
@@ -240,11 +248,13 @@ async function handleReview(command, raw) {
     return;
   }
   const finished = await startJob(root, job, Boolean(options.background));
-  out(options.json ? finished : options.background ? `Grok ${kind} started in the background.\nJob: ${id}\nCheck: /grok:status ${id}` : renderReview(finished), options.json);
+  out(options.json ? finished : options.background ? `Grok ${kind} started in the background.\nJob: ${id}\nCheck: ${hostCommand("status", id)}` : renderReview(finished), options.json);
 }
 
 function resumeCandidate(root, profile) {
-  return listJobs(root).find((job) => job.kind === "task" && job.status === "completed" && job.grokSessionId && job.claudeSessionId === sessionId() && sameSecurityProfile(job.profile, profile));
+  const host = currentHost();
+  if (!host.sessionId) return null;
+  return listJobs(root).find((job) => job.kind === "task" && job.status === "completed" && job.grokSessionId && sameHostSession(job, host) && sameSecurityProfile(job.profile, profile));
 }
 
 async function handleTask(raw) {
@@ -256,11 +266,11 @@ async function handleTask(raw) {
   const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd());
   const profile = profileFor("task", Boolean(options.write));
   const candidate = options.resume ? resumeCandidate(root, profile) : null;
-  if (options.resume && !candidate) throw new CompanionError("E_NO_RESUME_CANDIDATE", "No resumable Grok task with the same security profile exists in this Claude session.");
-  const prompt = `${promptText}\n\nGrok Companion constraints: do not invoke /grok:* or grok-rescue; do not spawn subagents or use web tools; stay within ${root}; report exactly what you changed and tested.`;
+  if (options.resume && !candidate) throw new CompanionError("E_NO_RESUME_CANDIDATE", "No resumable Grok task with the same security profile exists in this host session.");
+  const prompt = `${promptText}\n\nGrok Companion constraints: do not invoke Grok Companion recursively; do not spawn subagents or use web tools; stay within ${root}; report exactly what you changed and tested.`;
   const id = generateId("task"), job = baseRecord({ id, kind: "task", root, profile, title: promptText.slice(0, 100), request: { prompt, resumeSessionId: candidate?.grokSessionId || null }, write: Boolean(options.write), model: options.model, effort: options.effort });
   const finished = await startJob(root, job, Boolean(options.background));
-  out(options.json ? finished : options.background ? `Grok task started in the background.\nJob: ${id}\nCheck: /grok:status ${id}` : renderJob(finished), options.json);
+  out(options.json ? finished : options.background ? `Grok task started in the background.\nJob: ${id}\nCheck: ${hostCommand("status", id)}` : renderJob(finished), options.json);
 }
 
 async function handleStatus(raw) {
@@ -273,18 +283,25 @@ async function handleStatus(raw) {
     const timeout = Math.min(requested, 900000), start = Date.now();
     while (!terminal(readJob(root, positionals[0])) && Date.now() - start < timeout) { await new Promise((r) => setTimeout(r, 250)); await recoverActiveJobs(root); }
   }
-  const value = positionals[0] ? readJob(root, positionals[0]) : listJobs(root).filter((job) => options.all || !sessionId() || job.claudeSessionId === sessionId());
+  const host = currentHost();
+  let value;
+  if (positionals[0]) value = readJob(root, positionals[0]);
+  else if (options.all) value = listJobs(root);
+  else {
+    if (!host.sessionId) throw new CompanionError("E_JOB_NOT_FOUND", "Current host session identity is unavailable; provide an explicit job ID or pass --all.");
+    value = listJobs(root).filter((job) => sameHostSession(job, host));
+  }
   if (options.json) out(value, true); else if (Array.isArray(value)) out(["| Job | Kind | Status | Phase | Summary |", "|---|---|---|---|---|", ...value.map((j) => `| ${j.id} | ${j.kind} | ${j.status} | ${j.phase} | ${(j.summary || "").replace(/\|/g, "\\|")} |`)].join("\n")); else out(renderJob(value));
 }
 
 async function handleResult(raw) {
-  const { options, positionals } = parseArgs(argvFrom(raw), { values: ["cwd"], booleans: ["json"] }); const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd()); await recoverActiveJobs(root); const job = selectJob(root, { id: positionals[0], claudeSessionId: sessionId(), finished: !positionals[0] });
-  if (!terminal(job)) throw new CompanionError("E_JOB_ACTIVE", `Job ${job.id} is still ${job.status}; run /grok:status ${job.id} --wait.`);
+  const { options, positionals } = parseArgs(argvFrom(raw), { values: ["cwd"], booleans: ["json"] }); const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd()); await recoverActiveJobs(root); const job = selectJob(root, { id: positionals[0], host: currentHost(), finished: !positionals[0] });
+  if (!terminal(job)) throw new CompanionError("E_JOB_ACTIVE", `Job ${job.id} is still ${job.status}; run ${hostCommand("status", `${job.id} --wait`)}.`);
   out(options.json ? job : job.jobClass === "review" ? renderReview(job) : renderJob(job), options.json);
 }
 
 async function handleCancel(raw) {
-  const { options, positionals } = parseArgs(argvFrom(raw), { values: ["cwd"], booleans: ["json"] }); const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd()); await recoverActiveJobs(root); const job = selectJob(root, { id: positionals[0], claudeSessionId: sessionId(), active: !positionals[0] });
+  const { options, positionals } = parseArgs(argvFrom(raw), { values: ["cwd"], booleans: ["json"] }); const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd()); await recoverActiveJobs(root); const job = selectJob(root, { id: positionals[0], host: currentHost(), active: !positionals[0] });
   if (!terminal(job)) requestCancel(root, job.id, job.workerProcess?.nonce || "");
   const deadline = Date.now() + 10000; let current = readJob(root, job.id); while (!terminal(current) && Date.now() < deadline) { await new Promise((r) => setTimeout(r, 200)); current = readJob(root, job.id); }
   if (!terminal(current)) {
@@ -299,25 +316,6 @@ async function handleCancel(raw) {
     });
   }
   out(options.json ? current : `Cancellation requested.\n${renderJob(current)}`, options.json);
-}
-
-function validateTranscript(source) {
-  let fd = null;
-  try {
-    const projects = fs.realpathSync(path.join(process.env.HOME || os.homedir(), ".claude", "projects"));
-    if (fs.lstatSync(source).isSymbolicLink()) throw new CompanionError("E_IMPORT_SOURCE", "Transcript symlinks are not accepted.");
-    const real = fs.realpathSync(source);
-    if (path.extname(real) !== ".jsonl" || !(real === projects || real.startsWith(`${projects}${path.sep}`))) throw new CompanionError("E_IMPORT_SOURCE", "Transcript must be a regular .jsonl file of at most 100 MiB beneath ~/.claude/projects.");
-    fd = fs.openSync(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    const stat = fs.fstatSync(fd);
-    const current = fs.statSync(real);
-    if (!stat.isFile() || !current.isFile() || stat.dev !== current.dev || stat.ino !== current.ino || stat.size > 100 * 1024 * 1024) throw new CompanionError("E_IMPORT_SOURCE", "Transcript changed while it was being opened or is not a regular .jsonl file of at most 100 MiB beneath ~/.claude/projects.");
-    return { real, fd };
-  } catch (error) {
-    if (fd != null) try { fs.closeSync(fd); } catch {}
-    if (error instanceof CompanionError) throw error;
-    throw new CompanionError("E_IMPORT_SOURCE", "Transcript must be a real .jsonl file beneath ~/.claude/projects.");
-  }
 }
 
 function importedSessionId(output) {
@@ -398,17 +396,30 @@ async function runImportProcess({ binary, root, transcriptFd, alias, leaderSocke
 async function handleTransfer(raw) {
   const { options } = parseArgs(argvFrom(raw), { values: ["source", "cwd", "model", "effort"], booleans: ["json"] });
   validateModelEffort(options);
-  const source = options.source || process.env.GROK_COMPANION_TRANSCRIPT_PATH; if (!source) throw new CompanionError("E_IMPORT_SOURCE", "No Claude transcript path is available; pass --source <file.jsonl>.");
-  const { real, fd } = validateTranscript(source);
-  let importAlias = null, run;
+  const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd(), false);
+  const host = currentHost();
+  const metadata = host.kind === "codex" ? readCodexSessionMetadata(pluginDataRoot(), host.sessionId) : null;
+  const source = options.source || process.env.GROK_COMPANION_TRANSCRIPT_PATH || metadata?.transcriptPath;
+  if (!source) {
+    const guidance = host.kind === "codex" ? "Review and trust the plugin SessionStart hook with /hooks, start a new task, or pass --source <file.jsonl>." : "Pass --source <file.jsonl>.";
+    throw new CompanionError("E_IMPORT_SOURCE", `No host transcript path is available. ${guidance}`);
+  }
+  const opened = openTranscriptSource(source);
+  let importAlias = null, run, importFd = opened.fd, convertedFile = null;
   const controller = new AbortController();
   const abort = () => controller.abort();
   process.once("SIGINT", abort);
   process.once("SIGTERM", abort);
   try {
     const binary = discoverGrok(); grokVersion(binary);
-    const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd(), false), importDir = path.join(stateDir(root), "imports");
+    const importDir = path.join(stateDir(root), "imports");
     fs.mkdirSync(importDir, { recursive: true, mode: 0o700 });
+    if (opened.format === "codex") {
+      const converted = codexTranscriptToClaude(readTranscriptSnapshot(opened), { cwd: root });
+      const anonymous = createAnonymousTranscript(converted, importDir);
+      importFd = anonymous.fd;
+      convertedFile = anonymous.file;
+    }
     importAlias = path.join(importDir, `import-${crypto.randomBytes(12).toString("hex")}.jsonl`);
     const runtime = await probe(root, stateDir(root));
     const selected = options.model ? runtime.models.find((item) => item.id === options.model) : runtime.models[0];
@@ -418,20 +429,27 @@ async function handleTransfer(raw) {
     fs.symlinkSync(inheritedFd, importAlias);
     const marker = `transfer-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
     const leaderSocket = path.join(stateDir(root), `leader-${marker}.sock`);
-    run = await runImportProcess({ binary, root, transcriptFd: fd, alias: importAlias, leaderSocket, marker, signal: controller.signal });
+    run = await runImportProcess({ binary, root, transcriptFd: importFd, alias: importAlias, leaderSocket, marker, signal: controller.signal });
     run.selectedModel = selected.id;
   } finally {
+    const cleanupWarnings = [];
     process.removeListener("SIGINT", abort);
     process.removeListener("SIGTERM", abort);
-    fs.closeSync(fd);
-    if (importAlias) try { fs.unlinkSync(importAlias); } catch (error) { if (error.code !== "ENOENT") throw error; }
+    if (importFd !== opened.fd) {
+      const cleanup = disposeConvertedTranscript({ fd: importFd, file: convertedFile });
+      if (!cleanup.ok) cleanupWarnings.push(cleanup.warning);
+    }
+    try { fs.closeSync(opened.fd); } catch (error) { cleanupWarnings.push(error.message); }
+    if (importAlias) try { fs.unlinkSync(importAlias); } catch (error) { if (error.code !== "ENOENT") cleanupWarnings.push(error.message); }
+    if (cleanupWarnings.length) throw new CompanionError("E_STATE", "Could not completely remove the private transcript transfer artifacts.", { warning: cleanupWarnings.join("; ") });
   }
-  if (run.status !== 0) throw new CompanionError("E_IMPORT_RESULT", "Grok could not import the Claude transcript.", { diagnostic: redactText(run.stderr || run.stdout) });
+  if (run.status !== 0) throw new CompanionError("E_IMPORT_RESULT", `Grok could not import the ${opened.format === "codex" ? "Codex" : "Claude Code"} transcript.`, { diagnostic: redactText(run.stderr || run.stdout) });
   const id = importedSessionId(run.stdout); if (!id) throw new CompanionError("E_IMPORT_RESULT", "Grok import succeeded but returned no usable session ID.");
   const resumeParts = ["grok", "--model", run.selectedModel];
   if (options.effort) resumeParts.push("--reasoning-effort", options.effort);
   resumeParts.push("--resume", id);
-  const result = { sessionId: id, source: real, model: run.selectedModel, effort: options.effort || null, resume: resumeParts.map(shellWord).join(" ") }; out(options.json ? result : `Imported Claude transcript into Grok session ${id}.\nResume: ${result.resume}`, options.json);
+  const label = opened.format === "codex" ? "Codex" : "Claude Code";
+  const result = { sessionId: id, source: opened.real, sourceFormat: opened.format, model: run.selectedModel, effort: options.effort || null, resume: resumeParts.map(shellWord).join(" ") }; out(options.json ? result : `Imported ${label} transcript into Grok session ${id}.\nResume: ${result.resume}`, options.json);
 }
 
 async function main() {

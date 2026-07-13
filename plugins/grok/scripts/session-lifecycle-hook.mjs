@@ -8,6 +8,7 @@ import { workspaceRoot, workspaceState } from "./lib/workspace.mjs";
 import { cleanupReviewEnvironment } from "./lib/grok-provider.mjs";
 import { hasGrokAncestor, identityMatches, processGroupAlive, processIsZombie, processStartToken } from "./lib/process-control.mjs";
 import { hasForeignActiveProvider, unregisterProviderGuard } from "./lib/recursion-guard.mjs";
+import { pluginDataRoot, sameHostSession, writeCodexSessionMetadata } from "./lib/host.mjs";
 
 if (process.env.GROK_COMPANION_CHILD === "1" || process.env.GROK_COMPANION_JOB_MARKER || process.env.GROK_AGENT || process.env.GROK_LEADER_SOCKET || hasGrokAncestor()) process.exit(0);
 
@@ -49,29 +50,43 @@ async function terminateOwned(identity, marker, kind, ownershipEstablished) {
 
 const event = await readInput();
 const phase = process.argv[2] || event.hook_event_name;
-const claudeSessionId = event.session_id || event.sessionId || process.env.GROK_COMPANION_CLAUDE_SESSION_ID || null;
+const hostSessionId = event.session_id || event.sessionId || process.env.GROK_COMPANION_HOST_SESSION_ID || process.env.GROK_COMPANION_CLAUDE_SESSION_ID || null;
 const transcript = event.transcript_path || event.transcriptPath || null;
 const cwd = event.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
 try {
   const guardRoot = workspaceRoot(path.resolve(cwd), false);
-  if (!claudeSessionId && hasForeignActiveProvider(guardRoot, null)) process.exit(0);
+  if (!hostSessionId && hasForeignActiveProvider(guardRoot, null)) process.exit(0);
 } catch {}
 
 if (phase === "SessionStart") {
   const envFile = process.env.CLAUDE_ENV_FILE;
-  if (!envFile) process.exit(0);
-  const lines = [];
-  if (claudeSessionId) lines.push(`export GROK_COMPANION_CLAUDE_SESSION_ID=${shellQuote(claudeSessionId)}`);
-  if (transcript) lines.push(`export GROK_COMPANION_TRANSCRIPT_PATH=${shellQuote(transcript)}`);
-  if (process.env.CLAUDE_PLUGIN_DATA) lines.push(`export CLAUDE_PLUGIN_DATA=${shellQuote(process.env.CLAUDE_PLUGIN_DATA)}`);
-  if (lines.length) fs.appendFileSync(envFile, `${lines.join("\n")}\n`, { mode: 0o600 });
+  if (envFile) {
+    const lines = ["export GROK_COMPANION_HOST='claude-code'"];
+    if (hostSessionId) {
+      lines.push(`export GROK_COMPANION_HOST_SESSION_ID=${shellQuote(hostSessionId)}`);
+      lines.push(`export GROK_COMPANION_CLAUDE_SESSION_ID=${shellQuote(hostSessionId)}`);
+    }
+    if (transcript) lines.push(`export GROK_COMPANION_TRANSCRIPT_PATH=${shellQuote(transcript)}`);
+    if (process.env.CLAUDE_PLUGIN_DATA) {
+      lines.push(`export GROK_COMPANION_PLUGIN_DATA=${shellQuote(process.env.CLAUDE_PLUGIN_DATA)}`);
+      lines.push(`export CLAUDE_PLUGIN_DATA=${shellQuote(process.env.CLAUDE_PLUGIN_DATA)}`);
+    }
+    fs.appendFileSync(envFile, `${lines.join("\n")}\n`, { mode: 0o600 });
+  } else if (process.env.PLUGIN_DATA && hostSessionId && transcript) {
+    try {
+      writeCodexSessionMetadata(pluginDataRoot(), { sessionId: hostSessionId, transcriptPath: transcript, cwd });
+    } catch {
+      process.stderr.write("Grok Companion could not persist Codex SessionStart metadata; check plugin data permissions and retry in a new task.\n");
+      process.exit(1);
+    }
+  }
   process.exit(0);
 }
 
-if (phase === "SessionEnd" && claudeSessionId) {
+if (phase === "SessionEnd" && hostSessionId) {
   let root;
   try { root = workspaceRoot(path.resolve(cwd)); } catch { process.exit(0); }
-  const owned = listJobs(root).filter((job) => job.claudeSessionId === claudeSessionId);
+  const owned = listJobs(root).filter((job) => sameHostSession(job, { kind: "claude-code", sessionId: hostSessionId }));
   const verified = new Map();
   for (const job of owned) for (const kind of ["provider", "worker"]) {
     const identity = job[`${kind}Process`];

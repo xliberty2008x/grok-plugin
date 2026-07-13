@@ -1,16 +1,20 @@
 {
   "name": "grok-companion",
-  "owner": { "name": "grok-plugin community maintainers" },
+  "owner": {
+    "name": "grok-plugin community maintainers"
+  },
   "metadata": {
     "description": "Use the official Grok Build CLI as a companion agent from Claude Code.",
-    "version": "0.1.0"
+    "version": "0.2.0"
   },
   "plugins": [
     {
       "name": "grok",
       "description": "Delegate tasks and read-only reviews to the official Grok Build CLI.",
-      "version": "0.1.0",
-      "author": { "name": "grok-plugin community maintainers" },
+      "version": "0.2.0",
+      "author": {
+        "name": "grok-plugin community maintainers"
+      },
       "source": "./plugins/grok"
     }
   ]

@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const COMPANION = path.join(ROOT, "plugins", "grok", "scripts", "grok-companion.mjs");
+export const CODEX_COMPANION = path.join(ROOT, "plugins", "grok", "scripts", "grok-codex.mjs");
 
 export function tempDir(prefix = "grok-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -46,6 +47,8 @@ export function testEnvironment({ fake, pluginData = tempDir("grok-plugin-data-"
     GROK_BIN: fake.binary,
     GROK_AUTH_PATH: fake.authPath,
     CLAUDE_PLUGIN_DATA: pluginData,
+    GROK_COMPANION_HOST: "claude-code",
+    GROK_COMPANION_HOST_SESSION_ID: sessionId,
     GROK_COMPANION_CLAUDE_SESSION_ID: sessionId,
     ...extra
   };
@@ -53,6 +56,10 @@ export function testEnvironment({ fake, pluginData = tempDir("grok-plugin-data-"
 
 export function runCompanion(args, { cwd, env, timeout = 20000 } = {}) {
   return run(process.execPath, [COMPANION, ...args], { cwd, env, timeout });
+}
+
+export function runCodexCompanion(args, { cwd, env, timeout = 20000 } = {}) {
+  return run(process.execPath, [CODEX_COMPANION, ...args], { cwd, env, timeout });
 }
 
 export async function waitFor(predicate, { timeoutMs = 10000, intervalMs = 50 } = {}) {

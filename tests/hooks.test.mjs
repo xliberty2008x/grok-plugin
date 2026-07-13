@@ -17,6 +17,7 @@ import {
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import { identityMatches, processGroupAlive, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
 import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
+import { readCodexSessionMetadata } from "../plugins/grok/scripts/lib/host.mjs";
 import { COMPANION, ROOT, initRepo, run, tempDir, testEnvironment, waitFor } from "./helpers.mjs";
 
 const SESSION_HOOK = path.join(ROOT, "plugins", "grok", "scripts", "session-lifecycle-hook.mjs");
@@ -106,19 +107,73 @@ test("SessionStart exports shell-safe session, transcript, and plugin-data value
   assert.equal(
     source,
     [
+      "export GROK_COMPANION_HOST='claude-code'",
+      `export GROK_COMPANION_HOST_SESSION_ID='session'"'"'quoted'`,
       `export GROK_COMPANION_CLAUDE_SESSION_ID='session'"'"'quoted'`,
       `export GROK_COMPANION_TRANSCRIPT_PATH='/tmp/transcript'"'"'s file.jsonl'`,
+      `export GROK_COMPANION_PLUGIN_DATA='${pluginData.replace(/'/g, `'"'"'`)}'`,
       `export CLAUDE_PLUGIN_DATA='${pluginData.replace(/'/g, `'"'"'`)}'`,
       ""
     ].join("\n")
   );
 
-  const evaluated = run("/bin/sh", ["-c", `. ${JSON.stringify(envFile)}; printf '%s\\n%s\\n%s' "$GROK_COMPANION_CLAUDE_SESSION_ID" "$GROK_COMPANION_TRANSCRIPT_PATH" "$CLAUDE_PLUGIN_DATA"`]);
+  const evaluated = run("/bin/sh", ["-c", `. ${JSON.stringify(envFile)}; printf '%s\\n%s\\n%s\\n%s\\n%s' "$GROK_COMPANION_HOST" "$GROK_COMPANION_HOST_SESSION_ID" "$GROK_COMPANION_CLAUDE_SESSION_ID" "$GROK_COMPANION_TRANSCRIPT_PATH" "$GROK_COMPANION_PLUGIN_DATA"`]);
   assert.equal(evaluated.status, 0, evaluated.stderr);
   assert.equal(
     evaluated.stdout,
-    `session'quoted\n/tmp/transcript's file.jsonl\n${pluginData}`
+    `claude-code\nsession'quoted\nsession'quoted\n/tmp/transcript's file.jsonl\n${pluginData}`
   );
+});
+
+test("Codex SessionStart persists thread and transcript metadata without CLAUDE_ENV_FILE", () => {
+  const root = fs.realpathSync(initRepo());
+  const pluginData = tempDir("grok-codex-hook-data-");
+  const transcript = path.join(tempDir("grok-codex-transcript-"), "rollout.jsonl");
+  fs.writeFileSync(transcript, "{}\n", "utf8");
+  const env = { ...process.env, PLUGIN_DATA: pluginData, CLAUDE_PLUGIN_DATA: pluginData };
+  delete env.CLAUDE_ENV_FILE;
+  const result = hook(
+    SESSION_HOOK,
+    "SessionStart",
+    { cwd: root, session_id: "codex-thread-a", transcript_path: transcript, source: "startup" },
+    { cwd: root, env }
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "");
+  assert.deepEqual(readCodexSessionMetadata(pluginData, "codex-thread-a"), {
+    schemaVersion: 1,
+    host: "codex",
+    sessionId: "codex-thread-a",
+    transcriptPath: transcript,
+    cwd: root,
+    updatedAt: readCodexSessionMetadata(pluginData, "codex-thread-a").updatedAt
+  });
+});
+
+test("Codex SessionStart reports metadata persistence failures without exposing host details", () => {
+  const root = fs.realpathSync(initRepo());
+  const directory = tempDir("grok-codex-hook-error-");
+  const invalidPluginData = path.join(directory, "not-a-directory");
+  fs.writeFileSync(invalidPluginData, "sentinel\n", { mode: 0o600 });
+  const transcript = path.join(directory, "private-rollout.jsonl");
+  const sessionId = "private-codex-thread";
+  fs.writeFileSync(transcript, "{}\n", { mode: 0o600 });
+  const env = { ...process.env, PLUGIN_DATA: invalidPluginData };
+  delete env.CLAUDE_ENV_FILE;
+
+  const result = hook(
+    SESSION_HOOK,
+    "SessionStart",
+    { cwd: root, session_id: sessionId, transcript_path: transcript, source: "startup" },
+    { cwd: root, env }
+  );
+
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /could not persist Codex SessionStart metadata/i);
+  assert.doesNotMatch(result.stderr, new RegExp(sessionId));
+  assert.doesNotMatch(result.stderr, new RegExp(path.basename(transcript)));
+  assert.doesNotMatch(result.stderr, new RegExp(path.basename(invalidPluginData)));
 });
 
 test("lifecycle and stop hooks are no-ops inside a Grok child", () => {
@@ -144,12 +199,17 @@ test("SessionEnd requests cancellation and removes only jobs owned by the ending
   const root = fs.realpathSync(initRepo());
   const pluginData = tempDir("grok-hook-data-");
   const ownedFinished = generateId("task");
+  const ownedModernFinished = generateId("task");
   const ownedActive = generateId("task");
   const foreignFinished = generateId("task");
   const foreignActive = generateId("task");
 
   withPluginData(pluginData, () => {
     writeJob(root, record(ownedFinished, "session-a"));
+    writeJob(root, record(ownedModernFinished, undefined, "completed", {
+      schemaVersion: 2,
+      host: { kind: "claude-code", sessionId: "session-a" }
+    }));
     writeJob(root, record(ownedActive, "session-a", "running", {
       workerProcess: { nonce: "owned-worker-nonce" }
     }));
@@ -286,12 +346,16 @@ test("enabled stop gate emits Claude block JSON for BLOCK output", () => {
   assert.equal(log.some((entry) => entry.event === "rpc"), false);
 });
 
-test("a crashed stop hook is recovered without retaining its provider or isolated home", async (t) => {
+test("a crashed stop hook honors explicit host context and is recovered without retaining its provider or isolated home", async (t) => {
   const root = fs.realpathSync(initRepo());
   const fake = installFakeGrok(tempDir("fake-grok-stop-crash-"), { taskText: "ALLOW: complete", headlessDelayMs: 60_000 });
   const pluginData = tempDir("grok-hook-data-");
   withPluginData(pluginData, () => setConfig(root, { stopReviewGate: true }));
-  const env = testEnvironment({ fake, pluginData, sessionId: "stop-crash-session" });
+  const env = {
+    ...testEnvironment({ fake, pluginData, sessionId: "stop-crash-session" }),
+    GROK_COMPANION_HOST: "claude-code",
+    PLUGIN_ROOT: "/codex-style/plugin-root"
+  };
   const running = spawnHook(
     STOP_HOOK,
     null,
@@ -310,6 +374,7 @@ test("a crashed stop hook is recovered without retaining its provider or isolate
     const job = withPluginData(pluginData, () => listJobs(root).find((candidate) => candidate.kind === "stop-review" && candidate.providerProcess?.startToken));
     return job || null;
   });
+  assert.deepEqual(active.host, { kind: "claude-code", sessionId: "stop-crash-session" });
   running.child.kill("SIGKILL");
   const killed = await running.completed;
   assert.equal(killed.signal, "SIGKILL");

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.0
+
+- Added native Codex plugin packaging, a repository marketplace, and eight
+  `$grok:*` workflow skills matching the Claude Code command surface.
+- Added host-aware session ownership, state storage, background workers,
+  recursion guards, resume selection, and Codex-specific follow-up guidance.
+- Added Codex `SessionStart` transcript capture and the supported `Stop` review
+  gate while making Claude explicitly load the shared hook file and its
+  Claude Code-only `SessionEnd` cleanup file.
+- Added privacy-filtered Codex transcript transfer. The converter keeps only
+  user-visible user and assistant messages, excludes developer/system context,
+  reasoning and tool traces, and passes the converted stream to `grok import`
+  through a private anonymous descriptor.
+- Added exact-size descriptor snapshots, secure converted-file disposal,
+  fail-closed implicit job selection, visible non-secret SessionStart failures,
+  cross-host skill discovery policy, and verdict/finding consistency checks.
+- Codex has no documented `SessionEnd` event, so its background jobs remain
+  recoverable until completion, explicit cancellation, or stale-worker cleanup.
+
 ## 0.1.0
 
 - Implemented community release candidate; hosted cross-platform and publication gates remain open.

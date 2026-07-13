@@ -2,25 +2,26 @@
 
 Status: Implementation and macOS qualification complete; cross-platform CI and release publication pending
 
-Target release: `0.1.0`
+Target release: `0.2.0`
 
 Companion specification: [SPEC.md](SPEC.md)
 
 ## 1. Objective
 
-Harden and qualify `grok-plugin` as a Claude Code marketplace plugin that exposes the official Grok Build CLI as a companion coding agent. The implemented target is user-visible parity with [`openai/codex-plugin-cc` v1.0.6](https://github.com/openai/codex-plugin-cc/tree/db52e28f4d9ded852ab3942cea316258ae4ef346), while using Grok-supported runtime interfaces.
+Harden and qualify `grok-plugin` as a dual-host Claude Code and Codex marketplace plugin that exposes the official Grok Build CLI as a companion coding agent. The implemented target is user-visible parity with [`openai/codex-plugin-cc` v1.0.6](https://github.com/openai/codex-plugin-cc/tree/db52e28f4d9ded852ab3942cea316258ae4ef346), while using Grok-supported runtime interfaces.
 
 Parity means:
 
 - The same eight command families, arguments, foreground/background modes, and output discipline.
 - Equivalent review, adversarial review, rescue, transcript transfer, resume, status, result, cancellation, session cleanup, and stop-gate behavior.
 - Equivalent read-only and write-capable safety boundaries.
-- Equivalent failure transparency: Claude must not silently substitute its own work when Grok fails.
+- Equivalent failure transparency: neither host may silently substitute its own work when Grok fails.
 - Provider internals differ intentionally: reviews use headless Grok, resumable tasks use ACP v1, and transfer uses `grok import --json`.
 
 ## 2. Verified current state
 
 - The repository now contains the marketplace, plugin, runtime, hooks, prompts, schema, tests, validation scripts, provenance, and release documentation.
+- Version 0.2.0 adds a Codex marketplace and manifest, eight `$grok:*` command skills, a Codex wrapper, schema-2 host identity, cross-host job isolation, shared Codex-compatible hooks, and a privacy-filtered Codex rollout converter.
 - The upstream reference is pinned to v1.0.6, commit `db52e28f4d9ded852ab3942cea316258ae4ef346`.
 - The pinned upstream repository passes all 91 tests and its build locally.
 - The runtime enforces Grok Build 0.2.99 as the compatibility floor because the hardened ACP path depends on `--agent-profile`, `agent --no-leader`, and `--leader-socket`.
@@ -35,15 +36,15 @@ Parity means:
 - Grok can discover Claude-compatible plugins, making recursive plugin invocation a release-critical risk.
 - Tool-using jobs require cached authentication created by `grok login`; environment-key-only authentication is unsupported. Cached authentication expiring within 45 minutes is refreshed through the normal CLI before an isolated copy is made, and setup removes its transient copy before returning.
 - SessionEnd verifies complete owned worker/provider process groups before removing records or guards; unverifiable cleanup records `E_PROCESS_IDENTITY` and retains state for inspection.
-- Linux provider execution remains authenticated-provider-unverified. Windows runs provider-neutral tests only; provider execution and process control are unsupported in v0.1 pending trustworthy process ownership and authenticated lifecycle evidence.
+- Linux provider execution remains authenticated-provider-unverified. Windows runs provider-neutral tests only; provider execution and process control are unsupported in v0.2 pending trustworthy process ownership and authenticated lifecycle evidence.
 
-The remaining release work is external qualification and publication: obtain provider-neutral CI results on the declared OS/Node matrix, keep Linux provider-unverified and Windows provider-unsupported, perform a clean-profile marketplace install, and decide whether to tag `v0.1.0`.
+The remaining release work is external qualification and publication: obtain provider-neutral CI results on the declared OS/Node matrix, keep Linux provider-unverified and Windows provider-unsupported, perform a clean-profile marketplace install, and decide whether to tag `v0.2.0`.
 
 ## 3. Planning assumptions
 
 | ID | Assumption |
 |---|---|
-| A1 | Claude Code is the host and the official local Grok Build CLI is the delegated agent. |
+| A1 | Claude Code or Codex is the host and the official local Grok Build CLI is the delegated agent. |
 | A2 | Headless `explore` is the review transport; ACP over `grok agent --no-leader --leader-socket <path> --agent-profile <profile> stdio` is the resumable task transport. |
 | A3 | Transport is profile-fixed before execution; there is no automatic headless/ACP fallback. |
 | A4 | Node.js 18.18 is the intended minimum unless testing forces a higher version. |
@@ -51,8 +52,8 @@ The remaining release work is external qualification and publication: obtain pro
 | A6 | Behavioral and safety parity are required; identical internal architecture is not. |
 | A7 | Users authenticate with a cached `grok login`; environment-key-only authentication is unsupported and the plugin never bundles credentials. |
 | A8 | One Grok process per job, `agent --no-leader`, and a unique `--leader-socket` preserve profile isolation. |
-| A9 | The first release is `0.1.0`. |
-| A10 | Names are repository `grok-plugin`, marketplace `grok-companion`, plugin `grok`, and namespace `/grok:*`. |
+| A9 | The first release is `0.2.0`. |
+| A10 | Names are repository `grok-plugin`, marketplace `grok-companion`, plugin `grok`, Claude namespace `/grok:*`, and Codex skill namespace `$grok:*`. |
 
 If an assumption changes, update both SPEC.md and PLAN.md before implementation continues.
 
@@ -60,7 +61,7 @@ If an assumption changes, update both SPEC.md and PLAN.md before implementation 
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Host packaging | Claude Code marketplace and plugin manifests | Matches the reference host and installation model. |
+| Host packaging | Native Claude Code and Codex marketplace/plugin manifests | Keeps each host's discovery and installation model while sharing one runtime. |
 | Review transport | Headless `explore`, anonymous fd 3 prompt input, JSON/JSON-Schema output | Grok has no documented native review RPC; the immediately unlinked descriptor avoids leaving a named prompt on disk. |
 | Task transport | ACP v1 over `grok agent --no-leader --leader-socket <path> --agent-profile <profile> stdio` | Provides streamed progress and session loading while binding each rescue mode to a checked-in profile and isolated process. |
 | Transport fallback | None | Retrying through another transport could duplicate side effects or weaken a security contract. |
@@ -69,9 +70,9 @@ If an assumption changes, update both SPEC.md and PLAN.md before implementation 
 | Normal review | Versioned plugin-owned prompt and collected Git context | Grok has no documented native review RPC equivalent. |
 | Background lifecycle | Plugin-owned persistent job registry | Provider sessions alone do not provide Claude-scoped status/result/cancel behavior. |
 | Task identity | Contract-version-2 checked-in read/write `toolConfig` profiles, persisted `agentProfileDigest`, separate mode-private homes, and sanitized cached credentials | Makes the exact tool boundary auditable, binds resume to unchanged profile contents, and prevents cross-mode configuration or credential-state reuse. |
-| Transcript transfer | Canonical, post-open device/inode-bound `grok import --json` source read through inherited fd 3 and a short-lived `.jsonl` descriptor alias | Uses Grok's native Claude-session import route without copying the transcript body to a plugin-owned file or accepting a path-swap race. |
-| Direct xAI API | Excluded from v0.1 | It would require rebuilding the Grok Build tool loop, sandbox, and persistence. |
-| Shared broker | Excluded from v0.1 | It adds complexity without removing process-level sandbox boundaries. |
+| Transcript transfer | Claude sources use a canonical post-open-bound descriptor; Codex rollouts are reduced to user-visible user/assistant messages and passed through an immediately unlinked descriptor | Uses Grok's native Claude-session import route without persisting host transcripts or exposing hidden Codex records. |
+| Direct xAI API | Excluded from v0.2 | It would require rebuilding the Grok Build tool loop, sandbox, and persistence. |
+| Shared broker | Excluded from v0.2 | It adds complexity without removing process-level sandbox boundaries. |
 | Upstream incorporation | Copy and adapt selected pinned files into this repository | Keeps this repository's history while preserving Apache provenance explicitly. |
 
 ## 5. Delivery sequence
@@ -174,7 +175,7 @@ Build a disposable harness before porting production runtime code.
 - Make runtime entry points refuse nested companion execution.
 - Make lifecycle hooks no-op in a child.
 - Disable subagents for review and stop-gate profiles.
-- Add an explicit prompt rule against invoking `/grok:*` or `grok-rescue`.
+- Add an explicit prompt rule against invoking `/grok:*`, `$grok:*`, or `grok-rescue`.
 - Demonstrate that a child cannot create a recursive companion job.
 
 ### Headless review tasks
@@ -317,7 +318,7 @@ Using the fake provider and an opt-in real CLI test:
 - Use `0700` directories and `0600` sensitive files where supported.
 - Retain at most 50 jobs without evicting active jobs.
 - Implement `queued`, `running`, `completed`, `failed`, and `cancelled` transitions.
-- Persist workspace, Claude session, Grok session, the complete effective security profile, model, effort, verified process identities, timestamps, result, and stable error.
+- Persist workspace, schema-2 host kind/session, Grok session, the complete effective security profile, model, effort, verified process identities, timestamps, result, and stable error; read legacy schema-1 Claude records compatibly.
 - Convert stale active records to `E_WORKER_LOST` only after provider cleanup is absent or verified; record `E_PROCESS_IDENTITY` and retain the guard/state when a leader is gone with a live group or ownership cannot be verified.
 - Implement current-session implicit lookup and repository-scoped explicit IDs.
 - Detach background workers safely.
@@ -331,7 +332,7 @@ Using the fake provider and an opt-in real CLI test:
 - Foreground and background jobs reach correct terminal states.
 - Concurrent writers do not corrupt or lose jobs.
 - Status, result, wait, and cancel work from a new command process.
-- Implicit lookup never selects another Claude session's job.
+- Implicit lookup never selects another host kind's or another host session's job, and never treats a missing session ID as a match.
 - Crash recovery leaves no phantom running job.
 - Cancellation kills a provider's spawned grandchild.
 - A simulated PID-reuse mismatch produces `E_PROCESS_IDENTITY` and never signals the unrelated process.
@@ -392,7 +393,7 @@ Using the fake provider and an opt-in real CLI test:
 
 ### Lifecycle tasks
 
-- SessionStart exports the Claude session ID, transcript path, and plugin data path.
+- SessionStart exports Claude host/session/transcript/plugin-data variables or records the equivalent Codex metadata without transcript contents.
 - SessionEnd cancels only jobs owned by that Claude session, verifies their worker/provider identities, and terminates complete owned process groups with bounded `SIGTERM`-to-`SIGKILL` escalation.
 - SessionEnd removes guards, records, and artifacts only after every owned group is verified gone, without touching other sessions. Unverifiable ownership or shutdown records `E_PROCESS_IDENTITY` and retains the guard and job state for manual inspection.
 - Hooks no-op when `GROK_COMPANION_CHILD=1`.
@@ -449,7 +450,7 @@ Using the fake provider and an opt-in real CLI test:
 ### Command contract coverage
 
 - Every command and supported flag combination.
-- Human slash-command output and corresponding internal runtime `--json` payloads; `--json` is not a public slash-command flag in v0.1.
+- Human slash-command output and corresponding internal runtime `--json` payloads; `--json` is not a public slash-command flag in v0.2.
 - Exact hook-consumed first lines and exit behavior.
 - Background start, status, wait, result, and cancel.
 - Resume candidate selection and ambiguity.
@@ -486,7 +487,7 @@ Using the fake provider and an opt-in real CLI test:
 
 Real Grok tests MUST NOT run on normal pull requests because they consume credentials and quota.
 
-Before release, run the protected `GROK_E2E=1` headless review, sandbox, cancellation, resume, transfer, recursion, and stop-gate subset on every platform claimed as provider-supported. Commit non-secret result metadata containing OS, Grok version, date, and outcome. macOS 26.5 on arm64 passed all 10 cases with Grok Build 0.2.99 on July 13, 2026. Linux remains provider-unverified, and Windows provider execution/process control remains unsupported in v0.1 until safe process identity and authenticated evidence exist.
+Before release, run the protected `GROK_E2E=1` headless review, sandbox, cancellation, resume, transfer, recursion, and stop-gate subset on every platform claimed as provider-supported. Commit non-secret result metadata containing OS, Grok version, date, and outcome. macOS 26.5 on arm64 passed all 10 cases with Grok Build 0.2.99 on July 13, 2026. Linux remains provider-unverified, and Windows provider execution/process control remains unsupported in v0.2 until safe process identity and authenticated evidence exist.
 
 ### G7 — Release-candidate gate
 
@@ -506,9 +507,9 @@ Before release, run the protected `GROK_E2E=1` headless review, sandbox, cancell
 - Document every command and flag.
 - Add foreground/background, resume, transfer, and cancellation examples.
 - Document state and log locations plus cleanup.
-- Document `CLAUDE_PLUGIN_DATA/state/<workspace>/`, the fallback `~/.claude/plugins/data/grok/state/`, safe workspace/all-plugin state removal, and isolated review homes.
-- Document Grok's independent `~/.grok/sessions` store and the `grok sessions list` / `grok sessions delete <session-id>` cleanup flow for imported sessions; document that rescue sessions live only in the plugin-owned isolated task homes and are continued through `/grok:rescue --resume`.
-- Disclose that prompts, plugin-collected review context, repository content selected by task tools, command output, and imported Claude context may be processed through Grok/xAI services despite the local CLI transport.
+- Document both host data roots, safe workspace/all-plugin state removal, and isolated review homes.
+- Document Grok's independent `~/.grok/sessions` store and the `grok sessions list` / `grok sessions delete <session-id>` cleanup flow for imported sessions; document both host forms of the rescue resume command.
+- Disclose that prompts, plugin-collected review context, repository content selected by task tools, command output, imported Claude context, and filtered user-visible Codex context may be processed through Grok/xAI services despite the local CLI transport.
 - Explain read-only versus write profiles and managed-policy limitations.
 - Document the macOS child-network caveat.
 - Document stable error codes and troubleshooting.
@@ -520,20 +521,34 @@ Before release, run the protected `GROK_E2E=1` headless review, sandbox, cancell
 
 ### Release tasks
 
-- Validate from a clean Claude profile.
-- Install from `xliberty2008x/grok-plugin` and run `/grok:setup`.
+- Validate from clean Claude Code and Codex profiles.
+- Install from `xliberty2008x/grok-plugin` and run both host setup commands.
 - Run the opt-in live smoke suite.
-- Synchronize all versions to `0.1.0`.
+- Synchronize all versions to `0.2.0`.
 - Check package contents for secrets, local state, and temporary fixtures.
 - Update `CHANGELOG.md`.
-- Tag `v0.1.0` only after every release gate passes.
+- Tag `v0.2.0` only after every release gate passes.
 - Record exact Node, Claude Code, and Grok versions used for validation.
 - Record OS, date, transport cases, and pass/fail outcome without credentials for every authenticated release run.
 
+### Codex 0.2.0 delivery tranche
+
+1. **Package discovery:** add `.agents/plugins/marketplace.json` and `.codex-plugin/plugin.json`; synchronize identity, version, policy, repository metadata, and the `./skills/` root.
+2. **Command facade:** add eight public `$grok:*` skills. Each skill uses an unqualified base name so Codex applies the `grok:` plugin namespace, resolves the checked-in Codex wrapper relative to `SKILL.md`, invokes it exactly once, preserves output and exit status, prohibits Codex from reproducing failed Grok work, and carries host-specific policy so Claude hides the duplicate facade while Codex keeps it discoverable. Disable Codex implicit invocation for Claude-internal helper skills.
+3. **Host adapter:** normalize `claude-code`, `codex`, and `generic` host contexts; migrate new job records to schema 2; retain schema-1 Claude compatibility; require exact host/session matches for every implicit operation and resume.
+4. **Data ownership:** resolve plugin data from generic overrides, host hook variables, then the canonical host fallback. Keep Codex session metadata mode-private and keyed by a one-way session digest.
+5. **Transcript bridge:** validate Codex rollout paths beneath `CODEX_HOME/sessions`; retain only user-visible user/assistant text; reject symlinks, outside-root paths, malformed records, missing metadata, oversized input/output, and unsupported roles; import through an anonymous descriptor.
+6. **Lifecycle:** share Codex-compatible `SessionStart` and `Stop` defaults; make Claude explicitly load both the shared file and its `SessionEnd` hook file; prevent recursive Stop handling; render host-native remediation commands.
+7. **Regression coverage:** test host detection, legacy/schema-2 isolation, transcript filtering and path rejection, packaging contracts, every skill wrapper, Codex metadata capture, and source-wrapper transfer with a fake provider.
+8. **Qualification:** run the full offline suite, plugin validator, package-content inspection, an authenticated Codex-wrapper smoke test, clean marketplace installation, and installed-snapshot inspection.
+9. **Handoff:** document that hooks require trust through `/hooks`, that discovery occurs in a new Codex task, and that Codex has no `SessionEnd` cleanup event.
+
+Exit gate: every step above passes without weakening the existing Claude Code behavior or provider sandbox contract.
+
 ### G8 — Release gate
 
-- Clean-profile install and setup succeed.
-- All eight commands are discoverable.
+- Clean-profile installation and setup succeed in both hosts.
+- All eight commands are discoverable in both host-native forms.
 - Read-only review, write rescue, background lifecycle, cancellation, resume, transfer, and stop-gate smoke tests pass.
 - Attribution and non-affiliation notices are present.
 - Every modified upstream-derived file has its required prominent change notice.
@@ -554,7 +569,7 @@ Keep implementation reviewable and bisectable:
 6. `feat: add Grok commands prompts and rescue agent`
 7. `feat: add setup transfer and lifecycle hooks`
 8. `test: harden security lifecycle and platform coverage`
-9. `docs: prepare Grok companion v0.1.0 release`
+9. `docs: prepare Grok companion v0.2.0 release`
 
 Implementation SHOULD occur on `codex/grok-port` and merge into `main` only after G7. Each commit must keep tests passing or isolate an explicitly non-production spike.
 
@@ -577,10 +592,10 @@ Implementation SHOULD occur on `codex/grok-port` and merge into `main` only afte
 | R13 | Structured review output is malformed | Medium | Medium | JSON Schema, one repair turn, deterministic failure | G3, G5 |
 | R14 | Repository prompt-injects the reviewer | Medium | High | Read-only boundary, tool denial, no review subagents/web, untrusted-content instruction | G7 |
 | R15 | Resume attempts to change privilege profile or use modified profile contents | Medium | High | Contract version 2, persisted `agentProfileDigest`, exact `toolConfig`, reject mismatch, require fresh session | G3, G5 |
-| R16 | Per-job startup is too slow | Medium | Low | Benchmark in WP1; consider profile-separated pooling only after v0.1 | G1 |
+| R16 | Per-job startup is too slow | Medium | Low | Benchmark in WP1; consider profile-separated pooling only after v0.2 | G1 |
 | R17 | Version fields drift across manifests | Medium | Medium | One source, bump script, CI synchronization test | G2, G8 |
 
-## 17. Explicit non-goals for v0.1
+## 17. Explicit non-goals for v0.2
 
 - Reimplementing Grok Build over the direct xAI API.
 - A long-lived shared Grok broker.
@@ -595,20 +610,21 @@ Implementation SHOULD occur on `codex/grok-port` and merge into `main` only afte
 
 The first release is complete only when:
 
-- All eight `/grok:*` commands work with documented flags.
+- All eight command families work through `/grok:*` in Claude Code and `$grok:*` in Codex with documented flags.
 - Review jobs leave the repository unchanged.
 - User-project changes from rescue jobs remain inside the intended workspace; only documented Grok-owned runtime writes are allowed outside it.
 - Background status, result, wait, cancellation, and crash recovery work across command processes.
-- Resume selects only an eligible Grok session for the canonical repository and Claude session.
-- Transfer yields a valid resumable Grok session.
+- Resume selects only an eligible Grok session for the canonical repository, host kind, and exact host session.
+- Transfer yields a valid resumable Grok session; Codex transfer exposes only supported user-visible user/assistant messages.
 - Stop-gate output and failure behavior match the reference.
 - Requested task models and transfer model/effort qualification follow the documented capability rules.
 - Child Grok processes cannot recursively invoke the plugin.
 - Authentication material, including the exact opaque cached credential value, and seeded secret sentinels never enter job records, logs, results, or snapshots; cached login is required, environment-key-only auth is unsupported, near-expiry authentication is refreshed, task credentials are sanitized, and transient setup/review authentication is deleted on every lifecycle path.
-- Headless prompts and imported transcript bodies are passed by anonymous/direct descriptors rather than persisted plugin-owned copies; transcript descriptors are bound post-open by device and inode.
+- Headless prompts and imported transcript bodies are passed by anonymous/direct descriptors rather than persisted plugin-owned copies; Claude transcript descriptors are bound post-open by device and inode and Codex rollouts are filtered before import.
 - Cancellation and timeout leave no provider, importer, or descendant process after bounded whole-process-group cleanup.
 - Contract-version-2 read/write ACP profiles retain the exact tool IDs, terminal parameters, task-manager tools, and `agentProfileDigest`; only isolated provider-bundled skills may coexist with builtin capabilities.
 - SessionEnd cleans only the current Claude session's complete process groups and retains guard/state with `E_PROCESS_IDENTITY` whenever ownership or shutdown cannot be verified.
-- Installation and validation succeed from a clean profile.
+- Codex jobs remain recoverable across task closure because the host has no `SessionEnd` plugin event.
+- Installation and validation succeed from clean Claude Code and Codex profiles.
 - Versions and attribution are synchronized.
 - Provider-neutral Linux, macOS, and Windows CI is green; the full fake-provider suite is green on Linux and macOS; every provider-supported OS has authenticated release evidence.

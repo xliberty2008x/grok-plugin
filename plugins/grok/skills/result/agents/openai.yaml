@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grok Result"
+  short_description: "Retrieve a completed Grok job result"
+  default_prompt: "Use $grok:result to retrieve the completed Grok job."
+policy:
+  allow_implicit_invocation: true

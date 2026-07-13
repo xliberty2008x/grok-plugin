@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grok Rescue"
+  short_description: "Delegate a coding task to Grok Build"
+  default_prompt: "Use $grok:rescue to delegate this coding task to Grok."
+policy:
+  allow_implicit_invocation: true

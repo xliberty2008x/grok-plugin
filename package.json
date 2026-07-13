@@ -1,10 +1,12 @@
 {
   "name": "grok-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Claude Code companion plugin for the official Grok Build CLI",
-  "engines": { "node": ">=18.18" },
+  "description": "Claude Code and Codex companion plugin for the official Grok Build CLI",
+  "engines": {
+    "node": ">=18.18"
+  },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
     "test:e2e": "node --test tests/live-grok.test.mjs",

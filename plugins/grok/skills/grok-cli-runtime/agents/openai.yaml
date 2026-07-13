@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grok CLI Runtime"
+  short_description: "Internal Grok runtime invocation contract"
+  default_prompt: "Use $grok:grok-cli-runtime only from the Grok rescue agent."
+policy:
+  allow_implicit_invocation: false

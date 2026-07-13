@@ -42,7 +42,9 @@ const packageJson = readJson("package.json");
 const previousVersion = packageJson.version;
 const packageLock = readJson("package-lock.json");
 const marketplace = readJson(".claude-plugin/marketplace.json");
+const codexMarketplace = readJson(".agents/plugins/marketplace.json");
 const pluginManifest = readJson("plugins/grok/.claude-plugin/plugin.json");
+const codexPluginManifest = readJson("plugins/grok/.codex-plugin/plugin.json");
 
 packageJson.version = nextVersion;
 packageLock.version = nextVersion;
@@ -54,6 +56,10 @@ const marketplacePlugin = marketplace.plugins?.find((entry) => entry?.name === "
 if (!marketplacePlugin) throw new Error("Marketplace has no grok plugin entry.");
 marketplacePlugin.version = nextVersion;
 pluginManifest.version = nextVersion;
+const codexMarketplacePlugin = codexMarketplace.plugins?.find((entry) => entry?.name === "grok");
+if (!codexMarketplacePlugin) throw new Error("Codex marketplace has no grok plugin entry.");
+codexMarketplacePlugin.version = nextVersion;
+codexPluginManifest.version = nextVersion;
 
 const changelogPath = "plugins/grok/CHANGELOG.md";
 let changelog = fs.readFileSync(file(changelogPath), "utf8");
@@ -65,10 +71,10 @@ if (!new RegExp(`^## ${nextVersion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m
 
 const noticePath = "plugins/grok/NOTICE";
 let notice = fs.readFileSync(file(noticePath), "utf8");
-if (!/^Grok Companion for Claude Code \d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\./m.test(notice)) {
+if (!/^Grok Companion for Claude Code and Codex \d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\./m.test(notice)) {
   throw new Error("Plugin NOTICE has no versioned product line.");
 }
-notice = notice.replace(/^Grok Companion for Claude Code \d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\./m, `Grok Companion for Claude Code ${nextVersion}.`);
+notice = notice.replace(/^Grok Companion for Claude Code and Codex \d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\./m, `Grok Companion for Claude Code and Codex ${nextVersion}.`);
 
 const providerPath = "plugins/grok/scripts/lib/grok-provider.mjs";
 let provider = fs.readFileSync(file(providerPath), "utf8");
@@ -80,7 +86,9 @@ const updates = [
   ["package.json", serializeJson(packageJson)],
   ["package-lock.json", serializeJson(packageLock)],
   [".claude-plugin/marketplace.json", serializeJson(marketplace)],
+  [".agents/plugins/marketplace.json", serializeJson(codexMarketplace)],
   ["plugins/grok/.claude-plugin/plugin.json", serializeJson(pluginManifest)],
+  ["plugins/grok/.codex-plugin/plugin.json", serializeJson(codexPluginManifest)],
   [changelogPath, changelog],
   [noticePath, notice],
   [providerPath, provider]

@@ -3,6 +3,16 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["verdict", "summary", "findings"],
+  "allOf": [
+    {
+      "if": { "properties": { "verdict": { "const": "pass" } } },
+      "then": { "properties": { "findings": { "maxItems": 0 } } }
+    },
+    {
+      "if": { "properties": { "verdict": { "const": "needs_changes" } } },
+      "then": { "properties": { "findings": { "minItems": 1 } } }
+    }
+  ],
   "properties": {
     "verdict": { "enum": ["pass", "needs_changes"] },
     "summary": { "type": "string", "minLength": 1 },

@@ -10,11 +10,13 @@ import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import {
   COMPANION,
   initRepo,
+  runCodexCompanion,
   runCompanion,
   tempDir,
   testEnvironment,
   waitFor
 } from "./helpers.mjs";
+import { writeCodexSessionMetadata } from "../plugins/grok/scripts/lib/host.mjs";
 
 function parseJson(result) {
   assert.equal(result.status, 0, `command failed\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
@@ -554,6 +556,50 @@ test("transfer imports only regular Claude JSONL files beneath the canonical pro
   const symlinked = runCompanion(["transfer", "--source", link, "--json"], { cwd: root, env: transferEnv });
   assert.equal(symlinked.status, 5);
   assert.equal(JSON.parse(symlinked.stdout).error.code, "E_IMPORT_SOURCE");
+});
+
+test("Codex wrapper imports the captured current transcript through a privacy-filtered descriptor", () => {
+  const root = fs.realpathSync(initRepo());
+  const { fake, env } = fixture({ importSessionId: "12345678-1234-4234-8234-123456789abc" });
+  const home = tempDir("grok-codex-transfer-home-");
+  const codexHome = path.join(home, ".codex");
+  const sessions = path.join(codexHome, "sessions", "2026", "07", "13");
+  const pluginData = path.join(codexHome, "plugins", "data", "grok-grok-companion");
+  const threadId = crypto.randomUUID();
+  fs.mkdirSync(sessions, { recursive: true, mode: 0o700 });
+  const source = path.join(sessions, `rollout-${threadId}.jsonl`);
+  const records = [
+    { timestamp: "2026-07-13T10:00:00.000Z", type: "session_meta", payload: { id: threadId, cwd: root, cli_version: "0.143.0" } },
+    { timestamp: "2026-07-13T10:00:01.000Z", type: "response_item", payload: { type: "message", role: "developer", content: [{ type: "input_text", text: "HIDDEN_DEVELOPER_TEXT" }] } },
+    { timestamp: "2026-07-13T10:00:02.000Z", type: "event_msg", payload: { type: "user_message", message: "VISIBLE_CODEX_USER_TEXT" } },
+    { timestamp: "2026-07-13T10:00:03.000Z", type: "response_item", payload: { type: "reasoning", summary: [{ text: "HIDDEN_REASONING_TEXT" }] } },
+    { timestamp: "2026-07-13T10:00:04.000Z", type: "response_item", payload: { type: "function_call_output", output: "HIDDEN_TOOL_TEXT" } },
+    { timestamp: "2026-07-13T10:00:05.000Z", type: "event_msg", payload: { type: "agent_message", phase: "final_answer", message: "VISIBLE_CODEX_ASSISTANT_TEXT" } }
+  ];
+  fs.writeFileSync(source, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+  writeCodexSessionMetadata(pluginData, { sessionId: threadId, transcriptPath: source, cwd: root });
+
+  const transferEnv = {
+    ...env,
+    HOME: home,
+    CODEX_HOME: codexHome,
+    CODEX_THREAD_ID: threadId
+  };
+  delete transferEnv.CLAUDE_PLUGIN_DATA;
+  delete transferEnv.GROK_COMPANION_CLAUDE_SESSION_ID;
+  delete transferEnv.GROK_COMPANION_HOST;
+  delete transferEnv.GROK_COMPANION_HOST_SESSION_ID;
+  delete transferEnv.GROK_COMPANION_PLUGIN_DATA;
+
+  const imported = parseJson(runCodexCompanion(["transfer", "--json"], { cwd: root, env: transferEnv }));
+  assert.equal(imported.source, fs.realpathSync(source));
+  assert.equal(imported.sourceFormat, "codex");
+  assert.equal(imported.sessionId, "12345678-1234-4234-8234-123456789abc");
+  const invocation = readFakeLog(fake.logFile).find((entry) => entry.event === "argv" && entry.args[0] === "import");
+  assert.equal(invocation.args.includes(source), false);
+  const importedInput = readFakeLog(fake.logFile).find((entry) => entry.event === "import-input");
+  assert.ok(importedInput.bytes > 0);
+  assert.notEqual(importedInput.bytes, fs.statSync(source).size, "raw Codex transcript was forwarded without filtering");
 });
 
 test("transfer rejects malformed UUIDs, malformed NDJSON, and nonzero import exits", () => {

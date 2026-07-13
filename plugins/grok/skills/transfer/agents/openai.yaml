@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grok Transfer"
+  short_description: "Transfer current Codex context to Grok"
+  default_prompt: "Use $grok:transfer to continue this Codex task in Grok."
+policy:
+  allow_implicit_invocation: true

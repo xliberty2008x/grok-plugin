@@ -16,7 +16,8 @@ import {
   ensureChildExit,
   runHeadless,
   runProvider,
-  runStructuredReview
+  runStructuredReview,
+  validateReview
 } from "../plugins/grok/scripts/lib/grok-provider.mjs";
 import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
 import { hasForeignActiveProvider } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
@@ -272,9 +273,21 @@ test("isolated ACP homes reject external discovery and redact opaque copied cred
   });
 });
 
+test("review validation rejects verdict and finding-count contradictions", () => {
+  assert.throws(
+    () => validateReview({ verdict: "needs_changes", summary: "inconsistent", findings: [] }),
+    (error) => error?.code === "E_SCHEMA"
+  );
+  assert.throws(
+    () => validateReview({ verdict: "pass", summary: "inconsistent", findings: [{ severity: "low", title: "Unexpected", body: "Pass cannot contain findings." }] }),
+    (error) => error?.code === "E_SCHEMA"
+  );
+  assert.equal(validateReview({ verdict: "pass", summary: "No defects found.", findings: [] }).verdict, "pass");
+});
+
 test("isolated headless reviews redact opaque cached credentials from diagnostics and results", async () => {
   const secret = "opaque-review-credential-value-123456";
-  await withFake({ authSecret: secret, headlessStderr: `diagnostic ${secret}\n`, review: { verdict: "needs_changes", summary: secret, findings: [] } }, async () => {
+  await withFake({ authSecret: secret, headlessStderr: `diagnostic ${secret}\n`, review: { verdict: "needs_changes", summary: secret, findings: [{ severity: "high", title: "Secret finding", body: secret }] } }, async () => {
     const root = initRepo(), state = tempDir("provider-state-"), events = [];
     const result = await runStructuredReview({ root, profile: profileFor("review"), prompt: "review contract", stateDir: state, jobMarker: "review-secret-test", onEvent: (event) => events.push(event) });
     assert.equal(JSON.stringify({ result, events }).includes(secret), false);
