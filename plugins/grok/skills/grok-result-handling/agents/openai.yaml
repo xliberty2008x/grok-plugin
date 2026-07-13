@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grok Result Handling"
+  short_description: "Internal Grok result forwarding guidance"
+  default_prompt: "Use $grok:grok-result-handling only to forward a Grok result."
+policy:
+  allow_implicit_invocation: false

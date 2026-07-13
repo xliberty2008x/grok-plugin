@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grok Adversarial Review"
+  short_description: "Challenge current changes with Grok"
+  default_prompt: "Use $grok:adversarial-review to challenge my current implementation."
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grok Prompting"
+  short_description: "Internal Grok task prompting guidance"
+  default_prompt: "Use $grok:grok-prompting only to shape a delegated Grok task."
+policy:
+  allow_implicit_invocation: false

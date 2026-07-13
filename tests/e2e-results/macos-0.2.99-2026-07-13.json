@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-07-13",
+  "platform": {
+    "name": "macOS",
+    "version": "26.5",
+    "build": "25F71",
+    "architecture": "arm64"
+  },
+  "runtime": {
+    "node": "25.5.0",
+    "claudeCode": "2.1.199",
+    "grokBuild": "0.2.99",
+    "grokBuildRevision": "b1b49ccb71a7",
+    "model": "grok-4.5",
+    "reasoningEffort": "low",
+    "profileContractVersion": 2
+  },
+  "suite": {
+    "invocation": "GROK_E2E=1 GROK_E2E_CANCEL=1 GROK_E2E_MODEL=grok-4.5 GROK_E2E_EFFORT=low npm run test:e2e",
+    "outcome": "pass",
+    "tests": 10,
+    "passed": 10,
+    "failed": 0,
+    "durationMs": 50625.8765
+  },
+  "cases": [
+    { "name": "setup initializes ACP", "outcome": "pass" },
+    { "name": "read-only review preserves every fixture file", "outcome": "pass" },
+    { "name": "isolated read-only ACP task reads the repository without changing it", "outcome": "pass" },
+    { "name": "stop-time review gate runs against a clean repository without mutation", "outcome": "pass" },
+    { "name": "write task creates only the requested sentinel", "outcome": "pass" },
+    { "name": "resume loads the same Grok session", "outcome": "pass" },
+    { "name": "nested companion invocation from a Grok task is refused", "outcome": "pass" },
+    { "name": "transfer imports Claude JSONL and resumes it directly with Grok", "outcome": "pass" },
+    { "name": "background task can be cancelled", "outcome": "pass" },
+    { "name": "authenticated Grok end-to-end flow", "outcome": "pass" }
+  ],
+  "scope": "Authenticated provider qualification for macOS only. Linux remains provider-unverified; Windows provider execution and process control remain unsupported in 0.2.0."
+}

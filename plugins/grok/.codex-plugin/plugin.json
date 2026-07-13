@@ -1,0 +1,36 @@
+{
+  "name": "grok",
+  "version": "0.2.0",
+  "description": "Delegate coding tasks and read-only reviews to the official Grok Build CLI from Codex.",
+  "author": {
+    "name": "grok-plugin community maintainers"
+  },
+  "homepage": "https://github.com/xliberty2008x/grok-plugin",
+  "repository": "https://github.com/xliberty2008x/grok-plugin",
+  "license": "Apache-2.0",
+  "keywords": [
+    "grok",
+    "xai",
+    "companion-agent",
+    "code-review",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Grok Companion",
+    "shortDescription": "Delegate coding work and reviews to Grok Build",
+    "longDescription": "Use the official Grok Build CLI as an isolated companion agent for setup checks, code reviews, implementation tasks, transcript transfer, and background-job control.",
+    "developerName": "grok-plugin community maintainers",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Ask Grok to review my current changes",
+      "Delegate this implementation task to Grok",
+      "Show my recent Grok companion jobs"
+    ]
+  }
+}

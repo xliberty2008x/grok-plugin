@@ -1,0 +1,7 @@
+{
+  "description": "Session capture and optional stop-time review gate for Grok Companion on Claude Code and Codex.",
+  "hooks": {
+    "SessionStart": [{"hooks":[{"type":"command","command":"node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.mjs\" SessionStart","timeout":5}]}],
+    "Stop": [{"hooks":[{"type":"command","command":"node \"${CLAUDE_PLUGIN_ROOT}/scripts/stop-review-gate-hook.mjs\"","timeout":900}]}]
+  }
+}

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grok Setup"
+  short_description: "Check Grok Companion readiness"
+  default_prompt: "Use $grok:setup to check whether Grok Companion is ready."
+policy:
+  allow_implicit_invocation: true
