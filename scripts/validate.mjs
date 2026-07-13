@@ -6,6 +6,8 @@ import process from "node:process";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { hasYamlFrontmatter } from "./lib/frontmatter.mjs";
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = new Set(process.argv.slice(2));
 const jsonOutput = args.has("--json");
@@ -296,7 +298,7 @@ if (!versionsOnly) {
     const file = `plugins/grok/commands/${name}.md`;
     const text = readText(file, { required: false });
     if (text == null) continue;
-    if (!text.startsWith("---\n") || text.indexOf("\n---\n", 4) < 0) problem("Command file must start with YAML frontmatter.", file);
+    if (!hasYamlFrontmatter(text)) problem("Command file must start with YAML frontmatter.", file);
     if (!/^description:\s*\S+/m.test(text)) problem("Command frontmatter must include a description.", file);
     if (!/modified|adapted/i.test(text) || !/openai\/codex-plugin-cc/i.test(text)) {
       problem("Adapted command must carry a prominent modification notice naming openai/codex-plugin-cc.", file);
@@ -327,7 +329,7 @@ if (!versionsOnly) {
 
   const agent = readText("plugins/grok/agents/grok-rescue.md", { required: false });
   if (agent != null) {
-    if (!agent.startsWith("---\n") || agent.indexOf("\n---\n", 4) < 0) problem("Agent file must start with YAML frontmatter.", "plugins/grok/agents/grok-rescue.md");
+    if (!hasYamlFrontmatter(agent)) problem("Agent file must start with YAML frontmatter.", "plugins/grok/agents/grok-rescue.md");
     if (!/modified|adapted/i.test(agent) || !/openai\/codex-plugin-cc/i.test(agent)) problem("Adapted agent must carry a prominent upstream modification notice.", "plugins/grok/agents/grok-rescue.md");
   }
 

@@ -7,6 +7,8 @@ import test from "node:test";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { hasYamlFrontmatter } from "../scripts/lib/frontmatter.mjs";
+
 import {
   hostCommand,
   hostContext,
@@ -77,6 +79,14 @@ function job(id, createdAt, values) {
     ...values
   };
 }
+
+test("validator frontmatter detection accepts LF, CRLF, and CR line endings", () => {
+  assert.equal(hasYamlFrontmatter("---\ndescription: test\n---\nbody\n"), true);
+  assert.equal(hasYamlFrontmatter("---\r\ndescription: test\r\n---\r\nbody\r\n"), true);
+  assert.equal(hasYamlFrontmatter("---\rdescription: test\r---\rbody\r"), true);
+  assert.equal(hasYamlFrontmatter("description: test\n---\nbody\n"), false);
+  assert.equal(hasYamlFrontmatter("---\ndescription: test\nbody\n"), false);
+});
 
 test("Codex host detection honors normalized overrides and uses a Codex data fallback", () => {
   assert.deepEqual(hostContext({ CODEX_THREAD_ID: "codex-thread" }), {
