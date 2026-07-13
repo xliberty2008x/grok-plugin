@@ -253,6 +253,13 @@ async function serveHeadless(binary, config, args) {
   if (config.headlessIgnoreSigterm) process.once("SIGTERM", () => appendLog(config, { event: "signal", signal: "SIGTERM", transport: "headless" }));
   if (config.headlessStdoutBytes) process.stdout.write("x".repeat(config.headlessStdoutBytes));
   if (config.headlessMutatePath) fs.appendFileSync(config.headlessMutatePath, config.headlessMutation || "mutated by fake Grok\n");
+  if (config.headlessLockHome && process.env.HOME) {
+    // Leave an undeletable nested path so isolated-home cleanup fails after the review.
+    const nest = path.join(process.env.HOME, "undeletable-cleanup");
+    fs.mkdirSync(nest, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(nest, "locked"), "locked by fake Grok\n", { mode: 0o600 });
+    fs.chmodSync(nest, 0o000);
+  }
 
   if (config.headlessDelayMs) {
     await new Promise((resolve) => {
@@ -358,6 +365,14 @@ async function main() {
     } else {
       const id = config.importSessionId ?? "12345678-1234-1234-1234-123456789abc";
       process.stdout.write(`${JSON.stringify({ sessionId: id })}\n`);
+    }
+    if (config.importPoisonAlias) {
+      // Replace the private descriptor alias with a non-empty directory so post-import unlink fails.
+      try { fs.unlinkSync(alias); } catch {}
+      try {
+        fs.mkdirSync(alias, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(alias, "poison"), "import alias cleanup must fail\n", { mode: 0o600 });
+      } catch {}
     }
     if (config.importExitCode) process.exitCode = config.importExitCode;
     return;

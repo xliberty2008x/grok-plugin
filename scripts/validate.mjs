@@ -173,6 +173,7 @@ if (!versionsOnly) {
     "plugins/grok/agents/grok-rescue.md",
     "plugins/grok/provider-agents/rescue-read.md",
     "plugins/grok/provider-agents/rescue-write.md",
+    "plugins/grok/provider-agents/setup-probe.md",
     "plugins/grok/hooks/hooks.json",
     "plugins/grok/hooks/claude-hooks.json",
     "plugins/grok/prompts/review.md",

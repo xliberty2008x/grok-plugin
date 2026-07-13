@@ -106,7 +106,7 @@ test("childEnvironment strips project and provider secrets while retaining runti
 });
 
 test("probe negotiates ACP v1, session loading, auth methods, models, and efforts", async () => {
-  await withFake({}, async () => {
+  await withFake({}, async (fake) => {
     const root = initRepo();
     const result = await probe(root, tempDir("provider-state-"));
     assert.equal(result.version, "0.2.99");
@@ -117,6 +117,25 @@ test("probe negotiates ACP v1, session loading, auth methods, models, and effort
     assert.deepEqual(result.authMethods, [{ id: "local", name: "Local test auth" }]);
     assert.deepEqual(result.models, [{ id: "grok-test", efforts: ["low", "medium", "high"] }]);
     assert.equal(hasForeignActiveProvider(root, null), false, "setup probe retained an active-provider guard");
+    assert.equal(result.acpIsolation.isolated, true);
+    assert.equal(result.acpIsolation.sandbox, "read-only");
+    assert.equal(result.acpIsolation.permissionMode, "dontAsk");
+    assert.equal(result.acpIsolation.injectDefaultTools, false);
+    assert.equal(result.acpIsolation.unattendedPrivilegeExpansion, false);
+    assert.match(result.acpIsolation.agentProfileDigest, /^[a-f0-9]{64}$/);
+
+    const invocation = readFakeLog(fake.logFile).find((entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio"));
+    assert.ok(invocation, "setup probe did not launch ACP stdio");
+    assert.equal(invocation.args[invocation.args.indexOf("--sandbox") + 1], "read-only");
+    assert.equal(invocation.args[invocation.args.indexOf("--permission-mode") + 1], "dontAsk");
+    assert.equal(invocation.args.includes("--always-approve"), false, "setup probe must not expand unattended privileges");
+    const profileIndex = invocation.args.indexOf("--agent-profile");
+    assert.ok(profileIndex >= 0, "setup probe must use a checked-in --agent-profile");
+    const agentProfile = fs.readFileSync(invocation.args[profileIndex + 1], "utf8");
+    assert.match(agentProfile, /injectDefaultTools: false/);
+    assert.match(agentProfile, /permission_mode: dontAsk/);
+    assert.match(path.basename(invocation.args[profileIndex + 1]), /^setup-probe\.md$/);
+    for (const rule of ["Bash", "Edit", "Write", "MCPTool", "WebFetch"]) assert.ok(invocation.args.includes(rule), `setup probe missing deny ${rule}`);
   });
 });
 

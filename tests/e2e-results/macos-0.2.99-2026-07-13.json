@@ -36,5 +36,5 @@
     { "name": "background task can be cancelled", "outcome": "pass" },
     { "name": "authenticated Grok end-to-end flow", "outcome": "pass" }
   ],
-  "scope": "Authenticated provider qualification for macOS only. Linux remains provider-unverified; Windows provider execution and process control remain unsupported in 0.1.0."
+  "scope": "Authenticated provider qualification for macOS only. Linux remains provider-unverified; Windows provider execution and process control remain unsupported in 0.2.0."
 }

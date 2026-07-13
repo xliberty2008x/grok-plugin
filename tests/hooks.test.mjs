@@ -346,6 +346,39 @@ test("enabled stop gate emits Claude block JSON for BLOCK output", () => {
   assert.equal(log.some((entry) => entry.event === "rpc"), false);
 });
 
+test("enabled stop gate preserves primary BLOCK reason when isolated-home cleanup also fails", { skip: process.platform === "win32" }, () => {
+  const root = fs.realpathSync(initRepo());
+  const fake = installFakeGrok(tempDir("fake-grok-stop-cleanup-"), {
+    taskText: "BLOCK: add the missing regression test",
+    headlessLockHome: true
+  });
+  const pluginData = tempDir("grok-hook-data-");
+  withPluginData(pluginData, () => setConfig(root, { stopReviewGate: true }));
+  const result = hook(
+    STOP_HOOK,
+    null,
+    { cwd: root, last_assistant_message: "Implemented without tests." },
+    { cwd: root, env: testEnvironment({ fake, pluginData }) }
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.decision, "block");
+  assert.match(payload.reason, /add the missing regression test/);
+  assert.match(payload.reason, /Isolated credential environment cleanup failed/i);
+  // Primary BLOCK text must remain, not be replaced by cleanup-only wording.
+  assert.doesNotMatch(payload.reason, /^Grok stop review could not remove its isolated credential environment/);
+
+  // Best-effort unlock of any retained review homes so the temp tree can be removed later.
+  const homes = path.join(workspaceState(root), "review-homes");
+  if (fs.existsSync(homes)) {
+    for (const name of fs.readdirSync(homes)) {
+      const nest = path.join(homes, name, "undeletable-cleanup");
+      try { fs.chmodSync(nest, 0o700); } catch {}
+    }
+    try { fs.rmSync(homes, { recursive: true, force: true }); } catch {}
+  }
+});
+
 test("a crashed stop hook honors explicit host context and is recovered without retaining its provider or isolated home", async (t) => {
   const root = fs.realpathSync(initRepo());
   const fake = installFakeGrok(tempDir("fake-grok-stop-crash-"), { taskText: "ALLOW: complete", headlessDelayMs: 60_000 });

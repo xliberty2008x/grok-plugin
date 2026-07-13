@@ -345,7 +345,7 @@ async function runImportProcess({ binary, root, transcriptFd, alias, leaderSocke
     stdio: ["ignore", "pipe", "pipe", transcriptFd]
   });
   const identity = { pid: child.pid, startToken: processStartToken(child.pid), processGroupId: process.platform === "win32" ? null : child.pid };
-  try { registerProviderGuard(root, marker, identity, sessionId()); }
+  try { registerProviderGuard(root, marker, identity, sessionId(), "import"); }
   catch (error) { await ensureChildExit(child, identity); throw error; }
   let stdout = "", stdoutBytes = 0, stderr = "", terminationReason = null, forceTimer = null;
   const terminate = (name) => {
@@ -406,6 +406,7 @@ async function handleTransfer(raw) {
   }
   const opened = openTranscriptSource(source);
   let importAlias = null, run, importFd = opened.fd, convertedFile = null;
+  const cleanupWarnings = [];
   const controller = new AbortController();
   const abort = () => controller.abort();
   process.once("SIGINT", abort);
@@ -432,7 +433,6 @@ async function handleTransfer(raw) {
     run = await runImportProcess({ binary, root, transcriptFd: importFd, alias: importAlias, leaderSocket, marker, signal: controller.signal });
     run.selectedModel = selected.id;
   } finally {
-    const cleanupWarnings = [];
     process.removeListener("SIGINT", abort);
     process.removeListener("SIGTERM", abort);
     if (importFd !== opened.fd) {
@@ -441,15 +441,49 @@ async function handleTransfer(raw) {
     }
     try { fs.closeSync(opened.fd); } catch (error) { cleanupWarnings.push(error.message); }
     if (importAlias) try { fs.unlinkSync(importAlias); } catch (error) { if (error.code !== "ENOENT") cleanupWarnings.push(error.message); }
-    if (cleanupWarnings.length) throw new CompanionError("E_STATE", "Could not completely remove the private transcript transfer artifacts.", { warning: cleanupWarnings.join("; ") });
   }
-  if (run.status !== 0) throw new CompanionError("E_IMPORT_RESULT", `Grok could not import the ${opened.format === "codex" ? "Codex" : "Claude Code"} transcript.`, { diagnostic: redactText(run.stderr || run.stdout) });
-  const id = importedSessionId(run.stdout); if (!id) throw new CompanionError("E_IMPORT_RESULT", "Grok import succeeded but returned no usable session ID.");
+  if (!run) {
+    if (cleanupWarnings.length) throw new CompanionError("E_STATE", "Could not completely remove the private transcript transfer artifacts.", { warning: cleanupWarnings.join("; ") });
+    throw new CompanionError("E_IMPORT_RESULT", "Grok transcript import did not complete.");
+  }
+  if (run.status !== 0) {
+    if (cleanupWarnings.length) throw new CompanionError("E_IMPORT_RESULT", `Grok could not import the ${opened.format === "codex" ? "Codex" : "Claude Code"} transcript.`, { diagnostic: redactText(run.stderr || run.stdout), privacyWarning: cleanupWarnings.join("; ") });
+    throw new CompanionError("E_IMPORT_RESULT", `Grok could not import the ${opened.format === "codex" ? "Codex" : "Claude Code"} transcript.`, { diagnostic: redactText(run.stderr || run.stdout) });
+  }
+  const id = importedSessionId(run.stdout); if (!id) throw new CompanionError("E_IMPORT_RESULT", "Grok import succeeded but returned no usable session ID.", cleanupWarnings.length ? { privacyWarning: cleanupWarnings.join("; ") } : undefined);
   const resumeParts = ["grok", "--model", run.selectedModel];
   if (options.effort) resumeParts.push("--reasoning-effort", options.effort);
   resumeParts.push("--resume", id);
+  const deleteParts = ["grok", "sessions", "delete", id];
   const label = opened.format === "codex" ? "Codex" : "Claude Code";
-  const result = { sessionId: id, source: opened.real, sourceFormat: opened.format, model: run.selectedModel, effort: options.effort || null, resume: resumeParts.map(shellWord).join(" ") }; out(options.json ? result : `Imported ${label} transcript into Grok session ${id}.\nResume: ${result.resume}`, options.json);
+  const result = {
+    sessionId: id,
+    source: opened.real,
+    sourceFormat: opened.format,
+    model: run.selectedModel,
+    effort: options.effort || null,
+    resume: resumeParts.map(shellWord).join(" "),
+    delete: deleteParts.map(shellWord).join(" ")
+  };
+  if (cleanupWarnings.length) {
+    // Import succeeded: keep session identity and resume/delete guidance so the provider session is not orphaned.
+    throw new CompanionError(
+      "E_STATE",
+      `Imported ${label} transcript into Grok session ${id}, but private alias or descriptor cleanup failed. Resume with \`${result.resume}\` or delete with \`${result.delete}\`, then remove leftover transfer artifacts.`,
+      {
+        warning: cleanupWarnings.join("; "),
+        privacyWarning: cleanupWarnings.join("; "),
+        sessionId: result.sessionId,
+        source: result.source,
+        sourceFormat: result.sourceFormat,
+        model: result.model,
+        effort: result.effort,
+        resume: result.resume,
+        delete: result.delete
+      }
+    );
+  }
+  out(options.json ? result : `Imported ${label} transcript into Grok session ${id}.\nResume: ${result.resume}`, options.json);
 }
 
 async function main() {

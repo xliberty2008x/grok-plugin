@@ -102,7 +102,15 @@ try {
   response = { decision: "block", reason: `Grok stop review failed: ${redactText(error.message)}. Run ${hostCommand("setup")} and retry.` };
 } finally {
   const cleanup = cleanupReviewEnvironment(workspaceState(root), jobMarker);
-  if (!cleanup.ok) response = { decision: "block", reason: `Grok stop review could not remove its isolated credential environment: ${cleanup.warning}.` };
+  if (!cleanup.ok) {
+    const cleanupNote = `Isolated credential environment cleanup failed: ${cleanup.warning}.`;
+    if (response?.reason) {
+      // Preserve the primary BLOCK / mutation / provider failure reason and append cleanup.
+      response = { decision: "block", reason: `${response.reason} ${cleanupNote}` };
+    } else {
+      response = { decision: "block", reason: `Grok stop review could not remove its isolated credential environment: ${cleanup.warning}.` };
+    }
+  }
   if (jobWritten) {
     try {
       updateJob(root, jobMarker, (job) => {

@@ -650,3 +650,20 @@ test("transfer rejects multiple different session IDs from NDJSON", () => {
   ), "E_IMPORT_RESULT");
   assert.match(error.message, /multiple different session IDs/i);
 });
+
+test("transfer preserves imported session identity when private alias cleanup fails", () => {
+  const sessionId = "12345678-1234-4234-8234-123456789abc";
+  const { root, source, env } = transferFixture({
+    importSessionId: sessionId,
+    importPoisonAlias: true
+  });
+  const result = runCompanion(["transfer", "--source", source, "--json"], { cwd: root, env });
+  const error = parseError(result, "E_STATE");
+  assert.match(error.message, /cleanup failed/i);
+  assert.match(error.message, new RegExp(sessionId));
+  assert.equal(error.details?.sessionId, sessionId);
+  assert.equal(error.details?.resume, `grok --model grok-test --resume ${sessionId}`);
+  assert.equal(error.details?.delete, `grok sessions delete ${sessionId}`);
+  assert.ok(error.details?.privacyWarning || error.details?.warning, "privacy failure must remain explicit");
+  assert.match(String(error.details?.privacyWarning || error.details?.warning), /\S/);
+});

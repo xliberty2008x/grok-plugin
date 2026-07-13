@@ -42,12 +42,14 @@ function atomicJson(file, value) {
   fs.renameSync(temporary, file);
 }
 
-export function registerProviderGuard(workspaceRoot, marker, providerProcess, owner = null) {
+export function registerProviderGuard(workspaceRoot, marker, providerProcess, owner = null, identityKind = "provider") {
   if (!providerProcess?.pid || !providerProcess?.startToken) return;
+  const kind = identityKind === "import" ? "import" : "provider";
   atomicJson(guardFile(workspaceRoot, marker), {
     schemaVersion: 1,
     marker: markerName(marker),
     owner: ownerDigest(owner),
+    identityKind: kind,
     providerProcess,
     createdAt: new Date().toISOString()
   });
@@ -82,7 +84,8 @@ export function hasForeignActiveProvider(workspaceRoot, owner = null) {
       continue;
     }
     const sameOwner = Boolean(expectedOwner) && record.owner === expectedOwner;
-    if (!identityMatches(record.providerProcess, record.marker, "provider")) {
+    const kind = record.identityKind === "import" ? "import" : "provider";
+    if (!identityMatches(record.providerProcess, record.marker, kind)) {
       if (record.providerProcess?.processGroupId && process.platform !== "win32" && processGroupAlive(record.providerProcess.processGroupId)) {
         conflict = true;
         continue;

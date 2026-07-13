@@ -223,19 +223,26 @@ function inspectIsolation(binary, root, environment) {
   return value;
 }
 
+function checkedInAgentProfile(profile) {
+  if (profile?.id === "rescue-read-v2") return path.join(PLUGIN_ROOT, "provider-agents", "rescue-read.md");
+  if (profile?.id === "rescue-write-v2") return path.join(PLUGIN_ROOT, "provider-agents", "rescue-write.md");
+  if (profile?.id === "setup-probe-v2") return path.join(PLUGIN_ROOT, "provider-agents", "setup-probe.md");
+  return null;
+}
+
 function spawnArgs({ root, profile, model, effort, leaderSocket }) {
-  const readTask = profile.id === "rescue-read-v2";
-  const taskProfile = readTask
-    ? path.join(PLUGIN_ROOT, "provider-agents", "rescue-read.md")
-    : profile.id === "rescue-write-v2"
-      ? path.join(PLUGIN_ROOT, "provider-agents", "rescue-write.md")
-      : null;
+  const readOnlyProfile = profile.id === "rescue-read-v2" || profile.id === "setup-probe-v2";
+  const taskProfile = checkedInAgentProfile(profile);
   if (taskProfile) {
     const actualDigest = crypto.createHash("sha256").update(fs.readFileSync(taskProfile)).digest("hex");
-    if (!profile.agentProfileDigest || profile.agentProfileDigest !== actualDigest) throw new CompanionError("E_SECURITY_PROFILE", "The checked-in Grok agent profile changed; start a fresh rescue task under the current security contract.");
+    if (!profile.agentProfileDigest || profile.agentProfileDigest !== actualDigest) {
+      const label = profile.id === "setup-probe-v2" ? "setup probe" : "rescue task";
+      throw new CompanionError("E_SECURITY_PROFILE", `The checked-in Grok agent profile changed; start a fresh ${label} under the current security contract.`);
+    }
   }
   const args = ["--cwd", root, "--sandbox", profile.sandbox, "--permission-mode", profile.permissionMode, "--deny", "WebFetch", "--deny", "MCPTool", "--disable-web-search", "--no-subagents", "--no-memory", "--no-plan"];
-  if (readTask) args.push("--deny", "Bash", "--deny", "Edit", "--deny", "Write");
+  if (readOnlyProfile) args.push("--deny", "Bash", "--deny", "Edit", "--deny", "Write");
+  // Setup probe uses permissionMode dontAsk, so it never receives unattended --always-approve expansion.
   if (profile.permissionMode === "bypassPermissions") args.push("--always-approve");
   args.push("agent", "--no-leader", "--leader-socket", leaderSocket);
   if (taskProfile) args.push("--agent-profile", taskProfile);
@@ -517,9 +524,44 @@ export async function probe(root, stateDir) {
   let provider = null;
   try {
     inspectIsolation(binary, root, isolation);
-    const profile = { id: "setup-probe-v1", sandbox: "read-only", permissionMode: "dontAsk" };
+    const agentProfilePath = path.join(PLUGIN_ROOT, "provider-agents", "setup-probe.md");
+    const agentProfile = fs.readFileSync(agentProfilePath, "utf8");
+    if (!/^injectDefaultTools:\s*false\s*$/m.test(agentProfile)) throw new CompanionError("E_SECURITY_PROFILE", "The checked-in setup probe agent profile must set injectDefaultTools: false.");
+    if (!/^permission_mode:\s*dontAsk\s*$/m.test(agentProfile)) throw new CompanionError("E_SECURITY_PROFILE", "The checked-in setup probe agent profile must use permission_mode dontAsk without unattended privilege expansion.");
+    const agentProfileDigest = crypto.createHash("sha256").update(agentProfile).digest("hex");
+    const profile = {
+      id: "setup-probe-v2",
+      contractVersion: 2,
+      transport: "acp",
+      sandbox: "read-only",
+      permissionMode: "dontAsk",
+      webSearch: false,
+      subagents: false,
+      isolatedLeader: true,
+      agentProfileDigest,
+      allowedTools: [],
+      deniedTools: ["WebSearch", "WebFetch", "Agent", "mcp__*", "Bash", "Edit", "Write"]
+    };
     provider = await openProvider({ root, profile, stateDir, jobMarker: marker, environment: isolation });
-    return { binary: provider.binary, version: provider.version, authenticated: true, headlessReview: { flags: requiredFlags, isolated: true, externalHooks: 0, externalSkills: 0, externalPlugins: 0, externalMcpServers: 0 }, acpIsolation: { flags: requiredAgentFlags, isolated: true }, protocolVersion: provider.initialized.protocolVersion, loadSession: Boolean(provider.initialized.agentCapabilities?.loadSession), authMethods: (provider.initialized.authMethods || []).map((x) => ({ id: x.id, name: x.name })), models: (provider.initialized?._meta?.modelState?.availableModels || []).map((x) => ({ id: x.modelId, efforts: (x._meta?.reasoningEfforts || []).map((e) => e.id) })) };
+    return {
+      binary: provider.binary,
+      version: provider.version,
+      authenticated: true,
+      headlessReview: { flags: requiredFlags, isolated: true, externalHooks: 0, externalSkills: 0, externalPlugins: 0, externalMcpServers: 0 },
+      acpIsolation: {
+        flags: requiredAgentFlags,
+        isolated: true,
+        sandbox: profile.sandbox,
+        permissionMode: profile.permissionMode,
+        injectDefaultTools: false,
+        agentProfileDigest,
+        unattendedPrivilegeExpansion: false
+      },
+      protocolVersion: provider.initialized.protocolVersion,
+      loadSession: Boolean(provider.initialized.agentCapabilities?.loadSession),
+      authMethods: (provider.initialized.authMethods || []).map((x) => ({ id: x.id, name: x.name })),
+      models: (provider.initialized?._meta?.modelState?.availableModels || []).map((x) => ({ id: x.modelId, efforts: (x._meta?.reasoningEfforts || []).map((e) => e.id) }))
+    };
   } finally {
     let shutdownError = null;
     if (provider) {

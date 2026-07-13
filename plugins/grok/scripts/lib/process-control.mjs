@@ -78,6 +78,10 @@ export function identityMatches(identity, marker, kind) {
   if (kind === "provider") {
     return /(?:^|\s)agent(?:\s+[^\r\n]*)?\s+stdio(?:\s|$)/.test(command) || command.includes("--prompt-file") || command.includes("--single");
   }
+  if (kind === "import") {
+    // Live `grok import --json` transfer processes are registered as import-kind providers.
+    return /(?:^|\s)import(?:\s|$)/.test(command) && /(?:^|\s)--json(?:\s|$)/.test(command);
+  }
   if (kind === "worker") {
     return command.includes("grok-companion.mjs") && command.includes("--worker");
   }

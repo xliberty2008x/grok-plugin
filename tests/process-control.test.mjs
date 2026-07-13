@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import process from "node:process";
 import test from "node:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { isGrokProcessCommand } from "../plugins/grok/scripts/lib/process-control.mjs";
+import { identityMatches, isGrokProcessCommand, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
+import { waitFor } from "./helpers.mjs";
 
 test("Grok ancestor classification recognizes official CLI launch forms", () => {
   for (const command of [
@@ -25,6 +26,23 @@ test("Grok ancestor classification rejects unrelated commands", () => {
     "/usr/bin/python /workspace/grok_review.py"
   ]) {
     assert.equal(isGrokProcessCommand(command), false, command);
+  }
+});
+
+test("import identity kind matches live grok import --json process commands", { skip: process.platform === "win32" }, async () => {
+  const marker = "transfer-import-identity-marker";
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "import", "--json", marker], {
+    detached: true,
+    stdio: "ignore"
+  });
+  try {
+    const startToken = await waitFor(() => processStartToken(child.pid));
+    const identity = { pid: child.pid, startToken, processGroupId: child.pid };
+    assert.equal(identityMatches(identity, marker, "import"), true);
+    assert.equal(identityMatches(identity, marker, "provider"), false, "import processes must not match the ACP/headless provider matcher");
+    assert.equal(identityMatches(identity, "wrong-marker", "import"), false);
+  } finally {
+    try { process.kill(-child.pid, "SIGKILL"); } catch {}
   }
 });
 
