@@ -1,0 +1,20 @@
+# Dependencies and build output
+node_modules/
+coverage/
+dist/
+build/
+plugins/grok/.generated/
+
+# Runtime and local state
+*.log
+*.pid
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
