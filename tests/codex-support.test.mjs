@@ -452,17 +452,25 @@ test("Codex manifest, marketplace, public skills, hooks, and wrapper form one in
 
   const codexHome = tempDir("grok-codex-wrapper-");
   t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  const helpEnv = {
+    ...process.env,
+    CODEX_HOME: codexHome,
+    CODEX_THREAD_ID: "codex-wrapper-test",
+    GROK_COMPANION_PLUGIN_DATA: path.join(codexHome, "plugin-data")
+  };
+  // Avoid nested-companion refusal when this suite runs under a Grok rescue worker.
+  delete helpEnv.GROK_COMPANION_CHILD;
+  delete helpEnv.GROK_COMPANION_JOB_MARKER;
+  delete helpEnv.GROK_AGENT;
+  delete helpEnv.GROK_LEADER_SOCKET;
   const run = spawnSync(process.execPath, [path.join(PLUGIN_ROOT, "scripts", "grok-codex.mjs"), "help"], {
     cwd: ROOT,
     encoding: "utf8",
     shell: false,
-    env: {
-      ...process.env,
-      CODEX_HOME: codexHome,
-      CODEX_THREAD_ID: "codex-wrapper-test",
-      GROK_COMPANION_PLUGIN_DATA: path.join(codexHome, "plugin-data")
-    }
+    env: helpEnv
   });
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stdout, /^Usage:/);
+  assert.match(run.stdout, /transfer \[--source <claude-or-codex-jsonl>\] \[--model <id>\] \[--effort low\|medium\|high\] \[--json\]/);
+  assert.doesNotMatch(run.stdout, /task-resume-candidate/);
 });

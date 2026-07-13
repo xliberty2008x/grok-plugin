@@ -24,7 +24,21 @@ try { event = raw.trim() ? JSON.parse(raw) : {}; } catch {}
 if (event.stop_hook_active === true) process.exit(0);
 const cwd = event.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
 const eventSessionId = event.session_id || event.sessionId || process.env.GROK_COMPANION_HOST_SESSION_ID || process.env.GROK_COMPANION_CLAUDE_SESSION_ID || null;
-process.env.GROK_COMPANION_HOST ||= process.env.PLUGIN_ROOT ? "codex" : "claude-code";
+// Prefer an existing host claim. Otherwise classify from Codex markers first
+// (CODEX_THREAD_ID / PLUGIN_DATA / PLUGIN_ROOT), then Claude markers; leave unset so
+// hostContext may remain cli when no host markers are present. Do not treat missing
+// PLUGIN_ROOT as Claude — Codex SessionStart guarantees PLUGIN_DATA, not PLUGIN_ROOT.
+if (!process.env.GROK_COMPANION_HOST) {
+  if (process.env.CODEX_THREAD_ID || process.env.PLUGIN_DATA || process.env.PLUGIN_ROOT) {
+    process.env.GROK_COMPANION_HOST = "codex";
+  } else if (
+    process.env.GROK_COMPANION_CLAUDE_SESSION_ID
+    || process.env.CLAUDE_PROJECT_DIR
+    || process.env.CLAUDE_PLUGIN_DATA
+  ) {
+    process.env.GROK_COMPANION_HOST = "claude-code";
+  }
+}
 if (eventSessionId) process.env.GROK_COMPANION_HOST_SESSION_ID ||= eventSessionId;
 const eventHost = hostContext();
 let root;

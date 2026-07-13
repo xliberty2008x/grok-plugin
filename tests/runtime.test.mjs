@@ -6,7 +6,9 @@ import test from "node:test";
 import { spawn } from "node:child_process";
 import { processGroupAlive, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
 import { hasForeignActiveProvider, registerProviderGuard, unregisterProviderGuard } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
-import { generateId } from "../plugins/grok/scripts/lib/state.mjs";
+import { generateId, logFile, writeJob } from "../plugins/grok/scripts/lib/state.mjs";
+import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
+import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import {
@@ -272,6 +274,118 @@ test("resume candidates preserve read/write profiles and never escalate an exist
   assert.ok(readFakeLog(fake.logFile).some((entry) =>
     entry.event === "rpc" && entry.message.method === "session/load" && entry.message.params.sessionId === write.grokSessionId
   ));
+});
+
+function seedTerminalTaskJob(root, env, { status, grokSessionId, write = false, id = generateId("task") }) {
+  // Align plugin-data roots with the companion env so writeJob and task-resume-candidate
+  // share the same workspace state (prefer CLAUDE_PLUGIN_DATA from the fixture).
+  const keys = ["CLAUDE_PLUGIN_DATA", "GROK_COMPANION_PLUGIN_DATA", "PLUGIN_DATA"];
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  process.env.CLAUDE_PLUGIN_DATA = env.CLAUDE_PLUGIN_DATA;
+  process.env.GROK_COMPANION_PLUGIN_DATA = env.CLAUDE_PLUGIN_DATA;
+  delete process.env.PLUGIN_DATA;
+  try {
+    const timestamp = new Date().toISOString();
+    const profile = profileFor("task", write);
+    writeJob(root, {
+      schemaVersion: 2,
+      id,
+      kind: "task",
+      jobClass: "task",
+      title: `seeded ${status} task`,
+      summary: status,
+      write,
+      status,
+      phase: status,
+      workspaceRoot: root,
+      host: {
+        kind: env.GROK_COMPANION_HOST || "claude-code",
+        sessionId: env.GROK_COMPANION_HOST_SESSION_ID || env.GROK_COMPANION_CLAUDE_SESSION_ID
+      },
+      grokSessionId,
+      createdAt: timestamp,
+      startedAt: timestamp,
+      updatedAt: timestamp,
+      completedAt: ["queued", "running"].includes(status) ? null : timestamp,
+      workerProcess: null,
+      providerProcess: null,
+      profile,
+      model: null,
+      effort: null,
+      logFile: logFile(root, id),
+      progress: null,
+      request: { prompt: null, resumeSessionId: null },
+      result: status === "completed" ? { text: "seeded" } : null,
+      error: status === "failed" ? { code: "E_PROVIDER_EXIT", message: "seeded failure" } : null
+    });
+    return id;
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+test("resume candidates accept failed and cancelled terminal tasks with a Grok session id", () => {
+  {
+    // realpath so workspaceState hash matches companion's workspaceRoot resolution
+    const root = fs.realpathSync(initRepo());
+    const { env } = fixture();
+    const failedSession = "11111111-1111-4111-8111-111111111111";
+    const failedId = seedTerminalTaskJob(root, env, { status: "failed", grokSessionId: failedSession });
+    const candidate = parseJson(runCompanion(["task-resume-candidate", "--json"], { cwd: root, env }));
+    assert.deepEqual(candidate, {
+      available: true,
+      jobId: failedId,
+      grokSessionId: failedSession,
+      profileId: "rescue-read-v2"
+    });
+  }
+
+  {
+    const root = fs.realpathSync(initRepo());
+    const { env } = fixture();
+    const cancelledSession = "22222222-2222-4222-8222-222222222222";
+    const cancelledId = seedTerminalTaskJob(root, env, {
+      status: "cancelled",
+      grokSessionId: cancelledSession
+    });
+    const candidate = parseJson(runCompanion(["task-resume-candidate", "--json"], { cwd: root, env }));
+    assert.deepEqual(candidate, {
+      available: true,
+      jobId: cancelledId,
+      grokSessionId: cancelledSession,
+      profileId: "rescue-read-v2"
+    });
+  }
+});
+
+test("resume candidates reject queued and running tasks even when a Grok session id is present", () => {
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  seedTerminalTaskJob(root, env, {
+    status: "queued",
+    grokSessionId: "33333333-3333-4333-8333-333333333333"
+  });
+  seedTerminalTaskJob(root, env, {
+    status: "running",
+    grokSessionId: "44444444-4444-4444-8444-444444444444"
+  });
+
+  const candidate = parseJson(runCompanion(["task-resume-candidate", "--json"], { cwd: root, env }));
+  assert.deepEqual(candidate, {
+    available: false,
+    jobId: null,
+    grokSessionId: null,
+    profileId: null
+  });
+
+  const resume = runCompanion(
+    ["task", "--wait", "--resume", "should not resume active work", "--json"],
+    { cwd: root, env }
+  );
+  parseError(resume, "E_NO_RESUME_CANDIDATE");
 });
 
 test("background task is durable across command processes and supports status, wait, and result", () => {
@@ -1326,6 +1440,105 @@ test("Codex wrapper imports the captured current transcript through a privacy-fi
   const importedInput = readFakeLog(fake.logFile).find((entry) => entry.event === "import-input");
   assert.ok(importedInput.bytes > 0);
   assert.notEqual(importedInput.bytes, fs.statSync(source).size, "raw Codex transcript was forwarded without filtering");
+});
+
+test("transfer rejects unavailable model/effort before conversion or alias artifacts", () => {
+  const root = fs.realpathSync(initRepo());
+  const { fake, env } = fixture({ importSessionId: "12345678-1234-4234-8234-123456789abc" });
+  const home = tempDir("grok-transfer-cap-home-");
+  const codexHome = path.join(home, ".codex");
+  const sessions = path.join(codexHome, "sessions", "2026", "07", "13");
+  const pluginData = path.join(codexHome, "plugins", "data", "grok-grok-companion");
+  const threadId = crypto.randomUUID();
+  fs.mkdirSync(sessions, { recursive: true, mode: 0o700 });
+  const source = path.join(sessions, `rollout-${threadId}.jsonl`);
+  // Valid Codex transcript that would require conversion if capability checks ran later.
+  const records = [
+    { timestamp: "2026-07-13T10:00:00.000Z", type: "session_meta", payload: { id: threadId, cwd: root, cli_version: "0.143.0" } },
+    { timestamp: "2026-07-13T10:00:01.000Z", type: "event_msg", payload: { type: "user_message", message: "VISIBLE_CODEX_USER_TEXT" } },
+    { timestamp: "2026-07-13T10:00:02.000Z", type: "event_msg", payload: { type: "agent_message", phase: "final_answer", message: "VISIBLE_CODEX_ASSISTANT_TEXT" } }
+  ];
+  fs.writeFileSync(source, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+  writeCodexSessionMetadata(pluginData, { sessionId: threadId, transcriptPath: source, cwd: root });
+
+  const transferEnv = {
+    ...env,
+    HOME: home,
+    CODEX_HOME: codexHome,
+    CODEX_THREAD_ID: threadId
+  };
+  delete transferEnv.CLAUDE_PLUGIN_DATA;
+  delete transferEnv.GROK_COMPANION_CLAUDE_SESSION_ID;
+  delete transferEnv.GROK_COMPANION_HOST;
+  delete transferEnv.GROK_COMPANION_HOST_SESSION_ID;
+  delete transferEnv.GROK_COMPANION_PLUGIN_DATA;
+
+  function assertFailedBeforeArtifacts(result, restrictedLog = null) {
+    assert.notEqual(result.status, 0, result.stdout);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.ok, false);
+    // Healthy runners reject with E_CAPABILITY after a successful probe. Restricted
+    // sandboxes may fail probe teardown with E_PROCESS_IDENTITY — still before conversion.
+    assert.ok(
+      payload.error.code === "E_CAPABILITY" || payload.error.code === "E_PROCESS_IDENTITY",
+      `unexpected error ${payload.error.code}: ${payload.error.message}`
+    );
+    if (payload.error.code === "E_CAPABILITY") {
+      assert.match(payload.error.message, /not advertised|not-a-real-model|effort high/i);
+    }
+    // Ordering proof: imports dir is created only after probe+capability succeed.
+    const previous = process.env.GROK_COMPANION_PLUGIN_DATA;
+    process.env.GROK_COMPANION_PLUGIN_DATA = pluginData;
+    try {
+      const importsDir = path.join(workspaceState(root), "imports");
+      assert.equal(fs.existsSync(importsDir), false, "must not create import/conversion artifacts before capability acceptance");
+    } finally {
+      if (previous === undefined) delete process.env.GROK_COMPANION_PLUGIN_DATA;
+      else process.env.GROK_COMPANION_PLUGIN_DATA = previous;
+    }
+    assert.equal(readFakeLog(fake.logFile).some((entry) => entry.event === "import-input"), false, "import must not run");
+    if (restrictedLog) {
+      assert.equal(readFakeLog(restrictedLog).some((entry) => entry.event === "import-input"), false);
+    }
+    return payload.error;
+  }
+
+  const modelError = assertFailedBeforeArtifacts(runCodexCompanion(
+    ["transfer", "--source", source, "--model", "not-a-real-model", "--json"],
+    { cwd: root, env: transferEnv }
+  ));
+  if (modelError.code === "E_CAPABILITY") {
+    assert.match(modelError.message, /not-a-real-model|not advertised/i);
+  }
+
+  const restricted = installFakeGrok(tempDir("fake-grok-transfer-effort-"), {
+    models: [{ modelId: "grok-test", _meta: { reasoningEfforts: [{ id: "low" }] } }],
+    importSessionId: "12345678-1234-4234-8234-123456789abc"
+  });
+  const effortError = assertFailedBeforeArtifacts(
+    runCodexCompanion(
+      ["transfer", "--source", source, "--model", "grok-test", "--effort", "high", "--json"],
+      { cwd: root, env: { ...transferEnv, GROK_BIN: restricted.binary, GROK_AUTH_PATH: restricted.authPath } }
+    ),
+    restricted.logFile
+  );
+  if (effortError.code === "E_CAPABILITY") {
+    assert.match(effortError.message, /effort high|not advertised/i);
+  }
+
+  // When the environment can complete probe+import, model/effort still flow into resume.
+  const ok = runCodexCompanion(
+    ["transfer", "--source", source, "--model", "grok-test", "--effort", "high", "--json"],
+    { cwd: root, env: transferEnv }
+  );
+  if (ok.status === 0) {
+    const imported = JSON.parse(ok.stdout);
+    assert.equal(imported.model, "grok-test");
+    assert.equal(imported.effort, "high");
+    assert.equal(imported.resume, "grok --model grok-test --reasoning-effort high --resume 12345678-1234-4234-8234-123456789abc");
+  } else {
+    assert.equal(JSON.parse(ok.stdout).error.code, "E_PROCESS_IDENTITY");
+  }
 });
 
 test("transfer rejects malformed UUIDs, malformed NDJSON, and nonzero import exits", () => {

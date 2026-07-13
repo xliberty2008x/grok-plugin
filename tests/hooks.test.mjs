@@ -916,6 +916,86 @@ test("enabled stop gate preserves primary BLOCK reason when isolated-home cleanu
   }
 });
 
+test("Codex stop gate classifies PLUGIN_DATA host, preserves session id, and uses $grok remediation", async () => {
+  const root = fs.realpathSync(initRepo());
+  // Brief delay so the stop-review job is observable with host.kind before completion removes it.
+  const fake = installFakeGrok(tempDir("fake-grok-stop-codex-"), {
+    taskText: "not an allow/block decision",
+    headlessDelayMs: 400
+  });
+  const pluginData = tempDir("grok-hook-data-codex-");
+  const sessionId = "codex-stop-session";
+  const previous = {
+    PLUGIN_DATA: process.env.PLUGIN_DATA,
+    GROK_COMPANION_PLUGIN_DATA: process.env.GROK_COMPANION_PLUGIN_DATA,
+    CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA
+  };
+  const restorePluginRoots = () => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+  process.env.PLUGIN_DATA = pluginData;
+  process.env.GROK_COMPANION_PLUGIN_DATA = pluginData;
+  delete process.env.CLAUDE_PLUGIN_DATA;
+  try {
+    setConfig(root, { stopReviewGate: true });
+  } finally {
+    restorePluginRoots();
+  }
+
+  const env = {
+    ...process.env,
+    GROK_BIN: fake.binary,
+    GROK_AUTH_PATH: fake.authPath,
+    PLUGIN_DATA: pluginData,
+    // Isolate workspace state without claiming host via GROK_COMPANION_HOST.
+    GROK_COMPANION_PLUGIN_DATA: pluginData
+  };
+  // Codex-like: PLUGIN_DATA + event session_id only — no PLUGIN_ROOT / GROK_COMPANION_HOST.
+  delete env.GROK_COMPANION_HOST;
+  delete env.GROK_COMPANION_HOST_SESSION_ID;
+  delete env.GROK_COMPANION_CLAUDE_SESSION_ID;
+  delete env.PLUGIN_ROOT;
+  delete env.CLAUDE_PLUGIN_DATA;
+  delete env.CLAUDE_PROJECT_DIR;
+  delete env.CLAUDE_ENV_FILE;
+  delete env.CODEX_THREAD_ID;
+  delete env.GROK_COMPANION_CHILD;
+  delete env.GROK_COMPANION_JOB_MARKER;
+  delete env.GROK_AGENT;
+  delete env.GROK_LEADER_SOCKET;
+
+  const running = spawnHook(
+    STOP_HOOK,
+    null,
+    { cwd: root, session_id: sessionId, last_assistant_message: "Edited under Codex." },
+    { cwd: root, env }
+  );
+
+  const active = await waitFor(() => {
+    process.env.PLUGIN_DATA = pluginData;
+    process.env.GROK_COMPANION_PLUGIN_DATA = pluginData;
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    try {
+      return listJobs(root).find((candidate) => candidate.kind === "stop-review") || null;
+    } finally {
+      restorePluginRoots();
+    }
+  });
+  assert.deepEqual(active.host, { kind: "codex", sessionId });
+
+  const completed = await running.completed;
+  assert.equal(completed.code, 0, completed.stderr);
+  const payload = JSON.parse(completed.stdout);
+  assert.equal(payload.decision, "block");
+  // Codex remediation uses $grok: form (not /grok:), whether from malformed
+  // output ($grok:review) or provider/cleanup failure ($grok:setup).
+  assert.match(payload.reason, /\$grok:(review|setup)/);
+  assert.doesNotMatch(payload.reason, /\/grok:/);
+});
+
 test("a crashed stop hook honors explicit host context and is recovered without retaining its provider or isolated home", async (t) => {
   const root = fs.realpathSync(initRepo());
   const fake = installFakeGrok(tempDir("fake-grok-stop-crash-"), { taskText: "ALLOW: complete", headlessDelayMs: 60_000 });
@@ -1035,8 +1115,14 @@ test("enabled stop gate fails open with setup guidance when Grok is missing", ()
     HOME: isolatedHome,
     PATH: isolatedBin,
     GROK_BIN: path.join(isolatedBin, "missing-grok"),
+    // Explicit Claude host: inherited Codex markers (PLUGIN_DATA/PLUGIN_ROOT/CODEX_THREAD_ID)
+    // would otherwise win host classification and emit $grok:setup instead of /grok:setup.
+    GROK_COMPANION_HOST: "claude-code",
     CLAUDE_PLUGIN_DATA: pluginData
   };
+  delete env.PLUGIN_DATA;
+  delete env.PLUGIN_ROOT;
+  delete env.CODEX_THREAD_ID;
   const result = hook(
     STOP_HOOK,
     null,

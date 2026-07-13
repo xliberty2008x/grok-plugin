@@ -24,7 +24,7 @@ const PLUGIN_ROOT = path.resolve(path.dirname(SCRIPT), "..");
 const VALID_EFFORTS = new Set(["low", "medium", "high"]);
 
 function usage() {
-  return ["Usage:", "  grok-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]", "  grok-companion.mjs review|adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]", "  grok-companion.mjs task [--wait|--background] [--write] [--resume|--fresh] [--model <id>] [--effort low|medium|high] <task>", "  grok-companion.mjs transfer [--source <claude-or-codex-jsonl>] [--json]", "  grok-companion.mjs status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--json]", "  grok-companion.mjs result [job-id] [--json]", "  grok-companion.mjs cancel [job-id] [--json]"].join("\n");
+  return ["Usage:", "  grok-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]", "  grok-companion.mjs review|adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]", "  grok-companion.mjs task [--wait|--background] [--write] [--resume|--fresh] [--model <id>] [--effort low|medium|high] <task>", "  grok-companion.mjs transfer [--source <claude-or-codex-jsonl>] [--model <id>] [--effort low|medium|high] [--json]", "  grok-companion.mjs status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--json]", "  grok-companion.mjs result [job-id] [--json]", "  grok-companion.mjs cancel [job-id] [--json]"].join("\n");
 }
 
 function argvFrom(raw) { return raw.length === 1 && /\s/.test(raw[0]) ? splitArgs(raw[0]) : raw; }
@@ -314,7 +314,9 @@ async function handleReview(command, raw) {
 function resumeCandidate(root, profile) {
   const host = currentHost();
   if (!host.sessionId) return null;
-  return listJobs(root).find((job) => job.kind === "task" && job.status === "completed" && job.grokSessionId && sameHostSession(job, host) && sameSecurityProfile(job.profile, profile));
+  // SPEC §11.5: any finished task (not queued/running) with a Grok session ID is eligible,
+  // including failed/cancelled — not only completed.
+  return listJobs(root).find((job) => job.kind === "task" && terminal(job) && job.grokSessionId && sameHostSession(job, host) && sameSecurityProfile(job.profile, profile));
 }
 
 async function handleTask(raw) {
@@ -478,6 +480,13 @@ async function handleTransfer(raw) {
   process.once("SIGTERM", abort);
   try {
     const binary = discoverGrok(); grokVersion(binary);
+    // After path-validated open, probe model/effort before Codex conversion or alias creation
+    // so unavailable selections fail without private conversion work. finally still closes every
+    // opened descriptor/artifact (source fd, converted fd/file, import alias).
+    const runtime = await probe(root, stateDir(root));
+    const selected = options.model ? runtime.models.find((item) => item.id === options.model) : runtime.models[0];
+    if (!selected) throw new CompanionError("E_CAPABILITY", options.model ? `Model ${options.model} is not advertised by Grok.` : "Grok did not advertise a model that can resume the imported session.", { available: runtime.models.map((item) => item.id) });
+    if (options.effort && selected.efforts.length && !selected.efforts.includes(options.effort)) throw new CompanionError("E_CAPABILITY", `Reasoning effort ${options.effort} is not advertised for model ${selected.id}.`, { available: selected.efforts });
     const importDir = path.join(stateDir(root), "imports");
     fs.mkdirSync(importDir, { recursive: true, mode: 0o700 });
     if (opened.format === "codex") {
@@ -487,10 +496,6 @@ async function handleTransfer(raw) {
       convertedFile = anonymous.file;
     }
     importAlias = path.join(importDir, `import-${crypto.randomBytes(12).toString("hex")}.jsonl`);
-    const runtime = await probe(root, stateDir(root));
-    const selected = options.model ? runtime.models.find((item) => item.id === options.model) : runtime.models[0];
-    if (!selected) throw new CompanionError("E_CAPABILITY", options.model ? `Model ${options.model} is not advertised by Grok.` : "Grok did not advertise a model that can resume the imported session.", { available: runtime.models.map((item) => item.id) });
-    if (options.effort && selected.efforts.length && !selected.efforts.includes(options.effort)) throw new CompanionError("E_CAPABILITY", `Reasoning effort ${options.effort} is not advertised for model ${selected.id}.`, { available: selected.efforts });
     const inheritedFd = process.platform === "linux" ? "/proc/self/fd/3" : "/dev/fd/3";
     fs.symlinkSync(inheritedFd, importAlias);
     const marker = `transfer-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
