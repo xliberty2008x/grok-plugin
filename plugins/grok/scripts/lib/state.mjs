@@ -37,11 +37,28 @@ function readPrivateFile(file, { maxBytes = 8 * 1024 * 1024 } = {}) {
   }
 }
 
-function atomicJson(file, value) {
+function atomicPrivateFile(file, contents) {
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
-  const fd = fs.openSync(tmp, "wx", 0o600);
-  try { fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  fs.renameSync(tmp, file);
+  let descriptor;
+  try {
+    descriptor = fs.openSync(tmp, "wx", 0o600);
+    fs.writeFileSync(descriptor, contents);
+    fs.fchmodSync(descriptor, 0o600);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    if (descriptor != null) {
+      try { fs.closeSync(descriptor); } catch {}
+    }
+    try { fs.unlinkSync(tmp); } catch {}
+    throw error;
+  }
+}
+
+function atomicJson(file, value) {
+  atomicPrivateFile(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function withLock(root, name, action) {
@@ -193,14 +210,10 @@ export function requestCancel(root, id, nonce) {
     throw new CompanionError("E_PROCESS_IDENTITY", "Refusing to create a cancellation marker without the active worker nonce.");
   }
   const file = cancelFile(root, id);
-  let descriptor;
-  try {
-    descriptor = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | (fs.constants.O_NOFOLLOW || 0), 0o600);
-    fs.writeFileSync(descriptor, `${nonce}\n`);
-    fs.fchmodSync(descriptor, 0o600);
-  } finally {
-    if (descriptor != null) fs.closeSync(descriptor);
-  }
+  // Publish only a fully written marker. Creating/truncating the destination
+  // first lets another process observe an empty nonce between open and write,
+  // which can lose a launch-window cancellation on slower runtimes.
+  atomicPrivateFile(file, `${nonce}\n`);
 }
 
 export function isCancelRequested(root, id, expectedNonce) {

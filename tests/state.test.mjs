@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -253,6 +254,17 @@ test("cancellation markers are private and retention keeps active plus newest te
     assert.equal(isCancelRequested(root, activeId), false);
     assert.equal(fs.readFileSync(cancelFile(root, activeId), "utf8"), "nonce-value\n");
     assert.equal(fs.statSync(cancelFile(root, activeId)).mode & 0o777, 0o600);
+
+    requestCancel(root, activeId, "replacement-nonce");
+    assert.equal(isCancelRequested(root, activeId, "nonce-value"), false);
+    assert.equal(isCancelRequested(root, activeId, "replacement-nonce"), true);
+    assert.equal(fs.readFileSync(cancelFile(root, activeId), "utf8"), "replacement-nonce\n");
+    assert.equal(fs.statSync(cancelFile(root, activeId)).mode & 0o777, 0o600);
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(cancelFile(root, activeId))).filter((name) => name.startsWith(`${activeId}.cancel.`)),
+      [],
+      "atomic cancellation publication left a temporary marker"
+    );
 
     const terminalIds = [];
     for (let index = 0; index < 4; index += 1) {

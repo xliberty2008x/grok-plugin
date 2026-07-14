@@ -54,6 +54,10 @@ Status: hardening candidate; not release-qualified.
   admission lock, defers while another continuation owns the lineage, retries
   cleanup-blocked verified process termination, and retains task/review homes,
   profiles, guards, and the intended terminal outcome until cleanup succeeds.
+- Publish authenticated cancellation markers through a mode-`0600`, fsynced
+  temporary file and atomic rename. This closes the launch-window race exposed
+  by Ubuntu Node 18 CI, where SessionEnd or a worker could observe an existing
+  but still-empty nonce file between destination creation and the write.
 - Added a fail-closed RC/stable promotion gate. Evidence binds a deterministic
   source inventory without self-referencing its own record and must contain
   separate installed, authenticated boundary results for both advertised hosts;
