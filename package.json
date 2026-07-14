@@ -1,6 +1,6 @@
 {
   "name": "grok-plugin",
-  "version": "0.2.0",
+  "version": "0.3.0-dev.1",
   "private": true,
   "type": "module",
   "description": "Claude Code and Codex companion plugin for the official Grok Build CLI",
@@ -10,6 +10,10 @@
   "scripts": {
     "test": "node --test tests/*.test.mjs",
     "test:e2e": "node --test tests/live-grok.test.mjs",
+    "test:pty-ingress": "node --test tests/pty-ingress.test.mjs",
+    "test:installed-codex": "node --test tests/installed-codex.test.mjs",
+    "test:natural-codex": "node scripts/test-natural-codex.mjs",
+    "codex:update-local": "node scripts/update-local-codex.mjs",
     "validate": "node scripts/validate.mjs",
     "version:check": "node scripts/validate.mjs --versions-only",
     "version:bump": "node scripts/bump-version.mjs",

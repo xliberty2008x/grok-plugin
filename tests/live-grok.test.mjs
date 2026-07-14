@@ -16,6 +16,7 @@ const STOP_HOOK = path.join(REPOSITORY, "plugins", "grok", "scripts", "stop-revi
 const LIVE_ENABLED = process.env.GROK_E2E === "1" || process.env.npm_lifecycle_event === "test:e2e";
 const CANCELLATION_ENABLED = process.env.GROK_E2E_CANCEL === "1";
 const KEEP_FIXTURE = process.env.GROK_E2E_KEEP === "1";
+const LIVE_ONLY = process.env.GROK_E2E_ONLY || null;
 const CLAUDE_SESSION = `live-grok-${crypto.randomBytes(8).toString("hex")}`;
 
 function run(executable, args, { cwd, env = process.env, input, timeout = 60_000 } = {}) {
@@ -38,10 +39,11 @@ function git(cwd, args) {
   return result.stdout;
 }
 
-function companion(env, cwd, args, timeout = 10 * 60_000) {
+function companion(env, cwd, args, timeout = 10 * 60_000, input = undefined) {
   const result = run(process.execPath, [COMPANION, ...args, "--json", "--cwd", cwd], {
     cwd,
     env,
+    input,
     timeout
   });
   assert.equal(
@@ -54,6 +56,46 @@ function companion(env, cwd, args, timeout = 10 * 60_000) {
   } catch (error) {
     assert.fail(`Companion returned invalid JSON: ${error.message}\n${result.stdout}`);
   }
+}
+
+function companionTask(env, root, {
+  userRequest,
+  write = false,
+  background = false,
+  jobId = null,
+  include = [],
+  exclude = [],
+  requiredPaths = [],
+  acceptance = "Complete the bounded task and report exact evidence."
+}, timeout = 10 * 60_000) {
+  const envelope = {
+    schemaVersion: 1,
+    userRequest,
+    objective: acceptance,
+    mode: write ? "write" : "read",
+    scope: { include, exclude },
+    context: {
+      facts: ["Authenticated isolated E2E fixture."],
+      constraints: ["Do not modify files outside the declared scope."],
+      expectedProjectMarkers: [],
+      requiredPaths,
+      workspaceState: "task_scoped",
+      upstreamFreshness: "not_checked"
+    },
+    nonGoals: ["Do not use web, subagents, MCP, or Grok Companion recursively."],
+    acceptanceCriteria: [{ id: "AC-01", text: acceptance }],
+    requiredVerification: [],
+    expectedReturnFormat: "End with GROK_WORKER_REPORT followed by the required JSON object."
+  };
+  const args = [
+    "task",
+    background ? "--background" : "--wait",
+    ...(write ? ["--write"] : []),
+    ...(jobId ? ["--job-id", jobId] : ["--fresh"]),
+    ...selectionArgs(),
+    "--envelope-stdin"
+  ];
+  return companion(env, root, args, timeout, JSON.stringify(envelope));
 }
 
 function fileEntries(root) {
@@ -151,6 +193,13 @@ async function waitForJob(env, root, id, predicate, timeoutMs) {
   return job;
 }
 
+function liveSubtest(t, name, optionsOrRun, maybeRun) {
+  const options = typeof optionsOrRun === "function" ? {} : { ...(optionsOrRun || {}) };
+  const runTest = typeof optionsOrRun === "function" ? optionsOrRun : maybeRun;
+  if (LIVE_ONLY && !name.includes(LIVE_ONLY)) options.skip = `GROK_E2E_ONLY=${LIVE_ONLY}`;
+  return t.test(name, options, runTest);
+}
+
 test("authenticated Grok end-to-end flow", { skip: !LIVE_ENABLED, timeout: 40 * 60_000 }, async (t) => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "grok-plugin-e2e-"));
   const root = path.join(temporary, "repository");
@@ -166,6 +215,18 @@ test("authenticated Grok end-to-end flow", { skip: !LIVE_ENABLED, timeout: 40 * 
   const providerSessions = new Set();
   let grokBinary = null;
   let transcriptDirectory = null;
+
+  const initializeGrok = () => {
+    const setup = companion(env, root, ["setup"], 90_000);
+    assert.equal(setup.ready, true, JSON.stringify(setup));
+    assert.equal(setup.grok.protocolVersion, 1);
+    assert.equal(setup.grok.loadSession, true);
+    assert.equal(setup.grok.acpIsolation?.isolated, true);
+    assert.match(setup.grok.version, /^\d+\.\d+\.\d+/);
+    assert.ok(path.isAbsolute(setup.grok.binary));
+    grokBinary = setup.grok.binary;
+    return setup;
+  };
 
   t.diagnostic("This opt-in suite invokes the authenticated Grok CLI and may consume quota.");
   t.diagnostic(`Fixture: ${temporary}`);
@@ -200,18 +261,11 @@ test("authenticated Grok end-to-end flow", { skip: !LIVE_ENABLED, timeout: 40 * 
   git(root, ["add", "app.mjs", "README.md", "READ_ONLY_TOKEN.txt"]);
   git(root, ["commit", "-m", "baseline"]);
 
-  await t.test("setup initializes ACP", () => {
-    const setup = companion(env, root, ["setup"], 90_000);
-    assert.equal(setup.ready, true, JSON.stringify(setup));
-    assert.equal(setup.grok.protocolVersion, 1);
-    assert.equal(setup.grok.loadSession, true);
-    assert.equal(setup.grok.acpIsolation?.isolated, true);
-    assert.match(setup.grok.version, /^\d+\.\d+\.\d+/);
-    assert.ok(path.isAbsolute(setup.grok.binary));
-    grokBinary = setup.grok.binary;
+  await liveSubtest(t, "setup initializes ACP", () => {
+    initializeGrok();
   });
 
-  await t.test("read-only review preserves every fixture file", () => {
+  await liveSubtest(t, "read-only review preserves every fixture file", () => {
     fs.appendFileSync(path.join(root, "app.mjs"), "\n// Review-only E2E change.\n", "utf8");
     const before = repositorySnapshot(root);
     const job = companion(env, root, ["review", "--wait", "--scope", "working-tree"], 12 * 60_000);
@@ -224,28 +278,26 @@ test("authenticated Grok end-to-end flow", { skip: !LIVE_ENABLED, timeout: 40 * 
     git(root, ["commit", "-m", "review fixture"]);
   });
 
-  await t.test("isolated read-only ACP task reads the repository without changing it", () => {
+  await liveSubtest(t, "isolated read-only ACP task reads the repository without changing it", () => {
     const before = repositorySnapshot(root);
-    const task = companion(
+    const taskJob = companionTask(
       env,
       root,
-      [
-        "task",
-        "--wait",
-        "--fresh",
-        ...selectionArgs(),
-        "Read READ_ONLY_TOKEN.txt and reply with the exact token it contains. Do not edit files or run shell commands."
-      ],
+      {
+        userRequest: "Read READ_ONLY_TOKEN.txt. Put the exact token in the final report summary. Do not edit files.",
+        requiredPaths: ["READ_ONLY_TOKEN.txt", "app.mjs"],
+        acceptance: "The final report contains the exact READ_ONLY_TOKEN.txt token and the workspace is unchanged."
+      },
       8 * 60_000
     );
-    assert.equal(task.status, "completed", JSON.stringify(task.error));
-    assert.equal(task.profile?.id, "rescue-read-v2");
-    assert.ok(task.grokSessionId, "read-only task did not record a Grok session ID");
-    assert.match(task.result?.text || "", new RegExp(readToken), "read-only task did not return the repository token");
+    assert.equal(taskJob.status, "completed", JSON.stringify(taskJob.error));
+    assert.equal(taskJob.profileId, "rescue-read-v3");
+    assert.equal(taskJob.result?.workerReport?.valid, true, JSON.stringify(taskJob.result?.workerReport));
+    assert.match(JSON.stringify(taskJob.result.workerReport), new RegExp(readToken), "read-only task did not return the repository token");
     assert.deepEqual(repositorySnapshot(root), before, "isolated read-only ACP task changed the fixture repository");
   });
 
-  await t.test("stop-time review gate runs against a clean repository without mutation", () => {
+  await liveSubtest(t, "stop-time review gate runs against a clean repository without mutation", () => {
     const enabled = companion(env, root, ["setup", "--enable-review-gate"], 90_000);
     assert.equal(enabled.ready, true, JSON.stringify(enabled));
     assert.equal(enabled.config.stopReviewGate, true);
@@ -267,24 +319,24 @@ test("authenticated Grok end-to-end flow", { skip: !LIVE_ENABLED, timeout: 40 * 
 
   const createToken = `LIVE_GROK_CREATE_${crypto.randomBytes(8).toString("hex")}`;
   let firstTask;
-  await t.test("write task creates only the requested sentinel", () => {
+  await liveSubtest(t, "write task creates only the requested sentinel", () => {
     const before = repositorySnapshot(root);
-    firstTask = companion(
+    firstTask = companionTask(
       env,
       root,
-      [
-        "task",
-        "--wait",
-        "--write",
-        "--fresh",
-        ...selectionArgs(),
-        `Create a file named E2E_SENTINEL.txt containing exactly ${createToken} followed by a newline. Do not modify any other file.`
-      ],
+      {
+        write: true,
+        userRequest: `Create E2E_SENTINEL.txt containing exactly ${createToken} followed by one newline. Do not modify any other file.`,
+        include: ["E2E_SENTINEL.txt"],
+        requiredPaths: ["app.mjs", "README.md"],
+        acceptance: "E2E_SENTINEL.txt exists with the exact requested bytes and no other file changes."
+      },
       12 * 60_000
     );
     assert.equal(firstTask.status, "completed", JSON.stringify(firstTask.error));
-    assert.ok(firstTask.grokSessionId, "write task did not record a Grok session ID");
-    assert.equal(firstTask.profile?.id, "rescue-write-v2");
+    assert.equal(firstTask.profileId, "rescue-write-v3");
+    assert.equal(firstTask.result?.workerReport?.valid, true, JSON.stringify(firstTask.result?.workerReport));
+    assert.deepEqual(firstTask.result?.runtimeEvidence?.observedChangedPaths, ["E2E_SENTINEL.txt"]);
     assert.equal(fs.readFileSync(path.join(root, "E2E_SENTINEL.txt"), "utf8"), `${createToken}\n`);
     const after = repositorySnapshot(root);
     assert.deepEqual(
@@ -294,24 +346,26 @@ test("authenticated Grok end-to-end flow", { skip: !LIVE_ENABLED, timeout: 40 * 
     );
   });
 
-  await t.test("resume loads the same Grok session", () => {
+  await liveSubtest(t, "resume loads the same Grok session", () => {
     const resumeToken = `LIVE_GROK_RESUME_${crypto.randomBytes(8).toString("hex")}`;
     const before = repositorySnapshot(root);
-    const resumed = companion(
+    const resumed = companionTask(
       env,
       root,
-      [
-        "task",
-        "--wait",
-        "--write",
-        "--resume",
-        ...selectionArgs(),
-        `Append exactly ${resumeToken} followed by a newline to E2E_SENTINEL.txt. Do not modify any other file.`
-      ],
+      {
+        write: true,
+        jobId: firstTask.id,
+        userRequest: `Append exactly ${resumeToken} followed by one newline to E2E_SENTINEL.txt. Do not modify any other file.`,
+        include: ["E2E_SENTINEL.txt"],
+        requiredPaths: ["E2E_SENTINEL.txt"],
+        acceptance: "E2E_SENTINEL.txt retains its existing line and has the requested second line; no other files change."
+      },
       12 * 60_000
     );
     assert.equal(resumed.status, "completed", JSON.stringify(resumed.error));
-    assert.equal(resumed.grokSessionId, firstTask.grokSessionId, "resume created a different Grok session");
+    assert.equal(resumed.profileId, "rescue-write-v3");
+    assert.equal(resumed.resumeJobId, firstTask.id);
+    assert.equal(resumed.result?.workerReport?.valid, true, JSON.stringify(resumed.result?.workerReport));
     assert.equal(fs.readFileSync(path.join(root, "E2E_SENTINEL.txt"), "utf8"), `${createToken}\n${resumeToken}\n`);
     const after = repositorySnapshot(root);
     assert.deepEqual(
@@ -321,41 +375,29 @@ test("authenticated Grok end-to-end flow", { skip: !LIVE_ENABLED, timeout: 40 * 
     );
   });
 
-  await t.test("nested companion invocation from a Grok task is refused", () => {
+  await liveSubtest(t, "write worker has no terminal or recursive companion capability", () => {
     const before = repositorySnapshot(root);
-    const command = [
-      "/usr/bin/env",
-      "-u GROK_COMPANION_CHILD",
-      "-u GROK_COMPANION_JOB_MARKER",
-      "-u GROK_AGENT",
-      "-u GROK_LEADER_SOCKET",
-      process.execPath,
-      COMPANION,
-      "setup --json --cwd",
-      root,
-      "2>&1"
-    ].join(" ");
-    const task = companion(
+    const taskJob = companionTask(
       env,
       root,
-      [
-        "task",
-        "--wait",
-        "--write",
-        "--fresh",
-        ...selectionArgs(),
-        `Use the terminal tool to run the command on the next line exactly once, then return its complete output verbatim. Do not modify any files.\n${command}`
-      ],
+      {
+        write: true,
+        userRequest: "Do not edit files. Inspect only your available tools and report that terminal, shell, subagent, web, and recursive Grok Companion execution are unavailable. Do not attempt any such invocation.",
+        include: ["E2E_SENTINEL.txt"],
+        requiredPaths: ["E2E_SENTINEL.txt"],
+        acceptance: "No file changes occur and the report acknowledges the unavailable execution capabilities."
+      },
       8 * 60_000
     );
-    assert.equal(task.status, "completed", JSON.stringify(task.error));
-    assert.ok(task.grokSessionId, "recursion test did not record a Grok session ID");
-    assert.match(task.result?.text || "", /E_RECURSION|Nested Grok Companion invocation refused/i);
+    assert.equal(taskJob.status, "completed", JSON.stringify(taskJob.error));
+    assert.equal(taskJob.profileId, "rescue-write-v3");
+    assert.equal(taskJob.result?.workerReport?.valid, true, JSON.stringify(taskJob.result?.workerReport));
+    assert.deepEqual(taskJob.result?.runtimeEvidence?.observedChangedPaths, []);
     assert.deepEqual(repositorySnapshot(root), before, "recursion refusal task changed the fixture repository");
   });
 
-  await t.test("transfer imports Claude JSONL and resumes it directly with Grok", () => {
-    assert.ok(grokBinary, "setup did not record the Grok executable");
+  await liveSubtest(t, "transfer imports Claude JSONL and resumes it directly with Grok", () => {
+    if (!grokBinary) initializeGrok();
     const projects = path.join(env.HOME || os.homedir(), ".claude", "projects");
     fs.mkdirSync(projects, { recursive: true, mode: 0o700 });
     // Keep the real HOME so cached Grok authentication remains available, but
@@ -364,12 +406,15 @@ test("authenticated Grok end-to-end flow", { skip: !LIVE_ENABLED, timeout: 40 * 
     const sourceSessionId = crypto.randomUUID();
     const phrase = `LIVE_GROK_IMPORT_${crypto.randomBytes(8).toString("hex")}`;
     const source = path.join(transcriptDirectory, `${sourceSessionId}.jsonl`);
-    fs.writeFileSync(source, claudeTranscript(root, sourceSessionId, phrase), { encoding: "utf8", mode: 0o600 });
+    fs.writeFileSync(source, claudeTranscript(fs.realpathSync(root), sourceSessionId, phrase), { encoding: "utf8", mode: 0o600 });
 
     const imported = companion(env, root, ["transfer", "--source", source, ...selectionArgs()], 3 * 60_000);
     assert.ok(imported.sessionId, JSON.stringify(imported));
     assert.ok(imported.model, JSON.stringify(imported));
-    assert.equal(imported.resume, `grok --model ${imported.model}${imported.effort ? ` --reasoning-effort ${imported.effort}` : ""} --resume ${imported.sessionId}`);
+    const expectedResume = process.env.GROK_E2E_EFFORT
+      ? `grok --model ${imported.model} --reasoning-effort ${process.env.GROK_E2E_EFFORT} --resume ${imported.sessionId}`
+      : `grok --model ${imported.model} --resume ${imported.sessionId}`;
+    assert.equal(imported.resume, expectedResume);
     providerSessions.add(imported.sessionId);
 
     const resumeArgs = ["--cwd", root, "--model", imported.model];
@@ -391,6 +436,14 @@ test("authenticated Grok end-to-end flow", { skip: !LIVE_ENABLED, timeout: 40 * 
     assert.equal(resumed.status, 0, `Direct Grok resume failed:\n${resumed.stderr || resumed.stdout}`);
     assert.match(resumed.stdout, new RegExp(phrase), "resumed Grok session did not preserve imported Claude context");
 
+    const exported = run(grokBinary, ["export", imported.sessionId], {
+      cwd: root,
+      env: grokChildEnv,
+      timeout: 30_000
+    });
+    assert.equal(exported.status, 0, `Could not export resumed Grok session:\n${exported.stderr || exported.stdout}`);
+    assert.match(exported.stdout, new RegExp(phrase), "resumed Grok export did not preserve imported Claude context");
+
     const deleted = run(grokBinary, ["sessions", "delete", imported.sessionId], {
       cwd: root,
       env: grokChildEnv,
@@ -400,16 +453,20 @@ test("authenticated Grok end-to-end flow", { skip: !LIVE_ENABLED, timeout: 40 * 
     providerSessions.delete(imported.sessionId);
   });
 
-  await t.test("background task can be cancelled", { skip: !CANCELLATION_ENABLED }, async () => {
+  await liveSubtest(t, "background task can be cancelled", { skip: !CANCELLATION_ENABLED }, async () => {
+    const bulk = path.join(root, "bulk");
+    fs.mkdirSync(bulk);
+    for (let index = 0; index < 120; index += 1) {
+      fs.writeFileSync(path.join(bulk, `item-${String(index).padStart(3, "0")}.txt`), `${index}: ${"fixture-data ".repeat(80)}\n`);
+    }
     const before = repositorySnapshot(root);
-    const started = companion(env, root, [
-      "task",
-      "--background",
-      "--write",
-      "--fresh",
-      "Use a shell tool to run this exact command and wait for it: node -e \"setTimeout(() => {}, 120000)\". Do not edit any files and do not answer before the command ends."
-    ], 60_000);
-    const running = await waitForJob(env, root, started.id, (job) => job.status === "running" && Boolean(job.grokSessionId), 90_000);
+    const started = companionTask(env, root, {
+      background: true,
+      userRequest: "Read every file under bulk in lexical order and produce a detailed indexed summary with one entry per file. Do not edit any files.",
+      requiredPaths: ["bulk", "app.mjs"],
+      acceptance: "The final report accounts for every bulk fixture file without modifying the workspace."
+    }, 60_000);
+    const running = await waitForJob(env, root, started.id, (job) => job.status === "running", 90_000);
     assert.equal(running?.status, "running", `job became ${running?.status ?? "unavailable"} before cancellation`);
     const requested = companion(env, root, ["cancel", started.id], 30_000);
     const terminal = ["cancelled", "completed", "failed"].includes(requested.status)

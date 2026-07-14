@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PROVIDER_AGENTS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../provider-agents");
-const base = { contractVersion: 2, webSearch: false, subagents: false, isolatedLeader: true };
+const base = { contractVersion: 3, webSearch: false, subagents: false, isolatedLeader: true };
 
 function agentProfileDigest(name) {
   return crypto.createHash("sha256").update(fs.readFileSync(path.join(PROVIDER_AGENTS, name))).digest("hex");
@@ -18,7 +18,24 @@ export function profileFor(kind, write = false) {
   if (kind === "review") return { ...reviewBase, id: "review-v1", sandbox: "strict", permissionMode: "default", allowedTools: reviewTools, deniedTools: denied };
   if (kind === "adversarial-review") return { ...reviewBase, id: "adversarial-review-v1", sandbox: "strict", permissionMode: "default", allowedTools: reviewTools, deniedTools: denied };
   if (kind === "stop-review") return { ...reviewBase, id: "stop-review-v1", sandbox: "strict", permissionMode: "default", allowedTools: reviewTools, deniedTools: denied };
-  return { ...taskBase, id: write ? "rescue-write-v2" : "rescue-read-v2", sandbox: write ? "workspace" : "read-only", permissionMode: write ? "bypassPermissions" : "dontAsk", agentProfileDigest: agentProfileDigest(write ? "rescue-write.md" : "rescue-read.md"), allowedTools: write ? ["read_file", "list_dir", "grep", "run_terminal_cmd", "search_replace", "todo_write", "kill_task", "get_task_output"] : ["read_file", "list_dir", "grep"], deniedTools: denied };
+  if (kind === "report-repair") return {
+    ...taskBase,
+    id: "rescue-report-v3",
+    sandbox: "strict",
+    permissionMode: "dontAsk",
+    agentProfileDigest: agentProfileDigest("report-repair.md"),
+    allowedTools: [],
+    deniedTools: [...denied, "Bash", "Edit", "Write"]
+  };
+  return {
+    ...taskBase,
+    id: write ? "rescue-write-v3" : "rescue-read-v3",
+    sandbox: "strict",
+    permissionMode: write ? "acceptEdits" : "dontAsk",
+    agentProfileDigest: agentProfileDigest(write ? "rescue-write.md" : "rescue-read.md"),
+    allowedTools: write ? ["read_file", "list_dir", "grep", "search_replace", "todo_write"] : ["read_file", "list_dir", "grep"],
+    deniedTools: [...denied, "Bash"]
+  };
 }
 
 export function sameSecurityProfile(a, b) {

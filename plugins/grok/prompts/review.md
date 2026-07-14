@@ -6,10 +6,12 @@ write-capable tool. Inspect only the requested target and report actionable
 correctness, security, reliability, and regression defects.
 
 Return exactly one JSON object matching this shape:
-`{"verdict":"pass|needs_changes","summary":"...","findings":[{"severity":"critical|high|medium|low|info","title":"...","body":"...","file":"path or null","line":1}]}`
+`{"summary":"...","findings":[{"severity":"critical|high|medium|low|info","title":"...","body":"...","file":"path or null","line":1}]}`
 
-Use `pass` only with an empty `findings` array. Use `needs_changes` only when
-`findings` contains at least one actionable defect.
+Provide a non-empty `summary` and a `findings` array. Leave `findings` empty when there are no
+actionable defects. Include one or more findings when changes are needed. Do not rely on a
+model-controlled `verdict`; the runtime derives pass from zero findings and needs_changes from
+any finding. Do not include a `verdict` field.
 
 TARGET: {{TARGET_LABEL}}
 

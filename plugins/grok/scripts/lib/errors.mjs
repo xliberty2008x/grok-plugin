@@ -47,8 +47,8 @@ export const EXIT = Object.freeze({ OK: 0, USAGE: 2, PREREQ: 3, PROVIDER: 4, VAL
 export function exitCodeFor(error) {
   if (error?.code === "E_USAGE") return EXIT.USAGE;
   if (["E_GIT_REQUIRED", "E_GROK_NOT_FOUND", "E_GROK_VERSION", "E_AUTH_REQUIRED", "E_CAPABILITY", "E_POLICY"].includes(error?.code)) return EXIT.PREREQ;
-  if (["E_SCHEMA", "E_IMPORT_SOURCE", "E_IMPORT_RESULT", "E_JOB_NOT_FOUND", "E_JOB_ACTIVE", "E_NO_RESUME_CANDIDATE"].includes(error?.code)) return EXIT.VALIDATION;
+  if (["E_SCHEMA", "E_IMPORT_SOURCE", "E_IMPORT_RESULT", "E_JOB_NOT_FOUND", "E_JOB_ACTIVE", "E_NO_RESUME_CANDIDATE", "E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE", "E_INPUT_READ", "E_INPUT_TIMEOUT"].includes(error?.code)) return EXIT.VALIDATION;
   if (error?.code === "E_CANCELLED") return EXIT.CANCELLED;
-  if (["E_RECURSION", "E_REVIEW_MUTATED_WORKSPACE", "E_PROCESS_IDENTITY"].includes(error?.code)) return EXIT.SAFETY;
+  if (["E_RECURSION", "E_REVIEW_MUTATED_WORKSPACE", "E_PROCESS_IDENTITY", "E_SCOPE_VIOLATION"].includes(error?.code)) return EXIT.SAFETY;
   return EXIT.PROVIDER;
 }

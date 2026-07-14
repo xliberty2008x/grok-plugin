@@ -20,7 +20,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" setup "--json $ARGUMENTS
 Rules:
 
 - Preserve `--enable-review-gate` or `--disable-review-gate` exactly. They are mutually exclusive.
-- Never print or request authentication credentials. Preserve the runtime disclosure that reviews use an ephemeral private credential copy, while resumable ACP tasks keep a refreshed sanitized copy inside their private, extension-free read/write task homes under plugin state.
+- Never print or request authentication credentials. Preserve the runtime disclosure that reviews use an ephemeral private credential copy, while resumable ACP tasks stage a refreshed sanitized credential inside their private, extension-free lineage home only for authentication and remove it before `session/prompt` exposes workspace tools.
 - Preserve the runtime's data-boundary disclosure and actionable next steps.
 - If Grok is installed but authentication is unavailable, direct the user to run `grok login`, then `/grok:setup` again.
 - If the result reports that Grok is missing, check whether npm is available. If npm is unavailable, present the original setup result and stop.

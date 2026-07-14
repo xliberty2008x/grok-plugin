@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "baseVersion": "0.2.0",
+  "changeClass": "breaking",
+  "targetVersion": "0.3.0",
+  "stage": "development",
+  "preRelease": "dev.1",
+  "supportedHosts": [
+    "codex",
+    "claude-code"
+  ],
+  "reasons": [
+    "Replace the profile-v2 rescue path with the TaskEnvelope and ContextManifest control plane.",
+    "Change persistent jobs and security profiles to schema and contract version 3.",
+    "Change write verification, credential isolation, lifecycle, resume, and transfer contracts.",
+    "Repair the Codex runtime-ingress contract and add boundary-scoped host-orchestration and installed-artifact qualification rules."
+  ]
+}

@@ -157,8 +157,7 @@ test("Codex wrapper without host markers falls through to cli identity", () => {
   const result = runCodexCompanion(["review", "--scope", "working-tree", "--json"], { cwd: root, env });
   assert.equal(result.status, 0, result.stderr || result.stdout);
   const job = JSON.parse(result.stdout);
-  assert.equal(job.host.kind, "cli");
-  assert.equal(job.host.sessionId, null);
+  assert.equal(Object.hasOwn(job, "host"), false, "public job output exposed private host identity");
   assert.equal(job.result.skipped, true);
   assert.equal(job.result.skipReason, "empty-target");
 });
@@ -257,8 +256,8 @@ test("implicit status, result, and cancel fail closed without a host session", (
 
   for (const command of ["status", "result", "cancel"]) {
     const invocation = runCompanion([command, id, "--json"], { cwd: root, env });
-    assert.equal(invocation.status, 0, `${command} rejected an explicit repo-scoped ID: ${invocation.stderr || invocation.stdout}`);
-    assert.equal(JSON.parse(invocation.stdout).id, id);
+    assert.notEqual(invocation.status, 0, `${command} accepted a cross-task explicit ID`);
+    assert.equal(JSON.parse(invocation.stdout).error.code, "E_JOB_NOT_FOUND");
   }
 });
 
@@ -440,7 +439,7 @@ test("Codex manifest, marketplace, public skills, hooks, and wrapper form one in
   for (const name of ["grok-cli-runtime", "grok-prompting", "grok-result-handling"]) {
     assert.match(read(`plugins/grok/skills/${name}/agents/openai.yaml`), /allow_implicit_invocation:\s*false/);
   }
-  assert.match(read("plugins/grok/skills/rescue/SKILL.md"), /never spawn a host subagent/i);
+  assert.match(read("plugins/grok/skills/rescue/SKILL.md"), /substitute a different worker unless the active fallback policy permits it/i);
 
   assert.deepEqual(Object.keys(defaultHooks.hooks).sort(), ["SessionStart", "Stop"]);
   assert.deepEqual(Object.keys(claudeHooks.hooks), ["SessionEnd"]);

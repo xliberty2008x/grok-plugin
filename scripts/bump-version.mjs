@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { activeVersionForPlan, validateReleasePlan } from "./lib/version-policy.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const [nextVersion, ...flags] = process.argv.slice(2);
@@ -40,6 +41,13 @@ function atomicWrite(relative, contents) {
 
 const packageJson = readJson("package.json");
 const previousVersion = packageJson.version;
+const releasePlan = readJson("release-plan.json");
+const releasePlanErrors = validateReleasePlan(releasePlan);
+if (releasePlanErrors.length) throw new Error(`Invalid release-plan.json: ${releasePlanErrors.join(" ")}`);
+const plannedVersion = activeVersionForPlan(releasePlan);
+if (nextVersion !== plannedVersion) {
+  throw new Error(`Requested version ${nextVersion} does not match active release-plan version ${plannedVersion}. Update release-plan.json first.`);
+}
 const packageLock = readJson("package-lock.json");
 const marketplace = readJson(".claude-plugin/marketplace.json");
 const codexMarketplace = readJson(".agents/plugins/marketplace.json");

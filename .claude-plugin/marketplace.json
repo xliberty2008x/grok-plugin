@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Use the official Grok Build CLI as a companion agent from Claude Code.",
-    "version": "0.2.0"
+    "version": "0.3.0-dev.1"
   },
   "plugins": [
     {
       "name": "grok",
       "description": "Delegate tasks and read-only reviews to the official Grok Build CLI.",
-      "version": "0.2.0",
+      "version": "0.3.0-dev.1",
       "author": {
         "name": "grok-plugin community maintainers"
       },

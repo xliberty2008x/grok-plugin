@@ -38,8 +38,9 @@ test("provider-neutral profiles preserve the read/write boundary", () => {
   const normalizedWriteTools = write.allowedTools.map((tool) => tool.toLowerCase());
   assert.equal(review.sandbox, "strict");
   assert.equal(normalizedReviewTools.includes("write"), false);
-  assert.equal(write.sandbox, "workspace");
-  assert.equal(normalizedWriteTools.includes("run_terminal_cmd"), true);
+  assert.equal(write.sandbox, "strict");
+  assert.equal(normalizedWriteTools.includes("run_terminal_cmd"), false);
+  assert.equal(normalizedWriteTools.includes("search_replace"), true);
   assert.equal(sameSecurityProfile(review, write), false);
 });
 

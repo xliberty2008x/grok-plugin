@@ -14,13 +14,30 @@ export function redactText(value, knownSecrets = []) {
   return text;
 }
 
-export function redact(value, knownSecrets = [], seen = new WeakSet()) {
+/** Redact common secrets and remove terminal/control characters that can forge rendered output. */
+export function sanitizeDisplayText(value, knownSecrets = []) {
+  return redactText(value, knownSecrets)
+    .replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, "")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .replace(/[\u202A-\u202E\u2066-\u2069]/g, "");
+}
+
+export function redact(value, knownSecrets = [], ancestors = new WeakSet()) {
   if (typeof value === "string") return redactText(value, knownSecrets);
   if (!value || typeof value !== "object") return value;
-  if (seen.has(value)) return "[CIRCULAR]";
-  seen.add(value);
-  if (Array.isArray(value)) return value.map((item) => redact(item, knownSecrets, seen));
-  const result = {};
-  for (const [key, item] of Object.entries(value)) result[key] = SECRET_KEY.test(key) ? "[REDACTED]" : redact(item, knownSecrets, seen);
-  return result;
+  // Track only the current recursion path. A WeakSet retained for the complete
+  // traversal misclassifies ordinary shared arrays/objects as cycles and can
+  // corrupt stored result types (for example validationIssues -> "[CIRCULAR]").
+  if (ancestors.has(value)) return "[CIRCULAR]";
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) return value.map((item) => redact(item, knownSecrets, ancestors));
+    const result = {};
+    for (const [key, item] of Object.entries(value)) {
+      result[key] = SECRET_KEY.test(key) ? "[REDACTED]" : redact(item, knownSecrets, ancestors);
+    }
+    return result;
+  } finally {
+    ancestors.delete(value);
+  }
 }

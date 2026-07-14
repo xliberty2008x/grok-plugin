@@ -81,6 +81,21 @@ test("recursive redaction masks secret-shaped keys and handles circular input", 
   });
 });
 
+test("redaction duplicates shared acyclic values without corrupting their type", () => {
+  const shared = [];
+  const value = redact({
+    reportRepair: { validationIssues: shared },
+    workerReport: { validationIssues: shared },
+    providerClaims: { changedFiles: shared }
+  });
+  assert.deepEqual(value, {
+    reportRepair: { validationIssues: [] },
+    workerReport: { validationIssues: [] },
+    providerClaims: { changedFiles: [] }
+  });
+  assert.equal(Array.isArray(value.workerReport.validationIssues), true);
+});
+
 test("execution profiles keep reviews immutable and grant writes only to write rescue", () => {
   const review = profileFor("review");
   assert.equal(review.transport, "headless");
@@ -95,17 +110,24 @@ test("execution profiles keep reviews immutable and grant writes only to write r
   const readTask = profileFor("task", false);
   assert.equal(readTask.transport, "acp");
   assert.equal(readTask.agent, "build");
-  assert.equal(readTask.sandbox, "read-only");
+  assert.equal(readTask.sandbox, "strict");
   assert.match(readTask.agentProfileDigest, /^[a-f0-9]{64}$/);
   assert.deepEqual(readTask.allowedTools, ["read_file", "list_dir", "grep"]);
   assert.ok(!readTask.allowedTools.includes("write"));
 
   const writeTask = profileFor("task", true);
-  assert.equal(writeTask.sandbox, "workspace");
-  assert.equal(writeTask.permissionMode, "bypassPermissions");
+  assert.equal(writeTask.sandbox, "strict");
+  assert.equal(writeTask.permissionMode, "acceptEdits");
   assert.match(writeTask.agentProfileDigest, /^[a-f0-9]{64}$/);
-  assert.ok(writeTask.allowedTools.includes("run_terminal_cmd"));
+  assert.equal(writeTask.allowedTools.includes("run_terminal_cmd"), false);
   assert.ok(writeTask.allowedTools.includes("search_replace"));
+
+  const reportRepair = profileFor("report-repair");
+  assert.equal(reportRepair.id, "rescue-report-v3");
+  assert.equal(reportRepair.permissionMode, "dontAsk");
+  assert.match(reportRepair.agentProfileDigest, /^[a-f0-9]{64}$/);
+  assert.deepEqual(reportRepair.allowedTools, []);
+  for (const denied of ["Bash", "Edit", "Write"]) assert.ok(reportRepair.deniedTools.includes(denied));
 });
 
 test("security-profile comparison ignores diagnostics but rejects privilege changes", () => {
