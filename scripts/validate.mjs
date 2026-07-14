@@ -7,6 +7,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { hasYamlFrontmatter } from "./lib/frontmatter.mjs";
+import { activeVersionForPlan, qualificationEvidencePath, qualificationSourceDigest, validateQualificationEvidence, validateReadmeReleaseStatus, validateReleasePlan } from "./lib/version-policy.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = new Set(process.argv.slice(2));
@@ -101,7 +102,8 @@ function versionChecks() {
   const codexMarketplace = readJson(".agents/plugins/marketplace.json");
   const pluginManifest = readJson("plugins/grok/.claude-plugin/plugin.json");
   const codexPluginManifest = readJson("plugins/grok/.codex-plugin/plugin.json");
-  if (!packageJson || !packageLock || !marketplace || !codexMarketplace || !pluginManifest || !codexPluginManifest) return;
+  const releasePlan = readJson("release-plan.json");
+  if (!packageJson || !packageLock || !marketplace || !codexMarketplace || !pluginManifest || !codexPluginManifest || !releasePlan) return;
 
   const version = packageJson.version;
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(String(version))) {
@@ -128,9 +130,74 @@ function versionChecks() {
     if (value !== version) problem(`${label} (${value ?? "missing"}) does not match package version ${version}.`);
   }
 
+  for (const message of validateReleasePlan(releasePlan)) problem(message, "release-plan.json");
+  const plannedVersion = activeVersionForPlan(releasePlan);
+  if (plannedVersion !== version) {
+    problem(`Active release-plan version (${plannedVersion ?? "invalid"}) does not match package version ${version}.`, "release-plan.json");
+  }
+
   const changelog = readText("plugins/grok/CHANGELOG.md");
-  if (changelog != null && !new RegExp(`^## ${version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m").test(changelog)) {
-    problem(`Changelog has no release heading for ${version}.`, "plugins/grok/CHANGELOG.md");
+  const firstChangelogVersion = changelog?.match(/^##\s+([^\s]+)\s*$/m)?.[1] || null;
+  if (changelog != null && firstChangelogVersion !== version) {
+    problem(`First changelog version (${firstChangelogVersion ?? "missing"}) must match active package version ${version}.`, "plugins/grok/CHANGELOG.md");
+  }
+  if (changelog != null && !new RegExp(`^## ${releasePlan.baseVersion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m").test(changelog)) {
+    problem(`Changelog must retain stable base version ${releasePlan.baseVersion} as immutable history.`, "plugins/grok/CHANGELOG.md");
+  }
+
+  const readme = readText("README.md");
+  if (readme != null) for (const message of validateReadmeReleaseStatus(readme, releasePlan, version)) problem(message, "README.md");
+  if (readme != null) {
+    const requiredCurrentContract = [
+      "TaskEnvelope",
+      "ContextManifest",
+      "contract version **3**",
+      "record-verification",
+      "npm run test:pty-ingress",
+      "npm run test:installed-codex",
+      "npm run test:natural-codex",
+      "npm run codex:update-local"
+    ];
+    for (const term of requiredCurrentContract) {
+      if (!readme.includes(term)) problem(`README is missing current contract/install evidence: ${term}.`, "README.md");
+    }
+    if (!/historical[\s\S]{0,220}(?:does not|doesn't|do not) qualify/i.test(readme)) {
+      problem("README must state that historical evidence does not qualify the current hardening worktree.", "README.md");
+    }
+    const staleCurrentClaims = [
+      "rescue-read-v2",
+      "rescue-write-v2",
+      "security-contract version **2**",
+      "GrokBuild:run_terminal_cmd",
+      "GrokBuild:kill_task",
+      "GrokBuild:get_task_output",
+      "v0.2.0"
+    ];
+    for (const claim of staleCurrentClaims) {
+      if (readme.includes(claim)) problem(`README contains a stale current-contract claim: ${claim}.`, "README.md");
+    }
+  }
+
+  if (releasePlan.stage !== "development") {
+    const evidenceFile = qualificationEvidencePath(releasePlan.targetVersion);
+    const evidence = readJson(evidenceFile);
+    let current = {};
+    try {
+      current = {
+        sourceDigest: qualificationSourceDigest(ROOT)
+      };
+    } catch (error) {
+      problem(`Could not resolve the current qualification source digest: ${error.message}`, evidenceFile);
+    }
+    if (evidence) for (const message of validateQualificationEvidence(releasePlan, evidence, current)) problem(message, evidenceFile);
+  }
+
+  for (const file of ["SPEC.md", "PLAN.md"]) {
+    const text = readText(file);
+    const target = text?.match(/^Target release:\s*`([^`]+)`\s*$/m)?.[1] || null;
+    if (target !== releasePlan.targetVersion) {
+      problem(`Target release (${target ?? "missing"}) must match release-plan target ${releasePlan.targetVersion}.`, file);
+    }
   }
 
   const pluginNotice = readText("plugins/grok/NOTICE");
@@ -153,18 +220,28 @@ if (!versionsOnly) {
     ".npmignore",
     "LICENSE",
     "NOTICE",
+    "CONTRIBUTING.md",
     "README.md",
     "SPEC.md",
     "PLAN.md",
     "UPSTREAM.md",
     "package.json",
     "package-lock.json",
+    "release-plan.json",
     ".claude-plugin/marketplace.json",
     ".agents/plugins/marketplace.json",
     ".github/workflows/ci.yml",
     "scripts/validate.mjs",
     "scripts/bump-version.mjs",
+    "scripts/update-local-codex.mjs",
+    "scripts/test-natural-codex.mjs",
     "tests/live-grok.test.mjs",
+    "tests/installed-codex.test.mjs",
+    "tests/natural-codex-output.schema.json",
+    "tests/nonblocking-stdin-child.mjs",
+    "tests/pty-ingress.test.mjs",
+    "tests/pty-stdin-driver.py",
+    "tests/stdin.test.mjs",
     "tests/e2e-results/macos-0.2.99-2026-07-13.json",
     "tests/windows-neutral.test.mjs",
     "plugins/grok/.claude-plugin/plugin.json",
@@ -175,6 +252,7 @@ if (!versionsOnly) {
     "plugins/grok/agents/grok-rescue.md",
     "plugins/grok/provider-agents/rescue-read.md",
     "plugins/grok/provider-agents/rescue-write.md",
+    "plugins/grok/provider-agents/report-repair.md",
     "plugins/grok/provider-agents/setup-probe.md",
     "plugins/grok/hooks/hooks.json",
     "plugins/grok/hooks/claude-hooks.json",
@@ -189,6 +267,8 @@ if (!versionsOnly) {
     "plugins/grok/scripts/lib/process-control.mjs",
     "plugins/grok/scripts/lib/recursion-guard.mjs",
     "plugins/grok/scripts/lib/host.mjs",
+    "plugins/grok/scripts/lib/stdin.mjs",
+    "plugins/grok/scripts/lib/task-contract.mjs",
     "plugins/grok/scripts/lib/transcript.mjs",
     "plugins/grok/skills/grok-cli-runtime/SKILL.md",
     "plugins/grok/skills/grok-result-handling/SKILL.md",
@@ -205,9 +285,38 @@ if (!versionsOnly) {
     if (packageJson.type !== "module") problem("The package must use ESM (`type: module`).", "package.json");
     if (packageJson.license !== "Apache-2.0") problem("Package license must be Apache-2.0.", "package.json");
     if (packageJson.engines?.node !== ">=18.18") problem("Node engine must remain >=18.18.", "package.json");
-    for (const script of ["test", "test:e2e", "validate", "version:check", "version:bump", "check"]) {
+    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "codex:update-local", "validate", "version:check", "version:bump", "check"]) {
       if (!packageJson.scripts?.[script]) problem(`Missing npm script: ${script}.`, "package.json");
     }
+    if (packageJson.scripts?.["test:pty-ingress"] !== "node --test tests/pty-ingress.test.mjs") {
+      problem("test:pty-ingress must execute the dedicated nonblocking PTY regression directly.", "package.json");
+    }
+    if (packageJson.scripts?.["test:installed-codex"] !== "node --test tests/installed-codex.test.mjs") {
+      problem("test:installed-codex must execute the installed Codex gate directly.", "package.json");
+    }
+    if (packageJson.scripts?.["codex:update-local"] !== "node scripts/update-local-codex.mjs") {
+      problem("codex:update-local must execute the verified local-cache updater directly.", "package.json");
+    }
+  }
+
+  const contributing = readText("CONTRIBUTING.md", { required: false });
+  if (contributing != null && (!/Versioning convention and change taxonomy/i.test(contributing)
+    || !/version already present on the base branch[\s\S]{0,80}MUST NOT be reused/i.test(contributing)
+    || !/release-plan\.json/.test(contributing)
+    || !["runtime_ingress", "host_orchestration", "artifact_install", "provider_transport", "worker_execution", "host_verification"].every((boundary) => contributing.includes(`\`${boundary}\``))
+    || !/Evidence may no longer|Do not promote evidence across boundaries/i.test(contributing)
+    || !/npm run test:installed-codex/.test(contributing)
+    || !/npm run codex:update-local/.test(contributing)
+    || !/CODEX_PLUGIN_RUNNER_ENABLED/.test(contributing))) {
+    problem("CONTRIBUTING.md must define version governance, boundary-scoped evidence, and the installed-Codex gate.", "CONTRIBUTING.md");
+  }
+
+  const specification = readText("SPEC.md", { required: false });
+  if (specification != null && (!/Boundary-scoped evidence/.test(specification)
+    || !/reader-ready handshake/.test(specification)
+    || !/PTY/.test(specification)
+    || !/host_orchestration/.test(specification))) {
+    problem("SPEC.md must preserve the runtime-ingress, PTY, and host-orchestration qualification boundaries.", "SPEC.md");
   }
 
   const marketplace = readJson(".claude-plugin/marketplace.json");
@@ -281,9 +390,11 @@ if (!versionsOnly) {
   const schema = readJson("plugins/grok/schemas/review-output.schema.json");
   if (schema) {
     if (schema.$schema !== "https://json-schema.org/draft/2020-12/schema") problem("Review schema must use JSON Schema 2020-12.", "plugins/grok/schemas/review-output.schema.json");
-    for (const field of ["verdict", "summary", "findings"]) {
+    // summary + findings are the complete provider contract; verdict is runtime-derived only.
+    for (const field of ["summary", "findings"]) {
       if (!schema.required?.includes(field) || !schema.properties?.[field]) problem(`Review schema is missing required field ${field}.`, "plugins/grok/schemas/review-output.schema.json");
     }
+    if (schema.properties?.verdict || schema.required?.includes("verdict")) problem("Review schema must not accept a model-controlled verdict; runtime derives it from findings.", "plugins/grok/schemas/review-output.schema.json");
   }
 
   const macosEvidence = readJson("tests/e2e-results/macos-0.2.99-2026-07-13.json");
@@ -292,6 +403,9 @@ if (!versionsOnly) {
     if (macosEvidence.platform?.name !== "macOS" || macosEvidence.runtime?.grokBuild !== "0.2.99") problem("macOS E2E evidence must identify macOS and Grok Build 0.2.99.", "tests/e2e-results/macos-0.2.99-2026-07-13.json");
     if (macosEvidence.suite?.outcome !== "pass" || macosEvidence.suite?.tests !== 10 || macosEvidence.suite?.passed !== 10 || macosEvidence.suite?.failed !== 0) problem("macOS E2E evidence must record the complete 10/10 passing suite.", "tests/e2e-results/macos-0.2.99-2026-07-13.json");
     if (!Array.isArray(macosEvidence.cases) || macosEvidence.cases.length !== 10 || macosEvidence.cases.some((entry) => entry?.outcome !== "pass")) problem("macOS E2E evidence must list ten passing cases.", "tests/e2e-results/macos-0.2.99-2026-07-13.json");
+    if (macosEvidence.runtime?.profileContractVersion !== 3 || !macosEvidence.sourceCommit || !macosEvidence.sourceTreeDigest) {
+      warn("Historical profile-v2 evidence has no current source-digest binding and does not qualify the profile-v3 hardening worktree; rerun authenticated E2E before release claims.", "tests/e2e-results/macos-0.2.99-2026-07-13.json");
+    }
   }
 
   for (const name of commandNames) {
@@ -331,6 +445,17 @@ if (!versionsOnly) {
   if (agent != null) {
     if (!hasYamlFrontmatter(agent)) problem("Agent file must start with YAML frontmatter.", "plugins/grok/agents/grok-rescue.md");
     if (!/modified|adapted/i.test(agent) || !/openai\/codex-plugin-cc/i.test(agent)) problem("Adapted agent must carry a prominent upstream modification notice.", "plugins/grok/agents/grok-rescue.md");
+  }
+
+  const reportRepairFile = "plugins/grok/provider-agents/report-repair.md";
+  const reportRepair = readText(reportRepairFile, { required: false });
+  if (reportRepair != null) {
+    const frontmatter = reportRepair.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] || "";
+    if (!frontmatter) problem("Report-repair profile must start with YAML frontmatter.", reportRepairFile);
+    if (!/^permission_mode:\s*dontAsk\s*$/m.test(frontmatter)) problem("Report-repair profile must deny interactive permission escalation.", reportRepairFile);
+    if (!/^injectDefaultTools:\s*false\s*$/m.test(frontmatter)) problem("Report-repair profile must disable default tools.", reportRepairFile);
+    if (!/^toolConfig:\s*\r?\n\s+tools:\s*\[\s*\]\s*$/m.test(frontmatter)) problem("Report-repair profile must declare an empty tool list.", reportRepairFile);
+    if (/GrokBuild:[A-Za-z_]/.test(frontmatter)) problem("Report-repair profile must not name any Grok tool.", reportRepairFile);
   }
 
   const rootLicense = readText("LICENSE");
@@ -402,6 +527,14 @@ if (!versionsOnly) {
   if (workflow != null) {
     if (!/permissions:\s*\n\s+contents:\s*read/m.test(workflow)) problem("CI must declare read-only contents permission.", ".github/workflows/ci.yml");
     if (/GROK_E2E\s*[:=]\s*["']?1/i.test(workflow) || /test:e2e/.test(workflow)) problem("Default CI must not run quota-consuming Grok E2E tests.", ".github/workflows/ci.yml");
+    if (!/npm run test:pty-ingress/.test(workflow)) problem("CI must expose the source nonblocking PTY regression as a named gate.", ".github/workflows/ci.yml");
+    if (!/CODEX_PLUGIN_RUNNER_ENABLED/.test(workflow) || !/npm run test:installed-codex/.test(workflow)) {
+      problem("CI must define the opt-in Codex-equipped installed-snapshot gate.", ".github/workflows/ci.yml");
+    }
+    if (!/github\.event_name == 'workflow_dispatch'/.test(workflow)
+      || !/github\.event_name == 'push'\s*&&\s*github\.ref == 'refs\/heads\/main'/.test(workflow)) {
+      problem("The self-hosted installed-Codex gate must be restricted to trusted main pushes or explicit workflow dispatch.", ".github/workflows/ci.yml");
+    }
   }
 }
 

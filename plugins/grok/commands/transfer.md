@@ -9,6 +9,6 @@ allowed-tools: Bash(node:*)
 
 !`node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" transfer "$ARGUMENTS"`
 
-Present the command output exactly as returned. Preserve the imported Grok session ID and the exact model-qualified `grok --model <id> --resume <session-id>` command. Imported Claude sessions use a legacy placeholder model in Grok Build 0.2.99, so omitting the selected available model can make direct resume return an empty result.
+Present the command output exactly as returned. Preserve the imported Grok session ID and exact model-qualified `grok --model <id> [--reasoning-effort <effort>] --resume <session-id>` command. Imported legacy-model sessions can otherwise resume with an empty result, so the runtime discovers the model from the same non-isolated Grok home used for import and waits until the exact session ID is listed before returning success.
 
-Do not read, copy, summarize, or quote the transcript. The runtime accepts only a real `.jsonl` file beneath `~/.claude/projects` and sends it through Grok's native import command. On failure, report the runtime error without attempting a manual transcript conversion.
+Do not read, copy, summarize, or quote the transcript. The runtime accepts only a real `.jsonl` file beneath `~/.claude/projects`, freezes its validated current size into an anonymous point-in-time descriptor, and sends that snapshot through Grok's native import command. On failure, report the runtime error without attempting a manual transcript conversion.

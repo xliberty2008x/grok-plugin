@@ -50,11 +50,13 @@ function nextPromptNumber(binary) {
 }
 
 function reviewValue(config) {
-  return config.review ?? {
-    verdict: "pass",
+  const value = config.review ?? {
     summary: "No material findings in the fake review.",
     findings: []
   };
+  if (config.preserveReviewVerdict) return value;
+  const { verdict: _ignored, ...providerPayload } = value;
+  return providerPayload;
 }
 
 function reviewJson(config) {
@@ -105,6 +107,7 @@ async function serveAcp(binary, config) {
         return;
       }
       if (config.exitOnInitialize) {
+        if (config.initializeStderr) process.stderr.write(String(config.initializeStderr));
         process.exit(config.exitCode ?? 23);
       }
       send({ jsonrpc: "2.0", id: message.id, result: capabilities(config) });
@@ -145,8 +148,11 @@ async function serveAcp(binary, config) {
       const prompt = message.params?.prompt?.map((item) => item.text ?? "").join("") ?? "";
       appendLog(config, { event: "prompt", promptNumber, prompt, sessionId: currentSession });
 
-      if (config.promptError) {
-        send({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: config.promptError } });
+      const promptError = Array.isArray(config.promptErrors)
+        ? config.promptErrors[promptNumber - 1]
+        : config.promptError;
+      if (promptError) {
+        send({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: promptError } });
         return;
       }
 
@@ -169,10 +175,31 @@ async function serveAcp(binary, config) {
       update(currentSession, { sessionUpdate: "usage_update", tokens: 12 });
       update(currentSession, { sessionUpdate: "future_event", secret: config.unknownSecret ?? "safe" });
 
+      // Optional interim chatter before tools complete (must not contaminate final report).
+      if (config.interimText) {
+        update(currentSession, {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: String(config.interimText) }
+        });
+      }
+
+      update(currentSession, {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tool-1",
+        title: "Read fixture",
+        status: "completed"
+      });
+
+      if (config.taskMutatePath && (!config.taskMutateOnPrompt || config.taskMutateOnPrompt === promptNumber)) {
+        fs.writeFileSync(config.taskMutatePath, config.taskMutation || "mutated by fake Grok task\n");
+      }
+
       let text;
       if (config.invalidReviewFirst && promptNumber === 1) text = "This is not JSON.";
       else if (/review contract|review schema|required schema|valid review JSON/i.test(prompt)) text = reviewJson(config);
-      else text = config.taskText ?? "Fake Grok task completed.";
+      else if (Array.isArray(config.taskTexts) && config.taskTexts.length) {
+        text = config.taskTexts[Math.min(promptNumber - 1, config.taskTexts.length - 1)];
+      } else text = config.taskText ?? "Fake Grok task completed.";
 
       const midpoint = Math.max(1, Math.floor(text.length / 2));
       for (const chunk of [text.slice(0, midpoint), text.slice(midpoint)].filter(Boolean)) {
@@ -181,12 +208,14 @@ async function serveAcp(binary, config) {
           content: { type: "text", text: chunk }
         });
       }
-      update(currentSession, {
-        sessionUpdate: "tool_call_update",
-        toolCallId: "tool-1",
-        title: "Read fixture",
-        status: "completed"
-      });
+      if (config.toolAfterFinal) {
+        update(currentSession, {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "tool-after-final",
+          title: "Trailing provider bookkeeping",
+          status: "completed"
+        });
+      }
 
       const finish = () => send({
         jsonrpc: "2.0",
@@ -339,7 +368,8 @@ async function main() {
   }
 
   if (args[0] === "inspect" && args[1] === "--json") {
-    appendLog(effective, { event: "inspect-environment", home: process.env.HOME, grokHome: process.env.GROK_HOME, config: process.env.GROK_HOME && fs.existsSync(path.join(process.env.GROK_HOME, "config.toml")) ? fs.readFileSync(path.join(process.env.GROK_HOME, "config.toml"), "utf8") : null });
+    const authFile = process.env.GROK_HOME ? path.join(process.env.GROK_HOME, "auth.json") : null;
+    appendLog(effective, { event: "inspect-environment", home: process.env.HOME, grokHome: process.env.GROK_HOME, config: process.env.GROK_HOME && fs.existsSync(path.join(process.env.GROK_HOME, "config.toml")) ? fs.readFileSync(path.join(process.env.GROK_HOME, "config.toml"), "utf8") : null, authExists: Boolean(authFile && fs.existsSync(authFile)), authMode: authFile && fs.existsSync(authFile) ? fs.statSync(authFile).mode & 0o777 : null });
     let inspectValue = effective.inspectValue;
     if (!inspectValue && effective.inspectBundledSkill && process.env.GROK_HOME) {
       const skills = [
@@ -357,13 +387,76 @@ async function main() {
   }
 
   if (args[0] === "models") {
-    if (effective.authError) { process.stderr.write(effective.authError); process.exitCode = 1; }
-    else process.stdout.write("You are logged in with fake auth.\n");
+    appendLog(effective, {
+      event: "models",
+      home: process.env.HOME || null,
+      userProfile: process.env.USERPROFILE || null,
+      grokHome: process.env.GROK_HOME || null
+    });
+    if (effective.authError) {
+      process.stderr.write(effective.authError);
+      process.exitCode = 1;
+      return;
+    }
+    if (Object.hasOwn(effective, "modelsText")) {
+      process.stdout.write(String(effective.modelsText));
+      return;
+    }
+    const models = effective.models ?? [
+      {
+        modelId: "grok-test",
+        _meta: { reasoningEfforts: [{ id: "low" }, { id: "medium" }, { id: "high" }] }
+      }
+    ];
+    const defaultId = effective.defaultModel
+      || models.find((item) => item.default || item.isDefault)?.modelId
+      || models[0]?.modelId
+      || "grok-test";
+    process.stdout.write("You are logged in with fake auth.\n\n");
+    process.stdout.write(`Default model: ${defaultId}\n\n`);
+    process.stdout.write("Available models:\n");
+    for (const model of models) {
+      const id = model.modelId || model.id;
+      if (!id) continue;
+      const efforts = (model._meta?.reasoningEfforts || model.efforts || [])
+        .map((item) => (typeof item === "string" ? item : item?.id))
+        .filter(Boolean);
+      const marker = id === defaultId ? "*" : "-";
+      const defaultLabel = id === defaultId ? " (default)" : "";
+      const effortLabel = efforts.length ? ` efforts=${efforts.join(",")}` : "";
+      process.stdout.write(`  ${marker} ${id}${defaultLabel}${effortLabel}\n`);
+    }
+    return;
+  }
+
+  if (args[0] === "sessions" && args[1] === "list") {
+    const store = readJson(`${binary}.sessions.json`, { sessions: [] });
+    const now = Date.now();
+    const visible = (store.sessions || []).filter((entry) => {
+      if (!entry?.id) return false;
+      if (entry.neverReady) return false;
+      if (typeof entry.readyAt === "number" && entry.readyAt > now) return false;
+      return true;
+    });
+    appendLog(effective, {
+      event: "sessions-list",
+      home: process.env.HOME || null,
+      grokHome: process.env.GROK_HOME || null,
+      count: visible.length,
+      sessionIds: visible.map((entry) => entry.id)
+    });
+    process.stdout.write("SESSION ID                            CREATED     UPDATED     STATUS      SUMMARY\n");
+    for (const entry of visible) {
+      process.stdout.write(`${entry.id}  2026-07-14  2026-07-14  local  imported\n`);
+    }
     return;
   }
 
   if (args[0] === "sessions" && args[1] === "delete") {
     appendLog(effective, { event: "delete-session", sessionId: args[2] ?? null });
+    const store = readJson(`${binary}.sessions.json`, { sessions: [] });
+    store.sessions = (store.sessions || []).filter((entry) => entry?.id !== args[2]);
+    writeJson(`${binary}.sessions.json`, store);
     if (effective.deleteSessionFails) {
       process.stderr.write("delete failed with xai-FAKESECRET000000\n");
       process.exitCode = 1;
@@ -382,17 +475,55 @@ async function main() {
       return;
     }
     const alias = args.at(-1);
+    if (effective.importAppendSourcePath) {
+      fs.appendFileSync(effective.importAppendSourcePath, effective.importAppendText || "APPENDED_AFTER_TRANSFER_STARTED\n");
+    }
     const input = fs.readFileSync(alias);
-    appendLog(effective, { event: "import-input", alias, bytes: input.length, sha256: crypto.createHash("sha256").update(input).digest("hex"), sourceInArgv: args.some((arg) => arg === effective.expectedSourcePath) });
+    appendLog(effective, {
+      event: "import-input",
+      alias,
+      bytes: input.length,
+      sha256: crypto.createHash("sha256").update(input).digest("hex"),
+      sourceInArgv: args.some((arg) => arg === effective.expectedSourcePath),
+      home: process.env.HOME || null,
+      grokHome: process.env.GROK_HOME || null
+    });
     if (effective.importSpawnStubbornDescendant) stubbornDescendant(effective, "import");
     if (effective.importStderr) process.stderr.write(String(effective.importStderr));
+    let importedId = null;
     if (Object.hasOwn(effective, "importOutput")) {
       process.stdout.write(String(effective.importOutput));
+      try {
+        const parsed = JSON.parse(String(effective.importOutput).split(/\r?\n/).find(Boolean) || "{}");
+        importedId = parsed.sessionId || parsed.session_id || parsed.grokSessionId || parsed.grok_session_id || null;
+      } catch {}
     } else if (Array.isArray(effective.importRecords)) {
       for (const record of effective.importRecords) process.stdout.write(`${JSON.stringify(record)}\n`);
+      for (const record of effective.importRecords) {
+        importedId = record.sessionId || record.session_id || record.grokSessionId || record.grok_session_id || importedId;
+      }
     } else {
       const id = effective.importSessionId ?? "12345678-1234-1234-1234-123456789abc";
+      importedId = id;
       process.stdout.write(`${JSON.stringify({ sessionId: id })}\n`);
+    }
+    // Register imported session for readiness checks. Never store transcript content.
+    if (importedId && !effective.importExitCode) {
+      const store = readJson(`${binary}.sessions.json`, { sessions: [] });
+      const readyDelayMs = Number(effective.importReadyAfterMs);
+      const entry = {
+        id: importedId,
+        readyAt: Number.isFinite(readyDelayMs) && readyDelayMs > 0 ? Date.now() + readyDelayMs : Date.now(),
+        neverReady: Boolean(effective.importNeverReady)
+      };
+      store.sessions = [...(store.sessions || []).filter((item) => item?.id !== importedId), entry];
+      writeJson(`${binary}.sessions.json`, store);
+      appendLog(effective, {
+        event: "import-session-registered",
+        sessionId: importedId,
+        readyAt: entry.readyAt,
+        neverReady: entry.neverReady
+      });
     }
     if (effective.importPoisonAlias) {
       // Replace the private descriptor alias with a non-empty directory so post-import unlink fails.
@@ -414,6 +545,42 @@ async function main() {
   if (!args.includes("agent") || !args.includes("stdio")) {
     process.stderr.write(`unexpected fake Grok arguments: ${args.join(" ")}\n`);
     process.exitCode = 2;
+    return;
+  }
+
+  const profileIndex = args.indexOf("--agent-profile");
+  const profilePath = profileIndex >= 0 ? args[profileIndex + 1] : null;
+  const grokHome = process.env.GROK_HOME || null;
+  let profileEvidence = {
+    event: "agent-profile",
+    path: profilePath,
+    grokHome,
+    exists: false,
+    insideGrokHome: false,
+    mode: null,
+    sha256: null
+  };
+  if (profilePath) {
+    try {
+      const actualProfile = fs.realpathSync(profilePath);
+      const actualHome = grokHome ? fs.realpathSync(grokHome) : null;
+      const relative = actualHome ? path.relative(actualHome, actualProfile) : null;
+      const bytes = fs.readFileSync(actualProfile);
+      profileEvidence = {
+        ...profileEvidence,
+        path: actualProfile,
+        grokHome: actualHome,
+        exists: true,
+        insideGrokHome: Boolean(actualHome && relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative)),
+        mode: fs.statSync(actualProfile).mode & 0o777,
+        sha256: crypto.createHash("sha256").update(bytes).digest("hex")
+      };
+    } catch {}
+  }
+  appendLog(effective, profileEvidence);
+  if (effective.requireAgentProfileUnderGrokHome && (!profileEvidence.exists || !profileEvidence.insideGrokHome)) {
+    process.stderr.write(`error: --agent-profile path '${profilePath || ""}': Operation not permitted (os error 1)\n`);
+    process.exitCode = 1;
     return;
   }
 

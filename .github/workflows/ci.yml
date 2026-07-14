@@ -14,6 +14,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  pty-ingress:
+    name: PTY ingress / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+
+      # This gate recreates issue #2 with a real nonblocking PTY, delayed and
+      # split writes, the reader-ready handshake, EOT framing, and no echo. It
+      # does not claim that Codex marketplace installation itself was tested.
+      - name: Run source PTY ingress regression
+        run: npm run test:pty-ingress
+
   validate-and-test:
     name: ${{ matrix.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
@@ -42,6 +70,8 @@ jobs:
 
       - name: Run full offline suite (Linux and macOS)
         if: runner.os != 'Windows'
+        # Includes three concurrently accepted structured read jobs, distinct
+        # isolated profile paths, terminal cleanup, and bounded exit diagnostics.
         run: npm test
 
       # The fake Grok executable is a POSIX process fixture. Until a genuine
@@ -50,3 +80,72 @@ jobs:
       - name: Run provider-neutral tests (Windows; provider unverified)
         if: runner.os == 'Windows'
         run: node --test tests/windows-neutral.test.mjs
+
+  # Hosted GitHub runners do not provide the Codex plugin CLI. Repositories
+  # that configure a Codex-equipped runner with these labels and set the
+  # CODEX_PLUGIN_RUNNER_ENABLED Actions variable get a clean-profile cache gate
+  # only for trusted main pushes or an explicitly dispatched workflow. Never
+  # execute pull-request code on the self-hosted runner.
+  installed-codex:
+    name: Installed Codex snapshot / self-hosted macOS
+    if: >-
+      ${{ vars.CODEX_PLUGIN_RUNNER_ENABLED == 'true' &&
+          (github.event_name == 'workflow_dispatch' ||
+           (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
+    runs-on: [self-hosted, macOS, codex-plugin]
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Require clean Codex marketplace install and cached PTY execution
+        env:
+          CODEX_INSTALL_E2E_REQUIRED: "1"
+        run: npm run test:installed-codex
+
+  # This is the boundary the production incidents showed was missing: the real
+  # installed Codex skill drives the real Grok CLI, persists a job, records a
+  # host-owned check, and proves cleanup. It is opt-in because it uses both
+  # authenticated services and must never execute pull-request code.
+  natural-codex-grok:
+    name: Natural Codex + real Grok / self-hosted macOS
+    if: >-
+      ${{ vars.CODEX_GROK_NATURAL_E2E_ENABLED == 'true' &&
+          (github.event_name == 'workflow_dispatch' ||
+           (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
+    runs-on: [self-hosted, macOS, codex-plugin, grok-authenticated]
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Point the local marketplace at this checkout
+        run: codex plugin marketplace add "$GITHUB_WORKSPACE" --json
+
+      - name: Verify and install the tested plugin snapshot
+        run: npm run codex:update-local
+
+      - name: Run natural installed Codex to real Grok qualification
+        env:
+          CODEX_E2E_MODEL: ${{ vars.CODEX_E2E_MODEL }}
+        run: npm run test:natural-codex

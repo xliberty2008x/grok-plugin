@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 
 import {
+  admitJob,
   cancelFile,
   config,
   generateId,
@@ -49,10 +51,38 @@ test("configuration uses isolated workspace state and atomic private files", () 
     assert.equal(updated.disclosureAccepted, true);
 
     const stateRoot = workspaceState(root);
-    assert.ok(stateRoot.startsWith(pluginData));
+    assert.ok(stateRoot.startsWith(fs.realpathSync(pluginData)));
     const configFile = `${stateRoot}/config.json`;
     assert.equal(fs.statSync(configFile).mode & 0o777, 0o600);
     assert.deepEqual(fs.readdirSync(stateRoot).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_PLUGIN_DATA;
+    else process.env.CLAUDE_PLUGIN_DATA = previous;
+  }
+});
+
+test("workspace state refuses symlinked state and lock directories", () => {
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  const pluginData = tempDir("grok-state-data-");
+  const outside = tempDir("grok-state-outside-");
+  process.env.CLAUDE_PLUGIN_DATA = pluginData;
+  try {
+    fs.symlinkSync(outside, `${pluginData}/state`, "dir");
+    const root = initRepo();
+    assert.throws(
+      () => config(root),
+      (error) => error?.code === "E_STATE" && /unsafe plugin state directory/.test(error.message)
+    );
+    fs.unlinkSync(`${pluginData}/state`);
+
+    const stateRoot = workspaceState(root);
+    config(root);
+    fs.rmSync(`${stateRoot}/locks`, { recursive: true });
+    fs.symlinkSync(outside, `${stateRoot}/locks`, "dir");
+    assert.throws(
+      () => setConfig(root, { disclosureAccepted: true }),
+      (error) => error?.code === "E_STATE" && /unsafe plugin state directory/.test(error.message)
+    );
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_PLUGIN_DATA;
     else process.env.CLAUDE_PLUGIN_DATA = previous;
@@ -83,6 +113,101 @@ test("job IDs are random, path-safe, and records preserve unknown fields", () =>
       () => readJob(root, "../../outside"),
       (error) => error.code === "E_USAGE"
     );
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_PLUGIN_DATA;
+    else process.env.CLAUDE_PLUGIN_DATA = previous;
+  }
+});
+
+test("workspace admission gives write jobs an exclusive lease", () => {
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = tempDir("grok-state-data-");
+  try {
+    const root = initRepo();
+    const writer = job(generateId("task"), { status: "running", write: true });
+    admitJob(root, writer);
+    assert.throws(
+      () => admitJob(root, job(generateId("task"), { status: "queued", write: false })),
+      (error) => error?.code === "E_JOB_ACTIVE" && error.details?.conflictingJobId === writer.id
+    );
+    assert.throws(
+      () => admitJob(root, job(generateId("task"), { status: "queued", write: true })),
+      (error) => error?.code === "E_JOB_ACTIVE"
+    );
+    updateJob(root, writer.id, (current) => ({ ...current, status: "completed" }));
+    assert.doesNotThrow(() => admitJob(root, job(generateId("task"), { status: "queued", write: false })));
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_PLUGIN_DATA;
+    else process.env.CLAUDE_PLUGIN_DATA = previous;
+  }
+});
+
+test("workspace admission serializes continuations that share one provider lineage", () => {
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = tempDir("grok-state-data-");
+  try {
+    const root = initRepo();
+    const first = job(generateId("task"), {
+      jobClass: "task",
+      status: "running",
+      write: false,
+      request: { providerHomeId: "shared-lineage" }
+    });
+    admitJob(root, first);
+    assert.throws(
+      () => admitJob(root, job(generateId("task"), {
+        jobClass: "task",
+        status: "queued",
+        write: false,
+        request: { providerHomeId: "shared-lineage" }
+      })),
+      (error) => error?.code === "E_JOB_ACTIVE"
+        && error.details?.conflictingJobId === first.id
+        && error.details?.conflictingProviderHomeId === "shared-lineage"
+    );
+    assert.doesNotThrow(() => admitJob(root, job(generateId("task"), {
+      jobClass: "task",
+      status: "queued",
+      write: false,
+      request: { providerHomeId: "independent-lineage" }
+    })));
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_PLUGIN_DATA;
+    else process.env.CLAUDE_PLUGIN_DATA = previous;
+  }
+});
+
+test("workspace admission blocks a lineage until terminal task cleanup is complete", () => {
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = tempDir("grok-state-data-");
+  try {
+    const root = initRepo();
+    const pending = job(generateId("task"), {
+      jobClass: "task",
+      status: "completed",
+      request: { providerHomeId: "cleanup-pending-lineage" },
+      result: { taskRuntimeCleaned: false }
+    });
+    writeJob(root, pending);
+    assert.throws(
+      () => admitJob(root, job(generateId("task"), {
+        jobClass: "task",
+        status: "queued",
+        request: { providerHomeId: "cleanup-pending-lineage" }
+      })),
+      (error) => error?.code === "E_JOB_ACTIVE"
+        && error.details?.conflictingJobId === pending.id
+        && error.details?.conflictingProviderHomeId === "cleanup-pending-lineage"
+    );
+    updateJob(root, pending.id, (current) => ({
+      ...current,
+      result: { ...current.result, taskRuntimeCleaned: true }
+    }));
+    assert.doesNotThrow(() => admitJob(root, job(generateId("task"), {
+      jobClass: "task",
+      status: "queued",
+      request: { providerHomeId: "cleanup-pending-lineage" }
+    })));
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_PLUGIN_DATA;
     else process.env.CLAUDE_PLUGIN_DATA = previous;
@@ -130,6 +255,17 @@ test("cancellation markers are private and retention keeps active plus newest te
     assert.equal(fs.readFileSync(cancelFile(root, activeId), "utf8"), "nonce-value\n");
     assert.equal(fs.statSync(cancelFile(root, activeId)).mode & 0o777, 0o600);
 
+    requestCancel(root, activeId, "replacement-nonce");
+    assert.equal(isCancelRequested(root, activeId, "nonce-value"), false);
+    assert.equal(isCancelRequested(root, activeId, "replacement-nonce"), true);
+    assert.equal(fs.readFileSync(cancelFile(root, activeId), "utf8"), "replacement-nonce\n");
+    assert.equal(fs.statSync(cancelFile(root, activeId)).mode & 0o777, 0o600);
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(cancelFile(root, activeId))).filter((name) => name.startsWith(`${activeId}.cancel.`)),
+      [],
+      "atomic cancellation publication left a temporary marker"
+    );
+
     const terminalIds = [];
     for (let index = 0; index < 4; index += 1) {
       const id = generateId("task");
@@ -150,12 +286,13 @@ test("cancellation markers are private and retention keeps active plus newest te
   }
 });
 
-test("retain never prunes unclean review jobs while empty-target skips stay eligible", () => {
+test("retain never prunes unclean review or task jobs while empty-target skips stay eligible", () => {
   const previous = process.env.CLAUDE_PLUGIN_DATA;
   process.env.CLAUDE_PLUGIN_DATA = tempDir("grok-state-data-");
   try {
     const root = initRepo();
     const uncleanId = generateId("review");
+    const uncleanTaskId = generateId("task");
     const emptyTargetId = generateId("review");
     const normalId = generateId("task");
 
@@ -169,6 +306,15 @@ test("retain never prunes unclean review jobs while empty-target skips stay elig
         review: { verdict: "pass", summary: "fixture", findings: [] },
         providerSessionDeleted: false,
         privacyWarning: "Isolated review home retained"
+      }
+    }));
+    writeJob(root, job(uncleanTaskId, {
+      jobClass: "task",
+      status: "failed",
+      createdAt: "2026-01-01T12:00:00.000Z",
+      result: {
+        taskRuntimeCleaned: false,
+        privacyWarning: "Task runtime artifacts retained"
       }
     }));
     // Empty-target skip uses the same providerSessionDeleted flag but remains eligible for prune.
@@ -194,9 +340,10 @@ test("retain never prunes unclean review jobs while empty-target skips stay elig
     const retained = listJobs(root);
     const retainedIds = new Set(retained.map((item) => item.id));
     assert.equal(retainedIds.has(uncleanId), true, "unclean review with providerSessionDeleted false must never be pruned");
+    assert.equal(retainedIds.has(uncleanTaskId), true, "unclean task with taskRuntimeCleaned false must never be pruned");
     assert.equal(retainedIds.has(normalId), true, "newest normal terminal job fills the retention limit");
     assert.equal(retainedIds.has(emptyTargetId), false, "empty-target skip remains eligible for normal terminal pruning");
-    assert.equal(retained.length, 2);
+    assert.equal(retained.length, 3);
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_PLUGIN_DATA;
     else process.env.CLAUDE_PLUGIN_DATA = previous;

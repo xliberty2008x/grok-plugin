@@ -46,7 +46,16 @@ export function normalizeUpdate(update) {
   if (!update || typeof update !== "object") return { type: "unknown", value: update };
   const kind = update.sessionUpdate || update.type || "unknown";
   if (kind === "agent_message_chunk") return { type: "message", text: update.content?.text || "" };
-  if (kind.includes("tool_call")) return { type: "tool", name: update.title || update.toolCallId || "tool", status: update.status || kind };
+  if (kind.includes("tool_call")) {
+    const exitCode = [update.exitCode, update.exit_code, update.content?.exitCode, update.content?.exit_code]
+      .find((value) => Number.isInteger(value));
+    return {
+      type: "tool",
+      name: update.title || update.toolCallId || "tool",
+      status: update.status || kind,
+      ...(Number.isInteger(exitCode) ? { exitCode } : {})
+    };
+  }
   if (kind.includes("plan")) return { type: "plan", value: update };
   if (kind.includes("usage")) return { type: "usage", value: update };
   return { type: "unknown", value: update };

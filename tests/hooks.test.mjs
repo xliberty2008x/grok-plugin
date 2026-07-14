@@ -392,7 +392,10 @@ test("SessionEnd fails closed when ownership was never established for a live gr
   assert.equal(processGroupAlive(child.pid), true, "must not signal a never-owned live group");
   withPluginData(pluginData, () => {
     const job = readJob(root, id);
-    assert.equal(job.status, "failed");
+    assert.equal(job.status, "running");
+    assert.equal(job.phase, "cleanup-blocked");
+    assert.equal(job.result?.taskRuntimeCleaned, false);
+    assert.equal(job.pendingTerminal?.status, "completed");
     assert.equal(job.error?.code, "E_PROCESS_IDENTITY");
     assert.match(job.error?.message || "", /could not verify complete process-group shutdown/i);
   });
@@ -504,7 +507,8 @@ test("SessionEnd refuses to signal a replaced leader PID after ownership snapsho
     assert.equal(job.status, "failed");
     assert.equal(job.error?.code, "E_PROCESS_IDENTITY");
     assert.match(job.error?.message || "", /could not verify complete process-group shutdown/i);
-    assert.equal(job.result?.privacyWarning, "prior privacy evidence", "token mismatch must not clear privacy evidence");
+    assert.match(job.result?.privacyWarning || "", /prior privacy evidence/, "token mismatch must not clear privacy evidence");
+    assert.match(job.result?.privacyWarning || "", /SessionEnd process cleanup could not be verified/);
     assert.equal(job.result?.providerSessionDeleted, false);
   });
   assert.equal(hasForeignActiveProvider(root, "other-session"), true, "guard must be retained after ownership failure");
@@ -653,7 +657,8 @@ test("SessionEnd preserves guard and home when guard-only identity is live/unver
     assert.equal(job.status, "failed");
     assert.equal(job.error?.code, "E_PROCESS_IDENTITY");
     assert.match(job.error?.message || "", /could not verify complete process-group shutdown/i);
-    assert.equal(job.result?.privacyWarning, "prior-privacy-signal", "must not clear privacy evidence");
+    assert.match(job.result?.privacyWarning || "", /prior-privacy-signal/, "must not clear privacy evidence");
+    assert.match(job.result?.privacyWarning || "", /SessionEnd process cleanup could not be verified/);
     assert.equal(job.result?.providerSessionDeleted, false);
   });
   assert.equal(hasForeignActiveProvider(root, "other-session"), true, "guard must be retained after ownership failure");
@@ -763,7 +768,8 @@ test("SessionEnd refuses to signal a replaced leader when only the provider guar
     assert.equal(job.status, "failed");
     assert.equal(job.error?.code, "E_PROCESS_IDENTITY");
     assert.match(job.error?.message || "", /could not verify complete process-group shutdown/i);
-    assert.equal(job.result?.privacyWarning, "prior privacy evidence", "token mismatch must not clear privacy evidence");
+    assert.match(job.result?.privacyWarning || "", /prior privacy evidence/, "token mismatch must not clear privacy evidence");
+    assert.match(job.result?.privacyWarning || "", /SessionEnd process cleanup could not be verified/);
     assert.equal(job.result?.providerSessionDeleted, false);
   });
   assert.equal(hasForeignActiveProvider(root, "other-session"), true, "guard must be retained after ownership failure");

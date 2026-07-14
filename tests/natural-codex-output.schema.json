@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "jobId",
+    "workerOutcome",
+    "hostVerification",
+    "issue2Prevented"
+  ],
+  "properties": {
+    "jobId": {
+      "type": "string",
+      "pattern": "^task-[a-f0-9]{24}$"
+    },
+    "workerOutcome": {
+      "type": "string",
+      "enum": ["complete"]
+    },
+    "hostVerification": {
+      "type": "string",
+      "enum": ["passed"]
+    },
+    "issue2Prevented": {
+      "type": "boolean",
+      "enum": [true]
+    }
+  }
+}

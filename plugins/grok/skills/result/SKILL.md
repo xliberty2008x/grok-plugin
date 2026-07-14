@@ -1,12 +1,12 @@
 ---
 name: result
-description: Retrieve the stored final output of a completed Grok Companion job for the current repository and Codex task.
+description: Retrieve the stored final output of a completed Grok Companion job for the current repository and Codex task, then integrate it under host authority.
 user-invocable: false
 ---
 
 # Grok Result
 
-Use this skill when the user asks to show or retrieve the final result of a Grok Companion job.
+Use this skill when the user asks to show or retrieve the final result of a Grok Companion job, or when integrating a finished worker report into a Codex control-plane response.
 
 ## Invocation contract
 
@@ -17,7 +17,9 @@ Use this skill when the user asks to show or retrieve the final result of a Grok
    node <resolved-grok-codex.mjs> result [job-id]
    ```
 
-3. Forward an explicit job ID as one literal argument. Never evaluate user input as shell syntax.
-4. Return the full runtime output unchanged. If it exits unsuccessfully, return its emitted error unchanged and stop.
+3. Prefer an explicit job ID. Forward it as one literal argument. Never evaluate user input as shell syntax.
+4. Treat the structured worker report (`outcome`, `summary`, `changedFiles`, `checksClaimed`, `acceptanceResults`, `risks`, `questions`) and runtime evidence as Grok's claims plus observed facts. `hostVerification` from the runtime defaults to `not_run` and is not host success.
+5. Codex should integrate the worker report, run authoritative verification when the task requires it, and synthesize the user-facing result. Do not require a verbatim echo of opaque runtime JSON when a clear integrated report is better. Preserve job ID, outcomes, file lists, error codes, and acceptance IDs accurately.
+6. If the job is still active, return the runtime's actionable status error and stop. If the runtime exits unsuccessfully, surface the emitted error and stop.
 
-Do not summarize, condense, reorder, retry, wait for an active job, or reproduce the work in the host.
+Do not invent verification that was not run, overwrite worker findings with unstated guesses, or cancel an active job from this skill.

@@ -7,10 +7,12 @@ import { fileURLToPath } from "node:url";
 
 import { normalizeUpdate } from "../plugins/grok/scripts/lib/acp-client.mjs";
 import {
+  captureSpawnIdentity,
   childEnvironment,
   discoverGrok,
   grokVersion,
   openProvider,
+  providerCleanupIdentity,
   processStartToken,
   probe,
   cleanupReviewEnvironment,
@@ -89,6 +91,44 @@ test("owned process-tree cleanup refuses a forged leader start token", async () 
   assert.equal(processGroupAlive(child.pid), false);
 });
 
+test("spawn identity acquisition stops untracked providers and preserves live-group cleanup identity", async () => {
+  const signals = [];
+  let failure;
+  try {
+    await captureSpawnIdentity({ pid: 424242 }, {
+      timeoutMs: 0,
+      shutdownTimeoutMs: 0,
+      readStartToken: () => null,
+      isGroupAlive: () => true,
+      signalGroup: (_pid, signal) => signals.push(signal)
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.equal(failure?.code, "E_PROCESS_IDENTITY");
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+  assert.deepEqual(providerCleanupIdentity(failure), {
+    pid: 424242,
+    startToken: null,
+    processGroupId: 424242
+  });
+
+  let stoppedFailure;
+  try {
+    await captureSpawnIdentity({ pid: 434343 }, {
+      timeoutMs: 0,
+      shutdownTimeoutMs: 0,
+      readStartToken: () => null,
+      isGroupAlive: () => false,
+      signalGroup: () => {}
+    });
+  } catch (error) {
+    stoppedFailure = error;
+  }
+  assert.equal(stoppedFailure?.code, "E_PROCESS_IDENTITY");
+  assert.equal(providerCleanupIdentity(stoppedFailure), null, "stopped provider should not retain cleanup identity");
+});
+
 test("childEnvironment strips project and provider secrets while retaining runtime essentials", () => {
   const keys = ["XAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "CLAUDE_PLUGIN_DATA", "GROK_BIN", "GROK_COMPANION_CLAUDE_SESSION_ID"];
   const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
@@ -135,11 +175,14 @@ test("probe negotiates ACP v1, session loading, auth methods, models, and effort
     assert.equal(invocation.args[invocation.args.indexOf("--permission-mode") + 1], "dontAsk");
     assert.equal(invocation.args.includes("--always-approve"), false, "setup probe must not expand unattended privileges");
     const profileIndex = invocation.args.indexOf("--agent-profile");
-    assert.ok(profileIndex >= 0, "setup probe must use a checked-in --agent-profile");
-    const agentProfile = fs.readFileSync(invocation.args[profileIndex + 1], "utf8");
-    assert.match(agentProfile, /injectDefaultTools: false/);
-    assert.match(agentProfile, /permission_mode: dontAsk/);
-    assert.match(path.basename(invocation.args[profileIndex + 1]), /^setup-probe\.md$/);
+    assert.ok(profileIndex >= 0, "setup probe must use a digest-pinned --agent-profile");
+    const profileEvidence = readFakeLog(fake.logFile).find((entry) => entry.event === "agent-profile");
+    assert.ok(profileEvidence?.exists, "setup probe profile was not readable by the provider");
+    assert.equal(profileEvidence.insideGrokHome, true, "setup probe profile must be materialized inside isolated GROK_HOME");
+    assert.equal(profileEvidence.mode, 0o600);
+    assert.match(path.basename(profileEvidence.path), /^setup-probe-v2-[a-f0-9]{64}-[a-f0-9]{16}\.md$/);
+    assert.equal(profileEvidence.sha256, result.acpIsolation.agentProfileDigest);
+    assert.equal(fs.existsSync(profileEvidence.path), false, "setup profile remained after verified provider exit");
     for (const rule of ["Bash", "Edit", "Write", "MCPTool", "WebFetch"]) assert.ok(invocation.args.includes(rule), `setup probe missing deny ${rule}`);
   });
 });
@@ -174,14 +217,9 @@ test("runProvider creates a session, streams normalized events, and preserves li
         (entry) => entry.event === "argv" && entry.args.includes("agent")
       );
       assert.ok(invocation);
-      assert.deepEqual(invocation.args.slice(0, 6), [
-        "--cwd",
-        root,
-        "--sandbox",
-        "read-only",
-        "--permission-mode",
-        "dontAsk"
-      ]);
+      assert.deepEqual(invocation.args.slice(0, 2), ["--cwd", root]);
+      assert.match(invocation.args[invocation.args.indexOf("--sandbox") + 1], /^companion_[a-f0-9]{20}$/);
+      assert.equal(invocation.args[invocation.args.indexOf("--permission-mode") + 1], "dontAsk");
       assert.ok(invocation.args.includes("--disable-web-search"));
       assert.ok(invocation.args.includes("--no-subagents"));
       assert.equal(invocation.args.includes("--tools"), false);
@@ -190,7 +228,16 @@ test("runProvider creates a session, streams normalized events, and preserves li
       assert.ok(invocation.args.includes("--no-leader"));
       const agentIndex = invocation.args.indexOf("agent"), profileIndex = invocation.args.indexOf("--agent-profile");
       assert.ok(agentIndex >= 0 && profileIndex > agentIndex);
-      const agentProfile = fs.readFileSync(invocation.args[profileIndex + 1], "utf8");
+      const profileEvidence = providerLog.find((entry) => entry.event === "agent-profile");
+      assert.equal(profileEvidence?.insideGrokHome, true, "task profile must be materialized inside isolated GROK_HOME");
+      assert.equal(profileEvidence?.mode, 0o600);
+      assert.equal(path.basename(profileEvidence?.path || ""), path.basename(invocation.args[profileIndex + 1]));
+      assert.equal(profileEvidence?.sha256, profileFor("task", false).agentProfileDigest);
+      assert.equal(fs.existsSync(profileEvidence.path), false, "task profile remained after verified provider exit");
+      const agentProfile = fs.readFileSync(
+        path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../plugins/grok/provider-agents/rescue-read.md"),
+        "utf8"
+      );
       assert.match(agentProfile, /injectDefaultTools: false/);
       for (const allowed of ["GrokBuild:read_file", "GrokBuild:list_dir", "GrokBuild:grep"]) assert.match(agentProfile, new RegExp(`- id: ${allowed}`));
       for (const forbidden of ["GrokBuild:run_terminal_cmd", "GrokBuild:search_replace", "GrokBuild:task", "web_search", "image_gen"]) assert.equal(agentProfile.includes(forbidden), false);
@@ -228,9 +275,10 @@ test("runProvider loads an existing session and rejects unadvertised models", as
   await withFake({}, async () => {
     const root = initRepo();
     await assert.rejects(
-      () => openProvider({
+      () => runProvider({
         root,
         profile: profileFor("task", false),
+        prompt: "inspect",
         model: "missing-model",
         stateDir: tempDir("provider-state-")
       }),
@@ -241,8 +289,50 @@ test("runProvider loads an existing session and rejects unadvertised models", as
   await withFake({ models: [{ modelId: "grok-test", _meta: { reasoningEfforts: [{ id: "low" }] } }] }, async () => {
     const root = initRepo();
     await assert.rejects(
-      () => openProvider({ root, profile: profileFor("task", false), model: "grok-test", effort: "high", stateDir: tempDir("provider-state-") }),
+      () => runProvider({ root, profile: profileFor("task", false), prompt: "inspect", model: "grok-test", effort: "high", stateDir: tempDir("provider-state-") }),
       (error) => error.code === "E_CAPABILITY" && error.details.available.includes("low")
+    );
+  });
+});
+
+test("materialized task profile is removed after provider initialization failure", async () => {
+  const secret = "opaque-provider-diagnostic-secret";
+  await withFake({
+    authSecret: secret,
+    exitOnInitialize: true,
+    exitCode: 23,
+    initializeStderr: `authentication denied for ${secret}\n`
+  }, async (fake) => {
+    const root = initRepo();
+    await assert.rejects(
+      () => runProvider({
+        root,
+        profile: profileFor("task", false),
+        prompt: "inspect",
+        stateDir: tempDir("provider-profile-cleanup-state-")
+      }),
+      (error) => {
+        assert.equal(error?.code, "E_PROVIDER_EXIT");
+        assert.equal(error?.details?.code, 23);
+        assert.match(String(error?.details?.stderr || ""), /authentication denied/);
+        assert.equal(JSON.stringify(error?.details).includes(secret), false);
+        assert.ok(String(error?.details?.stderr || "").length <= 32_768);
+        return true;
+      }
+    );
+    const profileEvidence = readFakeLog(fake.logFile).find((entry) => entry.event === "agent-profile");
+    assert.ok(profileEvidence?.exists, "provider never observed the staged profile");
+    assert.equal(profileEvidence.insideGrokHome, true);
+    assert.equal(fs.existsSync(profileEvidence.path), false, "staged profile remained after initialization failure");
+  });
+});
+
+test("direct ACP startup fails closed without an isolated GROK_HOME", async () => {
+  await withFake({}, async () => {
+    const root = initRepo();
+    await assert.rejects(
+      () => openProvider({ root, profile: profileFor("task", false), stateDir: tempDir("provider-state-") }),
+      (error) => error?.code === "E_SECURITY_PROFILE" && /isolated GROK_HOME/.test(error.message)
     );
   });
 });
@@ -494,10 +584,12 @@ test("isolated ACP homes reject external discovery and redact opaque copied cred
     assert.equal(JSON.stringify({ result, events }).includes(secret), false);
     const inspection = readFakeLog(fake.logFile).find((entry) => entry.event === "inspect-environment" && entry.config?.includes("[skills]"));
     assert.ok(inspection);
-    assert.ok(inspection.home.startsWith(path.join(state, "task-homes", "rescue-read-v2")));
+    assert.equal(inspection.home, path.join(state, "task-homes", "job"));
     assert.equal(inspection.grokHome, path.join(inspection.home, ".grok"));
     assert.ok(inspection.config.includes(fs.realpathSync(root)));
-    assert.equal(fs.statSync(path.join(inspection.grokHome, "auth.json")).mode & 0o777, 0o600);
+    assert.equal(inspection.authExists, true);
+    assert.equal(inspection.authMode, 0o600);
+    assert.equal(fs.existsSync(path.join(inspection.grokHome, "auth.json")), false, "task credential remained after ACP session creation");
   });
 
   await withFake({ inspectValue: { hooks: [{ event: "SessionStart" }], skills: [], plugins: [], mcpServers: [], agents: [] } }, async () => {
@@ -520,16 +612,61 @@ test("isolated ACP homes reject external discovery and redact opaque copied cred
   });
 });
 
-test("review validation rejects verdict and finding-count contradictions", () => {
+test("task homes are isolated per lineage and credentials are revoked before every prompt", async () => {
+  await withFake({}, async (fake) => {
+    const root = initRepo();
+    const state = tempDir("provider-state-");
+    const profile = profileFor("task", false);
+    await runProvider({ root, profile, prompt: "first", stateDir: state, jobMarker: "job-a", providerHomeId: "lineage-a" });
+    await runProvider({ root, profile, prompt: "second", stateDir: state, jobMarker: "job-b", providerHomeId: "lineage-b" });
+    await runProvider({
+      root,
+      profile,
+      prompt: "resume first",
+      stateDir: state,
+      jobMarker: "job-c",
+      providerHomeId: "lineage-a",
+      resumeSessionId: "fake-session-00000001"
+    });
+
+    const inspections = readFakeLog(fake.logFile).filter((entry) => entry.event === "inspect-environment" && entry.config?.includes("[skills]"));
+    assert.equal(inspections.length, 3);
+    assert.equal(inspections[0].home, path.join(state, "task-homes", "lineage-a"));
+    assert.equal(inspections[1].home, path.join(state, "task-homes", "lineage-b"));
+    assert.equal(inspections[2].home, inspections[0].home);
+    assert.notEqual(inspections[0].home, inspections[1].home);
+    for (const inspection of inspections) {
+      assert.equal(inspection.authExists, true, "provider could not authenticate session creation/load");
+      assert.equal(fs.existsSync(path.join(inspection.grokHome, "auth.json")), false, "credential survived into prompt execution");
+    }
+  });
+});
+
+test("review validation derives verdict solely from findings and rejects model verdicts", () => {
   assert.throws(
-    () => validateReview({ verdict: "needs_changes", summary: "inconsistent", findings: [] }),
+    () => validateReview({ verdict: "needs_changes", summary: "No defects.", findings: [] }),
     (error) => error?.code === "E_SCHEMA"
   );
   assert.throws(
-    () => validateReview({ verdict: "pass", summary: "inconsistent", findings: [{ severity: "low", title: "Unexpected", body: "Pass cannot contain findings." }] }),
+    () => validateReview({
+      verdict: "pass",
+      summary: "One defect.",
+      findings: [{ severity: "low", title: "Unexpected", body: "A real finding." }]
+    }),
     (error) => error?.code === "E_SCHEMA"
   );
-  assert.equal(validateReview({ verdict: "pass", summary: "No defects found.", findings: [] }).verdict, "pass");
+  assert.equal(validateReview({ summary: "No defects found.", findings: [] }).verdict, "pass");
+  assert.equal(
+    validateReview({
+      summary: "Issue found.",
+      findings: [{ severity: "high", title: "Bug", body: "Broken." }]
+    }).verdict,
+    "needs_changes"
+  );
+  assert.throws(
+    () => validateReview({ summary: "", findings: [] }),
+    (error) => error?.code === "E_SCHEMA" && Boolean(error?.details?.hint)
+  );
 });
 
 test("runtime review schema stays in the provider-supported subset without conditional allOf", () => {
@@ -537,11 +674,9 @@ test("runtime review schema stays in the provider-supported subset without condi
   assert.equal(Object.hasOwn(REVIEW_SCHEMA, "if"), false);
   assert.equal(Object.hasOwn(REVIEW_SCHEMA, "then"), false);
   assert.equal(REVIEW_SCHEMA.type, "object");
-  assert.deepEqual(REVIEW_SCHEMA.required, ["verdict", "summary", "findings"]);
-  assert.match(REVIEW_SCHEMA.properties.verdict.description, /pass means zero findings/i);
-  assert.match(REVIEW_SCHEMA.properties.verdict.description, /needs_changes means at least one finding/i);
-  assert.match(REVIEW_SCHEMA.properties.findings.description, /empty when verdict is pass/i);
-  assert.match(REVIEW_SCHEMA.properties.findings.description, /at least one actionable defect when verdict is needs_changes/i);
+  assert.deepEqual(REVIEW_SCHEMA.required, ["summary", "findings"]);
+  assert.match(REVIEW_SCHEMA.properties.findings.description, /derived by the runtime/i);
+  assert.equal(Object.hasOwn(REVIEW_SCHEMA.properties, "verdict"), false);
   // Serialized form passed to --json-schema must remain free of conditional keywords.
   const serialized = JSON.stringify(REVIEW_SCHEMA);
   assert.equal(serialized.includes('"allOf"'), false);
@@ -549,13 +684,13 @@ test("runtime review schema stays in the provider-supported subset without condi
   assert.equal(serialized.includes('"then"'), false);
 });
 
-test("review and adversarial-review prompts encode pass and needs_changes finding rules", () => {
+test("review and adversarial-review prompts encode findings-derived pass and needs_changes rules", () => {
   const promptsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../plugins/grok/prompts");
   const review = fs.readFileSync(path.join(promptsDir, "review.md"), "utf8");
   const adversarial = fs.readFileSync(path.join(promptsDir, "adversarial-review.md"), "utf8");
   for (const text of [review, adversarial]) {
-    assert.match(text, /Use `pass` only with an empty `findings` array/);
-    assert.match(text, /Use `needs_changes` only when\s*`findings` contains at least one actionable defect/);
+    assert.match(text, /Leave `findings` empty when there are no/);
+    assert.match(text, /runtime derives pass from zero findings/i);
   }
 });
 
@@ -700,9 +835,10 @@ test("ACP process exit during initialization is surfaced as a provider error", a
   await withFake({ exitOnInitialize: true, exitCode: 19 }, async () => {
     const root = initRepo();
     await assert.rejects(
-      () => openProvider({
+      () => runProvider({
         root,
         profile: profileFor("task", false),
+        prompt: "inspect",
         stateDir: tempDir("provider-state-")
       }),
       (error) => error.code === "E_PROVIDER_EXIT" && error.details.code === 19

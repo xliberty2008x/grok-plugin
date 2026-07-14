@@ -1,12 +1,14 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const COMPANION = path.join(ROOT, "plugins", "grok", "scripts", "grok-companion.mjs");
 export const CODEX_COMPANION = path.join(ROOT, "plugins", "grok", "scripts", "grok-codex.mjs");
+export const NONBLOCKING_STDIN_CHILD = path.join(ROOT, "tests", "nonblocking-stdin-child.mjs");
+export const PTY_STDIN_DRIVER = path.join(ROOT, "tests", "pty-stdin-driver.py");
 
 export function tempDir(prefix = "grok-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -54,12 +56,65 @@ export function testEnvironment({ fake, pluginData = tempDir("grok-plugin-data-"
   };
 }
 
-export function runCompanion(args, { cwd, env, timeout = 20000 } = {}) {
-  return run(process.execPath, [COMPANION, ...args], { cwd, env, timeout });
+export function runCompanion(args, { cwd, env, timeout = 20000, input } = {}) {
+  return run(process.execPath, [COMPANION, ...args], { cwd, env, timeout, input });
 }
 
-export function runCodexCompanion(args, { cwd, env, timeout = 20000 } = {}) {
-  return run(process.execPath, [CODEX_COMPANION, ...args], { cwd, env, timeout });
+export function runCodexCompanion(args, { cwd, env, timeout = 20000, input } = {}) {
+  return run(process.execPath, [CODEX_COMPANION, ...args], { cwd, env, timeout, input });
+}
+
+export function spawnNonblockingStdin(target, args, { cwd, env, timeout = 20000 } = {}) {
+  const child = spawn(process.execPath, [NONBLOCKING_STDIN_CHILD, target, ...args], {
+    cwd,
+    env: env ?? process.env,
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  let stdout = "";
+  let stderr = "";
+  let stdinError = null;
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.on("error", (error) => { stdinError = error; });
+
+  const completed = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`Timed out waiting for nonblocking stdin child after ${timeout} ms.`));
+    }, timeout);
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, stdout, stderr, stdinError });
+    });
+  });
+  return {
+    child,
+    completed,
+    get stdout() { return stdout; },
+    get stderr() { return stderr; }
+  };
+}
+
+export function runPtyStdin(target, args, { cwd, env, input, timeout = 30000 } = {}) {
+  const result = run("python3", [PTY_STDIN_DRIVER, process.execPath, target, ...args], {
+    cwd,
+    env,
+    input,
+    timeout
+  });
+  if (result.status !== 0) return { driver: result, result: null };
+  try {
+    return { driver: result, result: JSON.parse(result.stdout) };
+  } catch {
+    return { driver: result, result: null };
+  }
 }
 
 export async function waitFor(predicate, { timeoutMs = 10000, intervalMs = 50 } = {}) {

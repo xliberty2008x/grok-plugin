@@ -14,10 +14,12 @@ import { redact } from "../plugins/grok/scripts/lib/redact.mjs";
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import {
+  CODEX_COMPANION,
   COMPANION,
   initRepo,
   runCodexCompanion,
   runCompanion,
+  spawnNonblockingStdin,
   tempDir,
   testEnvironment,
   waitFor
@@ -37,8 +39,23 @@ function parseError(result, code) {
   return payload.error;
 }
 
+function taskReport(summary = "Fake Grok task completed", acceptanceIds = ["AC-01", "AC-02"]) {
+  return `GROK_WORKER_REPORT: ${JSON.stringify({
+    outcome: "complete",
+    summary,
+    changedFiles: [],
+    checksClaimed: [],
+    acceptanceResults: acceptanceIds.map((id) => ({ id, status: "met" })),
+    risks: [],
+    questions: []
+  })}`;
+}
+
 function fixture(config = {}) {
-  const fake = installFakeGrok(tempDir("fake-grok-runtime-"), config);
+  const fake = installFakeGrok(tempDir("fake-grok-runtime-"), {
+    taskText: taskReport(),
+    ...config
+  });
   const pluginData = tempDir("grok-runtime-data-");
   const env = testEnvironment({ fake, pluginData });
   // Strip host companion markers so CLI under test is not refused as nested recursion
@@ -74,8 +91,87 @@ function transferFixture(config = {}) {
   fs.mkdirSync(projects, { recursive: true });
   const source = path.join(projects, "session.jsonl");
   fs.writeFileSync(source, '{"type":"user"}\n', "utf8");
-  return { root, source, ...runtime, env: { ...runtime.env, HOME: home } };
+  return { root, source, home, ...runtime, env: { ...runtime.env, HOME: home } };
 }
+
+test("transfer helpers format model-qualified resume and parse non-isolated models text", async () => {
+  const {
+    formatResumeCommand,
+    parseAdvertisedModels,
+    selectTransferModel,
+    assertTransferEffort,
+    isImportedSessionReady,
+    waitForImportedSession
+  } = await import("../plugins/grok/scripts/lib/grok-provider.mjs");
+  const { installFakeGrok, readFakeLog } = await import("./fake-grok.mjs");
+
+  assert.equal(
+    formatResumeCommand("12345678-1234-4234-8234-123456789abc", "grok-4.5"),
+    "grok --model grok-4.5 --resume 12345678-1234-4234-8234-123456789abc"
+  );
+  assert.equal(
+    formatResumeCommand("12345678-1234-4234-8234-123456789abc", "grok-4.5", "high"),
+    "grok --model grok-4.5 --reasoning-effort high --resume 12345678-1234-4234-8234-123456789abc"
+  );
+
+  const models = parseAdvertisedModels(`
+You are logged in with grok.com.
+
+Default model: grok-primary
+
+Available models:
+  * grok-primary (default) efforts=low,medium,high
+  - grok-secondary efforts=low
+`);
+  assert.deepEqual(models.map((item) => item.id), ["grok-primary", "grok-secondary"]);
+  assert.deepEqual(models[0].efforts, ["low", "medium", "high"]);
+  assert.equal(selectTransferModel(models).id, "grok-primary");
+  assert.equal(selectTransferModel(models, "grok-secondary").id, "grok-secondary");
+  assert.throws(
+    () => selectTransferModel(models, "missing"),
+    (error) => error?.code === "E_CAPABILITY"
+  );
+  assert.throws(
+    () => assertTransferEffort(models[1], "high"),
+    (error) => error?.code === "E_CAPABILITY" && /effort high/i.test(error.message)
+  );
+  assertTransferEffort(models[0], "high");
+
+  const sessionId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const fake = installFakeGrok(tempDir("fake-grok-ready-"), {
+    importSessionId: sessionId,
+    importReadyAfterMs: 80
+  });
+  // Simulate a completed import registration without running transfer end-to-end.
+  const storePath = `${fake.binary}.sessions.json`;
+  fs.writeFileSync(storePath, JSON.stringify({
+    sessions: [{ id: sessionId, readyAt: Date.now(), neverReady: true }]
+  }), "utf8");
+  assert.equal(isImportedSessionReady(sessionId, fake.binary), false);
+  const publish = setTimeout(() => fs.writeFileSync(storePath, JSON.stringify({
+    sessions: [{ id: sessionId, readyAt: Date.now(), neverReady: false }]
+  }), "utf8"), 80);
+  try {
+    await waitForImportedSession(sessionId, {
+      binary: fake.binary,
+      timeoutMs: 1500,
+      intervalMs: 30
+    });
+  } finally {
+    clearTimeout(publish);
+  }
+  assert.equal(isImportedSessionReady(sessionId, fake.binary), true);
+  const listEvents = readFakeLog(fake.logFile).filter((entry) => entry.event === "sessions-list");
+  assert.ok(listEvents.length >= 2);
+
+  fs.writeFileSync(storePath, JSON.stringify({
+    sessions: [{ id: sessionId, readyAt: Date.now(), neverReady: true }]
+  }), "utf8");
+  await assert.rejects(
+    () => waitForImportedSession(sessionId, { binary: fake.binary, timeoutMs: 120, intervalMs: 30 }),
+    (error) => error?.code === "E_IMPORT_RESULT" && /not yet observable/i.test(error.message)
+  );
+});
 
 function spawnCompanion(args, { cwd, env }) {
   const child = spawn(process.execPath, [COMPANION, ...args], {
@@ -109,6 +205,34 @@ function persistedJobs(pluginData) {
   });
 }
 
+function persistedJob(pluginData, id) {
+  const value = persistedJobs(pluginData).find((job) => job.id === id);
+  assert.ok(value, `missing persisted job ${id}`);
+  return value;
+}
+
+function writeEnvelope(userRequest, overrides = {}) {
+  return JSON.stringify({
+    schemaVersion: 1,
+    userRequest,
+    objective: userRequest,
+    mode: "write",
+    scope: { include: ["tracked.txt"], exclude: [] },
+    context: {
+      facts: [],
+      constraints: [],
+      expectedProjectMarkers: [],
+      requiredPaths: ["tracked.txt"],
+      workspaceState: "task_scoped",
+      upstreamFreshness: "not_checked"
+    },
+    nonGoals: [],
+    acceptanceCriteria: [{ id: "AC-01", text: "Complete the fixture task" }],
+    requiredVerification: [],
+    ...overrides
+  });
+}
+
 test("empty review target records a skipped empty-target result without claiming session deletion", () => {
   const root = initRepo();
   const { env } = fixture();
@@ -116,7 +240,7 @@ test("empty review target records a skipped empty-target result without claiming
   const job = parseJson(result);
   assert.equal(job.status, "completed");
   assert.equal(job.phase, "done");
-  assert.equal(job.grokSessionId, null);
+  assert.equal(Object.hasOwn(job, "grokSessionId"), false);
   assert.equal(job.result.skipped, true);
   assert.equal(job.result.skipReason, "empty-target");
   assert.equal(job.result.providerSessionDeleted, false);
@@ -134,7 +258,7 @@ test("runtime review validates structured output, preserves workspace integrity,
   fs.appendFileSync(path.join(root, "tracked.txt"), "review me\n");
   const before = fs.readFileSync(path.join(root, "tracked.txt"), "utf8");
   const secret = "xai-abcdefghijklmnop";
-  const { fake, env } = fixture({
+  const { fake, env, pluginData } = fixture({
     unknownSecret: secret,
     review: {
       verdict: "needs_changes",
@@ -157,16 +281,13 @@ test("runtime review validates structured output, preserves workspace integrity,
   assert.equal(job.status, "completed");
   assert.equal(job.phase, "done");
   assert.equal(job.write, false);
-  assert.equal(job.profile.transport, "headless");
-  assert.equal(job.profile.agent, "explore");
-  assert.equal(job.profile.sandbox, "strict");
-  assert.equal(job.profile.permissionMode, "default");
-  assert.equal(job.profile.subagents, false);
+  assert.equal(job.profileId, "review-v1");
   assert.equal(job.result.review.verdict, "needs_changes");
   assert.equal(job.result.providerSessionDeleted, true);
   assert.equal(fs.readFileSync(path.join(root, "tracked.txt"), "utf8"), before);
-  assert.equal(job.request.prompt, null);
-  assert.match(job.request.promptDigest, /^[a-f0-9]{64}$/);
+  const stored = persistedJob(pluginData, job.id);
+  assert.equal(stored.request.prompt, null);
+  assert.match(stored.request.promptDigest, /^[a-f0-9]{64}$/);
 
   const providerLog = readFakeLog(fake.logFile);
   assert.equal(providerLog.some((entry) => entry.event === "delete-session"), false);
@@ -180,7 +301,7 @@ test("runtime review validates structured output, preserves workspace integrity,
   assert.equal(reviewInvocation.args[reviewInvocation.args.indexOf("--tools") + 1], "todo_write");
   assert.ok(reviewInvocation.args.includes("MCPTool(*)"));
   assert.equal(providerLog.some((entry) => entry.event === "rpc"), false);
-  const persistedLog = fs.readFileSync(job.logFile, "utf8");
+  const persistedLog = fs.readFileSync(stored.logFile, "utf8");
   assert.equal(persistedLog.includes(secret), false);
 
   const human = runCompanion(["result", job.id], { cwd: root, env });
@@ -191,35 +312,36 @@ test("runtime review validates structured output, preserves workspace integrity,
 
 test("runtime write task forwards model and effort under the write security profile", () => {
   const root = initRepo();
-  const { fake, env } = fixture({ taskText: "Implemented the requested fake change and ran tests." });
+  const { fake, env, pluginData } = fixture({ taskText: taskReport("Implemented the requested fake change and ran tests.", ["AC-01"]) });
   const result = runCompanion(
-    ["task", "--wait", "--write", "--model", "grok-test", "--effort", "high", "implement fixture" , "--json"],
-    { cwd: root, env }
+    ["task", "--wait", "--write", "--model", "grok-test", "--effort", "high", "--envelope-stdin", "--json"],
+    { cwd: root, env, input: writeEnvelope("implement fixture") }
   );
   const job = parseJson(result);
+  const stored = persistedJob(pluginData, job.id);
   assert.equal(job.kind, "task");
   assert.equal(job.status, "completed");
   assert.equal(job.write, true);
   assert.equal(job.model, "grok-test");
   assert.equal(job.effort, "high");
-  assert.equal(job.profile.id, "rescue-write-v2");
-  assert.equal(job.profile.transport, "acp");
-  assert.equal(job.profile.agent, "build");
-  assert.equal(job.profile.sandbox, "workspace");
-  assert.equal(job.profile.permissionMode, "bypassPermissions");
-  assert.equal(job.result.text, "Implemented the requested fake change and ran tests.");
-  assert.equal(job.request.prompt, null);
-  assert.match(job.request.promptDigest, /^[a-f0-9]{64}$/);
-  assert.ok(job.providerProcess.pid > 0);
-  assert.ok(job.grokSessionId);
+  assert.equal(job.profileId, "rescue-write-v3");
+  assert.equal(stored.profile.transport, "acp");
+  assert.equal(stored.profile.agent, "build");
+  assert.equal(stored.profile.sandbox, "strict");
+  assert.equal(stored.profile.permissionMode, "acceptEdits");
+  assert.match(stored.result.text, /Implemented the requested fake change and ran tests\./);
+  assert.equal(stored.request.prompt, null);
+  assert.match(stored.request.promptDigest, /^[a-f0-9]{64}$/);
+  assert.ok(stored.providerProcess.pid > 0);
+  assert.ok(stored.grokSessionId);
 
   const providerLog = readFakeLog(fake.logFile);
   const invocation = providerLog.find(
     (entry) => entry.event === "argv" && entry.args.includes("agent")
   );
-  assert.ok(invocation.args.includes("workspace"));
-  assert.ok(invocation.args.includes("bypassPermissions"));
-  assert.ok(invocation.args.includes("--always-approve"));
+  assert.match(invocation.args[invocation.args.indexOf("--sandbox") + 1], /^companion_[a-f0-9]{20}$/);
+  assert.ok(invocation.args.includes("acceptEdits"));
+  assert.equal(invocation.args.includes("--always-approve"), false);
   assert.ok(invocation.args.includes("grok-test"));
   assert.ok(invocation.args.includes("high"));
   assert.equal(invocation.args.includes("--tools"), false);
@@ -233,48 +355,54 @@ test("runtime write task forwards model and effort under the write security prof
 
 test("resume candidates preserve read/write profiles and never escalate an existing session", () => {
   const root = initRepo();
-  const { fake, env } = fixture({ taskText: "Profile-specific task result." });
+  const { fake, env, pluginData } = fixture({
+    taskTexts: [
+      taskReport("Profile-specific read result."),
+      taskReport("Profile-specific write result.", ["AC-01"]),
+      taskReport("Profile-specific resumed write result.", ["AC-01"])
+    ]
+  });
 
   const read = parseJson(runCompanion(
     ["task", "--wait", "--fresh", "read-only investigation", "--json"],
     { cwd: root, env }
   ));
-  assert.equal(read.profile.id, "rescue-read-v2");
+  assert.equal(read.profileId, "rescue-read-v3");
   const readCandidate = parseJson(runCompanion(["task-resume-candidate", "--json"], { cwd: root, env }));
   assert.deepEqual(readCandidate, {
     available: true,
     jobId: read.id,
-    grokSessionId: read.grokSessionId,
-    profileId: "rescue-read-v2"
+    profileId: "rescue-read-v3"
   });
 
   const escalated = runCompanion(
-    ["task", "--wait", "--write", "--resume", "attempt privilege escalation", "--json"],
-    { cwd: root, env }
+    ["task", "--wait", "--write", "--resume", "--envelope-stdin", "--json"],
+    { cwd: root, env, input: writeEnvelope("attempt privilege escalation") }
   );
   parseError(escalated, "E_NO_RESUME_CANDIDATE");
 
   const write = parseJson(runCompanion(
-    ["task", "--wait", "--write", "--fresh", "write-profile implementation", "--json"],
-    { cwd: root, env }
+    ["task", "--wait", "--write", "--fresh", "--envelope-stdin", "--json"],
+    { cwd: root, env, input: writeEnvelope("write-profile implementation") }
   ));
-  assert.equal(write.profile.id, "rescue-write-v2");
+  assert.equal(write.profileId, "rescue-write-v3");
+  const storedWrite = persistedJob(pluginData, write.id);
   const writeCandidate = parseJson(runCompanion(["task-resume-candidate", "--write", "--json"], { cwd: root, env }));
   assert.deepEqual(writeCandidate, {
     available: true,
     jobId: write.id,
-    grokSessionId: write.grokSessionId,
-    profileId: "rescue-write-v2"
+    profileId: "rescue-write-v3"
   });
 
   const resumed = parseJson(runCompanion(
-    ["task", "--wait", "--write", "--resume", "continue write-profile work", "--json"],
-    { cwd: root, env }
+    ["task", "--wait", "--write", "--resume", "--envelope-stdin", "--json"],
+    { cwd: root, env, input: writeEnvelope("continue write-profile work") }
   ));
-  assert.equal(resumed.grokSessionId, write.grokSessionId);
-  assert.equal(resumed.request.resumeSessionId, write.grokSessionId);
+  const storedResumed = persistedJob(pluginData, resumed.id);
+  assert.equal(storedResumed.grokSessionId, storedWrite.grokSessionId);
+  assert.equal(storedResumed.request.resumeSessionId, storedWrite.grokSessionId);
   assert.ok(readFakeLog(fake.logFile).some((entry) =>
-    entry.event === "rpc" && entry.message.method === "session/load" && entry.message.params.sessionId === write.grokSessionId
+    entry.event === "rpc" && entry.message.method === "session/load" && entry.message.params.sessionId === storedWrite.grokSessionId
   ));
 });
 
@@ -340,8 +468,7 @@ test("resume candidates accept failed and cancelled terminal tasks with a Grok s
     assert.deepEqual(candidate, {
       available: true,
       jobId: failedId,
-      grokSessionId: failedSession,
-      profileId: "rescue-read-v2"
+      profileId: "rescue-read-v3"
     });
   }
 
@@ -357,8 +484,7 @@ test("resume candidates accept failed and cancelled terminal tasks with a Grok s
     assert.deepEqual(candidate, {
       available: true,
       jobId: cancelledId,
-      grokSessionId: cancelledSession,
-      profileId: "rescue-read-v2"
+      profileId: "rescue-read-v3"
     });
   }
 });
@@ -379,7 +505,6 @@ test("resume candidates reject queued and running tasks even when a Grok session
   assert.deepEqual(candidate, {
     available: false,
     jobId: null,
-    grokSessionId: null,
     profileId: null
   });
 
@@ -390,25 +515,158 @@ test("resume candidates reject queued and running tasks even when a Grok session
   parseError(resume, "E_NO_RESUME_CANDIDATE");
 });
 
+test("explicit resume completes pending lineage cleanup before provider admission", () => {
+  const root = fs.realpathSync(initRepo());
+  const { env, pluginData } = fixture();
+  const first = parseJson(runCompanion(["task", "--wait", "seed resumable cleanup lineage", "--json"], { cwd: root, env }));
+  const stored = persistedJob(pluginData, first.id);
+  const stateRoot = path.dirname(path.dirname(stored.logFile));
+  const taskHome = path.join(stateRoot, "task-homes", stored.request.providerHomeId, ".grok");
+  fs.mkdirSync(path.join(taskHome, "agent-profiles"), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(taskHome, "auth.json"), "{}\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(taskHome, "agent-profiles", "pending.md"), "profile\n", { mode: 0o600 });
+  const jobFile = path.join(stateRoot, "jobs", `${first.id}.json`);
+  fs.writeFileSync(jobFile, `${JSON.stringify({
+    ...stored,
+    result: { ...(stored.result || {}), taskRuntimeCleaned: false, privacyWarning: "cleanup pending" }
+  }, null, 2)}\n`, { mode: 0o600 });
+
+  const resumed = parseJson(runCompanion(["task", "--wait", "--job-id", first.id, "continue after cleanup", "--json"], { cwd: root, env }));
+  assert.equal(resumed.resumeJobId, first.id);
+  assert.equal(resumed.status, "completed");
+  assert.equal(persistedJob(pluginData, first.id).result.taskRuntimeCleaned, true);
+  assert.equal(fs.existsSync(path.join(taskHome, "auth.json")), false);
+  assert.equal(fs.existsSync(path.join(taskHome, "agent-profiles")), false);
+});
+
+test("concurrent read-only continuations admit only one job per provider lineage", { skip: process.platform === "win32" }, async () => {
+  const root = fs.realpathSync(initRepo());
+  const { fake, pluginData, env } = fixture({ cancelMode: "wait" });
+  const priorId = seedTerminalTaskJob(root, env, {
+    status: "completed",
+    grokSessionId: "55555555-5555-4555-8555-555555555555"
+  });
+  const args = ["task", "--background", "--job-id", priorId, "continue shared lineage", "--json"];
+  const first = spawnCompanion(args, { cwd: root, env });
+  const second = spawnCompanion(args, { cwd: root, env });
+  const outcomes = await Promise.all([first.completed, second.completed]);
+  const successes = outcomes.filter((outcome) => outcome.code === 0);
+  const failures = outcomes.filter((outcome) => outcome.code !== 0);
+  assert.equal(successes.length, 1, JSON.stringify(outcomes));
+  assert.equal(failures.length, 1, JSON.stringify(outcomes));
+  const rejected = JSON.parse(failures[0].stdout);
+  assert.equal(rejected.error?.code, "E_JOB_ACTIVE");
+  assert.equal(rejected.error?.details?.conflictingProviderHomeId, priorId);
+
+  const started = JSON.parse(successes[0].stdout);
+  const running = await waitFor(() => {
+    const job = persistedJob(pluginData, started.id);
+    return job.status === "running" && job.providerProcess?.pid ? job : false;
+  }, { timeoutMs: 10_000 });
+  assert.equal(running.request.providerHomeId, priorId);
+  const providerStarts = await waitFor(() => {
+    const starts = readFakeLog(fake.logFile).filter((entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio"));
+    return starts.length === 1 ? starts : false;
+  }, { timeoutMs: 5000 });
+  assert.equal(providerStarts.length, 1, "rejected continuation launched a second provider");
+
+  const cancelled = parseJson(runCompanion(["cancel", started.id, "--json"], { cwd: root, env, timeout: 15_000 }));
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.result?.taskRuntimeCleaned, true);
+  const stored = persistedJob(pluginData, started.id);
+  const grokHome = path.join(path.dirname(path.dirname(stored.logFile)), "task-homes", priorId, ".grok");
+  assert.equal(fs.existsSync(path.join(grokHome, "auth.json")), false);
+  assert.equal(fs.existsSync(path.join(grokHome, "agent-profiles")), false);
+});
+
+test("three independent Codex read envelopes run concurrently with isolated provider profiles", { skip: process.platform === "win32" }, async () => {
+  const root = fs.realpathSync(initRepo());
+  const { fake, pluginData, env } = fixture({
+    delayMs: 1500,
+    requireAgentProfileUnderGrokHome: true
+  });
+  const dispatches = ["stdin", "profile", "lifecycle"].map((slice) => {
+    const dispatch = spawnNonblockingStdin(
+      CODEX_COMPANION,
+      ["task", "--background", "--envelope-stdin", "--stdin-ready", "--fresh", "--json"],
+      { cwd: root, env, timeout: 20_000 }
+    );
+    return { slice, dispatch };
+  });
+
+  await waitFor(
+    () => dispatches.every(({ dispatch }) => dispatch.stderr.includes("GROK_COMPANION_STDIN_READY")),
+    { timeoutMs: 5000 }
+  );
+  assert.equal(
+    readFakeLog(fake.logFile).filter((entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio")).length,
+    0,
+    "a provider started before its private TaskEnvelope arrived"
+  );
+
+  for (const { slice, dispatch } of dispatches) {
+    dispatch.child.stdin.end(writeEnvelope(`inspect ${slice}`, {
+      mode: "read",
+      scope: { include: ["tracked.txt"], exclude: [] },
+      acceptanceCriteria: [
+        { id: "AC-01", text: `Inspect the ${slice} slice` },
+        { id: "AC-02", text: "Return a structured read-only report" }
+      ]
+    }));
+  }
+  const accepted = await Promise.all(dispatches.map(({ dispatch }) => dispatch.completed));
+  assert.ok(accepted.every((outcome) => outcome.code === 0), JSON.stringify(accepted));
+  const jobIds = accepted.map((outcome) => JSON.parse(outcome.stdout).id);
+  assert.equal(new Set(jobIds).size, 3);
+
+  const overlapping = await waitFor(() => {
+    const jobs = jobIds.map((id) => persistedJob(pluginData, id));
+    return jobs.every((job) => job.status === "running" && job.providerProcess?.pid) ? jobs : false;
+  }, { timeoutMs: 10_000 });
+  assert.equal(new Set(overlapping.map((job) => job.request.providerHomeId)).size, 3);
+
+  const terminal = await waitFor(() => {
+    const jobs = jobIds.map((id) => persistedJob(pluginData, id));
+    return jobs.every((job) => ["completed", "failed", "cancelled"].includes(job.status)) ? jobs : false;
+  }, { timeoutMs: 20_000 });
+  for (const job of terminal) {
+    assert.equal(job.status, "completed", JSON.stringify(job.error));
+    assert.equal(job.error, null);
+    assert.equal(job.result?.workerReport?.outcome, "complete");
+    assert.equal(job.result?.taskRuntimeCleaned, true);
+    assert.deepEqual(job.result?.runtimeEvidence?.observedChangedPaths, []);
+  }
+
+  const profiles = readFakeLog(fake.logFile).filter((entry) => entry.event === "agent-profile");
+  assert.equal(profiles.length, 3);
+  assert.equal(new Set(profiles.map((entry) => entry.path)).size, 3);
+  for (const profile of profiles) {
+    assert.equal(profile.exists, true);
+    assert.equal(profile.insideGrokHome, true);
+    assert.equal(profile.mode, 0o600);
+    assert.equal(fs.existsSync(profile.path), false, "provider profile remained after verified job cleanup");
+  }
+});
+
 test("background task is durable across command processes and supports status, wait, and result", () => {
   const root = initRepo();
-  const { env } = fixture({ taskText: "Background fake result", delayMs: 250 });
+  const { env, pluginData } = fixture({ taskText: taskReport("Background fake result"), delayMs: 250 });
   const launch = parseJson(runCompanion(
     ["task", "--background", "background fixture", "--json"],
     { cwd: root, env }
   ));
   assert.equal(launch.status, "queued");
-  assert.ok(launch.workerProcess.pid > 0);
-  assert.match(launch.workerProcess.nonce, /^[a-f0-9]{32}$/);
+  assert.equal(Object.hasOwn(launch, "workerProcess"), false);
 
   const waited = parseJson(runCompanion(
     ["status", launch.id, "--wait", "--timeout-ms", "10000", "--json"],
     { cwd: root, env, timeout: 15000 }
   ));
   assert.equal(waited.status, "completed");
-  assert.equal(waited.result.text, "Background fake result");
-  assert.equal(waited.request.prompt, null);
-  assert.match(waited.request.promptDigest, /^[a-f0-9]{64}$/);
+  const stored = persistedJob(pluginData, launch.id);
+  assert.match(stored.result.text, /Background fake result/);
+  assert.equal(stored.request.prompt, null);
+  assert.match(stored.request.promptDigest, /^[a-f0-9]{64}$/);
 
   const result = parseJson(runCompanion(["result", launch.id, "--json"], { cwd: root, env }));
   assert.equal(result.id, launch.id);
@@ -423,16 +681,17 @@ test("background task is durable across command processes and supports status, w
 test("task results redact provider secrets in immediate, stored, JSON, and human output", () => {
   const root = initRepo();
   const secret = "xai-abcdefghijklmnopqrstuvwxyz";
-  const { env } = fixture({ taskText: `Completed safely; provider token was ${secret}.` });
+  const { env, pluginData } = fixture({ taskText: taskReport(`Completed safely; provider token was ${secret}.`) });
   const immediate = runCompanion(["task", "--wait", "redaction fixture", "--json"], { cwd: root, env });
   const job = parseJson(immediate);
-  assert.match(job.result.text, /Completed safely/);
+  assert.match(persistedJob(pluginData, job.id).result.text, /Completed safely/);
 
   const jsonResult = runCompanion(["result", job.id, "--json"], { cwd: root, env });
   assert.equal(jsonResult.status, 0, jsonResult.stderr);
   const humanResult = runCompanion(["result", job.id], { cwd: root, env });
   assert.equal(humanResult.status, 0, humanResult.stderr);
-  const persisted = `${fs.readFileSync(job.logFile, "utf8")}\n${fs.readFileSync(path.join(path.dirname(job.logFile), `${job.id}.json`), "utf8")}`;
+  const stored = persistedJob(pluginData, job.id);
+  const persisted = `${fs.readFileSync(stored.logFile, "utf8")}\n${fs.readFileSync(path.join(path.dirname(stored.logFile), `${job.id}.json`), "utf8")}`;
 
   for (const output of [immediate.stdout, jsonResult.stdout, humanResult.stdout, persisted]) {
     assert.equal(output.includes(secret), false);
@@ -669,7 +928,8 @@ test("lost-worker recovery preserves guard and home when guard identity is live/
   assert.equal(processGroupAlive(provider.pid), true);
 
   const recovered = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
-  assert.equal(recovered.status, "failed");
+  assert.equal(recovered.status, "running");
+  assert.equal(recovered.phase, "cleanup-blocked");
   assert.equal(recovered.error.code, "E_PROCESS_IDENTITY");
   assert.equal(processGroupAlive(provider.pid), true, "must not tear down an unverifiable live process group");
   assert.equal(hasForeignActiveProvider(root, null), true, "guard must be retained");
@@ -936,12 +1196,75 @@ test("force-cancel preserves guard and home when guard identity is live/unverifi
   assert.equal(hasForeignActiveProvider(root, null), true, "guard must be retained after force-cancel failure");
   assert.equal(fs.existsSync(path.join(isolatedHome, "retained.txt")), true, "isolated home must be retained");
   const job = JSON.parse(fs.readFileSync(path.join(stateRoot, "jobs", `${id}.json`), "utf8"));
-  assert.equal(job.status, "queued", "force-cancel must not mark cancelled when provider cleanup fails closed");
+  assert.equal(job.status, "running", "force-cancel failure must remain recoverable rather than falsely terminal");
+  assert.equal(job.phase, "cleanup-blocked");
+  assert.equal(job.pendingTerminal?.status, "cancelled");
+  assert.equal(job.result?.providerSessionDeleted, false);
+  assert.match(job.result?.privacyWarning || "", /prior-privacy-signal/);
+  assert.match(job.result?.privacyWarning || "", /force-cancel process cleanup could not be verified/);
+});
+
+test("force-cancel persists cleanup-blocked when worker termination cannot be verified", { skip: process.platform === "win32" }, async (t) => {
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("task");
+  const taskHome = path.join(stateRoot, "task-homes", id, ".grok");
+  fs.mkdirSync(path.join(taskHome, "agent-profiles"), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(taskHome, "auth.json"), "{}\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(taskHome, "agent-profiles", "retained.md"), "profile\n", { mode: 0o600 });
+  const worker = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)", id], { detached: true, stdio: "ignore" });
+  t.after(() => { try { process.kill(-worker.pid, "SIGKILL"); } catch {} });
+  await waitFor(() => processGroupAlive(worker.pid), { timeoutMs: 5000 });
+  const workerNonce = crypto.randomBytes(16).toString("hex");
+  const stamped = new Date().toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 3,
+    id,
+    kind: "task",
+    jobClass: "task",
+    title: "task: force-cancel unverifiable worker",
+    summary: "Queued",
+    write: false,
+    status: "queued",
+    phase: "queued",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    workerAuthorization: null,
+    workerProcess: { pid: worker.pid, startToken: "unverified-worker-token", nonce: workerNonce, processGroupId: worker.pid, commandMarker: id },
+    providerProcess: null,
+    profile: profileFor("task", false),
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null, providerHomeId: id },
+    result: { privacyWarning: "prior-task-privacy" },
+    error: null
+  });
+
+  const failed = runCompanion(["cancel", id, "--json"], { cwd: root, env, timeout: 20_000 });
+  parseError(failed, "E_PROCESS_IDENTITY");
+  const job = JSON.parse(fs.readFileSync(path.join(stateRoot, "jobs", `${id}.json`), "utf8"));
+  assert.equal(job.status, "running");
+  assert.equal(job.phase, "cleanup-blocked");
+  assert.equal(job.pendingTerminal?.status, "cancelled");
+  assert.equal(job.result?.taskRuntimeCleaned, false);
+  assert.match(job.result?.privacyWarning || "", /prior-task-privacy/);
+  assert.match(job.result?.privacyWarning || "", /force-cancel process cleanup could not be verified/);
+  assert.equal(processGroupAlive(worker.pid), true);
+  assert.equal(fs.existsSync(path.join(taskHome, "auth.json")), true);
+  assert.equal(fs.existsSync(path.join(taskHome, "agent-profiles", "retained.md")), true);
 });
 
 test("background cancellation writes a marker, sends ACP cancel, and reaches cancelled once", async () => {
   const root = initRepo();
-  const { fake, env } = fixture({ cancelMode: "wait" });
+  const { fake, env, pluginData } = fixture({ cancelMode: "wait" });
   const launch = parseJson(runCompanion(
     ["task", "--background", "wait until cancelled", "--json"],
     { cwd: root, env }
@@ -950,7 +1273,7 @@ test("background cancellation writes a marker, sends ACP cancel, and reaches can
   await waitFor(() => {
     const result = runCompanion(["status", launch.id, "--json"], { cwd: root, env });
     if (result.status !== 0) return false;
-    const job = JSON.parse(result.stdout);
+    const job = persistedJob(pluginData, launch.id);
     return job.status === "running" && job.grokSessionId ? job : false;
   });
 
@@ -962,8 +1285,9 @@ test("background cancellation writes a marker, sends ACP cancel, and reaches can
   assert.equal(cancelled.status, "cancelled");
   assert.equal(cancelled.phase, "cancelled");
   assert.equal(cancelled.error.code, "E_CANCELLED");
-  const marker = path.join(path.dirname(cancelled.logFile), `${launch.id}.cancel`);
-  assert.equal(fs.readFileSync(marker, "utf8"), `${launch.workerProcess.nonce}\n`);
+  const stored = persistedJob(pluginData, launch.id);
+  const marker = path.join(path.dirname(stored.logFile), `${launch.id}.cancel`);
+  assert.equal(fs.readFileSync(marker, "utf8"), `${stored.workerProcess.nonce}\n`);
   assert.ok(readFakeLog(fake.logFile).some((entry) => entry.event === "cancel"));
 
   const second = parseJson(runCompanion(["cancel", launch.id, "--json"], { cwd: root, env }));
@@ -974,7 +1298,7 @@ test("background cancellation writes a marker, sends ACP cancel, and reaches can
 test("worker ignores forged and missing cancellation nonces", async () => {
   for (const forged of ["wrong-worker-nonce\n", "\n"]) {
     const root = initRepo();
-    const { fake, env } = fixture({ cancelMode: "wait" });
+    const { fake, env, pluginData } = fixture({ cancelMode: "wait" });
     const launch = parseJson(runCompanion(
       ["task", "--background", "reject forged cancellation", "--json"],
       { cwd: root, env }
@@ -983,7 +1307,7 @@ test("worker ignores forged and missing cancellation nonces", async () => {
     const running = await waitFor(() => {
       const result = runCompanion(["status", launch.id, "--json"], { cwd: root, env });
       if (result.status !== 0) return false;
-      const job = JSON.parse(result.stdout);
+      const job = persistedJob(pluginData, launch.id);
       return job.status === "running" && job.grokSessionId ? job : false;
     });
     const marker = path.join(path.dirname(running.logFile), `${launch.id}.cancel`);
@@ -1000,7 +1324,7 @@ test("worker ignores forged and missing cancellation nonces", async () => {
       timeout: 15000
     }));
     assert.equal(cancelled.status, "cancelled");
-    assert.equal(fs.readFileSync(marker, "utf8"), `${launch.workerProcess.nonce}\n`);
+    assert.equal(fs.readFileSync(marker, "utf8"), `${persistedJob(pluginData, launch.id).workerProcess.nonce}\n`);
   }
 });
 
@@ -1009,7 +1333,7 @@ test("background review cancellation terminates the headless process and preserv
   const tracked = path.join(root, "tracked.txt");
   fs.appendFileSync(tracked, "review cancellation fixture\n", "utf8");
   const before = fs.readFileSync(tracked, "utf8");
-  const { fake, env } = fixture({ headlessDelayMs: 60_000 });
+  const { fake, env, pluginData } = fixture({ headlessDelayMs: 60_000 });
   const launch = parseJson(runCompanion(
     ["review", "--background", "--json"],
     { cwd: root, env }
@@ -1018,7 +1342,7 @@ test("background review cancellation terminates the headless process and preserv
   await waitFor(() => {
     const status = runCompanion(["status", launch.id, "--json"], { cwd: root, env });
     if (status.status !== 0) return false;
-    const job = JSON.parse(status.stdout);
+    const job = persistedJob(pluginData, launch.id);
     const headlessStarted = readFakeLog(fake.logFile).some((entry) => entry.event === "headless");
     return job.status === "running" && job.providerProcess?.pid && headlessStarted ? job : false;
   });
@@ -1032,7 +1356,8 @@ test("background review cancellation terminates the headless process and preserv
   assert.equal(cancelled.phase, "cancelled");
   assert.equal(cancelled.error.code, "E_CANCELLED");
   assert.equal(fs.readFileSync(tracked, "utf8"), before);
-  assert.equal(fs.existsSync(path.join(path.dirname(path.dirname(cancelled.logFile)), "review-homes", launch.id)), false);
+  const stored = persistedJob(pluginData, launch.id);
+  assert.equal(fs.existsSync(path.join(path.dirname(path.dirname(stored.logFile)), "review-homes", launch.id)), false);
 
   const providerLog = readFakeLog(fake.logFile);
   assert.ok(providerLog.some((entry) => entry.event === "headless"));
@@ -1044,7 +1369,7 @@ test("background review cancellation terminates the headless process and preserv
 
 test("status recovers a background task whose worker crashes without replaying its prompt", { skip: process.platform === "win32" }, async () => {
   const root = initRepo();
-  const { fake, env } = fixture({ cancelMode: "wait" });
+  const { fake, env, pluginData } = fixture({ cancelMode: "wait" });
   const launch = parseJson(runCompanion(
     ["task", "--background", "worker crash fixture", "--json"],
     { cwd: root, env }
@@ -1052,7 +1377,7 @@ test("status recovers a background task whose worker crashes without replaying i
   const running = await waitFor(() => {
     const result = runCompanion(["status", launch.id, "--json"], { cwd: root, env });
     if (result.status !== 0) return false;
-    const job = JSON.parse(result.stdout);
+    const job = persistedJob(pluginData, launch.id);
     return job.status === "running" && job.providerProcess?.pid ? job : false;
   });
 
@@ -1066,6 +1391,233 @@ test("status recovers a background task whose worker crashes without replaying i
   assert.equal(recovered.error.code, "E_WORKER_LOST");
   assert.match(recovered.error.message, /prompt was not replayed/i);
   assert.ok(readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length <= 1, "crashed background prompt was replayed");
+  assert.equal(recovered.result?.taskRuntimeCleaned, true, "worker-crash recovery did not clean transient task artifacts");
+  const stored = persistedJob(pluginData, launch.id);
+  const taskHome = path.join(
+    path.dirname(path.dirname(stored.logFile)),
+    "task-homes",
+    stored.request?.providerHomeId || stored.id,
+    ".grok"
+  );
+  assert.equal(fs.existsSync(path.join(taskHome, "auth.json")), false, "worker-crash recovery retained the task credential");
+  assert.equal(fs.existsSync(path.join(taskHome, "agent-profiles")), false, "worker-crash recovery retained the staged profile");
+});
+
+test("cleanup-blocked task recovery preserves its completed outcome and evidence status", { skip: process.platform === "win32" }, () => {
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("task");
+  const taskHome = path.join(stateRoot, "task-homes", id, ".grok");
+  fs.mkdirSync(path.join(taskHome, "agent-profiles"), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(taskHome, "auth.json"), "{}\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(taskHome, "agent-profiles", "staged.md"), "profile\n", { mode: 0o600 });
+  const stamped = new Date(Date.now() - 60_000).toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 3,
+    id,
+    kind: "task",
+    jobClass: "task",
+    title: "task: completed cleanup retry",
+    summary: "Worker completed",
+    write: false,
+    status: "running",
+    phase: "cleanup-blocked",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: "fake-session-00000001",
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    completedAt: null,
+    heartbeatAt: stamped,
+    controllerProcess: null,
+    workerProcess: { pid: 999999997, startToken: "dead-worker", nonce: "n", processGroupId: 999999997, commandMarker: id },
+    providerProcess: { pid: 999999996, startToken: "dead-provider", processGroupId: 999999996 },
+    profile: profileFor("task", false),
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: "Task finished; runtime cleanup is still pending",
+    request: { prompt: null, providerHomeId: id, contextManifest: null, envelope: null },
+    result: { hostVerification: "not_run", taskRuntimeCleaned: false, privacyWarning: "cleanup pending" },
+    error: { code: "E_STATE", message: "cleanup pending" },
+    pendingTerminal: { status: "completed", phase: "done", completedAt: stamped, error: null, summary: "Worker completed" }
+  });
+
+  const recovered = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
+  assert.equal(recovered.status, "completed", JSON.stringify(recovered));
+  assert.equal(recovered.phase, "done");
+  assert.equal(recovered.error, null);
+  assert.equal(recovered.summary, "Worker completed");
+  assert.equal(recovered.result.taskRuntimeCleaned, true);
+  assert.equal(recovered.result.runtimeEvidence.executionStatus, "completed");
+  assert.equal(fs.existsSync(path.join(taskHome, "auth.json")), false);
+  assert.equal(fs.existsSync(path.join(taskHome, "agent-profiles")), false);
+});
+
+test("terminal task cleanup defers while an active continuation owns the same lineage", { skip: process.platform === "win32" }, () => {
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const lineage = generateId("task");
+  const oldId = generateId("task");
+  const activeId = generateId("task");
+  const taskHome = path.join(stateRoot, "task-homes", lineage, ".grok");
+  fs.mkdirSync(path.join(taskHome, "agent-profiles"), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(taskHome, "auth.json"), "{}\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(taskHome, "agent-profiles", "active.md"), "active profile\n", { mode: 0o600 });
+  const stamped = new Date().toISOString();
+  const common = {
+    schemaVersion: 3,
+    kind: "task",
+    jobClass: "task",
+    write: false,
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    profile: profileFor("task", false),
+    model: null,
+    effort: null,
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    heartbeatAt: stamped,
+    workerProcess: null,
+    providerProcess: null,
+    error: null
+  };
+  writeSeededJob(stateRoot, {
+    ...common,
+    id: oldId,
+    title: "old cleanup-pending task",
+    summary: "completed",
+    status: "completed",
+    phase: "done",
+    completedAt: stamped,
+    grokSessionId: "66666666-6666-4666-8666-666666666666",
+    logFile: path.join(stateRoot, "jobs", `${oldId}.log`),
+    progress: "done",
+    request: { prompt: null, providerHomeId: lineage },
+    result: { taskRuntimeCleaned: false, privacyWarning: "cleanup pending" }
+  });
+  writeSeededJob(stateRoot, {
+    ...common,
+    id: activeId,
+    title: "active continuation",
+    summary: "queued",
+    status: "queued",
+    phase: "queued",
+    completedAt: null,
+    grokSessionId: null,
+    logFile: path.join(stateRoot, "jobs", `${activeId}.log`),
+    progress: "queued",
+    request: { prompt: null, providerHomeId: lineage },
+    result: null
+  });
+
+  const deferred = parseJson(runCompanion(["status", oldId, "--json"], { cwd: root, env }));
+  assert.equal(deferred.result.taskRuntimeCleaned, false);
+  assert.equal(fs.existsSync(path.join(taskHome, "auth.json")), true);
+  assert.equal(fs.existsSync(path.join(taskHome, "agent-profiles", "active.md")), true);
+
+  writeSeededJob(stateRoot, {
+    ...JSON.parse(fs.readFileSync(path.join(stateRoot, "jobs", `${activeId}.json`), "utf8")),
+    status: "completed",
+    phase: "done",
+    completedAt: stamped,
+    result: { taskRuntimeCleaned: true }
+  });
+  const cleaned = parseJson(runCompanion(["status", oldId, "--json"], { cwd: root, env }));
+  assert.equal(cleaned.result.taskRuntimeCleaned, true);
+  assert.equal(fs.existsSync(path.join(taskHome, "auth.json")), false);
+  assert.equal(fs.existsSync(path.join(taskHome, "agent-profiles")), false);
+});
+
+test("cleanup-blocked recovery terminates a verified live worker before restoring completion", { skip: process.platform === "win32" }, async () => {
+  const root = fs.realpathSync(initRepo());
+  const { env, pluginData } = fixture({ cancelMode: "wait" });
+  const launch = parseJson(runCompanion(["task", "--background", "live finalizer fixture", "--json"], { cwd: root, env }));
+  const running = await waitFor(() => {
+    const job = persistedJob(pluginData, launch.id);
+    return job.status === "running" && job.phase === "responding" && job.workerProcess?.pid && job.providerProcess?.pid ? job : false;
+  }, { timeoutMs: 10_000 });
+  const stateRoot = path.dirname(path.dirname(running.logFile));
+  const taskHome = path.join(stateRoot, "task-homes", running.request.providerHomeId, ".grok");
+  const stamped = new Date().toISOString();
+  const jobFile = path.join(stateRoot, "jobs", `${running.id}.json`);
+  fs.writeFileSync(jobFile, `${JSON.stringify({
+    ...running,
+    status: "running",
+    phase: "cleanup-blocked",
+    completedAt: null,
+    controllerProcess: null,
+    progress: "cleanup pending",
+    result: { ...(running.result || {}), hostVerification: "not_run", taskRuntimeCleaned: false },
+    error: { code: "E_STATE", message: "cleanup pending" },
+    pendingTerminal: { status: "completed", phase: "done", completedAt: stamped, error: null, summary: "completed" }
+  }, null, 2)}\n`, { mode: 0o600 });
+
+  const recovered = parseJson(runCompanion(["status", running.id, "--json"], { cwd: root, env, timeout: 15_000 }));
+  assert.equal(recovered.status, "completed", JSON.stringify(recovered));
+  assert.equal(recovered.phase, "done");
+  assert.equal(recovered.error, null);
+  assert.equal(recovered.result.taskRuntimeCleaned, true);
+  assert.equal(processGroupAlive(running.workerProcess.processGroupId), false);
+  assert.equal(fs.existsSync(path.join(taskHome, "auth.json")), false);
+  assert.equal(fs.existsSync(path.join(taskHome, "agent-profiles")), false);
+});
+
+test("terminal review cleanup waits for the recorded worker group", { skip: process.platform === "win32" }, async (t) => {
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("review");
+  const reviewHome = path.join(stateRoot, "review-homes", id);
+  fs.mkdirSync(reviewHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(reviewHome, "retained.txt"), "privacy\n", { mode: 0o600 });
+  const worker = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)", id], { detached: true, stdio: "ignore" });
+  t.after(() => { try { process.kill(-worker.pid, "SIGKILL"); } catch {} });
+  await waitFor(() => processGroupAlive(worker.pid), { timeoutMs: 5000 });
+  const stamped = new Date().toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 3,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "terminal review with live worker",
+    summary: "pass",
+    write: false,
+    status: "completed",
+    phase: "done",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    completedAt: stamped,
+    heartbeatAt: stamped,
+    workerProcess: { pid: worker.pid, startToken: processStartToken(worker.pid), processGroupId: worker.pid, nonce: "n", commandMarker: id },
+    providerProcess: null,
+    profile: profileFor("review"),
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: "done",
+    request: { prompt: null, target: { mode: "working-tree", label: "fixture", base: null } },
+    result: { review: { verdict: "pass", summary: "pass", findings: [] }, providerSessionDeleted: false, privacyWarning: "cleanup pending" },
+    error: null
+  });
+
+  const deferred = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
+  assert.equal(deferred.result.providerSessionDeleted, false);
+  assert.equal(fs.existsSync(path.join(reviewHome, "retained.txt")), true);
+  process.kill(-worker.pid, "SIGKILL");
+  await waitFor(() => !processGroupAlive(worker.pid), { timeoutMs: 5000 });
+  const cleaned = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
+  assert.equal(cleaned.result.providerSessionDeleted, true);
+  assert.equal(cleaned.result.privacyWarning, undefined);
+  assert.equal(fs.existsSync(reviewHome), false);
 });
 
 test("a foreground caller returns the recovered worker-crash failure", { skip: process.platform === "win32" }, async () => {
@@ -1115,7 +1667,7 @@ test("lost-worker recovery terminates headless review and removes its isolated h
   const running = await waitFor(() => {
     const result = runCompanion(["status", launch.id, "--json"], { cwd: root, env });
     if (result.status !== 0) return false;
-    const job = JSON.parse(result.stdout);
+    const job = persistedJob(pluginData, launch.id);
     return job.status === "running" && job.providerProcess?.pid ? job : false;
   });
   const isolatedHome = path.join(path.dirname(path.dirname(running.logFile)), "review-homes", launch.id);
@@ -1182,7 +1734,8 @@ test("lost-worker recovery retains privacy evidence when provider terminate cann
   fs.writeFileSync(job.logFile, "", { mode: 0o600 });
 
   const recovered = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
-  assert.equal(recovered.status, "failed");
+  assert.equal(recovered.status, "running");
+  assert.equal(recovered.phase, "cleanup-blocked");
   assert.equal(recovered.result.providerSessionDeleted, false);
   assert.match(recovered.result.privacyWarning, /prior-privacy-signal/);
   assert.match(recovered.result.privacyWarning, /Isolated review home retained/);
@@ -1304,7 +1857,8 @@ test("terminal re-cleanup retains privacy until the full provider process group 
 
     // Recovery 1: lost worker + dead leader with live group → fail closed privacy retention.
     const first = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
-    assert.equal(first.status, "failed");
+    assert.equal(first.status, "running");
+    assert.equal(first.phase, "cleanup-blocked");
     assert.equal(first.error.code, "E_PROCESS_IDENTITY");
     assert.equal(first.result.providerSessionDeleted, false);
     assert.match(first.result.privacyWarning, /prior-privacy-signal/);
@@ -1312,9 +1866,9 @@ test("terminal re-cleanup retains privacy until the full provider process group 
     assert.equal(fs.existsSync(isolatedHome), true);
     assert.equal(processGroupAlive(processGroupId), true);
 
-    // Recovery 2: terminal re-cleanup must still refuse while the group remains live.
+    // Recovery 2: active cleanup must still refuse while the group remains live.
     const second = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
-    assert.equal(second.status, "failed");
+    assert.equal(second.status, "running");
     assert.equal(second.result.providerSessionDeleted, false);
     assert.match(second.result.privacyWarning, /prior-privacy-signal/);
     assert.match(second.result.privacyWarning, /Isolated review home retained/);
@@ -1362,12 +1916,18 @@ test("runtime rejects conflicting execution flags and nested companion invocatio
 
 test("transfer imports only regular Claude JSONL files beneath the canonical projects directory", () => {
   const root = initRepo();
-  const { fake, env } = fixture({ importSessionId: "12345678-1234-4234-8234-123456789abc", importSpawnStubbornDescendant: true });
   const home = tempDir("grok-transfer-home-");
   const projects = path.join(home, ".claude", "projects", "fixture");
   fs.mkdirSync(projects, { recursive: true });
   const source = path.join(projects, "session.jsonl");
-  fs.writeFileSync(source, '{"type":"user"}\n', "utf8");
+  const originalTranscript = '{"type":"user"}\n';
+  fs.writeFileSync(source, originalTranscript, "utf8");
+  const { fake, env } = fixture({
+    importSessionId: "12345678-1234-4234-8234-123456789abc",
+    importSpawnStubbornDescendant: true,
+    importAppendSourcePath: source,
+    importAppendText: "APPENDED_AFTER_TRANSFER_STARTED\n"
+  });
   const transferEnv = { ...env, HOME: home };
 
   const imported = parseJson(runCompanion(["transfer", "--source", source, "--json"], { cwd: root, env: transferEnv }));
@@ -1380,8 +1940,26 @@ test("transfer imports only regular Claude JSONL files beneath the canonical pro
   assert.equal(importInvocation.args.includes(source), false, "transfer exposed the source transcript path to Grok");
   assert.equal(fs.existsSync(importPath), false, "transfer left its descriptor alias behind");
   const importInput = readFakeLog(fake.logFile).find((entry) => entry.event === "import-input");
-  assert.equal(importInput.bytes, fs.statSync(source).size);
-  assert.equal(importInput.sha256, crypto.createHash("sha256").update(fs.readFileSync(source)).digest("hex"));
+  assert.equal(importInput.bytes, Buffer.byteLength(originalTranscript));
+  assert.equal(importInput.sha256, crypto.createHash("sha256").update(originalTranscript).digest("hex"));
+  assert.match(fs.readFileSync(source, "utf8"), /APPENDED_AFTER_TRANSFER_STARTED/);
+  // Same non-isolated home for models listing, import, and readiness (not setup-probe review-homes).
+  const modelsLog = readFakeLog(fake.logFile).find((entry) => entry.event === "models");
+  assert.ok(modelsLog);
+  assert.equal(modelsLog.home, home);
+  assert.equal(modelsLog.grokHome, null);
+  assert.equal(importInput.home, home);
+  assert.equal(importInput.grokHome, null);
+  const listLog = readFakeLog(fake.logFile).find((entry) => entry.event === "sessions-list");
+  assert.ok(listLog);
+  assert.equal(listLog.home, home);
+  assert.ok(listLog.sessionIds.includes(imported.sessionId));
+  // Logs must not retain source paths or transcript bodies.
+  for (const entry of readFakeLog(fake.logFile)) {
+    assert.equal(JSON.stringify(entry).includes(source), false);
+    assert.equal(JSON.stringify(entry).includes('"type":"user"'), false);
+  }
+
   const descendant = readFakeLog(fake.logFile).find((entry) => entry.event === "descendant" && entry.transport === "import");
   assert.ok(descendant?.pid);
   assert.equal(processStartToken(descendant.pid), null);
@@ -1479,16 +2057,9 @@ test("transfer rejects unavailable model/effort before conversion or alias artif
     assert.notEqual(result.status, 0, result.stdout);
     const payload = JSON.parse(result.stdout);
     assert.equal(payload.ok, false);
-    // Healthy runners reject with E_CAPABILITY after a successful probe. Restricted
-    // sandboxes may fail probe teardown with E_PROCESS_IDENTITY — still before conversion.
-    assert.ok(
-      payload.error.code === "E_CAPABILITY" || payload.error.code === "E_PROCESS_IDENTITY",
-      `unexpected error ${payload.error.code}: ${payload.error.message}`
-    );
-    if (payload.error.code === "E_CAPABILITY") {
-      assert.match(payload.error.message, /not advertised|not-a-real-model|effort high/i);
-    }
-    // Ordering proof: imports dir is created only after probe+capability succeed.
+    assert.equal(payload.error.code, "E_CAPABILITY");
+    assert.match(payload.error.message, /not advertised|not-a-real-model|effort high/i);
+    // Ordering proof: imports dir is created only after same-home model capability succeeds.
     const previous = process.env.GROK_COMPANION_PLUGIN_DATA;
     process.env.GROK_COMPANION_PLUGIN_DATA = pluginData;
     try {
@@ -1509,9 +2080,7 @@ test("transfer rejects unavailable model/effort before conversion or alias artif
     ["transfer", "--source", source, "--model", "not-a-real-model", "--json"],
     { cwd: root, env: transferEnv }
   ));
-  if (modelError.code === "E_CAPABILITY") {
-    assert.match(modelError.message, /not-a-real-model|not advertised/i);
-  }
+  assert.match(modelError.message, /not-a-real-model|not advertised/i);
 
   const restricted = installFakeGrok(tempDir("fake-grok-transfer-effort-"), {
     models: [{ modelId: "grok-test", _meta: { reasoningEfforts: [{ id: "low" }] } }],
@@ -1524,22 +2093,118 @@ test("transfer rejects unavailable model/effort before conversion or alias artif
     ),
     restricted.logFile
   );
-  if (effortError.code === "E_CAPABILITY") {
-    assert.match(effortError.message, /effort high|not advertised/i);
-  }
+  assert.match(effortError.message, /effort high|not advertised/i);
 
-  // When the environment can complete probe+import, model/effort still flow into resume.
-  const ok = runCodexCompanion(
+  // Successful import returns a model-qualified resume including requested effort.
+  const imported = parseJson(runCodexCompanion(
     ["transfer", "--source", source, "--model", "grok-test", "--effort", "high", "--json"],
     { cwd: root, env: transferEnv }
+  ));
+  assert.equal(imported.model, "grok-test");
+  assert.equal(imported.effort, "high");
+  assert.equal(
+    imported.resume,
+    "grok --model grok-test --reasoning-effort high --resume 12345678-1234-4234-8234-123456789abc"
   );
-  if (ok.status === 0) {
-    const imported = JSON.parse(ok.stdout);
-    assert.equal(imported.model, "grok-test");
-    assert.equal(imported.effort, "high");
-    assert.equal(imported.resume, "grok --model grok-test --reasoning-effort high --resume 12345678-1234-4234-8234-123456789abc");
-  } else {
-    assert.equal(JSON.parse(ok.stdout).error.code, "E_PROCESS_IDENTITY");
+});
+
+test("transfer selects resume model from non-isolated models listing and model-qualifies resume", () => {
+  const sessionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const { root, source, env, fake } = transferFixture({
+    models: [
+      { modelId: "grok-secondary", _meta: { reasoningEfforts: [{ id: "low" }] } },
+      { modelId: "grok-primary", default: true, _meta: { reasoningEfforts: [{ id: "low" }, { id: "high" }] } }
+    ],
+    defaultModel: "grok-primary",
+    importSessionId: sessionId
+  });
+  const home = env.HOME;
+  const imported = parseJson(runCompanion(["transfer", "--source", source, "--json"], { cwd: root, env }));
+  assert.equal(imported.model, "grok-primary");
+  assert.equal(imported.effort, null);
+  assert.equal(imported.resume, `grok --model grok-primary --resume ${sessionId}`);
+
+  const secondary = parseJson(runCompanion(
+    ["transfer", "--source", source, "--model", "grok-secondary", "--effort", "low", "--json"],
+    { cwd: root, env }
+  ));
+  assert.equal(secondary.model, "grok-secondary");
+  assert.equal(secondary.effort, "low");
+  assert.equal(
+    secondary.resume,
+    `grok --model grok-secondary --reasoning-effort low --resume ${sessionId}`
+  );
+
+  const modelsEvents = readFakeLog(fake.logFile).filter((entry) => entry.event === "models");
+  assert.ok(modelsEvents.length >= 2);
+  for (const event of modelsEvents) {
+    assert.equal(event.home, home, "models listing must use the non-isolated HOME");
+    assert.equal(event.grokHome, null, "models listing must not use an isolated GROK_HOME");
+  }
+  const importEvents = readFakeLog(fake.logFile).filter((entry) => entry.event === "import-input");
+  assert.ok(importEvents.length >= 2);
+  for (const event of importEvents) {
+    assert.equal(event.home, home);
+    assert.equal(event.grokHome, null);
+  }
+  // Transfer must not open the isolated setup-probe review home path.
+  const previous = process.env.GROK_COMPANION_PLUGIN_DATA;
+  process.env.GROK_COMPANION_PLUGIN_DATA = env.GROK_COMPANION_PLUGIN_DATA || env.CLAUDE_PLUGIN_DATA;
+  try {
+    const reviewHomes = path.join(workspaceState(root), "review-homes");
+    assert.equal(fs.existsSync(reviewHomes), false, "transfer must not create isolated setup-probe homes");
+  } finally {
+    if (previous === undefined) delete process.env.GROK_COMPANION_PLUGIN_DATA;
+    else process.env.GROK_COMPANION_PLUGIN_DATA = previous;
+  }
+});
+
+test("transfer waits for import readiness delay then succeeds", () => {
+  const sessionId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const { root, source, env, fake } = transferFixture({
+    importSessionId: sessionId,
+    importReadyAfterMs: 150
+  });
+  const imported = parseJson(runCompanion(["transfer", "--source", source, "--json"], {
+    cwd: root,
+    env: {
+      ...env,
+      GROK_COMPANION_TEST_IMPORT_READY_TIMEOUT_MS: "2000",
+      GROK_COMPANION_TEST_IMPORT_READY_INTERVAL_MS: "40"
+    }
+  }));
+  assert.equal(imported.sessionId, sessionId);
+  assert.equal(imported.resume, `grok --model grok-test --resume ${sessionId}`);
+  const listEvents = readFakeLog(fake.logFile).filter((entry) => entry.event === "sessions-list");
+  assert.ok(listEvents.length >= 2, "readiness delay should require more than one exact session-list poll");
+  assert.ok(listEvents.some((entry) => entry.sessionIds.includes(sessionId)));
+});
+
+test("transfer fails closed when imported session never becomes observable", () => {
+  const sessionId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const { root, source, env, fake } = transferFixture({
+    importSessionId: sessionId,
+    importNeverReady: true
+  });
+  const result = runCompanion(["transfer", "--source", source, "--json"], {
+    cwd: root,
+    env: {
+      ...env,
+      GROK_COMPANION_TEST_IMPORT_READY_TIMEOUT_MS: "250",
+      GROK_COMPANION_TEST_IMPORT_READY_INTERVAL_MS: "40"
+    }
+  });
+  const error = parseError(result, "E_IMPORT_RESULT");
+  assert.match(error.message, /not yet observable for resume/i);
+  assert.equal(error.details?.sessionId, sessionId);
+  assert.equal(readFakeLog(fake.logFile).some((entry) => entry.event === "import-input"), true);
+  const listEvents = readFakeLog(fake.logFile).filter((entry) => entry.event === "sessions-list");
+  assert.ok(listEvents.length >= 1);
+  assert.equal(listEvents.every((entry) => !entry.sessionIds.includes(sessionId)), true);
+  // No transcript body or source path in provider logs/argv.
+  for (const entry of readFakeLog(fake.logFile)) {
+    assert.equal(JSON.stringify(entry).includes(source), false);
+    assert.equal(JSON.stringify(entry).includes('"type":"user"'), false);
   }
 });
 
@@ -1734,7 +2399,7 @@ test("attachTransferCleanupEvidence preserves primary probe/import codes with in
   }
 });
 
-test("transfer primary probe error preserves code when injected close cleanup fails", () => {
+test("transfer primary model-selection error preserves code when injected close cleanup fails", () => {
   const { root, source, env } = transferFixture();
   const result = runCompanion(
     ["transfer", "--source", source, "--model", "not-a-real-model", "--json"],
@@ -1749,23 +2414,10 @@ test("transfer primary probe error preserves code when injected close cleanup fa
   assert.notEqual(result.status, 0);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.ok, false);
-  // Restricted sandboxes may surface E_PROCESS_IDENTITY from probe teardown instead of E_CAPABILITY.
-  // Either way the primary code/message stay and injected close evidence is attached.
-  assert.ok(
-    payload.error.code === "E_CAPABILITY" || payload.error.code === "E_PROCESS_IDENTITY",
-    `unexpected code ${payload.error.code}`
-  );
-  if (payload.error.code === "E_CAPABILITY") {
-    assert.match(payload.error.message, /not-a-real-model|not advertised/i);
-    assert.match(String(payload.error.details?.warning || ""), /injected close failure/);
-    assert.equal(payload.error.details?.privacyWarning, undefined, "source fd close alone is not residual private alias/converted evidence");
-  } else {
-    // Probe process-group gate may attach privacy evidence when shutdown is unverifiable.
-    assert.match(
-      String(payload.error.details?.privacyWarning || payload.error.details?.warning || ""),
-      /Isolated review home retained|injected close failure/
-    );
-  }
+  assert.equal(payload.error.code, "E_CAPABILITY");
+  assert.match(payload.error.message, /not-a-real-model|not advertised/i);
+  assert.match(String(payload.error.details?.warning || ""), /injected close failure/);
+  assert.equal(payload.error.details?.privacyWarning, undefined, "source fd close alone is not residual private alias/converted evidence");
 });
 
 test("transfer primary import error preserves code when alias cleanup fails", () => {

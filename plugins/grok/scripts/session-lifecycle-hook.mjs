@@ -5,7 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { listJobs, requestCancel, terminal, removeJob, updateJob, now } from "./lib/state.mjs";
 import { workspaceRoot, workspaceState } from "./lib/workspace.mjs";
-import { cleanupReviewEnvironment } from "./lib/grok-provider.mjs";
+import { cleanupReviewEnvironment, cleanupTaskRuntimeArtifacts } from "./lib/grok-provider.mjs";
 import { hasGrokAncestor, identityMatches, processGroupAlive, processGroupGone, processIsZombie, processStartToken } from "./lib/process-control.mjs";
 import { hasForeignActiveProvider, resolveProviderCleanupTarget, unregisterProviderGuard } from "./lib/recursion-guard.mjs";
 import { pluginDataRoot, sameHostSession, writeCodexSessionMetadata } from "./lib/host.mjs";
@@ -91,6 +91,16 @@ async function terminateOwned(identity, marker, kind, ownershipEstablished) {
   if (!await waitGone(1000)) throw new Error(`The ${kind} process group remained active after SIGKILL.`);
 }
 
+function includeGuardCleanup(root, id, cleanup) {
+  if (!cleanup?.ok) return cleanup;
+  try {
+    unregisterProviderGuard(root, id);
+    return cleanup;
+  } catch (error) {
+    return { ok: false, warning: `Runtime cleanup incomplete: provider guard removal failed (${error?.code || "unknown"}).` };
+  }
+}
+
 const event = await readInput();
 const phase = process.argv[2] || event.hook_event_name;
 const hostSessionId = event.session_id || event.sessionId || process.env.GROK_COMPANION_HOST_SESSION_ID || process.env.GROK_COMPANION_CLAUDE_SESSION_ID || null;
@@ -168,10 +178,30 @@ if (phase === "SessionEnd" && hostSessionId) {
     if (cleanupFailure || !allGone) {
       try {
         job = updateJob(root, job.id, (value) => {
-          value.status = "failed";
-          value.phase = "failed";
-          value.completedAt = now();
-          value.error = { code: "E_PROCESS_IDENTITY", message: "SessionEnd could not verify complete process-group shutdown. Inspect the recorded process identities before manual cleanup." };
+          const cleanupError = { code: "E_PROCESS_IDENTITY", message: "SessionEnd could not verify complete process-group shutdown. Inspect the recorded process identities before manual cleanup." };
+          if (value.jobClass === "task") {
+            value.pendingTerminal ||= terminal(value)
+              ? { status: value.status, phase: value.phase, completedAt: value.completedAt, error: value.error || null, summary: value.summary || null }
+              : { status: "cancelled", phase: "cancelled", completedAt: now(), error: { code: "E_CANCELLED", message: "Cancelled when the Claude session ended." }, summary: "Cancelled when the Claude session ended." };
+            value.status = "running";
+            value.phase = "cleanup-blocked";
+            value.completedAt = null;
+            value.result = {
+              ...(value.result || {}),
+              taskRuntimeCleaned: false,
+              privacyWarning: [...new Set([value.result?.privacyWarning, "Task runtime artifacts retained because process cleanup could not be verified."].filter(Boolean))].join("; ")
+            };
+          } else {
+            value.status = "failed";
+            value.phase = "failed";
+            value.completedAt = now();
+            value.result = {
+              ...(value.result || {}),
+              providerSessionDeleted: false,
+              privacyWarning: [...new Set([value.result?.privacyWarning, "Isolated review home retained because SessionEnd process cleanup could not be verified."].filter(Boolean))].join("; ")
+            };
+          }
+          value.error = cleanupError;
           value.summary = value.error.message;
           return value;
         });
@@ -183,10 +213,32 @@ if (phase === "SessionEnd" && hostSessionId) {
       job = updateJob(root, job.id, (value) => { value.status = "cancelled"; value.phase = "cancelled"; value.completedAt = now(); value.error = { code: "E_CANCELLED", message: "Cancelled when the Claude session ended." }; return value; });
     }
     if (terminal(job)) {
-      try { unregisterProviderGuard(root, job.id); } catch {}
-      const cleanup = job.jobClass === "review" ? cleanupReviewEnvironment(workspaceState(root), job.id) : { ok: true };
-      if (cleanup.ok) { try { removeJob(root, job.id); } catch {} }
-      else { try { updateJob(root, job.id, (value) => { value.result = { ...(value.result || {}), providerSessionDeleted: false, privacyWarning: [value.result?.privacyWarning, cleanup.warning].filter(Boolean).join("; ") }; return value; }); } catch {} }
+      let cleanup = job.jobClass === "review"
+        ? cleanupReviewEnvironment(workspaceState(root), job.id)
+        : cleanupTaskRuntimeArtifacts(
+          workspaceState(root),
+          job.request?.providerHomeId || job.id,
+          [providerIdentity, job.workerProcess].filter(Boolean)
+        );
+      cleanup = includeGuardCleanup(root, job.id, cleanup);
+      if (cleanup.ok) {
+        try { removeJob(root, job.id); } catch {}
+      } else {
+        try {
+          updateJob(root, job.id, (value) => {
+            if (value.jobClass === "review") {
+              value.result = { ...(value.result || {}), providerSessionDeleted: false, privacyWarning: [value.result?.privacyWarning, cleanup.warning].filter(Boolean).join("; ") };
+            } else {
+              value.pendingTerminal ||= { status: value.status, phase: value.phase, completedAt: value.completedAt, error: value.error || null, summary: value.summary || null };
+              value.status = "running";
+              value.phase = "cleanup-blocked";
+              value.completedAt = null;
+              value.result = { ...(value.result || {}), taskRuntimeCleaned: false, privacyWarning: [value.result?.privacyWarning, cleanup.warning].filter(Boolean).join("; ") };
+            }
+            return value;
+          });
+        } catch {}
+      }
     }
   }
 }

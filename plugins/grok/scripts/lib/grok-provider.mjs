@@ -15,36 +15,10 @@ export { processStartToken } from "./process-control.mjs";
 
 const MIN_VERSION = [0, 2, 99];
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-// Provider-compatible shape only: no allOf / if-then. Conditional verdict↔findings rules are
-// enforced by validateReview(), one same-session repair, and the review prompts.
-export const REVIEW_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["verdict", "summary", "findings"],
-  properties: {
-    verdict: {
-      enum: ["pass", "needs_changes"],
-      description: "pass means zero findings (example: {\"verdict\":\"pass\",\"findings\":[]}); needs_changes means at least one finding (example: needs_changes with one or more findings entries)."
-    },
-    summary: { type: "string", minLength: 1 },
-    findings: {
-      type: "array",
-      description: "Must be empty when verdict is pass; must contain at least one actionable defect when verdict is needs_changes.",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["severity", "title", "body"],
-        properties: {
-          severity: { enum: ["critical", "high", "medium", "low", "info"] },
-          title: { type: "string", minLength: 1 },
-          body: { type: "string", minLength: 1 },
-          file: { type: ["string", "null"] },
-          line: { type: ["integer", "null"], minimum: 1 }
-        }
-      }
-    }
-  }
-};
+// One canonical provider-compatible schema. The public verdict is derived after validation.
+export const REVIEW_SCHEMA = Object.freeze(JSON.parse(
+  fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8")
+));
 const ALLOW_ENV = new Set(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "COLORTERM", "NO_COLOR", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "SystemRoot", "ComSpec", "PATHEXT"]);
 
 /** Hard-gate for every provider execution entry. Prefer this over process-identity errors on unsupported platforms. */
@@ -208,12 +182,16 @@ function atomicPrivateFile(file, contents) {
   }
 }
 
-export function taskEnvironment(stateDir, root, profile) {
-  if (!profile?.id || !/^rescue-(read|write)-v2$/.test(profile.id)) throw new CompanionError("E_STATE", "A qualified isolated task profile is required.");
-  const home = path.join(stateDir, "task-homes", profile.id), grokHome = path.join(home, ".grok");
+export function taskEnvironment(stateDir, root, profile, homeMarker = "task") {
+  if (!profile?.id || !/^rescue-(read|write|report)-v3$/.test(profile.id)) throw new CompanionError("E_STATE", "A qualified isolated task profile is required.");
+  const lineage = safeMarker(homeMarker);
+  const home = path.join(stateDir, "task-homes", lineage), grokHome = path.join(home, ".grok");
   privateDirectory(home);
   privateDirectory(grokHome);
   atomicPrivateFile(path.join(grokHome, "config.toml"), `[skills]\nignore = [${JSON.stringify(fs.realpathSync(root))}]\n\n[subagents]\nenabled = false\n\n[features]\nlsp_tools = false\n`);
+  const gitPaths = protectedGitPaths(root);
+  const sandboxProfile = `companion_${crypto.createHash("sha256").update(`${lineage}:${profile.id}`).digest("hex").slice(0, 20)}`;
+  atomicPrivateFile(path.join(grokHome, "sandbox.toml"), `[profiles.${sandboxProfile}]\nextends = "strict"\nrestrict_network = true\ndeny = [${gitPaths.map((item) => JSON.stringify(item)).join(", ")}]\n`);
   const authPath = process.env.GROK_AUTH_PATH || path.join(os.homedir(), ".grok", "auth.json");
   if (!fs.existsSync(authPath)) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication is unavailable. Run \`grok login\`, then ${hostCommand("setup")}.`);
   ensureFreshCachedCredential(authPath);
@@ -230,7 +208,55 @@ export function taskEnvironment(stateDir, root, profile) {
   });
   delete env.HOMEDRIVE;
   delete env.HOMEPATH;
-  return { env, home, grokHome, knownSecrets };
+  const authFile = path.join(grokHome, "auth.json");
+  return {
+    env,
+    home,
+    grokHome,
+    knownSecrets,
+    sandboxProfile,
+    revokeCredential() {
+      try { fs.unlinkSync(authFile); } catch (error) { if (error.code !== "ENOENT") throw error; }
+    }
+  };
+}
+
+export function revokeTaskCredential(stateDir, homeMarker) {
+  const file = path.join(stateDir, "task-homes", safeMarker(homeMarker), ".grok", "auth.json");
+  try { fs.unlinkSync(file); return true; }
+  catch (error) { if (error.code === "ENOENT") return true; throw error; }
+}
+
+/** Remove only transient task credentials/profiles, preserving resumable session data. */
+export function cleanupTaskRuntimeArtifacts(stateDir, homeMarker, identities = []) {
+  const recorded = (Array.isArray(identities) ? identities : [identities]).filter(Boolean);
+  if (recorded.some((identity) => !processGroupGone(identity))) {
+    return { ok: false, warning: "Task runtime artifacts retained because process cleanup could not be verified." };
+  }
+
+  const grokHome = path.join(stateDir, "task-homes", safeMarker(homeMarker), ".grok");
+  const warnings = [];
+  try { revokeTaskCredential(stateDir, homeMarker); }
+  catch (error) { warnings.push(`credential cleanup failed (${error?.code || "unknown"})`); }
+
+  const profiles = path.join(grokHome, "agent-profiles");
+  try {
+    const stat = fs.lstatSync(profiles);
+    if (stat.isDirectory() && !stat.isSymbolicLink()) fs.rmSync(profiles, { recursive: true, force: true });
+    else fs.unlinkSync(profiles);
+  } catch (error) {
+    if (error.code !== "ENOENT") warnings.push(`agent-profile cleanup failed (${error?.code || "unknown"})`);
+  }
+  return warnings.length
+    ? { ok: false, warning: `Task runtime artifacts retained: ${warnings.join("; ")}.` }
+    : { ok: true };
+}
+
+function protectedGitPaths(root) {
+  const run = spawnSync("git", ["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], { cwd: root, encoding: "utf8", shell: false, timeout: 10000 });
+  const values = run.status === 0 ? String(run.stdout || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean) : [];
+  const dotGit = path.join(fs.realpathSync(root), ".git");
+  return [...new Set([dotGit, ...values.map((item) => path.resolve(root, item))])];
 }
 
 function inspectIsolation(binary, root, environment) {
@@ -264,24 +290,148 @@ function inspectIsolation(binary, root, environment) {
 }
 
 function checkedInAgentProfile(profile) {
-  if (profile?.id === "rescue-read-v2") return path.join(PLUGIN_ROOT, "provider-agents", "rescue-read.md");
-  if (profile?.id === "rescue-write-v2") return path.join(PLUGIN_ROOT, "provider-agents", "rescue-write.md");
+  if (profile?.id === "rescue-read-v3") return path.join(PLUGIN_ROOT, "provider-agents", "rescue-read.md");
+  if (profile?.id === "rescue-write-v3") return path.join(PLUGIN_ROOT, "provider-agents", "rescue-write.md");
+  if (profile?.id === "rescue-report-v3") return path.join(PLUGIN_ROOT, "provider-agents", "report-repair.md");
   if (profile?.id === "setup-probe-v2") return path.join(PLUGIN_ROOT, "provider-agents", "setup-probe.md");
   return null;
 }
 
-function spawnArgs({ root, profile, model, effort, leaderSocket }) {
-  const readOnlyProfile = profile.id === "rescue-read-v2" || profile.id === "setup-probe-v2";
-  const taskProfile = checkedInAgentProfile(profile);
-  if (taskProfile) {
-    const actualDigest = crypto.createHash("sha256").update(fs.readFileSync(taskProfile)).digest("hex");
-    if (!profile.agentProfileDigest || profile.agentProfileDigest !== actualDigest) {
-      const label = profile.id === "setup-probe-v2" ? "setup probe" : "rescue task";
-      throw new CompanionError("E_SECURITY_PROFILE", `The checked-in Grok agent profile changed; start a fresh ${label} under the current security contract.`);
-    }
+/**
+ * Verify the packaged profile, then materialize it inside the isolated Grok
+ * home. Grok's own filesystem boundary may reject Codex's plugin cache even
+ * though the host process can read it, so provider argv must not point back to
+ * the installation tree.
+ */
+function materializeAgentProfile(profile, environment) {
+  const source = checkedInAgentProfile(profile);
+  if (!source) return { path: null, cleanup() {} };
+  const contents = fs.readFileSync(source);
+  const expectedDigest = profile.agentProfileDigest;
+  const actualDigest = crypto.createHash("sha256").update(contents).digest("hex");
+  if (!expectedDigest || expectedDigest !== actualDigest) {
+    const label = profile.id === "setup-probe-v2" ? "setup probe" : "rescue task";
+    throw new CompanionError("E_SECURITY_PROFILE", `The checked-in Grok agent profile changed; start a fresh ${label} under the current security contract.`);
   }
+  if (!environment?.grokHome) {
+    throw new CompanionError("E_SECURITY_PROFILE", "A checked-in Grok agent profile requires an isolated GROK_HOME; refusing to expose a source or plugin-cache path to the provider.");
+  }
+
+  privateDirectory(environment.grokHome);
+  const directory = path.join(environment.grokHome, "agent-profiles");
+  privateDirectory(directory);
+  const destination = path.join(directory, `${safeMarker(profile.id)}-${expectedDigest}-${crypto.randomBytes(8).toString("hex")}.md`);
+  try {
+    atomicPrivateFile(destination, contents);
+    const stat = fs.lstatSync(destination);
+    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
+      throw new CompanionError("E_SECURITY_PROFILE", "The isolated Grok agent profile is not a private regular file.");
+    }
+    const materializedDigest = crypto.createHash("sha256").update(fs.readFileSync(destination)).digest("hex");
+    if (materializedDigest !== expectedDigest) {
+      throw new CompanionError("E_SECURITY_PROFILE", "The isolated Grok agent profile does not match the checked-in security contract.");
+    }
+  } catch (error) {
+    try { fs.unlinkSync(destination); } catch (cleanupError) { if (cleanupError.code !== "ENOENT") throw cleanupError; }
+    throw error;
+  }
+  let cleaned = false;
+  return {
+    path: destination,
+    cleanup() {
+      if (cleaned) return;
+      try { fs.unlinkSync(destination); }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+      try { fs.rmdirSync(directory); }
+      catch (error) { if (!["ENOENT", "ENOTEMPTY"].includes(error.code)) throw error; }
+      cleaned = true;
+    }
+  };
+}
+
+// Startup can fail after the provider process and its isolated home exist but
+// before openProvider can return a provider handle. Keep the verified process
+// identity on cleanup failures without exposing it through serialized error
+// details, so callers can retain credentials/state while that group may live.
+const PROVIDER_CLEANUP_IDENTITY = Symbol("grok-provider-cleanup-identity");
+
+function attachProviderCleanupIdentity(error, identity) {
+  if (error && typeof error === "object" && identity) {
+    Object.defineProperty(error, PROVIDER_CLEANUP_IDENTITY, {
+      configurable: true,
+      enumerable: false,
+      value: identity
+    });
+  }
+  return error;
+}
+
+export function providerCleanupIdentity(error) {
+  return error && typeof error === "object" ? error[PROVIDER_CLEANUP_IDENTITY] || null : null;
+}
+
+/** Acquire a birth token before exposing a freshly spawned detached group. */
+export async function captureSpawnIdentity(child, {
+  timeoutMs = 750,
+  intervalMs = 25,
+  shutdownTimeoutMs = 750,
+  readStartToken = processStartToken,
+  isGroupAlive = processGroupAlive,
+  signalGroup = (pid, signal) => process.kill(-pid, signal)
+} = {}) {
+  const pid = Number(child?.pid);
+  if (!Number.isInteger(pid) || pid <= 0) throw new CompanionError("E_PROCESS_IDENTITY", "Grok did not expose a valid provider PID after spawn.");
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  do {
+    const startToken = readStartToken(pid);
+    if (startToken) return { pid, startToken, processGroupId: process.platform === "win32" ? null : pid };
+    if (Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, Math.max(1, deadline - Date.now()))));
+  } while (true);
+
+  const identity = { pid, startToken: null, processGroupId: process.platform === "win32" ? null : pid };
+  const waitGone = async () => {
+    const stop = Date.now() + Math.max(0, shutdownTimeoutMs);
+    while (isGroupAlive(pid) && Date.now() < stop) await new Promise((resolve) => setTimeout(resolve, Math.max(1, intervalMs)));
+    return !isGroupAlive(pid);
+  };
+  for (const signal of ["SIGTERM", "SIGKILL"]) {
+    try { signalGroup(pid, signal); }
+    catch (error) { if (error.code !== "ESRCH") break; }
+    if (await waitGone()) break;
+  }
+  const error = new CompanionError("E_PROCESS_IDENTITY", "Could not record the Grok provider birth token before startup; the process was stopped before task execution.", { pid });
+  if (isGroupAlive(pid)) throw attachProviderCleanupIdentity(error, identity);
+  throw error;
+}
+
+async function cleanupFailedProviderStart({ child, identity, root, marker, stagedProfile, client = null, guardRegistered = false }) {
+  let cleanupError = null;
+  try { client?.close(); }
+  catch (error) { cleanupError = error; }
+
+  try {
+    await ensureChildExit(child, identity);
+  } catch (error) {
+    // Do not unregister the guard or remove the staged profile while the owned
+    // process group may still be using either one.
+    throw attachProviderCleanupIdentity(error, identity);
+  }
+
+  if (guardRegistered) {
+    try { unregisterProviderGuard(root, marker); }
+    catch (error) { cleanupError ||= error; }
+  }
+  try { stagedProfile.cleanup(); }
+  catch (error) { cleanupError ||= error; }
+  if (cleanupError) throw attachProviderCleanupIdentity(cleanupError, identity);
+}
+
+function spawnArgs({ root, profile, model, effort, leaderSocket, taskProfile = null }) {
+  const readOnlyProfile = profile.id === "rescue-read-v3" || profile.id === "rescue-report-v3" || profile.id === "setup-probe-v2";
   const args = ["--cwd", root, "--sandbox", profile.sandbox, "--permission-mode", profile.permissionMode, "--deny", "WebFetch", "--deny", "MCPTool", "--disable-web-search", "--no-subagents", "--no-memory", "--no-plan"];
   if (readOnlyProfile) args.push("--deny", "Bash", "--deny", "Edit", "--deny", "Write");
+  else if (profile.id === "rescue-write-v3") args.push("--deny", "Bash");
   // Setup probe uses permissionMode dontAsk, so it never receives unattended --always-approve expansion.
   if (profile.permissionMode === "bypassPermissions") args.push("--always-approve");
   args.push("agent", "--no-leader", "--leader-socket", leaderSocket);
@@ -302,17 +452,69 @@ function extractJson(text) {
   return null;
 }
 
+/**
+ * Validate provider review payload and deterministically derive the verdict.
+ * Zero findings always passes; nonzero findings always needs_changes.
+ * Model-supplied verdict is rejected; the public verdict exists only after validation.
+ */
 export function validateReview(value) {
   const rootKeys = value && typeof value === "object" && !Array.isArray(value) ? Object.keys(value) : [];
-  const ok = value && rootKeys.every((key) => ["verdict", "summary", "findings"].includes(key)) && ["pass", "needs_changes"].includes(value.verdict) && typeof value.summary === "string" && value.summary.trim() && Array.isArray(value.findings) && ((value.verdict === "pass" && value.findings.length === 0) || (value.verdict === "needs_changes" && value.findings.length > 0)) && value.findings.every((f) => f && typeof f === "object" && !Array.isArray(f) && Object.keys(f).every((key) => ["severity", "title", "body", "file", "line"].includes(key)) && ["critical", "high", "medium", "low", "info"].includes(f.severity) && typeof f.title === "string" && f.title.trim() && typeof f.body === "string" && f.body.trim() && (f.file === undefined || f.file === null || typeof f.file === "string") && (f.line === undefined || f.line === null || Number.isInteger(f.line) && f.line >= 1));
-  if (!ok) throw new CompanionError("E_SCHEMA", "Grok review output did not match the required schema.", {
-    rootKeys: rootKeys.filter((key) => ["verdict", "summary", "findings"].includes(key)),
-    hasUnknownRootKeys: rootKeys.some((key) => !["verdict", "summary", "findings"].includes(key)),
-    verdict: ["pass", "needs_changes"].includes(value?.verdict) ? value.verdict : typeof value?.verdict,
-    summaryType: typeof value?.summary,
-    findingsCount: Array.isArray(value?.findings) ? value.findings.length : null
-  });
-  return value;
+  const allowedKeys = new Set(["summary", "findings"]);
+  const reviewPathOk = (file) => {
+    if (file === undefined || file === null) return true;
+    if (typeof file !== "string" || !file.trim() || file.length > 1024) return false;
+    const normalized = file.replace(/\\/g, "/");
+    return !path.posix.isAbsolute(normalized)
+      && !/^[A-Za-z]:\//.test(normalized)
+      && !normalized.split("/").includes("..");
+  };
+  const findingsOk = Array.isArray(value?.findings) && value.findings.length <= 200 && value.findings.every((f) => f
+    && typeof f === "object"
+    && !Array.isArray(f)
+    && Object.keys(f).every((key) => ["severity", "title", "body", "file", "line"].includes(key))
+    && ["critical", "high", "medium", "low", "info"].includes(f.severity)
+    && typeof f.title === "string" && f.title.trim() && f.title.length <= 240
+    && typeof f.body === "string" && f.body.trim() && f.body.length <= 6000
+    && reviewPathOk(f.file)
+    && (f.line === undefined || f.line === null || (Number.isInteger(f.line) && f.line >= 1)));
+  const ok = Boolean(
+    value
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && rootKeys.every((key) => allowedKeys.has(key))
+    && typeof value.summary === "string"
+    && value.summary.trim()
+    && value.summary.length <= 2000
+    && findingsOk
+  );
+  if (!ok) {
+    const details = {
+      rootKeys: rootKeys.filter((key) => allowedKeys.has(key)).slice(0, 24),
+      hasUnknownRootKeys: rootKeys.some((key) => !allowedKeys.has(key)),
+      summaryType: typeof value?.summary,
+      findingsCount: Array.isArray(value?.findings) ? value.findings.length : null,
+      findingsShapeOk: findingsOk,
+      hint: "Return only summary and findings. Omit verdict; the runtime derives it. Paths must be repository-relative and strings must stay within schema limits."
+    };
+    try {
+      details.payloadDigest = crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
+    } catch {
+      details.payloadDigest = null;
+    }
+    throw new CompanionError("E_SCHEMA", "Grok review output did not match the required schema.", details);
+  }
+  const findings = value.findings.map((f) => ({
+    severity: f.severity,
+    title: redactText(f.title.trim()),
+    body: redactText(f.body.trim()),
+    ...(f.file === undefined ? {} : { file: f.file === null ? null : redactText(f.file.trim().replace(/\\/g, "/")) }),
+    ...(f.line === undefined ? {} : { line: f.line })
+  }));
+  return {
+    verdict: findings.length === 0 ? "pass" : "needs_changes",
+    summary: redactText(value.summary.trim()),
+    findings
+  };
 }
 
 /**
@@ -375,12 +577,27 @@ export async function openProvider({ root, profile, model = null, effort = null,
   const binary = discoverGrok(), version = grokVersion(binary);
   const safeMarker = String(jobMarker).replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 80);
   const leaderSocket = path.join(stateDir, `leader-${safeMarker}-${process.pid}-${Date.now()}.sock`);
-  const child = spawn(binary, spawnArgs({ root, profile, model, effort, leaderSocket }), { cwd: root, env: { ...(environment?.env || childEnvironment()), GROK_COMPANION_JOB_MARKER: safeMarker }, shell: false, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
-  const processIdentity = { pid: child.pid, startToken: processStartToken(child.pid), processGroupId: process.platform === "win32" ? null : child.pid };
+  const stagedProfile = materializeAgentProfile(profile, environment);
+  let child;
+  try {
+    child = spawn(binary, spawnArgs({ root, profile, model, effort, leaderSocket, taskProfile: stagedProfile.path }), { cwd: root, env: { ...(environment?.env || childEnvironment()), GROK_COMPANION_JOB_MARKER: safeMarker }, shell: false, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
+  } catch (error) {
+    stagedProfile.cleanup();
+    throw error;
+  }
+  let processIdentity;
+  try { processIdentity = await captureSpawnIdentity(child); }
+  catch (error) {
+    if (!providerCleanupIdentity(error)) stagedProfile.cleanup();
+    throw error;
+  }
   try { registerProviderGuard(root, safeMarker, processIdentity, hostContext().sessionId); }
-  catch (error) { await ensureChildExit(child, processIdentity); throw error; }
+  catch (error) {
+    await cleanupFailedProviderStart({ child, identity: processIdentity, root, marker: safeMarker, stagedProfile });
+    throw error;
+  }
   const permissionPolicy = (params) => {
-    const selected = selectAcpPermissionOption(params?.options, { write: profile.id === "rescue-write-v2" });
+    const selected = selectAcpPermissionOption(params?.options, { write: profile.id === "rescue-write-v3" });
     return selected?.optionId ? { outcome: { outcome: "selected", optionId: selected.optionId } } : { outcome: { outcome: "cancelled" } };
   };
   const client = new AcpClient(child, { timeoutMs: 30000, permissionPolicy, knownSecrets });
@@ -399,25 +616,39 @@ export async function openProvider({ root, profile, model = null, effort = null,
   let initialized;
   try {
     if (eventError) throw eventError;
-    initialized = await client.request("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } }, clientInfo: { name: "grok-companion", version: "0.2.0" } });
+    initialized = await client.request("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } }, clientInfo: { name: "grok-companion", version: "0.3.0-dev.1" } });
     if (eventError) throw eventError;
   } catch (error) {
-    client.close(); await ensureChildExit(child, processIdentity); unregisterProviderGuard(root, safeMarker); throw eventError || error;
+    await cleanupFailedProviderStart({ child, identity: processIdentity, root, marker: safeMarker, stagedProfile, client, guardRegistered: true });
+    throw eventError || error;
   }
-  if (initialized?.protocolVersion !== 1 || !initialized?.agentCapabilities?.loadSession) { client.close(); await ensureChildExit(child, processIdentity); unregisterProviderGuard(root, safeMarker); throw new CompanionError("E_CAPABILITY", "Grok ACP v1 with session loading is required."); }
+  if (initialized?.protocolVersion !== 1 || !initialized?.agentCapabilities?.loadSession) {
+    const error = new CompanionError("E_CAPABILITY", "Grok ACP v1 with session loading is required.");
+    await cleanupFailedProviderStart({ child, identity: processIdentity, root, marker: safeMarker, stagedProfile, client, guardRegistered: true });
+    throw error;
+  }
   const availableModels = initialized?._meta?.modelState?.availableModels || [];
   const selectedModel = model
     ? availableModels.find((item) => item.modelId === model)
     : availableModels.find((item) => item.modelId === initialized?._meta?.modelState?.currentModelId) || availableModels[0];
-  if (model && !selectedModel) { client.close(); await ensureChildExit(child, processIdentity); unregisterProviderGuard(root, safeMarker); throw new CompanionError("E_CAPABILITY", `Model ${model} is not advertised by Grok.`, { available: availableModels.map((x) => x.modelId) }); }
+  if (model && !selectedModel) {
+    const error = new CompanionError("E_CAPABILITY", `Model ${model} is not advertised by Grok.`, { available: availableModels.map((x) => x.modelId) });
+    await cleanupFailedProviderStart({ child, identity: processIdentity, root, marker: safeMarker, stagedProfile, client, guardRegistered: true });
+    throw error;
+  }
   const efforts = (selectedModel?._meta?.reasoningEfforts || []).map((item) => item.id);
-  if (effort && efforts.length && !efforts.includes(effort)) { client.close(); await ensureChildExit(child, processIdentity); unregisterProviderGuard(root, safeMarker); throw new CompanionError("E_CAPABILITY", `Reasoning effort ${effort} is not advertised for model ${selectedModel.modelId}.`, { available: efforts }); }
-  return { binary, version, child, client, initialized, leaderSocket, process: processIdentity, marker: safeMarker, emitEvent, eventError: () => eventError };
+  if (effort && efforts.length && !efforts.includes(effort)) {
+    const error = new CompanionError("E_CAPABILITY", `Reasoning effort ${effort} is not advertised for model ${selectedModel.modelId}.`, { available: efforts });
+    await cleanupFailedProviderStart({ child, identity: processIdentity, root, marker: safeMarker, stagedProfile, client, guardRegistered: true });
+    throw error;
+  }
+  return { binary, version, child, client, initialized, leaderSocket, process: processIdentity, marker: safeMarker, emitEvent, eventError: () => eventError, cleanupAgentProfile: stagedProfile.cleanup };
 }
 
 export async function ensureChildExit(child, identity, { naturalExitMs = 750 } = {}) {
   // Defense in depth: unsupported platforms must surface E_CAPABILITY before identity failures.
   assertProviderPlatform();
+  if (identity?.pid && child.pid === identity.pid && processGroupGone(identity)) return;
   if (!identity?.pid || child.pid !== identity.pid || !identity.startToken) throw new CompanionError("E_PROCESS_IDENTITY", "Refusing to clean up an unverified Grok process tree.", { pid: identity?.pid || child.pid || null });
   if (process.platform !== "win32" && identity.processGroupId !== identity.pid) throw new CompanionError("E_PROCESS_IDENTITY", "Refusing to clean up a Grok process outside its owned process group.", { pid: identity.pid, processGroupId: identity.processGroupId });
   const initialToken = processStartToken(identity.pid);
@@ -469,7 +700,7 @@ function anonymousPrompt(directory, prompt) {
   }
 }
 
-export async function runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker = "review", resumeSessionId = null, structured = false, cancelRequested = () => false, onEvent = () => {}, timeoutMs = 15 * 60 * 1000, maxOutputBytes = 32 * 1024 * 1024 }) {
+export async function runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker = "review", resumeSessionId = null, structured = false, cancelRequested = () => false, onEvent = () => {}, timeoutMs = 15 * 60 * 1000, maxOutputBytes = 1024 * 1024 }) {
   assertProviderPlatform();
   const binary = discoverGrok(), version = grokVersion(binary);
   const marker = safeMarker(jobMarker), isolation = reviewEnvironment(stateDir, marker);
@@ -483,9 +714,37 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
   } finally {
     fs.closeSync(promptFd);
   }
-  const identity = { pid: child.pid, startToken: processStartToken(child.pid), processGroupId: process.platform === "win32" ? null : child.pid };
+  let identity;
+  try { identity = await captureSpawnIdentity(child); }
+  catch (error) {
+    const failedIdentity = providerCleanupIdentity(error);
+    if (failedIdentity) {
+      try { onEvent({ type: "provider", process: failedIdentity, version }); } catch {}
+    }
+    const cleanup = gatedCleanupReviewEnvironment(stateDir, marker, failedIdentity);
+    if (!cleanup.ok && error && typeof error === "object") {
+      const details = error.details && typeof error.details === "object" && !Array.isArray(error.details) ? { ...error.details } : {};
+      details.privacyWarning = [details.privacyWarning, cleanup.warning].filter(Boolean).join("; ");
+      error.details = details;
+    }
+    throw error;
+  }
   try { registerProviderGuard(root, marker, identity, hostContext().sessionId); }
-  catch (error) { await ensureChildExit(child, identity); cleanupReviewEnvironment(stateDir, marker); throw error; }
+  catch (error) {
+    try { await ensureChildExit(child, identity); }
+    catch (shutdownError) {
+      try { onEvent({ type: "provider", process: identity, version }); } catch {}
+      const cleanup = gatedCleanupReviewEnvironment(stateDir, marker, identity);
+      const details = shutdownError?.details && typeof shutdownError.details === "object" && !Array.isArray(shutdownError.details)
+        ? { ...shutdownError.details }
+        : {};
+      if (!cleanup.ok) details.privacyWarning = [details.privacyWarning, cleanup.warning].filter(Boolean).join("; ");
+      if (shutdownError && typeof shutdownError === "object") shutdownError.details = details;
+      throw attachProviderCleanupIdentity(shutdownError, identity);
+    }
+    cleanupReviewEnvironment(stateDir, marker);
+    throw error;
+  }
   let stdout = "", stdoutBytes = 0, stderr = "", terminationReason = null, forceTimer = null, eventError = null;
   const MAX_OUTPUT = maxOutputBytes;
   const terminate = (signal) => { try { process.kill(identity.processGroupId && process.platform !== "win32" ? -identity.processGroupId : child.pid, signal); } catch (error) { if (error.code !== "ESRCH") throw error; } };
@@ -542,12 +801,43 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
   return { sessionId, text: redactText(String(payload.text ?? "").trim(), isolation.knownSecrets), structuredOutput: redact(payload.structuredOutput, isolation.knownSecrets), stopReason: payload.stopReason || "EndTurn", provider: { version, process: identity, isolatedHome: isolation.home }, capabilities: { transport: "headless", agent: "explore", sandbox: isolation.sandboxProfile } };
 }
 
-export async function runProvider({ root, profile, prompt, model, effort, stateDir, jobMarker = "job", resumeSessionId = null, cancelRequested = () => false, onEvent = () => {}, timeoutMs = undefined }) {
+export async function runProvider({ root, profile, prompt, model, effort, stateDir, jobMarker = "job", providerHomeId = null, resumeSessionId = null, cancelRequested = () => false, onEvent = () => {}, timeoutMs = undefined }) {
   if (profile.transport === "headless") return runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker, resumeSessionId, cancelRequested, onEvent, ...(timeoutMs == null ? {} : { timeoutMs }) });
-  const environment = /^rescue-(read|write)-v2$/.test(profile.id || "") ? taskEnvironment(stateDir, root, profile) : null;
-  if (environment) inspectIsolation(discoverGrok(), root, environment);
-  const provider = await openProvider({ root, profile, model, effort, stateDir, jobMarker, environment, onEvent });
-  let sessionId = null, text = "", poll, killTimer, cancelled = false;
+  const environment = /^rescue-(read|write|report)-v3$/.test(profile.id || "") ? taskEnvironment(stateDir, root, profile, providerHomeId || jobMarker) : null;
+  const effectiveProfile = environment?.sandboxProfile ? { ...profile, sandbox: environment.sandboxProfile } : profile;
+  try {
+    if (environment) inspectIsolation(discoverGrok(), root, environment);
+  } catch (error) {
+    try { environment?.revokeCredential(); }
+    catch (cleanupError) {
+      const details = error?.details && typeof error.details === "object" && !Array.isArray(error.details) ? { ...error.details } : {};
+      details.privacyWarning = [details.privacyWarning, `credential: ${redactText(cleanupError?.message || String(cleanupError), environment?.knownSecrets || []).slice(0, 500)}`].filter(Boolean).join("; ");
+      if (error && typeof error === "object") error.details = details;
+    }
+    throw error;
+  }
+  let provider;
+  try {
+    provider = await openProvider({ root, profile: effectiveProfile, model, effort, stateDir, jobMarker, environment, onEvent });
+  } catch (error) {
+    const failedIdentity = providerCleanupIdentity(error);
+    if (failedIdentity) {
+      try { onEvent({ type: "provider", process: failedIdentity, version: null }); }
+      catch (eventError) {
+        const details = error?.details && typeof error.details === "object" && !Array.isArray(error.details) ? { ...error.details } : {};
+        details.cleanupWarning = [details.cleanupWarning, `provider identity persistence: ${redactText(eventError?.message || String(eventError)).slice(0, 500)}`].filter(Boolean).join("; ");
+        if (error && typeof error === "object") error.details = details;
+      }
+    }
+    try { environment?.revokeCredential(); }
+    catch (cleanupError) {
+      const details = error?.details && typeof error.details === "object" && !Array.isArray(error.details) ? { ...error.details } : {};
+      details.privacyWarning = [details.privacyWarning, `credential: ${redactText(cleanupError?.message || String(cleanupError), environment?.knownSecrets || []).slice(0, 500)}`].filter(Boolean).join("; ");
+      if (error && typeof error === "object") error.details = details;
+    }
+    throw error;
+  }
+  let sessionId = null, interimText = "", finalText = "", allMessageText = "", poll, killTimer, cancelled = false, outputError = null, outputBytes = 0;
   try {
     if ((provider.initialized.authMethods || []).some((method) => method?.id === "cached_token")) {
       await provider.client.request("authenticate", { methodId: "cached_token", _meta: { headless: true } }, 30000);
@@ -558,25 +848,98 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
     if (resumeSessionId && sessionId !== resumeSessionId) throw new CompanionError("E_PROTOCOL", `Grok loaded session ${sessionId} while ${resumeSessionId} was required.`);
     provider.emitEvent({ type: "session", sessionId, models: session?.models });
     if (provider.eventError()) throw provider.eventError();
-    const listener = (event) => { if (event.type === "message") text += event.text; };
+    // Session creation is authenticated before any model tool can run. Remove the
+    // reusable bearer credential before session/prompt exposes workspace tools.
+    environment?.revokeCredential();
+    // Separate interim chatter (messages before/between tool/plan activity) from the final answer.
+    const listener = (event) => {
+      if (event.type === "message") {
+        const chunk = event.text || "";
+        outputBytes += Buffer.byteLength(chunk, "utf8");
+        if (outputBytes > 512 * 1024) {
+          if (!outputError) {
+            outputError = new CompanionError("E_OUTPUT_LIMIT", "Grok provider message output exceeded the 512 KiB job limit.", { limitBytes: 512 * 1024 });
+            provider.client.notify("session/cancel", { sessionId });
+            killTimer = setTimeout(() => {
+              try { process.kill(provider.process.processGroupId ? -provider.process.processGroupId : provider.child.pid, "SIGTERM"); } catch {}
+            }, 5000);
+          }
+          return;
+        }
+        allMessageText += chunk;
+        finalText += chunk;
+        return;
+      }
+      if (event.type === "tool" || event.type === "plan") {
+        if (finalText) {
+          interimText += finalText;
+          finalText = "";
+        }
+      }
+    };
     provider.client.on("update", listener);
     poll = setInterval(() => { if (!cancelled && cancelRequested()) { cancelled = true; provider.client.notify("session/cancel", { sessionId }); killTimer = setTimeout(() => { try { process.kill(provider.process.processGroupId ? -provider.process.processGroupId : provider.child.pid, "SIGTERM"); } catch {} }, 5000); } }, 100);
     let result;
     try { result = await provider.client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: prompt }] }, timeoutMs ?? 30 * 60 * 1000); }
-    catch (error) { if (cancelled) throw new CompanionError("E_CANCELLED", "Grok job was cancelled."); throw provider.eventError() || error; }
+    catch (error) { if (outputError) throw outputError; if (cancelled) throw new CompanionError("E_CANCELLED", "Grok job was cancelled."); throw provider.eventError() || error; }
     if (provider.eventError()) throw provider.eventError();
     clearInterval(poll); poll = null; provider.client.off("update", listener);
+    if (outputError) throw outputError;
     if (cancelled || result?.stopReason === "cancelled") throw new CompanionError("E_CANCELLED", "Grok job was cancelled.");
-    return { sessionId, text: redactText(text.trim(), environment?.knownSecrets || []), stopReason: result?.stopReason || "end_turn", provider: { version: provider.version, process: provider.process }, capabilities: provider.initialized };
+    const secrets = environment?.knownSecrets || [];
+    // Tool/plan notifications can arrive after the assistant has already emitted its final
+    // report. Bind task finality to the explicit last report marker across the ordered message
+    // stream instead of trusting notification order. Non-task/setup turns retain segmentation.
+    const reportMarker = allMessageText.lastIndexOf("GROK_WORKER_REPORT:");
+    const resolvedFinal = (reportMarker >= 0 ? allMessageText.slice(reportMarker) : finalText).trim();
+    const resolvedInterim = (reportMarker >= 0 ? allMessageText.slice(0, reportMarker) : interimText).trim();
+    return {
+      sessionId,
+      text: redactText(resolvedFinal, secrets),
+      interimText: redactText(resolvedInterim, secrets),
+      stopReason: result?.stopReason || "end_turn",
+      provider: { version: provider.version, process: provider.process },
+      capabilities: provider.initialized
+    };
   } catch (error) {
     if (/auth|login|unauthori[sz]ed|no auth method/i.test(`${error?.message || ""} ${error?.details?.data || ""}`)) throw new CompanionError("E_AUTH_REQUIRED", `Grok authentication is unavailable or expired. Run \`grok login\`, then ${hostCommand("setup")}.`);
     throw provider.eventError() || error;
   } finally {
     if (poll) clearInterval(poll);
     if (killTimer) clearTimeout(killTimer);
-    provider.client.close();
-    await ensureChildExit(provider.child, provider.process);
-    unregisterProviderGuard(root, provider.marker);
+    const cleanupWarnings = [];
+    const noteCleanupFailure = (label, error) => {
+      cleanupWarnings.push(`${label}: ${redactText(error?.message || String(error), environment?.knownSecrets || []).slice(0, 500)}`);
+    };
+    try { environment?.revokeCredential(); }
+    catch (error) { noteCleanupFailure("credential", error); }
+    try { provider.client.close(); }
+    catch (error) { noteCleanupFailure("ACP client", error); }
+
+    try {
+      await ensureChildExit(provider.child, provider.process);
+    } catch (error) {
+      if (cleanupWarnings.length && error && typeof error === "object") {
+        const details = error.details && typeof error.details === "object" && !Array.isArray(error.details)
+          ? { ...error.details }
+          : {};
+        details.privacyWarning = [details.privacyWarning, ...cleanupWarnings].filter(Boolean).join("; ");
+        error.details = details;
+      }
+      // The provider may still be using the guard/profile. Retain both until a
+      // later status/cancel recovery proves the complete process group is gone.
+      throw error;
+    }
+
+    try { unregisterProviderGuard(root, provider.marker); }
+    catch (error) { noteCleanupFailure("provider guard", error); }
+    try { provider.cleanupAgentProfile?.(); }
+    catch (error) { noteCleanupFailure("agent profile", error); }
+    if (cleanupWarnings.length) {
+      throw new CompanionError("E_STATE", "Grok provider exited, but transient task runtime cleanup was incomplete.", {
+        privacyWarning: cleanupWarnings.join("; ")
+      });
+    }
   }
 }
 
@@ -585,9 +948,28 @@ export async function runStructuredReview(options) {
   let run = await execute(options), parsed = run.structuredOutput ?? extractJson(run.text);
   try { return { ...run, review: validateReview(parsed) }; }
   catch (firstError) {
-    const repair = await execute({ ...options, resumeSessionId: run.sessionId, prompt: "Your previous response was not valid review JSON. Return only one JSON object matching the required schema. Use verdict pass with an empty findings array when there are no actionable defects. Use verdict needs_changes only with at least one actionable finding. Preserve any substantive findings, but do not preserve a contradictory verdict." });
+    const repair = await execute({
+      ...options,
+      resumeSessionId: run.sessionId,
+      prompt: "Your previous response was not valid review JSON. Return only one JSON object with exactly summary and findings. Omit verdict; the runtime derives pass from zero findings and needs_changes from one or more findings. Preserve substantive findings and use repository-relative paths."
+    });
     parsed = repair.structuredOutput ?? extractJson(repair.text);
-    return { ...repair, review: validateReview(parsed) };
+    try {
+      return { ...repair, review: validateReview(parsed) };
+    } catch (repairError) {
+      const details = {
+        ...(repairError?.details && typeof repairError.details === "object" ? repairError.details : {}),
+        firstError: firstError?.code || null,
+        repairAttempted: true,
+        attempts: 2,
+        jobId: options.jobMarker || null
+      };
+      throw new CompanionError(
+        repairError?.code || "E_SCHEMA",
+        repairError?.message || "Grok review repair still did not match the required schema.",
+        details
+      );
+    }
   }
 }
 
@@ -595,6 +977,174 @@ export function deleteSession(sessionId, binary = null, env = null) {
   if (!sessionId) return { ok: true };
   const run = spawnSync(binary || discoverGrok(), ["sessions", "delete", sessionId], { encoding: "utf8", timeout: 10000, shell: false, env: env || childEnvironment() });
   return { ok: run.status === 0, warning: run.status === 0 ? null : redactText(run.stderr || run.stdout) };
+}
+
+function shellWord(value) {
+  const text = String(value);
+  return /^[a-zA-Z0-9_./:+-]+$/.test(text) ? text : `'${text.replaceAll("'", `'"'"'`)}'`;
+}
+
+/**
+ * Executable resume argv for an imported Grok session.
+ * Model is required: legacy placeholder models on import otherwise resume empty.
+ */
+export function formatResumeCommand(sessionId, model, effort = null) {
+  if (!sessionId) throw new CompanionError("E_IMPORT_RESULT", "Cannot format a resume command without a Grok session ID.");
+  if (!model) throw new CompanionError("E_CAPABILITY", "Cannot format a resume command without an advertised Grok model.");
+  const parts = ["grok", "--model", model];
+  if (effort) parts.push("--reasoning-effort", effort);
+  parts.push("--resume", sessionId);
+  return parts.map(shellWord).join(" ");
+}
+
+/**
+ * Parse `grok models` text from the non-isolated CLI home used by import/resume.
+ * Optional trailing `efforts=a,b` is recognized when a provider prints it (tests);
+ * production Grok text may omit efforts, in which case advertised effort checks are skipped.
+ */
+export function parseAdvertisedModels(text) {
+  const models = [];
+  let defaultId = null;
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const defaultMatch = line.match(/^Default model:\s+(\S+)\s*$/i);
+    if (defaultMatch) {
+      defaultId = defaultMatch[1];
+      continue;
+    }
+    const modelMatch = line.match(/^[*-]\s+(\S+)(?:\s+\(default\))?(?:\s+efforts=([A-Za-z0-9_,-]+))?\s*$/i);
+    if (!modelMatch) continue;
+    const id = modelMatch[1];
+    const efforts = modelMatch[2]
+      ? modelMatch[2].split(",").map((item) => item.trim()).filter(Boolean)
+      : [];
+    if (!models.some((item) => item.id === id)) models.push({ id, efforts });
+    if (/\(default\)/i.test(line)) defaultId = id;
+  }
+  if (defaultId) {
+    const index = models.findIndex((item) => item.id === defaultId);
+    if (index > 0) {
+      const [preferred] = models.splice(index, 1);
+      models.unshift(preferred);
+    } else if (index < 0) {
+      models.unshift({ id: defaultId, efforts: [] });
+    }
+  }
+  return models;
+}
+
+/**
+ * List models advertised by the same non-isolated Grok home used for import and resume.
+ * Does not open an isolated setup-probe ACP home.
+ */
+export function listAdvertisedModels(binary = null, env = null) {
+  assertProviderPlatform();
+  const resolved = binary || discoverGrok();
+  const run = spawnSync(resolved, ["models"], {
+    encoding: "utf8",
+    shell: false,
+    timeout: 30000,
+    env: env || childEnvironment()
+  });
+  if (run.status !== 0) {
+    throw new CompanionError(
+      "E_AUTH_REQUIRED",
+      `Grok authentication is unavailable or expired. Run \`grok login\`, then retry ${hostCommand("setup")}.`,
+      { diagnostic: redactText(run.stderr || run.stdout).slice(-2000) }
+    );
+  }
+  const models = parseAdvertisedModels(`${run.stdout || ""}\n${run.stderr || ""}`);
+  if (!models.length) {
+    throw new CompanionError("E_CAPABILITY", "Grok did not advertise a model that can resume the imported session.");
+  }
+  return models;
+}
+
+export function selectTransferModel(models, requestedModel = null) {
+  const list = Array.isArray(models) ? models : [];
+  if (!list.length) {
+    throw new CompanionError("E_CAPABILITY", "Grok did not advertise a model that can resume the imported session.");
+  }
+  if (requestedModel) {
+    const selected = list.find((item) => item.id === requestedModel);
+    if (!selected) {
+      throw new CompanionError("E_CAPABILITY", `Model ${requestedModel} is not advertised by Grok.`, {
+        available: list.map((item) => item.id)
+      });
+    }
+    return selected;
+  }
+  return list[0];
+}
+
+export function assertTransferEffort(selected, effort = null) {
+  if (!effort) return;
+  const efforts = Array.isArray(selected?.efforts) ? selected.efforts : [];
+  if (efforts.length && !efforts.includes(effort)) {
+    throw new CompanionError("E_CAPABILITY", `Reasoning effort ${effort} is not advertised for model ${selected.id}.`, {
+      available: efforts
+    });
+  }
+}
+
+/**
+ * True when the exact session ID appears in the non-isolated Grok session list.
+ * Only provider metadata is retained; transcript contents are never requested.
+ */
+export function isImportedSessionReady(sessionId, binary = null, env = null, cwd = null) {
+  if (!sessionId) return false;
+  const resolved = binary || discoverGrok();
+  const run = spawnSync(resolved, ["sessions", "list", "-n", "200"], {
+    cwd: cwd || process.cwd(),
+    encoding: "utf8",
+    shell: false,
+    timeout: 15000,
+    env: env || childEnvironment()
+  });
+  if (run.status !== 0) return false;
+  const text = `${run.stdout || ""}\n${run.stderr || ""}`;
+  const escaped = String(sessionId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|\\s)${escaped}(?:\\s|$)`, "i").test(text);
+}
+
+/**
+ * Fail closed until the exact imported session is observable for resume.
+ * Bounded polling accounts for Grok import persistence races.
+ */
+export async function waitForImportedSession(sessionId, {
+  binary = null,
+  env = null,
+  cwd = null,
+  signal = null,
+  timeoutMs = null,
+  intervalMs = null
+} = {}) {
+  assertProviderPlatform();
+  if (!sessionId) throw new CompanionError("E_IMPORT_RESULT", "Grok import returned no usable session ID.");
+  const testTimeout = Number(process.env.GROK_COMPANION_TEST_IMPORT_READY_TIMEOUT_MS);
+  const testInterval = Number(process.env.GROK_COMPANION_TEST_IMPORT_READY_INTERVAL_MS);
+  const limitMs = Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? timeoutMs
+    : (Number.isFinite(testTimeout) && testTimeout > 0 ? testTimeout : 10_000);
+  const stepMs = Number.isFinite(intervalMs) && intervalMs > 0
+    ? intervalMs
+    : (Number.isFinite(testInterval) && testInterval > 0 ? testInterval : 100);
+  const resolved = binary || discoverGrok();
+  const deadline = Date.now() + limitMs;
+  while (true) {
+    if (signal?.aborted) throw new CompanionError("E_CANCELLED", "Grok transcript import was cancelled while waiting for session readiness.");
+    if (isImportedSessionReady(sessionId, resolved, env, cwd)) return true;
+    if (Date.now() >= deadline) {
+      throw new CompanionError(
+        "E_IMPORT_RESULT",
+        `Grok import reported session ${sessionId}, but the session is not yet observable for resume.`,
+        { sessionId }
+      );
+    }
+    const remaining = deadline - Date.now();
+    await new Promise((resolve) => setTimeout(resolve, Math.min(stepMs, Math.max(0, remaining))));
+  }
 }
 
 export async function probe(root, stateDir) {
@@ -616,6 +1166,8 @@ export async function probe(root, stateDir) {
   const marker = `setup-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
   const isolation = reviewEnvironment(stateDir, marker);
   let provider = null;
+  let failedProviderProcess = null;
+  let primaryError = null;
   try {
     inspectIsolation(binary, root, isolation);
     const agentProfilePath = path.join(PLUGIN_ROOT, "provider-agents", "setup-probe.md");
@@ -656,6 +1208,10 @@ export async function probe(root, stateDir) {
       authMethods: (provider.initialized.authMethods || []).map((x) => ({ id: x.id, name: x.name })),
       models: (provider.initialized?._meta?.modelState?.availableModels || []).map((x) => ({ id: x.modelId, efforts: (x._meta?.reasoningEfforts || []).map((e) => e.id) }))
     };
+  } catch (error) {
+    primaryError = error;
+    failedProviderProcess = providerCleanupIdentity(error);
+    throw error;
   } finally {
     let shutdownError = null;
     if (provider) {
@@ -663,6 +1219,7 @@ export async function probe(root, stateDir) {
       try {
         await ensureChildExit(provider.child, provider.process);
         unregisterProviderGuard(root, provider.marker);
+        provider.cleanupAgentProfile?.();
       } catch (error) {
         shutdownError = error;
       }
@@ -670,21 +1227,22 @@ export async function probe(root, stateDir) {
     // Never delete the isolated credential home while the recorded process group remains live
     // or shutdown is unverifiable. Preserve the guard (unregister only after verified exit)
     // and keep the primary shutdown error when present.
-    const cleanup = gatedCleanupReviewEnvironment(stateDir, marker, provider?.process || null);
+    const cleanupIdentity = provider?.process || failedProviderProcess;
+    const cleanup = gatedCleanupReviewEnvironment(stateDir, marker, cleanupIdentity);
     if (!cleanup.ok) {
-      if (shutdownError) {
-        const details = shutdownError.details && typeof shutdownError.details === "object" && !Array.isArray(shutdownError.details)
-          ? { ...shutdownError.details }
+      const surfacedError = shutdownError || primaryError;
+      if (surfacedError) {
+        const details = surfacedError.details && typeof surfacedError.details === "object" && !Array.isArray(surfacedError.details)
+          ? { ...surfacedError.details }
           : {};
         details.privacyWarning = [details.privacyWarning, cleanup.warning].filter(Boolean).join("; ");
-        if (shutdownError instanceof CompanionError) shutdownError.details = details;
-        else shutdownError.details = details;
-        throw shutdownError;
+        surfacedError.details = details;
+        throw surfacedError;
       }
-      if (provider?.process && !processGroupGone(provider.process)) {
+      if (cleanupIdentity && !processGroupGone(cleanupIdentity)) {
         throw new CompanionError("E_PROCESS_IDENTITY", "Could not verify complete process-group shutdown for the setup review-isolation probe.", {
-          pid: provider.process.pid,
-          processGroupId: provider.process.processGroupId ?? null,
+          pid: cleanupIdentity.pid,
+          processGroupId: cleanupIdentity.processGroupId ?? null,
           privacyWarning: cleanup.warning
         });
       }

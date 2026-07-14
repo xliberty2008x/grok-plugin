@@ -22,10 +22,21 @@ export function workspaceRoot(cwd = process.cwd(), required = true) {
 }
 
 export function workspaceState(root) {
-  const pluginData = pluginDataRoot();
-  const hash = crypto.createHash("sha256").update(root).digest("hex").slice(0, 16);
-  const slug = path.basename(root).replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 40) || "workspace";
-  return path.join(pluginData, "state", `${slug}-${hash}`);
+  const canonicalRoot = fs.realpathSync(root);
+  const configuredData = pluginDataRoot();
+  fs.mkdirSync(configuredData, { recursive: true, mode: 0o700 });
+  const pluginData = fs.realpathSync(configuredData);
+  const stateParent = path.join(pluginData, "state");
+  try { fs.mkdirSync(stateParent, { mode: 0o700 }); }
+  catch (error) { if (error.code !== "EEXIST") throw error; }
+  const stateStat = fs.lstatSync(stateParent);
+  if (!stateStat.isDirectory() || stateStat.isSymbolicLink()) {
+    throw new CompanionError("E_STATE", `Refusing unsafe plugin state directory ${stateParent}.`);
+  }
+  if ((stateStat.mode & 0o077) !== 0) fs.chmodSync(stateParent, 0o700);
+  const hash = crypto.createHash("sha256").update(canonicalRoot).digest("hex").slice(0, 16);
+  const slug = path.basename(canonicalRoot).replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 40) || "workspace";
+  return path.join(stateParent, `${slug}-${hash}`);
 }
 
 export function assertSafeJobId(id) {

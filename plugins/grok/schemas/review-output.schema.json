@@ -2,31 +2,22 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "summary", "findings"],
-  "allOf": [
-    {
-      "if": { "properties": { "verdict": { "const": "pass" } } },
-      "then": { "properties": { "findings": { "maxItems": 0 } } }
-    },
-    {
-      "if": { "properties": { "verdict": { "const": "needs_changes" } } },
-      "then": { "properties": { "findings": { "minItems": 1 } } }
-    }
-  ],
+  "required": ["summary", "findings"],
   "properties": {
-    "verdict": { "enum": ["pass", "needs_changes"] },
-    "summary": { "type": "string", "minLength": 1 },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 2000 },
     "findings": {
       "type": "array",
+      "maxItems": 200,
+      "description": "Actionable defects only. Empty means pass; any finding means needs_changes. Verdict is derived by the runtime.",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["severity", "title", "body"],
         "properties": {
           "severity": { "enum": ["critical", "high", "medium", "low", "info"] },
-          "title": { "type": "string", "minLength": 1 },
-          "body": { "type": "string", "minLength": 1 },
-          "file": { "type": ["string", "null"] },
+          "title": { "type": "string", "minLength": 1, "maxLength": 240 },
+          "body": { "type": "string", "minLength": 1, "maxLength": 6000 },
+          "file": { "type": ["string", "null"], "maxLength": 1024 },
           "line": { "type": ["integer", "null"], "minimum": 1 }
         }
       }
