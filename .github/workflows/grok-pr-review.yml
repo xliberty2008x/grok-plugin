@@ -5,6 +5,7 @@
 # - GROK_AUTH never shared with GITHUB_TOKEN in the same child process
 # - Findings never fail the job; infra/auth/schema/post failures do
 # - github.event.* never interpolated into shell double-quoted strings (use env:)
+# - macos-latest: Linux hosted runners block bubblewrap uid maps for strict sandbox
 name: Grok PR Review
 
 on:
@@ -25,7 +26,7 @@ jobs:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository
       && github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 30
 
     steps:
@@ -58,11 +59,6 @@ jobs:
         with:
           node-version: 22.x
 
-      - name: Install bubblewrap (Linux review sandbox)
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq bubblewrap
 
       - name: Install Grok Build CLI
         env:
