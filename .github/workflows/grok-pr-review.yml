@@ -58,6 +58,12 @@ jobs:
         with:
           node-version: 22.x
 
+      - name: Install bubblewrap (Linux review sandbox)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+
       - name: Install Grok Build CLI
         env:
           GROK_CLI_VERSION: ${{ vars.GROK_CLI_VERSION || '0.2.99' }}
