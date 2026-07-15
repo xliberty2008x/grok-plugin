@@ -796,11 +796,9 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
     namedPromptPath = path.join(promptDir, "prompt.md");
     fs.writeFileSync(namedPromptPath, String(prompt), { mode: 0o600 });
     promptFile = namedPromptPath;
-    try { fs.writeSync(2, `grok-provider: forceNamedPrompt=true promptFile=${promptFile}\n`); } catch {}
   } else {
     promptFile = process.platform === "linux" ? "/proc/self/fd/3" : "/dev/fd/3";
     promptFd = anonymousPrompt(isolation.home, prompt);
-    try { fs.writeSync(2, `grok-provider: forceNamedPrompt=false using fd3\n`); } catch {}
   }
   const newSessionId = resumeSessionId ? null : crypto.randomUUID();
   const closePromptFd = () => {
