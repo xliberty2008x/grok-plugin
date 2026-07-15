@@ -791,22 +791,26 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
   let promptFd = null;
   let namedPromptPath = null;
   if (forceNamedPrompt) {
-    try { process.stderr.write(`grok-provider: forceNamedPrompt=true file under ${isolation.home}\n`); } catch {}
-    namedPromptPath = path.join(isolation.home, `prompt-${process.pid}-${crypto.randomBytes(8).toString("hex")}.md`);
+    // Prefer /tmp so the strict sandbox can always open the prompt path.
+    const promptDir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-ci-prompt-"));
+    namedPromptPath = path.join(promptDir, "prompt.md");
     fs.writeFileSync(namedPromptPath, String(prompt), { mode: 0o600 });
     promptFile = namedPromptPath;
+    try { fs.writeSync(2, `grok-provider: forceNamedPrompt=true promptFile=${promptFile}\n`); } catch {}
   } else {
-    try { process.stderr.write(`grok-provider: forceNamedPrompt=false using fd3 envHost=${process.env.GROK_COMPANION_HOST} onDisk=${process.env.GROK_HEADLESS_PROMPT_ON_DISK}\n`); } catch {}
     promptFile = process.platform === "linux" ? "/proc/self/fd/3" : "/dev/fd/3";
     promptFd = anonymousPrompt(isolation.home, prompt);
+    try { fs.writeSync(2, `grok-provider: forceNamedPrompt=false using fd3\n`); } catch {}
   }
   const newSessionId = resumeSessionId ? null : crypto.randomUUID();
-  // When using fd 3, keep the parent-side prompt fd open until the child finishes so
-  // sandbox re-exec that still inherits the fd can read it. Named CI prompts skip this.
   const closePromptFd = () => {
     if (promptFd != null) {
       try { fs.closeSync(promptFd); } catch { /* already closed */ }
       promptFd = null;
+    }
+    if (namedPromptPath) {
+      try { fs.rmSync(path.dirname(namedPromptPath), { recursive: true, force: true }); } catch { /* best-effort */ }
+      namedPromptPath = null;
     }
   };
   let child;
