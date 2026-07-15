@@ -145,6 +145,23 @@ review and post an informational GitHub review (`COMMENT`) with inline findings
 when mappable. Findings never fail the check; only auth, CLI, schema, or API
 errors fail the job.
 
+### Superpowers-style methodology (not a runner plugin install)
+
+CI does **not** install the Superpowers marketplace plugin or Claude
+`pr-review-toolkit` on the GitHub Actions runner. Interactive Superpowers skills
+and multi-agent Claude PR review require subagents, user-driven PENDING reviews,
+and host tools that break the CI trust model (auth/token split, no agent-held
+`GITHUB_TOKEN`).
+
+Instead, the trusted Companion headless `explore` review uses a **Superpowers-style
+code-reviewer contract** in `plugins/grok/prompts/review.md` (severity calibration,
+strengths + readiness in the summary, plan/architecture/testing checks). Posted
+reviews are attributed as Superpowers-style Grok Companion reviews.
+
+For **local interactive** Superpowers or Grok bundled `/review` (PENDING reviews,
+subagent orchestration), install those plugins/skills on your machine — they are
+optional and separate from CI.
+
 ### Enable
 
 1. Create a dedicated SuperGrok / `grok login` session (prefer a bot identity).
@@ -160,7 +177,7 @@ errors fail the job.
 
 - **Forks** are skipped (secrets are unavailable and `pull_request_target` is not used).
 - **Drafts** are skipped until `ready_for_review`.
-- Runtime scripts and the companion binary path come from the **trusted ref**, not
+- Runtime scripts, companion, and **review prompts** come from the **trusted ref**, not
   from the PR tip. The PR head is only the git tree under review.
 - Rotate `GROK_AUTH_JSON` when jobs fail with authentication errors.
 

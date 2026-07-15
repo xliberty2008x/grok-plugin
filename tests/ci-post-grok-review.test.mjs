@@ -143,6 +143,26 @@ test("buildPrReviewPayload places mappable findings inline and promotes others",
   assert.match(r.payload.body, /General/);
 });
 
+test("buildPrReviewPayload footer attributes Superpowers-style Companion review", () => {
+  const right = new Set(["src/a.js:1"]);
+  const r = buildPrReviewPayload({
+    job: sampleJob([
+      {
+        severity: "high",
+        title: "Missing check",
+        body: "Add a guard.",
+        file: "src/a.js",
+        line: 1
+      }
+    ]),
+    headSha: "abc123",
+    rightSideLines: right
+  });
+  assert.equal(r.skip, false);
+  assert.match(r.payload.body, /Superpowers-style/i);
+  assert.match(r.payload.body, /Companion/i);
+});
+
 test("buildPrReviewPayload throws on missing review when not skippable", () => {
   assert.throws(
     () =>

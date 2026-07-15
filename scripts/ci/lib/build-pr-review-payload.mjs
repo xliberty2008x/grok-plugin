@@ -84,7 +84,7 @@ export function buildPrReviewPayload({ job, headSha, rightSideLines }) {
   bodyParts.push(
     "---",
     "",
-    "_Automated Grok Companion review (informational; does not block merge)._"
+    "_Automated Superpowers-style Grok Companion review (informational; does not block merge)._"
   );
 
   return {
