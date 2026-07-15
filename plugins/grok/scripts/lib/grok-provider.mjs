@@ -83,18 +83,93 @@ export function childEnvironment(extra = {}) {
 
 function safeMarker(value) { return String(value).replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 80); }
 
+function authEntryExpiries(parsed) {
+  return Object.values(parsed || {})
+    .flatMap((entry) => (
+      entry && typeof entry === "object" && typeof entry.key === "string" && entry.key.length >= 16 && entry.expires_at
+        ? [Date.parse(entry.expires_at)]
+        : []
+    ))
+    .filter(Number.isFinite);
+}
+
+/**
+ * Ensure the cached auth file has enough validity for an isolated job.
+ * When `source` is not the default `~/.grok/auth.json` (e.g. CI staged path via
+ * GROK_AUTH_PATH), refresh must use a temporary HOME that carries that file so
+ * `grok models` can rotate the staged session and write the result back.
+ */
 function ensureFreshCachedCredential(source, minimumValidityMs = 45 * 60 * 1000) {
+  const sourcePath = path.resolve(source);
   let parsed;
-  try { parsed = JSON.parse(fs.readFileSync(source, "utf8")); }
+  try { parsed = JSON.parse(fs.readFileSync(sourcePath, "utf8")); }
   catch { throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication is unreadable. Run \`grok login\`, then ${hostCommand("setup")}.`); }
-  const expiries = Object.values(parsed || {}).flatMap((entry) => entry && typeof entry === "object" && typeof entry.key === "string" && entry.key.length >= 16 && entry.expires_at ? [Date.parse(entry.expires_at)] : []).filter(Number.isFinite);
+  const expiries = authEntryExpiries(parsed);
   if (!expiries.length || Math.max(...expiries) - Date.now() >= minimumValidityMs) return;
-  const refreshed = spawnSync(discoverGrok(), ["models"], { encoding: "utf8", shell: false, timeout: 30000, env: childEnvironment() });
-  if (refreshed.status !== 0 || refreshed.error) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication could not be refreshed. Run \`grok login\`, then ${hostCommand("setup")}.`);
-  try { parsed = JSON.parse(fs.readFileSync(source, "utf8")); }
-  catch { throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication is unreadable after refresh. Run \`grok login\`, then ${hostCommand("setup")}.`); }
-  const refreshedExpiries = Object.values(parsed || {}).flatMap((entry) => entry && typeof entry === "object" && typeof entry.key === "string" && entry.key.length >= 16 && entry.expires_at ? [Date.parse(entry.expires_at)] : []).filter(Number.isFinite);
-  if (refreshedExpiries.length && Math.max(...refreshedExpiries) - Date.now() < minimumValidityMs) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication expires too soon for an isolated job. Run \`grok login\`, then ${hostCommand("setup")}.`);
+
+  const defaultAuth = path.resolve(path.join(os.homedir(), ".grok", "auth.json"));
+  let refreshEnv = childEnvironment();
+  let tempHome = null;
+  try {
+    if (sourcePath !== defaultAuth) {
+      tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "grok-auth-refresh-"));
+      const grokHome = path.join(tempHome, ".grok");
+      fs.mkdirSync(grokHome, { recursive: true, mode: 0o700 });
+      const staged = path.join(grokHome, "auth.json");
+      fs.copyFileSync(sourcePath, staged);
+      fs.chmodSync(staged, 0o600);
+      refreshEnv = childEnvironment({
+        HOME: tempHome,
+        USERPROFILE: tempHome,
+        GROK_HOME: grokHome,
+        GROK_AUTH_PATH: staged
+      });
+    }
+
+    const refreshed = spawnSync(discoverGrok(), ["models"], {
+      encoding: "utf8",
+      shell: false,
+      timeout: 30000,
+      env: refreshEnv
+    });
+    if (refreshed.status !== 0 || refreshed.error) {
+      throw new CompanionError(
+        "E_AUTH_REQUIRED",
+        `Grok cached authentication could not be refreshed. Run \`grok login\`, then ${hostCommand("setup")}.`
+      );
+    }
+
+    if (tempHome) {
+      const refreshedAuth = path.join(tempHome, ".grok", "auth.json");
+      if (fs.existsSync(refreshedAuth)) {
+        fs.copyFileSync(refreshedAuth, sourcePath);
+        fs.chmodSync(sourcePath, 0o600);
+      }
+    }
+
+    try { parsed = JSON.parse(fs.readFileSync(sourcePath, "utf8")); }
+    catch {
+      throw new CompanionError(
+        "E_AUTH_REQUIRED",
+        `Grok cached authentication is unreadable after refresh. Run \`grok login\`, then ${hostCommand("setup")}.`
+      );
+    }
+    const refreshedExpiries = authEntryExpiries(parsed);
+    // After a successful `grok models` call the CLI accepted the credential. Isolated
+    // review jobs are short-lived; require a small remaining window rather than a full
+    // 45-minute buffer when the provider did not extend expires_at.
+    const postRefreshFloorMs = Math.min(minimumValidityMs, 2 * 60 * 1000);
+    if (refreshedExpiries.length && Math.max(...refreshedExpiries) - Date.now() < postRefreshFloorMs) {
+      throw new CompanionError(
+        "E_AUTH_REQUIRED",
+        `Grok cached authentication expires too soon for an isolated job. Run \`grok login\`, then ${hostCommand("setup")}.`
+      );
+    }
+  } finally {
+    if (tempHome) {
+      try { fs.rmSync(tempHome, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  }
 }
 
 function writeReviewCredential(source, destination, { refresh = false } = {}) {
