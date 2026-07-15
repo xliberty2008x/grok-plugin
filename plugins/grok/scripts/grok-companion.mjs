@@ -53,6 +53,7 @@ import {
   observeChangedPaths,
   parseTaskEnvelopeInput
 } from "./lib/task-contract.mjs";
+import { projectWorkerSnapshot } from "./lib/worker-protocol.mjs";
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = path.resolve(path.dirname(SCRIPT), "..");
@@ -120,77 +121,9 @@ function out(value, json = false) { process.stdout.write(`${json ? JSON.stringif
 function currentHost() { return hostContext(); }
 function sessionId() { return currentHost().sessionId; }
 function stateDir(root) { return workspaceState(root); }
-function publicJob(job, { detail = true } = {}) {
-  const envelope = job.request?.envelope || null;
-  const manifest = job.request?.contextManifest || null;
-  const result = detail && job.result
-    ? {
-        ...(job.result.review ? { review: job.result.review } : {}),
-        ...(job.result.workerReport ? { workerReport: job.result.workerReport } : {}),
-        ...(job.result.reportRepair ? { reportRepair: job.result.reportRepair } : {}),
-        ...(job.result.providerClaims ? { providerClaims: job.result.providerClaims } : {}),
-        ...(job.result.runtimeEvidence ? { runtimeEvidence: job.result.runtimeEvidence } : {}),
-        ...(job.result.verification ? { verification: job.result.verification } : {}),
-        ...(job.result.textDigest ? { textBytes: job.result.textBytes || 0, textDigest: job.result.textDigest, textTruncated: Boolean(job.result.textTruncated) } : {}),
-        ...(job.result.interim ? { interim: job.result.interim } : {}),
-        hostVerification: job.result.hostVerification || "not_run",
-        ...(job.result.stopReason ? { stopReason: job.result.stopReason } : {}),
-        ...(job.result.skipped ? { skipped: true, skipReason: job.result.skipReason || null } : {}),
-        ...(job.result.providerSessionDeleted != null ? { providerSessionDeleted: job.result.providerSessionDeleted } : {}),
-        ...(job.result.taskRuntimeCleaned != null ? { taskRuntimeCleaned: job.result.taskRuntimeCleaned } : {}),
-        ...(job.result.privacyWarning ? { privacyWarning: job.result.privacyWarning } : {})
-      }
-    : null;
-  return {
-    schemaVersion: job.schemaVersion,
-    id: job.id,
-    kind: job.kind,
-    jobClass: job.jobClass,
-    write: Boolean(job.write),
-    status: job.status,
-    phase: job.phase,
-    summary: job.summary || null,
-    progress: job.progress || null,
-    createdAt: job.createdAt || null,
-    startedAt: job.startedAt || null,
-    updatedAt: job.updatedAt || null,
-    completedAt: job.completedAt || null,
-    heartbeatAt: job.heartbeatAt || null,
-    profileId: job.profile?.id || null,
-    model: job.model || null,
-    effort: job.effort || null,
-    latestPlan: detail ? job.latestPlan || [] : [],
-    lifecycleEvents: detail ? job.lifecycleEvents || [] : [],
-    taskContract: detail && envelope ? {
-      schemaVersion: envelope.schemaVersion,
-      envelopeId: envelope.envelopeId,
-      digest: envelope.digest,
-      // Positional/default envelopes use literal task text as the objective. Keep that raw
-      // prompt private; expose only the separately recorded control-plane objective.
-      objective: job.request?.publicObjective || null,
-      mode: envelope.mode,
-      scope: envelope.scope,
-      nonGoals: envelope.nonGoals,
-      acceptanceCriteria: envelope.acceptanceCriteria,
-      requiredVerification: envelope.requiredVerification,
-      expectedReturnFormat: envelope.expectedReturnFormat,
-      context: envelope.context,
-      contextManifestId: envelope.contextManifestId
-    } : null,
-    context: detail && manifest ? {
-      manifestId: manifest.manifestId,
-      digest: manifest.digest,
-      branch: manifest.git?.branch || null,
-      head: manifest.git?.head || null,
-      dirtyDigest: manifest.git?.dirtyDigest || null,
-      dirtyEntryCount: manifest.git?.dirtyEntryCount || 0,
-      projectMarkers: manifest.projectMarkers || [],
-      materialization: manifest.materialization || null
-    } : null,
-    resumeJobId: job.request?.resumeJobId || null,
-    result,
-    error: job.error || null
-  };
+/** Public job JSON shares Worker Protocol v1 snapshot projection with future brokers. */
+function publicJob(job, options = {}) {
+  return projectWorkerSnapshot(job, options);
 }
 function publicJson(value, options = {}) { return Array.isArray(value) ? value.map((job) => publicJob(job, options)) : publicJob(value, options); }
 function assertHostJobAccess(job, operation) {

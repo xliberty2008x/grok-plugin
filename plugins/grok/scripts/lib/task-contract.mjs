@@ -19,7 +19,8 @@ export const LIFECYCLE_EVENT_TYPES = Object.freeze([
   "blocked",
   "final.report"
 ]);
-const MAX_LIFECYCLE_EVENTS = 128;
+/** Bounded retention for durable lifecycle evidence (oldest entries are dropped first). */
+export const MAX_LIFECYCLE_EVENTS = 128;
 const MAX_TEXT = 16 * 1024;
 const MAX_USER_REQUEST = 64 * 1024;
 const MAX_LIST = 64;
@@ -679,15 +680,57 @@ export function assertContextCompatible(root, expected, { mode = "execute" } = {
   return current;
 }
 
+/**
+ * Assign strictly increasing integer sequences to lifecycle events.
+ * Legacy entries without a sequence receive deterministic 1..n values in array order.
+ * Existing valid sequences are preserved when they remain strictly increasing.
+ */
+export function normalizeLifecycleEventSequences(events) {
+  if (!Array.isArray(events) || events.length === 0) return [];
+  let lastSequence = 0;
+  return events.map((event) => {
+    const base = event && typeof event === "object" && !Array.isArray(event)
+      ? { ...event }
+      : { type: "checkpoint", at: null, summary: "" };
+    const provided = base.sequence;
+    let sequence;
+    if (Number.isSafeInteger(provided) && provided > lastSequence) {
+      sequence = provided;
+    } else {
+      if (lastSequence >= Number.MAX_SAFE_INTEGER) {
+        throw new CompanionError("E_STATE", "Lifecycle event sequence space is exhausted.");
+      }
+      sequence = lastSequence + 1;
+    }
+    lastSequence = sequence;
+    return { ...base, sequence };
+  });
+}
+
+/**
+ * Append a typed lifecycle event with a durable monotonic sequence number.
+ * Retention keeps the newest MAX_LIFECYCLE_EVENTS entries; sequences of retained
+ * events are unchanged so cursors survive normal append/restart behavior.
+ */
 export function appendLifecycleEvent(events, type, summary, detail = undefined) {
   if (!LIFECYCLE_EVENT_TYPES.includes(type)) {
     throw new CompanionError("E_STATE", `Unknown lifecycle event type ${type}.`);
   }
-  const list = Array.isArray(events) ? events.slice(-MAX_LIFECYCLE_EVENTS + 1) : [];
+  const normalized = normalizeLifecycleEventSequences(Array.isArray(events) ? events : []);
+  const list = normalized.length >= MAX_LIFECYCLE_EVENTS
+    ? normalized.slice(-(MAX_LIFECYCLE_EVENTS - 1))
+    : normalized.slice();
+  const lastSequence = list.length
+    ? list[list.length - 1].sequence
+    : (normalized.length ? normalized[normalized.length - 1].sequence : 0);
+  if (lastSequence >= Number.MAX_SAFE_INTEGER) {
+    throw new CompanionError("E_STATE", "Lifecycle event sequence space is exhausted.");
+  }
   const entry = {
     type,
     at: timestamp(),
-    summary: clip(redactText(summary || type), 500)
+    summary: clip(redactText(summary || type), 500),
+    sequence: lastSequence + 1
   };
   if (detail !== undefined) entry.detail = redact(boundLifecycleDetail(detail));
   list.push(entry);
