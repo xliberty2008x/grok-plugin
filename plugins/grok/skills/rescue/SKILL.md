@@ -62,3 +62,18 @@ Build one JSON object with exactly these TaskEnvelope v1 input fields:
 8. Report a synthesized outcome containing every job ID in the logical chain, worker claims, runtime evidence, host verification, unresolved risks/questions, and any exact error code.
 
 Use the companion cancel command for cancellation. Do not widen Grok's profile merely to perform host checks, silently replay a failed task, signal opaque process trees yourself, or substitute a different worker unless the active fallback policy permits it after a concrete failure.
+
+## `record-verification` input contract
+
+The stdin frame is one JSON object of at most 64 KiB whose only root field is `commandOutcomes`. That array must contain 1 through 64 outcomes with unique `command` values. Every outcome must contain exactly `command`, `status`, and `exitCode`: `command` must exactly match one declared `requiredVerification` string, `status` must be `passed|failed`, and `exitCode` must be an integer. Do not add `stdout`, `stderr`, `output`, summaries, excerpts, or any other fields.
+
+A passing record must include every distinct declared `requiredVerification` command exactly once with `status: "passed"` and `exitCode: 0`. A failing record may be partial, but at least one submitted outcome must have `status: "failed"` or a nonzero `exitCode`. Given `requiredVerification: ["node --test tests/control-plane.test.mjs", "npm run lint"]`, this is a valid complete passing frame:
+
+```json
+{
+  "commandOutcomes": [
+    { "command": "node --test tests/control-plane.test.mjs", "status": "passed", "exitCode": 0 },
+    { "command": "npm run lint", "status": "passed", "exitCode": 0 }
+  ]
+}
+```

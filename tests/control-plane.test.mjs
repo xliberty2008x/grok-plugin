@@ -177,6 +177,182 @@ test("ContextManifest observes same-path content, index, and Git-metadata change
   );
 });
 
+test("verification observer tolerates only pytest/Python cache ignored drift", () => {
+  const root = initRepo();
+  fs.writeFileSync(
+    path.join(root, ".gitignore"),
+    ".pytest_cache/\n__pycache__/\n.pytest_cache-copy/\n__pycache__-copy/\nbuild-output.txt\n"
+  );
+  git(root, "add", ".gitignore");
+  git(root, "commit", "-m", "ignore cache and build output");
+
+  const before = captureContextManifest(root);
+  assert.match(before.git.verificationIgnoredDigest, /^[a-f0-9]{64}$/);
+  assert.equal(before.git.verificationIgnoredEntryCount, 0);
+
+  fs.mkdirSync(path.join(root, ".pytest_cache", "v"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".pytest_cache", "v", "cache"), "nodeids\n");
+  fs.mkdirSync(path.join(root, "pkg", "__pycache__"), { recursive: true });
+  fs.writeFileSync(path.join(root, "pkg", "__pycache__", "mod.cpython-311.pyc"), "bytecode");
+  const afterCache = captureContextManifest(root);
+
+  assert.notEqual(afterCache.git.ignoredDigest, before.git.ignoredDigest);
+  assert.equal(afterCache.git.verificationIgnoredDigest, before.git.verificationIgnoredDigest);
+  const fullObserved = observeChangedPaths(before, afterCache);
+  assert.deepEqual(fullObserved.sort(), [
+    ".pytest_cache/v/cache",
+    "pkg/__pycache__/mod.cpython-311.pyc"
+  ]);
+  assert.deepEqual(observeChangedPaths(before, afterCache, { observer: "verification" }), []);
+
+  fs.mkdirSync(path.join(root, ".pytest_cache-copy"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".pytest_cache-copy", "evidence.txt"), "not pytest cache\n");
+  fs.mkdirSync(path.join(root, "pkg", "__pycache__-copy"), { recursive: true });
+  fs.writeFileSync(path.join(root, "pkg", "__pycache__-copy", "evidence.pyc"), "not pycache\n");
+  fs.writeFileSync(path.join(root, "build-output.txt"), "meaningful ignored write\n");
+  const afterMeaningful = captureContextManifest(root);
+  assert.notEqual(afterMeaningful.git.verificationIgnoredDigest, before.git.verificationIgnoredDigest);
+  assert.deepEqual(observeChangedPaths(before, afterMeaningful, { observer: "verification" }).sort(), [
+    ".pytest_cache-copy/evidence.txt",
+    "build-output.txt",
+    "pkg/__pycache__-copy/evidence.pyc"
+  ]);
+});
+
+test("verification observer falls back fail-closed without verification-only identity", () => {
+  const legacyBefore = {
+    git: {
+      dirtyDigest: "dirty",
+      dirtyEntries: [],
+      ignoredDigest: "ignored-before",
+      ignoredEntriesAttributable: false,
+      head: "head",
+      trackedTreeIdentity: "tree",
+      metadataIdentity: "metadata"
+    }
+  };
+  const current = {
+    git: {
+      dirtyDigest: "dirty",
+      dirtyEntries: [],
+      ignoredDigest: "ignored-after",
+      ignoredEntriesAttributable: false,
+      verificationIgnoredDigest: "verification-same",
+      verificationIgnoredEntriesAttributable: true,
+      verificationIgnoredEntries: [],
+      head: "head",
+      trackedTreeIdentity: "tree",
+      metadataIdentity: "metadata"
+    }
+  };
+  assert.deepEqual(
+    observeChangedPaths(legacyBefore, current, { observer: "verification" }),
+    ["[IGNORED_WORKTREE]"]
+  );
+
+  const malformedBefore = {
+    git: {
+      ...legacyBefore.git,
+      verificationIgnoredDigest: "not-a-sha256",
+      verificationIgnoredEntryCount: 0,
+      verificationIgnoredEntriesAttributable: true,
+      verificationIgnoredEntries: [],
+      verificationIgnoredInventoryComplete: true
+    }
+  };
+  const malformedAfter = {
+    git: {
+      ...malformedBefore.git,
+      ignoredDigest: "ignored-after"
+    }
+  };
+  assert.deepEqual(
+    observeChangedPaths(malformedBefore, malformedAfter, { observer: "verification" }),
+    ["[IGNORED_WORKTREE]"]
+  );
+
+  const attributableBefore = {
+    git: {
+      dirtyDigest: "dirty",
+      dirtyEntries: [],
+      ignoredDigest: "ignored-a",
+      ignoredEntriesAttributable: true,
+      ignoredEntries: [{ path: "secret.bin", fingerprint: "fp-a" }],
+      verificationIgnoredDigest: "verification-stable",
+      verificationIgnoredEntryCount: 1,
+      verificationIgnoredEntriesAttributable: true,
+      verificationIgnoredEntries: [{ path: "secret.bin", fingerprint: "verify-fp" }],
+      // Deliberately omit verificationIgnoredInventoryComplete. A partially
+      // populated new identity must fall back to the full ignored observer.
+      head: "head",
+      trackedTreeIdentity: "tree",
+      metadataIdentity: "metadata"
+    }
+  };
+  const attributableAfter = {
+    git: {
+      ...attributableBefore.git,
+      ignoredDigest: "ignored-b",
+      ignoredEntries: [{ path: "secret.bin", fingerprint: "fp-b" }],
+      verificationIgnoredDigest: "verification-stable"
+    }
+  };
+  assert.deepEqual(
+    observeChangedPaths(attributableBefore, attributableAfter, { observer: "verification" }),
+    ["secret.bin"]
+  );
+
+  const impossibleBefore = {
+    git: {
+      ...attributableBefore.git,
+      verificationIgnoredDigest: "0".repeat(64),
+      verificationIgnoredEntryCount: 0,
+      verificationIgnoredEntriesAttributable: false,
+      verificationIgnoredEntries: [],
+      verificationIgnoredInventoryComplete: true
+    }
+  };
+  const impossibleAfter = {
+    git: {
+      ...impossibleBefore.git,
+      ignoredDigest: "ignored-b",
+      ignoredEntries: [{ path: "secret.bin", fingerprint: "fp-b" }]
+    }
+  };
+  assert.deepEqual(
+    observeChangedPaths(impossibleBefore, impossibleAfter, { observer: "verification" }),
+    ["secret.bin"]
+  );
+});
+
+test("verification observer retains [IGNORED_WORKTREE] when non-cache ignored drift is not attributable", () => {
+  const before = {
+    git: {
+      dirtyDigest: "dirty",
+      dirtyEntries: [],
+      ignoredDigest: "full-a",
+      ignoredEntriesAttributable: false,
+      verificationIgnoredDigest: "verify-a",
+      verificationIgnoredEntryCount: 2001,
+      verificationIgnoredEntriesAttributable: false,
+      verificationIgnoredEntries: [],
+      verificationIgnoredInventoryComplete: true,
+      head: "head",
+      trackedTreeIdentity: "tree",
+      metadataIdentity: "metadata"
+    }
+  };
+  const after = {
+    git: {
+      ...before.git,
+      ignoredDigest: "full-b",
+      verificationIgnoredDigest: "verify-b"
+    }
+  };
+  assert.deepEqual(observeChangedPaths(before, after), ["[IGNORED_WORKTREE]"]);
+  assert.deepEqual(observeChangedPaths(before, after, { observer: "verification" }), ["[IGNORED_WORKTREE]"]);
+});
+
 test("changed-path overflow remains a fail-closed scope violation", () => {
   const entries = Array.from({ length: 201 }, (_, index) => ({
     status: " M",
@@ -448,6 +624,10 @@ test("Codex control-plane skill contracts describe host authority and explicit j
   assert.match(rescue, /authoritative verification/i);
   assert.match(rescue, /record-verification/);
   assert.match(rescue, /command\/status\/exit-code/i);
+  assert.match(rescue, /commandOutcomes/);
+  assert.match(rescue, /passed\|failed|passed" or "failed/i);
+  assert.match(rescue, /64 KiB|64\s*KiB/i);
+  assert.match(rescue, /at most 64|≤64|64 outcomes/i);
   assert.match(rescue, /fix-and-reverify loop/i);
   assert.match(rescue, /same failure repeats/i);
   assert.match(rescue, /write_stdin/);
@@ -815,6 +995,229 @@ test("integration: host verification rejects empty declarations and outcomes", {
   );
   assert.notEqual(rejected.status, 0);
   assert.equal(JSON.parse(rejected.stdout).error.code, "E_USAGE");
+});
+
+test("integration: record-verification accepts pytest/Python cache drift and continues", {
+  skip: !PROVIDER_LIFECYCLE_AVAILABLE && "process start tokens unavailable (ps denied in this environment)"
+}, () => {
+  const root = initRepo();
+  fs.writeFileSync(path.join(root, ".gitignore"), ".pytest_cache/\n__pycache__/\n");
+  git(root, "add", ".gitignore");
+  git(root, "commit", "-m", "ignore pytest and pycache");
+  const { env } = fixture({ taskText: workerReport() });
+  const envelope = {
+    schemaVersion: 1,
+    userRequest: "prepare cache-tolerant verification",
+    objective: "Prepare cache-tolerant verification",
+    mode: "read",
+    scope: { include: ["tracked.txt"], exclude: [] },
+    context: { workspaceState: "task_scoped", requiredPaths: ["tracked.txt"] },
+    acceptanceCriteria: [
+      { id: "AC-01", text: "Prepare the fixture" },
+      { id: "AC-02", text: "Report the result" }
+    ],
+    requiredVerification: ["node verify-fixture.mjs", "npm run check"]
+  };
+  const job = parseJson(runCompanion(
+    ["task", "--wait", "--envelope-stdin", "--json"],
+    { cwd: root, env, input: JSON.stringify(envelope) }
+  ));
+
+  fs.mkdirSync(path.join(root, ".pytest_cache", "v"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".pytest_cache", "v", "cache"), "nodeids\n");
+  fs.mkdirSync(path.join(root, "src", "__pycache__"), { recursive: true });
+  fs.writeFileSync(path.join(root, "src", "__pycache__", "mod.cpython-311.pyc"), "pyc");
+
+  const recorded = parseJson(runCompanion(
+    ["record-verification", job.id, "--verification-stdin", "--json"],
+    {
+      cwd: root,
+      env,
+      input: JSON.stringify({
+        commandOutcomes: [
+          { command: "node verify-fixture.mjs", status: "passed", exitCode: 0 },
+          { command: "npm run check", status: "passed", exitCode: 0 }
+        ]
+      })
+    }
+  ));
+  assert.equal(recorded.result.hostVerification, "passed");
+  assert.equal(recorded.result.verification.authority, "host_asserted");
+  assert.deepEqual(recorded.result.verification.observedChangedPaths, []);
+  assert.deepEqual(recorded.result.runtimeEvidence.commandOutcomes, [
+    { command: "node verify-fixture.mjs", status: "passed", exitCode: 0 },
+    { command: "npm run check", status: "passed", exitCode: 0 }
+  ]);
+
+  const resumed = parseJson(runCompanion(
+    ["task", "--wait", "--job-id", job.id, "continue after cache-only verification", "--json"],
+    { cwd: root, env }
+  ));
+  assert.equal(resumed.resumeJobId, job.id);
+});
+
+test("integration: record-verification rejects cache drift mixed with meaningful ignored writes", {
+  skip: !PROVIDER_LIFECYCLE_AVAILABLE && "process start tokens unavailable (ps denied in this environment)"
+}, () => {
+  const root = initRepo();
+  fs.writeFileSync(path.join(root, ".gitignore"), ".pytest_cache/\n__pycache__/\nsecret-output.txt\n");
+  git(root, "add", ".gitignore");
+  git(root, "commit", "-m", "ignore cache and secret output");
+  const { env } = fixture({ taskText: workerReport() });
+  const envelope = {
+    schemaVersion: 1,
+    userRequest: "prepare mixed ignored verification",
+    objective: "Prepare mixed ignored verification",
+    mode: "read",
+    scope: { include: ["tracked.txt"], exclude: [] },
+    context: { workspaceState: "task_scoped", requiredPaths: ["tracked.txt"] },
+    acceptanceCriteria: [
+      { id: "AC-01", text: "Prepare the fixture" },
+      { id: "AC-02", text: "Report the result" }
+    ],
+    requiredVerification: ["node verify-fixture.mjs"]
+  };
+  const job = parseJson(runCompanion(
+    ["task", "--wait", "--envelope-stdin", "--json"],
+    { cwd: root, env, input: JSON.stringify(envelope) }
+  ));
+
+  fs.mkdirSync(path.join(root, ".pytest_cache"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".pytest_cache", "CACHEDIR.TAG"), "tag\n");
+  fs.writeFileSync(path.join(root, "secret-output.txt"), "out-of-scope ignored write\n");
+
+  const rejected = runCompanion(
+    ["record-verification", job.id, "--verification-stdin", "--json"],
+    {
+      cwd: root,
+      env,
+      input: JSON.stringify({
+        commandOutcomes: [{ command: "node verify-fixture.mjs", status: "passed", exitCode: 0 }]
+      })
+    }
+  );
+  assert.notEqual(rejected.status, 0);
+  const error = JSON.parse(rejected.stdout).error;
+  assert.equal(error.code, "E_SCOPE_VIOLATION");
+  assert.deepEqual(error.details.paths, ["secret-output.txt"]);
+});
+
+test("integration: commandOutcomes contract accepts complete/partial records and rejects invalid shapes", {
+  skip: !PROVIDER_LIFECYCLE_AVAILABLE && "process start tokens unavailable (ps denied in this environment)"
+}, () => {
+  const root = initRepo();
+  const requiredVerification = ["node verify-fixture.mjs", "npm run check"];
+  const baseEnvelope = {
+    schemaVersion: 1,
+    userRequest: "exercise verification contract",
+    objective: "Exercise verification contract",
+    mode: "read",
+    scope: { include: ["tracked.txt"], exclude: [] },
+    context: { workspaceState: "task_scoped", requiredPaths: ["tracked.txt"] },
+    acceptanceCriteria: [
+      { id: "AC-01", text: "Prepare the fixture" },
+      { id: "AC-02", text: "Report the result" }
+    ],
+    requiredVerification
+  };
+
+  const rejectCase = (label, input, setup = {}) => {
+    const { env } = fixture({ taskText: workerReport() });
+    const job = parseJson(runCompanion(
+      ["task", "--wait", "--envelope-stdin", "--json"],
+      { cwd: root, env, input: JSON.stringify({ ...baseEnvelope, ...setup.envelope }) }
+    ));
+    const rejected = runCompanion(
+      ["record-verification", job.id, "--verification-stdin", "--json"],
+      { cwd: root, env, input: JSON.stringify(input) }
+    );
+    assert.notEqual(rejected.status, 0, label);
+    assert.equal(JSON.parse(rejected.stdout).error.code, "E_USAGE", label);
+  };
+
+  rejectCase("missing status", {
+    commandOutcomes: [{ command: "node verify-fixture.mjs", exitCode: 0 }]
+  });
+  rejectCase("non-declared command", {
+    commandOutcomes: [{ command: "node not-declared.mjs", status: "passed", exitCode: 0 }]
+  });
+  rejectCase("incomplete passing record", {
+    commandOutcomes: [{ command: "node verify-fixture.mjs", status: "passed", exitCode: 0 }]
+  });
+  rejectCase("duplicate command", {
+    commandOutcomes: [
+      { command: "node verify-fixture.mjs", status: "passed", exitCode: 0 },
+      { command: "node verify-fixture.mjs", status: "passed", exitCode: 0 }
+    ]
+  });
+  rejectCase("unsupported output field", {
+    commandOutcomes: [{
+      command: "node verify-fixture.mjs",
+      status: "passed",
+      exitCode: 0,
+      output: "should not be recorded"
+    }]
+  });
+  rejectCase("unsupported root field", {
+    commandOutcomes: [{ command: "npm run check", status: "failed", exitCode: 1 }],
+    summary: "not part of the contract"
+  });
+  rejectCase("more than 64 outcomes", {
+    commandOutcomes: Array.from({ length: 65 }, () => ({
+      command: "node verify-fixture.mjs",
+      status: "failed",
+      exitCode: 1
+    }))
+  });
+
+  {
+    const { env } = fixture({ taskText: workerReport() });
+    const job = parseJson(runCompanion(
+      ["task", "--wait", "--envelope-stdin", "--json"],
+      { cwd: root, env, input: JSON.stringify(baseEnvelope) }
+    ));
+    const partial = parseJson(runCompanion(
+      ["record-verification", job.id, "--verification-stdin", "--json"],
+      {
+        cwd: root,
+        env,
+        input: JSON.stringify({
+          commandOutcomes: [{ command: "npm run check", status: "failed", exitCode: 1 }]
+        })
+      }
+    ));
+    assert.equal(partial.result.hostVerification, "failed");
+    assert.equal(partial.result.verification.authority, "host_asserted");
+    assert.deepEqual(partial.result.runtimeEvidence.commandOutcomes, [
+      { command: "npm run check", status: "failed", exitCode: 1 }
+    ]);
+  }
+
+  {
+    const { env } = fixture({ taskText: workerReport() });
+    const job = parseJson(runCompanion(
+      ["task", "--wait", "--envelope-stdin", "--json"],
+      { cwd: root, env, input: JSON.stringify(baseEnvelope) }
+    ));
+    const complete = parseJson(runCompanion(
+      ["record-verification", job.id, "--verification-stdin", "--json"],
+      {
+        cwd: root,
+        env,
+        input: JSON.stringify({
+          commandOutcomes: [
+            { command: "node verify-fixture.mjs", status: "passed", exitCode: 0 },
+            { command: "npm run check", status: "passed", exitCode: 0 }
+          ]
+        })
+      }
+    ));
+    assert.equal(complete.result.hostVerification, "passed");
+    assert.deepEqual(complete.result.runtimeEvidence.commandOutcomes, [
+      { command: "node verify-fixture.mjs", status: "passed", exitCode: 0 },
+      { command: "npm run check", status: "passed", exitCode: 0 }
+    ]);
+  }
 });
 
 test("integration: host verification cannot rebase a lineage while a writer is active", {
