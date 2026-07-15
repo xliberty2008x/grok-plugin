@@ -80,23 +80,29 @@ function parseVerificationRecord(text, requiredVerification = []) {
   if (required.length === 0) {
     throw new CompanionError("E_USAGE", "Host verification reconciliation requires at least one declared requiredVerification command.");
   }
+  if (value.commandOutcomes.length < 1 || value.commandOutcomes.length > 64) {
+    throw new CompanionError("E_USAGE", "Host verification reconciliation requires between 1 and 64 command outcomes.");
+  }
   const allowedCommands = new Set(required);
-  const commandOutcomes = value.commandOutcomes.slice(0, 64).map((item) => {
+  const commandOutcomes = value.commandOutcomes.map((item) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) throw new CompanionError("E_USAGE", "Each host verification outcome must be an object.");
     const unknown = Object.keys(item).filter((key) => !["command", "status", "exitCode"].includes(key));
     if (unknown.length) throw new CompanionError("E_USAGE", `Host verification outcome contains unsupported fields: ${unknown.join(", ")}.`);
-    const command = sanitizeDisplayText(String(item.command || "")).slice(0, 2 * 1024);
-    const status = String(item.status || "");
-    if (!command || !["passed", "failed"].includes(status) || !Number.isInteger(item.exitCode)) {
+    const command = item.command;
+    const status = item.status;
+    if (typeof command !== "string" || !command || typeof status !== "string"
+      || !["passed", "failed"].includes(status) || !Number.isInteger(item.exitCode)) {
       throw new CompanionError("E_USAGE", "Each host verification outcome requires command, status passed|failed, and an integer exitCode.");
     }
-    if (required.length && !allowedCommands.has(command)) {
-      throw new CompanionError("E_USAGE", `Host verification command was not declared in requiredVerification: ${command}`);
+    if (!allowedCommands.has(command)) {
+      throw new CompanionError(
+        "E_USAGE",
+        `Host verification command was not declared in requiredVerification: ${sanitizeDisplayText(command).slice(0, 2 * 1024)}`
+      );
     }
     return { command, status, exitCode: item.exitCode };
   });
   const byCommand = new Map(commandOutcomes.map((item) => [item.command, item]));
-  if (commandOutcomes.length === 0) throw new CompanionError("E_USAGE", "Host verification reconciliation requires at least one command outcome.");
   if (byCommand.size !== commandOutcomes.length) throw new CompanionError("E_USAGE", "Host verification commands must be unique.");
   const anyFailed = commandOutcomes.some((item) => item.status === "failed" || item.exitCode !== 0);
   const allRequiredPassed = required.every((command) => {
@@ -1244,8 +1250,15 @@ async function handleRecordVerification(raw) {
     const activeWriter = listJobs(root).find((candidate) => candidate.id !== job.id && !terminal(candidate) && candidate.write);
     if (activeWriter) throw new CompanionError("E_JOB_ACTIVE", `Cannot record verification while writer ${activeWriter.id} is active.`);
     const record = parseVerificationRecord(input, job.request?.envelope?.requiredVerification || []);
+    // Store the full exact current snapshot for continuation binding, but compare
+    // completion→current with the verification-only ignored observer so standard
+    // pytest/Python cache drift from host checks is not treated as out-of-scope.
     const verificationContextManifest = captureContextManifest(root);
-    const observedChangedPaths = observeChangedPaths(job.completionContextManifest, verificationContextManifest);
+    const observedChangedPaths = observeChangedPaths(
+      job.completionContextManifest,
+      verificationContextManifest,
+      { observer: "verification" }
+    );
     const scope = job.request?.envelope?.scope || { include: [], exclude: [] };
     const scopeViolations = scope.include?.length
       ? evaluateScope(observedChangedPaths, scope)

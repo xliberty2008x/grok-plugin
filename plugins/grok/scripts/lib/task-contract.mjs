@@ -284,6 +284,14 @@ export function captureContextManifest(root) {
       ignoredEntries: ignoredSnapshot.entries,
       ignoredEntriesAttributable: ignoredSnapshot.attributable,
       ignoredInventoryComplete: ignoredSnapshot.complete,
+      // Verification-only identity excludes pytest/Python cache path components so
+      // record-verification can tolerate host-check cache drift without weakening
+      // ordinary resume or task-scope ignored-write protection.
+      verificationIgnoredDigest: ignoredSnapshot.verificationDigest,
+      verificationIgnoredEntryCount: ignoredSnapshot.verificationCount,
+      verificationIgnoredEntries: ignoredSnapshot.verificationEntries,
+      verificationIgnoredEntriesAttributable: ignoredSnapshot.verificationAttributable,
+      verificationIgnoredInventoryComplete: ignoredSnapshot.verificationComplete,
       trackedTreeIdentity: trackedTree,
       metadataIdentity,
       insideWorktree,
@@ -406,10 +414,25 @@ function hashFile(file) {
 }
 
 /**
+ * True when any path component is exactly `.pytest_cache` or `__pycache__`.
+ * Used only for the verification-time ignored identity; ordinary task/resume
+ * comparison keeps the full ignored inventory.
+ */
+export function isVerificationCacheIgnoredPath(relativePath) {
+  return String(relativePath || "")
+    .split("/")
+    .some((part) => part === ".pytest_cache" || part === "__pycache__");
+}
+
+/**
  * Fingerprint ignored worktree paths that `git status --untracked-files=all` omits.
  * Small files receive content hashes up to a global budget; every path also carries
  * high-resolution metadata so ordinary search/replace writes remain observable.
  * Large inventories retain only a digest and fail closed to an unattributed marker.
+ *
+ * From the same inventory, also compute a verification-only identity that drops
+ * only standard pytest/Python cache path components so host checks can leave
+ * cache drift without triggering out-of-scope write detection.
  */
 function ignoredWorktreeSnapshot(root) {
   const run = git(root, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], {
@@ -422,63 +445,114 @@ function ignoredWorktreeSnapshot(root) {
       count: 0,
       entries: [],
       attributable: false,
-      complete: false
+      complete: false,
+      verificationDigest: sha("ignored-verification-v1:unavailable"),
+      verificationCount: 0,
+      verificationEntries: [],
+      verificationAttributable: false,
+      verificationComplete: false
     };
   }
   const allPaths = String(run.stdout || "").split("\0").filter(Boolean).sort();
   const complete = allPaths.length <= MAX_IGNORED_PATHS;
   const paths = allPaths.slice(0, MAX_IGNORED_PATHS);
   const attributable = complete && paths.length <= MAX_IGNORED_ATTRIBUTABLE;
+  const allVerificationPaths = allPaths.filter((relativePath) => !isVerificationCacheIgnoredPath(relativePath));
+  const verificationCount = allVerificationPaths.length;
+  const verificationComplete = verificationCount <= MAX_IGNORED_PATHS;
+  const verificationPaths = allVerificationPaths.slice(0, MAX_IGNORED_PATHS);
+  const verificationAttributable = verificationComplete && verificationCount <= MAX_IGNORED_ATTRIBUTABLE;
+  const fullPathSet = new Set(paths);
+  const verificationPathSet = new Set(verificationPaths);
+  const snapshotPaths = [...new Set([...paths, ...verificationPaths])].sort();
   const entries = [];
+  const verificationEntries = [];
   const digest = crypto.createHash("sha256");
+  const verificationDigest = crypto.createHash("sha256");
   digest.update("ignored-v1\0");
+  verificationDigest.update("ignored-verification-v1\0");
   let hashedBytes = 0;
-  for (const relativePath of paths) {
+  let verificationHashedBytes = 0;
+  for (const relativePath of snapshotPaths) {
+    const inFullSnapshot = fullPathSet.has(relativePath);
+    const inVerificationSnapshot = verificationPathSet.has(relativePath);
     const absolute = path.resolve(root, relativePath);
     let identity;
+    let verificationIdentity;
     if (absolute === root || !absolute.startsWith(`${root}${path.sep}`)) {
       identity = { kind: "outside" };
+      verificationIdentity = identity;
     } else {
       try {
         const stat = fs.lstatSync(absolute, { bigint: true });
         const mode = Number(stat.mode & 0o7777n);
         if (stat.isSymbolicLink()) {
           identity = { kind: "symlink", mode, targetDigest: sha(fs.readlinkSync(absolute)) };
+          verificationIdentity = identity;
         } else if (stat.isFile()) {
           const size = Number(stat.size);
-          const mayHash = Number.isSafeInteger(size) && size >= 0 && hashedBytes + size <= MAX_IGNORED_HASH_BYTES;
-          identity = {
+          const safeSize = Number.isSafeInteger(size) && size >= 0;
+          const mayHash = inFullSnapshot && safeSize && hashedBytes + size <= MAX_IGNORED_HASH_BYTES;
+          const verificationMayHash = inVerificationSnapshot
+            && safeSize
+            && verificationHashedBytes + size <= MAX_IGNORED_HASH_BYTES;
+          const contentDigest = mayHash || verificationMayHash ? hashFile(absolute) : null;
+          const baseIdentity = {
             kind: "file",
             mode,
             size: stat.size.toString(),
-            mtimeNs: stat.mtimeNs.toString(),
-            ...(mayHash ? { contentDigest: hashFile(absolute) } : { contentDigest: null })
+            mtimeNs: stat.mtimeNs.toString()
           };
+          identity = { ...baseIdentity, contentDigest: mayHash ? contentDigest : null };
+          verificationIdentity = { ...baseIdentity, contentDigest: verificationMayHash ? contentDigest : null };
           if (mayHash) hashedBytes += size;
+          if (verificationMayHash) verificationHashedBytes += size;
         } else if (stat.isDirectory()) {
           identity = { kind: "directory", mode, mtimeNs: stat.mtimeNs.toString() };
+          verificationIdentity = identity;
         } else {
           identity = { kind: "other", mode, mtimeNs: stat.mtimeNs.toString() };
+          verificationIdentity = identity;
         }
       } catch (error) {
         identity = { kind: error?.code === "ENOENT" ? "missing" : "unreadable", code: String(error?.code || "ERR").slice(0, 32) };
+        verificationIdentity = identity;
       }
     }
-    const fingerprint = canonicalJson(identity);
-    digest.update(`${relativePath.length}:`);
-    digest.update(relativePath);
-    digest.update("\0");
-    digest.update(fingerprint);
-    digest.update("\0");
-    if (attributable) entries.push({ path: relativePath.slice(0, 4096), fingerprint });
+    if (inFullSnapshot) {
+      const fingerprint = canonicalJson(identity);
+      digest.update(`${relativePath.length}:`);
+      digest.update(relativePath);
+      digest.update("\0");
+      digest.update(fingerprint);
+      digest.update("\0");
+      if (attributable) entries.push({ path: relativePath.slice(0, 4096), fingerprint });
+    }
+    if (inVerificationSnapshot) {
+      const fingerprint = canonicalJson(verificationIdentity);
+      verificationDigest.update(`${relativePath.length}:`);
+      verificationDigest.update(relativePath);
+      verificationDigest.update("\0");
+      verificationDigest.update(fingerprint);
+      verificationDigest.update("\0");
+      if (verificationAttributable) {
+        verificationEntries.push({ path: relativePath.slice(0, 4096), fingerprint });
+      }
+    }
   }
   digest.update(`count=${allPaths.length};complete=${complete}`);
+  verificationDigest.update(`count=${verificationCount};complete=${verificationComplete}`);
   return {
     digest: digest.digest("hex"),
     count: allPaths.length,
     entries,
     attributable,
-    complete
+    complete,
+    verificationDigest: verificationDigest.digest("hex"),
+    verificationCount,
+    verificationEntries,
+    verificationAttributable,
+    verificationComplete
   };
 }
 
@@ -938,7 +1012,18 @@ function globToRegExp(pattern) {
   return new RegExp(`${expression}$`);
 }
 
-export function observeChangedPaths(preContext, postContext) {
+/**
+ * Observe path-level drift between two ContextManifests.
+ *
+ * observer:
+ * - "full" (default): compare the complete ignored-worktree identity. Used for
+ *   task completion scope checks and ordinary resume compatibility.
+ * - "verification": compare the verification-only ignored identity that excludes
+ *   exact `.pytest_cache` / `__pycache__` path components. Used only by
+ *   record-verification. Older manifests without verification fields fall back
+ *   fail-closed to the full ignored comparison.
+ */
+export function observeChangedPaths(preContext, postContext, { observer = "full" } = {}) {
   if (!preContext?.git || !postContext?.git) return [];
   const fingerprint = (entry) => canonicalJson({
     status: entry?.status || null,
@@ -966,22 +1051,85 @@ export function observeChangedPaths(preContext, postContext) {
     && (changed.size === 0 || preContext.git.dirtyEntriesTruncated || postContext.git.dirtyEntriesTruncated)) {
     changed.add("[DIRTY_OVERFLOW]");
   }
-  if ((preContext.git.ignoredDigest || null) !== (postContext.git.ignoredDigest || null)) {
-    if (preContext.git.ignoredEntriesAttributable && postContext.git.ignoredEntriesAttributable) {
-      const beforeIgnored = new Map((preContext.git.ignoredEntries || []).map((entry) => [entry.path, entry.fingerprint]));
-      const afterIgnored = new Map((postContext.git.ignoredEntries || []).map((entry) => [entry.path, entry.fingerprint]));
-      for (const [relativePath, value] of afterIgnored) if (beforeIgnored.get(relativePath) !== value) changed.add(relativePath);
-      for (const [relativePath, value] of beforeIgnored) if (afterIgnored.get(relativePath) !== value) changed.add(relativePath);
-    } else {
-      changed.add("[IGNORED_WORKTREE]");
-    }
-  }
+  observeIgnoredDrift(preContext.git, postContext.git, changed, { observer });
   if ((preContext.git.head || null) !== (postContext.git.head || null)) changed.add("[HEAD]");
   if ((preContext.git.trackedTreeIdentity || null) !== (postContext.git.trackedTreeIdentity || null)) changed.add("[INDEX]");
   if ((preContext.git.metadataIdentity || null) !== (postContext.git.metadataIdentity || null)) changed.add("[GIT_METADATA]");
   // Keep the complete internally attributable set for scope evaluation. Public/runtime
   // projections apply boundPathEvidence separately and expose an explicit overflow marker.
   return [...changed];
+}
+
+function observeFullIgnoredDrift(preGit, postGit, changed) {
+  if ((preGit.ignoredDigest || null) !== (postGit.ignoredDigest || null)) {
+    if (preGit.ignoredEntriesAttributable && postGit.ignoredEntriesAttributable) {
+      const beforeIgnored = new Map((preGit.ignoredEntries || []).map((entry) => [entry.path, entry.fingerprint]));
+      const afterIgnored = new Map((postGit.ignoredEntries || []).map((entry) => [entry.path, entry.fingerprint]));
+      for (const [relativePath, value] of afterIgnored) if (beforeIgnored.get(relativePath) !== value) changed.add(relativePath);
+      for (const [relativePath, value] of beforeIgnored) if (afterIgnored.get(relativePath) !== value) changed.add(relativePath);
+    } else {
+      changed.add("[IGNORED_WORKTREE]");
+    }
+  }
+}
+
+function hasVerificationIgnoredIdentity(gitManifest) {
+  if (!gitManifest || typeof gitManifest !== "object") return false;
+  const digest = gitManifest.verificationIgnoredDigest;
+  const entries = gitManifest.verificationIgnoredEntries;
+  const count = gitManifest.verificationIgnoredEntryCount;
+  const attributable = gitManifest.verificationIgnoredEntriesAttributable;
+  const complete = gitManifest.verificationIgnoredInventoryComplete;
+  if (typeof digest !== "string"
+    || !/^[a-f0-9]{64}$/.test(digest)
+    || !Number.isInteger(count)
+    || count < 0
+    || !Array.isArray(entries)
+    || typeof attributable !== "boolean"
+    || typeof complete !== "boolean") return false;
+  // A captured inventory is complete exactly while it remains within the path
+  // budget, and it is attributable exactly while the complete inventory also
+  // remains within the per-path evidence budget. Reject impossible combinations
+  // rather than trusting an equal but malformed verification digest.
+  if (complete !== (count <= MAX_IGNORED_PATHS)) return false;
+  if (attributable !== (complete && count <= MAX_IGNORED_ATTRIBUTABLE)) return false;
+  if (entries.length !== (attributable ? count : 0)) return false;
+  const paths = new Set();
+  for (const entry of entries) {
+    if (typeof entry?.path !== "string"
+      || !entry.path
+      || typeof entry?.fingerprint !== "string"
+      || !entry.fingerprint
+      || isVerificationCacheIgnoredPath(entry.path)
+      || paths.has(entry.path)) return false;
+    paths.add(entry.path);
+  }
+  return true;
+}
+
+function observeIgnoredDrift(preGit, postGit, changed, { observer }) {
+  if (observer === "verification") {
+    // Fail closed: missing or malformed verification identity on either side
+    // reverts to the complete ignored-worktree comparison.
+    if (!hasVerificationIgnoredIdentity(preGit) || !hasVerificationIgnoredIdentity(postGit)) {
+      observeFullIgnoredDrift(preGit, postGit, changed);
+      return;
+    }
+    const preDigest = preGit.verificationIgnoredDigest;
+    const postDigest = postGit.verificationIgnoredDigest;
+    if (preDigest !== postDigest) {
+      if (preGit.verificationIgnoredEntriesAttributable && postGit.verificationIgnoredEntriesAttributable) {
+        const beforeIgnored = new Map((preGit.verificationIgnoredEntries || []).map((entry) => [entry.path, entry.fingerprint]));
+        const afterIgnored = new Map((postGit.verificationIgnoredEntries || []).map((entry) => [entry.path, entry.fingerprint]));
+        for (const [relativePath, value] of afterIgnored) if (beforeIgnored.get(relativePath) !== value) changed.add(relativePath);
+        for (const [relativePath, value] of beforeIgnored) if (afterIgnored.get(relativePath) !== value) changed.add(relativePath);
+      } else {
+        changed.add("[IGNORED_WORKTREE]");
+      }
+    }
+    return;
+  }
+  observeFullIgnoredDrift(preGit, postGit, changed);
 }
 
 /**

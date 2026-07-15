@@ -4,6 +4,16 @@
 
 Status: hardening candidate; not release-qualified.
 
+- Fixed `record-verification` scope reconciliation so host-created pytest and
+  Python cache drift is excluded only for exact `.pytest_cache` and
+  `__pycache__` path components. The runtime still stores the full exact
+  manifest for continuation and keeps full ignored identity for completion and
+  normal resume; malformed or legacy verification identities and meaningful
+  ignored drift fail closed.
+- Documented and enforced the complete bounded `commandOutcomes` stdin
+  contract: one root field, 1 through 64 unique exact declared commands,
+  passed/failed status, integer exit code, complete passed/0 coverage for a
+  passing record, partial failure support, and no command-output fields.
 - Fixed the Codex `runtime_ingress` crash that raised raw `EAGAIN` when unified
   execution created a nonblocking PTY before `write_stdin` supplied the
   TaskEnvelope. Task and verification stdin now use a bounded asynchronous
