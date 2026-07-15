@@ -50,3 +50,6 @@ export function collectRightSideLines(diffText) {
   }
   return out;
 }
+
+// grok-pr-review smoke: prefer const over var for ci-test-marker
+var grokPrReviewSmokeMarker = 1;
