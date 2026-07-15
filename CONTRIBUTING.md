@@ -137,3 +137,39 @@ before provider launch is a plugin/runtime-ingress or host-orchestration failure
 and MUST NOT be reported as a Grok provider failure. Any untested boundary
 remains explicitly unqualified; `runtime_ingress`, `host_orchestration`, or
 `artifact_install` failures block release.
+
+## Optional Grok PR review (GitHub Actions)
+
+Same-repository, non-draft pull requests can run the plugin's headless Grok
+review and post an informational GitHub review (`COMMENT`) with inline findings
+when mappable. Findings never fail the check; only auth, CLI, schema, or API
+errors fail the job.
+
+### Enable
+
+1. Create a dedicated SuperGrok / `grok login` session (prefer a bot identity).
+2. Copy the session file contents into a repository secret named `GROK_AUTH_JSON`
+   (the full `auth.json` body).
+3. Merge the workflow `.github/workflows/grok-pr-review.yml` (already in tree when
+   this section applies).
+4. Optional repository variables:
+   - `GROK_PR_REVIEW_TRUSTED_REF` — git ref for the review runtime (default `main`)
+   - `GROK_CLI_VERSION` — `@xai-official/grok` version (default `0.2.99`)
+
+### Policy
+
+- **Forks** are skipped (secrets are unavailable and `pull_request_target` is not used).
+- **Drafts** are skipped until `ready_for_review`.
+- Runtime scripts and the companion binary path come from the **trusted ref**, not
+  from the PR tip. The PR head is only the git tree under review.
+- Rotate `GROK_AUTH_JSON` when jobs fail with authentication errors.
+
+### Local dry-run of the poster
+
+```bash
+node scripts/ci/post-grok-review.mjs \
+  --job-json /path/to/review-job.json \
+  --diff /path/to/pr.diff \
+  --owner OWNER --repo REPO --pr N --head-sha SHA \
+  --dry-run
+```
