@@ -301,13 +301,20 @@ function workerEnvironment(nonce) {
   const allowed = new Set(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "COLORTERM", "NO_COLOR", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "SystemRoot", "ComSpec", "PATHEXT"]);
   for (const [key, value] of Object.entries(process.env)) if ((allowed.has(key) || key.startsWith("LC_")) && value != null) env[key] = value;
   const host = currentHost();
-  env.GROK_COMPANION_HOST = host.kind;
+  // Preserve CI host flag: normalizeHostKind("ci") is null and would otherwise collapse to
+  // claude-code when CLAUDE_PLUGIN_DATA is set, dropping GROK_HEADLESS_PROMPT_ON_DISK consumers.
+  env.GROK_COMPANION_HOST = process.env.GROK_COMPANION_HOST === "ci" ? "ci" : host.kind;
   if (host.sessionId) env.GROK_COMPANION_HOST_SESSION_ID = host.sessionId;
+  else if (process.env.GROK_COMPANION_HOST_SESSION_ID) env.GROK_COMPANION_HOST_SESSION_ID = process.env.GROK_COMPANION_HOST_SESSION_ID;
   env.GROK_COMPANION_PLUGIN_DATA = pluginDataRoot();
   if (process.env.GROK_BIN) env.GROK_BIN = process.env.GROK_BIN;
   // The trusted detached worker must be able to locate a configured credential so it can
   // sanitize/copy it into the isolated task home. Provider children still receive only GROK_HOME.
   if (process.env.GROK_AUTH_PATH) env.GROK_AUTH_PATH = process.env.GROK_AUTH_PATH;
+  // CI headless reviews need on-disk prompts (sandbox re-exec cannot open /dev/fd/3).
+  if (process.env.GROK_HEADLESS_PROMPT_ON_DISK) env.GROK_HEADLESS_PROMPT_ON_DISK = process.env.GROK_HEADLESS_PROMPT_ON_DISK;
+  if (process.env.CI) env.CI = process.env.CI;
+  if (process.env.GITHUB_ACTIONS) env.GITHUB_ACTIONS = process.env.GITHUB_ACTIONS;
   env.GROK_COMPANION_WORKER_NONCE = nonce;
   return env;
 }
