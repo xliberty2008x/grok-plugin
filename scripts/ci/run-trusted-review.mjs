@@ -108,16 +108,6 @@ function main() {
 
   fs.mkdirSync(env.CLAUDE_PLUGIN_DATA, { recursive: true, mode: 0o700 });
 
-  process.stderr.write(
-    `run-trusted-review: flags host=${env.GROK_COMPANION_HOST} onDisk=${env.GROK_HEADLESS_PROMPT_ON_DISK} companion=${companion}\n`
-  );
-  // Prove trusted provider source includes forceNamedPrompt
-  try {
-    const src = fs.readFileSync(path.join(args.trustedRoot, 'plugins/grok/scripts/lib/grok-provider.mjs'), 'utf8');
-    process.stderr.write(`run-trusted-review: providerHasForceNamed=${src.includes('forceNamedPrompt')} providerHasOnDiskEnv=${src.includes('GROK_HEADLESS_PROMPT_ON_DISK')}\n`);
-  } catch (e) {
-    process.stderr.write(`run-trusted-review: provider read failed ${e.message}\n`);
-  }
     const result = spawnSync(
     process.execPath,
     [
