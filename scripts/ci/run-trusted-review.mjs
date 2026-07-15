@@ -143,7 +143,6 @@ function main() {
     fs.mkdirSync(path.dirname(args.out), { recursive: true });
     fs.writeFileSync(args.out, result.stdout, "utf8");
   }
-  process.stderr.write(`run-trusted-review: stderr_bytes=${Buffer.byteLength(result.stderr||"")} stdout_bytes=${Buffer.byteLength(result.stdout||"")}\n`);
   if (result.stderr) process.stderr.write(result.stderr);
 
   if (result.status !== 0) {
