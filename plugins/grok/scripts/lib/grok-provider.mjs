@@ -783,15 +783,24 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
   const promptFile = process.platform === "linux" ? "/proc/self/fd/3" : "/dev/fd/3";
   const promptFd = anonymousPrompt(isolation.home, prompt);
   const newSessionId = resumeSessionId ? null : crypto.randomUUID();
+  // Keep the parent-side prompt fd open until the child has finished (or failed to
+  // start). Closing immediately after spawn races sandbox re-exec on macOS/Linux CI,
+  // where the child re-opens `--prompt-file /dev/fd/3` after the parent closed it
+  // ("Bad file descriptor"). The prompt file itself remains unlinked (anonymous).
+  const closePromptFd = () => {
+    try { fs.closeSync(promptFd); } catch { /* already closed */ }
+  };
   let child;
   try {
     child = spawn(binary, headlessArgs({ root, promptFile, model, effort, leaderSocket, resumeSessionId, newSessionId, structured, sandboxProfile: isolation.sandboxProfile }), { cwd: root, env: { ...isolation.env, GROK_COMPANION_JOB_MARKER: marker }, shell: false, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe", promptFd] });
-  } finally {
-    fs.closeSync(promptFd);
+  } catch (error) {
+    closePromptFd();
+    throw error;
   }
   let identity;
   try { identity = await captureSpawnIdentity(child); }
   catch (error) {
+    closePromptFd();
     const failedIdentity = providerCleanupIdentity(error);
     if (failedIdentity) {
       try { onEvent({ type: "provider", process: failedIdentity, version }); } catch {}
@@ -806,6 +815,7 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
   }
   try { registerProviderGuard(root, marker, identity, hostContext().sessionId); }
   catch (error) {
+    closePromptFd();
     try { await ensureChildExit(child, identity); }
     catch (shutdownError) {
       try { onEvent({ type: "provider", process: identity, version }); } catch {}
@@ -855,6 +865,7 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
     throw new CompanionError("E_PROVIDER_EXIT", `Could not start Grok: ${error.message}`);
   } finally {
     clearInterval(cancelPoll); clearTimeout(timeout); if (forceTimer) clearTimeout(forceTimer);
+    closePromptFd();
     await ensureChildExit(child, identity);
     unregisterProviderGuard(root, marker);
   }
