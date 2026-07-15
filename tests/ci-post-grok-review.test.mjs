@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { buildPrReviewPayload } from "../scripts/ci/lib/build-pr-review-payload.mjs";
 import { collectRightSideLines } from "../scripts/ci/lib/diff-right-lines.mjs";
 
 test("collectRightSideLines records added and context lines on RIGHT side", () => {
@@ -56,4 +57,99 @@ test("collectRightSideLines ignores No newline metadata", () => {
   const set = collectRightSideLines(diff);
   assert.equal(set.has("f:1"), true);
   assert.equal(set.size, 1);
+});
+
+function sampleJob(findings) {
+  return {
+    id: "review-test",
+    status: "completed",
+    result: {
+      review: {
+        verdict: findings.length ? "needs_changes" : "pass",
+        summary: "Summary text.",
+        findings
+      }
+    }
+  };
+}
+
+test("buildPrReviewPayload skips empty findings", () => {
+  const right = new Set(["src/a.js:1"]);
+  const r = buildPrReviewPayload({
+    job: sampleJob([]),
+    headSha: "abc123",
+    rightSideLines: right
+  });
+  assert.equal(r.skip, true);
+  assert.equal(r.reason, "no-findings");
+});
+
+test("buildPrReviewPayload skips empty-target", () => {
+  const job = sampleJob([]);
+  job.result.skipped = true;
+  job.result.skipReason = "empty-target";
+  const r = buildPrReviewPayload({
+    job,
+    headSha: "abc123",
+    rightSideLines: new Set()
+  });
+  assert.equal(r.skip, true);
+  assert.equal(r.reason, "empty-target");
+});
+
+test("buildPrReviewPayload places mappable findings inline and promotes others", () => {
+  const right = new Set(["src/a.js:2"]);
+  const r = buildPrReviewPayload({
+    job: sampleJob([
+      {
+        severity: "high",
+        title: "Bug",
+        body: "Broken thing",
+        file: "src/a.js",
+        line: 2
+      },
+      {
+        severity: "low",
+        title: "Off",
+        body: "Not in diff",
+        file: "src/a.js",
+        line: 99
+      },
+      {
+        severity: "info",
+        title: "General",
+        body: "No location",
+        file: null,
+        line: null
+      }
+    ]),
+    headSha: "deadbeef",
+    rightSideLines: right
+  });
+  assert.equal(r.skip, false);
+  assert.equal(r.payload.commit_id, "deadbeef");
+  assert.equal(r.payload.event, "COMMENT");
+  assert.equal(r.payload.comments.length, 1);
+  assert.equal(r.payload.comments[0].path, "src/a.js");
+  assert.equal(r.payload.comments[0].line, 2);
+  assert.equal(r.payload.comments[0].side, "RIGHT");
+  assert.match(r.payload.comments[0].body, /\[high\]/);
+  assert.match(r.payload.comments[0].body, /Bug/);
+  assert.match(r.payload.body, /Summary text/);
+  assert.match(r.payload.body, /high:\s*1/);
+  assert.match(r.payload.body, /Issues outside the diff/);
+  assert.match(r.payload.body, /Off/);
+  assert.match(r.payload.body, /General/);
+});
+
+test("buildPrReviewPayload throws on missing review when not skippable", () => {
+  assert.throws(
+    () =>
+      buildPrReviewPayload({
+        job: { status: "failed", result: null, error: { code: "E_AUTH_REQUIRED" } },
+        headSha: "x",
+        rightSideLines: new Set()
+      }),
+    /review/i
+  );
 });
