@@ -585,6 +585,9 @@ CI matrix:
 
 A trusted, Codex-equipped self-hosted macOS runner may additionally run `npm run test:installed-codex` on `main` pushes or explicit workflow dispatch when `CODEX_PLUGIN_RUNNER_ENABLED=true`. With an authenticated Grok/Codex runner and `CODEX_GROK_NATURAL_E2E_ENABLED=true`, a separate protected job updates the installed snapshot and runs `npm run test:natural-codex`: a new natural Codex task must invoke the installed `$grok:rescue`, complete a real Grok job, persist a passed host check, preserve the worktree, and remove transient auth/profile artifacts. Neither trusted job executes pull-request code. CI validates commits; it does not deploy them into your desktop Codex cache. Run `npm run codex:update-local`, then start a **new Codex task** so the app loads the refreshed skill text and runtime snapshot.
 
+- **Optional PR Grok review:** same-repo non-draft PRs can post informational Grok reviews when `GROK_AUTH_JSON` is configured. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+
 Release promotion is fail-closed. `release-plan.json` declares the change class,
 target, stage, and both supported hosts. RC/stable validation requires one
 machine-readable `qualification-<target>.json` whose deterministic source
