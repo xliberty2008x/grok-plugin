@@ -676,3 +676,5 @@ This is an independent community project and is **not** affiliated with, endorse
 It adapts Apache-2.0-licensed portions of OpenAI's [`codex-plugin-cc` v1.0.6](https://github.com/openai/codex-plugin-cc/tree/db52e28f4d9ded852ab3942cea316258ae4ef346) (commit `db52e28f4d9ded852ab3942cea316258ae4ef346`) while retaining required attribution and modification notices. See [UPSTREAM.md](UPSTREAM.md), [LICENSE](LICENSE), and [NOTICE](NOTICE).
 
 Apache License 2.0.
+
+# Superpowers CI smoke marker
