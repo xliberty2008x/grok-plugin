@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { CompanionError } from "./errors.mjs";
 import { processIsZombie, processStartToken } from "./process-control.mjs";
-import { workspaceState, assertSafeJobId } from "./workspace.mjs";
+import { workspaceState, assertSafeJobId, resolveWorkspaceStateDir } from "./workspace.mjs";
 import { sameHostSession } from "./host.mjs";
 
 const ACTIVE = new Set(["queued", "running"]);
@@ -122,6 +122,70 @@ export function generateId(kind) { return `${kind}-${crypto.randomBytes(12).toSt
 export function jobFile(root, id) { return path.join(ensure(root), "jobs", `${assertSafeJobId(id)}.json`); }
 export function cancelFile(root, id) { return path.join(ensure(root), "jobs", `${assertSafeJobId(id)}.cancel`); }
 export function logFile(root, id) { return path.join(ensure(root), "jobs", `${assertSafeJobId(id)}.log`); }
+
+/**
+ * Side-effect-free job path resolution. Does not create state directories.
+ * Returns null when the workspace state root is absent or the id is unsafe.
+ */
+export function jobFileIfPresent(root, id, env = process.env) {
+  if (!/^(review|adversarial-review|task|stop-review)-[a-f0-9]{16,64}$/.test(String(id ?? ""))) return null;
+  const base = resolveWorkspaceStateDir(root, env);
+  if (!base) return null;
+  const jobs = path.join(base, "jobs");
+  try {
+    const stat = fs.lstatSync(jobs);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(jobs) !== jobs) return null;
+  } catch {
+    return null;
+  }
+  return path.join(jobs, `${id}.json`);
+}
+
+/**
+ * Read a job record without ensure(), recovery, or directory creation.
+ * Missing/unreadable/unsafe ids all return null so callers can unify not-found.
+ */
+export function tryReadJob(root, id, env = process.env) {
+  const file = jobFileIfPresent(root, id, env);
+  if (!file) return null;
+  try {
+    return JSON.parse(readPrivateFile(file));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    if (error instanceof CompanionError) return null;
+    return null;
+  }
+}
+
+/**
+ * List job records without ensure(), recovery, or directory creation.
+ * Absent state directories yield an empty list rather than creating storage.
+ */
+export function listJobsReadonly(root, env = process.env) {
+  const base = resolveWorkspaceStateDir(root, env);
+  if (!base) return [];
+  const dir = path.join(base, "jobs");
+  let names;
+  try {
+    const stat = fs.lstatSync(dir);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(dir) !== dir) return [];
+    names = fs.readdirSync(dir);
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    return [];
+  }
+  return names
+    .filter((name) => /^(review|adversarial-review|task|stop-review)-[a-f0-9]{16,64}\.json$/.test(name))
+    .flatMap((name) => {
+      try {
+        const record = JSON.parse(readPrivateFile(path.join(dir, name)));
+        return record?.id === name.slice(0, -5) ? [record] : [];
+      } catch {
+        return [];
+      }
+    })
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+}
 
 export function readJob(root, id) {
   const file = jobFile(root, id);

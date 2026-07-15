@@ -21,6 +21,49 @@ export function workspaceRoot(cwd = process.cwd(), required = true) {
   return fs.realpathSync(String(run.stdout).trim());
 }
 
+/**
+ * Stable per-repository state directory segment under the plugin data root.
+ * Pure string derivation from a canonical repository path.
+ */
+export function workspaceStateSegment(canonicalRoot) {
+  const hash = crypto.createHash("sha256").update(String(canonicalRoot)).digest("hex").slice(0, 16);
+  const slug = path.basename(String(canonicalRoot)).replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 40) || "workspace";
+  return `${slug}-${hash}`;
+}
+
+/**
+ * Compute the workspace job-state directory without creating directories, locks,
+ * or chmod side effects. Returns null when the plugin data root is absent.
+ * Used by read-only MCP/service paths that must not call ensure().
+ */
+export function resolveWorkspaceStateDir(root, env = process.env) {
+  let canonicalRoot;
+  try {
+    canonicalRoot = fs.realpathSync(root);
+  } catch {
+    return null;
+  }
+  const configuredData = pluginDataRoot(env);
+  let pluginData;
+  try {
+    pluginData = fs.realpathSync(configuredData);
+  } catch {
+    return null;
+  }
+  const stateParent = path.join(pluginData, "state");
+  const workspaceDirectory = path.join(stateParent, workspaceStateSegment(canonicalRoot));
+  for (const directory of [stateParent, workspaceDirectory]) {
+    try {
+      const stat = fs.lstatSync(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) return null;
+      if (fs.realpathSync(directory) !== directory) return null;
+    } catch {
+      return null;
+    }
+  }
+  return workspaceDirectory;
+}
+
 export function workspaceState(root) {
   const canonicalRoot = fs.realpathSync(root);
   const configuredData = pluginDataRoot();
@@ -34,9 +77,7 @@ export function workspaceState(root) {
     throw new CompanionError("E_STATE", `Refusing unsafe plugin state directory ${stateParent}.`);
   }
   if ((stateStat.mode & 0o077) !== 0) fs.chmodSync(stateParent, 0o700);
-  const hash = crypto.createHash("sha256").update(canonicalRoot).digest("hex").slice(0, 16);
-  const slug = path.basename(canonicalRoot).replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 40) || "workspace";
-  return path.join(stateParent, `${slug}-${hash}`);
+  return path.join(stateParent, workspaceStateSegment(canonicalRoot));
 }
 
 export function assertSafeJobId(id) {

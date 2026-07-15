@@ -246,6 +246,7 @@ if (!versionsOnly) {
     "tests/windows-neutral.test.mjs",
     "plugins/grok/.claude-plugin/plugin.json",
     "plugins/grok/.codex-plugin/plugin.json",
+    "plugins/grok/.mcp.json",
     "plugins/grok/CHANGELOG.md",
     "plugins/grok/LICENSE",
     "plugins/grok/NOTICE",
@@ -262,6 +263,8 @@ if (!versionsOnly) {
     "plugins/grok/schemas/review-output.schema.json",
     "plugins/grok/scripts/grok-companion.mjs",
     "plugins/grok/scripts/grok-codex.mjs",
+    "plugins/grok/mcp/broker.mjs",
+    "plugins/grok/mcp/server.mjs",
     "plugins/grok/scripts/session-lifecycle-hook.mjs",
     "plugins/grok/scripts/stop-review-gate-hook.mjs",
     "plugins/grok/scripts/lib/process-control.mjs",
@@ -355,6 +358,7 @@ if (!versionsOnly) {
   }
   if (codexPluginManifest?.name !== "grok") problem("Codex plugin manifest name must be grok.", "plugins/grok/.codex-plugin/plugin.json");
   if (codexPluginManifest?.skills !== "./skills/") problem("Codex plugin manifest must expose ./skills/.", "plugins/grok/.codex-plugin/plugin.json");
+  if (codexPluginManifest?.mcpServers !== "./.mcp.json") problem("Codex plugin manifest must expose the bundled MCP config.", "plugins/grok/.codex-plugin/plugin.json");
 
   const hooks = readJson("plugins/grok/hooks/hooks.json");
   if (hooks) {
@@ -483,11 +487,13 @@ if (!versionsOnly) {
     ...walk("plugins/grok/skills"),
     ...walk("plugins/grok/hooks"),
     ...walk("plugins/grok/prompts"),
+    ...walk("plugins/grok/mcp"),
     ...walk("plugins/grok/scripts"),
     absolute(".claude-plugin/marketplace.json"),
     absolute(".agents/plugins/marketplace.json"),
     absolute("plugins/grok/.claude-plugin/plugin.json"),
-    absolute("plugins/grok/.codex-plugin/plugin.json")
+    absolute("plugins/grok/.codex-plugin/plugin.json"),
+    absolute("plugins/grok/.mcp.json")
   ].filter((file) => fs.existsSync(file) && fs.statSync(file).isFile());
   const stalePatterns = [
     [/\/codex:/i, "Codex slash-command namespace"],
@@ -513,7 +519,12 @@ if (!versionsOnly) {
     if (forbiddenNames.test(name)) problem("Potential secret or runtime-state file would be included in the repository.", name);
   }
 
-  const moduleFiles = [...walk("scripts"), ...walk("tests"), ...walk("plugins/grok/scripts")].filter((file) => file.endsWith(".mjs"));
+  const moduleFiles = [
+    ...walk("scripts"),
+    ...walk("tests"),
+    ...walk("plugins/grok/scripts"),
+    ...walk("plugins/grok/mcp")
+  ].filter((file) => file.endsWith(".mjs"));
   for (const file of moduleFiles) {
     try {
       execFileSync(process.execPath, ["--check", file], { cwd: ROOT, stdio: "pipe" });
