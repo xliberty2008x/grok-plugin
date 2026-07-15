@@ -780,19 +780,39 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
   const binary = discoverGrok(), version = grokVersion(binary);
   const marker = safeMarker(jobMarker), isolation = reviewEnvironment(stateDir, marker);
   const leaderSocket = path.join(stateDir, `leader-${marker}-${process.pid}-${Date.now()}.sock`);
-  const promptFile = process.platform === "linux" ? "/proc/self/fd/3" : "/dev/fd/3";
-  const promptFd = anonymousPrompt(isolation.home, prompt);
+  // Prefer anonymous fd 3 prompts locally. On CI (GitHub Actions sets CI=true), sandbox
+  // re-exec cannot re-open /dev/fd/3 reliably ("Bad file descriptor"). Use a mode-0600
+  // file under the isolated review home instead; it is removed with that home.
+  const forceNamedPrompt = process.env.GROK_HEADLESS_PROMPT_ON_DISK === "1"
+    || process.env.CI === "true"
+    || process.env.GITHUB_ACTIONS === "true"
+    || process.env.GROK_COMPANION_HOST === "ci";
+  let promptFile;
+  let promptFd = null;
+  let namedPromptPath = null;
+  if (forceNamedPrompt) {
+    namedPromptPath = path.join(isolation.home, `prompt-${process.pid}-${crypto.randomBytes(8).toString("hex")}.md`);
+    fs.writeFileSync(namedPromptPath, String(prompt), { mode: 0o600 });
+    promptFile = namedPromptPath;
+  } else {
+    promptFile = process.platform === "linux" ? "/proc/self/fd/3" : "/dev/fd/3";
+    promptFd = anonymousPrompt(isolation.home, prompt);
+  }
   const newSessionId = resumeSessionId ? null : crypto.randomUUID();
-  // Keep the parent-side prompt fd open until the child has finished (or failed to
-  // start). Closing immediately after spawn races sandbox re-exec on macOS/Linux CI,
-  // where the child re-opens `--prompt-file /dev/fd/3` after the parent closed it
-  // ("Bad file descriptor"). The prompt file itself remains unlinked (anonymous).
+  // When using fd 3, keep the parent-side prompt fd open until the child finishes so
+  // sandbox re-exec that still inherits the fd can read it. Named CI prompts skip this.
   const closePromptFd = () => {
-    try { fs.closeSync(promptFd); } catch { /* already closed */ }
+    if (promptFd != null) {
+      try { fs.closeSync(promptFd); } catch { /* already closed */ }
+      promptFd = null;
+    }
   };
   let child;
   try {
-    child = spawn(binary, headlessArgs({ root, promptFile, model, effort, leaderSocket, resumeSessionId, newSessionId, structured, sandboxProfile: isolation.sandboxProfile }), { cwd: root, env: { ...isolation.env, GROK_COMPANION_JOB_MARKER: marker }, shell: false, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe", promptFd] });
+    const stdio = forceNamedPrompt
+      ? ["ignore", "pipe", "pipe"]
+      : ["ignore", "pipe", "pipe", promptFd];
+    child = spawn(binary, headlessArgs({ root, promptFile, model, effort, leaderSocket, resumeSessionId, newSessionId, structured, sandboxProfile: isolation.sandboxProfile }), { cwd: root, env: { ...isolation.env, GROK_COMPANION_JOB_MARKER: marker }, shell: false, detached: process.platform !== "win32", stdio });
   } catch (error) {
     closePromptFd();
     throw error;
