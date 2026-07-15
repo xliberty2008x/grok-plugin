@@ -4,6 +4,7 @@
 # - Trusted runtime for scripts/plugin; PR head is git review target only
 # - GROK_AUTH never shared with GITHUB_TOKEN in the same child process
 # - Findings never fail the job; infra/auth/schema/post failures do
+# - github.event.* never interpolated into shell double-quoted strings (use env:)
 name: Grok PR Review
 
 on:
@@ -35,14 +36,22 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Fetch base ref
-        run: git fetch origin "${{ github.event.pull_request.base.ref }}":"refs/remotes/origin/${{ github.event.pull_request.base.ref }}"
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: git fetch origin "${BASE_REF}:refs/remotes/origin/${BASE_REF}"
 
       - name: Check out trusted runtime
         uses: actions/checkout@v4
         with:
           ref: ${{ vars.GROK_PR_REVIEW_TRUSTED_REF || 'main' }}
-          path: .grok-trusted
+          path: _grok_trusted_src
           fetch-depth: 1
+
+      - name: Isolate trusted runtime under RUNNER_TEMP
+        run: |
+          set -euo pipefail
+          rm -rf "${RUNNER_TEMP}/grok-trusted"
+          mv "${GITHUB_WORKSPACE}/_grok_trusted_src" "${RUNNER_TEMP}/grok-trusted"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -58,36 +67,45 @@ jobs:
         id: review
         env:
           GROK_AUTH_JSON: ${{ secrets.GROK_AUTH_JSON }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
           OUT="${RUNNER_TEMP}/review-job.json"
-          node .grok-trusted/scripts/ci/run-trusted-review.mjs \
-            --trusted-root "${GITHUB_WORKSPACE}/.grok-trusted" \
+          node "${RUNNER_TEMP}/grok-trusted/scripts/ci/run-trusted-review.mjs" \
+            --trusted-root "${RUNNER_TEMP}/grok-trusted" \
             --workspace "${GITHUB_WORKSPACE}" \
-            --base-ref "${{ github.event.pull_request.base.ref }}" \
+            --base-ref "${BASE_REF}" \
             --out "${OUT}"
           echo "job_json=${OUT}" >> "$GITHUB_OUTPUT"
 
       - name: Collect PR diff for inline mapping
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           git diff \
-            "origin/${{ github.event.pull_request.base.ref }}...${{ github.event.pull_request.head.sha }}" \
+            "origin/${BASE_REF}...${HEAD_SHA}" \
             > "${RUNNER_TEMP}/pr.diff"
 
       - name: Post review to GitHub
         env:
           GH_TOKEN: ${{ github.token }}
           # Do not pass GROK_AUTH_JSON here
+          JOB_JSON: ${{ steps.review.outputs.job_json }}
+          PR_OWNER: ${{ github.repository_owner }}
+          PR_REPO: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          node .grok-trusted/scripts/ci/post-grok-review.mjs \
-            --job-json "${{ steps.review.outputs.job_json }}" \
+          node "${RUNNER_TEMP}/grok-trusted/scripts/ci/post-grok-review.mjs" \
+            --job-json "${JOB_JSON}" \
             --diff "${RUNNER_TEMP}/pr.diff" \
-            --owner "${{ github.repository_owner }}" \
-            --repo "${{ github.event.repository.name }}" \
-            --pr "${{ github.event.pull_request.number }}" \
-            --head-sha "${{ github.event.pull_request.head.sha }}"
+            --owner "${PR_OWNER}" \
+            --repo "${PR_REPO}" \
+            --pr "${PR_NUMBER}" \
+            --head-sha "${HEAD_SHA}"
 
       - name: Upload review job JSON on failure
         if: failure()

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildPrReviewPayload } from "../scripts/ci/lib/build-pr-review-payload.mjs";
 import { collectRightSideLines } from "../scripts/ci/lib/diff-right-lines.mjs";
+import { buildReviewChildEnv } from "../scripts/ci/lib/review-child-env.mjs";
 
 test("collectRightSideLines records added and context lines on RIGHT side", () => {
   const diff = [
@@ -152,4 +153,66 @@ test("buildPrReviewPayload throws on missing review when not skippable", () => {
       }),
     /review/i
   );
+});
+
+test("buildReviewChildEnv sets auth path and session, omits GitHub/auth JSON secrets", () => {
+  const env = buildReviewChildEnv({
+    authPath: "/tmp/grok-ci-auth/auth.json",
+    runId: "12345",
+    pathEnv: "/usr/bin",
+    home: "/home/runner",
+    user: "runner",
+    logname: "runner",
+    tmpdir: "/tmp",
+    runnerTemp: "/runner/temp",
+    pid: 99,
+    grokBin: "/usr/local/bin/grok"
+  });
+
+  assert.equal(env.GROK_AUTH_PATH, "/tmp/grok-ci-auth/auth.json");
+  assert.equal(env.GROK_COMPANION_HOST, "ci");
+  assert.equal(env.GROK_COMPANION_HOST_SESSION_ID, "12345");
+  assert.equal(env.CLAUDE_PLUGIN_DATA, "/runner/temp/grok-ci-plugin-data-99");
+  assert.equal(env.PATH, "/usr/bin");
+  assert.equal(env.HOME, "/home/runner");
+  assert.equal(env.GROK_BIN, "/usr/local/bin/grok");
+
+  assert.equal(Object.hasOwn(env, "GITHUB_TOKEN"), false);
+  assert.equal(Object.hasOwn(env, "GH_TOKEN"), false);
+  assert.equal(Object.hasOwn(env, "GROK_AUTH_JSON"), false);
+  assert.equal(env.GITHUB_TOKEN, undefined);
+  assert.equal(env.GH_TOKEN, undefined);
+  assert.equal(env.GROK_AUTH_JSON, undefined);
+});
+
+test("buildReviewChildEnv does not leak parent secrets even if caller only passes allowlisted fields", () => {
+  // Simulates isolation: parent process may have tokens, but builder never copies them.
+  const polluted = {
+    GITHUB_TOKEN: "ghs_should_not_appear",
+    GH_TOKEN: "ghs_also_not",
+    GROK_AUTH_JSON: '{"secret":true}',
+    PATH: "/bin",
+    HOME: "/home/x"
+  };
+  const env = buildReviewChildEnv({
+    authPath: "/secure/auth.json",
+    pathEnv: polluted.PATH,
+    home: polluted.HOME,
+    runnerTemp: "/tmp",
+    pid: 1,
+    runId: "run-1"
+  });
+  for (const key of Object.keys(env)) {
+    assert.notEqual(key, "GITHUB_TOKEN");
+    assert.notEqual(key, "GH_TOKEN");
+    assert.notEqual(key, "GROK_AUTH_JSON");
+  }
+  assert.ok(!JSON.stringify(env).includes("ghs_should_not_appear"));
+  assert.ok(!JSON.stringify(env).includes("ghs_also_not"));
+  assert.ok(!JSON.stringify(env).includes('{"secret":true}'));
+});
+
+test("buildReviewChildEnv requires authPath", () => {
+  assert.throws(() => buildReviewChildEnv({ authPath: "" }), /authPath/);
+  assert.throws(() => buildReviewChildEnv({}), /authPath/);
 });

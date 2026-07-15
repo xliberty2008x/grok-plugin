@@ -20,6 +20,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { buildReviewChildEnv } from "./lib/review-child-env.mjs";
 
 function usage() {
   return `Usage: node run-trusted-review.mjs --trusted-root <dir> --workspace <dir> --base-ref <ref> --out <file>`;
@@ -89,26 +90,21 @@ function main() {
     ? args.baseRef
     : `origin/${args.baseRef}`;
 
-  const env = {
-    PATH: process.env.PATH,
-    HOME: process.env.HOME,
-    USER: process.env.USER,
-    LOGNAME: process.env.LOGNAME,
-    TMPDIR: process.env.TMPDIR,
-    TMP: process.env.TMP,
-    TEMP: process.env.TEMP,
-    LANG: process.env.LANG,
-    GROK_AUTH_PATH: authPath,
-    // Isolate plugin state from runner home noise
-    CLAUDE_PLUGIN_DATA: path.join(
-      process.env.RUNNER_TEMP || os.tmpdir(),
-      `grok-ci-plugin-data-${process.pid}`
-    ),
-    GROK_COMPANION_HOST: "ci",
-    GROK_COMPANION_HOST_SESSION_ID: process.env.GITHUB_RUN_ID || `ci-${process.pid}`
-  };
-  if (process.env.GROK_BIN) env.GROK_BIN = process.env.GROK_BIN;
-  // Explicitly do not pass GITHUB_TOKEN / GH_TOKEN / GROK_AUTH_JSON into child
+  const env = buildReviewChildEnv({
+    authPath,
+    runId: process.env.GITHUB_RUN_ID,
+    pathEnv: process.env.PATH,
+    home: process.env.HOME,
+    user: process.env.USER,
+    logname: process.env.LOGNAME,
+    tmpdir: process.env.TMPDIR,
+    tmp: process.env.TMP,
+    temp: process.env.TEMP,
+    lang: process.env.LANG,
+    runnerTemp: process.env.RUNNER_TEMP || os.tmpdir(),
+    pid: process.pid,
+    grokBin: process.env.GROK_BIN
+  });
 
   fs.mkdirSync(env.CLAUDE_PLUGIN_DATA, { recursive: true, mode: 0o700 });
 
