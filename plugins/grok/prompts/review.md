@@ -61,7 +61,7 @@ Return exactly one JSON object matching this shape:
 in plain language (e.g. ready / ready with fixes / not ready) — without inventing a
 `verdict` field.
 
-**findings**: Leave empty when there are no actionable defects. For each finding:
+**findings**: Leave `findings` empty when there are no actionable defects. For each finding:
 - `title`: short specific issue name
 - `body`: what is wrong, why it matters, and how to fix (if not obvious)
 - `file` / `line`: prefer a single line on the **RIGHT** (new/post-change) side of the
