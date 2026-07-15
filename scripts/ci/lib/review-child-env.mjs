@@ -52,7 +52,8 @@ export function buildReviewChildEnv({
     GROK_AUTH_PATH: authPath,
     CLAUDE_PLUGIN_DATA: `${pluginBase}/grok-ci-plugin-data-${processId}`,
     GROK_COMPANION_HOST: "ci",
-    GROK_COMPANION_HOST_SESSION_ID: runId || `ci-${processId}`
+    GROK_COMPANION_HOST_SESSION_ID: runId || `ci-${processId}`,
+    GROK_HEADLESS_PROMPT_ON_DISK: "1"
   };
   if (grokBin) env.GROK_BIN = grokBin;
   // Explicitly do not set GITHUB_TOKEN / GH_TOKEN / GROK_AUTH_JSON

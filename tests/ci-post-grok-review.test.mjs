@@ -171,6 +171,7 @@ test("buildReviewChildEnv sets auth path and session, omits GitHub/auth JSON sec
 
   assert.equal(env.GROK_AUTH_PATH, "/tmp/grok-ci-auth/auth.json");
   assert.equal(env.GROK_COMPANION_HOST, "ci");
+  assert.equal(env.GROK_HEADLESS_PROMPT_ON_DISK, "1");
   assert.equal(env.GROK_COMPANION_HOST_SESSION_ID, "12345");
   assert.equal(env.CLAUDE_PLUGIN_DATA, "/runner/temp/grok-ci-plugin-data-99");
   assert.equal(env.PATH, "/usr/bin");
