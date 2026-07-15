@@ -1,0 +1,105 @@
+# Grok PR Review — same-repo non-draft PRs only.
+# Security invariants:
+# - No pull_request_target
+# - Trusted runtime for scripts/plugin; PR head is git review target only
+# - GROK_AUTH never shared with GITHUB_TOKEN in the same child process
+# - Findings never fail the job; infra/auth/schema/post failures do
+name: Grok PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: grok-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  grok-pr-review:
+    name: Grok headless review
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out PR head (code under review)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch base ref
+        run: git fetch origin "${{ github.event.pull_request.base.ref }}":"refs/remotes/origin/${{ github.event.pull_request.base.ref }}"
+
+      - name: Check out trusted runtime
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ vars.GROK_PR_REVIEW_TRUSTED_REF || 'main' }}
+          path: .grok-trusted
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - name: Install Grok Build CLI
+        env:
+          GROK_CLI_VERSION: ${{ vars.GROK_CLI_VERSION || '0.2.99' }}
+        run: npm install -g "@xai-official/grok@${GROK_CLI_VERSION}"
+
+      - name: Run trusted Grok review
+        id: review
+        env:
+          GROK_AUTH_JSON: ${{ secrets.GROK_AUTH_JSON }}
+        run: |
+          set -euo pipefail
+          OUT="${RUNNER_TEMP}/review-job.json"
+          node .grok-trusted/scripts/ci/run-trusted-review.mjs \
+            --trusted-root "${GITHUB_WORKSPACE}/.grok-trusted" \
+            --workspace "${GITHUB_WORKSPACE}" \
+            --base-ref "${{ github.event.pull_request.base.ref }}" \
+            --out "${OUT}"
+          echo "job_json=${OUT}" >> "$GITHUB_OUTPUT"
+
+      - name: Collect PR diff for inline mapping
+        run: |
+          set -euo pipefail
+          git diff \
+            "origin/${{ github.event.pull_request.base.ref }}...${{ github.event.pull_request.head.sha }}" \
+            > "${RUNNER_TEMP}/pr.diff"
+
+      - name: Post review to GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Do not pass GROK_AUTH_JSON here
+        run: |
+          set -euo pipefail
+          node .grok-trusted/scripts/ci/post-grok-review.mjs \
+            --job-json "${{ steps.review.outputs.job_json }}" \
+            --diff "${RUNNER_TEMP}/pr.diff" \
+            --owner "${{ github.repository_owner }}" \
+            --repo "${{ github.event.repository.name }}" \
+            --pr "${{ github.event.pull_request.number }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}"
+
+      - name: Upload review job JSON on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-review-job-${{ github.event.pull_request.number }}
+          path: ${{ runner.temp }}/review-job.json
+          if-no-files-found: ignore
+
+      - name: Wipe staged Grok auth
+        if: always()
+        run: |
+          set +e
+          find "${RUNNER_TEMP}" -name 'auth.json' -type f -delete 2>/dev/null
+          true
