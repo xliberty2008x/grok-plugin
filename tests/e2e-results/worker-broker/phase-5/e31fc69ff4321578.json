@@ -7,18 +7,18 @@
   "phase": "5",
   "slice": "safety-proofs-aggregate-deterministic",
   "status": "verified_on_draft",
-  "recordedAt": "2026-07-16T11:16:23.979Z",
+  "recordedAt": "2026-07-16T11:16:56.704Z",
   "releaseQualification": false,
   "evidenceSystemQualification": true,
   "provisionalSupportingRecord": false,
   "source": {
     "pluginVersion": "0.3.0-dev.1",
     "foundationCommit": null,
-    "headCommit": "ffcdca990b476a2b6c38dd69c92d4ef71d5d90fb",
-    "headTree": "690bdf40ddfd143635d84bdc42d044d24db6866a",
+    "headCommit": "8aec42e70bb38d2440c886f036d88fb9b80b55c0",
+    "headTree": "08411baae615f28d95acf4e66f773c124cb2afd1",
     "sourceInventoryDigest": "e31fc69ff43215786900beea2ea0bd14a53ece82cce063a4ebe2fd62a5405f29",
     "phaseScopeDigest": "785f28f407f9679cfd8eff288ad750028b080ecc8a75c9fe3739f1d9b375330e",
-    "cleanTreeAtVerification": false,
+    "cleanTreeAtVerification": true,
     "phaseScopePaths": [
       "tests/worker-safety-proofs.test.mjs",
       "scripts/lib/worker-broker-evidence.mjs"
@@ -128,5 +128,5 @@
       "GROK_E2E authenticated lifecycle not recorded for this source boundary"
     ]
   },
-  "recordDigest": "eb87422912c6708c43fc4b541fd1bc240dd81c5324689362bc0d0c7936801b5e"
+  "recordDigest": "d3e7ae5ade7eaed337c21f34316fbc2d281791986b019692ec24df9e538b9243"
 }

@@ -7,18 +7,18 @@
   "phase": "1",
   "slice": "worker-api-spawn-cancel-schemas",
   "status": "verified_on_draft",
-  "recordedAt": "2026-07-16T11:16:23.806Z",
+  "recordedAt": "2026-07-16T11:16:56.304Z",
   "releaseQualification": false,
   "evidenceSystemQualification": true,
   "provisionalSupportingRecord": false,
   "source": {
     "pluginVersion": "0.3.0-dev.1",
     "foundationCommit": null,
-    "headCommit": "ffcdca990b476a2b6c38dd69c92d4ef71d5d90fb",
-    "headTree": "690bdf40ddfd143635d84bdc42d044d24db6866a",
+    "headCommit": "8aec42e70bb38d2440c886f036d88fb9b80b55c0",
+    "headTree": "08411baae615f28d95acf4e66f773c124cb2afd1",
     "sourceInventoryDigest": "e31fc69ff43215786900beea2ea0bd14a53ece82cce063a4ebe2fd62a5405f29",
     "phaseScopeDigest": "3f5d3154a40f155ea86b92ca6932a20d7d6ea942c64810fa7fc66c4ae7e63e5f",
-    "cleanTreeAtVerification": false,
+    "cleanTreeAtVerification": true,
     "phaseScopePaths": [
       "plugins/grok/scripts/lib/worker-protocol.mjs",
       "plugins/grok/scripts/lib/worker-service.mjs",
@@ -140,5 +140,5 @@
       "GROK_E2E authenticated lifecycle not recorded for this source boundary"
     ]
   },
-  "recordDigest": "4d811e7717ed6994ce564ae374ba113a9df224719c27470181092b50801624b1"
+  "recordDigest": "e0b8a239135d1545fbb40fd69c2fee43ca3d719cc218f74b197ffbabc0861480"
 }

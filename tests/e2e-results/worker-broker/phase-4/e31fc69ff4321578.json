@@ -7,18 +7,18 @@
   "phase": "4",
   "slice": "host-presentation",
   "status": "verified_on_draft",
-  "recordedAt": "2026-07-16T11:16:23.936Z",
+  "recordedAt": "2026-07-16T11:16:56.608Z",
   "releaseQualification": false,
   "evidenceSystemQualification": true,
   "provisionalSupportingRecord": false,
   "source": {
     "pluginVersion": "0.3.0-dev.1",
     "foundationCommit": null,
-    "headCommit": "ffcdca990b476a2b6c38dd69c92d4ef71d5d90fb",
-    "headTree": "690bdf40ddfd143635d84bdc42d044d24db6866a",
+    "headCommit": "8aec42e70bb38d2440c886f036d88fb9b80b55c0",
+    "headTree": "08411baae615f28d95acf4e66f773c124cb2afd1",
     "sourceInventoryDigest": "e31fc69ff43215786900beea2ea0bd14a53ece82cce063a4ebe2fd62a5405f29",
     "phaseScopeDigest": "3d01806c5c1b8b84c0b84938372523030c4c223c9e4649c454efbad4f024ed32",
-    "cleanTreeAtVerification": false,
+    "cleanTreeAtVerification": true,
     "phaseScopePaths": [
       "plugins/grok/scripts/lib/worker-presentation.mjs",
       "tests/worker-presentation.test.mjs"
@@ -122,5 +122,5 @@
       "GROK_E2E authenticated lifecycle not recorded for this source boundary"
     ]
   },
-  "recordDigest": "ddaa6c48f9857e6ae28c83f0ef7ecbdb339390ced646fb66798b0fc5d53c8af8"
+  "recordDigest": "342960bd726f26ceac4f31657b460d9430b93158ecabd0e03b96bebf3bcd1edc"
 }

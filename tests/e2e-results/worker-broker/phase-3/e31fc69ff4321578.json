@@ -7,18 +7,18 @@
   "phase": "3",
   "slice": "control-workspace-worktrees",
   "status": "verified_on_draft",
-  "recordedAt": "2026-07-16T11:16:23.894Z",
+  "recordedAt": "2026-07-16T11:16:56.506Z",
   "releaseQualification": false,
   "evidenceSystemQualification": true,
   "provisionalSupportingRecord": false,
   "source": {
     "pluginVersion": "0.3.0-dev.1",
     "foundationCommit": null,
-    "headCommit": "ffcdca990b476a2b6c38dd69c92d4ef71d5d90fb",
-    "headTree": "690bdf40ddfd143635d84bdc42d044d24db6866a",
+    "headCommit": "8aec42e70bb38d2440c886f036d88fb9b80b55c0",
+    "headTree": "08411baae615f28d95acf4e66f773c124cb2afd1",
     "sourceInventoryDigest": "e31fc69ff43215786900beea2ea0bd14a53ece82cce063a4ebe2fd62a5405f29",
     "phaseScopeDigest": "f6cebfe01457842391b3b0782e3b432b0ad749d956b7dd52bdff4e2eeb730966",
-    "cleanTreeAtVerification": false,
+    "cleanTreeAtVerification": true,
     "phaseScopePaths": [
       "plugins/grok/scripts/lib/workspace.mjs",
       "plugins/grok/scripts/lib/worker-worktree.mjs",
@@ -130,5 +130,5 @@
       "GROK_E2E authenticated lifecycle not recorded for this source boundary"
     ]
   },
-  "recordDigest": "ec0acce60ebca3dfe79d97fefce1bac4a4867d878aeaf0cca6e00e50e5a449e5"
+  "recordDigest": "2c5fe9705db4fc04cfd12d6d2de5257610582c0dff3b5aba59a4e02cd8d7d7dd"
 }
