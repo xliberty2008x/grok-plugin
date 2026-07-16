@@ -4,26 +4,24 @@
   "recordType": "worker-broker-slice",
   "issue": "https://github.com/xliberty2008x/grok-plugin/issues/25",
   "pullRequest": "https://github.com/xliberty2008x/grok-plugin/pull/26",
-  "phase": "3",
-  "slice": "control-workspace-worktrees",
+  "phase": "5",
+  "slice": "safety-proofs-aggregate-deterministic",
   "status": "verified_on_draft",
-  "recordedAt": "2026-07-16T11:04:11.582Z",
+  "recordedAt": "2026-07-16T11:16:23.979Z",
   "releaseQualification": false,
   "evidenceSystemQualification": true,
   "provisionalSupportingRecord": false,
   "source": {
     "pluginVersion": "0.3.0-dev.1",
     "foundationCommit": null,
-    "headCommit": "00ced4a204ad58b2ef4ccb271b932038373f1790",
-    "headTree": "e0c6ed6a23cbc0447a3c76bf063e0309f65b447c",
-    "sourceInventoryDigest": "fd059cd92544d8e6ca961e83b9d9537ab86af8248636db59324ebc1e40898c46",
-    "phaseScopeDigest": "f83f5d07a63b2c550bb381efd3c2a42c68b9643feec154787ddf7b530ddb172d",
+    "headCommit": "ffcdca990b476a2b6c38dd69c92d4ef71d5d90fb",
+    "headTree": "690bdf40ddfd143635d84bdc42d044d24db6866a",
+    "sourceInventoryDigest": "e31fc69ff43215786900beea2ea0bd14a53ece82cce063a4ebe2fd62a5405f29",
+    "phaseScopeDigest": "785f28f407f9679cfd8eff288ad750028b080ecc8a75c9fe3739f1d9b375330e",
     "cleanTreeAtVerification": false,
     "phaseScopePaths": [
-      "plugins/grok/scripts/lib/workspace.mjs",
-      "plugins/grok/scripts/lib/worker-worktree.mjs",
-      "plugins/grok/scripts/lib/worker-artifacts.mjs",
-      "tests/worker-worktree.test.mjs"
+      "tests/worker-safety-proofs.test.mjs",
+      "scripts/lib/worker-broker-evidence.mjs"
     ]
   },
   "installation": {
@@ -51,7 +49,7 @@
       "command": "npm run check",
       "boundary": "source-provider-neutral",
       "outcome": "pass",
-      "testsPassed": 259,
+      "testsPassed": 262,
       "testsSkipped": 1,
       "testsFailed": 0,
       "skipMeaning": "Expected authenticated-provider E2E skip where applicable."
@@ -60,25 +58,36 @@
       "command": "node --test focused worker-broker suite",
       "boundary": "focused-source-provider-neutral",
       "outcome": "pass",
-      "testsPassed": 45,
+      "testsPassed": 68,
       "testsFailed": 0
     },
     {
       "command": "git diff --check",
       "boundary": "source",
       "outcome": "pass"
+    },
+    {
+      "command": "npm run worker:verify -- --all --strict",
+      "boundary": "evidence-system",
+      "outcome": "pass"
     }
   ],
   "scenarios": [
     {
-      "id": "control-identity",
-      "expected": "stable controlWorkspaceId",
+      "id": "no-prompt-replay",
+      "expected": "reconciler never replays",
       "actual": "pass",
       "outcome": "pass"
     },
     {
-      "id": "parent-isolation",
-      "expected": "parent unchanged before integration",
+      "id": "host-verification-authority",
+      "expected": "provider cannot set passed",
+      "actual": "pass",
+      "outcome": "pass"
+    },
+    {
+      "id": "foreign-equiv",
+      "expected": "foreign == missing",
       "actual": "pass",
       "outcome": "pass"
     }
@@ -119,5 +128,5 @@
       "GROK_E2E authenticated lifecycle not recorded for this source boundary"
     ]
   },
-  "recordDigest": "1be0b90cd2c23bf78af4207bb7debce69c9f7209ca83898a9bbe0b5b953307d6"
+  "recordDigest": "eb87422912c6708c43fc4b541fd1bc240dd81c5324689362bc0d0c7936801b5e"
 }

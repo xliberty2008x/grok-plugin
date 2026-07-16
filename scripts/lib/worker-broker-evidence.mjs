@@ -144,12 +144,44 @@ export function computePhaseScopeDigest(phase, root = REPO_ROOT) {
   return computeInventoryDigest(root, { paths: existing });
 }
 
+/**
+ * Working-tree dirtiness for evidence purposes: evidence-only paths may be dirty
+ * without invalidating a clean-tree claim (they are excluded from source digests).
+ */
+export function isNonEvidenceTreeClean(root = REPO_ROOT) {
+  const status = execFileSync("git", ["status", "--porcelain", "-z"], {
+    cwd: root,
+    encoding: "utf8"
+  });
+  if (!status) return true;
+  // porcelain -z: XY PATH\0 or XY ORIG\0PATH\0 for renames
+  const entries = status.split("\0").filter(Boolean);
+  for (const entry of entries) {
+    // Format: "XY path" or "XY orig" then next entry is path for renames — handle simple case.
+    const pathPart = entry.length >= 3 ? entry.slice(3).trim() : entry;
+    const relative = pathPart.includes(" -> ")
+      ? pathPart.split(" -> ").pop().trim()
+      : pathPart;
+    if (!isEvidenceOnlyPath(relative)) return false;
+  }
+  return true;
+}
+
 export function gitIdentity(root = REPO_ROOT) {
   const headCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
   const headTree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], { cwd: root, encoding: "utf8" }).trim();
   const status = execFileSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8" });
-  const cleanTreeAtVerification = status.trim().length === 0;
-  return { headCommit, headTree, cleanTreeAtVerification };
+  // Strict identity uses full porcelain for the raw flag, but clean-for-evidence
+  // ignores evidence-only dirtiness so evidence-only commits do not self-invalidate.
+  const cleanTreeAtVerification = isNonEvidenceTreeClean(root) && (
+    status.trim().length === 0 || isNonEvidenceTreeClean(root)
+  );
+  // Prefer non-evidence clean semantics as the recorded cleanTreeAtVerification.
+  return {
+    headCommit,
+    headTree,
+    cleanTreeAtVerification: isNonEvidenceTreeClean(root)
+  };
 }
 
 export function runtimeSnapshot() {
@@ -298,26 +330,36 @@ export function validateEvidenceRecord(record, options = {}) {
     }
   }
 
-  // Strict mode: bind to current tree when requested.
+  // Strict mode: bind to current non-evidence source identity when requested.
+  // Evidence-only commits may advance HEAD/tree without invalidating records whose
+  // sourceInventoryDigest and phaseScopeDigest still match (plan §6.4).
   if (options.strict && options.root) {
     const identity = gitIdentity(options.root);
-    if (source?.cleanTreeAtVerification === true && !identity.cleanTreeAtVerification) {
-      fail("Record claims clean tree but working tree is dirty.");
-    }
-    if (source?.headCommit && source.headCommit !== identity.headCommit) {
-      fail(`Record headCommit ${source.headCommit} does not match current HEAD ${identity.headCommit}.`);
-    }
-    if (source?.headTree && source.headTree !== identity.headTree) {
-      fail(`Record headTree ${source.headTree} does not match current tree ${identity.headTree}.`);
+    if (source?.cleanTreeAtVerification === true && !isNonEvidenceTreeClean(options.root)) {
+      fail("Record claims clean tree but non-evidence working tree is dirty.");
     }
     const currentSourceDigest = computeInventoryDigest(options.root, { includeEvidence: false });
-    if (source?.sourceInventoryDigest && source.sourceInventoryDigest !== currentSourceDigest) {
+    const sourceDigestMatches = source?.sourceInventoryDigest
+      && source.sourceInventoryDigest === currentSourceDigest;
+    if (source?.sourceInventoryDigest && !sourceDigestMatches) {
       fail("sourceInventoryDigest is stale relative to current non-evidence source inventory.");
     }
     if (source?.phaseScopeDigest && record.phase != null && record.phase !== "aggregate") {
       const currentPhase = computePhaseScopeDigest(record.phase, options.root);
       if (source.phaseScopeDigest !== currentPhase) {
         fail(`phaseScopeDigest for phase ${record.phase} is stale.`);
+      }
+    }
+    // headCommit/headTree must match HEAD, unless only evidence-only identity drifted
+    // (source digests still match the current non-evidence inventory).
+    if (source?.headCommit && source.headCommit !== identity.headCommit) {
+      if (!sourceDigestMatches) {
+        fail(`Record headCommit ${source.headCommit} does not match current HEAD ${identity.headCommit}.`);
+      }
+    }
+    if (source?.headTree && source.headTree !== identity.headTree) {
+      if (!sourceDigestMatches) {
+        fail(`Record headTree ${source.headTree} does not match current tree ${identity.headTree}.`);
       }
     }
   }

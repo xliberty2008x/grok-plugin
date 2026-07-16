@@ -4,27 +4,36 @@
   "recordType": "worker-broker-slice",
   "issue": "https://github.com/xliberty2008x/grok-plugin/issues/25",
   "pullRequest": "https://github.com/xliberty2008x/grok-plugin/pull/26",
-  "phase": "0",
-  "slice": "evidence-system",
+  "phase": "1",
+  "slice": "worker-api-spawn-cancel-schemas",
   "status": "verified_on_draft",
-  "recordedAt": "2026-07-16T11:04:11.404Z",
+  "recordedAt": "2026-07-16T11:16:23.806Z",
   "releaseQualification": false,
   "evidenceSystemQualification": true,
   "provisionalSupportingRecord": false,
   "source": {
     "pluginVersion": "0.3.0-dev.1",
     "foundationCommit": null,
-    "headCommit": "00ced4a204ad58b2ef4ccb271b932038373f1790",
-    "headTree": "e0c6ed6a23cbc0447a3c76bf063e0309f65b447c",
-    "sourceInventoryDigest": "fd059cd92544d8e6ca961e83b9d9537ab86af8248636db59324ebc1e40898c46",
-    "phaseScopeDigest": "4dc092ae204bc92a2241209c1a3aab20343d8e2ea27418069e5f72a3cf1219e0",
+    "headCommit": "ffcdca990b476a2b6c38dd69c92d4ef71d5d90fb",
+    "headTree": "690bdf40ddfd143635d84bdc42d044d24db6866a",
+    "sourceInventoryDigest": "e31fc69ff43215786900beea2ea0bd14a53ece82cce063a4ebe2fd62a5405f29",
+    "phaseScopeDigest": "3f5d3154a40f155ea86b92ca6932a20d7d6ea942c64810fa7fc66c4ae7e63e5f",
     "cleanTreeAtVerification": false,
     "phaseScopePaths": [
-      "scripts/lib/worker-broker-evidence.mjs",
-      "scripts/worker-broker-evidence.mjs",
-      "plugins/grok/schemas/worker-broker-evidence.schema.json",
-      "tests/worker-broker-evidence.test.mjs",
-      "package.json"
+      "plugins/grok/scripts/lib/worker-protocol.mjs",
+      "plugins/grok/scripts/lib/worker-service.mjs",
+      "plugins/grok/scripts/lib/worker-authority.mjs",
+      "plugins/grok/scripts/lib/worker-mutation.mjs",
+      "plugins/grok/scripts/lib/worker-reconcile.mjs",
+      "plugins/grok/scripts/lib/state.mjs",
+      "plugins/grok/scripts/lib/task-contract.mjs",
+      "plugins/grok/mcp/broker.mjs",
+      "plugins/grok/mcp/server.mjs",
+      "plugins/grok/schemas/worker-protocol.schema.json",
+      "tests/worker-protocol.test.mjs",
+      "tests/worker-service.test.mjs",
+      "tests/mcp-worker-broker.test.mjs",
+      "tests/worker-mutation.test.mjs"
     ]
   },
   "installation": {
@@ -52,7 +61,7 @@
       "command": "npm run check",
       "boundary": "source-provider-neutral",
       "outcome": "pass",
-      "testsPassed": 259,
+      "testsPassed": 262,
       "testsSkipped": 1,
       "testsFailed": 0,
       "skipMeaning": "Expected authenticated-provider E2E skip where applicable."
@@ -61,26 +70,36 @@
       "command": "node --test focused worker-broker suite",
       "boundary": "focused-source-provider-neutral",
       "outcome": "pass",
-      "testsPassed": 45,
+      "testsPassed": 68,
       "testsFailed": 0
     },
     {
       "command": "git diff --check",
       "boundary": "source",
       "outcome": "pass"
+    },
+    {
+      "command": "npm run worker:verify -- --all --strict",
+      "boundary": "evidence-system",
+      "outcome": "pass"
     }
   ],
   "scenarios": [
     {
-      "id": "schema-validator",
-      "expected": "strict reject dirty/stale/missing",
+      "id": "idempotent-spawn",
+      "expected": "retry does not duplicate",
       "actual": "pass",
-      "outcome": "pass",
-      "negative": true
+      "outcome": "pass"
     },
     {
-      "id": "evidence-only-exclusion",
-      "expected": "evidence paths excluded from source digest",
+      "id": "idempotent-cancel",
+      "expected": "single cancellation-request event",
+      "actual": "pass",
+      "outcome": "pass"
+    },
+    {
+      "id": "mcp-protocol-pin",
+      "expected": "unknown versions fail closed",
       "actual": "pass",
       "outcome": "pass"
     }
@@ -121,5 +140,5 @@
       "GROK_E2E authenticated lifecycle not recorded for this source boundary"
     ]
   },
-  "recordDigest": "5e3496584d51c354a9bdd90be0894f3e852332ce45915879228d3740873123c2"
+  "recordDigest": "4d811e7717ed6994ce564ae374ba113a9df224719c27470181092b50801624b1"
 }

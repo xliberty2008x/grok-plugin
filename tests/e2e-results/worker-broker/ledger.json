@@ -2,67 +2,67 @@
   "schemaVersion": 1,
   "roadmapVersion": "1.0",
   "issue": "https://github.com/xliberty2008x/grok-plugin/issues/25",
-  "updatedAt": "2026-07-16T11:04:11.727Z",
+  "updatedAt": "2026-07-16T11:16:23.983Z",
   "entries": [
     {
       "phase": "0",
       "slice": "evidence-system",
       "status": "verified_on_draft",
-      "path": "tests/e2e-results/worker-broker/phase-0/fd059cd92544d8e6.json",
-      "recordDigest": "5e3496584d51c354a9bdd90be0894f3e852332ce45915879228d3740873123c2",
-      "sourceCommit": "00ced4a204ad58b2ef4ccb271b932038373f1790",
+      "path": "tests/e2e-results/worker-broker/phase-0/e31fc69ff4321578.json",
+      "recordDigest": "80edc4655a3ccce37911eddbb5a1d62bc3fd8d4ba16a3201958a7aff6a0f66ae",
+      "sourceCommit": "ffcdca990b476a2b6c38dd69c92d4ef71d5d90fb",
       "currency": "current",
-      "recordedAt": "2026-07-16T11:04:11.404Z"
+      "recordedAt": "2026-07-16T11:16:23.761Z"
     },
     {
       "phase": "1",
       "slice": "worker-api-spawn-cancel-schemas",
       "status": "verified_on_draft",
-      "path": "tests/e2e-results/worker-broker/phase-1/fd059cd92544d8e6.json",
-      "recordDigest": "9890e38f5f8562058f4157862272e16b0013b67ececab41a7702d6a3912c61bc",
-      "sourceCommit": "00ced4a204ad58b2ef4ccb271b932038373f1790",
+      "path": "tests/e2e-results/worker-broker/phase-1/e31fc69ff4321578.json",
+      "recordDigest": "4d811e7717ed6994ce564ae374ba113a9df224719c27470181092b50801624b1",
+      "sourceCommit": "ffcdca990b476a2b6c38dd69c92d4ef71d5d90fb",
       "currency": "current",
-      "recordedAt": "2026-07-16T11:04:11.465Z"
+      "recordedAt": "2026-07-16T11:16:23.806Z"
     },
     {
       "phase": "2",
       "slice": "mailbox-context-roles",
       "status": "verified_on_draft",
-      "path": "tests/e2e-results/worker-broker/phase-2/fd059cd92544d8e6.json",
-      "recordDigest": "deff42fcee2f6695a1480d5399a615370c6bb015f32bd9634d07f5057787e7b5",
-      "sourceCommit": "00ced4a204ad58b2ef4ccb271b932038373f1790",
+      "path": "tests/e2e-results/worker-broker/phase-2/e31fc69ff4321578.json",
+      "recordDigest": "a75a471b13a518b71054c0029ae473855121e05ea1ed89928e2d691aa3fee845",
+      "sourceCommit": "ffcdca990b476a2b6c38dd69c92d4ef71d5d90fb",
       "currency": "current",
-      "recordedAt": "2026-07-16T11:04:11.524Z"
+      "recordedAt": "2026-07-16T11:16:23.850Z"
     },
     {
       "phase": "3",
       "slice": "control-workspace-worktrees",
       "status": "verified_on_draft",
-      "path": "tests/e2e-results/worker-broker/phase-3/fd059cd92544d8e6.json",
-      "recordDigest": "1be0b90cd2c23bf78af4207bb7debce69c9f7209ca83898a9bbe0b5b953307d6",
-      "sourceCommit": "00ced4a204ad58b2ef4ccb271b932038373f1790",
+      "path": "tests/e2e-results/worker-broker/phase-3/e31fc69ff4321578.json",
+      "recordDigest": "ec0acce60ebca3dfe79d97fefce1bac4a4867d878aeaf0cca6e00e50e5a449e5",
+      "sourceCommit": "ffcdca990b476a2b6c38dd69c92d4ef71d5d90fb",
       "currency": "current",
-      "recordedAt": "2026-07-16T11:04:11.582Z"
+      "recordedAt": "2026-07-16T11:16:23.894Z"
     },
     {
       "phase": "4",
       "slice": "host-presentation",
       "status": "verified_on_draft",
-      "path": "tests/e2e-results/worker-broker/phase-4/fd059cd92544d8e6.json",
-      "recordDigest": "0d6f6f7035e40cc8d81ea7ece1d16a7e3a2afcf5e7c4d90dffa6b54e2ae7acbe",
-      "sourceCommit": "00ced4a204ad58b2ef4ccb271b932038373f1790",
+      "path": "tests/e2e-results/worker-broker/phase-4/e31fc69ff4321578.json",
+      "recordDigest": "ddaa6c48f9857e6ae28c83f0ef7ecbdb339390ced646fb66798b0fc5d53c8af8",
+      "sourceCommit": "ffcdca990b476a2b6c38dd69c92d4ef71d5d90fb",
       "currency": "current",
-      "recordedAt": "2026-07-16T11:04:11.639Z"
+      "recordedAt": "2026-07-16T11:16:23.936Z"
     },
     {
       "phase": "5",
       "slice": "safety-proofs-aggregate-deterministic",
       "status": "verified_on_draft",
-      "path": "tests/e2e-results/worker-broker/phase-5/fd059cd92544d8e6.json",
-      "recordDigest": "88582dccf1d901aeca5dc066ebfe10c7e3c59a9ae65a1a1764fc0d47797e735e",
-      "sourceCommit": "00ced4a204ad58b2ef4ccb271b932038373f1790",
+      "path": "tests/e2e-results/worker-broker/phase-5/e31fc69ff4321578.json",
+      "recordDigest": "eb87422912c6708c43fc4b541fd1bc240dd81c5324689362bc0d0c7936801b5e",
+      "sourceCommit": "ffcdca990b476a2b6c38dd69c92d4ef71d5d90fb",
       "currency": "current",
-      "recordedAt": "2026-07-16T11:04:11.695Z"
+      "recordedAt": "2026-07-16T11:16:23.979Z"
     }
   ]
 }
