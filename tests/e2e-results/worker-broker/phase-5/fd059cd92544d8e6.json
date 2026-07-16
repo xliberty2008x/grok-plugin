@@ -4,26 +4,24 @@
   "recordType": "worker-broker-slice",
   "issue": "https://github.com/xliberty2008x/grok-plugin/issues/25",
   "pullRequest": "https://github.com/xliberty2008x/grok-plugin/pull/26",
-  "phase": "3",
-  "slice": "control-workspace-worktrees",
+  "phase": "5",
+  "slice": "safety-proofs-aggregate-deterministic",
   "status": "verified_on_draft",
-  "recordedAt": "2026-07-16T11:02:59.691Z",
+  "recordedAt": "2026-07-16T11:04:11.695Z",
   "releaseQualification": false,
   "evidenceSystemQualification": true,
   "provisionalSupportingRecord": false,
   "source": {
     "pluginVersion": "0.3.0-dev.1",
     "foundationCommit": null,
-    "headCommit": "585a382c75a4793fb8fae8d9c932c4547dab146b",
-    "headTree": "e2640b8a7ec0805c4263af03386c7f813f8dc7f2",
-    "sourceInventoryDigest": "01c6bbea488e5bc4239387a8b50963384959345d800029488263cdbaa48a3d08",
-    "phaseScopeDigest": "f83f5d07a63b2c550bb381efd3c2a42c68b9643feec154787ddf7b530ddb172d",
+    "headCommit": "00ced4a204ad58b2ef4ccb271b932038373f1790",
+    "headTree": "e0c6ed6a23cbc0447a3c76bf063e0309f65b447c",
+    "sourceInventoryDigest": "fd059cd92544d8e6ca961e83b9d9537ab86af8248636db59324ebc1e40898c46",
+    "phaseScopeDigest": "2b08376055eb540bb49b930119bc233e3864e45470a24ca23ad5a1e7c29f4a44",
     "cleanTreeAtVerification": false,
     "phaseScopePaths": [
-      "plugins/grok/scripts/lib/workspace.mjs",
-      "plugins/grok/scripts/lib/worker-worktree.mjs",
-      "plugins/grok/scripts/lib/worker-artifacts.mjs",
-      "tests/worker-worktree.test.mjs"
+      "tests/worker-safety-proofs.test.mjs",
+      "scripts/lib/worker-broker-evidence.mjs"
     ]
   },
   "installation": {
@@ -57,10 +55,10 @@
       "skipMeaning": "Expected authenticated-provider E2E skip where applicable."
     },
     {
-      "command": "node --test tests/worker-*.test.mjs tests/mcp-worker-broker.test.mjs tests/worker-service.test.mjs tests/worker-protocol.test.mjs tests/codex-support.test.mjs tests/state.test.mjs",
+      "command": "node --test focused worker-broker suite",
       "boundary": "focused-source-provider-neutral",
       "outcome": "pass",
-      "testsPassed": 65,
+      "testsPassed": 45,
       "testsFailed": 0
     },
     {
@@ -71,23 +69,22 @@
   ],
   "scenarios": [
     {
-      "id": "control-identity",
-      "expected": "stable controlWorkspaceId",
+      "id": "no-prompt-replay",
+      "expected": "reconciler never replays",
       "actual": "pass",
       "outcome": "pass"
     },
     {
-      "id": "parent-isolation",
-      "expected": "parent unchanged before integration",
+      "id": "host-verification-authority",
+      "expected": "provider cannot set passed",
       "actual": "pass",
       "outcome": "pass"
     },
     {
-      "id": "path-scope",
-      "expected": "malicious/out-of-scope blocked",
+      "id": "foreign-equiv",
+      "expected": "foreign == missing",
       "actual": "pass",
-      "outcome": "pass",
-      "negative": true
+      "outcome": "pass"
     }
   ],
   "liveScenarios": [
@@ -126,5 +123,5 @@
       "GROK_E2E authenticated lifecycle not recorded for this source boundary"
     ]
   },
-  "recordDigest": "d110fa98ebdbc697998b862b707c2d33ec907d0e8a60da4faf36adf4c1a44b26"
+  "recordDigest": "88582dccf1d901aeca5dc066ebfe10c7e3c59a9ae65a1a1764fc0d47797e735e"
 }

@@ -7,17 +7,17 @@
   "phase": "0",
   "slice": "evidence-system",
   "status": "verified_on_draft",
-  "recordedAt": "2026-07-16T11:02:59.604Z",
+  "recordedAt": "2026-07-16T11:04:11.404Z",
   "releaseQualification": false,
   "evidenceSystemQualification": true,
   "provisionalSupportingRecord": false,
   "source": {
     "pluginVersion": "0.3.0-dev.1",
     "foundationCommit": null,
-    "headCommit": "585a382c75a4793fb8fae8d9c932c4547dab146b",
-    "headTree": "e2640b8a7ec0805c4263af03386c7f813f8dc7f2",
-    "sourceInventoryDigest": "01c6bbea488e5bc4239387a8b50963384959345d800029488263cdbaa48a3d08",
-    "phaseScopeDigest": "5f96196af35567f225eedc9b2c9743d13d3d15fbd9ea10a9dfe79e813a73705c",
+    "headCommit": "00ced4a204ad58b2ef4ccb271b932038373f1790",
+    "headTree": "e0c6ed6a23cbc0447a3c76bf063e0309f65b447c",
+    "sourceInventoryDigest": "fd059cd92544d8e6ca961e83b9d9537ab86af8248636db59324ebc1e40898c46",
+    "phaseScopeDigest": "4dc092ae204bc92a2241209c1a3aab20343d8e2ea27418069e5f72a3cf1219e0",
     "cleanTreeAtVerification": false,
     "phaseScopePaths": [
       "scripts/lib/worker-broker-evidence.mjs",
@@ -58,10 +58,10 @@
       "skipMeaning": "Expected authenticated-provider E2E skip where applicable."
     },
     {
-      "command": "node --test tests/worker-*.test.mjs tests/mcp-worker-broker.test.mjs tests/worker-service.test.mjs tests/worker-protocol.test.mjs tests/codex-support.test.mjs tests/state.test.mjs",
+      "command": "node --test focused worker-broker suite",
       "boundary": "focused-source-provider-neutral",
       "outcome": "pass",
-      "testsPassed": 65,
+      "testsPassed": 45,
       "testsFailed": 0
     },
     {
@@ -121,5 +121,5 @@
       "GROK_E2E authenticated lifecycle not recorded for this source boundary"
     ]
   },
-  "recordDigest": "2245c867fb8c759ffe6f1f35e689da41500b78db48964d2b14fe4e4d31da7bf6"
+  "recordDigest": "5e3496584d51c354a9bdd90be0894f3e852332ce45915879228d3740873123c2"
 }
