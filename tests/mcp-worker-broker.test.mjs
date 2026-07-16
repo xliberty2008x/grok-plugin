@@ -19,7 +19,7 @@ const PRINCIPAL = Object.freeze({
   root: ROOT
 });
 
-test("MCP broker advertises sandbox metadata support and only five read-only tools", async () => {
+test("MCP broker advertises sandbox metadata, pins protocol versions, and lists structured tools", async () => {
   const initialized = await handleMcpRequest({
     jsonrpc: "2.0",
     id: 1,
@@ -28,22 +28,30 @@ test("MCP broker advertises sandbox metadata support and only five read-only too
   });
   assert.ok(initialized.result.capabilities.experimental[MCP_SANDBOX_STATE_META_CAPABILITY]);
   assert.equal(initialized.result.capabilities.tools.listChanged, false);
+  assert.equal(initialized.result.protocolVersion, "2025-11-25");
+  assert.ok(initialized.result._meta["grok/supportedProtocolVersions"].includes("2025-11-25"));
+  assert.equal(initialized.result._meta["grok/externalWorkerLabel"], "external-grok-worker");
+
+  const rejected = await handleMcpRequest({
+    jsonrpc: "2.0",
+    id: 9,
+    method: "initialize",
+    params: { protocolVersion: "2099-01-01" }
+  });
+  assert.equal(rejected.error.code, -32602);
 
   const listed = await handleMcpRequest({ jsonrpc: "2.0", id: 2, method: "tools/list" });
-  assert.equal(listed.result.tools.length, 5);
+  assert.equal(listed.result.tools.length, WORKER_TOOLS.length);
   assert.deepEqual(listed.result.tools.map((tool) => tool.name), WORKER_TOOLS.map((tool) => tool.name));
   for (const tool of listed.result.tools) {
-    assert.deepEqual(tool.annotations, {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false
-    });
+    assert.equal(tool.annotations.idempotentHint, true);
     const schema = JSON.stringify(tool.inputSchema);
     for (const forbidden of ["root", "threadId", "sessionId", "workspace", "owner", "all"]) {
       assert.equal(schema.includes(`\"${forbidden}\"`), false);
     }
   }
+  const readOnly = listed.result.tools.filter((tool) => tool.annotations.readOnlyHint);
+  assert.equal(readOnly.length, 5);
 });
 
 test("MCP calls fail closed without metadata and reject identity or root spoof arguments", async () => {
@@ -137,5 +145,5 @@ test("bundled STDIO server and Codex plugin manifests form one MCP contract", ()
   assert.equal(executed.status, 0, executed.stderr);
   const replies = executed.stdout.trim().split("\n").map((line) => JSON.parse(line));
   assert.equal(replies[0].result.serverInfo.name, "grok-worker-broker");
-  assert.equal(replies[1].result.tools.length, 5);
+  assert.equal(replies[1].result.tools.length, WORKER_TOOLS.length);
 });

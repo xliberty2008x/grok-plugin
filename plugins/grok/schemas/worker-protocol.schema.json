@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xliberty2008x/grok-plugin/schemas/worker-protocol.schema.json",
+  "title": "Worker Protocol v1 public types",
+  "description": "Public WorkerHandle, WorkerEvent, WorkerSnapshot, WorkerResult, cursor, and WorkerError schemas.",
+  "$defs": {
+    "isoDateTime": {
+      "type": ["string", "null"],
+      "maxLength": 64
+    },
+    "workerId": {
+      "type": "string",
+      "pattern": "^(review|adversarial-review|task|stop-review)-[a-f0-9]{16,64}$"
+    },
+    "publicErrorCode": {
+      "type": "string",
+      "enum": [
+        "E_AUTH_REQUIRED",
+        "E_CAPABILITY",
+        "E_JOB_NOT_FOUND",
+        "E_JOB_ACTIVE",
+        "E_USAGE",
+        "E_BROKER",
+        "E_CANCELLED",
+        "E_IDEMPOTENCY_CONFLICT",
+        "E_SCOPE_VIOLATION",
+        "E_CONTEXT_DRIFT",
+        "E_DELIVERY",
+        "E_ROLE",
+        "E_WORKTREE",
+        "E_INTEGRATION",
+        "E_PROVIDER_EXIT",
+        "E_PROCESS_IDENTITY",
+        "E_STATE",
+        "E_SCHEMA"
+      ]
+    },
+    "WorkerError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "$ref": "#/$defs/publicErrorCode" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "details": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "WorkerEventCursor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "workerId", "sequence"],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "workerId": { "$ref": "#/$defs/workerId" },
+        "sequence": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "WorkerEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "at", "summary", "sequence"],
+      "properties": {
+        "type": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "at": { "$ref": "#/$defs/isoDateTime" },
+        "summary": { "type": "string", "maxLength": 2000 },
+        "sequence": { "type": ["integer", "null"], "minimum": 1 },
+        "detail": {}
+      }
+    },
+    "securityProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": ["string", "null"] },
+        "contractVersion": { "type": ["integer", "null"] },
+        "agentProfileDigest": { "type": ["string", "null"] }
+      }
+    },
+    "WorkerHandle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workerProtocolVersion",
+        "handleSchemaVersion",
+        "id",
+        "status",
+        "terminal"
+      ],
+      "properties": {
+        "workerProtocolVersion": { "type": "integer", "const": 1 },
+        "handleSchemaVersion": { "type": "integer", "const": 1 },
+        "id": { "$ref": "#/$defs/workerId" },
+        "kind": { "type": ["string", "null"] },
+        "jobClass": { "type": ["string", "null"] },
+        "write": { "type": "boolean" },
+        "status": { "type": "string" },
+        "phase": { "type": ["string", "null"] },
+        "summary": { "type": ["string", "null"] },
+        "progress": { "type": ["string", "null"] },
+        "createdAt": { "$ref": "#/$defs/isoDateTime" },
+        "startedAt": { "$ref": "#/$defs/isoDateTime" },
+        "updatedAt": { "$ref": "#/$defs/isoDateTime" },
+        "completedAt": { "$ref": "#/$defs/isoDateTime" },
+        "heartbeatAt": { "$ref": "#/$defs/isoDateTime" },
+        "profileId": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "effort": { "type": ["string", "null"] },
+        "parentWorkerId": { "type": ["string", "null"] },
+        "lineageWorkerId": { "type": ["string", "null"] },
+        "eventCursor": { "$ref": "#/$defs/WorkerEventCursor" },
+        "taskEnvelopeId": { "type": ["string", "null"] },
+        "taskEnvelopeDigest": { "type": ["string", "null"] },
+        "contextManifestId": { "type": ["string", "null"] },
+        "contextDigest": { "type": ["string", "null"] },
+        "workspaceSnapshotDigest": { "type": ["string", "null"] },
+        "hostTaskBinding": { "type": ["string", "null"] },
+        "securityProfile": { "$ref": "#/$defs/securityProfile" },
+        "terminal": { "type": "boolean" },
+        "controlWorkspaceId": { "type": ["string", "null"] },
+        "executionRootDigest": { "type": ["string", "null"] },
+        "roleId": { "type": ["string", "null"] },
+        "externalWorkerLabel": { "type": ["string", "null"] }
+      }
+    },
+    "WorkerResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hostVerification"],
+      "properties": {
+        "review": {},
+        "workerReport": {},
+        "reportRepair": {},
+        "providerClaims": {},
+        "runtimeEvidence": {},
+        "verification": {},
+        "textBytes": { "type": "integer", "minimum": 0 },
+        "textDigest": { "type": "string" },
+        "textTruncated": { "type": "boolean" },
+        "interim": {},
+        "hostVerification": {
+          "type": "string",
+          "enum": ["not_run", "passed", "failed", "skipped"]
+        },
+        "stopReason": { "type": ["string", "null"] },
+        "skipped": { "type": "boolean" },
+        "skipReason": { "type": ["string", "null"] },
+        "providerSessionDeleted": { "type": ["boolean", "null"] },
+        "taskRuntimeCleaned": { "type": ["boolean", "null"] },
+        "privacyWarning": { "type": ["string", "null"] },
+        "cancellation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requestAcceptedAt": { "$ref": "#/$defs/isoDateTime" },
+            "processGroupGoneAt": { "$ref": "#/$defs/isoDateTime" },
+            "terminalRecordCommittedAt": { "$ref": "#/$defs/isoDateTime" },
+            "receiptId": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    "WorkerSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workerProtocolVersion",
+        "snapshotSchemaVersion",
+        "id",
+        "status",
+        "terminal"
+      ],
+      "properties": {
+        "workerProtocolVersion": { "type": "integer", "const": 1 },
+        "snapshotSchemaVersion": { "type": "integer", "const": 1 },
+        "schemaVersion": { "type": ["integer", "null"] },
+        "id": { "$ref": "#/$defs/workerId" },
+        "kind": { "type": ["string", "null"] },
+        "jobClass": { "type": ["string", "null"] },
+        "write": { "type": "boolean" },
+        "status": { "type": "string" },
+        "phase": { "type": ["string", "null"] },
+        "summary": { "type": ["string", "null"] },
+        "progress": { "type": ["string", "null"] },
+        "createdAt": { "$ref": "#/$defs/isoDateTime" },
+        "startedAt": { "$ref": "#/$defs/isoDateTime" },
+        "updatedAt": { "$ref": "#/$defs/isoDateTime" },
+        "completedAt": { "$ref": "#/$defs/isoDateTime" },
+        "heartbeatAt": { "$ref": "#/$defs/isoDateTime" },
+        "profileId": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "effort": { "type": ["string", "null"] },
+        "parentWorkerId": { "type": ["string", "null"] },
+        "lineageWorkerId": { "type": ["string", "null"] },
+        "eventCursor": { "$ref": "#/$defs/WorkerEventCursor" },
+        "taskEnvelopeId": { "type": ["string", "null"] },
+        "taskEnvelopeDigest": { "type": ["string", "null"] },
+        "contextManifestId": { "type": ["string", "null"] },
+        "contextDigest": { "type": ["string", "null"] },
+        "workspaceSnapshotDigest": { "type": ["string", "null"] },
+        "hostTaskBinding": { "type": ["string", "null"] },
+        "securityProfile": { "$ref": "#/$defs/securityProfile" },
+        "latestPlan": { "type": "array" },
+        "lifecycleEvents": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/WorkerEvent" }
+        },
+        "taskContract": { "type": ["object", "null"] },
+        "context": { "type": ["object", "null"] },
+        "resumeJobId": { "type": ["string", "null"] },
+        "result": {
+          "anyOf": [
+            { "$ref": "#/$defs/WorkerResult" },
+            { "type": "null" }
+          ]
+        },
+        "error": {
+          "anyOf": [
+            { "$ref": "#/$defs/WorkerError" },
+            { "type": "null" }
+          ]
+        },
+        "terminal": { "type": "boolean" },
+        "controlWorkspaceId": { "type": ["string", "null"] },
+        "executionRootDigest": { "type": ["string", "null"] },
+        "roleId": { "type": ["string", "null"] },
+        "externalWorkerLabel": { "type": ["string", "null"] },
+        "awaitingHostAction": { "type": ["object", "null"] }
+      }
+    },
+    "CancellationReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receiptId", "workerId", "status", "requestAcceptedAt"],
+      "properties": {
+        "receiptId": { "type": "string", "minLength": 1 },
+        "workerId": { "$ref": "#/$defs/workerId" },
+        "status": {
+          "type": "string",
+          "enum": ["accepted", "already_cancelled", "already_terminal"]
+        },
+        "requestAcceptedAt": { "type": "string" },
+        "idempotencyKeyDigest": { "type": ["string", "null"] },
+        "cancellationRequestSequence": { "type": ["integer", "null"] }
+      }
+    },
+    "DeliveryReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["messageId", "workerId", "state", "acceptedAt"],
+      "properties": {
+        "messageId": { "type": "string" },
+        "workerId": { "$ref": "#/$defs/workerId" },
+        "state": {
+          "type": "string",
+          "enum": ["accepted", "pending", "delivered", "delivery_unknown", "rejected"]
+        },
+        "acceptedAt": { "type": "string" },
+        "outcomeAt": { "type": ["string", "null"] },
+        "idempotencyKeyDigest": { "type": ["string", "null"] },
+        "contentDigest": { "type": ["string", "null"] },
+        "reason": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

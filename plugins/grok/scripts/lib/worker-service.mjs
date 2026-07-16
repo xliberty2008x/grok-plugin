@@ -10,6 +10,16 @@ import {
   projectWorkerSnapshot
 } from "./worker-protocol.mjs";
 import { isCanonicalUuid } from "./worker-authority.mjs";
+import {
+  cancelWorker,
+  projectCancellationReceipt,
+  spawnReadOnlyWorker
+} from "./worker-mutation.mjs";
+import {
+  followupWorker,
+  sendWorkerMessage
+} from "./worker-mailbox.mjs";
+import { buildTaskEnvelope } from "./task-contract.mjs";
 
 export const MAX_WORKER_WAIT_MS = 30_000;
 const DEFAULT_WORKER_WAIT_MS = 10_000;
@@ -40,7 +50,8 @@ export function createWorkerService({
   readJob = tryReadJob,
   listJobs = listJobsReadonly,
   clock = () => performance.now(),
-  sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
+  sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  allowWriteSpawn = false
 }) {
   assertServicePrincipal(principal);
   if (typeof root !== "string" || !root) {
@@ -51,6 +62,8 @@ export function createWorkerService({
   const ownedJob = (id) => {
     const job = readJob(root, id, env);
     if (!job || !sameHostSession(job, host)) throw notFound();
+    // Host-attested parent access is mutation-path only; reads stay exact-thread
+    // equivalent so foreign/nonexistent remain observationally identical.
     return job;
   };
 
@@ -91,6 +104,82 @@ export function createWorkerService({
         throw new CompanionError("E_JOB_ACTIVE", "Worker result is not available yet.");
       }
       return projectWorkerSnapshot(job);
+    },
+
+    /**
+     * Idempotent read-only spawn. Durable commit is success; provider not started.
+     */
+    spawn({
+      userRequest,
+      objective = null,
+      envelope = null,
+      contextManifest = null,
+      idempotencyKey,
+      roleId = "explorer",
+      write = false
+    } = {}) {
+      if (!idempotencyKey) {
+        throw new CompanionError("E_USAGE", "idempotencyKey is required for spawn.");
+      }
+      const taskEnvelope = envelope || buildTaskEnvelope({
+        userRequest: userRequest || objective || "worker task",
+        objective,
+        mode: write ? "write" : "read"
+      });
+      return spawnReadOnlyWorker({
+        root,
+        principal,
+        envelope: taskEnvelope,
+        contextManifest,
+        idempotencyKey,
+        roleId,
+        write,
+        env,
+        allowWriteSpawn
+      });
+    },
+
+    cancel({ id, idempotencyKey, signalProcess = null } = {}) {
+      if (!id) throw new CompanionError("E_USAGE", "id is required for cancel.");
+      if (!idempotencyKey) {
+        throw new CompanionError("E_USAGE", "idempotencyKey is required for cancel.");
+      }
+      const { receipt, replayed } = cancelWorker({
+        root,
+        principal,
+        workerId: id,
+        idempotencyKey,
+        env,
+        signalProcess
+      });
+      return { receipt: projectCancellationReceipt(receipt), replayed };
+    },
+
+    send({ id, message, idempotencyKey, deliver = null } = {}) {
+      if (!id) throw new CompanionError("E_USAGE", "id is required for send.");
+      return sendWorkerMessage({
+        root,
+        principal,
+        workerId: id,
+        message,
+        idempotencyKey,
+        deliver,
+        env
+      });
+    },
+
+    followup({ id, message, idempotencyKey, envelope = null, contextManifest = null } = {}) {
+      if (!id) throw new CompanionError("E_USAGE", "id is required for followup.");
+      return followupWorker({
+        root,
+        principal,
+        workerId: id,
+        message,
+        idempotencyKey,
+        envelope,
+        contextManifest,
+        env
+      });
     }
   });
 }

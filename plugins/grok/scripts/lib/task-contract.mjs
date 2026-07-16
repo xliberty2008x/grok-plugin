@@ -17,7 +17,8 @@ export const LIFECYCLE_EVENT_TYPES = Object.freeze([
   "activity.completed",
   "checkpoint",
   "blocked",
-  "final.report"
+  "final.report",
+  "cancellation.requested"
 ]);
 /** Bounded retention for durable lifecycle evidence (oldest entries are dropped first). */
 export const MAX_LIFECYCLE_EVENTS = 128;

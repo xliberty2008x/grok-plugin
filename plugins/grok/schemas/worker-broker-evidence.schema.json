@@ -1,0 +1,282 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xliberty2008x/grok-plugin/schemas/worker-broker-evidence.schema.json",
+  "title": "Worker Broker Evidence Record",
+  "description": "Immutable per-phase evidence for the Worker Broker roadmap (issue #25).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "roadmapVersion",
+    "recordType",
+    "issue",
+    "phase",
+    "slice",
+    "status",
+    "recordedAt",
+    "source",
+    "runtime",
+    "verification",
+    "authorities",
+    "limits"
+  ],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "roadmapVersion": { "type": "string", "minLength": 1, "maxLength": 32 },
+    "recordType": {
+      "type": "string",
+      "enum": ["worker-broker-slice", "worker-broker-aggregate"]
+    },
+    "issue": {
+      "type": "string",
+      "const": "https://github.com/xliberty2008x/grok-plugin/issues/25"
+    },
+    "pullRequest": { "type": ["string", "null"], "maxLength": 256 },
+    "phase": {
+      "type": "string",
+      "enum": ["0", "1", "2", "3", "4", "5", "aggregate"]
+    },
+    "slice": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "status": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "implemented_unverified",
+        "verified_on_draft",
+        "qualified",
+        "blocked",
+        "deferred",
+        "historical"
+      ]
+    },
+    "recordedAt": { "type": "string", "format": "date-time" },
+    "releaseQualification": { "type": "boolean" },
+    "evidenceSystemQualification": { "type": "boolean" },
+    "provisionalSupportingRecord": { "type": "boolean" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pluginVersion",
+        "headCommit",
+        "headTree",
+        "sourceInventoryDigest",
+        "phaseScopeDigest",
+        "cleanTreeAtVerification"
+      ],
+      "properties": {
+        "pluginVersion": { "type": "string", "minLength": 1 },
+        "foundationCommit": { "type": ["string", "null"] },
+        "headCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "headTree": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "sourceInventoryDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "phaseScopeDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "cleanTreeAtVerification": { "type": "boolean" },
+        "phaseScopePaths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "maxItems": 512
+        }
+      }
+    },
+    "installation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "method": { "type": "string" },
+        "sourcePluginInventoryDigest": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "installedPluginInventoryDigest": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "installedFileCount": { "type": ["integer", "null"], "minimum": 0 },
+        "sourceAndInstalledInventoriesEqual": { "type": ["boolean", "null"] },
+        "privateInstallPathRecorded": { "type": "boolean" }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "architecture", "node", "git"],
+      "properties": {
+        "platform": { "type": "string" },
+        "architecture": { "type": "string" },
+        "node": { "type": "string" },
+        "git": { "type": "string" },
+        "codexStandalone": { "type": ["string", "null"] },
+        "codexDesktopBundled": { "type": ["string", "null"] },
+        "grokBuild": { "type": ["string", "null"] },
+        "grokBuildRevision": { "type": ["string", "null"] },
+        "mcpProtocolVersion": { "type": ["string", "null"] }
+      }
+    },
+    "prerequisites": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["phase", "recordDigest"],
+        "properties": {
+          "phase": { "type": "string" },
+          "recordDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "gateIds": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "verification": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "boundary", "outcome"],
+        "properties": {
+          "command": { "type": "string", "minLength": 1 },
+          "boundary": { "type": "string", "minLength": 1 },
+          "outcome": {
+            "type": "string",
+            "enum": ["pass", "fail", "skip", "not_run"]
+          },
+          "startedAt": { "type": ["string", "null"] },
+          "endedAt": { "type": ["string", "null"] },
+          "exitCode": { "type": ["integer", "null"] },
+          "testsPassed": { "type": ["integer", "null"], "minimum": 0 },
+          "testsSkipped": { "type": ["integer", "null"], "minimum": 0 },
+          "testsFailed": { "type": ["integer", "null"], "minimum": 0 },
+          "outputDigest": {
+            "type": ["string", "null"],
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "assertions": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "skipMeaning": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "scenarios": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "expected", "actual", "outcome"],
+        "properties": {
+          "id": { "type": "string" },
+          "boundary": { "type": ["string", "null"] },
+          "expected": { "type": "string" },
+          "actual": { "type": "string" },
+          "outcome": {
+            "type": "string",
+            "enum": ["pass", "fail", "skip", "not_run"]
+          },
+          "measurements": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "negative": { "type": "boolean" }
+        }
+      }
+    },
+    "liveScenarios": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "boundary", "outcome"],
+        "properties": {
+          "id": { "type": "string" },
+          "boundary": { "type": "string" },
+          "runtime": { "type": ["string", "null"] },
+          "expected": { "type": ["string", "null"] },
+          "actual": { "type": ["string", "null"] },
+          "outcome": {
+            "type": "string",
+            "enum": ["pass", "fail", "skip", "not_run"]
+          }
+        }
+      }
+    },
+    "ci": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workflowUrl": { "type": ["string", "null"] },
+        "runId": { "type": ["string", "null"] },
+        "attempt": { "type": ["integer", "null"] },
+        "jobs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "result"],
+            "properties": {
+              "name": { "type": "string" },
+              "result": {
+                "type": "string",
+                "enum": ["success", "failure", "skipped", "cancelled"]
+              }
+            }
+          }
+        }
+      }
+    },
+    "authorities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workerClaims",
+        "runtimeObservations",
+        "hostVerification",
+        "independentValidation"
+      ],
+      "properties": {
+        "workerClaims": { "type": "string" },
+        "runtimeObservations": { "type": "string" },
+        "hostVerification": { "type": "string" },
+        "independentValidation": { "type": "string" }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["residualRisks", "unsupportedPlatforms", "invalidationTriggers"],
+      "properties": {
+        "residualRisks": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "unsupportedPlatforms": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "invalidationTriggers": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "supersededBy": { "type": ["string", "null"] },
+        "liveQualificationGaps": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "recordDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of the canonical record body excluding this field."
+    }
+  }
+}

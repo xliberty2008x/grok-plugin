@@ -184,14 +184,14 @@ A phase may remain historically delivered while its current qualification become
 
 | Phase | Current state | Current deliverable | Blocking gap |
 | --- | --- | --- | --- |
-| 0 — Baseline and evidence | `implemented_unverified` | Existing regression harnesses and documented platform boundaries | Evidence schema/verifier plus exact-source natural-host and provider qualification |
-| 1A — Worker Protocol | `verified_on_draft` | Versioned handle/snapshot and durable cursor foundation at `bbae194` | Published event/result/error schemas and compatibility fixtures |
-| 1B — Read-only broker | `verified_on_draft` | Owned list/get/events/wait/result MCP slice at `dcb78b8` | Protocol pinning and stable authority/capability contract |
-| 1C — Spawn/cancel/reconcile | `not_started` | Contract described below | Ownership semantics, idempotency, and trusted reconciliation design |
-| 2 — Mailbox/context/roles | `not_started` | Contract described below | Strong delivery/context modes are blocked on ACP acknowledgement/dedup and trusted transcript acquisition feasibility |
-| 3 — Worktrees/artifacts | `blocked` | Contract described below | Control-workspace identity separate from execution paths |
-| 4 — Host presentation | `implemented_unverified` | Long-poll/cursor primitive arrived early in Phase 1 | Structured adapter, aliases/tree, capability fallback, natural-host qualification |
-| 5 — Side-by-side qualification | `not_started` | Qualification design below | Phases 0–4 mandatory gates |
+| 0 — Baseline and evidence | `verified_on_draft` | Evidence schema, ledger, capture/verify CLI, invalidation tests | Live installed natural Codex + authenticated Grok qualification residual |
+| 1A — Worker Protocol | `verified_on_draft` | Public schemas + handle/snapshot/cursor foundation | Live host qualification residual |
+| 1B — Read-only broker | `verified_on_draft` | Owned reads + MCP protocol pin + capability matrix | Live host qualification residual |
+| 1C — Spawn/cancel/reconcile | `verified_on_draft` | Idempotent read-only spawn, cancel receipts, trusted reconciler | Live provider orchestration residual; write spawn still gated |
+| 2 — Mailbox/context/roles | `verified_on_draft` | Mailbox send/followup, explicit-envelope context, immutable roles | Strong exactly-once / recent:N blocked on ACP+transcript proof (honest residual) |
+| 3 — Worktrees/artifacts | `verified_on_draft` | controlWorkspaceId/controlRoot, worktrees, artifact manifests, isolation gates | Broker write spawn remains default-disabled pending host integration productization |
+| 4 — Host presentation | `verified_on_draft` | Structured presentation, aliases, capability fallbacks, external-worker labeling | Natural-host end-to-end residual |
+| 5 — Side-by-side qualification | `implemented_unverified` | Deterministic safety proofs + aggregate evidence records | Live side-by-side natural/Grok qualification residual; do not close #25 yet |
 
 ## 8. Phase 0 — Baseline and evidence system
 

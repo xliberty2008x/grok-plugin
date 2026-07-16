@@ -28,7 +28,14 @@ export function isCanonicalUuid(value) {
  * Resolve a private broker principal from host-injected per-call MCP metadata.
  * Tool arguments and process environment are intentionally not authority inputs.
  */
-export function resolveWorkerAuthority(meta) {
+/**
+ * Plugin-ID requirement freeze for mutation-capable calls.
+ * Reads may proceed without plugin_id for backward compatibility with proven
+ * Codex identity; mutation tools require a valid grok plugin id.
+ */
+export const MUTATION_REQUIRES_PLUGIN_ID = true;
+
+export function resolveWorkerAuthority(meta, { mutation = false } = {}) {
   if (!meta || typeof meta !== "object" || Array.isArray(meta)) throw authFailure();
   const threadId = meta.threadId;
   const turn = meta["x-codex-turn-metadata"];
@@ -47,6 +54,18 @@ export function resolveWorkerAuthority(meta) {
   if (meta.plugin_id != null && turn.plugin_id != null && meta.plugin_id !== turn.plugin_id) {
     throw authFailure();
   }
+  if (mutation && MUTATION_REQUIRES_PLUGIN_ID) {
+    if (pluginId == null || !GROK_PLUGIN_ID.test(String(pluginId))) {
+      throw authFailure();
+    }
+  }
+
+  // Host-attested parent/subagent ownership — never inferred from tool arguments.
+  const attestedByHost = meta.attestedByHost === true
+    || turn.attested_by_host === true;
+  const attestedParentThreadId = isCanonicalUuid(meta.attestedParentThreadId)
+    ? meta.attestedParentThreadId
+    : (isCanonicalUuid(turn.attested_parent_thread_id) ? turn.attested_parent_thread_id : null);
 
   const sandbox = meta[MCP_SANDBOX_STATE_META_CAPABILITY];
   const sandboxCwd = sandbox?.sandboxCwd;
@@ -75,6 +94,9 @@ export function resolveWorkerAuthority(meta) {
     turnId,
     source: "codex-mcp-stdio",
     pluginId,
-    root
+    root,
+    attestedByHost: Boolean(attestedByHost && attestedParentThreadId),
+    attestedParentThreadId: attestedByHost ? attestedParentThreadId : null,
+    mutationCapable: Boolean(pluginId && GROK_PLUGIN_ID.test(String(pluginId)))
   });
 }

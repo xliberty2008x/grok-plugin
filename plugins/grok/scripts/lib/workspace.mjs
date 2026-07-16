@@ -32,6 +32,70 @@ export function workspaceStateSegment(canonicalRoot) {
 }
 
 /**
+ * Resolve the Git common directory for a checkout (shared by linked worktrees).
+ */
+export function gitCommonDir(root) {
+  const run = git(root, ["rev-parse", "--path-format=absolute", "--git-common-dir"], { allowFailure: true });
+  if (run.status !== 0) {
+    throw new CompanionError("E_GIT_REQUIRED", "Could not resolve git common directory.");
+  }
+  return fs.realpathSync(String(run.stdout).trim());
+}
+
+/**
+ * Stable control-workspace identity shared by all linked worktrees of one repo.
+ * controlRoot is the primary checkout root used for state/admission/integration.
+ * executionRoot is per-worker and may differ (isolated worktree).
+ */
+export function resolveControlWorkspace(root, env = process.env) {
+  const controlRoot = workspaceRoot(root, true);
+  const common = gitCommonDir(controlRoot);
+  const controlWorkspaceId = `cws-${crypto.createHash("sha256").update(common).digest("hex").slice(0, 32)}`;
+  return Object.freeze({
+    controlWorkspaceId,
+    controlRoot,
+    gitCommonDir: common,
+    // Default execution root is the control root until a worktree is assigned.
+    executionRoot: controlRoot
+  });
+}
+
+/**
+ * State directory keyed by control workspace (git common dir), not execution path.
+ * Falls back to legacy path-keyed state for migration compatibility when
+ * GROK_COMPANION_CONTROL_STATE is not set and legacy dir already exists.
+ */
+export function controlStateSegment(controlWorkspaceId) {
+  const id = String(controlWorkspaceId || "");
+  if (!/^cws-[a-f0-9]{32}$/.test(id)) {
+    throw new CompanionError("E_STATE", "Invalid controlWorkspaceId.");
+  }
+  return `control-${id.slice(4, 20)}`;
+}
+
+export function controlStateDir(control, env = process.env) {
+  const configuredData = pluginDataRoot(env);
+  fs.mkdirSync(configuredData, { recursive: true, mode: 0o700 });
+  const pluginData = fs.realpathSync(configuredData);
+  const stateParent = path.join(pluginData, "state");
+  try { fs.mkdirSync(stateParent, { mode: 0o700 }); }
+  catch (error) { if (error.code !== "EEXIST") throw error; }
+  const controlDir = path.join(stateParent, controlStateSegment(control.controlWorkspaceId));
+  // Migration: if legacy path-keyed dir exists and control dir does not, prefer
+  // creating control dir while leaving legacy intact (compatible dual-read later).
+  try { fs.mkdirSync(controlDir, { mode: 0o700 }); }
+  catch (error) { if (error.code !== "EEXIST") throw error; }
+  return controlDir;
+}
+
+/**
+ * Shared admission lock name for a control workspace (cross-worktree).
+ */
+export function controlAdmissionLockName(controlWorkspaceId) {
+  return `admission-${controlStateSegment(controlWorkspaceId)}`;
+}
+
+/**
  * Compute the workspace job-state directory without creating directories, locks,
  * or chmod side effects. Returns null when the plugin data root is absent.
  * Used by read-only MCP/service paths that must not call ensure().
@@ -64,9 +128,9 @@ export function resolveWorkspaceStateDir(root, env = process.env) {
   return workspaceDirectory;
 }
 
-export function workspaceState(root) {
+export function workspaceState(root, env = process.env) {
   const canonicalRoot = fs.realpathSync(root);
-  const configuredData = pluginDataRoot();
+  const configuredData = pluginDataRoot(env);
   fs.mkdirSync(configuredData, { recursive: true, mode: 0o700 });
   const pluginData = fs.realpathSync(configuredData);
   const stateParent = path.join(pluginData, "state");

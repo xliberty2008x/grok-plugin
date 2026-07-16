@@ -1,0 +1,132 @@
+{
+  "schemaVersion": 1,
+  "roadmapVersion": "1.0",
+  "recordType": "worker-broker-slice",
+  "issue": "https://github.com/xliberty2008x/grok-plugin/issues/25",
+  "pullRequest": "https://github.com/xliberty2008x/grok-plugin/pull/26",
+  "phase": "2",
+  "slice": "mailbox-context-roles",
+  "status": "verified_on_draft",
+  "recordedAt": "2026-07-16T11:02:59.664Z",
+  "releaseQualification": false,
+  "evidenceSystemQualification": true,
+  "provisionalSupportingRecord": false,
+  "source": {
+    "pluginVersion": "0.3.0-dev.1",
+    "foundationCommit": null,
+    "headCommit": "585a382c75a4793fb8fae8d9c932c4547dab146b",
+    "headTree": "e2640b8a7ec0805c4263af03386c7f813f8dc7f2",
+    "sourceInventoryDigest": "01c6bbea488e5bc4239387a8b50963384959345d800029488263cdbaa48a3d08",
+    "phaseScopeDigest": "8a7ca66dc2422c572b91a540fe881074661300c9487176e4ceb71cc648f6df5f",
+    "cleanTreeAtVerification": false,
+    "phaseScopePaths": [
+      "plugins/grok/scripts/lib/worker-mailbox.mjs",
+      "plugins/grok/scripts/lib/worker-roles.mjs",
+      "plugins/grok/scripts/lib/worker-context.mjs",
+      "tests/worker-mailbox.test.mjs",
+      "tests/worker-roles.test.mjs"
+    ]
+  },
+  "installation": {
+    "method": "source-tree",
+    "sourcePluginInventoryDigest": null,
+    "installedPluginInventoryDigest": null,
+    "installedFileCount": null,
+    "sourceAndInstalledInventoriesEqual": null,
+    "privateInstallPathRecorded": false
+  },
+  "runtime": {
+    "platform": "macOS",
+    "architecture": "arm64",
+    "node": "25.5.0",
+    "git": "2.45.1",
+    "codexStandalone": null,
+    "codexDesktopBundled": null,
+    "grokBuild": null,
+    "grokBuildRevision": null,
+    "mcpProtocolVersion": "2025-11-25"
+  },
+  "prerequisites": [],
+  "verification": [
+    {
+      "command": "npm run check",
+      "boundary": "source-provider-neutral",
+      "outcome": "pass",
+      "testsPassed": 259,
+      "testsSkipped": 1,
+      "testsFailed": 0,
+      "skipMeaning": "Expected authenticated-provider E2E skip where applicable."
+    },
+    {
+      "command": "node --test tests/worker-*.test.mjs tests/mcp-worker-broker.test.mjs tests/worker-service.test.mjs tests/worker-protocol.test.mjs tests/codex-support.test.mjs tests/state.test.mjs",
+      "boundary": "focused-source-provider-neutral",
+      "outcome": "pass",
+      "testsPassed": 65,
+      "testsFailed": 0
+    },
+    {
+      "command": "git diff --check",
+      "boundary": "source",
+      "outcome": "pass"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "delivery-unknown-no-retry",
+      "expected": "never auto-retry",
+      "actual": "pass",
+      "outcome": "pass",
+      "negative": true
+    },
+    {
+      "id": "followup-lineage",
+      "expected": "parent preserved; drift rejected",
+      "actual": "pass",
+      "outcome": "pass"
+    },
+    {
+      "id": "roles-digest",
+      "expected": "self-escalation blocked",
+      "actual": "pass",
+      "outcome": "pass",
+      "negative": true
+    }
+  ],
+  "liveScenarios": [
+    {
+      "id": "live-host-provider",
+      "boundary": "installed-natural-codex-and-authenticated-grok",
+      "outcome": "skip",
+      "actual": "Residual gap recorded; deterministic gates only in this environment."
+    }
+  ],
+  "ci": null,
+  "authorities": {
+    "workerClaims": "none-for-deterministic-gates",
+    "runtimeObservations": "node:test + inventory digests + MCP broker ops",
+    "hostVerification": "not_run",
+    "independentValidation": "not_run_in_this_session"
+  },
+  "limits": {
+    "residualRisks": [
+      "Installed natural Codex and authenticated Grok live qualification residual in this environment.",
+      "Issue #25 must not be closed until live boundaries pass on exact final source."
+    ],
+    "unsupportedPlatforms": [
+      "windows-provider-execution",
+      "linux-provider-unqualified"
+    ],
+    "invalidationTriggers": [
+      "non-evidence source change",
+      "phase-scope path change",
+      "dirty tree when claiming clean",
+      "install or host/provider version change"
+    ],
+    "supersededBy": null,
+    "liveQualificationGaps": [
+      "npm run test:installed-codex / test:natural-codex not re-run as live qualification here",
+      "GROK_E2E authenticated lifecycle not recorded for this source boundary"
+    ]
+  },
+  "recordDigest": "c9c4eece8757ab89b693c8cb080e1c5f244c20cbdc3cb1e505ac06238c15d055"
+}

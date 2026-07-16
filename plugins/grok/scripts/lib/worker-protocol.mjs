@@ -287,6 +287,9 @@ export function projectWorkerHandle(job) {
     model: job.model || null,
     effort: job.effort || null,
     ...projectWorkerIdentityMetadata(job),
+    controlWorkspaceId: job.controlWorkspaceId || null,
+    roleId: job.role?.id || job.profile?.id || null,
+    externalWorkerLabel: "external-grok-worker",
     terminal: isWorkerTerminal(job)
   });
 }
@@ -396,6 +399,10 @@ export function projectWorkerSnapshot(job, { detail = true } = {}) {
     resumeJobId: job.request?.resumeJobId || null,
     result: projectPublicResult(job, { detail }),
     error: projectPublicError(job.error),
+    controlWorkspaceId: job.controlWorkspaceId || null,
+    roleId: job.role?.id || job.profile?.id || null,
+    externalWorkerLabel: "external-grok-worker",
+    awaitingHostAction: job.awaitingHostAction || null,
     terminal: isWorkerTerminal(job)
   });
 }

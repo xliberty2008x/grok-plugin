@@ -17,7 +17,10 @@
     "validate": "node scripts/validate.mjs",
     "version:check": "node scripts/validate.mjs --versions-only",
     "version:bump": "node scripts/bump-version.mjs",
-    "check": "npm run validate && npm test"
+    "check": "npm run validate && npm test",
+    "worker:evidence": "node scripts/worker-broker-evidence.mjs",
+    "worker:verify": "node scripts/worker-broker-evidence.mjs verify",
+    "worker:qualify": "node scripts/worker-broker-evidence.mjs qualify"
   },
   "license": "Apache-2.0"
 }

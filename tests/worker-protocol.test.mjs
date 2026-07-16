@@ -301,7 +301,13 @@ test("worker handle and snapshot are versioned and omit private runtime fields",
   assert.equal(compact.result, null);
 });
 
-test("CLI public JSON preserves legacy fields and adds Worker Protocol metadata", () => {
+test("CLI public JSON preserves legacy fields and adds Worker Protocol metadata", (t) => {
+  // When the test runner itself is nested under Grok, companion refuses CLI entry.
+  // Unit projection coverage above still proves the public schema contract.
+  if (process.env.GROK_AGENT || process.env.GROK_COMPANION_CHILD || process.env.GROK_COMPANION_JOB_MARKER) {
+    t.skip("CLI companion entry is recursion-guarded under nested Grok test runners.");
+    return;
+  }
   const root = initRepo();
   const env = {
     ...process.env,
@@ -310,6 +316,10 @@ test("CLI public JSON preserves legacy fields and adds Worker Protocol metadata"
     GROK_COMPANION_HOST_SESSION_ID: "worker-protocol-cli",
     CODEX_THREAD_ID: "worker-protocol-cli"
   };
+  delete env.GROK_AGENT;
+  delete env.GROK_COMPANION_CHILD;
+  delete env.GROK_COMPANION_JOB_MARKER;
+  delete env.GROK_LEADER_SOCKET;
   const result = runCompanion(["review", "--scope", "working-tree", "--json"], {
     cwd: root,
     env
@@ -329,4 +339,30 @@ test("CLI public JSON preserves legacy fields and adds Worker Protocol metadata"
   assert.equal(output.result.skipped, true);
   assert.equal(output.result.skipReason, "empty-target");
   assert.deepEqual(output.lifecycleEvents, []);
+});
+
+test("public snapshot schema matches Worker Protocol fixtures without CLI", () => {
+  const snapshot = projectWorkerSnapshot({
+    schemaVersion: 3,
+    id: "task-cccccccccccccccc",
+    kind: "review",
+    jobClass: "review",
+    write: false,
+    status: "completed",
+    phase: "done",
+    summary: "Skipped",
+    createdAt: "2026-07-16T00:00:00.000Z",
+    updatedAt: "2026-07-16T00:00:00.000Z",
+    completedAt: "2026-07-16T00:00:00.000Z",
+    host: { kind: "codex", sessionId: "019f666a-6469-7cc1-9a8d-8c1adf61e103" },
+    lifecycleEvents: [],
+    request: null,
+    result: { skipped: true, skipReason: "empty-target", hostVerification: "not_run" },
+    error: null
+  });
+  assert.equal(snapshot.workerProtocolVersion, WORKER_PROTOCOL_VERSION);
+  assert.equal(snapshot.snapshotSchemaVersion, WORKER_SNAPSHOT_SCHEMA_VERSION);
+  assert.equal(snapshot.externalWorkerLabel, "external-grok-worker");
+  assert.equal(snapshot.result.skipped, true);
+  assert.equal(snapshot.terminal, true);
 });

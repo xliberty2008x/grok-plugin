@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "roadmapVersion": "1.0",
+  "issue": "https://github.com/xliberty2008x/grok-plugin/issues/25",
+  "updatedAt": "2026-07-16T11:02:59.751Z",
+  "entries": [
+    {
+      "phase": "0",
+      "slice": "evidence-system",
+      "status": "verified_on_draft",
+      "path": "tests/e2e-results/worker-broker/phase-0/01c6bbea488e5bc4.json",
+      "recordDigest": "2245c867fb8c759ffe6f1f35e689da41500b78db48964d2b14fe4e4d31da7bf6",
+      "sourceCommit": "585a382c75a4793fb8fae8d9c932c4547dab146b",
+      "currency": "current",
+      "recordedAt": "2026-07-16T11:02:59.604Z"
+    },
+    {
+      "phase": "1",
+      "slice": "worker-api-spawn-cancel-schemas",
+      "status": "verified_on_draft",
+      "path": "tests/e2e-results/worker-broker/phase-1/01c6bbea488e5bc4.json",
+      "recordDigest": "fd6c2a1c9ce2350088d9fcdd962f06b8440222221c805b181ab62ce07c022920",
+      "sourceCommit": "585a382c75a4793fb8fae8d9c932c4547dab146b",
+      "currency": "current",
+      "recordedAt": "2026-07-16T11:02:59.636Z"
+    },
+    {
+      "phase": "2",
+      "slice": "mailbox-context-roles",
+      "status": "verified_on_draft",
+      "path": "tests/e2e-results/worker-broker/phase-2/01c6bbea488e5bc4.json",
+      "recordDigest": "c9c4eece8757ab89b693c8cb080e1c5f244c20cbdc3cb1e505ac06238c15d055",
+      "sourceCommit": "585a382c75a4793fb8fae8d9c932c4547dab146b",
+      "currency": "current",
+      "recordedAt": "2026-07-16T11:02:59.664Z"
+    },
+    {
+      "phase": "3",
+      "slice": "control-workspace-worktrees",
+      "status": "verified_on_draft",
+      "path": "tests/e2e-results/worker-broker/phase-3/01c6bbea488e5bc4.json",
+      "recordDigest": "d110fa98ebdbc697998b862b707c2d33ec907d0e8a60da4faf36adf4c1a44b26",
+      "sourceCommit": "585a382c75a4793fb8fae8d9c932c4547dab146b",
+      "currency": "current",
+      "recordedAt": "2026-07-16T11:02:59.691Z"
+    },
+    {
+      "phase": "4",
+      "slice": "host-presentation",
+      "status": "verified_on_draft",
+      "path": "tests/e2e-results/worker-broker/phase-4/01c6bbea488e5bc4.json",
+      "recordDigest": "33414d8020b0c759cf5ca57921c338580821b2a47662b40aca77e3f093c1e744",
+      "sourceCommit": "585a382c75a4793fb8fae8d9c932c4547dab146b",
+      "currency": "current",
+      "recordedAt": "2026-07-16T11:02:59.718Z"
+    },
+    {
+      "phase": "5",
+      "slice": "safety-proofs-aggregate-deterministic",
+      "status": "verified_on_draft",
+      "path": "tests/e2e-results/worker-broker/phase-5/01c6bbea488e5bc4.json",
+      "recordDigest": "92a3e7f134538abf48b0a76a6e6fa02b3811e3d15c2ea528acd043564a5edb61",
+      "sourceCommit": "585a382c75a4793fb8fae8d9c932c4547dab146b",
+      "currency": "current",
+      "recordedAt": "2026-07-16T11:02:59.746Z"
+    }
+  ]
+}
