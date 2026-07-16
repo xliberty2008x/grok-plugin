@@ -3,7 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { CompanionError } from "./errors.mjs";
 import { processIsZombie, processStartToken } from "./process-control.mjs";
-import { workspaceState, assertSafeJobId, resolveWorkspaceStateDir } from "./workspace.mjs";
+import {
+  workspaceState,
+  assertSafeJobId,
+  resolveWorkspaceStateDir,
+  resolveAdmissionLockName
+} from "./workspace.mjs";
 import { sameHostSession } from "./host.mjs";
 
 const ACTIVE = new Set(["queued", "running"]);
@@ -105,9 +110,11 @@ function withLock(root, name, action, env = process.env) {
   try { return action(); } finally { fs.rmSync(lock, { recursive: true, force: true }); }
 }
 
-/** Serialize host-side verification reconciliation with workspace job admission. */
+/** Serialize host-side verification reconciliation with workspace job admission.
+ * Lock name is control-workspace scoped so linked worktrees share one admission gate.
+ */
 export function withWorkspaceAdmission(root, action, env = process.env) {
-  return withLock(root, "workspace-admission", action, env);
+  return withLock(root, resolveAdmissionLockName(root, env), action, env);
 }
 
 export function config(root, env = process.env) {
@@ -214,7 +221,8 @@ export function writeJob(root, job, env = process.env) {
  * session store. A writer requires an otherwise idle workspace.
  */
 export function admitJob(root, job, env = process.env) {
-  return withLock(root, "workspace-admission", () => {
+  // Control-workspace admission lock — shared by all linked worktrees of one repo.
+  return withLock(root, resolveAdmissionLockName(root, env), () => {
     const requestedLineage = job.jobClass === "task" ? job.request?.providerHomeId || null : null;
     const conflict = listJobs(root, env).find((candidate) => {
       const candidateLineage = candidate.jobClass === "task" ? candidate.request?.providerHomeId || null : null;

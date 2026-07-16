@@ -27,8 +27,7 @@ import {
 import { appendLifecycleEvent } from "./task-contract.mjs";
 import { projectWorkerHandle, projectWorkerSnapshot } from "./worker-protocol.mjs";
 import { materializeRole, assertRoleDigest } from "./worker-roles.mjs";
-import { resolveControlWorkspace, controlStateDir } from "./workspace.mjs";
-import { workspaceState } from "./workspace.mjs";
+import { resolveControlWorkspace, workspaceState } from "./workspace.mjs";
 
 export const SPAWN_OWNERSHIP_MODE = "exact-thread-or-host-attested-parent";
 export const SPAWN_SUCCESS_DEFINITION = "durable-job-commit";
@@ -53,14 +52,8 @@ function assertIdempotencyKey(key) {
 }
 
 function idempotencyPath(root, kind, keyDigest, env = process.env) {
-  // Prefer control-workspace state when available; fall back to classic workspace state.
-  let base;
-  try {
-    const control = resolveControlWorkspace(root, env);
-    base = controlStateDir(control, env);
-  } catch {
-    base = workspaceState(root);
-  }
+  // Same control-workspace state store as jobs (shared across linked worktrees).
+  const base = workspaceState(root, env);
   const dir = path.join(base, "idempotency", kind);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   return path.join(dir, `${keyDigest}.json`);
