@@ -19,6 +19,7 @@
     "version:bump": "node scripts/bump-version.mjs",
     "check": "npm run validate && npm test",
     "worker:evidence": "node scripts/worker-broker-evidence.mjs",
+    "worker:prove": "node scripts/worker-broker-evidence.mjs prove",
     "worker:verify": "node scripts/worker-broker-evidence.mjs verify",
     "worker:qualify": "node scripts/worker-broker-evidence.mjs qualify"
   },

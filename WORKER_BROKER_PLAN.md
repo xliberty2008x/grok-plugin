@@ -180,13 +180,19 @@ The current capture command records identity and an honest `implemented_unverifi
 npm run worker:evidence -- capture --phase <N> --slice <slice-id> --write
 ```
 
-It must not promote a phase. The current qualification command is also capture-only and exits nonzero when live work is skipped:
+It must not promote a phase. Phase 0 now has a code-owned execution-only proof producer; it accepts no caller-supplied command, argv, outcome, environment, or result input:
+
+```sh
+npm run worker:prove -- --phase 0 --slice evidence-system --write
+```
+
+The producer runs the fixed Phase 0 manifest, binds a clean stable source identity before/after execution and publication, stores only bounded redacted output digests, and performs a locked fail-closed baseline cutover. Its implementation remains `implemented_unverified` until committed and used to publish a current exact-source immutable record. The current qualification command is also capture-only and exits nonzero when live work is skipped:
 
 ```sh
 npm run worker:qualify -- --phase <N> --host <codex|claude-code> --record
 ```
 
-A proof-producing gate runner or bounded ingestion path is still required before new `verified_on_draft`/`qualified` records can be written without hand-editing evidence.
+No generic result-ingestion path is trusted. Later phase/live producers must add separately reviewed code-owned manifests or authenticated receipts rather than accepting caller-authored proof JSON.
 
 ## 6. Phase 0 — Baseline and evidence system
 
@@ -201,7 +207,7 @@ Phase 0 establishes the fail-closed evidence machinery used by every downstream 
 | P0-D1 | Machine-readable evidence schema and nested allowlists | `implemented_unverified` | Evidence schema and validator | Bind to clean integrated commit and record passing schema tests |
 | P0-D2 | Canonical digest, immutable write, safe ledger identity, historical compatibility | `implemented_unverified` | Evidence library and focused regression tests | Rerun after integration and preserve command outcome digest |
 | P0-D3 | Phase scopes, mandatory gates, and prerequisite digest closure | `implemented_unverified` | Phase manifests in evidence library | Supersede all stale phase records with exact prerequisites |
-| P0-D4 | Proof-producing capture/replay workflow | `not_started` | The current CLI is an identity-only capture and strict replay skeleton, not a proof producer | Add/approve bounded gate-result execution or ingestion for verified records; never hand-edit proof |
+| P0-D4 | Proof-producing capture/replay workflow | `implemented_unverified` | Fixed Phase 0 manifest, broker-owned producer provenance, bounded sanitized execution, private promotion authority, post-publication source recheck/rollback, strict resulting-ledger validation, and locked legacy-current cutover in evidence library/CLI; focused suite passes 50/50 | Commit this source slice; generalize the code-owned producer before final qualification, then publish Phase 0 only after all evidence-source changes are frozen |
 | P0-D5 | Current immutable records and ledger | `implemented_unverified` | Existing records and ledger are migration inputs | Create new current records after clean commit; keep old entries historical |
 | P0-D6 | Exact-source installed natural Codex proof | `not_started` | Installed inventory and natural-host trace | Install exact artifact and run natural task without source-tree bypass |
 | P0-D7 | Current authenticated macOS Grok lifecycle proof | `not_started` | Redacted provider qualification record | Run provider lifecycle against same source/install identity |
@@ -429,9 +435,9 @@ This ledger distinguishes implementation found in the working tree from proof st
 
 | Audit item | Observed/done | Authoritative check or artifact | Remaining remediation |
 | --- | --- | --- | --- |
-| A-01 Evidence contract | Schema, canonical digest, bounded command outcomes, qualification boundaries, nested allowlists, phase scopes, prerequisites, and historical compatibility implemented | Evidence schema/library/CLI; `node --test tests/worker-broker-evidence.test.mjs` | Commit integrated source, add proof-producing ingestion, supersede current records, run strict replay |
-| A-02 Evidence regression | Focused suite passed in the audit working tree | `node --test tests/worker-broker-evidence.test.mjs` | Preserve exact command timestamps/output digest in new Phase 0 record |
-| A-03 Repository validation | Final integrated pre-commit run passed 366 tests with 0 failures and 1 expected authenticated-live skip; validation emitted only the historical profile-v2 warning | `npm run validate`; `npm run check` | Repeat on the exact clean commit and record the commit-bound count in issue #25/PR #26 |
+| A-01 Evidence contract | Schema, canonical digest, bounded command outcomes, qualification boundaries, nested allowlists, phase scopes, prerequisites, historical compatibility, and the fixed Phase 0 proof producer are implemented | Evidence schema/library/CLI; `node --test tests/worker-broker-evidence.test.mjs` | Commit integrated source, run the code-owned producer, supersede stale current claims through its locked cutover, and run strict replay |
+| A-02 Evidence regression | Focused suite passed 50/50 in the proof-runner working tree | `node --test tests/worker-broker-evidence.test.mjs` | Repeat through the producer on the exact clean commit and preserve its bounded timestamps/output digests in the new Phase 0 record |
+| A-03 Repository validation | Phase 0 stationary pre-commit run passed 377 tests with 0 failures and 1 expected authenticated-live skip; validation emitted only the historical profile-v2 warning | `npm run validate`; `npm run check` | Repeat on the exact clean commit and again after every later integrated source slice; record the final commit-bound count in issue #25/PR #26 |
 | A-04 Current ledger | Entries exist for Phases 0–5 but bind older source and evidence shape | Ledger and phase JSON files | Keep immutable, supersede from clean final source, prove identity/prerequisite closure |
 | A-05 Strict replay | Hardened strict replay fails closed on stale records | `npm run worker:verify -- --all --strict` returns nonzero | This becomes a required pass only after supersession; do not weaken validator |
 | A-06 Phase 1 foundation | Protocol, read broker, mutation, cancellation, and reconcile code/tests exist | Worker protocol/service/mutation files and focused test files | Run focused/full gates, restart/crash and installed/live flows, write current record |
@@ -442,9 +448,9 @@ This ledger distinguishes implementation found in the working tree from proof st
 | A-11 Independent Grok review | Review lifecycle ended with explicit `E_STATE`; native/manual audit continued | No qualifying repository artifact was produced; preserve the typed failure in task history | Optional fresh Grok review after lifecycle recovery; never count failed/fallback review as proof |
 | A-12 Plan/issue synchronization | This plan links open issue #25 and now records conservative truth | This file | After commit, update issue with exact commit, commands, outcomes, record paths, and unchecked residuals |
 | A-13 Native MCP enhancement | Draft ADR defines the E0-E7 path from durable broker foundations to a production native-shaped MCP control loop | `docs/superpowers/specs/2026-07-16-native-mcp-control-surface-design.md` | Do not count the ADR as implementation; contract and execute provider launch, live delivery, facade/multi-wait, host verification, skill teaching, and natural MCP proof as future bounded slices |
-| A-14 Independent native safety audit | Multiple stationary read-only reviews reproduced and remediated state-lock, cancellation, reconciliation, mailbox, evidence privacy/publication, ledger lost-update, legacy cutover/class normalization, dirty-parent, authoritative-record corruption, CLI/SessionEnd launch-window, and unmerged-index failures | Final frozen-tree review passed focused 195/195 and full 366 passed plus 1 expected live-auth skip, with no remaining P0/P1 or other P2 blocker | Bind the result to the exact commit checks and issue/PR update; reviewer findings do not promote any phase without exact-source records |
+| A-14 Independent native safety audit | Multiple stationary read-only reviews reproduced and remediated state-lock, cancellation, reconciliation, mailbox, evidence privacy/publication, ledger lost-update, legacy cutover/class normalization, dirty-parent, authoritative-record corruption, CLI/SessionEnd launch-window, unmerged-index, publication-drift, and producer-presence failures | Prior integrated audit passed focused 195/195 and full 366 plus 1 expected live-auth skip; the fresh Phase 0 review passed focused 50/50 and the full tree passed 377 plus 1 expected live-auth skip, with no remaining P0/P1/P2 defect in this slice | Repeat fresh independent validation on the final integrated commit; reviewer findings do not promote any phase without exact-source records |
 | A-15 Legacy cutover boundary | Immutable snapshot receipts, global quiescence preflight, late terminal import, and divergent-content failure are implemented | `workspace.mjs` and worktree migration regressions | Operate only after old workers finish/stop; retain legacy directories; do not claim live cross-version fencing |
-| A-16 Evidence publication concurrency/privacy | Repository-local generation-bound ledger serialization, crash/reclaim transitions, raw publication validation, exact ledger allowlists, and concurrent append regressions are implemented | Evidence library/CLI and 39 focused evidence tests | Bind to the exact clean commit; strict replay remains red until current records and proof-producing ingestion exist |
+| A-16 Evidence publication concurrency/privacy | Repository-local generation-bound ledger serialization, crash/reclaim transitions, raw publication validation, exact ledger allowlists, concurrent append regressions, private proof promotion, property-presence producer validation, strict producer-current validation, post-ledger source rollback, and atomic pre-runner baseline cutover are implemented | Evidence library/CLI and 50 focused evidence tests | Bind to the exact clean commit and publish the current Phase 0 record; no implementation-only test result promotes the phase |
 | A-17 Cross-version CI remediation | Secret-shaped test canaries are composed only at runtime; the legacy cache probe observes the exact retained payload instead of Node internals; foreground crash recovery is verified by one bounded recovery actor with a cleared timer and persisted terminal assertions | Node 18.18.2 focused/full worktree and runtime suites; `npm run check`; GitGuardian and GitHub Actions OS/Node matrix | Repeat on the exact remote commit, require the supported deterministic matrix and secret scan to pass, and continue treating skipped live-host/provider jobs as absent proof |
 
 ## 13. Acceptance target definitions
@@ -480,9 +486,9 @@ Issue #25 must link this plan near the top and mirror stable deliverable IDs. Fo
 
 1. [Done for this delivery] Integrate all concurrent implementation and remediation edits without overlapping or discarding unrelated work.
 2. [Done for pre-commit remediation] Run phase-focused deterministic suites, independent negative review, and fix every P0/P1/P2 finding accepted into scope.
-3. [Pending final stationary tree] Run `npm run check`, `git diff --check`, and `git diff --cached --check` on the complete pre-commit integrated tree.
+3. [Done for Phase 0 source slice; repeat on final stationary tree] Run `npm run check`, `git diff --check`, and `git diff --cached --check` on the complete pre-commit integrated tree.
 4. [Pending final commit] Commit the source, then run `git show --check --format= HEAD` and `npm run check` so proof binds to that exact commit/tree and stable phase-scope digests.
-5. Complete Phase 0 proof-producing ingestion, then generate a new Phase 0 current record.
+5. [Pending final evidence-source freeze] Generalize the code-owned producer, then run `npm run worker:prove -- --phase 0 --slice evidence-system --write` on the final clean source and require Phase 0 and all-ledger strict integrity replay to pass while `--require-complete` remains honestly red.
 6. Generate Phase 1–4 current records in dependency order, each referencing current predecessor digests and mandatory gate IDs.
 7. Run clean installed natural Codex and compatibility Claude scenarios for the exact installed artifact.
 8. Run authenticated Grok lifecycle scenarios without exposing credentials or private runtime data.

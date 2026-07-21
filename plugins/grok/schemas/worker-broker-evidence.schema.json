@@ -29,13 +29,17 @@
     "limits",
     "recordDigest"
   ],
-  "not": {
-    "properties": {
-      "status": { "enum": ["verified_on_draft", "qualified"] }
-    },
-    "required": ["status"],
-    "description": "Promotion is disabled until a broker-owned proof-producing runner exists."
-  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": { "enum": ["verified_on_draft", "qualified"] }
+        },
+        "required": ["status"]
+      },
+      "then": { "required": ["proofProducer"] }
+    }
+  ],
   "properties": {
     "schemaVersion": { "type": "integer", "const": 1 },
     "roadmapVersion": { "type": "string", "const": "1.0" },
@@ -69,6 +73,19 @@
     "releaseQualification": { "type": "boolean" },
     "evidenceSystemQualification": { "type": "boolean" },
     "provisionalSupportingRecord": { "type": "boolean" },
+    "proofProducer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "manifestDigest"],
+      "properties": {
+        "id": { "type": "string", "const": "worker-broker-gate-runner" },
+        "version": { "type": "integer", "const": 1 },
+        "manifestDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
     "qualification": {
       "type": "object",
       "additionalProperties": false,

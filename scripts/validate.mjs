@@ -418,11 +418,21 @@ if (!versionsOnly) {
         problem(`Worker Broker evidence schema is missing required field ${field}.`, file);
       }
     }
-    const blockedPromotions = workerEvidenceSchema.not?.properties?.status?.enum || [];
+    const proofRule = (workerEvidenceSchema.allOf || []).find((rule) => (
+      rule?.then?.required?.includes("proofProducer")
+    ));
+    const proofStatuses = proofRule?.if?.properties?.status?.enum || [];
     for (const status of ["verified_on_draft", "qualified"]) {
-      if (!blockedPromotions.includes(status)) {
-        problem(`Worker Broker evidence schema must fail closed on ${status} until proof provenance exists.`, file);
+      if (!proofStatuses.includes(status)) {
+        problem(`Worker Broker evidence schema must require proofProducer for ${status}.`, file);
       }
+    }
+    const proofProducer = workerEvidenceSchema.properties?.proofProducer;
+    if (proofProducer?.additionalProperties !== false
+      || proofProducer?.properties?.id?.const !== "worker-broker-gate-runner"
+      || proofProducer?.properties?.version?.const !== 1
+      || !proofProducer?.required?.includes("manifestDigest")) {
+      problem("Worker Broker evidence schema must bind exact gate-runner provenance.", file);
     }
     if (workerEvidenceSchema.properties?.scenarios?.items?.properties?.measurements?.additionalProperties !== false) {
       problem("Worker Broker scenario measurements must be a bounded allowlist.", file);

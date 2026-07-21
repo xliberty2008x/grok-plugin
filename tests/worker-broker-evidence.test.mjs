@@ -8,10 +8,14 @@ import {
   REPO_ROOT,
   PHASE_SCOPE,
   PHASE_MANDATORY_GATE_IDS,
+  PHASE_PROOF_GATE_MANIFEST,
+  PROOF_PRODUCER_ID,
+  PROOF_PRODUCER_VERSION,
   attachRecordDigest,
   buildEvidenceRecord,
   computeInventoryDigest,
   computePhaseScopeDigest,
+  computeProofManifestDigest,
   computeRecordDigest,
   expandLocalStaticImportClosure,
   findMissingLocalStaticImportDependencies,
@@ -20,6 +24,9 @@ import {
   isNonEvidenceTreeClean,
   loadLedger,
   parsePorcelainV1ZChanges,
+  provePhaseZero,
+  runCommandCapture,
+  sanitizeProofEnvironment,
   updateLedger,
   validateEvidenceRecord,
   verifyLedger,
@@ -153,6 +160,27 @@ function deterministicQualification() {
   };
 }
 
+function exactPhaseZeroProof() {
+  return PHASE_PROOF_GATE_MANIFEST["0"].map((gate) => ({
+    gateId: gate.gateId,
+    argv: [...gate.argv],
+    boundary: gate.boundary,
+    outcome: "pass",
+    startedAt: STARTED_AT,
+    endedAt: ENDED_AT,
+    exitCode: 0,
+    outputDigest: sha256Text(`${gate.gateId}:proof`)
+  }));
+}
+
+function proofProducer(phase = "0") {
+  return {
+    id: PROOF_PRODUCER_ID,
+    version: PROOF_PRODUCER_VERSION,
+    manifestDigest: computeProofManifestDigest(phase)
+  };
+}
+
 function initPhaseZeroEvidenceFixture(name = "evidence-fixture") {
   const root = initRepo();
   for (const relative of PHASE_SCOPE["0"]) {
@@ -171,6 +199,93 @@ function initPhaseZeroEvidenceFixture(name = "evidence-fixture") {
   git(root, "add", ".");
   git(root, "commit", "-m", `add ${name}`);
   return { root, evidenceDir };
+}
+
+function initProofRunnerFixture(name, checkScript = "node --test tests/proof-smoke.test.mjs") {
+  const { root, evidenceDir } = initPhaseZeroEvidenceFixture(name);
+  fs.writeFileSync(path.join(root, "package.json"), `${JSON.stringify({
+    name,
+    version: "1.0.0",
+    private: true,
+    type: "module",
+    scripts: { check: checkScript }
+  }, null, 2)}\n`);
+  fs.writeFileSync(
+    path.join(root, "tests/worker-broker-evidence.test.mjs"),
+    'import test from "node:test";\nimport assert from "node:assert/strict";\ntest("focused", () => assert.equal(1, 1));\n'
+  );
+  fs.writeFileSync(
+    path.join(root, "tests/proof-smoke.test.mjs"),
+    'import test from "node:test";\nimport assert from "node:assert/strict";\ntest("smoke", () => assert.equal(1, 1));\n'
+  );
+  git(root, "add", ".");
+  git(root, "commit", "-m", `configure ${name}`);
+  return { root, evidenceDir };
+}
+
+function seedPreRunnerCurrent(root, phase, slice = `legacy-${phase}`) {
+  const base = buildEvidenceRecord({
+    root,
+    phase: "0",
+    slice,
+    status: "implemented_unverified",
+    verification: [passedCommand("legacy", "legacy proof")]
+  });
+  const legacy = attachRecordDigest({
+    ...base,
+    phase: String(phase),
+    slice,
+    status: "verified_on_draft",
+    evidenceSystemQualification: true,
+    qualification: deterministicQualification()
+  });
+  const recordPath = rawEvidenceFixturePath(root, legacy);
+  updateLedger({
+    phase: legacy.phase,
+    slice: legacy.slice,
+    status: legacy.status,
+    path: recordPath,
+    recordDigest: legacy.recordDigest,
+    sourceCommit: legacy.source.headCommit,
+    recordedAt: legacy.recordedAt
+  }, root);
+  return { record: legacy, recordPath };
+}
+
+function spawnProofWriter({ root, slice, ready, barrier }) {
+  const source = `
+import fs from "node:fs";
+import { provePhaseZero } from ${JSON.stringify(EVIDENCE_MODULE_URL)};
+fs.writeFileSync(process.env.READY_FILE, "ready\\n");
+while (!fs.existsSync(process.env.BARRIER_FILE)) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+}
+const result = provePhaseZero({ phase: "0", slice: process.env.PROOF_SLICE, root: process.env.PROOF_ROOT, write: true });
+process.stdout.write(JSON.stringify({ ok: result.ok, code: result.code || null }) + "\\n");
+process.exitCode = result.ok ? 0 : 1;
+`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PROOF_ROOT: root,
+      PROOF_SLICE: slice,
+      READY_FILE: ready,
+      BARRIER_FILE: barrier
+    },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const completed = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => resolve({ code, signal, stdout, stderr }));
+  });
+  return { child, completed };
 }
 
 function writePhaseZeroLedgerRecord(root, slice) {
@@ -1279,7 +1394,176 @@ test("release transition retires only its generation and cannot delete a success
   fs.rmSync(lock, { recursive: true, force: true });
 });
 
-test("strict validator rejects caller-authored promotion even with plausible mandatory gate metadata", () => {
+test("Phase 0 proof manifest and persisted producer provenance are exact", () => {
+  assert.deepEqual(
+    PHASE_PROOF_GATE_MANIFEST["0"].map((gate) => gate.gateId),
+    PHASE_MANDATORY_GATE_IDS["0"]
+  );
+  assert.match(computeProofManifestDigest("0"), /^[0-9a-f]{64}$/);
+  assert.equal(Object.isFrozen(PHASE_PROOF_GATE_MANIFEST["0"]), true);
+  assert.equal(Object.isFrozen(PHASE_PROOF_GATE_MANIFEST["0"][0].argv), true);
+
+  const { root } = initProofRunnerFixture("proof-provenance");
+  let record = buildEvidenceRecord({
+    root,
+    phase: "0",
+    slice: "proof-provenance",
+    status: "verified_on_draft",
+    verification: exactPhaseZeroProof(),
+    qualification: deterministicQualification(),
+    evidenceSystemQualification: true
+  });
+  record = attachRecordDigest({ ...record, proofProducer: proofProducer() });
+  const accepted = validateEvidenceRecord(record, { strict: true, root });
+  assert.equal(accepted.ok, true, accepted.errors.join("; "));
+
+  const wrongArgv = structuredClone(record);
+  wrongArgv.verification[0].argv = ["node", "-e", "process.exit(0)"];
+  const wrongArgvResult = validateEvidenceRecord(attachRecordDigest(wrongArgv), { strict: true, root });
+  assert.equal(wrongArgvResult.ok, false);
+  assert.ok(wrongArgvResult.errors.some((message) => /argv.*code-owned proof manifest/i.test(message)));
+
+  const missing = structuredClone(record);
+  missing.verification.pop();
+  const missingResult = validateEvidenceRecord(attachRecordDigest(missing), { strict: true, root });
+  assert.equal(missingResult.ok, false);
+  assert.ok(missingResult.errors.some((message) => /exactly the code-owned/i.test(message)));
+
+  const duplicate = structuredClone(record);
+  duplicate.verification[1] = structuredClone(duplicate.verification[0]);
+  const duplicateResult = validateEvidenceRecord(attachRecordDigest(duplicate), { strict: true, root });
+  assert.equal(duplicateResult.ok, false);
+  assert.ok(duplicateResult.errors.some((message) => /duplicated/i.test(message)));
+
+  const wrongProducer = structuredClone(record);
+  wrongProducer.proofProducer.manifestDigest = "0".repeat(64);
+  const wrongProducerResult = validateEvidenceRecord(attachRecordDigest(wrongProducer), { strict: true, root });
+  assert.equal(wrongProducerResult.ok, false);
+  assert.ok(wrongProducerResult.errors.some((message) => /manifestDigest.*code-owned/i.test(message)));
+
+  assert.throws(
+    () => writeEvidenceRecord(record, root),
+    /invalid/i,
+    "the generic writer must never gain verified publication authority"
+  );
+});
+
+test("present null or undefined proofProducer values fail validation and publication", () => {
+  const { root } = initProofRunnerFixture("proof-producer-presence");
+  const base = buildEvidenceRecord({
+    root,
+    phase: "0",
+    slice: "proof-producer-presence",
+    verification: [passedCommand("identity", "identity")]
+  });
+  const phaseDirectory = path.join(root, "tests/e2e-results/worker-broker/phase-0");
+  for (const value of [null, undefined]) {
+    const candidate = attachRecordDigest({ ...base, proofProducer: value });
+    assert.equal(Object.hasOwn(candidate, "proofProducer"), true);
+    const validation = validateEvidenceRecord(candidate);
+    assert.equal(validation.ok, false);
+    assert.ok(validation.errors.some((message) => /proofProducer must be an object when present/i.test(message)));
+    assert.throws(() => writeEvidenceRecord(candidate, root), /invalid/i);
+    if (value === undefined) {
+      assert.equal(Object.hasOwn(JSON.parse(JSON.stringify(candidate)), "proofProducer"), false);
+    }
+  }
+  assert.equal(fs.existsSync(phaseDirectory), false, "invalid producer values must not create evidence paths");
+});
+
+test("proof command capture strips ambient authority and never returns secret-bearing output", () => {
+  const secret = ["xai", "A".repeat(24)].join("-");
+  const environment = sanitizeProofEnvironment({
+    ...process.env,
+    XAI_API_KEY: secret,
+    GROK_E2E: "1",
+    GROK_E2E_CANCEL: "1",
+    NODE_OPTIONS: "--inspect",
+    GIT_DIR: "elsewhere",
+    PASSWORD: secret
+  });
+  for (const key of [
+    "XAI_API_KEY",
+    "GROK_E2E",
+    "GROK_E2E_CANCEL",
+    "NODE_OPTIONS",
+    "GIT_DIR",
+    "PASSWORD"
+  ]) assert.equal(Object.hasOwn(environment, key), false, key);
+  assert.equal(environment.CI, "1");
+
+  const secretResult = runCommandCapture(
+    process.execPath,
+    ["-e", `process.stdout.write(${JSON.stringify(secret)})`],
+    { timeout: 5_000 }
+  );
+  assert.equal(secretResult.outcome, "fail");
+  assert.equal(secretResult.failureKind, "secret_output");
+  assert.equal(JSON.stringify(secretResult).includes(secret), false);
+  assert.equal(Object.hasOwn(secretResult, "stdout"), false);
+  assert.equal(Object.hasOwn(secretResult, "stderr"), false);
+
+  const nonzero = runCommandCapture(process.execPath, ["-e", "process.exit(7)"], { timeout: 5_000 });
+  assert.equal(nonzero.failureKind, "nonzero_exit");
+  assert.equal(nonzero.exitCode, 7);
+
+  const timeout = runCommandCapture(
+    process.execPath,
+    ["-e", "setInterval(() => {}, 1000)"],
+    { timeout: 25 }
+  );
+  assert.equal(timeout.outcome, "fail");
+  assert.equal(timeout.failureKind, "timeout");
+
+  const signalled = runCommandCapture(
+    process.execPath,
+    ["-e", 'process.kill(process.pid, "SIGTERM")'],
+    { timeout: 5_000 }
+  );
+  assert.equal(signalled.outcome, "fail");
+  assert.equal(signalled.failureKind, "signal");
+
+  const missingExecutable = runCommandCapture(
+    "definitely-not-a-worker-proof-executable",
+    [],
+    { timeout: 5_000 }
+  );
+  assert.equal(missingExecutable.outcome, "fail");
+  assert.equal(missingExecutable.failureKind, "spawn_error");
+});
+
+test("Phase 0 proof fails without publication on dirty, drifting, failed, or secret-output gates", () => {
+  const failed = initProofRunnerFixture("proof-failed", 'node -e "process.exit(7)"');
+  const failedResult = provePhaseZero({ phase: "0", slice: "proof-failed", root: failed.root, write: true });
+  assert.equal(failedResult.ok, false);
+  assert.equal(failedResult.code, "E_PROOF_GATE");
+  assert.equal(fs.existsSync(path.join(failed.evidenceDir, "ledger.json")), false);
+
+  const secretExpression = "process.stdout.write(['xai', 'A'.repeat(24)].join('-'))";
+  const secret = initProofRunnerFixture("proof-secret", `node -e "${secretExpression}"`);
+  const secretResult = provePhaseZero({ phase: "0", slice: "proof-secret", root: secret.root, write: true });
+  assert.equal(secretResult.ok, false);
+  assert.equal(secretResult.failureKind, "secret_output");
+  assert.equal(fs.existsSync(path.join(secret.evidenceDir, "ledger.json")), false);
+
+  const dirty = initProofRunnerFixture("proof-dirty");
+  fs.writeFileSync(path.join(dirty.root, "tracked.txt"), "dirty\n");
+  const dirtyResult = provePhaseZero({ phase: "0", slice: "proof-dirty", root: dirty.root, write: true });
+  assert.equal(dirtyResult.ok, false);
+  assert.equal(dirtyResult.code, "E_PROOF_SOURCE_DIRTY");
+  assert.equal(fs.existsSync(path.join(dirty.evidenceDir, "ledger.json")), false);
+
+  const drift = initProofRunnerFixture(
+    "proof-drift",
+    'node -e "require(\'node:fs\').writeFileSync(\'tracked.txt\', \'drift\\n\')"'
+  );
+  const driftResult = provePhaseZero({ phase: "0", slice: "proof-drift", root: drift.root, write: true });
+  assert.equal(driftResult.ok, false);
+  assert.equal(driftResult.code, "E_PROOF_SOURCE_DRIFT");
+  assert.equal(fs.existsSync(path.join(drift.evidenceDir, "ledger.json")), false);
+});
+
+test("strict validator rejects caller-authored promotion without exact producer provenance", () => {
   const record = buildEvidenceRecord({
     phase: "0",
     slice: "strict-positive",
@@ -1296,7 +1580,7 @@ test("strict validator rejects caller-authored promotion even with plausible man
   });
   const result = validateEvidenceRecord(record, { strict: true, root: REPO_ROOT });
   assert.equal(result.ok, false);
-  assert.ok(result.errors.some((message) => /promotion is disabled.*proof-producing runner/i.test(message)));
+  assert.ok(result.errors.some((message) => /proofProducer provenance/i.test(message)));
 });
 
 test("strict ledger validates incomplete integrity while readiness remains fail closed", () => {
@@ -1512,6 +1796,231 @@ test("strict ledger applies raw privacy checks to historical and invalidated leg
   const serialized = JSON.stringify(result);
   for (const canary of canaries) assert.equal(serialized.includes(canary), false);
   assert.equal(serialized.includes("rawSecret"), false);
+});
+
+test("proof publication atomically invalidates canonical pre-runner current claims", () => {
+  const { root } = initProofRunnerFixture("proof-cutover");
+  seedPreRunnerCurrent(root, "0", "legacy-zero");
+  seedPreRunnerCurrent(root, "1", "legacy-one");
+
+  const result = provePhaseZero({ phase: "0", slice: "phase-zero-baseline", root, write: true });
+  assert.equal(result.ok, true, result.code);
+  assert.match(result.path, /^tests\/e2e-results\/worker-broker\/phase-0\//);
+  const ledger = loadLedger(root);
+  const current = ledger.entries.filter((entry) => entry.currency === "current");
+  assert.equal(current.length, 1);
+  assert.equal(current[0].phase, "0");
+  assert.equal(current[0].recordDigest, result.recordDigest);
+  assert.equal(
+    ledger.entries.filter((entry) => entry.currency === "invalidated").length,
+    2
+  );
+  const strict = verifyPhase("0", root, { strict: true });
+  assert.equal(strict.ok, true, strict.errors.join("; "));
+  const allStrict = verifyLedger(root, { strict: true });
+  assert.equal(allStrict.ok, true, allStrict.errors.join("; "));
+  const readiness = verifyLedger(root, { strict: true, requireComplete: true });
+  assert.equal(readiness.ok, false);
+  assert.equal(readiness.readinessReady, false);
+  assert.ok(readiness.errors.some((message) => /phase 1/i.test(message)));
+});
+
+test("baseline cutover refuses current captures, private history, and identity tampering", () => {
+  {
+    const { root } = initProofRunnerFixture("proof-cutover-current-capture");
+    const current = buildEvidenceRecord({
+      root,
+      phase: "0",
+      slice: "caller-capture",
+      verification: [passedCommand("identity", "identity")]
+    });
+    const currentPath = writeEvidenceRecord(current, root);
+    updateLedger({
+      phase: current.phase,
+      slice: current.slice,
+      status: current.status,
+      path: currentPath,
+      recordDigest: current.recordDigest,
+      sourceCommit: current.source.headCommit,
+      recordedAt: current.recordedAt
+    }, root);
+    const result = provePhaseZero({ phase: "0", slice: "must-refuse-current", root, write: true });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "E_PROOF_PUBLICATION");
+    assert.equal(loadLedger(root).entries.filter((entry) => entry.currency === "current")[0].slice, "caller-capture");
+  }
+
+  {
+    const { root } = initProofRunnerFixture("proof-cutover-private");
+    const { record } = seedPreRunnerCurrent(root, "0", "private-legacy");
+    const ledger = loadLedger(root);
+    const entry = ledger.entries[0];
+    const privateRecord = attachRecordDigest({
+      ...record,
+      rawSecret: "PRIVATE_EVIDENCE_CANARY"
+    });
+    fs.writeFileSync(path.join(root, entry.path), `${JSON.stringify(privateRecord, null, 2)}\n`);
+    entry.recordDigest = privateRecord.recordDigest;
+    const ledgerPath = path.join(root, "tests/e2e-results/worker-broker/ledger.json");
+    fs.writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`);
+    const result = provePhaseZero({ phase: "0", slice: "must-refuse-private", root, write: true });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "E_PROOF_PUBLICATION");
+    assert.equal(JSON.stringify(result).includes("PRIVATE_EVIDENCE_CANARY"), false);
+    assert.equal(loadLedger(root).entries[0].currency, "current");
+  }
+
+  {
+    const { root } = initProofRunnerFixture("proof-cutover-identity");
+    seedPreRunnerCurrent(root, "0", "identity-legacy");
+    const ledgerPath = path.join(root, "tests/e2e-results/worker-broker/ledger.json");
+    const ledger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+    ledger.entries[0].sourceCommit = "0".repeat(40);
+    fs.writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`);
+    const result = provePhaseZero({ phase: "0", slice: "must-refuse-identity", root, write: true });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "E_PROOF_PUBLICATION");
+    assert.equal(loadLedger(root).entries[0].currency, "current");
+  }
+});
+
+test("baseline cutover rejects malformed object and null proofProducer values by property presence", () => {
+  const { root } = initProofRunnerFixture("proof-cutover-malformed-producer");
+  const { record, recordPath } = seedPreRunnerCurrent(root, "0", "malformed-producer-current");
+  const malformed = attachRecordDigest({
+    ...record,
+    proofProducer: {
+      id: "caller-forged-producer",
+      version: PROOF_PRODUCER_VERSION,
+      manifestDigest: "0".repeat(64)
+    }
+  });
+  fs.writeFileSync(path.join(root, recordPath), `${JSON.stringify(malformed, null, 2)}\n`);
+  const ledgerPath = path.join(root, "tests/e2e-results/worker-broker/ledger.json");
+  const ledger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  ledger.entries[0].recordDigest = malformed.recordDigest;
+  fs.writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`);
+
+  const result = provePhaseZero({ phase: "0", slice: "must-refuse-malformed-producer", root, write: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "E_PROOF_PUBLICATION");
+  const unchanged = loadLedger(root);
+  assert.equal(unchanged.entries.filter((entry) => entry.currency === "current").length, 1);
+  assert.equal(unchanged.entries[0].slice, "malformed-producer-current");
+  assert.equal(unchanged.entries[0].currency, "current");
+
+  const nullProducer = attachRecordDigest({ ...record, proofProducer: null });
+  fs.writeFileSync(path.join(root, recordPath), `${JSON.stringify(nullProducer, null, 2)}\n`);
+  const nullLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  nullLedger.entries[0].recordDigest = nullProducer.recordDigest;
+  fs.writeFileSync(ledgerPath, `${JSON.stringify(nullLedger, null, 2)}\n`);
+  const nullResult = provePhaseZero({ phase: "0", slice: "must-refuse-null-producer", root, write: true });
+  assert.equal(nullResult.ok, false);
+  assert.equal(nullResult.code, "E_PROOF_PUBLICATION");
+  const nullUnchanged = loadLedger(root);
+  assert.equal(nullUnchanged.entries.filter((entry) => entry.currency === "current").length, 1);
+  assert.equal(nullUnchanged.entries[0].slice, "malformed-producer-current");
+});
+
+test("proof publication crash leaves only an orphan and retry completes cutover", () => {
+  const { root } = initProofRunnerFixture("proof-cutover-crash");
+  seedPreRunnerCurrent(root, "0", "legacy-before-crash");
+  const rename = fs.renameSync;
+  fs.renameSync = (source, destination) => {
+    if (path.basename(destination) === "ledger.json"
+      && path.basename(source).startsWith(".ledger.json.")) {
+      throw new Error("injected ledger publication crash");
+    }
+    return rename(source, destination);
+  };
+  let crashed;
+  try {
+    crashed = provePhaseZero({ phase: "0", slice: "crash-before-ledger", root, write: true });
+  } finally {
+    fs.renameSync = rename;
+  }
+  assert.equal(crashed.ok, false);
+  assert.equal(crashed.code, "E_PROOF_PUBLICATION");
+  assert.equal(loadLedger(root).entries.filter((entry) => entry.currency === "current")[0].slice, "legacy-before-crash");
+  const phaseDirectory = path.join(root, "tests/e2e-results/worker-broker/phase-0");
+  assert.ok(fs.readdirSync(phaseDirectory).filter((name) => name.endsWith(".json")).length >= 2);
+
+  const retried = provePhaseZero({ phase: "0", slice: "retry-after-crash", root, write: true });
+  assert.equal(retried.ok, true, retried.code);
+  const strict = verifyLedger(root, { strict: true });
+  assert.equal(strict.ok, true, strict.errors.join("; "));
+});
+
+test("tracked source drift at ledger replacement invalidates every current claim before failure", () => {
+  const { root } = initProofRunnerFixture("proof-post-ledger-drift");
+  seedPreRunnerCurrent(root, "0", "legacy-before-post-ledger-drift");
+  const rename = fs.renameSync;
+  let ledgerReplacements = 0;
+  fs.renameSync = (source, destination) => {
+    const result = rename(source, destination);
+    if (path.basename(destination) === "ledger.json"
+      && path.basename(source).startsWith(".ledger.json.")) {
+      ledgerReplacements += 1;
+      fs.writeFileSync(path.join(root, "tracked.txt"), "drift-after-ledger-replacement\n");
+    }
+    return result;
+  };
+  let observed;
+  try {
+    observed = provePhaseZero({ phase: "0", slice: "post-ledger-drift", root, write: true });
+  } finally {
+    fs.renameSync = rename;
+  }
+  assert.equal(observed.ok, false);
+  assert.equal(observed.code, "E_PROOF_PUBLICATION");
+  assert.ok(ledgerReplacements >= 2, "the successful rename must be followed by a fail-closed invalidation rename");
+  const ledger = loadLedger(root);
+  assert.equal(ledger.entries.filter((entry) => entry.currency === "current").length, 0);
+  assert.equal(ledger.entries.filter((entry) => entry.currency === "invalidated").length, 2);
+  const strict = verifyLedger(root, { strict: true });
+  assert.equal(strict.ok, true, strict.errors.join("; "));
+});
+
+test("concurrent Phase 0 proof writers retain one current record without lost cutover", async () => {
+  const { root } = initProofRunnerFixture("proof-cutover-concurrent");
+  seedPreRunnerCurrent(root, "0", "legacy-concurrent");
+  const control = tempDir("proof-writer-barrier-");
+  const barrier = path.join(control, "go");
+  const readyA = path.join(control, "ready-a");
+  const readyB = path.join(control, "ready-b");
+  const first = spawnProofWriter({ root, slice: "concurrent-a", ready: readyA, barrier });
+  const second = spawnProofWriter({ root, slice: "concurrent-b", ready: readyB, barrier });
+  await waitFor(() => fs.existsSync(readyA) && fs.existsSync(readyB));
+  fs.writeFileSync(barrier, "go\n");
+  const [firstResult, secondResult] = await Promise.all([first.completed, second.completed]);
+  assert.equal(firstResult.code, 0, firstResult.stderr);
+  assert.equal(secondResult.code, 0, secondResult.stderr);
+  const ledger = loadLedger(root);
+  assert.equal(ledger.entries.filter((entry) => entry.currency === "current").length, 1);
+  assert.equal(ledger.entries.filter((entry) => entry.currency === "invalidated").length, 1);
+  assert.equal(ledger.entries.filter((entry) => entry.currency === "historical").length, 1);
+  const strict = verifyLedger(root, { strict: true });
+  assert.equal(strict.ok, true, strict.errors.join("; "));
+});
+
+test("prove CLI rejects injection-shaped and duplicate arguments before execution", () => {
+  const cases = [
+    ["--phase", "0", "--phase", "0", "--slice", "duplicate"],
+    ["--phase", "0", "--slice", "valid", "--command", "true"],
+    ["--phase", "0", "--slice", "valid", "--argv", "true"],
+    ["--phase", "1", "--slice", "wrong-phase"],
+    ["--phase", "0", "--slice", "bad;touch-sentinel"],
+    ["--phase", "0", "--slice", "valid", "--write", "--write"]
+  ];
+  for (const args of cases) {
+    const result = run(process.execPath, [
+      path.join(ROOT, "scripts/worker-broker-evidence.mjs"),
+      "prove",
+      ...args
+    ], { cwd: ROOT });
+    assert.notEqual(result.status, 0, args.join(" "));
+    assert.match(result.stderr, /Usage:/);
+  }
 });
 
 test("capture CLI refuses fabricated verified or qualified status", () => {

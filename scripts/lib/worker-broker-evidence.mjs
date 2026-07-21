@@ -21,6 +21,8 @@ export const EVIDENCE_ONLY_PREFIXES = Object.freeze([
   "tests/e2e-results/macos-",
   "tests/e2e-results/qualification-"
 ]);
+export const PROOF_PRODUCER_ID = "worker-broker-gate-runner";
+export const PROOF_PRODUCER_VERSION = 1;
 
 /** Explicit phase entrypoints; repository-local static imports are derived below. */
 const PHASE_SCOPE_SEEDS = freezeScopeMap({
@@ -350,6 +352,51 @@ export const PHASE_MANDATORY_GATE_IDS = Object.freeze({
   aggregate: Object.freeze(["repository-check", "aggregate-qualification", "git-diff-check"])
 });
 
+function freezeGateManifest(manifest) {
+  return Object.freeze(Object.fromEntries(
+    Object.entries(manifest).map(([phase, gates]) => [
+      phase,
+      Object.freeze(gates.map((gate) => Object.freeze({
+        ...gate,
+        argv: Object.freeze([...gate.argv])
+      })))
+    ])
+  ));
+}
+
+/**
+ * Code-owned proof commands. CLI callers may select a supported phase, but can
+ * never provide or replace an executable, argv, boundary, timeout, or outcome.
+ */
+export const PHASE_PROOF_GATE_MANIFEST = freezeGateManifest({
+  "0": [
+    {
+      gateId: "repository-check",
+      argv: ["npm", "run", "check"],
+      boundary: "source-provider-neutral",
+      timeoutMs: 15 * 60_000
+    },
+    {
+      gateId: "phase-0-focused-tests",
+      argv: ["node", "--test", "tests/worker-broker-evidence.test.mjs"],
+      boundary: "focused-source-provider-neutral",
+      timeoutMs: 5 * 60_000
+    },
+    {
+      gateId: "git-diff-check",
+      argv: ["git", "show", "--check", "--format=", "HEAD"],
+      boundary: "source",
+      timeoutMs: 60_000
+    }
+  ]
+});
+
+export function computeProofManifestDigest(phase) {
+  const manifest = PHASE_PROOF_GATE_MANIFEST[String(phase)];
+  if (!manifest) throw new Error("No proof gate manifest exists for this phase.");
+  return sha256Text(stableStringify(manifest));
+}
+
 /** Phase dependency closure required for current verified evidence. */
 export const PHASE_PREREQUISITES = Object.freeze({
   "0": Object.freeze([]),
@@ -381,6 +428,7 @@ const RECORD_TOP_LEVEL_FIELDS = new Set([
   "releaseQualification",
   "evidenceSystemQualification",
   "provisionalSupportingRecord",
+  "proofProducer",
   "qualification",
   "source",
   "installation",
@@ -410,6 +458,11 @@ const VERIFICATION_FIELDS = new Set([
   "outputDigest",
   "assertions",
   "skipMeaning"
+]);
+const PROOF_PRODUCER_FIELDS = new Set([
+  "id",
+  "version",
+  "manifestDigest"
 ]);
 
 const SOURCE_FIELDS = new Set([
@@ -528,6 +581,7 @@ const LEDGER_ENTRY_FIELDS = new Set([
 const EVIDENCE_PATH_FIELDS = new Set([
   ...RECORD_TOP_LEVEL_FIELDS,
   ...VERIFICATION_FIELDS,
+  ...PROOF_PRODUCER_FIELDS,
   ...SOURCE_FIELDS,
   ...INSTALLATION_FIELDS,
   ...RUNTIME_FIELDS,
@@ -1815,12 +1869,6 @@ export function validateEvidenceRecord(record, options = {}) {
   }
   if (typeof record.slice !== "string" || !record.slice) fail("slice is required.");
   if (!STATUS_SET.has(record.status)) fail("status is invalid.");
-  if (VERIFIED_STATUS_SET.has(record.status)) {
-    fail(
-      "Verified status promotion is disabled until a broker-owned proof-producing runner "
-      + "can attest executed gates; caller-authored timestamps and digests are not proof."
-    );
-  }
   if (!isIsoDateTime(record.recordedAt)) fail("recordedAt must be a valid date-time.");
   const phase = String(record.phase ?? "");
   if ((phase === "aggregate") !== (record.recordType === "worker-broker-aggregate")) {
@@ -1834,6 +1882,42 @@ export function validateEvidenceRecord(record, options = {}) {
   }
   if (typeof record.provisionalSupportingRecord !== "boolean") {
     fail("provisionalSupportingRecord must be boolean.");
+  }
+
+  const hasProofProducer = Object.hasOwn(record, "proofProducer");
+  const proofProducer = record.proofProducer;
+  let proofProducerValid = false;
+  if (hasProofProducer) {
+    if (!proofProducer || typeof proofProducer !== "object" || Array.isArray(proofProducer)) {
+      fail("proofProducer must be an object when present.");
+    } else {
+      if (unexpectedFields(proofProducer, PROOF_PRODUCER_FIELDS).length) {
+        fail("proofProducer contains unsupported fields.");
+      }
+      if (proofProducer.id !== PROOF_PRODUCER_ID) {
+        fail("proofProducer.id is invalid.");
+      }
+      if (proofProducer.version !== PROOF_PRODUCER_VERSION) {
+        fail("proofProducer.version is invalid.");
+      }
+      let expectedManifestDigest = null;
+      try {
+        expectedManifestDigest = computeProofManifestDigest(phase);
+      } catch {
+        fail(`No proof-producing gate manifest exists for phase ${phase}.`);
+      }
+      if (!SHA256.test(proofProducer.manifestDigest || "")) {
+        fail("proofProducer.manifestDigest must be sha256 hex.");
+      } else if (expectedManifestDigest && proofProducer.manifestDigest !== expectedManifestDigest) {
+        fail("proofProducer.manifestDigest does not match the code-owned gate manifest.");
+      }
+      proofProducerValid = Boolean(
+        proofProducer.id === PROOF_PRODUCER_ID
+        && proofProducer.version === PROOF_PRODUCER_VERSION
+        && expectedManifestDigest
+        && proofProducer.manifestDigest === expectedManifestDigest
+      );
+    }
   }
 
   const qualification = record.qualification;
@@ -2232,6 +2316,23 @@ export function validateEvidenceRecord(record, options = {}) {
   }
 
   if (VERIFIED_STATUS_SET.has(record.status)) {
+    if (!proofProducerValid) {
+      fail(`${record.status} requires exact broker-owned proofProducer provenance.`);
+    }
+    const manifest = PHASE_PROOF_GATE_MANIFEST[phase] || [];
+    if ((record.verification || []).length !== manifest.length) {
+      fail(`${record.status} requires exactly the code-owned phase ${phase} gate manifest.`);
+    }
+    for (const gate of manifest) {
+      const entry = (record.verification || []).find((candidate) => candidate?.gateId === gate.gateId);
+      if (!entry) continue;
+      if (entry.command != null || JSON.stringify(entry.argv) !== JSON.stringify(gate.argv)) {
+        fail(`Gate ${gate.gateId} argv does not match the code-owned proof manifest.`);
+      }
+      if (entry.boundary !== gate.boundary) {
+        fail(`Gate ${gate.gateId} boundary does not match the code-owned proof manifest.`);
+      }
+    }
     if (source?.cleanTreeAtVerification !== true) {
       fail(`${record.status} requires source.cleanTreeAtVerification=true.`);
     }
@@ -2466,7 +2567,9 @@ export function buildEvidenceRecord({
   return attachRecordDigest(record);
 }
 
-function prepareEvidenceRecordForPublication(record) {
+const PROOF_PUBLICATION_AUTHORITY = Symbol("proof-publication-authority");
+
+function prepareEvidenceRecordForPublication(record, authority = null) {
   if (!rawEvidenceValueIsSafe(record, "$record")) throw invalidEvidencePublicationError();
   const suppliedDigest = Object.hasOwn(record, "recordDigest");
   let body;
@@ -2489,13 +2592,16 @@ function prepareEvidenceRecordForPublication(record) {
   }
   const validated = validateEvidenceRecord(body, { strict: false });
   if (!validated.ok) throw invalidEvidencePublicationError();
+  if (VERIFIED_STATUS_SET.has(body.status) && authority !== PROOF_PUBLICATION_AUTHORITY) {
+    throw invalidEvidencePublicationError();
+  }
   return body;
 }
 
-export function writeEvidenceRecord(record, root = REPO_ROOT) {
+function writeEvidenceRecordInternal(record, root, authority = null) {
   // Publication validation is deliberately complete before ensureEvidenceDirectory
   // can create even the evidence root. Invalid/private caller data leaves no files.
-  const body = prepareEvidenceRecordForPublication(record);
+  const body = prepareEvidenceRecordForPublication(record, authority);
   const phase = body.phase;
   const declaredSourceDigest = body.source?.sourceInventoryDigest;
   const sourceDigest = declaredSourceDigest == null ? body.recordDigest : declaredSourceDigest;
@@ -2542,6 +2648,10 @@ export function writeEvidenceRecord(record, root = REPO_ROOT) {
     throw error;
   }
   return relativeFile;
+}
+
+export function writeEvidenceRecord(record, root = REPO_ROOT) {
+  return writeEvidenceRecordInternal(record, root, null);
 }
 
 function emptyLedger() {
@@ -2751,6 +2861,218 @@ export function updateLedger(entry, root = REPO_ROOT) {
     }
     return next;
   });
+}
+
+function loadCanonicalCutoverRecord(entry, root) {
+  if (!ledgerEntryShapeIsValid(entry) || !normalizedLedgerEvidencePath(entry.path)) {
+    throw invalidLedgerDocumentError();
+  }
+  let record;
+  try {
+    const absolute = path.resolve(root, entry.path);
+    const evidenceRoot = path.resolve(root, EVIDENCE_ROOT);
+    if (!absolute.startsWith(`${evidenceRoot}${path.sep}`)) throw invalidLedgerDocumentError();
+    record = JSON.parse(readBoundedEvidenceFile(root, absolute));
+  } catch {
+    throw invalidLedgerDocumentError();
+  }
+  if (!record || typeof record !== "object" || Array.isArray(record)
+    || !rawEvidenceValueIsSafe(record, "$record")
+    || boundedEvidenceErrors(record, "$record").length
+    || !SHA256.test(record.recordDigest || "")
+    || record.recordDigest !== computeRecordDigest(record)
+    || entry.phase !== record.phase
+    || entry.slice !== record.slice
+    || entry.status !== record.status
+    || entry.recordDigest !== record.recordDigest
+    || entry.sourceCommit !== record.source?.headCommit
+    || entry.recordedAt !== record.recordedAt) {
+    throw invalidLedgerDocumentError();
+  }
+  return record;
+}
+
+function invalidateAllCurrentLedgerEntriesUnderLock(root, loaded = null) {
+  let document = loaded;
+  if (!document) {
+    try {
+      document = loadLedgerDocument(root);
+    } catch {
+      throw invalidLedgerDocumentError();
+    }
+  }
+  if (!ledgerDocumentShapeIsValid(document.ledger)) throw invalidLedgerDocumentError();
+  for (const entry of document.ledger.entries) loadCanonicalCutoverRecord(entry, root);
+  const entries = document.ledger.entries.map((entry) => ({
+    ...cloneLedgerEntry(entry),
+    currency: entry.currency === "current" ? "invalidated" : entry.currency
+  }));
+  if (!document.ledger.entries.some((entry) => entry.currency === "current")) return;
+  const next = {
+    schemaVersion: 1,
+    roadmapVersion: ROADMAP_VERSION,
+    issue: ISSUE_URL,
+    updatedAt: new Date().toISOString(),
+    entries
+  };
+  if (!ledgerDocumentShapeIsValid(next)) throw invalidLedgerUpdateError();
+  const file = path.join(root, EVIDENCE_ROOT, "ledger.json");
+  try {
+    atomicReplaceEvidenceFile(root, file, `${JSON.stringify(next, null, 2)}\n`, document.expected);
+  } catch {
+    throw invalidLedgerDocumentError();
+  }
+  const strict = verifyLedger(root, { strict: true });
+  if (!strict.ok) throw invalidLedgerDocumentError();
+}
+
+function invalidateAllCurrentLedgerEntries(root) {
+  return withEvidenceLedgerLock(root, () => invalidateAllCurrentLedgerEntriesUnderLock(root));
+}
+
+/**
+ * Publish the first proof-produced Phase 0 baseline. Existing immutable files
+ * are retained. Only canonical pre-runner verified claims may be invalidated;
+ * mixed or caller-captured current state aborts the cutover.
+ */
+function publishPhaseZeroProofRecord(record, root, expectedSource) {
+  if (record?.phase !== "0" || record?.status !== "verified_on_draft") {
+    throw invalidEvidencePublicationError();
+  }
+  const validation = validateEvidenceRecord(record, {
+    strict: true,
+    root,
+    requireEvidenceSystem: true
+  });
+  if (!validation.ok) throw invalidEvidencePublicationError();
+  const immediatelyBeforeRecord = captureProofSourceSnapshot("0", root);
+  if (!sameProofSourceSnapshot(expectedSource, immediatelyBeforeRecord)
+    || !proofRecordMatchesSnapshot(record, expectedSource)) {
+    throw invalidEvidencePublicationError();
+  }
+
+  const relative = writeEvidenceRecordInternal(record, root, PROOF_PUBLICATION_AUTHORITY);
+  withEvidenceLedgerLock(root, () => {
+    const immediatelyBeforeLedger = captureProofSourceSnapshot("0", root);
+    if (!sameProofSourceSnapshot(expectedSource, immediatelyBeforeLedger)
+      || !proofRecordMatchesSnapshot(record, expectedSource)) {
+      throw invalidEvidencePublicationError();
+    }
+
+    let loaded;
+    try {
+      loaded = loadLedgerDocument(root);
+    } catch {
+      throw invalidLedgerDocumentError();
+    }
+    if (!ledgerDocumentShapeIsValid(loaded.ledger)) throw invalidLedgerDocumentError();
+
+    const inspected = loaded.ledger.entries.map((entry) => ({
+      entry: cloneLedgerEntry(entry),
+      record: loadCanonicalCutoverRecord(entry, root)
+    }));
+    const current = inspected.filter(({ entry }) => entry.currency === "current");
+    const legacyCurrent = current.filter(({ record: existing }) => (
+      !Object.hasOwn(existing, "proofProducer") && VERIFIED_STATUS_SET.has(existing.status)
+    ));
+    const runnerCurrent = current.filter(({ record: existing }) => (
+      Object.hasOwn(existing, "proofProducer")
+    ));
+    const unsupportedCurrent = current.filter(({ record: existing }) => (
+      !Object.hasOwn(existing, "proofProducer") && !VERIFIED_STATUS_SET.has(existing.status)
+    ));
+    if (unsupportedCurrent.length || (legacyCurrent.length && runnerCurrent.length)) {
+      throw invalidLedgerDocumentError();
+    }
+    for (const { record: existing } of runnerCurrent) {
+      const existingValidation = validateEvidenceRecord(existing, {
+        strict: true,
+        root,
+        requireEvidenceSystem: true
+      });
+      if (!VERIFIED_STATUS_SET.has(existing.status) || !existingValidation.ok) {
+        throw invalidLedgerDocumentError();
+      }
+    }
+
+    const entries = inspected.map(({ entry, record: existing }) => {
+      const next = cloneLedgerEntry(entry);
+      if (next.currency !== "current") return next;
+      if (legacyCurrent.length && !Object.hasOwn(existing, "proofProducer")) {
+        next.currency = "invalidated";
+      } else if (next.phase === "0") {
+        next.currency = "historical";
+      }
+      return next;
+    });
+    entries.push({
+      phase: record.phase,
+      slice: record.slice,
+      status: record.status,
+      path: relative,
+      recordDigest: record.recordDigest,
+      sourceCommit: record.source.headCommit,
+      currency: "current",
+      recordedAt: record.recordedAt
+    });
+    const next = {
+      schemaVersion: 1,
+      roadmapVersion: ROADMAP_VERSION,
+      issue: ISSUE_URL,
+      updatedAt: new Date().toISOString(),
+      entries
+    };
+    if (!ledgerDocumentShapeIsValid(next)) throw invalidLedgerUpdateError();
+    const file = path.join(root, EVIDENCE_ROOT, "ledger.json");
+    const serializedNext = `${JSON.stringify(next, null, 2)}\n`;
+    try {
+      atomicReplaceEvidenceFile(root, file, serializedNext, loaded.expected);
+    } catch {
+      throw invalidLedgerDocumentError();
+    }
+
+    let published;
+    try {
+      published = loadLedgerDocument(root);
+    } catch {
+      throw invalidLedgerDocumentError();
+    }
+    if (published.expected.contents !== serializedNext) throw invalidLedgerDocumentError();
+    let afterLedger;
+    let afterStrict;
+    let finalInsideLock;
+    try {
+      afterLedger = captureProofSourceSnapshot("0", root);
+      afterStrict = verifyLedger(root, { strict: true });
+      finalInsideLock = captureProofSourceSnapshot("0", root);
+    } catch {
+      afterStrict = { ok: false };
+    }
+    if (!sameProofSourceSnapshot(expectedSource, afterLedger)
+      || !afterStrict.ok
+      || !sameProofSourceSnapshot(expectedSource, finalInsideLock)) {
+      invalidateAllCurrentLedgerEntriesUnderLock(root, published);
+      throw invalidEvidencePublicationError();
+    }
+  });
+
+  let afterRelease;
+  let strictAfterRelease;
+  let finalAfterRelease;
+  try {
+    afterRelease = captureProofSourceSnapshot("0", root);
+    strictAfterRelease = verifyLedger(root, { strict: true });
+    finalAfterRelease = captureProofSourceSnapshot("0", root);
+  } catch {
+    strictAfterRelease = { ok: false };
+  }
+  if (!sameProofSourceSnapshot(expectedSource, afterRelease)
+    || !strictAfterRelease.ok
+    || !sameProofSourceSnapshot(expectedSource, finalAfterRelease)) {
+    invalidateAllCurrentLedgerEntries(root);
+    throw invalidEvidencePublicationError();
+  }
+  return relative;
 }
 
 export function verifyLedger(root = REPO_ROOT, {
@@ -3053,28 +3375,267 @@ export function digestsIgnoreEvidenceOnly(root = REPO_ROOT) {
   };
 }
 
-export function runCommandCapture(command, args, { cwd = REPO_ROOT, env = process.env, timeout = 120000 } = {}) {
+const PROOF_ENVIRONMENT_KEYS = Object.freeze([
+  "PATH",
+  "HOME",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "SYSTEMROOT",
+  "SystemRoot",
+  "COMSPEC",
+  "ComSpec",
+  "PATHEXT",
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA"
+]);
+
+export function sanitizeProofEnvironment(source = process.env) {
+  const safe = {};
+  for (const key of PROOF_ENVIRONMENT_KEYS) {
+    if (typeof source?.[key] === "string") safe[key] = source[key];
+  }
+  safe.CI = "1";
+  safe.NO_COLOR = "1";
+  safe.FORCE_COLOR = "0";
+  return safe;
+}
+
+/**
+ * Bounded command observation for code-owned proof gates. It deliberately
+ * returns no raw output and cannot publish evidence by itself.
+ */
+export function runCommandCapture(command, args, {
+  cwd = REPO_ROOT,
+  env = process.env,
+  timeout = 120000
+} = {}) {
   const startedAt = new Date().toISOString();
   const result = spawnSync(command, args, {
     cwd,
-    env,
+    env: sanitizeProofEnvironment(env),
     encoding: "utf8",
     shell: false,
     timeout,
-    maxBuffer: 16 * 1024 * 1024
+    killSignal: "SIGKILL",
+    maxBuffer: 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"]
   });
   const endedAt = new Date().toISOString();
   const output = `${result.stdout || ""}${result.stderr || ""}`;
+  const redactedOutput = redactText(output);
+  const secretOutputDetected = redactedOutput !== output;
+  let failureKind = null;
+  if (secretOutputDetected) failureKind = "secret_output";
+  else if (result.error?.code === "ETIMEDOUT") failureKind = "timeout";
+  else if (result.error?.code === "ENOBUFS") failureKind = "output_limit";
+  else if (result.error) failureKind = "spawn_error";
+  else if (result.signal) failureKind = "signal";
+  else if (!Number.isInteger(result.status) || result.status !== 0) failureKind = "nonzero_exit";
   return {
-    command: [command, ...args].join(" "),
-    exitCode: result.status,
     startedAt,
     endedAt,
-    outputDigest: sha256Text(output),
-    stdout: result.stdout || "",
-    stderr: result.stderr || "",
-    signal: result.signal || null
+    exitCode: Number.isInteger(result.status) ? result.status : null,
+    outputDigest: sha256Text(redactedOutput),
+    outcome: failureKind == null ? "pass" : "fail",
+    failureKind,
+    secretOutputDetected
   };
+}
+
+function proofExecutable(logical) {
+  if (logical === "node") return process.execPath;
+  if (logical === "npm" && process.platform === "win32") return "npm.cmd";
+  return logical;
+}
+
+function captureProofSourceSnapshot(phase, root) {
+  const identity = gitIdentity(root);
+  return {
+    ...identity,
+    sourceInventoryDigest: computeInventoryDigest(root, { includeEvidence: false }),
+    phaseScopeDigest: computePhaseScopeDigest(phase, root)
+  };
+}
+
+function sameProofSourceSnapshot(left, right) {
+  return Boolean(left && right
+    && left.headCommit === right.headCommit
+    && left.headTree === right.headTree
+    && left.cleanTreeAtVerification === true
+    && right.cleanTreeAtVerification === true
+    && left.sourceInventoryDigest === right.sourceInventoryDigest
+    && left.phaseScopeDigest === right.phaseScopeDigest);
+}
+
+function proofFailure(code, extras = {}) {
+  return { ok: false, code, ...extras };
+}
+
+function proofRecordMatchesSnapshot(record, snapshot) {
+  return Boolean(record?.source
+    && record.source.headCommit === snapshot.headCommit
+    && record.source.headTree === snapshot.headTree
+    && record.source.cleanTreeAtVerification === true
+    && record.source.sourceInventoryDigest === snapshot.sourceInventoryDigest
+    && record.source.phaseScopeDigest === snapshot.phaseScopeDigest);
+}
+
+export function provePhaseZero({
+  phase = "0",
+  slice,
+  root = REPO_ROOT,
+  write = false
+} = {}) {
+  if (String(phase) !== "0" || !/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(slice || "")) {
+    return proofFailure("E_PROOF_ARGUMENT");
+  }
+  const manifest = PHASE_PROOF_GATE_MANIFEST["0"];
+  let initial;
+  try {
+    initial = captureProofSourceSnapshot("0", root);
+  } catch {
+    return proofFailure("E_PROOF_SOURCE");
+  }
+  if (initial.cleanTreeAtVerification !== true) return proofFailure("E_PROOF_SOURCE_DIRTY");
+
+  const verification = [];
+  for (const gate of manifest) {
+    const [logicalExecutable, ...args] = gate.argv;
+    const observed = runCommandCapture(proofExecutable(logicalExecutable), args, {
+      cwd: root,
+      env: process.env,
+      timeout: gate.timeoutMs
+    });
+    if (observed.outcome !== "pass" || observed.exitCode !== 0) {
+      return proofFailure("E_PROOF_GATE", {
+        gateId: gate.gateId,
+        failureKind: observed.failureKind,
+        outputDigest: observed.outputDigest
+      });
+    }
+    verification.push({
+      gateId: gate.gateId,
+      argv: [...gate.argv],
+      boundary: gate.boundary,
+      outcome: "pass",
+      startedAt: observed.startedAt,
+      endedAt: observed.endedAt,
+      exitCode: 0,
+      outputDigest: observed.outputDigest,
+      assertions: [
+        "code-owned manifest gate exited successfully",
+        "output was bounded and redacted before digest"
+      ]
+    });
+  }
+
+  let afterGates;
+  try {
+    afterGates = captureProofSourceSnapshot("0", root);
+  } catch {
+    return proofFailure("E_PROOF_SOURCE");
+  }
+  if (!sameProofSourceSnapshot(initial, afterGates)) return proofFailure("E_PROOF_SOURCE_DRIFT");
+
+  let record = buildEvidenceRecord({
+    root,
+    phase: "0",
+    slice,
+    status: "verified_on_draft",
+    verification,
+    scenarios: [{
+      id: "phase-0-proof-runner",
+      boundary: "deterministic",
+      expected: "all fixed Phase 0 gates pass on one stable clean source identity",
+      actual: "all fixed gates passed and source identity remained stable",
+      outcome: "pass"
+    }],
+    liveScenarios: [],
+    evidenceSystemQualification: true,
+    provisionalSupportingRecord: false,
+    releaseQualification: false,
+    qualification: {
+      deterministic: "pass",
+      installedHost: "not_run",
+      provider: "not_run",
+      release: "not_run"
+    },
+    authorities: {
+      workerClaims: "none",
+      runtimeObservations: "broker-owned bounded Phase 0 gate runner",
+      hostVerification: "not_run",
+      independentValidation: "not_run"
+    },
+    limits: {
+      residualRisks: ["Installed-host and authenticated-provider qualification remain unproven."],
+      unsupportedPlatforms: ["windows-provider-execution", "linux-provider-unqualified"],
+      invalidationTriggers: [
+        "source inventory change outside evidence-only paths",
+        "phase-scope path change",
+        "proof gate manifest change",
+        "dirty tree when cleanTreeAtVerification claimed"
+      ],
+      supersededBy: null,
+      liveQualificationGaps: [
+        "installed natural host proof not run",
+        "authenticated Grok provider proof not run"
+      ]
+    }
+  });
+  record = attachRecordDigest({
+    ...record,
+    proofProducer: {
+      id: PROOF_PRODUCER_ID,
+      version: PROOF_PRODUCER_VERSION,
+      manifestDigest: computeProofManifestDigest("0")
+    }
+  });
+
+  let beforePublication;
+  try {
+    beforePublication = captureProofSourceSnapshot("0", root);
+  } catch {
+    return proofFailure("E_PROOF_SOURCE");
+  }
+  if (!sameProofSourceSnapshot(initial, beforePublication)
+    || !proofRecordMatchesSnapshot(record, initial)) {
+    return proofFailure("E_PROOF_SOURCE_DRIFT");
+  }
+  const validated = validateEvidenceRecord(record, { strict: true, root, requireEvidenceSystem: true });
+  if (!validated.ok) return proofFailure("E_PROOF_RECORD");
+
+  if (!write) {
+    return {
+      ok: true,
+      phase: "0",
+      slice,
+      status: record.status,
+      manifestDigest: record.proofProducer.manifestDigest,
+      gateIds: verification.map((entry) => entry.gateId),
+      record
+    };
+  }
+  try {
+    const path = publishPhaseZeroProofRecord(record, root, initial);
+    return {
+      ok: true,
+      phase: "0",
+      slice,
+      status: record.status,
+      path,
+      recordDigest: record.recordDigest,
+      sourceCommit: record.source.headCommit,
+      manifestDigest: record.proofProducer.manifestDigest,
+      gateIds: verification.map((entry) => entry.gateId),
+      record
+    };
+  } catch {
+    return proofFailure("E_PROOF_PUBLICATION");
+  }
 }
 
 export { REPO_ROOT, sha256Text };

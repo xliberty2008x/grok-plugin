@@ -7,6 +7,7 @@
  *   node scripts/worker-broker-evidence.mjs verify --phase <N> [--strict]
  *   node scripts/worker-broker-evidence.mjs verify --all [--strict] [--require-complete]
  *   node scripts/worker-broker-evidence.mjs capture --phase <N> --slice <id> [--write]
+ *   node scripts/worker-broker-evidence.mjs prove --phase 0 --slice <slug> [--write]
  *   node scripts/worker-broker-evidence.mjs qualify --phase <N> --host <codex|claude-code> [--record]
  */
 import { spawnSync } from "node:child_process";
@@ -18,6 +19,7 @@ import {
   computePhaseScopeDigest,
   evidenceStatus,
   gitIdentity,
+  provePhaseZero,
   sha256Text,
   updateLedger,
   validateEvidenceRecord,
@@ -31,6 +33,7 @@ function usage(exitCode = 2) {
   node scripts/worker-broker-evidence.mjs status [--strict]
   node scripts/worker-broker-evidence.mjs verify --phase <N>|--all [--strict] [--require-complete]
   node scripts/worker-broker-evidence.mjs capture --phase <N> --slice <id> [--status <s>] [--write]
+  node scripts/worker-broker-evidence.mjs prove --phase 0 --slice <bounded-slug> [--write]
   node scripts/worker-broker-evidence.mjs qualify --phase <N> --host <codex|claude-code> [--record]
 `);
   process.exit(exitCode);
@@ -52,6 +55,28 @@ function parseArgs(argv) {
     else if (token.startsWith("--")) usage();
     else args._.push(token);
   }
+  return args;
+}
+
+function parseProveArgs(argv) {
+  const args = { phase: null, slice: null, write: false };
+  const seen = new Set();
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!new Set(["--phase", "--slice", "--write"]).has(token) || seen.has(token)) usage();
+    seen.add(token);
+    if (token === "--write") {
+      args.write = true;
+      continue;
+    }
+    const value = argv[index + 1];
+    if (typeof value !== "string" || !value || value.startsWith("--")) usage();
+    index += 1;
+    if (token === "--phase") args.phase = value;
+    else args.slice = value;
+  }
+  if (args.phase !== "0"
+    || !/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(args.slice || "")) usage();
   return args;
 }
 
@@ -183,6 +208,36 @@ function commandCapture(args) {
   printJson({ ok: true, record });
 }
 
+function commandProve(args) {
+  const result = provePhaseZero({
+    phase: args.phase,
+    slice: args.slice,
+    write: args.write,
+    root: REPO_ROOT
+  });
+  if (!result.ok) {
+    printJson({
+      ok: false,
+      code: result.code,
+      gateId: result.gateId || null,
+      failureKind: result.failureKind || null,
+      outputDigest: result.outputDigest || null
+    });
+    process.exit(1);
+  }
+  printJson({
+    ok: true,
+    phase: result.phase,
+    slice: result.slice,
+    status: result.status,
+    path: result.path || null,
+    recordDigest: result.recordDigest || result.record?.recordDigest,
+    sourceCommit: result.sourceCommit || result.record?.source?.headCommit,
+    manifestDigest: result.manifestDigest,
+    gateIds: result.gateIds
+  });
+}
+
 function commandQualify(args) {
   if (!args.phase || !args.host) usage();
   if (!["codex", "claude-code"].includes(args.host)) usage();
@@ -263,11 +318,16 @@ function commandQualify(args) {
   process.exitCode = 1;
 }
 
-const args = parseArgs(process.argv.slice(2));
-if (args.help || !args._.length) usage(args.help ? 0 : 2);
-const command = args._[0];
-if (command === "status") commandStatus(args);
-else if (command === "verify") commandVerify(args);
-else if (command === "capture") commandCapture(args);
-else if (command === "qualify") commandQualify(args);
-else usage();
+const rawArgs = process.argv.slice(2);
+if (rawArgs[0] === "prove") {
+  commandProve(parseProveArgs(rawArgs.slice(1)));
+} else {
+  const args = parseArgs(rawArgs);
+  if (args.help || !args._.length) usage(args.help ? 0 : 2);
+  const command = args._[0];
+  if (command === "status") commandStatus(args);
+  else if (command === "verify") commandVerify(args);
+  else if (command === "capture") commandCapture(args);
+  else if (command === "qualify") commandQualify(args);
+  else usage();
+}
