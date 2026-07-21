@@ -70,7 +70,7 @@ export function materializeRole(roleId) {
     schemaVersion: WORKER_ROLE_VERSION,
     id: spec.id,
     write: spec.write,
-    tools: [...spec.tools],
+    tools: Object.freeze([...spec.tools]),
     description: spec.description,
     digest: roleDigest(spec)
   });
@@ -90,6 +90,14 @@ export function assertRoleDigest(role) {
   }
   if (Boolean(role.write) !== expected.write) {
     throw new CompanionError("E_ROLE", "Worker role write capability mismatch.");
+  }
+  if (
+    role.schemaVersion !== expected.schemaVersion
+    || !Array.isArray(role.tools)
+    || role.tools.length !== expected.tools.length
+    || role.tools.some((tool, index) => tool !== expected.tools[index])
+  ) {
+    throw new CompanionError("E_ROLE", "Worker role capability set mismatch.");
   }
   return expected;
 }
@@ -127,27 +135,16 @@ export function requestHostAction(currentRole, requested) {
 }
 
 export function grantHostAction(hostPrincipal, request, grant) {
-  if (!hostPrincipal?.hostKind) {
-    throw new CompanionError("E_AUTH_REQUIRED", "Host principal required to grant actions.");
-  }
-  if (!request || request.state !== "awaiting_host_action" || request.granted) {
-    throw new CompanionError("E_USAGE", "No pending host action to grant.");
-  }
-  if (grant?.roleId) {
-    const role = materializeRole(grant.roleId);
-    return Object.freeze({
-      ...request,
-      granted: true,
-      grantedAt: new Date().toISOString(),
-      grantedRole: role
-    });
-  }
-  return Object.freeze({
-    ...request,
-    granted: true,
-    grantedAt: new Date().toISOString(),
-    grantDetail: grant || {}
-  });
+  void hostPrincipal;
+  void request;
+  void grant;
+  // A plain JavaScript object is not a host attestation. Keep the grant side
+  // fail-closed until the broker supplies a non-forgeable, worker-bound host
+  // authorization primitive. Requests may still be recorded for presentation.
+  throw new CompanionError(
+    "E_CAPABILITY",
+    "Host action grants are disabled until trusted broker-bound host attestation is available."
+  );
 }
 
 export function assertWorkerCannotSelfEscalate(job, nextRoleId) {

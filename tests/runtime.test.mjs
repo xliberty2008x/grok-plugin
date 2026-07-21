@@ -11,6 +11,8 @@ import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
 import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 import { CompanionError, attachTransferCleanupEvidence, asErrorPayload } from "../plugins/grok/scripts/lib/errors.mjs";
 import { redact } from "../plugins/grok/scripts/lib/redact.mjs";
+import { spawnReadOnlyWorker } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
+import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import {
@@ -711,6 +713,196 @@ function writeSeededJob(stateRoot, job) {
   fs.writeFileSync(job.logFile, "", { mode: 0o600 });
 }
 
+function codexBrokerFixture() {
+  const runtime = fixture();
+  const threadId = "codex-broker-runtime-session";
+  return {
+    ...runtime,
+    threadId,
+    env: {
+      ...runtime.env,
+      GROK_COMPANION_HOST: "codex",
+      GROK_COMPANION_HOST_SESSION_ID: threadId,
+      CODEX_THREAD_ID: threadId
+    }
+  };
+}
+
+function spawnPendingBrokerJob(root, { env, threadId }, idempotencyKey) {
+  return spawnReadOnlyWorker({
+    root,
+    principal: { threadId, source: "codex" },
+    envelope: buildTaskEnvelope({
+      userRequest: "Inspect the repository without writing files.",
+      mode: "read"
+    }),
+    idempotencyKey,
+    env
+  });
+}
+
+test("legacy CLI recovery preserves broker jobs at every unsettled launch boundary", () => {
+  const root = fs.realpathSync(initRepo());
+  const runtime = codexBrokerFixture();
+  const spawned = spawnPendingBrokerJob(root, runtime, "runtime-pending-recovery");
+  const id = spawned.handle.id;
+  const old = new Date(Date.now() - 10_000).toISOString();
+  updateJob(root, id, (job) => ({ ...job, createdAt: old }), runtime.env);
+
+  const states = [
+    { providerLaunchPending: true, providerLaunchInFlight: false, providerLaunchOutcome: null },
+    { providerLaunchPending: false, providerLaunchInFlight: true, providerLaunchOutcome: null },
+    { providerLaunchPending: false, providerLaunchInFlight: false, providerLaunchOutcome: "unknown" }
+  ];
+  for (const launchState of states) {
+    updateJob(root, id, (job) => ({
+      ...job,
+      status: "queued",
+      phase: "provider-launching",
+      error: null,
+      request: {
+        ...job.request,
+        spawn: { ...job.request.spawn, ...launchState }
+      }
+    }), runtime.env);
+    const status = parseJson(runCompanion(["status", id, "--json"], {
+      cwd: root,
+      env: runtime.env
+    }));
+    assert.equal(status.status, "queued");
+    assert.equal(readJob(root, id, runtime.env).error, null);
+  }
+});
+
+test("legacy CLI cancel extracts the broker object authorization nonce", async () => {
+  const root = fs.realpathSync(initRepo());
+  const runtime = codexBrokerFixture();
+  const spawned = spawnPendingBrokerJob(root, runtime, "runtime-object-nonce-cancel");
+  const id = spawned.handle.id;
+  const nonce = readJob(root, id, runtime.env).workerAuthorization.nonce;
+  const stateRoot = workspaceState(root, runtime.env);
+  const marker = path.join(stateRoot, "jobs", `${id}.cancel`);
+
+  const canceling = spawnCompanion(["cancel", id, "--json"], { cwd: root, env: runtime.env });
+  await waitFor(() => fs.existsSync(marker), { timeoutMs: 5000 });
+  assert.equal(fs.readFileSync(marker, "utf8"), `${nonce}\n`);
+
+  updateJob(root, id, (job) => ({
+    ...job,
+    status: "cancelled",
+    phase: "cancelled",
+    completedAt: new Date().toISOString(),
+    error: { code: "E_CANCELLED", message: "cancelled during broker launch window" },
+    summary: "cancelled during broker launch window"
+  }), runtime.env);
+  const completed = await canceling.completed;
+  assert.equal(completed.code, 0, completed.stderr || completed.stdout);
+  assert.equal(JSON.parse(completed.stdout).status, "cancelled");
+});
+
+test("legacy CLI cancel retains every launch-unsettled broker boundary before cleanup", { timeout: 30_000 }, async () => {
+  const root = fs.realpathSync(initRepo());
+  const runtime = codexBrokerFixture();
+  const stateRoot = workspaceState(root, runtime.env);
+  const cases = [
+    {
+      name: "pending",
+      launch: { providerLaunchPending: true, providerLaunchInFlight: false, providerLaunchOutcome: null },
+      retained: true
+    },
+    {
+      name: "inflight",
+      launch: { providerLaunchPending: false, providerLaunchInFlight: true, providerLaunchOutcome: null },
+      retained: true
+    },
+    {
+      name: "unknown",
+      launch: { providerLaunchPending: false, providerLaunchInFlight: false, providerLaunchOutcome: "unknown" },
+      retained: true
+    },
+    {
+      name: "authorization-only",
+      launch: null,
+      retained: true
+    },
+    {
+      name: "not-launched",
+      launch: { providerLaunchPending: false, providerLaunchInFlight: false, providerLaunchOutcome: "not-launched" },
+      retained: false
+    }
+  ];
+
+  for (const fixture of cases) {
+    const spawned = spawnPendingBrokerJob(root, runtime, `runtime-cancel-settlement-${fixture.name}`);
+    fixture.id = spawned.handle.id;
+    updateJob(root, fixture.id, (job) => {
+      const spawnState = { ...job.request.spawn };
+      if (fixture.launch) Object.assign(spawnState, fixture.launch);
+      else {
+        delete spawnState.providerLaunchPending;
+        delete spawnState.providerLaunchInFlight;
+        delete spawnState.providerLaunchOutcome;
+      }
+      return {
+        ...job,
+        request: { ...job.request, spawn: spawnState }
+      };
+    }, runtime.env);
+    fixture.before = readJob(root, fixture.id, runtime.env);
+    fixture.nonce = fixture.before.workerAuthorization.nonce;
+    fixture.runtimeFile = path.join(stateRoot, "task-homes", fixture.id, ".grok", "auth.json");
+    fs.mkdirSync(path.dirname(fixture.runtimeFile), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(fixture.runtimeFile, `private-${fixture.name}-runtime\n`, { mode: 0o600 });
+  }
+
+  const canceling = cases.map((fixture) => ({
+    fixture,
+    process: spawnCompanion(["cancel", fixture.id, "--json"], { cwd: root, env: runtime.env })
+  }));
+  await waitFor(() => cases.every((fixture) => {
+    const marker = path.join(stateRoot, "jobs", `${fixture.id}.cancel`);
+    return fs.existsSync(marker) && fs.readFileSync(marker, "utf8") === `${fixture.nonce}\n`;
+  }), { timeoutMs: 5000 });
+
+  const outcomes = await Promise.all(canceling.map(async ({ fixture, process: running }) => ({
+    fixture,
+    completed: await running.completed
+  })));
+  for (const { fixture, completed } of outcomes) {
+    assert.equal(completed.code, 0, completed.stderr || completed.stdout);
+    const projected = JSON.parse(completed.stdout);
+    const stored = readJob(root, fixture.id, runtime.env);
+    const marker = path.join(stateRoot, "jobs", `${fixture.id}.cancel`);
+    assert.equal(fs.readFileSync(marker, "utf8"), `${fixture.nonce}\n`);
+
+    if (!fixture.retained) {
+      assert.equal(projected.status, "cancelled");
+      assert.equal(stored.status, "cancelled");
+      assert.equal(stored.result?.taskRuntimeCleaned, true);
+      assert.equal(fs.existsSync(fixture.runtimeFile), false, "explicit not-launched runtime must be cleaned");
+      continue;
+    }
+
+    assert.equal(projected.status, "running");
+    assert.equal(projected.phase, "launch-unsettled");
+    assert.equal(stored.status, "running");
+    assert.equal(stored.phase, "launch-unsettled");
+    assert.equal(stored.completedAt, null);
+    assert.deepEqual(stored.request, fixture.before.request, `${fixture.name} launch state must remain intact`);
+    assert.deepEqual(stored.workerAuthorization, fixture.before.workerAuthorization);
+    assert.deepEqual(stored.lifecycleEvents, fixture.before.lifecycleEvents);
+    assert.equal(stored.error?.code, "E_STATE");
+    assert.match(stored.error?.message || "", /launch settlement is incomplete/i);
+    assert.equal(stored.result?.taskRuntimeCleaned, false);
+    assert.match(stored.result?.privacyWarning || "", /task runtime artifacts retained/i);
+    assert.equal(fs.existsSync(fixture.runtimeFile), true, `${fixture.name} runtime must be retained`);
+    assert.doesNotMatch(stored.error?.message || "", new RegExp(fixture.id));
+    assert.doesNotMatch(stored.error?.message || "", new RegExp(fixture.nonce));
+    assert.doesNotMatch(completed.stdout, new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.doesNotMatch(completed.stderr, new RegExp(fixture.nonce));
+  }
+});
+
 test("cancel during worker launch window uses workerAuthorization when workerProcess is null", async () => {
   // Launch window: startJob persists workerAuthorization before workerProcess exists.
   // requestCancel must use that authenticated nonce rather than throwing E_PROCESS_IDENTITY.
@@ -971,7 +1163,7 @@ test("force-cancel uses provider guard when providerProcess is missing", { skip:
     updatedAt: stamped,
     completedAt: null,
     workerAuthorization: workerNonce,
-    workerProcess: null,
+    workerProcess: { pid: 999999992, startToken: "dead-worker-token", nonce: workerNonce, processGroupId: 999999992, commandMarker: id },
     providerProcess: null,
     profile: { id: "review", transport: "headless" },
     model: null,
@@ -1030,7 +1222,7 @@ test("force-cancel successful home cleanup clears prior privacy warning", { skip
     updatedAt: stamped,
     completedAt: null,
     workerAuthorization: workerNonce,
-    workerProcess: null,
+    workerProcess: { pid: 999999991, startToken: "dead-worker-token", nonce: workerNonce, processGroupId: 999999991, commandMarker: id },
     providerProcess: null,
     profile: { id: "review", transport: "headless" },
     model: null,
@@ -1096,7 +1288,7 @@ test("force-cancel failed home cleanup appends privacyWarning without erasing pr
     updatedAt: stamped,
     completedAt: null,
     workerAuthorization: workerNonce,
-    workerProcess: null,
+    workerProcess: { pid: 999999993, startToken: "dead-worker-token", nonce: workerNonce, processGroupId: 999999993, commandMarker: id },
     providerProcess: null,
     profile: { id: "review", transport: "headless" },
     model: null,
@@ -1176,7 +1368,7 @@ test("force-cancel preserves guard and home when guard identity is live/unverifi
     updatedAt: stamped,
     completedAt: null,
     workerAuthorization: workerNonce,
-    workerProcess: null,
+    workerProcess: { pid: 999999990, startToken: "dead-worker-token", nonce: workerNonce, processGroupId: 999999990, commandMarker: id },
     providerProcess: null,
     profile: { id: "review", transport: "headless" },
     model: null,
@@ -1635,21 +1827,32 @@ test("a foreground caller returns the recovered worker-crash failure", { skip: p
     }, { timeoutMs: 10000 });
     process.kill(running.workerProcess.pid, "SIGKILL");
 
-    const recovered = await waitFor(() => {
-      const status = runCompanion(["status", running.id, "--json"], { cwd: root, env });
-      if (status.status !== 0) return false;
-      const job = JSON.parse(status.stdout);
-      return job.status === "failed" ? job : false;
-    }, { timeoutMs: 15000 });
-    assert.equal(recovered.error.code, "E_WORKER_LOST");
-
-    const completed = await Promise.race([
-      foreground.completed,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("Foreground caller did not observe recovered worker failure.")), 10000))
-    ]);
+    let completionTimer;
+    let completed;
+    try {
+      completed = await Promise.race([
+        foreground.completed,
+        new Promise((_, reject) => {
+          completionTimer = setTimeout(
+            () => reject(new Error("Foreground caller did not observe recovered worker failure.")),
+            25000
+          );
+        })
+      ]);
+    } finally {
+      clearTimeout(completionTimer);
+    }
+    assert.equal(completed.signal, null);
     assert.notEqual(completed.code, 0, completed.stdout);
-    const error = JSON.parse(completed.stdout).error;
-    assert.equal(error.code, "E_WORKER_LOST");
+    const payload = JSON.parse(completed.stdout);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.error.code, "E_WORKER_LOST");
+    const recovered = persistedJob(pluginData, running.id);
+    assert.equal(recovered.id, running.id);
+    assert.equal(recovered.status, "failed");
+    assert.equal(recovered.phase, "failed");
+    assert.equal(recovered.error.code, "E_WORKER_LOST");
+    assert.ok(recovered.completedAt);
     assert.ok(readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length <= 1, "crashed foreground prompt was replayed");
   } finally {
     if (foreground.child.exitCode == null && foreground.child.signalCode == null) foreground.child.kill("SIGKILL");

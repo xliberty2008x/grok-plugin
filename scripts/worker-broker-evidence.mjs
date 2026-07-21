@@ -5,7 +5,7 @@
  * Usage:
  *   node scripts/worker-broker-evidence.mjs status [--strict]
  *   node scripts/worker-broker-evidence.mjs verify --phase <N> [--strict]
- *   node scripts/worker-broker-evidence.mjs verify --all [--strict]
+ *   node scripts/worker-broker-evidence.mjs verify --all [--strict] [--require-complete]
  *   node scripts/worker-broker-evidence.mjs capture --phase <N> --slice <id> [--write]
  *   node scripts/worker-broker-evidence.mjs qualify --phase <N> --host <codex|claude-code> [--record]
  */
@@ -18,6 +18,7 @@ import {
   computePhaseScopeDigest,
   evidenceStatus,
   gitIdentity,
+  sha256Text,
   updateLedger,
   validateEvidenceRecord,
   verifyLedger,
@@ -28,7 +29,7 @@ import {
 function usage(exitCode = 2) {
   process.stderr.write(`Usage:
   node scripts/worker-broker-evidence.mjs status [--strict]
-  node scripts/worker-broker-evidence.mjs verify --phase <N>|--all [--strict]
+  node scripts/worker-broker-evidence.mjs verify --phase <N>|--all [--strict] [--require-complete]
   node scripts/worker-broker-evidence.mjs capture --phase <N> --slice <id> [--status <s>] [--write]
   node scripts/worker-broker-evidence.mjs qualify --phase <N> --host <codex|claude-code> [--record]
 `);
@@ -40,6 +41,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
     if (token === "--strict") args.strict = true;
+    else if (token === "--require-complete") args.requireComplete = true;
     else if (token === "--write" || token === "--record") args.write = true;
     else if (token === "--all") args.all = true;
     else if (token === "--phase") args.phase = argv[++i];
@@ -62,6 +64,24 @@ function fail(errors) {
   process.exit(1);
 }
 
+function publishRecord(record) {
+  try {
+    const relative = writeEvidenceRecord(record, REPO_ROOT);
+    updateLedger({
+      phase: record.phase,
+      slice: record.slice,
+      status: record.status,
+      path: relative,
+      recordDigest: record.recordDigest,
+      sourceCommit: record.source.headCommit,
+      recordedAt: record.recordedAt
+    }, REPO_ROOT);
+    return relative;
+  } catch {
+    fail(["Evidence publication failed safely."]);
+  }
+}
+
 function commandStatus(args) {
   const result = evidenceStatus(REPO_ROOT, { strict: Boolean(args.strict) });
   printJson({
@@ -75,11 +95,15 @@ function commandStatus(args) {
 
 function commandVerify(args) {
   if (args.all) {
-    const result = verifyLedger(REPO_ROOT, { strict: Boolean(args.strict) });
+    const result = verifyLedger(REPO_ROOT, {
+      strict: Boolean(args.strict),
+      requireComplete: Boolean(args.requireComplete)
+    });
     printJson(result);
     if (!result.ok) process.exit(1);
     return;
   }
+  if (args.requireComplete) usage();
   if (!args.phase) usage();
   const result = verifyPhase(args.phase, REPO_ROOT, { strict: Boolean(args.strict) });
   printJson(result);
@@ -88,30 +112,46 @@ function commandVerify(args) {
 
 function commandCapture(args) {
   if (!args.phase || !args.slice) usage();
+  const status = args.status || "implemented_unverified";
+  if (["verified_on_draft", "qualified"].includes(status)) {
+    fail([
+      `capture cannot create ${status} evidence from identity-only observations.`,
+      "Run the required gates and ingest their bounded command outcomes through a proof-producing workflow."
+    ]);
+  }
   const identity = gitIdentity(REPO_ROOT);
+  const observedAt = new Date().toISOString();
+  const identityAssertions = [
+    `headCommit=${identity.headCommit}`,
+    `clean=${identity.cleanTreeAtVerification}`,
+    `sourceDigest=${computeInventoryDigest(REPO_ROOT)}`,
+    `phaseScopeDigest=${computePhaseScopeDigest(args.phase, REPO_ROOT)}`
+  ];
   const verification = [
     {
+      gateId: "repository-check",
       command: "npm run check",
       boundary: "source-provider-neutral",
       outcome: "not_run",
+      skipMeaning: "Identity-only capture does not execute repository checks.",
       assertions: ["capture records identity; run check separately for gate proof"]
     },
     {
+      gateId: "source-identity",
       command: "git identity + inventory digest",
       boundary: "source",
       outcome: identity.cleanTreeAtVerification ? "pass" : "fail",
-      assertions: [
-        `headCommit=${identity.headCommit}`,
-        `clean=${identity.cleanTreeAtVerification}`,
-        `sourceDigest=${computeInventoryDigest(REPO_ROOT)}`,
-        `phaseScopeDigest=${computePhaseScopeDigest(args.phase, REPO_ROOT)}`
-      ]
+      startedAt: observedAt,
+      endedAt: observedAt,
+      exitCode: identity.cleanTreeAtVerification ? 0 : 1,
+      outputDigest: sha256Text(identityAssertions.join("\n")),
+      assertions: identityAssertions
     }
   ];
   const record = buildEvidenceRecord({
     phase: args.phase,
     slice: args.slice,
-    status: args.status || "implemented_unverified",
+    status,
     verification,
     scenarios: [
       {
@@ -136,16 +176,7 @@ function commandCapture(args) {
   const validated = validateEvidenceRecord(record);
   if (!validated.ok) fail(validated.errors);
   if (args.write) {
-    const relative = writeEvidenceRecord(record, REPO_ROOT);
-    updateLedger({
-      phase: record.phase,
-      slice: record.slice,
-      status: record.status,
-      path: relative,
-      recordDigest: record.recordDigest,
-      sourceCommit: record.source.headCommit,
-      recordedAt: record.recordedAt
-    }, REPO_ROOT);
+    const relative = publishRecord(record);
     printJson({ ok: true, path: relative, record });
     return;
   }
@@ -154,9 +185,12 @@ function commandCapture(args) {
 
 function commandQualify(args) {
   if (!args.phase || !args.host) usage();
+  if (!["codex", "claude-code"].includes(args.host)) usage();
   const gaps = [];
   const which = process.platform === "win32" ? "where" : "which";
-  const probe = process.platform === "win32" ? "codex.exe" : "codex";
+  const probe = args.host === "claude-code"
+    ? (process.platform === "win32" ? "claude.exe" : "claude")
+    : (process.platform === "win32" ? "codex.exe" : "codex");
   const probeResult = spawnSync(which, [probe], { encoding: "utf8" });
   if (probeResult.status !== 0) {
     gaps.push(`${args.host} CLI not found on PATH; live qualification residual.`);
@@ -170,6 +204,7 @@ function commandQualify(args) {
     status: "implemented_unverified",
     verification: [
       {
+        gateId: `live-${args.host}`,
         command: `worker:qualify --phase ${args.phase} --host ${args.host}`,
         boundary: "live-host",
         outcome: "skip",
@@ -197,25 +232,35 @@ function commandQualify(args) {
       supersededBy: null,
       liveQualificationGaps: gaps
     },
-    evidenceSystemQualification: true,
+    evidenceSystemQualification: false,
     provisionalSupportingRecord: false,
-    releaseQualification: false
+    releaseQualification: false,
+    qualification: {
+      deterministic: "not_run",
+      installedHost: "not_run",
+      provider: "not_run",
+      release: "not_run"
+    }
   });
   if (args.write) {
-    const relative = writeEvidenceRecord(record, REPO_ROOT);
-    updateLedger({
-      phase: record.phase,
-      slice: record.slice,
-      status: record.status,
+    const relative = publishRecord(record);
+    printJson({
+      ok: false,
+      qualified: false,
       path: relative,
-      recordDigest: record.recordDigest,
-      sourceCommit: record.source.headCommit,
-      recordedAt: record.recordedAt
-    }, REPO_ROOT);
-    printJson({ ok: true, path: relative, residualGaps: gaps, record });
+      residualGaps: gaps.length ? gaps : ["Live qualification was not executed."],
+      record
+    });
+    process.exitCode = 1;
     return;
   }
-  printJson({ ok: true, residualGaps: gaps, record });
+  printJson({
+    ok: false,
+    qualified: false,
+    residualGaps: gaps.length ? gaps : ["Live qualification was not executed."],
+    record
+  });
+  process.exitCode = 1;
 }
 
 const args = parseArgs(process.argv.slice(2));

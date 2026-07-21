@@ -10,6 +10,33 @@ import { appendLifecycleEvent } from "./task-contract.mjs";
 
 export const RECONCILER_PRIVILEGE = "host-trusted-reconciler";
 
+export function providerLaunchUnsettled(job) {
+  const spawn = job?.request?.spawn;
+  return Boolean(spawn && (
+    spawn.providerLaunchPending === true
+    || spawn.providerLaunchInFlight === true
+    || spawn.providerLaunchOutcome === "unknown"
+  ));
+}
+
+/**
+ * Whether process/runtime cleanup must wait for a durable provider-launch
+ * settlement. Authorization is published before process identity, so an
+ * authorization-only record is still launch-capable unless the launcher has
+ * durably committed the explicit `not-launched` outcome.
+ */
+export function providerLaunchCleanupBlocked(job) {
+  if (providerLaunchUnsettled(job)) return true;
+  const hasAuthorization = job?.workerAuthorization !== null
+    && job?.workerAuthorization !== undefined;
+  const hasRecordedProcess = Boolean(
+    job?.workerProcess?.pid || job?.providerProcess?.pid
+  );
+  return hasAuthorization
+    && !hasRecordedProcess
+    && job?.request?.spawn?.providerLaunchOutcome !== "not-launched";
+}
+
 /**
  * @param {object} options
  * @param {string} options.root
@@ -54,23 +81,35 @@ export function reconcileOwnedWorkers({
       continue;
     }
 
-    const alive = processAlive(job);
-    if (alive) {
-      results.push({ workerId: job.id, action: "none", reason: "process-alive" });
+    // This privileged reconciler has an explicit processAlive observer. Once
+    // the launch flags are durably settled it may verify a launched process (or
+    // its loss) even if the job identity publication was incomplete. Raw
+    // cleanup paths without that observer must use providerLaunchCleanupBlocked.
+    if (providerLaunchUnsettled(job)) {
+      results.push({ workerId: job.id, action: "none", reason: "provider-launch-unsettled" });
       continue;
     }
 
-    // Process not alive: mark lost; never relaunch.
-    if (typeof cleanupProcess === "function") {
-      try {
-        cleanupProcess(job);
-      } catch {
-        /* cleanup is best-effort */
-      }
-    }
-
+    let decision = { action: "none", reason: "process-alive" };
+    let lostSnapshot = null;
     updateJob(root, job.id, (current) => {
-      if (terminal(current)) return current;
+      if (terminal(current)) {
+        decision = { action: "none", reason: "terminal" };
+        return current;
+      }
+      // Re-evaluate the durable launch state under the job lock. A provider may
+      // have entered its commit-to-launch window after the outer list snapshot;
+      // absence of a process before that window settles is not proof of loss.
+      if (providerLaunchUnsettled(current)) {
+        decision = { action: "none", reason: "provider-launch-unsettled" };
+        return current;
+      }
+      if (processAlive(current)) {
+        decision = { action: "none", reason: "process-alive" };
+        return current;
+      }
+      decision = { action: "marked-lost", reason: "process-not-alive" };
+      lostSnapshot = current;
       const events = appendLifecycleEvent(
         current.lifecycleEvents || [],
         "checkpoint",
@@ -104,10 +143,17 @@ export function reconcileOwnedWorkers({
         }
       };
     }, env);
+    if (decision.action === "marked-lost" && typeof cleanupProcess === "function") {
+      try {
+        cleanupProcess(lostSnapshot);
+      } catch {
+        /* cleanup is best-effort */
+      }
+    }
     results.push({
       workerId: job.id,
-      action: "marked-lost",
-      reason: "process-not-alive",
+      action: decision.action,
+      reason: decision.reason,
       replayedPrompt: false
     });
   }

@@ -60,7 +60,8 @@ test("safety: mutating prompts are never auto-replayed by reconciler", () => {
       principal: principal(root),
       trusted: true,
       processAlive: () => false,
-      replayPrompt: () => { replays += 1; }
+      replayPrompt: () => { replays += 1; },
+      env
     }),
     (error) => error?.code === "E_POLICY"
   );
@@ -69,7 +70,8 @@ test("safety: mutating prompts are never auto-replayed by reconciler", () => {
     root,
     principal: principal(root),
     trusted: true,
-    processAlive: () => false
+    processAlive: () => false,
+    env
   });
   assert.equal(result.replayedPrompt, false);
 });
@@ -85,10 +87,18 @@ test("safety: provider success cannot set hostVerification to passed", () => {
     idempotencyKey: "safety-host-ver-0001",
     env
   });
-  // Simulate provider claiming success in result payload.
+  // A provider-specific success status is not valid authoritative state.
+  assert.throws(
+    () => updateJob(root, spawned.handle.id, (job) => ({
+      ...job,
+      status: "succeeded"
+    }), env),
+    (error) => error?.code === "E_STATE"
+  );
+  // Simulate a provider success payload using the broker's valid terminal state.
   updateJob(root, spawned.handle.id, (job) => ({
     ...job,
-    status: "succeeded",
+    status: "completed",
     phase: "completed",
     completedAt: new Date().toISOString(),
     result: {
@@ -184,11 +194,44 @@ test("safety: two isolated writers cannot mutate parent before explicit integrat
     executionRoot: wt1.executionRoot,
     baseCommit: base
   });
-  const prep = prepareIntegration({ controlRoot: root, manifest, parentFingerprint: before });
+  const prep = prepareIntegration({
+    controlRoot: root,
+    executionRoot: wt1.executionRoot,
+    manifest,
+    parentFingerprint: before,
+    expectedWorkerId: "task-writer00000001",
+    expectedScope: null,
+    expectedLineage: null,
+    env
+  });
   assert.equal(prep.autoApplied, false);
   assertParentUnchanged(before, root);
-  removeWorkerWorktree(wt1.executionRoot, root);
-  removeWorkerWorktree(wt2.executionRoot, root);
+  removeWorkerWorktree(wt1.executionRoot, root, "task-writer00000001", env);
+  removeWorkerWorktree(wt2.executionRoot, root, "task-writer00000002", env);
+});
+
+test("safety: one worker identity cannot remove another worker's managed worktree", () => {
+  const root = initRepo();
+  const env = envFor();
+  const base = git(root, "rev-parse", "HEAD");
+  const workerA = "task-cleanup0000001";
+  const workerB = "task-cleanup0000002";
+  const wtA = createWorkerWorktree({ controlRoot: root, baseCommit: base, workerId: workerA, env });
+  const wtB = createWorkerWorktree({ controlRoot: root, baseCommit: base, workerId: workerB, env });
+
+  assert.throws(
+    () => removeWorkerWorktree(wtA.executionRoot, root),
+    (error) => error?.code === "E_USAGE"
+  );
+  assert.throws(
+    () => removeWorkerWorktree(wtB.executionRoot, root, workerA, env),
+    (error) => error?.code === "E_WORKTREE" && /expected worker identity/.test(error.message)
+  );
+  assert.ok(fs.existsSync(wtA.executionRoot));
+  assert.ok(fs.existsSync(wtB.executionRoot));
+
+  assert.equal(removeWorkerWorktree(wtA.executionRoot, root, workerA, env), true);
+  assert.equal(removeWorkerWorktree(wtB.executionRoot, root, workerB, env), true);
 });
 
 test("safety: typed failures remain explicit for schema/auth/lifecycle", async () => {

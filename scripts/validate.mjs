@@ -239,6 +239,8 @@ if (!versionsOnly) {
     "tests/live-grok.test.mjs",
     "tests/installed-codex.test.mjs",
     "tests/natural-codex-output.schema.json",
+    "tests/worker-broker-evidence.test.mjs",
+    "tests/worker-protocol.test.mjs",
     "tests/nonblocking-stdin-child.mjs",
     "tests/pty-ingress.test.mjs",
     "tests/pty-stdin-driver.py",
@@ -263,6 +265,8 @@ if (!versionsOnly) {
     "plugins/grok/prompts/adversarial-review.md",
     "plugins/grok/prompts/stop-review-gate.md",
     "plugins/grok/schemas/review-output.schema.json",
+    "plugins/grok/schemas/worker-broker-evidence.schema.json",
+    "plugins/grok/schemas/worker-protocol.schema.json",
     "plugins/grok/scripts/grok-companion.mjs",
     "plugins/grok/scripts/grok-codex.mjs",
     "plugins/grok/mcp/broker.mjs",
@@ -401,6 +405,41 @@ if (!versionsOnly) {
       if (!schema.required?.includes(field) || !schema.properties?.[field]) problem(`Review schema is missing required field ${field}.`, "plugins/grok/schemas/review-output.schema.json");
     }
     if (schema.properties?.verdict || schema.required?.includes("verdict")) problem("Review schema must not accept a model-controlled verdict; runtime derives it from findings.", "plugins/grok/schemas/review-output.schema.json");
+  }
+
+  const workerEvidenceSchema = readJson("plugins/grok/schemas/worker-broker-evidence.schema.json");
+  if (workerEvidenceSchema) {
+    const file = "plugins/grok/schemas/worker-broker-evidence.schema.json";
+    if (workerEvidenceSchema.$schema !== "https://json-schema.org/draft/2020-12/schema") {
+      problem("Worker Broker evidence schema must use JSON Schema 2020-12.", file);
+    }
+    for (const field of ["phase", "status", "qualification", "source", "verification", "recordDigest"]) {
+      if (!workerEvidenceSchema.required?.includes(field) || !workerEvidenceSchema.properties?.[field]) {
+        problem(`Worker Broker evidence schema is missing required field ${field}.`, file);
+      }
+    }
+    const blockedPromotions = workerEvidenceSchema.not?.properties?.status?.enum || [];
+    for (const status of ["verified_on_draft", "qualified"]) {
+      if (!blockedPromotions.includes(status)) {
+        problem(`Worker Broker evidence schema must fail closed on ${status} until proof provenance exists.`, file);
+      }
+    }
+    if (workerEvidenceSchema.properties?.scenarios?.items?.properties?.measurements?.additionalProperties !== false) {
+      problem("Worker Broker scenario measurements must be a bounded allowlist.", file);
+    }
+  }
+
+  const workerProtocolSchema = readJson("plugins/grok/schemas/worker-protocol.schema.json");
+  if (workerProtocolSchema) {
+    const file = "plugins/grok/schemas/worker-protocol.schema.json";
+    if (workerProtocolSchema.$schema !== "https://json-schema.org/draft/2020-12/schema") {
+      problem("Worker Protocol schema must use JSON Schema 2020-12.", file);
+    }
+    for (const definition of ["WorkerHandle", "WorkerSnapshot", "WorkerEvent", "WorkerEventPage", "WorkerResult", "WorkerError"]) {
+      if (!workerProtocolSchema.$defs?.[definition]) {
+        problem(`Worker Protocol schema is missing ${definition}.`, file);
+      }
+    }
   }
 
   const macosEvidence = readJson("tests/e2e-results/macos-0.2.99-2026-07-13.json");

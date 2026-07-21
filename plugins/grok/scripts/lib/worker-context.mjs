@@ -4,8 +4,11 @@
 import crypto from "node:crypto";
 
 import { CompanionError } from "./errors.mjs";
+import { redactText } from "./redact.mjs";
 
 export const CONTEXT_PACKET_VERSION = 1;
+export const MAX_CONTEXT_FACTS = 64;
+export const MAX_CONTEXT_FACT_CHARS = 2000;
 export const CONTEXT_MODES = Object.freeze([
   "none",
   "explicit-envelope",
@@ -14,23 +17,63 @@ export const CONTEXT_MODES = Object.freeze([
 ]);
 
 /**
- * Trusted privacy-filtered transcript acquisition is not proven by default.
- * Stronger modes remain disabled until a spike record sets proven=true.
+ * Trusted privacy-filtered transcript acquisition is not broker-attested yet.
+ * Do not accept caller-provided booleans as proof: any plugin caller could forge
+ * them. A future implementation must replace this with a capability created and
+ * verified by the broker boundary, not widen this public helper.
  */
-export function transcriptAcquisitionCapability({ proven = false, privacyFiltered = false } = {}) {
+export function transcriptAcquisitionCapability(_claim = {}) {
   return Object.freeze({
-    proven: Boolean(proven),
-    privacyFiltered: Boolean(privacyFiltered),
-    recentNEnabled: Boolean(proven && privacyFiltered),
-    allUserVisibleEnabled: Boolean(proven && privacyFiltered),
-    note: proven && privacyFiltered
-      ? "recent:N and all-user-visible may be enabled."
-      : "Only none and explicit-envelope are safe."
+    proven: false,
+    privacyFiltered: false,
+    recentNEnabled: false,
+    allUserVisibleEnabled: false,
+    note: "Only none and explicit-envelope are safe; broker-bound transcript attestation is unavailable."
   });
+}
+
+function deepFreeze(value, seen = new WeakSet()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return value;
+  seen.add(value);
+  for (const child of Object.values(value)) deepFreeze(child, seen);
+  return Object.freeze(value);
 }
 
 function digest(value) {
   return crypto.createHash("sha256").update(typeof value === "string" ? value : JSON.stringify(value)).digest("hex");
+}
+
+function normalizeBounds(bounds, mode) {
+  if (mode === "none") return Object.freeze({ maxFacts: 0, maxFactChars: 0 });
+  const maxFacts = bounds?.maxFacts ?? MAX_CONTEXT_FACTS;
+  const maxFactChars = bounds?.maxFactChars ?? MAX_CONTEXT_FACT_CHARS;
+  if (!Number.isSafeInteger(maxFacts) || maxFacts < 1 || maxFacts > MAX_CONTEXT_FACTS) {
+    throw new CompanionError("E_USAGE", `bounds.maxFacts must be an integer from 1 to ${MAX_CONTEXT_FACTS}.`);
+  }
+  if (!Number.isSafeInteger(maxFactChars) || maxFactChars < 1 || maxFactChars > MAX_CONTEXT_FACT_CHARS) {
+    throw new CompanionError("E_USAGE", `bounds.maxFactChars must be an integer from 1 to ${MAX_CONTEXT_FACT_CHARS}.`);
+  }
+  return Object.freeze({ maxFacts, maxFactChars });
+}
+
+function assertContextMode(mode, _capability) {
+  if (mode === "explicit-envelope") return null;
+  if (mode === "all-user-visible") {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "all-user-visible context requires broker-attested privacy-filtered transcript acquisition."
+    );
+  }
+  const recent = /^recent:(\d+)$/.exec(mode);
+  if (!recent) throw new CompanionError("E_USAGE", `Unsupported context mode ${mode}.`);
+  const count = Number(recent[1]);
+  if (!Number.isSafeInteger(count) || count < 1 || count > MAX_CONTEXT_FACTS) {
+    throw new CompanionError("E_USAGE", `recent:N requires N from 1 to ${MAX_CONTEXT_FACTS}.`);
+  }
+  throw new CompanionError(
+    "E_CAPABILITY",
+    "recent:N context requires broker-attested privacy-filtered transcript acquisition."
+  );
 }
 
 /**
@@ -47,7 +90,8 @@ export function buildContextPacket({
 } = {}) {
   const resolvedMode = String(mode || "explicit-envelope");
   if (resolvedMode === "none") {
-    return Object.freeze({
+    const safeBounds = normalizeBounds(bounds, resolvedMode);
+    return deepFreeze({
       schemaVersion: CONTEXT_PACKET_VERSION,
       mode: "none",
       packetId: `ctx-${digest("none").slice(0, 16)}`,
@@ -55,76 +99,81 @@ export function buildContextPacket({
       provenance: { source: "none", precedence: [] },
       facts: [],
       omissions: ["all-context-omitted"],
-      bounds: bounds || { maxFacts: 0 },
+      bounds: safeBounds,
       hiddenRecordsExported: false
     });
   }
 
-  if (resolvedMode.startsWith("recent:") || resolvedMode === "all-user-visible") {
-    if (resolvedMode.startsWith("recent:") && !transcriptCapability.recentNEnabled) {
-      throw new CompanionError(
-        "E_CAPABILITY",
-        "recent:N context requires proven privacy-filtered transcript acquisition."
-      );
-    }
-    if (resolvedMode === "all-user-visible" && !transcriptCapability.allUserVisibleEnabled) {
-      throw new CompanionError(
-        "E_CAPABILITY",
-        "all-user-visible context requires proven privacy-filtered transcript acquisition."
-      );
-    }
-  } else if (resolvedMode !== "explicit-envelope") {
-    throw new CompanionError("E_USAGE", `Unsupported context mode ${resolvedMode}.`);
-  }
+  const recentLimit = assertContextMode(resolvedMode, transcriptCapability);
+  const safeBounds = normalizeBounds(bounds, resolvedMode);
+  const effectiveMaxFacts = recentLimit == null
+    ? safeBounds.maxFacts
+    : Math.min(recentLimit, safeBounds.maxFacts);
 
-  const safeFacts = (Array.isArray(facts) ? facts : [])
+  const candidates = [];
+  if (envelope?.userRequest && !looksHidden(envelope.userRequest)) {
+    const objective = envelope.objective || envelope.userRequest;
+    if (objective) candidates.push(objective);
+  }
+  candidates.push(...(Array.isArray(facts) ? facts : []));
+  const safeFacts = candidates
     .map((item) => String(item ?? "").trim())
     .filter(Boolean)
     .filter((item) => !looksHidden(item))
+    .map((item) => item.slice(0, safeBounds.maxFactChars))
+    .filter((item, index, all) => all.indexOf(item) === index)
+    .slice(0, effectiveMaxFacts);
+  const safeOmissions = (Array.isArray(omissions) ? omissions : [])
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean)
+    .filter((item) => !looksHidden(item))
+    .map((item) => item.slice(0, 256))
+    .filter((item, index, all) => all.indexOf(item) === index)
     .slice(0, 64);
-
-  if (envelope?.userRequest && !looksHidden(envelope.userRequest)) {
-    // Include only non-secret envelope fields as facts when not already present.
-    const objective = envelope.objective || envelope.userRequest;
-    if (objective && !safeFacts.includes(objective)) {
-      safeFacts.unshift(String(objective).slice(0, 2000));
-    }
-  }
 
   const packet = {
     schemaVersion: CONTEXT_PACKET_VERSION,
     mode: resolvedMode === "explicit-envelope" ? "explicit-envelope" : resolvedMode,
     packetId: `ctx-${digest(JSON.stringify({ mode: resolvedMode, safeFacts })).slice(0, 16)}`,
     provenance: {
-      source: "explicit-envelope",
-      precedence: ["host-envelope", "explicit-facts"],
+      source: resolvedMode === "explicit-envelope"
+        ? "explicit-envelope"
+        : "trusted-privacy-filtered-transcript",
+      precedence: resolvedMode === "explicit-envelope"
+        ? ["host-envelope", "explicit-facts"]
+        : ["host-envelope", "privacy-filtered-transcript", "explicit-facts"],
       envelopeId: envelope?.envelopeId || null,
       envelopeDigest: envelope?.digest || null
     },
     facts: safeFacts,
     omissions: [
-      ...(Array.isArray(omissions) ? omissions : []),
+      ...safeOmissions,
       "hidden-system-instructions",
       "developer-instructions",
       "raw-transcripts",
       "credentials",
       "provider-session-ids"
     ],
-    bounds: bounds || { maxFacts: 64, maxFactChars: 2000 },
+    bounds: Object.freeze({
+      ...safeBounds,
+      effectiveMaxFacts
+    }),
     hiddenRecordsExported: false
   };
   packet.digest = digest({
     mode: packet.mode,
     facts: packet.facts,
     provenance: packet.provenance,
-    omissions: packet.omissions
+    omissions: packet.omissions,
+    bounds: packet.bounds
   });
-  return Object.freeze(packet);
+  return deepFreeze(packet);
 }
 
 function looksHidden(text) {
   const value = String(text || "");
-  return /(?:^|\b)(system:|developer:|<\s*system\s*>|api[_-]?key|bearer\s+[a-z0-9._-]+|xai-[a-z0-9]{10,})/i.test(value);
+  return /(?:^|\b)(system:|developer:|<\s*system\s*>|api[_-]?key|bearer\s+[a-z0-9._-]+|xai-[a-z0-9]{10,})/i.test(value)
+    || redactText(value) !== value;
 }
 
 export function assertNoHiddenExport(packet) {

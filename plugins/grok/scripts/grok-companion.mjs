@@ -54,6 +54,8 @@ import {
   parseTaskEnvelopeInput
 } from "./lib/task-contract.mjs";
 import { projectWorkerSnapshot } from "./lib/worker-protocol.mjs";
+import { cancellationNonce } from "./lib/worker-mutation.mjs";
+import { providerLaunchCleanupBlocked } from "./lib/worker-reconcile.mjs";
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = path.resolve(path.dirname(SCRIPT), "..");
@@ -191,6 +193,24 @@ function boundedLogEvent(event) {
   if (event.type === "session") return { type: "session", sessionId: event.sessionId || null };
   return { type: event.type || "unknown" };
 }
+function redactProviderEvent(event) {
+  const safe = redact(event);
+  // Provider process identity is created by the local broker, not by model
+  // output. Preserve its OS birth token only when the live PID still proves the
+  // same token; generic redaction must continue to mask untrusted `startToken`
+  // fields everywhere else.
+  const identity = event?.type === "provider" ? event.process : null;
+  if (
+    safe?.process
+    && Number.isInteger(identity?.pid)
+    && typeof identity.startToken === "string"
+    && identity.startToken.length <= 256
+    && processStartToken(identity.pid) === identity.startToken
+  ) {
+    safe.process.startToken = identity.startToken;
+  }
+  return safe;
+}
 function validateModelEffort(options) { if (options.effort && !VALID_EFFORTS.has(options.effort)) throw new CompanionError("E_USAGE", "--effort must be low, medium, or high."); }
 
 function scrubStoredRequest(request) {
@@ -288,6 +308,34 @@ function applyTaskPrivacy(result, cleanup, retentionNote = null) {
     next.privacyWarning = [...new Set([next.privacyWarning, retentionNote].filter(Boolean))].join("; ");
   }
   return next;
+}
+
+function recheckCancelLaunchSettlement(root, id) {
+  let retained = false;
+  const job = updateJob(root, id, (current) => {
+    if (terminal(current) || !providerLaunchCleanupBlocked(current)) return current;
+    retained = true;
+    const reason = "Cancellation is durable, but provider launch settlement is incomplete.";
+    current.status = "running";
+    current.phase = "launch-unsettled";
+    current.completedAt = null;
+    current.progress = "Cancellation requested; provider launch settlement is still pending";
+    current.summary = reason;
+    current.error = { code: "E_STATE", message: reason };
+    current.result = current.jobClass === "review"
+      ? applyReviewPrivacy(
+        current.result,
+        null,
+        "Isolated review home retained because provider launch settlement is incomplete."
+      )
+      : applyTaskPrivacy(
+        current.result,
+        null,
+        "Task runtime artifacts retained because provider launch settlement is incomplete."
+      );
+    return current;
+  });
+  return { job, retained };
 }
 
 function includeGuardCleanup(root, id, cleanup) {
@@ -397,6 +445,10 @@ async function recoverActiveJobs(root) {
     });
   }
   for (const job of listJobs(root).filter((candidate) => !terminal(candidate))) {
+    // Broker-owned spawns deliberately commit before provider launch. Missing
+    // process identity is not evidence of loss while that launch boundary is
+    // pending, in flight, or explicitly ambiguous.
+    if (providerLaunchCleanupBlocked(job)) continue;
     const cleanupBlocked = job.phase === "cleanup-blocked" && Boolean(job.pendingTerminal);
     if (job.status === "queued" && Date.now() - Date.parse(job.createdAt) < 5000) continue;
     const controllerTokenMatches = Boolean(job.controllerProcess?.pid && job.controllerProcess.startToken && processStartToken(job.controllerProcess.pid) === job.controllerProcess.startToken);
@@ -458,6 +510,9 @@ async function recoverActiveJobs(root) {
       // The worker can finish between the liveness check above and this locked
       // update. Never turn that freshly completed record into E_WORKER_LOST.
       if (terminal(current)) return current;
+      // Re-check the broker launch boundary under the job lock. The outer
+      // snapshot is only an optimization and cannot authorize terminalization.
+      if (providerLaunchCleanupBlocked(current)) return current;
       current.request = scrubStoredRequest(current.request);
       const pending = current.pendingTerminal || null;
       current.status = pending?.status || "failed";
@@ -636,7 +691,7 @@ function renderJob(job) {
 function eventUpdater(root, id) {
   let lastMessageUpdate = 0;
   return (event) => {
-    const safeEvent = boundedLogEvent(redact(event));
+    const safeEvent = boundedLogEvent(redactProviderEvent(event));
     appendLog(root, id, safeEvent);
     if (safeEvent.type === "provider") {
       updateJob(root, id, (job) => touchJob(job, {
@@ -1385,8 +1440,19 @@ async function handleCancel(raw) {
   const { options, positionals } = parseArgs(argvFrom(raw), { values: ["cwd"], booleans: ["json"] }); const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd()); await recoverActiveJobs(root); const job = assertHostJobAccess(selectJob(root, { id: positionals[0], host: currentHost(), active: !positionals[0] }), "active");
   // Launch window: workerAuthorization is persisted before workerProcess exists.
   // Prefer the live worker nonce; fall back to the authenticated launch nonce; fail closed if neither.
-  if (!terminal(job)) requestCancel(root, job.id, job.workerProcess?.nonce || job.workerAuthorization || "");
+  if (!terminal(job)) requestCancel(root, job.id, cancellationNonce(job) || "");
   const deadline = Date.now() + 10000; let current = readJob(root, job.id); while (!terminal(current) && Date.now() < deadline) { await new Promise((r) => setTimeout(r, 200)); current = readJob(root, job.id); }
+  if (!terminal(current)) {
+    // The timeout snapshot cannot authorize teardown. Re-read and classify under
+    // the per-job update lock so a launch-window authorization or settlement
+    // committed during the wait wins before any process signal or runtime cleanup.
+    const settlement = recheckCancelLaunchSettlement(root, current.id);
+    current = settlement.job;
+    if (settlement.retained) {
+      out(options.json ? publicJson(current) : `Cancellation requested.\n${renderJob(current)}`, options.json);
+      return;
+    }
+  }
   if (!terminal(current)) {
     const forcedTerminal = {
       status: "cancelled",

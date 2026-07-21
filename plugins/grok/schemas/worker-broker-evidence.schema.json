@@ -14,15 +14,31 @@
     "slice",
     "status",
     "recordedAt",
+    "releaseQualification",
+    "evidenceSystemQualification",
+    "provisionalSupportingRecord",
+    "qualification",
     "source",
+    "installation",
     "runtime",
+    "prerequisites",
     "verification",
+    "scenarios",
+    "liveScenarios",
     "authorities",
-    "limits"
+    "limits",
+    "recordDigest"
   ],
+  "not": {
+    "properties": {
+      "status": { "enum": ["verified_on_draft", "qualified"] }
+    },
+    "required": ["status"],
+    "description": "Promotion is disabled until a broker-owned proof-producing runner exists."
+  },
   "properties": {
     "schemaVersion": { "type": "integer", "const": 1 },
-    "roadmapVersion": { "type": "string", "minLength": 1, "maxLength": 32 },
+    "roadmapVersion": { "type": "string", "const": "1.0" },
     "recordType": {
       "type": "string",
       "enum": ["worker-broker-slice", "worker-broker-aggregate"]
@@ -53,6 +69,17 @@
     "releaseQualification": { "type": "boolean" },
     "evidenceSystemQualification": { "type": "boolean" },
     "provisionalSupportingRecord": { "type": "boolean" },
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deterministic", "installedHost", "provider", "release"],
+      "properties": {
+        "deterministic": { "type": "string", "enum": ["pass", "fail", "skip", "not_run"] },
+        "installedHost": { "type": "string", "enum": ["pass", "fail", "skip", "not_run"] },
+        "provider": { "type": "string", "enum": ["pass", "fail", "skip", "not_run"] },
+        "release": { "type": "string", "enum": ["pass", "fail", "skip", "not_run"] }
+      }
+    },
     "source": {
       "type": "object",
       "additionalProperties": false,
@@ -62,7 +89,8 @@
         "headTree",
         "sourceInventoryDigest",
         "phaseScopeDigest",
-        "cleanTreeAtVerification"
+        "cleanTreeAtVerification",
+        "phaseScopePaths"
       ],
       "properties": {
         "pluginVersion": { "type": "string", "minLength": 1 },
@@ -88,6 +116,14 @@
     "installation": {
       "type": "object",
       "additionalProperties": false,
+      "required": [
+        "method",
+        "sourcePluginInventoryDigest",
+        "installedPluginInventoryDigest",
+        "installedFileCount",
+        "sourceAndInstalledInventoriesEqual",
+        "privateInstallPathRecorded"
+      ],
       "properties": {
         "method": { "type": "string" },
         "sourcePluginInventoryDigest": {
@@ -100,7 +136,7 @@
         },
         "installedFileCount": { "type": ["integer", "null"], "minimum": 0 },
         "sourceAndInstalledInventoriesEqual": { "type": ["boolean", "null"] },
-        "privateInstallPathRecorded": { "type": "boolean" }
+        "privateInstallPathRecorded": { "type": "boolean", "const": false }
       }
     },
     "runtime": {
@@ -124,7 +160,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["phase", "recordDigest"],
+        "required": ["phase", "recordDigest", "gateIds"],
         "properties": {
           "phase": { "type": "string" },
           "recordDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
@@ -141,9 +177,20 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["command", "boundary", "outcome"],
+        "required": ["gateId", "boundary", "outcome"],
+        "oneOf": [
+          { "required": ["command"], "not": { "required": ["argv"] } },
+          { "required": ["argv"], "not": { "required": ["command"] } }
+        ],
         "properties": {
+          "gateId": { "type": "string", "minLength": 1, "maxLength": 128 },
           "command": { "type": "string", "minLength": 1 },
+          "argv": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 256,
+            "items": { "type": "string", "minLength": 1 }
+          },
           "boundary": { "type": "string", "minLength": 1 },
           "outcome": {
             "type": "string",
@@ -164,7 +211,19 @@
             "items": { "type": "string" }
           },
           "skipMeaning": { "type": ["string", "null"] }
-        }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "outcome": { "enum": ["pass", "fail"] } } },
+            "then": {
+              "required": ["startedAt", "endedAt", "exitCode", "outputDigest"]
+            }
+          },
+          {
+            "if": { "properties": { "outcome": { "enum": ["skip", "not_run"] } } },
+            "then": { "required": ["skipMeaning"] }
+          }
+        ]
       }
     },
     "scenarios": {
@@ -184,7 +243,36 @@
           },
           "measurements": {
             "type": "object",
-            "additionalProperties": true
+            "additionalProperties": false,
+            "properties": {
+              "durationMs": { "type": "number", "minimum": 0 },
+              "spawnLatencyMs": { "type": "number", "minimum": 0 },
+              "terminalVisibilityMs": { "type": "number", "minimum": 0 },
+              "cancellationRequestToProcessGroupGoneMs": { "type": "number", "minimum": 0 },
+              "cancellationRequestToTerminalRecordMs": { "type": "number", "minimum": 0 },
+              "workerCount": { "type": "number", "minimum": 0 },
+              "messageCount": { "type": "number", "minimum": 0 },
+              "deliveredCount": { "type": "number", "minimum": 0 },
+              "rejectedCount": { "type": "number", "minimum": 0 },
+              "deliveryUnknownCount": { "type": "number", "minimum": 0 },
+              "duplicateDeliveryCount": { "type": "number", "minimum": 0 },
+              "providerLaunchCount": { "type": "number", "minimum": 0 },
+              "artifactCount": { "type": "number", "minimum": 0 },
+              "changedFileCount": { "type": "number", "minimum": 0 },
+              "parentMutationCount": { "type": "number", "minimum": 0 },
+              "assertionCount": { "type": "number", "minimum": 0 },
+              "testsPassed": { "type": "number", "minimum": 0 },
+              "testsFailed": { "type": "number", "minimum": 0 },
+              "testsSkipped": { "type": "number", "minimum": 0 },
+              "retryCount": { "type": "number", "minimum": 0 },
+              "conflictCount": { "type": "number", "minimum": 0 },
+              "gapCount": { "type": "number", "minimum": 0 },
+              "bytes": { "type": "number", "minimum": 0 },
+              "parentUnchanged": { "type": "boolean" },
+              "workspaceIsolated": { "type": "boolean" },
+              "terminalObserved": { "type": "boolean" },
+              "processGroupGone": { "type": "boolean" }
+            }
           },
           "negative": { "type": "boolean" }
         }
@@ -210,7 +298,7 @@
       }
     },
     "ci": {
-      "type": "object",
+      "type": ["object", "null"],
       "additionalProperties": false,
       "properties": {
         "workflowUrl": { "type": ["string", "null"] },
