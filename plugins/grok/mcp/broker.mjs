@@ -4,10 +4,16 @@ import {
   resolveWorkerAuthority
 } from "../scripts/lib/worker-authority.mjs";
 import { MAX_WORKER_WAIT_MS, createWorkerService } from "../scripts/lib/worker-service.mjs";
+import {
+  MCP_CAPABILITY_CONTRACT_VERSION,
+  ROOT_READ_PROVIDER_CAPABILITY,
+  readValidProviderCapabilityReceipt
+} from "../scripts/lib/provider-capability.mjs";
+import { reconcileBrokerWorkers } from "../scripts/lib/worker-recovery.mjs";
 import { codexMetadataCapabilityMatrix } from "../scripts/lib/worker-presentation.mjs";
 
 export const MCP_SERVER_NAME = "grok-worker-broker";
-export const MCP_SERVER_VERSION = "1.1.0";
+export const MCP_SERVER_VERSION = MCP_CAPABILITY_CONTRACT_VERSION;
 
 /** Fail-closed supported MCP protocol versions. */
 export const SUPPORTED_MCP_PROTOCOL_VERSIONS = Object.freeze([
@@ -23,10 +29,12 @@ const CURSOR_SCHEMA = {
   required: ["schemaVersion", "workerId", "sequence"],
   properties: {
     schemaVersion: { type: "integer", const: 1 },
-    workerId: { type: "string" },
+    workerId: { type: "string", minLength: 1, maxLength: 256 },
     sequence: { type: "integer", minimum: 0 }
   }
 };
+
+const WORKER_ID_SCHEMA = Object.freeze({ type: "string", minLength: 1, maxLength: 256 });
 
 const READ_ONLY_ANNOTATIONS = Object.freeze({
   readOnlyHint: true,
@@ -49,7 +57,13 @@ const CANCEL_ANNOTATIONS = Object.freeze({
   openWorldHint: false
 });
 
-export const WORKER_TOOLS = Object.freeze([
+function deepFreeze(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const entry of Object.values(value)) deepFreeze(entry);
+  return Object.freeze(value);
+}
+
+export const BASE_WORKER_TOOLS = deepFreeze([
   {
     name: "worker_list_owned",
     title: "List owned Grok workers",
@@ -65,7 +79,7 @@ export const WORKER_TOOLS = Object.freeze([
       type: "object",
       additionalProperties: false,
       required: ["id"],
-      properties: { id: { type: "string" } }
+      properties: { id: WORKER_ID_SCHEMA }
     },
     annotations: READ_ONLY_ANNOTATIONS
   },
@@ -77,25 +91,25 @@ export const WORKER_TOOLS = Object.freeze([
       type: "object",
       additionalProperties: false,
       required: ["id"],
-      properties: { id: { type: "string" }, cursor: CURSOR_SCHEMA }
+      properties: { id: WORKER_ID_SCHEMA, cursor: CURSOR_SCHEMA }
     },
     annotations: READ_ONLY_ANNOTATIONS
   },
   {
     name: "worker_wait",
     title: "Wait for Grok worker progress",
-    description: "Wait up to 30 seconds for new lifecycle events or terminal state.",
+    description: "Wait up to 30 seconds for new lifecycle events or terminal state, draining this owned worker's durable launch outbox before authority-bound recovery maintenance.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       required: ["id"],
       properties: {
-        id: { type: "string" },
+        id: WORKER_ID_SCHEMA,
         cursor: CURSOR_SCHEMA,
         timeoutMs: { type: "integer", minimum: 0, maximum: MAX_WORKER_WAIT_MS }
       }
     },
-    annotations: READ_ONLY_ANNOTATIONS
+    annotations: MUTATION_ANNOTATIONS
   },
   {
     name: "worker_result",
@@ -105,30 +119,9 @@ export const WORKER_TOOLS = Object.freeze([
       type: "object",
       additionalProperties: false,
       required: ["id"],
-      properties: { id: { type: "string" } }
+      properties: { id: WORKER_ID_SCHEMA }
     },
     annotations: READ_ONLY_ANNOTATIONS
-  },
-  {
-    name: "worker_spawn",
-    title: "Spawn a read-only Grok worker",
-    description: "Idempotently commit a durable read-only Grok worker job. Success means durable commit, not provider startup. Write spawn is rejected until Phase 3.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: ["idempotencyKey", "userRequest"],
-      properties: {
-        idempotencyKey: { type: "string", minLength: 8, maxLength: 256 },
-        userRequest: { type: "string", minLength: 1, maxLength: 16000 },
-        objective: { type: "string", maxLength: 4000 },
-        roleId: {
-          type: "string",
-          enum: ["explorer", "implementer", "reviewer", "security", "test"]
-        },
-        write: { type: "boolean", description: "Must be false until Phase 3 worktrees enable broker write spawn." }
-      }
-    },
-    annotations: MUTATION_ANNOTATIONS
   },
   {
     name: "worker_cancel",
@@ -139,85 +132,132 @@ export const WORKER_TOOLS = Object.freeze([
       additionalProperties: false,
       required: ["id", "idempotencyKey"],
       properties: {
-        id: { type: "string" },
+        id: WORKER_ID_SCHEMA,
         idempotencyKey: { type: "string", minLength: 8, maxLength: 256 }
       }
     },
     annotations: CANCEL_ANNOTATIONS
-  },
-  {
-    name: "worker_send",
-    title: "Send a message to an active Grok worker",
-    description: "Durable mailbox send with explicit delivery outcome (delivered, rejected, or delivery_unknown).",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: ["id", "message", "idempotencyKey"],
-      properties: {
-        id: { type: "string" },
-        message: { type: "string", minLength: 1, maxLength: 16000 },
-        idempotencyKey: { type: "string", minLength: 8, maxLength: 256 }
-      }
-    },
-    annotations: MUTATION_ANNOTATIONS
-  },
-  {
-    name: "worker_followup",
-    title: "Follow up a terminal Grok worker",
-    description: "Lineage-preserving follow-up spawn for a terminal or idle worker.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: ["id", "message", "idempotencyKey"],
-      properties: {
-        id: { type: "string" },
-        message: { type: "string", minLength: 1, maxLength: 16000 },
-        idempotencyKey: { type: "string", minLength: 8, maxLength: 256 }
-      }
-    },
-    annotations: MUTATION_ANNOTATIONS
   }
 ]);
 
-const TOOL_NAMES = new Set(WORKER_TOOLS.map((tool) => tool.name));
-const MUTATION_TOOLS = new Set([
-  "worker_spawn",
-  "worker_cancel",
-  "worker_send",
-  "worker_followup"
-]);
-const ALLOWED_ARGUMENTS = Object.freeze({
-  worker_list_owned: [],
-  worker_get: ["id"],
-  worker_events_after: ["id", "cursor"],
-  worker_wait: ["id", "cursor", "timeoutMs"],
-  worker_result: ["id"],
-  worker_spawn: ["idempotencyKey", "userRequest", "objective", "roleId", "write"],
-  worker_cancel: ["id", "idempotencyKey"],
-  worker_send: ["id", "message", "idempotencyKey"],
-  worker_followup: ["id", "message", "idempotencyKey"]
+export const WORKER_SPAWN_TOOL = deepFreeze({
+  name: "worker_spawn",
+  title: "Spawn a read-only Grok worker",
+  description: "Idempotently commit a durable read-only Grok worker job under the installed provider capability receipt. Success means durable commit, not provider startup.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["idempotencyKey", "userRequest"],
+    properties: {
+      idempotencyKey: { type: "string", minLength: 8, maxLength: 256 },
+      userRequest: { type: "string", minLength: 1, maxLength: 16000 },
+      objective: { type: "string", maxLength: 4000 },
+      roleId: {
+        type: "string",
+        enum: ["explorer"]
+      }
+    }
+  },
+  annotations: MUTATION_ANNOTATIONS
 });
 
-function assertArguments(name, value) {
+/** Complete root-read inventory; runtime advertisement may omit spawn. */
+export const WORKER_TOOLS = deepFreeze([
+  ...BASE_WORKER_TOOLS.slice(0, -1),
+  WORKER_SPAWN_TOOL,
+  BASE_WORKER_TOOLS.at(-1)
+]);
+
+const MUTATION_AUTHORITY_TOOLS = new Set([
+  "worker_wait",
+  "worker_spawn",
+  "worker_cancel"
+]);
+
+const SHA256_HEX = /^[a-f0-9]{64}$/;
+
+export function createMcpBrokerRuntime({
+  env = process.env,
+  providerCapabilityReceipt = undefined
+} = {}) {
+  const receipt = providerCapabilityReceipt === undefined
+    ? readValidProviderCapabilityReceipt({ env })
+    : providerCapabilityReceipt;
+  const providerCapabilityDigest = SHA256_HEX.test(receipt?.capabilityDigest || "")
+    && Array.isArray(receipt?.capabilities)
+    && receipt.capabilities.includes(ROOT_READ_PROVIDER_CAPABILITY)
+    ? receipt.capabilityDigest
+    : null;
+  const tools = deepFreeze(providerCapabilityDigest
+    ? [...WORKER_TOOLS]
+    : [...BASE_WORKER_TOOLS]);
+  return Object.freeze({
+    tools,
+    providerCapabilityDigest
+  });
+}
+
+// The default server imports this module once per process, so this is a
+// freeze-at-server-start capability snapshot. A refreshed setup receipt takes
+// effect after reconnect/restart rather than mutating tools/list mid-session.
+const DEFAULT_BROKER_RUNTIME = createMcpBrokerRuntime();
+
+function brokerRuntime(options) {
+  return options?.runtime || DEFAULT_BROKER_RUNTIME;
+}
+
+function currentProviderCapabilityDigest(runtime, options) {
+  if (!SHA256_HEX.test(runtime?.providerCapabilityDigest || "")) return null;
+  try {
+    const readReceipt = options?.readProviderCapabilityReceipt
+      || readValidProviderCapabilityReceipt;
+    const receipt = readReceipt({ env: options?.env || process.env });
+    return receipt?.capabilityDigest === runtime.providerCapabilityDigest
+      ? receipt.capabilityDigest
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function schemaAccepts(value, schema) {
+  if (!schema || typeof schema !== "object") return false;
+  if (schema.type === "object") {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const properties = schema.properties || {};
+    if (schema.additionalProperties === false
+      && Object.keys(value).some((key) => !Object.hasOwn(properties, key))) return false;
+    if ((schema.required || []).some((key) => !Object.hasOwn(value, key))) return false;
+    return Object.entries(value).every(([key, entry]) => (
+      Object.hasOwn(properties, key) && schemaAccepts(entry, properties[key])
+    ));
+  }
+  if (schema.type === "string") {
+    if (typeof value !== "string") return false;
+    // JSON Schema measures string length in Unicode code points, not UTF-16
+    // code units. Keep runtime admission identical to the advertised schema
+    // for astral characters as well as ASCII.
+    const length = Array.from(value).length;
+    if (Number.isInteger(schema.minLength) && length < schema.minLength) return false;
+    if (Number.isInteger(schema.maxLength) && length > schema.maxLength) return false;
+  } else if (schema.type === "integer") {
+    if (!Number.isSafeInteger(value)) return false;
+    if (Number.isFinite(schema.minimum) && value < schema.minimum) return false;
+    if (Number.isFinite(schema.maximum) && value > schema.maximum) return false;
+  } else if (schema.type === "boolean") {
+    if (typeof value !== "boolean") return false;
+  } else {
+    return false;
+  }
+  if (Object.hasOwn(schema, "const") && value !== schema.const) return false;
+  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) return false;
+  return true;
+}
+
+function assertArguments(runtime, name, value) {
   const args = value == null ? {} : value;
-  if (!args || typeof args !== "object" || Array.isArray(args)) {
-    throw new CompanionError("E_USAGE", "Invalid worker broker request.");
-  }
-  const allowed = new Set(ALLOWED_ARGUMENTS[name]);
-  if (Object.keys(args).some((key) => !allowed.has(key))) {
-    throw new CompanionError("E_USAGE", "Invalid worker broker request.");
-  }
-  if (name !== "worker_list_owned" && name !== "worker_spawn") {
-    if (typeof args.id !== "string" || !args.id) {
-      throw new CompanionError("E_USAGE", "Invalid worker broker request.");
-    }
-  }
-  if (MUTATION_TOOLS.has(name)) {
-    if (typeof args.idempotencyKey !== "string" || !args.idempotencyKey) {
-      throw new CompanionError("E_USAGE", "Invalid worker broker request.");
-    }
-  }
-  if (name === "worker_spawn" && (typeof args.userRequest !== "string" || !args.userRequest)) {
+  const schema = runtime.tools.find((tool) => tool.name === name)?.inputSchema;
+  if (!schemaAccepts(args, schema)) {
     throw new CompanionError("E_USAGE", "Invalid worker broker request.");
   }
   return args;
@@ -242,7 +282,7 @@ function publicError(error) {
   ].includes(error?.code) ? error.code : "E_BROKER";
   const messages = {
     E_AUTH_REQUIRED: "Trusted Codex task identity is unavailable.",
-    E_CAPABILITY: "Trusted Codex workspace metadata is unavailable.",
+    E_CAPABILITY: "Required worker broker capability is unavailable.",
     E_JOB_NOT_FOUND: "Worker was not found.",
     E_JOB_ACTIVE: "Worker result is not available yet.",
     E_USAGE: "Invalid worker broker request.",
@@ -286,20 +326,42 @@ export function negotiateMcpProtocolVersion(requested) {
 
 export async function callWorkerTool(params, options = {}) {
   const name = params?.name;
-  if (!TOOL_NAMES.has(name)) {
-    return toolResult({ code: "E_USAGE", message: "Invalid worker broker request." }, true);
+  const runtime = brokerRuntime(options);
+  if (!runtime.tools.some((tool) => tool.name === name)) {
+    return name === "worker_spawn"
+      ? toolResult({ code: "E_CAPABILITY", message: "Required worker broker capability is unavailable." }, true)
+      : toolResult({ code: "E_USAGE", message: "Invalid worker broker request." }, true);
+  }
+  // tools/list is frozen for the MCP process lifetime, but provider readiness
+  // is not. Revalidate immediately before any new admission and again inside
+  // the service so expiry, setup revocation, or binary/profile drift fail closed.
+  if (name === "worker_spawn"
+    && currentProviderCapabilityDigest(runtime, options) === null) {
+    return toolResult({
+      code: "E_CAPABILITY",
+      message: "Required worker broker capability is unavailable."
+    }, true);
   }
   try {
     // Authority is resolved before arguments or cursors are interpreted.
-    const mutation = MUTATION_TOOLS.has(name);
+    const mutation = MUTATION_AUTHORITY_TOOLS.has(name);
     const authority = (options.resolveAuthority || ((meta) => resolveWorkerAuthority(meta, { mutation })))(params?._meta);
-    const args = assertArguments(name, params?.arguments);
+    const args = assertArguments(runtime, name, params?.arguments);
+    const reconcileWorkers = options.reconcileWorkers || reconcileBrokerWorkers;
     const service = (options.createService || createWorkerService)({
       root: authority.root,
       principal: authority,
       env: options.env || process.env,
-      allowWriteSpawn: Boolean(options.allowWriteSpawn),
-      ...(options.serviceOptions || {})
+      ...(options.serviceOptions || {}),
+      allowWriteSpawn: false,
+      providerCapabilityDigest: runtime.providerCapabilityDigest,
+      validateProviderCapability: () => currentProviderCapabilityDigest(runtime, options),
+      allowUnboundDispatch: false,
+      maintain: () => reconcileWorkers({
+        root: authority.root,
+        principal: authority,
+        env: options.env || process.env
+      })
     });
     if (name === "worker_list_owned") return toolResult({ workers: service.listOwned() });
     if (name === "worker_get") return toolResult({ worker: service.get(args.id) });
@@ -319,12 +381,13 @@ export async function callWorkerTool(params, options = {}) {
         objective: args.objective,
         idempotencyKey: args.idempotencyKey,
         roleId: args.roleId || "explorer",
-        write: Boolean(args.write)
+        write: false
       });
       return toolResult({
         worker: spawned.handle,
         replayed: spawned.replayed,
         spawnSuccessDefinition: spawned.spawnSuccessDefinition,
+        providerLaunchState: spawned.providerLaunchState,
         providerLaunched: spawned.providerLaunched
       });
     }
@@ -335,22 +398,6 @@ export async function callWorkerTool(params, options = {}) {
       });
       return toolResult({ receipt: cancelled.receipt, replayed: cancelled.replayed });
     }
-    if (name === "worker_send") {
-      const sent = service.send({
-        id: args.id,
-        message: args.message,
-        idempotencyKey: args.idempotencyKey
-      });
-      return toolResult({ receipt: sent.receipt, replayed: sent.replayed });
-    }
-    if (name === "worker_followup") {
-      const followed = service.followup({
-        id: args.id,
-        message: args.message,
-        idempotencyKey: args.idempotencyKey
-      });
-      return toolResult({ worker: followed.handle, replayed: followed.replayed });
-    }
     return toolResult({ code: "E_USAGE", message: "Invalid worker broker request." }, true);
   } catch (error) {
     return toolResult(publicError(error), true);
@@ -359,6 +406,7 @@ export async function callWorkerTool(params, options = {}) {
 
 export async function handleMcpRequest(message, options = {}) {
   const { id, method, params } = message || {};
+  const runtime = brokerRuntime(options);
   if (method === "initialize") {
     try {
       const protocolVersion = negotiateMcpProtocolVersion(params?.protocolVersion);
@@ -373,9 +421,11 @@ export async function handleMcpRequest(message, options = {}) {
             experimental: CODEX_MCP_EXPERIMENTAL_CAPABILITIES
           },
           serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
-          instructions: "Task-owned Grok worker broker (structured spawn/list/get/wait/result/cancel/send/followup). Grok workers are external, not native host subagents.",
+          instructions: "Task-owned Grok worker broker (structured list/get/events/wait/result/cancel, plus read-only spawn only when advertised). Grok workers are external, not native host subagents. Host verification is not trusted or promoted by this MCP surface.",
           _meta: {
             "grok/capability-matrix": capability,
+            "grok/capabilityDigest": runtime.providerCapabilityDigest,
+            "grok/hostVerification": "suppressed",
             "grok/supportedProtocolVersions": SUPPORTED_MCP_PROTOCOL_VERSIONS,
             "grok/externalWorkerLabel": "external-grok-worker"
           }
@@ -395,10 +445,10 @@ export async function handleMcpRequest(message, options = {}) {
   }
   if (method === "ping") return { jsonrpc: "2.0", id, result: {} };
   if (method === "tools/list") {
-    return { jsonrpc: "2.0", id, result: { tools: WORKER_TOOLS } };
+    return { jsonrpc: "2.0", id, result: { tools: runtime.tools } };
   }
   if (method === "tools/call") {
-    return { jsonrpc: "2.0", id, result: await callWorkerTool(params, options) };
+    return { jsonrpc: "2.0", id, result: await callWorkerTool(params, { ...options, runtime }) };
   }
   if (id === undefined) return null;
   return { jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found." } };

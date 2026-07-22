@@ -379,13 +379,47 @@ test("purported public snapshots are re-projected instead of trusted by version 
   assert.equal(Object.hasOwn(normalized, "arbitraryRootField"), false);
   assert.equal(Object.hasOwn(normalized.result, "arbitraryPrivateField"), false);
   assert.equal(normalized.result.hostVerification, "not_run");
-  assert.equal(normalized.result.runtimeEvidence.hostVerification, "not_run");
+  assert.equal(Object.hasOwn(normalized.result, "runtimeEvidence"), false);
   assert.equal(Object.hasOwn(normalized.result, "verification"), false);
   assert.deepEqual(normalized.lifecycleEvents[0].detail, { state: "accepted" });
   assert.equal(normalized.taskContract.context.upstreamFreshness, "not_checked");
   assert.equal(normalized.context.upstreamFreshness, "not_checked");
   assert.equal(normalized.context.materialization.upstreamFreshness, "not_checked");
   assertConforms("WorkerSnapshot", normalized);
+});
+
+test("untrusted cursor projection suppresses host verification authority", () => {
+  for (const claim of [
+    "Host verification: passed",
+    "hostVerification passed",
+    "Host-verification passed",
+    "Verification by trusted host passed",
+    "Host verified"
+  ]) {
+    const worker = job({
+      lifecycleEvents: [{
+        type: "checkpoint",
+        at: "2026-07-16T00:00:00.000Z",
+        summary: claim,
+        sequence: 1,
+        detail: {
+          authority: "host_asserted",
+          hostVerification: "passed",
+          state: "accepted"
+        }
+      }]
+    });
+    const trusted = projectWorkerLifecycleCursor(worker);
+    assert.equal(trusted.events[0].summary, claim);
+    assert.equal(trusted.events[0].detail.authority, "host_asserted");
+    assert.equal(trusted.events[0].detail.hostVerification, "passed");
+
+    const untrusted = projectWorkerLifecycleCursor(worker, null, { trustHostAuthority: false });
+    assert.deepEqual(untrusted.events[0].detail, { state: "accepted" });
+    assert.equal(untrusted.events[0].summary, null, claim);
+    assert.equal(JSON.stringify(untrusted).includes("host_asserted"), false, claim);
+    assert.equal(JSON.stringify(untrusted).includes('"hostVerification":"passed"'), false, claim);
+  }
 });
 
 test("worker handle and snapshot are versioned and omit private runtime fields", () => {

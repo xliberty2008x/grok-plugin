@@ -38,6 +38,29 @@
         "required": ["status"]
       },
       "then": { "required": ["proofProducer"] }
+    },
+    {
+      "not": {
+        "properties": {
+          "phase": { "const": "1" },
+          "status": { "enum": ["verified_on_draft", "qualified"] }
+        },
+        "required": ["phase", "status"]
+      }
+    },
+    {
+      "if": { "required": ["independentReviewReceipt"] },
+      "then": {
+        "properties": {
+          "phase": { "const": "1" },
+          "status": { "enum": ["verified_on_draft", "qualified"] },
+          "authorities": {
+            "properties": {
+              "independentValidation": { "const": "pass" }
+            }
+          }
+        }
+      }
     }
   ],
   "properties": {
@@ -79,11 +102,51 @@
       "required": ["id", "version", "manifestDigest"],
       "properties": {
         "id": { "type": "string", "const": "worker-broker-gate-runner" },
-        "version": { "type": "integer", "const": 1 },
+        "version": { "type": "integer", "const": 2 },
         "manifestDigest": {
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"
         }
+      }
+    },
+    "independentReviewReceipt": {
+      "type": "object",
+      "description": "Reserved structural format for historical parsing. It is not authenticated and cannot promote Phase 1 until signed issuer verification is implemented.",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "producerId",
+        "producerVersion",
+        "manifestDigest",
+        "reviewerRuntimeDigest",
+        "headCommit",
+        "headTree",
+        "sourceInventoryDigest",
+        "phaseScopeDigest",
+        "startedAt",
+        "endedAt",
+        "outcome",
+        "unresolvedFindings",
+        "receiptDigest"
+      ],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "producerId": { "type": "string", "const": "codex-native-review-runner" },
+        "producerVersion": { "type": "integer", "const": 1 },
+        "manifestDigest": {
+          "type": "string",
+          "const": "82792debed04937a264e759a1812ba1e33e0417aa555f87ce13e7f5417fd6f12"
+        },
+        "reviewerRuntimeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "headCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "headTree": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "sourceInventoryDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "phaseScopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "startedAt": { "type": "string", "format": "date-time" },
+        "endedAt": { "type": "string", "format": "date-time" },
+        "outcome": { "type": "string", "const": "pass" },
+        "unresolvedFindings": { "type": "integer", "const": 0 },
+        "receiptDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
       }
     },
     "qualification": {

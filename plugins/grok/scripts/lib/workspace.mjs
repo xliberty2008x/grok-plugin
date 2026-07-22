@@ -123,7 +123,7 @@ function legacyStateDir(stateParent, controlRoot) {
   return path.join(stateParent, workspaceStateSegment(fs.realpathSync(controlRoot)));
 }
 
-function listedWorktreeRoots(fromRoot) {
+export function listedWorktreeRoots(fromRoot) {
   const run = git(fromRoot, ["worktree", "list", "--porcelain", "-z"], { allowFailure: true });
   if (run.status !== 0) return [];
   return [...new Set(String(run.stdout || "")

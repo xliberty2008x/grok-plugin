@@ -13,6 +13,7 @@ import {
   assertProviderPlatform,
   assertTransferEffort,
   childEnvironment,
+  captureSpawnIdentity,
   cleanupReviewEnvironment,
   cleanupTaskRuntimeArtifacts,
   gatedCleanupReviewEnvironment,
@@ -30,12 +31,22 @@ import {
   waitForImportedSession
 } from "./lib/grok-provider.mjs";
 import { profileFor, sameSecurityProfile } from "./lib/profiles.mjs";
+import {
+  clearProviderCapabilityReceipt,
+  writeProviderCapabilityReceipt
+} from "./lib/provider-capability.mjs";
 import { admitJob, appendJobLog, config, setConfig, generateId, writeJob, updateJob, listJobs, readJob, selectJob, requestCancel, isCancelRequested, terminal, now, retain, logFile, withWorkspaceAdmission } from "./lib/state.mjs";
-import { workspaceRoot, workspaceState } from "./lib/workspace.mjs";
+import { resolveControlWorkspace, workspaceRoot, workspaceState } from "./lib/workspace.mjs";
 import { redact, redactText, sanitizeDisplayText } from "./lib/redact.mjs";
 import { readBoundedStdin, STDIN_READY_MARKER } from "./lib/stdin.mjs";
-import { hasGrokAncestor, identityMatches, processGroupAlive, processGroupGone, processIsZombie } from "./lib/process-control.mjs";
-import { hasForeignActiveProvider, registerProviderGuard, resolveProviderCleanupTarget, unregisterProviderGuard } from "./lib/recursion-guard.mjs";
+import { hasGrokAncestor, identityMatches, processGroupAlive, processGroupGone, processIsZombie, terminateOwnedProcess } from "./lib/process-control.mjs";
+import {
+  hasForeignActiveProvider,
+  registerProviderGuard,
+  resolveProviderCleanupTarget,
+  unregisterProviderGuard,
+  unregisterProviderGuardInWorkspaceTransaction
+} from "./lib/recursion-guard.mjs";
 import { hostCommand, hostContext, jobHostContext, pluginDataRoot, readCodexSessionMetadata, sameHostSession } from "./lib/host.mjs";
 import { codexTranscriptToClaude, createAnonymousTranscript, disposeConvertedTranscript, openTranscriptSource, readTranscriptSnapshot } from "./lib/transcript.mjs";
 import {
@@ -51,11 +62,38 @@ import {
   composeWorkerReportRepairPrompt,
   evaluateScope,
   observeChangedPaths,
-  parseTaskEnvelopeInput
+  parseTaskEnvelopeInput,
+  scrubStoredJob
 } from "./lib/task-contract.mjs";
 import { projectWorkerSnapshot } from "./lib/worker-protocol.mjs";
-import { cancellationNonce } from "./lib/worker-mutation.mjs";
+import {
+  assertDispatchContract,
+  authorizeWorkerProviderRotation,
+  cancelWorker,
+  cancellationNonce,
+  prepareDispatchProcessSpawn,
+  prepareWorkerProviderSpawn,
+  recordWorkerProviderSpawnNoChild,
+  recordWorkerProviderRotationNoChild,
+  recordUnsettledProviderProcess,
+  recordUnsettledWorkerProcess,
+  recordDispatchProcessNoChild,
+  settlePreProviderWorkerFinalization,
+  settleProviderStartedWorkerFinalization,
+  transitionWorkerDispatch
+} from "./lib/worker-mutation.mjs";
 import { providerLaunchCleanupBlocked } from "./lib/worker-reconcile.mjs";
+import { reconcileBrokerWorkers, recoverLostProviderStartedWorker } from "./lib/worker-recovery.mjs";
+import {
+  assertWorkerAuthorization,
+  createDispatchOutbox,
+  createWorkerAuthorization,
+  isDispatchV2,
+  isSupportedWorkerDispatch,
+  workerLaunchDigest
+} from "./lib/worker-launch-contract.mjs";
+import { launchCommittedWorker } from "./lib/worker-runtime.mjs";
+import { materializeRole } from "./lib/worker-roles.mjs";
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = path.resolve(path.dirname(SCRIPT), "..");
@@ -213,22 +251,6 @@ function redactProviderEvent(event) {
 }
 function validateModelEffort(options) { if (options.effort && !VALID_EFFORTS.has(options.effort)) throw new CompanionError("E_USAGE", "--effort must be low, medium, or high."); }
 
-function scrubStoredRequest(request) {
-  if (!request || typeof request !== "object") return request;
-  const prompt = typeof request.prompt === "string" ? request.prompt : null;
-  const literal = typeof request.envelope?.userRequest === "string" ? request.envelope.userRequest : null;
-  return {
-    ...request,
-    prompt: null,
-    promptDigest: request.promptDigest || (prompt ? crypto.createHash("sha256").update(prompt).digest("hex") : null),
-    envelope: request.envelope ? {
-      ...request.envelope,
-      userRequest: null,
-      userRequestDigest: literal ? crypto.createHash("sha256").update(literal).digest("hex") : request.envelope.userRequestDigest || null
-    } : null
-  };
-}
-
 function boundedProviderText(value, limitBytes = 64 * 1024) {
   const text = sanitizeDisplayText(value);
   const buffer = Buffer.from(text, "utf8");
@@ -249,7 +271,68 @@ function textEvidence(value) {
   };
 }
 
-function workerEnvironment(nonce) {
+function exactProviderRotationIntentStatus({ root, workerId, attemptId, fence, intentId }) {
+  const current = readJob(root, workerId);
+  assertDispatchContract(current);
+  const dispatch = current.request?.spawn?.dispatch;
+  const intent = current.request?.spawn?.providerRotationIntent;
+  if (!isDispatchV2(dispatch)
+    || dispatch.attemptId !== attemptId
+    || dispatch.fence !== fence
+    || intent?.intentId !== intentId
+    || intent.attemptId !== attemptId
+    || intent.dispatchFence !== fence) {
+    throw new CompanionError(
+      "E_STATE",
+      "Provider rotation intent changed before report-repair settlement."
+    );
+  }
+  return intent.status;
+}
+
+function settlePendingProviderRotationNoChild({ root, workerId, attemptId, fence, intentId }) {
+  const status = exactProviderRotationIntentStatus({
+    root,
+    workerId,
+    attemptId,
+    fence,
+    intentId
+  });
+  if (status === "registered" || status === "no-child") return;
+  if (status !== "pending") {
+    throw new CompanionError("E_STATE", "Provider rotation intent is not safely settleable.");
+  }
+
+  try {
+    recordWorkerProviderRotationNoChild({
+      root,
+      workerId,
+      attemptId,
+      fence,
+      intentId,
+      resolution: "cleanup-proven"
+    });
+  } catch (settlementError) {
+    // A provider event can durably register generation 2 between the read above
+    // and no-child settlement. Preserve the original provider/cancellation
+    // error only for that exact intent; every other race fails closed.
+    try {
+      const latestStatus = exactProviderRotationIntentStatus({
+        root,
+        workerId,
+        attemptId,
+        fence,
+        intentId
+      });
+      if (latestStatus === "registered" || latestStatus === "no-child") return;
+    } catch {
+      // The settlement error remains the authoritative fail-closed result.
+    }
+    throw settlementError;
+  }
+}
+
+function workerEnvironment(nonce, dispatchAttemptId = null, dispatchFence = null) {
   const env = {};
   const allowed = new Set(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "COLORTERM", "NO_COLOR", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "SystemRoot", "ComSpec", "PATHEXT"]);
   for (const [key, value] of Object.entries(process.env)) if ((allowed.has(key) || key.startsWith("LC_")) && value != null) env[key] = value;
@@ -269,6 +352,10 @@ function workerEnvironment(nonce) {
   if (process.env.CI) env.CI = process.env.CI;
   if (process.env.GITHUB_ACTIONS) env.GITHUB_ACTIONS = process.env.GITHUB_ACTIONS;
   env.GROK_COMPANION_WORKER_NONCE = nonce;
+  if (dispatchAttemptId) env.GROK_COMPANION_DISPATCH_ATTEMPT = dispatchAttemptId;
+  if (Number.isSafeInteger(dispatchFence) && dispatchFence > 0) {
+    env.GROK_COMPANION_DISPATCH_FENCE = String(dispatchFence);
+  }
   return env;
 }
 
@@ -338,10 +425,14 @@ function recheckCancelLaunchSettlement(root, id) {
   return { job, retained };
 }
 
-function includeGuardCleanup(root, id, cleanup) {
+function includeGuardCleanup(root, id, cleanup, { inWorkspaceTransaction = false } = {}) {
   if (!cleanup?.ok) return cleanup;
   try {
-    unregisterProviderGuard(root, id);
+    if (inWorkspaceTransaction) {
+      unregisterProviderGuardInWorkspaceTransaction(root, id);
+    } else {
+      unregisterProviderGuard(root, id);
+    }
     return cleanup;
   } catch (error) {
     return {
@@ -385,7 +476,20 @@ function captureTerminalEvidence(root, job, executionStatus) {
 }
 
 async function recoverActiveJobs(root) {
-  for (const job of listJobs(root).filter((candidate) => terminal(candidate) && candidate.jobClass === "review" && candidate.result?.providerSessionDeleted === false && candidate.result?.skipReason !== "empty-target")) {
+  const dispatchV1 = (candidate) => (
+    isSupportedWorkerDispatch(candidate?.request?.spawn?.dispatch)
+  );
+  const host = currentHost();
+  if (host.kind === "codex" && host.sessionId) {
+    // Worker Dispatch v1 has one owner-scoped, generation-aware recovery
+    // authority. The legacy CLI sweeper must never inspect or mutate foreign
+    // dispatch records and must never select a stale provider generation.
+    await reconcileBrokerWorkers({
+      root,
+      principal: { hostKind: "codex", threadId: host.sessionId }
+    });
+  }
+  for (const job of listJobs(root).filter((candidate) => !dispatchV1(candidate) && terminal(candidate) && candidate.jobClass === "review" && candidate.result?.providerSessionDeleted === false && candidate.result?.skipReason !== "empty-target")) {
     // Fail closed: require the complete owned provider process group to be gone
     // (not merely a dead leader). Mirrors SessionEnd processGroupGone semantics.
     // Use guard identity when providerProcess was never recorded on the job.
@@ -401,7 +505,7 @@ async function recoverActiveJobs(root) {
   // Re-clean terminal task records produced by older runtimes or a cleanup
   // failure after provider exit. If either recorded group still lives, move the
   // record back to cleanup-blocked so the active recovery path can terminate it.
-  for (const job of listJobs(root).filter((candidate) => terminal(candidate) && candidate.jobClass === "task" && candidate.result?.taskRuntimeCleaned !== true)) {
+  for (const job of listJobs(root).filter((candidate) => !dispatchV1(candidate) && terminal(candidate) && candidate.jobClass === "task" && candidate.result?.taskRuntimeCleaned !== true)) {
     withWorkspaceAdmission(root, () => {
       const currentJob = readJob(root, job.id);
       if (!terminal(currentJob) || currentJob.result?.taskRuntimeCleaned === true) return;
@@ -437,14 +541,14 @@ async function recoverActiveJobs(root) {
         });
         return;
       }
-      cleanup = includeGuardCleanup(root, currentJob.id, cleanup);
+      cleanup = includeGuardCleanup(root, currentJob.id, cleanup, { inWorkspaceTransaction: true });
       updateJob(root, currentJob.id, (current) => {
         current.result = applyTaskPrivacy(current.result, cleanup);
         return current;
       });
     });
   }
-  for (const job of listJobs(root).filter((candidate) => !terminal(candidate))) {
+  for (const job of listJobs(root).filter((candidate) => !dispatchV1(candidate) && !terminal(candidate))) {
     // Broker-owned spawns deliberately commit before provider launch. Missing
     // process identity is not evidence of loss while that launch boundary is
     // pending, in flight, or explicitly ambiguous.
@@ -513,7 +617,7 @@ async function recoverActiveJobs(root) {
       // Re-check the broker launch boundary under the job lock. The outer
       // snapshot is only an optimization and cannot authorize terminalization.
       if (providerLaunchCleanupBlocked(current)) return current;
-      current.request = scrubStoredRequest(current.request);
+      Object.assign(current, scrubStoredJob(current));
       const pending = current.pendingTerminal || null;
       current.status = pending?.status || "failed";
       current.phase = pending?.phase || (current.status === "completed" ? "done" : current.status);
@@ -548,25 +652,10 @@ async function recoverActiveJobs(root) {
 }
 
 async function terminateVerified(identity, marker, kind) {
-  if (!identity) return false;
-  // Defense in depth: unsupported platforms must surface E_CAPABILITY before identity failures.
+  // Defense in depth: retain the provider-level platform classification while
+  // sharing the exact identity/termination implementation with broker recovery.
   assertProviderPlatform();
-  if (processGroupGone(identity)) return false;
-  if (!identity.startToken) throw new CompanionError("E_PROCESS_IDENTITY", `Refusing to signal process ${identity.pid} without a start token.`, { pid: identity.pid });
-  const current = processStartToken(identity.pid);
-  const groupAlive = Boolean(identity.processGroupId && process.platform !== "win32" && processGroupAlive(identity.processGroupId));
-  if (!current) {
-    if (groupAlive) throw new CompanionError("E_PROCESS_IDENTITY", `Process ${identity.pid} exited while its process group remained active; ownership can no longer be verified.`, { pid: identity.pid, processGroupId: identity.processGroupId });
-    return false;
-  }
-  if (current !== identity.startToken || !identityMatches(identity, marker, kind)) throw new CompanionError("E_PROCESS_IDENTITY", `Refusing to signal unverified process ${identity.pid}.`, { pid: identity.pid });
-  try { process.kill(identity.processGroupId && process.platform !== "win32" ? -identity.processGroupId : identity.pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") throw error; }
-  const stillAlive = () => processStartToken(identity.pid) === identity.startToken || Boolean(identity.processGroupId && process.platform !== "win32" && processGroupAlive(identity.processGroupId));
-  const waitGone = async (timeout) => { const deadline = Date.now() + timeout; while (Date.now() < deadline) { if (!stillAlive()) return true; await new Promise((resolve) => setTimeout(resolve, 50)); } return !stillAlive(); };
-  if (await waitGone(2000)) return true;
-  try { process.kill(identity.processGroupId && process.platform !== "win32" ? -identity.processGroupId : identity.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
-  if (!await waitGone(1500)) throw new CompanionError("E_PROCESS_IDENTITY", `Verified process ${identity.pid} did not exit after SIGKILL.`, { pid: identity.pid });
-  return true;
+  return terminateOwnedProcess(identity, marker, kind);
 }
 
 function baseRecord({ id, kind, root, profile, title, request, write, model, effort, lifecycleEvents = null }) {
@@ -688,28 +777,88 @@ function renderJob(job) {
   return lines.join("\n");
 }
 
-function eventUpdater(root, id) {
+function eventUpdater(root, id, dispatchAttemptId = null, providerGeneration = null, dispatchFence = null) {
   let lastMessageUpdate = 0;
   return (event) => {
+    const trustedProviderProcess = event?.type === "provider" && event.process
+      ? {
+          pid: event.process.pid,
+          startToken: event.process.startToken,
+          processGroupId: event.process.processGroupId
+        }
+      : null;
+    const trustedProviderSpawnIntentId = event?.type === "provider"
+      && /^[0-9a-f]{32}$/.test(event.spawnIntentId || "")
+      ? event.spawnIntentId
+      : undefined;
     const safeEvent = boundedLogEvent(redactProviderEvent(event));
     appendLog(root, id, safeEvent);
     if (safeEvent.type === "provider") {
-      updateJob(root, id, (job) => touchJob(job, {
-        providerProcess: safeEvent.process,
-        profile: { ...job.profile, grokVersion: safeEvent.version },
-        phase: "creating-session",
-        progress: "Provider process started",
-        lifecycleEvents: appendLifecycleEvent(job.lifecycleEvents, "activity.started", "Provider process started", {
-          version: safeEvent.version || null
-        })
-      }));
+      const providerProcess = dispatchAttemptId ? {
+        ...trustedProviderProcess,
+        commandMarker: id,
+        dispatchAttemptId,
+        dispatchFence,
+        providerGeneration
+      } : trustedProviderProcess;
+      if (dispatchAttemptId) {
+        let transitioned;
+        try {
+          transitioned = transitionWorkerDispatch({
+            root,
+            workerId: id,
+            attemptId: dispatchAttemptId,
+            fence: dispatchFence,
+            state: "provider-started",
+            providerProcess,
+            spawnIntentId: trustedProviderSpawnIntentId
+          });
+        } catch (error) {
+          if (error?.code !== "E_PROCESS_IDENTITY" || providerProcess?.startToken !== null) throw error;
+          recordUnsettledProviderProcess({
+            root,
+            workerId: id,
+            attemptId: dispatchAttemptId,
+            providerProcess
+          });
+          return;
+        }
+        if (terminal(transitioned)
+          || transitioned.request?.spawn?.dispatch?.attemptId !== dispatchAttemptId
+          || transitioned.request?.spawn?.dispatch?.state !== "provider-started") {
+          throw new CompanionError(
+            "E_STATE",
+            "Provider promotion did not durably land on the exact active dispatch."
+          );
+        }
+      }
+      updateJob(root, id, (job) => {
+        if (terminal(job)
+          || (dispatchAttemptId && (
+            job.request?.spawn?.dispatch?.attemptId !== dispatchAttemptId
+            || job.request?.spawn?.dispatch?.state !== "provider-started"
+          ))) return job;
+        return touchJob(job, {
+          providerProcess,
+          profile: { ...job.profile, grokVersion: safeEvent.version },
+          phase: "creating-session",
+          progress: "Provider process started",
+          lifecycleEvents: appendLifecycleEvent(job.lifecycleEvents, "activity.started", "Provider process started", {
+            version: safeEvent.version || null
+          })
+        });
+      });
     } else if (safeEvent.type === "session") {
-      updateJob(root, id, (job) => touchJob(job, {
-        grokSessionId: safeEvent.sessionId,
-        phase: "prompting",
-        progress: "Grok session created",
-        lifecycleEvents: appendLifecycleEvent(job.lifecycleEvents, "checkpoint", "Grok session created")
-      }));
+      updateJob(root, id, (job) => {
+        if (terminal(job)
+          || (dispatchAttemptId && job.request?.spawn?.dispatch?.attemptId !== dispatchAttemptId)) return job;
+        return touchJob(job, {
+          grokSessionId: safeEvent.sessionId,
+          phase: "prompting",
+          progress: "Grok session created",
+          lifecycleEvents: appendLifecycleEvent(job.lifecycleEvents, "checkpoint", "Grok session created")
+        });
+      });
     } else if (["tool", "plan", "message"].includes(safeEvent.type)) {
       if (safeEvent.type === "message" && Date.now() - lastMessageUpdate < 1000) return;
       if (safeEvent.type === "message") lastMessageUpdate = Date.now();
@@ -722,6 +871,8 @@ function eventUpdater(root, id) {
           ? planItems[0] || "Plan updated"
           : "Provider message";
       updateJob(root, id, (job) => {
+        if (terminal(job)
+          || (dispatchAttemptId && job.request?.spawn?.dispatch?.attemptId !== dispatchAttemptId)) return job;
         const type = safeEvent.type === "plan"
           ? "plan.updated"
           : safeEvent.type === "tool" && /completed|failed|cancelled/i.test(String(safeEvent.status || ""))
@@ -755,8 +906,36 @@ function eventUpdater(root, id) {
   };
 }
 
-async function execute(root, id) {
+async function execute(root, id, { dispatchAttemptId = null, dispatchFence = null } = {}) {
+  const exactBrokerWorkerIdentity = (identity) => Boolean(
+    identity?.pid === process.pid
+    && identity.startToken === processStartToken(process.pid)
+    && identity.nonce === process.env.GROK_COMPANION_WORKER_NONCE
+    && identity.commandMarker === id
+    && identity.dispatchAttemptId === dispatchAttemptId
+    && (identity.dispatchFence ?? null) === (dispatchFence ?? null)
+    && (process.platform === "win32"
+      ? identity.processGroupId === null
+      : identity.processGroupId === process.pid)
+  );
   let job = readJob(root, id);
+  let providerGeneration = null;
+  if (dispatchAttemptId) {
+    const dispatch = job.request?.spawn?.dispatch;
+    const workerIdentity = job.workerProcess;
+    assertDispatchContract(job);
+    providerGeneration = (Number.isSafeInteger(dispatch?.providerGeneration)
+      ? dispatch.providerGeneration
+      : 0) + 1;
+    if (terminal(job)
+      || !isSupportedWorkerDispatch(dispatch)
+      || dispatch.attemptId !== dispatchAttemptId
+      || (isDispatchV2(dispatch) && dispatch.fence !== dispatchFence)
+      || dispatch.state !== "worker-started"
+      || !exactBrokerWorkerIdentity(workerIdentity)) {
+      throw new CompanionError("E_RECURSION", "Unauthenticated or stale broker worker invocation refused.");
+    }
+  }
   let prompt = job.request?.prompt;
   if (!prompt && job.request?.envelope) {
     prompt = composeProviderPrompt(job.request.envelope, {
@@ -765,12 +944,42 @@ async function execute(root, id) {
     });
   }
   if (!prompt) throw new CompanionError("E_STATE", "Queued job has no prompt.");
+  if (dispatchAttemptId && isDispatchV2(job.request?.spawn?.dispatch)) {
+    const observedPromptDigest = crypto.createHash("sha256").update(prompt).digest("hex");
+    if (job.request?.providerPromptDigest !== observedPromptDigest) {
+      throw new CompanionError("E_AUTH_REQUIRED", "Provider prompt no longer matches the authorized launch contract.");
+    }
+  }
 
   // Keep the accepted manifest available for failure evidence; exact validation happens
   // inside the terminal-state guard below so drift is persisted on the job.
   let preContext = job.request?.contextManifest || captureContextManifest(root);
   updateJob(root, id, (current) => {
+    if (terminal(current)) {
+      throw new CompanionError("E_STATE", "A terminal worker cannot be restarted.");
+    }
+    if (dispatchAttemptId) {
+      const dispatch = current.request?.spawn?.dispatch;
+      const identity = current.workerProcess;
+      assertDispatchContract(current);
+      if (!isSupportedWorkerDispatch(dispatch)
+        || dispatch.attemptId !== dispatchAttemptId
+        || (isDispatchV2(dispatch) && dispatch.fence !== dispatchFence)
+        || dispatch.state !== "worker-started"
+        || !exactBrokerWorkerIdentity(identity)) {
+        throw new CompanionError("E_RECURSION", "Broker worker authorization changed before execution.");
+      }
+      if (isDispatchV2(dispatch)
+        && current.request?.providerPromptDigest
+          !== crypto.createHash("sha256").update(prompt).digest("hex")) {
+        throw new CompanionError("E_AUTH_REQUIRED", "Provider prompt changed before launch-contract consumption.");
+      }
+    }
     const promptDigest = crypto.createHash("sha256").update(prompt).digest("hex");
+    const consumedLaunchContractDigest = dispatchAttemptId
+      && isDispatchV2(current.request?.spawn?.dispatch)
+      ? assertWorkerAuthorization(current, { allowLegacy: false }).launchContractDigest
+      : null;
     current.status = "running";
     current.phase = "starting";
     current.startedAt = now();
@@ -778,24 +987,77 @@ async function execute(root, id) {
     current.progress = "Starting Grok";
     current.heartbeatAt = now();
     // Retain structured envelope fields; only clear the assembled provider prompt text.
-    current.request = scrubStoredRequest({
-      ...current.request,
-      promptDigest,
-      contextManifest: current.request?.contextManifest || preContext
-    });
-    current.workerProcess = {
-      ...(current.workerProcess || {}),
-      pid: process.pid,
-      startToken: processStartToken(process.pid),
-      nonce: process.env.GROK_COMPANION_WORKER_NONCE || current.workerProcess?.nonce || crypto.randomBytes(16).toString("hex"),
-      processGroupId: current.workerProcess?.processGroupId ?? (process.platform === "win32" ? null : process.pid),
-      commandMarker: id
-    };
+    Object.assign(current, scrubStoredJob({
+      ...current,
+      request: {
+        ...current.request,
+        promptDigest,
+        contextManifest: current.request?.contextManifest || preContext,
+        ...(consumedLaunchContractDigest ? {
+          spawn: {
+            ...current.request?.spawn,
+            consumedLaunchContractDigest,
+            launchContractConsumedAt: now()
+          }
+        } : {})
+      }
+    }));
+    if (consumedLaunchContractDigest) current.workerAuthorization = null;
+    if (!dispatchAttemptId) {
+      current.workerProcess = {
+        ...(current.workerProcess || {}),
+        pid: process.pid,
+        startToken: processStartToken(process.pid),
+        nonce: process.env.GROK_COMPANION_WORKER_NONCE || current.workerProcess?.nonce || crypto.randomBytes(16).toString("hex"),
+        processGroupId: current.workerProcess?.processGroupId ?? (process.platform === "win32" ? null : process.pid),
+        commandMarker: id
+      };
+    }
     current.lifecycleEvents = appendLifecycleEvent(current.lifecycleEvents, "checkpoint", "Worker starting provider execution");
     return current;
   });
+  job = readJob(root, id);
+  if (dispatchAttemptId && isDispatchV2(job.request?.spawn?.dispatch)) {
+    assertDispatchContract(job);
+    if (!/^[0-9a-f]{64}$/.test(job.request?.spawn?.consumedLaunchContractDigest || "")
+      || !job.request?.spawn?.launchContractConsumedAt) {
+      throw new CompanionError("E_AUTH_REQUIRED", "Worker launch contract consumption was not durably recorded.");
+    }
+  }
   const before = job.jobClass === "review" ? integritySnapshot(root) : null;
   let terminalError = null;
+  let brokerPreProviderFailure = false;
+  let brokerTerminalIntent = null;
+  const terminalIntentFor = (error = null, summary = null) => {
+    if (!dispatchAttemptId) return null;
+    if (brokerTerminalIntent) return brokerTerminalIntent;
+    const status = error
+      ? (error.code === "E_CANCELLED" ? "cancelled" : "failed")
+      : "completed";
+    const payload = error ? redact(asErrorPayload(error)) : null;
+    brokerTerminalIntent = Object.freeze({
+      status,
+      phase: status === "completed" ? "done" : status,
+      completedAt: now(),
+      error: payload,
+      summary: summary || payload?.message || null
+    });
+    return brokerTerminalIntent;
+  };
+  const terminalIntentPatch = (current, intendedTerminal) => {
+    if (!intendedTerminal || !dispatchAttemptId) return {};
+    const dispatch = current.request?.spawn?.dispatch;
+    if (!isSupportedWorkerDispatch(dispatch)
+      || dispatch.attemptId !== dispatchAttemptId
+      || (isDispatchV2(dispatch) && dispatch.fence !== dispatchFence)
+      || dispatch.state !== "provider-started"
+      || !exactBrokerWorkerIdentity(current.workerProcess)) return {};
+    if (current.pendingTerminal
+      && JSON.stringify(current.pendingTerminal) !== JSON.stringify(intendedTerminal)) {
+      throw new CompanionError("E_STATE", "Durable worker terminal intent changed before finalization.");
+    }
+    return { pendingTerminal: intendedTerminal };
+  };
   let heartbeatTimer = null;
   try {
     preContext = job.request?.contextManifest
@@ -811,6 +1073,10 @@ async function execute(root, id) {
       } catch {}
     }, 1000);
     heartbeatTimer.unref?.();
+    // A generation-2 repair is authorized durably before runProvider starts.
+    // Keep the corresponding handoff process-local and single-use so an
+    // unrelated pre-existing pending intent can never admit another bootstrap.
+    let providerLaunchAuthorization = null;
     const common = {
       root,
       profile: job.profile,
@@ -822,7 +1088,51 @@ async function execute(root, id) {
       providerHomeId: job.request?.providerHomeId || id,
       resumeSessionId: job.request?.resumeSessionId || null,
       cancelRequested: () => isCancelRequested(root, id, workerNonce),
-      onEvent: eventUpdater(root, id)
+      ...(dispatchAttemptId ? {
+        guardBinding: {
+          controlWorkspaceId: job.controlWorkspaceId,
+          executionRoot: job.request?.spawn?.executionRoot,
+          dispatchAttemptId,
+          dispatchFence,
+          providerGeneration
+        },
+        providerLaunch: {
+          prepare: () => {
+            const authorization = providerLaunchAuthorization;
+            providerLaunchAuthorization = null;
+            const candidate = prepareWorkerProviderSpawn({
+              root,
+              workerId: id,
+              attemptId: dispatchAttemptId,
+              fence: dispatchFence,
+              providerGeneration
+            });
+            if (candidate?.prepared === true) return candidate;
+            if (authorization
+              && candidate?.reason === "already-pending"
+              && candidate?.intent?.status === "pending"
+              && candidate.intent.intentId === authorization.intentId
+              && candidate.intent.providerGeneration === authorization.providerGeneration) {
+              return Object.freeze({
+                ...candidate,
+                prepared: true,
+                reason: "preauthorized-rotation"
+              });
+            }
+            return candidate;
+          },
+          noChild: ({ intentId, resolution }) => recordWorkerProviderSpawnNoChild({
+            root,
+            workerId: id,
+            attemptId: dispatchAttemptId,
+            fence: dispatchFence,
+            providerGeneration,
+            intentId,
+            resolution
+          })
+        }
+      } : {}),
+      onEvent: eventUpdater(root, id, dispatchAttemptId, providerGeneration, dispatchFence)
     };
     let result = job.jobClass === "review" && job.kind !== "stop-review"
       ? await runStructuredReview(common)
@@ -842,12 +1152,34 @@ async function execute(root, id) {
         recordLifecycle(root, id, "checkpoint", "Requesting one same-session report-format repair", {
           validationIssues: workerReport.validationIssues
         });
+        let providerRotationIntentId = null;
         try {
+          if (dispatchAttemptId) {
+            const rotationAuthorization = authorizeWorkerProviderRotation({
+              root,
+              workerId: id,
+              attemptId: dispatchAttemptId,
+              workerProcess: job.workerProcess
+            });
+            providerGeneration = rotationAuthorization.providerGeneration;
+            providerRotationIntentId = rotationAuthorization.intentId;
+            providerLaunchAuthorization = Object.freeze({
+              intentId: rotationAuthorization.intentId,
+              providerGeneration: rotationAuthorization.providerGeneration
+            });
+          }
           const repaired = await runProvider({
             ...common,
             profile: profileFor("report-repair"),
             prompt: composeWorkerReportRepairPrompt(envelope, workerReport),
-            resumeSessionId: result.sessionId
+            resumeSessionId: result.sessionId,
+            ...(dispatchAttemptId ? {
+              guardBinding: {
+                ...common.guardBinding,
+                providerGeneration
+              },
+              onEvent: eventUpdater(root, id, dispatchAttemptId, providerGeneration, dispatchFence)
+            } : {})
           });
           const repairedReport = buildWorkerReport({
             providerText: repaired.text || "",
@@ -864,6 +1196,17 @@ async function execute(root, id) {
             workerReport = repairedReport;
           }
         } catch (repairError) {
+          if (dispatchAttemptId
+            && providerRotationIntentId
+            && providerCleanupIdentity(repairError) == null) {
+            settlePendingProviderRotationNoChild({
+              root,
+              workerId: id,
+              attemptId: dispatchAttemptId,
+              fence: dispatchFence,
+              intentId: providerRotationIntentId
+            });
+          }
           if (repairError?.code === "E_CANCELLED") throw repairError;
           reportRepairError = repairError;
           reportRepair = {
@@ -888,11 +1231,11 @@ async function execute(root, id) {
           executionStatus: "completed"
         })
       });
-      updateJob(root, id, (current) => touchJob(current, {
+      updateJob(root, id, (current) => terminal(current) ? current : touchJob(current, {
         phase: "finalizing",
         completionContextManifest: postContext,
         grokSessionId: result.sessionId,
-        providerProcess: result.provider?.process || null,
+        providerProcess: current.providerProcess || result.provider?.process || null,
         profile: { ...current.profile, grokVersion: result.provider?.version || null },
         result: safeResult,
         summary: `${safeResult.review.verdict}: ${safeResult.review.summary}`.slice(0, 160),
@@ -943,34 +1286,17 @@ async function execute(root, id) {
         hostVerification: "not_run",
         runtimeEvidence
       });
-      updateJob(root, id, (current) => touchJob(current, {
-        phase: "finalizing",
-        completionContextManifest: postContext,
-        grokSessionId: result.sessionId,
-        providerProcess: result.provider?.process || null,
-        profile: { ...current.profile, grokVersion: result.provider?.version || null },
-        result: safeResult,
-        summary: workerReport.summary.slice(0, 160),
-        progress: "Final report ready",
-        lifecycleEvents: appendLifecycleEvent(
-          workerReport.outcome === "blocked"
-            ? appendLifecycleEvent(current.lifecycleEvents, "blocked", workerReport.summary, { questions: workerReport.questions })
-            : current.lifecycleEvents,
-          "final.report",
-          "Worker report ready",
-          { outcome: workerReport.outcome, structured: workerReport.structured, hostVerification: "not_run" }
-        )
-      }));
+      let finalTaskError = null;
       if (scopeViolations.length) {
-        throw new CompanionError(
+        finalTaskError = new CompanionError(
           "E_SCOPE_VIOLATION",
           `Grok changed paths outside the delegated scope: ${scopeViolationEvidence.join(", ")}. Host review is required; changes were not rolled back.`,
           { paths: scopeViolationEvidence }
         );
-      }
-      if (reportRepairError) throw reportRepairError;
-      if (!workerReport.valid) {
-        throw new CompanionError(
+      } else if (reportRepairError) {
+        finalTaskError = reportRepairError;
+      } else if (!workerReport.valid) {
+        finalTaskError = new CompanionError(
           "E_SCHEMA",
           "Grok did not return a valid final worker report after one same-session format-repair attempt.",
           {
@@ -980,41 +1306,89 @@ async function execute(root, id) {
           }
         );
       }
+      const intendedTerminal = terminalIntentFor(finalTaskError, finalTaskError?.message || workerReport.summary);
+      updateJob(root, id, (current) => terminal(current) ? current : touchJob(current, {
+        phase: "finalizing",
+        completionContextManifest: postContext,
+        grokSessionId: result.sessionId,
+        providerProcess: current.providerProcess || result.provider?.process || null,
+        profile: { ...current.profile, grokVersion: result.provider?.version || null },
+        result: safeResult,
+        summary: workerReport.summary.slice(0, 160),
+        progress: "Final report ready",
+        ...terminalIntentPatch(current, intendedTerminal),
+        lifecycleEvents: appendLifecycleEvent(
+          workerReport.outcome === "blocked"
+            ? appendLifecycleEvent(current.lifecycleEvents, "blocked", workerReport.summary, { questions: workerReport.questions })
+            : current.lifecycleEvents,
+          "final.report",
+          "Worker report ready",
+          { outcome: workerReport.outcome, structured: workerReport.structured, hostVerification: "not_run" }
+        )
+      }));
+      if (finalTaskError) throw finalTaskError;
     }
   } catch (error) {
     terminalError = error;
+    const intendedTerminal = terminalIntentFor(error, redactText(error.message));
     const failedProviderProcess = providerCleanupIdentity(error);
     const postContext = (() => {
       try { return captureContextManifest(root); } catch { return null; }
     })();
-    updateJob(root, id, (current) => touchJob(current, {
-      phase: "finalizing",
-      providerProcess: current.providerProcess || failedProviderProcess || null,
-      error: redact(asErrorPayload(error)),
-      summary: redactText(error.message),
-      progress: error.code === "E_CONTEXT_DRIFT" ? "Blocked: context drift" : "Finalizing failure",
-      result: {
-        ...(current.result || {}),
-        hostVerification: current.result?.hostVerification || "not_run",
-        runtimeEvidence: buildRuntimeEvidence({
-          preContext,
-          postContext,
-          changedPaths: postContext ? observeChangedPaths(preContext, postContext) : [],
-          commandOutcomes: current.commandOutcomes || [],
-          scopeViolations: error.code === "E_SCOPE_VIOLATION" ? error.details?.paths || [] : [],
-          executionStatus: error.code === "E_CANCELLED" ? "cancelled" : "failed"
-        })
-      },
-      completionContextManifest: postContext,
-      lifecycleEvents: appendLifecycleEvent(
-        current.lifecycleEvents,
-        error.code === "E_CONTEXT_DRIFT" || error.code === "E_CANCELLED" ? "blocked" : "checkpoint",
-        redactText(error.message)
-      )
-    }));
+    updateJob(root, id, (current) => {
+      if (terminal(current)) return current;
+      const providerProcess = current.providerProcess || (
+        !dispatchAttemptId || (typeof failedProviderProcess?.startToken === "string" && failedProviderProcess.startToken)
+          ? failedProviderProcess || null
+          : null
+      );
+      return touchJob(current, {
+        phase: "finalizing",
+        providerProcess,
+        error: redact(asErrorPayload(error)),
+        summary: redactText(error.message),
+        progress: error.code === "E_CONTEXT_DRIFT" ? "Blocked: context drift" : "Finalizing failure",
+        ...terminalIntentPatch(current, intendedTerminal),
+        result: {
+          ...(current.result || {}),
+          hostVerification: current.result?.hostVerification || "not_run",
+          runtimeEvidence: buildRuntimeEvidence({
+            preContext,
+            postContext,
+            changedPaths: postContext ? observeChangedPaths(preContext, postContext) : [],
+            commandOutcomes: current.commandOutcomes || [],
+            scopeViolations: error.code === "E_SCOPE_VIOLATION" ? error.details?.paths || [] : [],
+            executionStatus: error.code === "E_CANCELLED" ? "cancelled" : "failed"
+          })
+        },
+        completionContextManifest: postContext,
+        lifecycleEvents: appendLifecycleEvent(
+          current.lifecycleEvents,
+          error.code === "E_CONTEXT_DRIFT" || error.code === "E_CANCELLED" ? "blocked" : "checkpoint",
+          redactText(error.message)
+        )
+      });
+    });
+    if (dispatchAttemptId) {
+      const current = readJob(root, id);
+      brokerPreProviderFailure = !terminal(current)
+        && current.request?.spawn?.dispatch?.attemptId === dispatchAttemptId
+        && current.request?.spawn?.dispatch?.state === "worker-started"
+        && exactBrokerWorkerIdentity(current.workerProcess);
+    }
   } finally {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     let taskCleanup = null;
+    const finalizationSnapshot = readJob(root, id);
+    const brokerProviderFinalization = Boolean(
+      job.jobClass === "task"
+      && dispatchAttemptId
+      && !terminal(finalizationSnapshot)
+      && finalizationSnapshot.request?.spawn?.dispatch?.attemptId === dispatchAttemptId
+      && finalizationSnapshot.request?.spawn?.dispatch?.state === "provider-started"
+      && finalizationSnapshot.pendingTerminal
+      && exactBrokerWorkerIdentity(finalizationSnapshot.workerProcess)
+    );
     if (job.jobClass === "review") {
       // Gate on the resolved job/guard-backed process group: never delete an isolated credential
       // home or claim providerSessionDeleted while the group remains live or unverifiable.
@@ -1026,7 +1400,7 @@ async function execute(root, id) {
         value.result = applyReviewPrivacy(value.result, cleanup);
         return value;
       });
-    } else {
+    } else if (!dispatchAttemptId || brokerPreProviderFailure) {
       const latest = readJob(root, id);
       const { identity } = resolveProviderCleanupTarget(root, latest);
       taskCleanup = cleanupTaskRuntimeArtifacts(
@@ -1035,12 +1409,90 @@ async function execute(root, id) {
         [identity].filter(Boolean)
       );
       taskCleanup = includeGuardCleanup(root, id, taskCleanup);
-      updateJob(root, id, (value) => {
-        value.result = applyTaskPrivacy(value.result, taskCleanup);
-        return value;
+      if (!brokerPreProviderFailure) {
+        updateJob(root, id, (value) => {
+          value.result = applyTaskPrivacy(value.result, taskCleanup);
+          return value;
+        });
+      }
+    }
+    if (brokerProviderFinalization) {
+      try {
+        const current = readJob(root, id);
+        settleProviderStartedWorkerFinalization({
+          root,
+          workerId: id,
+          attemptId: dispatchAttemptId,
+          workerProcess: current.workerProcess,
+          providerProcess: current.providerProcess,
+          runtimeCleanup: (latest) => {
+            let cleanup = cleanupTaskRuntimeArtifacts(
+              stateDir(root),
+              latest.request?.providerHomeId || id,
+              [latest.providerProcess].filter(Boolean)
+            );
+            if (cleanup.ok) {
+              cleanup = includeGuardCleanup(root, id, cleanup, { inWorkspaceTransaction: true });
+            }
+            return cleanup;
+          }
+        });
+      } catch (error) {
+        const warning = error?.code === "E_RUNTIME_CLEANUP"
+          ? error.details?.warning || "Task runtime cleanup remained incomplete."
+          : "Task runtime cleanup was deferred because the exact provider generation is not settled.";
+        updateJob(root, id, (current) => {
+          if (terminal(current)) return current;
+          const dispatch = current.request?.spawn?.dispatch;
+          if (dispatch?.attemptId !== dispatchAttemptId
+            || dispatch.state !== "provider-started"
+            || !current.pendingTerminal) return current;
+          current.status = "running";
+          current.phase = "cleanup-blocked";
+          current.completedAt = null;
+          current.progress = "Task finished; exact-generation runtime cleanup is still pending";
+          current.result = applyTaskPrivacy(current.result, { ok: false, warning });
+          return current;
+        });
+      }
+      retain(root);
+      if (terminalError) throw terminalError;
+      return readJob(root, id);
+    }
+    if (brokerPreProviderFailure) {
+      const current = readJob(root, id);
+      const intendedStatus = terminalError?.code === "E_CANCELLED" ? "cancelled" : "failed";
+      settlePreProviderWorkerFinalization({
+        root,
+        workerId: id,
+        attemptId: dispatchAttemptId,
+        workerProcess: current.workerProcess,
+        intendedTerminal: {
+          status: intendedStatus,
+          phase: intendedStatus,
+          completedAt: now(),
+          error: current.error || redact(asErrorPayload(terminalError)),
+          summary: current.summary || redactText(terminalError?.message || "Worker failed before provider startup")
+        },
+        runtimeCleanup: taskCleanup || {
+          ok: false,
+          warning: "Task runtime cleanup outcome is unavailable."
+        }
       });
+      retain(root);
+      if (terminalError) throw terminalError;
+      return readJob(root, id);
+    }
+    if (dispatchAttemptId) {
+      // Failed/unsettled broker generations are owned by authoritative
+      // recovery. Never fall through to the legacy task cleanup/finalization
+      // path, which has no generation binding.
+      retain(root);
+      if (terminalError) throw terminalError;
+      return readJob(root, id);
     }
     updateJob(root, id, (current) => {
+      if (terminal(current)) return current;
       const intendedStatus = terminalError ? (terminalError.code === "E_CANCELLED" ? "cancelled" : "failed") : "completed";
       const intendedPhase = intendedStatus === "completed" ? "done" : intendedStatus;
       const completedAt = now();
@@ -1079,28 +1531,87 @@ async function execute(root, id) {
   return readJob(root, id);
 }
 
+function prepareSharedTaskDispatch(root, job) {
+  const host = job.host;
+  if (job.jobClass !== "task"
+    || host?.kind !== "codex"
+    || !host.sessionId) return null;
+  const principal = Object.freeze({ hostKind: host.kind, threadId: host.sessionId, pluginId: null });
+  const role = materializeRole(job.write ? "implementer" : "explorer");
+  const createdAt = job.createdAt || now();
+  const { controlWorkspaceId, executionRoot } = resolveControlWorkspace(root);
+  const requestDigest = workerLaunchDigest({
+    schemaVersion: 1,
+    workerId: job.id,
+    host,
+    write: Boolean(job.write),
+    profile: job.profile,
+    role,
+    envelopeDigest: job.request?.envelope?.digest || null,
+    contextManifestDigest: job.request?.contextManifest?.digest || null,
+    resumeJobId: job.request?.resumeJobId || null,
+    resumeSessionId: job.request?.resumeSessionId || null,
+    providerHomeId: job.request?.providerHomeId || job.id
+  });
+  job.controlWorkspaceId = controlWorkspaceId;
+  job.role = { ...role, tools: [...role.tools] };
+  job.phase = "accepted";
+  job.request = {
+    ...job.request,
+    providerPromptDigest: crypto
+      .createHash("sha256")
+      .update(String(job.request?.prompt || ""))
+      .digest("hex"),
+    roleId: role.id,
+    spawn: {
+      executionRoot,
+      ownerThreadId: host.sessionId,
+      requestDigest,
+      successDefinition: "durable-job-commit",
+      ownershipMode: "exact-host-session",
+      providerLaunchPending: true,
+      providerLaunchInFlight: false,
+      providerLaunchOutcome: "pending",
+      dispatch: createDispatchOutbox({ createdAt })
+    }
+  };
+  job.workerAuthorization = null;
+  job.workerAuthorization = createWorkerAuthorization({ job, principal, issuedAt: createdAt });
+  return principal;
+}
+
 async function startJob(root, job, background, { announce = false } = {}) {
-  const nonce = crypto.randomBytes(16).toString("hex");
-  job.workerAuthorization = nonce;
+  const sharedPrincipal = prepareSharedTaskDispatch(root, job);
+  const nonce = sharedPrincipal ? null : crypto.randomBytes(16).toString("hex");
+  if (!sharedPrincipal) job.workerAuthorization = nonce;
   admitJob(root, job);
   let diagnostic = "";
   let launcher = null;
   let launcherCode = -1;
-  try {
-    launcher = spawn(process.execPath, [SCRIPT, "--launch-worker", job.id, "--cwd", root], { cwd: root, shell: false, stdio: ["ignore", "ignore", "pipe"], env: workerEnvironment(nonce) });
-    launcher.stderr?.setEncoding("utf8"); launcher.stderr?.on("data", (chunk) => { diagnostic = `${diagnostic}${chunk}`.slice(-8192); });
-    launcherCode = await new Promise((resolve) => {
-      launcher.once("error", (error) => { diagnostic = sanitizeDisplayText(error.message); resolve(-1); });
-      launcher.once("close", resolve);
-    });
-  } catch (error) {
-    diagnostic = sanitizeDisplayText(error.message);
+  if (sharedPrincipal) {
+    try {
+      launchCommittedWorker({ root, workerId: job.id, principal: sharedPrincipal });
+      launcherCode = 0;
+    } catch (error) {
+      diagnostic = sanitizeDisplayText(error.message);
+    }
+  } else {
+    try {
+      launcher = spawn(process.execPath, [SCRIPT, "--launch-worker", job.id, "--cwd", root], { cwd: root, shell: false, stdio: ["ignore", "ignore", "pipe"], env: workerEnvironment(nonce) });
+      launcher.stderr?.setEncoding("utf8"); launcher.stderr?.on("data", (chunk) => { diagnostic = `${diagnostic}${chunk}`.slice(-8192); });
+      launcherCode = await new Promise((resolve) => {
+        launcher.once("error", (error) => { diagnostic = sanitizeDisplayText(error.message); resolve(-1); });
+        launcher.once("close", resolve);
+      });
+    } catch (error) {
+      diagnostic = sanitizeDisplayText(error.message);
+    }
   }
   if (launcherCode !== 0) {
     const cleanup = job.jobClass === "review" ? cleanupReviewEnvironment(stateDir(root), job.id) : null;
     const evidence = captureTerminalEvidence(root, job, "failed");
     updateJob(root, job.id, (current) => {
-      current.request = scrubStoredRequest(current.request);
+      Object.assign(current, scrubStoredJob(current));
       current.status = "failed"; current.phase = "failed"; current.completedAt = now(); current.error = { code: "E_WORKER_LOST", message: redactText(diagnostic) || "Could not launch the isolated Grok worker." }; current.summary = current.error.message;
       current.completionContextManifest = evidence.postContext;
       current.result = { ...(current.result || {}), hostVerification: "not_run", runtimeEvidence: evidence.runtimeEvidence };
@@ -1136,7 +1647,15 @@ async function handleSetup(raw) {
   const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd(), false);
   if (options["disable-review-gate"]) setConfig(root, { stopReviewGate: false });
   let runtime;
-  try { runtime = await probe(root, stateDir(root)); } catch (error) { runtime = { ready: false, error: asErrorPayload(error) }; }
+  try {
+    // A setup attempt revokes any older readiness assertion before probing.
+    // A crash or failed probe therefore cannot leave stale spawn capability.
+    clearProviderCapabilityReceipt();
+    runtime = await probe(root, stateDir(root));
+    writeProviderCapabilityReceipt({ runtime });
+  } catch (error) {
+    runtime = { ready: false, error: asErrorPayload(error) };
+  }
   if (options["enable-review-gate"] && !runtime.error) setConfig(root, { stopReviewGate: true });
   const nextSteps = !runtime.error
     ? [`Run ${hostCommand("review", "--wait")} or ${hostCommand("rescue", "<task>")}.`]
@@ -1438,6 +1957,31 @@ async function handleResult(raw) {
 
 async function handleCancel(raw) {
   const { options, positionals } = parseArgs(argvFrom(raw), { values: ["cwd"], booleans: ["json"] }); const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd()); await recoverActiveJobs(root); const job = assertHostJobAccess(selectJob(root, { id: positionals[0], host: currentHost(), active: !positionals[0] }), "active");
+  if (isSupportedWorkerDispatch(job.request?.spawn?.dispatch)) {
+    const host = currentHost();
+    if (host.kind !== "codex" || !host.sessionId) {
+      throw new CompanionError("E_AUTH_REQUIRED", "Trusted Codex task identity is unavailable.");
+    }
+    cancelWorker({
+      root,
+      principal: { hostKind: "codex", threadId: host.sessionId },
+      workerId: job.id,
+      idempotencyKey: `cli-cancel-${job.id}`
+    });
+    const deadline = Date.now() + 10000;
+    let current = readJob(root, job.id);
+    while (!terminal(current) && Date.now() < deadline) {
+      await reconcileBrokerWorkers({
+        root,
+        principal: { hostKind: "codex", threadId: host.sessionId },
+        dispatchStartupGraceMs: 0
+      });
+      current = readJob(root, job.id);
+      if (!terminal(current)) await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    out(options.json ? publicJson(current) : `Cancellation requested.\n${renderJob(current)}`, options.json);
+    return;
+  }
   // Launch window: workerAuthorization is persisted before workerProcess exists.
   // Prefer the live worker nonce; fall back to the authenticated launch nonce; fail closed if neither.
   if (!terminal(job)) requestCancel(root, job.id, cancellationNonce(job) || "");
@@ -1510,7 +2054,7 @@ async function handleCancel(raw) {
     const evidence = captureTerminalEvidence(root, current, "cancelled");
     current = updateJob(root, current.id, (value) => {
       value.status = "cancelled"; value.phase = "cancelled"; value.completedAt = now(); value.error = { code: "E_CANCELLED", message: "Grok job was force-cancelled after the graceful timeout." }; value.summary = value.error.message;
-      value.request = scrubStoredRequest(value.request);
+      Object.assign(value, scrubStoredJob(value));
       value.completionContextManifest = evidence.postContext;
       value.result = { ...(value.result || {}), hostVerification: value.result?.hostVerification || "not_run", runtimeEvidence: evidence.runtimeEvidence };
       value.lifecycleEvents = appendLifecycleEvent(value.lifecycleEvents, "blocked", value.error.message);
@@ -1820,12 +2364,317 @@ async function main() {
   if (grokEnvironment || (!internal && hasGrokAncestor()) || guardedWorkspace) throw new CompanionError("E_RECURSION", "Nested Grok Companion invocation refused.");
   if (!command || ["help", "--help", "-h"].includes(command)) { out(usage()); return; }
   if (command === "--launch-worker") {
-    const [id, cwdFlag, cwd] = raw; if (cwdFlag !== "--cwd") throw new CompanionError("E_USAGE", "Invalid worker launcher invocation.");
-    const root = workspaceRoot(cwd), nonce = process.env.GROK_COMPANION_WORKER_NONCE, record = readJob(root, id);
+    const brokerInvocation = raw[1] === "--attempt";
+    const fencedInvocation = brokerInvocation && raw[3] === "--fence";
+    const id = raw[0];
+    const dispatchAttemptId = brokerInvocation ? raw[2] : null;
+    const providedDispatchFence = fencedInvocation ? Number(raw[4]) : null;
+    const controllerIntentFlag = brokerInvocation ? raw[fencedInvocation ? 5 : 3] : null;
+    const controllerIntentId = brokerInvocation ? raw[fencedInvocation ? 6 : 4] : null;
+    const cwdFlag = brokerInvocation ? raw[fencedInvocation ? 7 : 5] : raw[1];
+    const cwd = brokerInvocation ? raw[fencedInvocation ? 8 : 6] : raw[2];
+    if (raw.length !== (brokerInvocation ? (fencedInvocation ? 9 : 7) : 3)
+      || cwdFlag !== "--cwd"
+      || (brokerInvocation && (
+        controllerIntentFlag !== "--controller-intent"
+        || !/^[a-f0-9]{32}$/.test(String(dispatchAttemptId || ""))
+        || !/^[a-f0-9]{32}$/.test(String(controllerIntentId || ""))
+        || (fencedInvocation && (!Number.isSafeInteger(providedDispatchFence) || providedDispatchFence < 1))
+      ))) {
+      throw new CompanionError("E_USAGE", "Invalid worker launcher invocation.");
+    }
+    const root = workspaceRoot(cwd), nonce = process.env.GROK_COMPANION_WORKER_NONCE;
+    let record = readJob(root, id);
+    if (brokerInvocation) {
+      let authorized = false;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        record = readJob(root, id);
+        const authorization = record.workerAuthorization;
+        const dispatch = record.request?.spawn?.dispatch;
+        const dispatchFence = isDispatchV2(dispatch)
+          ? (providedDispatchFence ?? Number(process.env.GROK_COMPANION_DISPATCH_FENCE || dispatch.fence))
+          : null;
+        const controllerIntent = record.request?.spawn?.controllerSpawnIntent;
+        if (terminal(record)) return;
+        const ownStartToken = processStartToken(process.pid);
+        const ownController = {
+          pid: process.pid,
+          startToken: ownStartToken,
+          nonce,
+          processGroupId: process.platform === "win32" ? null : process.pid,
+          commandMarker: id,
+          dispatchAttemptId,
+          dispatchFence
+        };
+        let exactAuthorization = false;
+        try {
+          if (isDispatchV2(dispatch)) {
+            const bound = assertWorkerAuthorization(record, { allowLegacy: false });
+            exactAuthorization = bound.nonce === nonce
+              && bound.dispatchAttemptId === dispatchAttemptId
+              && bound.dispatchFence === dispatchFence;
+          } else {
+            exactAuthorization = authorization?.schemaVersion === 1
+              && authorization.nonce === nonce
+              && authorization.purpose === "launch-worker"
+              && authorization.ownerThreadId === record.host?.sessionId
+              && authorization.dispatchAttemptId === dispatchAttemptId;
+          }
+        } catch {}
+        const commonAuthorization = nonce
+          && process.env.GROK_COMPANION_DISPATCH_ATTEMPT === dispatchAttemptId
+          && (!isDispatchV2(dispatch)
+            || (dispatch.fence === dispatchFence
+              && Number(process.env.GROK_COMPANION_DISPATCH_FENCE || dispatchFence) === dispatchFence))
+          && currentHost().kind === record.host?.kind
+          && currentHost().sessionId === record.host?.sessionId
+          && isSupportedWorkerDispatch(dispatch)
+          && dispatch.attemptId === dispatchAttemptId
+          && controllerIntent?.schemaVersion === 1
+          && controllerIntent.intentId === controllerIntentId
+          && controllerIntent.attemptId === dispatchAttemptId
+          && (!isDispatchV2(dispatch) || controllerIntent.fence == null || controllerIntent.fence === dispatchFence)
+          && controllerIntent.processKind === "controller"
+          && ["pending", "registered"].includes(controllerIntent.status)
+          && typeof ownStartToken === "string"
+          && ownStartToken;
+        const firstRegistrationAuthorized = commonAuthorization
+          && dispatch.state === "claimed"
+          && controllerIntent.status === "pending"
+          && exactAuthorization;
+        const alreadyRegistered = commonAuthorization
+          && dispatch.state === "controller-started"
+          && record.controllerProcess?.pid === process.pid
+          && record.controllerProcess?.startToken === ownStartToken
+          && record.controllerProcess?.nonce === nonce
+          && record.controllerProcess?.processGroupId === ownController.processGroupId
+          && record.controllerProcess?.commandMarker === id
+          && record.controllerProcess?.dispatchAttemptId === dispatchAttemptId
+          && (record.controllerProcess?.dispatchFence ?? null) === dispatchFence;
+        if (firstRegistrationAuthorized || alreadyRegistered) {
+          try {
+            assertDispatchContract(record);
+            transitionWorkerDispatch({
+              root,
+              workerId: id,
+              attemptId: dispatchAttemptId,
+              fence: dispatchFence,
+              state: "controller-started",
+              controllerProcess: ownController,
+              spawnIntentId: controllerIntentId
+            });
+          } catch (error) {
+            throw error;
+          }
+          authorized = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      if (!authorized) {
+        throw new CompanionError("E_RECURSION", "Unauthenticated or stale broker launcher invocation refused.");
+      }
+      if (isCancelRequested(root, id, nonce)) {
+        // Exit without terminalizing this still-live controller. The trusted
+        // reconciler observes the durable cancel marker after group exit.
+        return;
+      }
+      let child;
+      let identity;
+      let workerIntent;
+      const dispatchFence = isDispatchV2(record.request?.spawn?.dispatch)
+        ? (providedDispatchFence ?? Number(process.env.GROK_COMPANION_DISPATCH_FENCE || record.request.spawn.dispatch.fence))
+        : null;
+      try {
+        const prepared = prepareDispatchProcessSpawn({
+          root,
+          workerId: id,
+          attemptId: dispatchAttemptId,
+          fence: dispatchFence,
+          processKind: "worker",
+          nonce
+        });
+        if (!prepared.prepared) return;
+        workerIntent = prepared.intent;
+        child = spawn(process.execPath, [
+          SCRIPT,
+          "--worker",
+          id,
+          "--attempt",
+          dispatchAttemptId,
+          ...(dispatchFence ? ["--fence", String(dispatchFence)] : []),
+          "--worker-intent",
+          workerIntent.intentId,
+          "--cwd",
+          root
+        ], {
+          cwd: root,
+          detached: true,
+          shell: false,
+          stdio: "ignore",
+          env: workerEnvironment(nonce, dispatchAttemptId, dispatchFence)
+        });
+        identity = await captureSpawnIdentity(child);
+        if (isCancelRequested(root, id, nonce)) {
+          await ensureChildExit(child, identity);
+          recordDispatchProcessNoChild({
+            root,
+            workerId: id,
+            attemptId: dispatchAttemptId,
+            fence: dispatchFence,
+            processKind: "worker",
+            intentId: workerIntent.intentId,
+            resolution: "cleanup-proven"
+          });
+          return;
+        }
+        const workerProcess = {
+          ...identity,
+          nonce,
+          commandMarker: id,
+          dispatchAttemptId,
+          dispatchFence
+        };
+        const transitioned = transitionWorkerDispatch({
+          root,
+          workerId: id,
+          attemptId: dispatchAttemptId,
+          fence: dispatchFence,
+          state: "worker-started",
+          workerProcess,
+          spawnIntentId: workerIntent.intentId
+        });
+        if (transitioned.request?.spawn?.dispatch?.state !== "worker-started") {
+          await ensureChildExit(child, identity);
+          return;
+        }
+        let exited = child.exitCode !== null || child.signalCode !== null;
+        const observeExit = () => { exited = true; };
+        child.once("exit", observeExit);
+        child.once("error", observeExit);
+        try {
+          for (;;) {
+            const latest = readJob(root, id);
+            const latestDispatch = latest.request?.spawn?.dispatch;
+            if (latestDispatch?.attemptId !== dispatchAttemptId) {
+              await ensureChildExit(child, identity);
+              return;
+            }
+            if (latestDispatch.state === "failed" || terminal(latest)) {
+              await ensureChildExit(child, identity);
+              return;
+            }
+            if (exited) {
+              await ensureChildExit(child, identity);
+              if (latestDispatch.state === "provider-started") {
+                await recoverLostProviderStartedWorker({
+                  root,
+                  workerId: id,
+                  attemptId: dispatchAttemptId,
+                  workerProcess,
+                  reconciler: false
+                });
+              } else {
+                // Leave the exact worker-started attempt nonterminal. Recovery
+                // decides whether launch was explicitly absent or ambiguous.
+              }
+              return;
+            }
+            const watchdogPollMs = latestDispatch.state === "provider-started" ? 250 : 25;
+            await new Promise((resolve) => setTimeout(resolve, watchdogPollMs));
+          }
+        } finally {
+          child.removeListener("exit", observeExit);
+          child.removeListener("error", observeExit);
+        }
+      } catch (error) {
+        if (workerIntent && !Number.isInteger(child?.pid)) {
+          try {
+            recordDispatchProcessNoChild({
+              root,
+              workerId: id,
+              attemptId: dispatchAttemptId,
+              fence: dispatchFence,
+              processKind: "worker",
+              intentId: workerIntent.intentId,
+              resolution: "spawn-not-created"
+            });
+          } catch {}
+        }
+        const attachedCleanupIdentity = providerCleanupIdentity(error);
+        const cleanupIdentity = identity || attachedCleanupIdentity;
+        if (child
+          && Number.isInteger(child.pid)
+          && !cleanupIdentity
+          && workerIntent) {
+          // captureSpawnIdentity attaches an observation-only identity whenever
+          // the spawned group may still be alive. A valid PID with no attached
+          // identity therefore means its SIGTERM/SIGKILL cleanup was proven
+          // before the error escaped.
+          try {
+            recordDispatchProcessNoChild({
+              root,
+              workerId: id,
+              attemptId: dispatchAttemptId,
+              fence: dispatchFence,
+              processKind: "worker",
+              intentId: workerIntent.intentId,
+              resolution: "cleanup-proven"
+            });
+          } catch {}
+        }
+        if (child && cleanupIdentity) {
+          let cleanupVerified = false;
+          if (cleanupIdentity.startToken) {
+            try {
+              await ensureChildExit(child, cleanupIdentity);
+              cleanupVerified = processGroupGone(cleanupIdentity);
+            } catch {}
+          } else {
+            cleanupVerified = processGroupGone(cleanupIdentity);
+          }
+          if (!cleanupVerified) {
+            try {
+              recordUnsettledWorkerProcess({
+                root,
+                workerId: id,
+                attemptId: dispatchAttemptId,
+                workerProcess: {
+                  pid: cleanupIdentity.pid,
+                  startToken: cleanupIdentity.startToken || null,
+                  processGroupId: cleanupIdentity.processGroupId,
+                  nonce,
+                  commandMarker: id,
+                  dispatchAttemptId,
+                  dispatchFence
+                }
+              });
+            } catch {}
+          } else if (workerIntent) {
+            try {
+              recordDispatchProcessNoChild({
+                root,
+                workerId: id,
+                attemptId: dispatchAttemptId,
+                fence: dispatchFence,
+                processKind: "worker",
+                intentId: workerIntent.intentId,
+                resolution: "cleanup-proven"
+              });
+            } catch {}
+          }
+        }
+        // The host-trusted reconciler publishes loss/cancellation only after
+        // this controller and every child group are verified gone.
+        throw error;
+      }
+    }
     if (!nonce || record.workerAuthorization !== nonce) throw new CompanionError("E_RECURSION", "Unauthenticated Grok Companion launcher invocation refused.");
-    if (terminal(record) || isCancelRequested(root, id, nonce)) {
+    if (terminal(record)) return;
+    if (isCancelRequested(root, id, nonce)) {
       const postContext = (() => { try { return captureContextManifest(root); } catch { return null; } })();
       updateJob(root, id, (current) => {
+        if (terminal(current)) return current;
         current.workerAuthorization = null;
         current.status = "cancelled";
         current.phase = "cancelled";
@@ -1834,7 +2683,7 @@ async function main() {
         current.completionContextManifest = postContext;
         current.error = { code: "E_CANCELLED", message: "Grok job was cancelled before worker launch." };
         current.summary = current.error.message;
-        current.request = scrubStoredRequest(current.request);
+        Object.assign(current, scrubStoredJob(current));
         current.result = {
           ...(current.result || {}),
           hostVerification: "not_run",
@@ -1853,16 +2702,168 @@ async function main() {
       return;
     }
     const child = spawn(process.execPath, [SCRIPT, "--worker", id, "--cwd", root], { cwd: root, detached: true, shell: false, stdio: "ignore", env: workerEnvironment(nonce) });
-    updateJob(root, id, (current) => { current.workerAuthorization = null; current.workerProcess = { pid: child.pid, startToken: processStartToken(child.pid), nonce, processGroupId: process.platform === "win32" ? null : child.pid, commandMarker: id }; current.summary = "Worker started"; return current; });
+    const identity = await captureSpawnIdentity(child);
+    updateJob(root, id, (current) => {
+      if (terminal(current)) return current;
+      current.workerAuthorization = null;
+      current.workerProcess = { ...identity, nonce, commandMarker: id };
+      current.summary = "Worker started";
+      return current;
+    });
     child.unref(); return;
   }
   if (command === "--worker") {
-    const [id, cwdFlag, cwd] = raw; if (cwdFlag !== "--cwd") throw new CompanionError("E_USAGE", "Invalid worker invocation.");
+    const brokerInvocation = raw[1] === "--attempt";
+    const fencedInvocation = brokerInvocation && raw[3] === "--fence";
+    const id = raw[0];
+    const dispatchAttemptId = brokerInvocation ? raw[2] : null;
+    const providedDispatchFence = fencedInvocation ? Number(raw[4]) : null;
+    const workerIntentFlag = brokerInvocation ? raw[fencedInvocation ? 5 : 3] : null;
+    const workerIntentId = brokerInvocation ? raw[fencedInvocation ? 6 : 4] : null;
+    const cwdFlag = brokerInvocation ? raw[fencedInvocation ? 7 : 5] : raw[1];
+    const cwd = brokerInvocation ? raw[fencedInvocation ? 8 : 6] : raw[2];
+    if (raw.length !== (brokerInvocation ? (fencedInvocation ? 9 : 7) : 3)
+      || cwdFlag !== "--cwd"
+      || (brokerInvocation && (
+        workerIntentFlag !== "--worker-intent"
+        || !/^[a-f0-9]{32}$/.test(String(dispatchAttemptId || ""))
+        || !/^[a-f0-9]{32}$/.test(String(workerIntentId || ""))
+        || (fencedInvocation && (!Number.isSafeInteger(providedDispatchFence) || providedDispatchFence < 1))
+      ))) {
+      throw new CompanionError("E_USAGE", "Invalid worker invocation.");
+    }
     const root = workspaceRoot(cwd), nonce = process.env.GROK_COMPANION_WORKER_NONCE;
     let authorized = false;
-    for (let attempt = 0; attempt < 40; attempt++) { const record = readJob(root, id); if (nonce && record.workerProcess?.nonce === nonce && record.workerProcess?.pid === process.pid && record.workerProcess?.commandMarker === id) { authorized = true; break; } await new Promise((resolve) => setTimeout(resolve, 25)); }
+    let authorizedFence = null;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const record = readJob(root, id);
+      let identity = record.workerProcess;
+      const activeDispatchFence = isDispatchV2(record.request?.spawn?.dispatch)
+        ? (providedDispatchFence
+          ?? Number(process.env.GROK_COMPANION_DISPATCH_FENCE || record.request.spawn.dispatch.fence))
+        : null;
+      if (terminal(record)) return;
+      if (brokerInvocation) {
+        const authorization = record.workerAuthorization;
+        const dispatch = record.request?.spawn?.dispatch;
+        const dispatchFence = activeDispatchFence;
+        const intent = record.request?.spawn?.workerSpawnIntent;
+        const ownStartToken = processStartToken(process.pid);
+        const ownIdentity = {
+          pid: process.pid,
+          startToken: ownStartToken,
+          nonce,
+          processGroupId: process.platform === "win32" ? null : process.pid,
+          commandMarker: id,
+          dispatchAttemptId,
+          dispatchFence
+        };
+        let exactAuthorization = false;
+        try {
+          if (isDispatchV2(dispatch)) {
+            const bound = assertWorkerAuthorization(record, { allowLegacy: false });
+            exactAuthorization = bound.nonce === nonce
+              && bound.dispatchAttemptId === dispatchAttemptId
+              && bound.dispatchFence === dispatchFence;
+          } else {
+            exactAuthorization = authorization?.schemaVersion === 1
+              && authorization.nonce === nonce
+              && authorization.purpose === "launch-worker"
+              && authorization.ownerThreadId === record.host?.sessionId
+              && authorization.dispatchAttemptId === dispatchAttemptId;
+          }
+        } catch {}
+        const commonAuthorization = nonce
+          && process.env.GROK_COMPANION_DISPATCH_ATTEMPT === dispatchAttemptId
+          && (!isDispatchV2(dispatch)
+            || (dispatch.fence === dispatchFence
+              && Number(process.env.GROK_COMPANION_DISPATCH_FENCE || dispatchFence) === dispatchFence))
+          && currentHost().kind === record.host?.kind
+          && currentHost().sessionId === record.host?.sessionId
+          && isSupportedWorkerDispatch(dispatch)
+          && dispatch.attemptId === dispatchAttemptId
+          && intent?.schemaVersion === 1
+          && intent.intentId === workerIntentId
+          && intent.attemptId === dispatchAttemptId
+          && (!isDispatchV2(dispatch) || intent.fence == null || intent.fence === dispatchFence)
+          && intent.processKind === "worker"
+          && ["pending", "registered"].includes(intent.status)
+          && typeof ownStartToken === "string"
+          && ownStartToken;
+        const firstRegistrationAuthorized = commonAuthorization
+          && dispatch.state === "controller-started"
+          && intent.status === "pending"
+          && exactAuthorization;
+        const alreadyRegistered = commonAuthorization
+          && dispatch.state === "worker-started"
+          && identity?.pid === process.pid
+          && identity?.startToken === ownStartToken
+          && identity?.nonce === nonce
+          && identity?.processGroupId === ownIdentity.processGroupId
+          && identity?.commandMarker === id
+          && identity?.dispatchAttemptId === dispatchAttemptId
+          && (identity?.dispatchFence ?? null) === dispatchFence;
+        if (firstRegistrationAuthorized || alreadyRegistered) {
+          assertDispatchContract(record);
+          const registered = transitionWorkerDispatch({
+            root,
+            workerId: id,
+            attemptId: dispatchAttemptId,
+            fence: dispatchFence,
+            state: "worker-started",
+            workerProcess: ownIdentity,
+            spawnIntentId: workerIntentId
+          });
+          identity = registered.workerProcess;
+        }
+      }
+      if (nonce
+        && (!brokerInvocation || (
+          process.env.GROK_COMPANION_DISPATCH_ATTEMPT === dispatchAttemptId
+          && currentHost().kind === record.host?.kind
+          && currentHost().sessionId === record.host?.sessionId
+        ))
+        && identity?.nonce === nonce
+        && identity?.pid === process.pid
+        && identity?.startToken === processStartToken(process.pid)
+        && (process.platform === "win32"
+          ? identity?.processGroupId === null
+          : identity?.processGroupId === process.pid)
+        && identity?.commandMarker === id
+        && (!brokerInvocation || (
+          identity.dispatchAttemptId === dispatchAttemptId
+          && (identity.dispatchFence ?? null) === activeDispatchFence
+          && record.request?.spawn?.dispatch?.attemptId === dispatchAttemptId
+          && record.request?.spawn?.dispatch?.state === "worker-started"
+        ))) {
+        if (brokerInvocation) {
+          try {
+            assertDispatchContract(record);
+          } catch (error) {
+            throw error;
+          }
+        }
+        authorized = true;
+        authorizedFence = brokerInvocation
+          ? (record.request?.spawn?.dispatch?.schemaVersion === 2
+              ? (providedDispatchFence ?? Number(process.env.GROK_COMPANION_DISPATCH_FENCE || record.request.spawn.dispatch.fence))
+              : null)
+          : null;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     if (!authorized) throw new CompanionError("E_RECURSION", "Unauthenticated Grok Companion worker invocation refused.");
-    await execute(root, id); return;
+    try {
+      await execute(root, id, { dispatchAttemptId, dispatchFence: authorizedFence });
+    } catch (error) {
+      // The executing worker never terminalizes its own still-live process.
+      // execute() atomically settles cleanup-safe pre-provider failures; if it
+      // could not, the controller/reconciler observes exact process exit and
+      // performs loss recovery without replaying the prompt.
+      throw error;
+    }
+    return;
   }
   if (command === "setup") return handleSetup(raw);
   if (["review", "adversarial-review"].includes(command)) return handleReview(command, raw);

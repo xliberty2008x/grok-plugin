@@ -677,7 +677,7 @@ test("jobs admitted from controlRoot and linked worktree share one store", () =>
   git(root, "worktree", "remove", "--force", linked);
 });
 
-test("spawn via linked worktree path is visible from primary controlRoot", () => {
+test("linked-worktree spawn shares control state while idempotency remains execution-root-bound", () => {
   const root = initRepo();
   const env = envFor();
   const linked = addLinkedWorktree(root);
@@ -694,17 +694,52 @@ test("spawn via linked worktree path is visible from primary controlRoot", () =>
   const fromPrimary = tryReadJob(root, spawned.handle.id, env);
   assert.ok(fromPrimary, "primary controlRoot must see spawn from linked worktree");
   assert.equal(fromPrimary.id, spawned.handle.id);
+  assert.equal(fromPrimary.request.spawn.executionRoot, linked);
+  assert.equal(fromPrimary.request.contextManifest.workspaceRoot, linked);
 
-  // Idempotency shared too.
+  // The idempotency namespace is shared, and an exact replay from the same
+  // execution context resolves to the original durable job.
   const replay = spawnReadOnlyWorker({
-    root,
-    principal: principal(root),
+    root: linked,
+    principal: principal(linked),
     envelope,
     idempotencyKey: "shared-store-spawn-0001",
     env
   });
   assert.equal(replay.replayed, true);
   assert.equal(replay.handle.id, spawned.handle.id);
+
+  // A primary-checkout request is a different execution context, even though
+  // it shares the control store. Reusing the key must fail closed rather than
+  // silently rebinding the accepted ContextManifest or execution root.
+  const jobCount = listJobs(root, env).length;
+  assert.throws(
+    () => spawnReadOnlyWorker({
+      root,
+      principal: principal(root),
+      envelope,
+      idempotencyKey: "shared-store-spawn-0001",
+      env
+    }),
+    (error) => error?.code === "E_IDEMPOTENCY_CONFLICT"
+  );
+  assert.equal(listJobs(root, env).length, jobCount);
+
+  assert.throws(
+    () => spawnReadOnlyWorker({
+      root,
+      principal: principal(root),
+      envelope,
+      contextManifest: fromPrimary.request.contextManifest,
+      idempotencyKey: "forged-linked-context-0001",
+      env
+    }),
+    (error) => error?.code === "E_CONTEXT_DRIFT"
+  );
+  assert.equal(listJobs(root, env).length, jobCount);
+  const retained = tryReadJob(root, spawned.handle.id, env);
+  assert.equal(retained.request.spawn.executionRoot, linked);
+  assert.equal(retained.request.contextManifest.workspaceRoot, linked);
 
   git(root, "worktree", "remove", "--force", linked);
 });

@@ -12,7 +12,8 @@ import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 import { CompanionError, attachTransferCleanupEvidence, asErrorPayload } from "../plugins/grok/scripts/lib/errors.mjs";
 import { redact } from "../plugins/grok/scripts/lib/redact.mjs";
 import { spawnReadOnlyWorker } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
-import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
+import { buildTaskEnvelope, scrubStoredJob } from "../plugins/grok/scripts/lib/task-contract.mjs";
+import { launchContractDigest } from "../plugins/grok/scripts/lib/worker-launch-contract.mjs";
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import {
@@ -26,7 +27,7 @@ import {
   testEnvironment,
   waitFor
 } from "./helpers.mjs";
-import { writeCodexSessionMetadata } from "../plugins/grok/scripts/lib/host.mjs";
+import { pluginDataRoot, writeCodexSessionMetadata } from "../plugins/grok/scripts/lib/host.mjs";
 
 function parseJson(result) {
   assert.equal(result.status, 0, `command failed\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
@@ -83,6 +84,32 @@ test("setup validates headless isolation before enabling the stop gate", () => {
   assert.equal(failed.ready, false);
   assert.equal(failed.grok.error.code, "E_CAPABILITY");
   assert.equal(failed.config.stopReviewGate, false);
+});
+
+test("a failed setup attempt revokes the previously published provider capability", () => {
+  const root = initRepo();
+  const readyFixture = fixture();
+  const ready = parseJson(runCompanion(["setup", "--json"], { cwd: root, env: readyFixture.env }));
+  assert.equal(ready.ready, true);
+  const receipt = path.join(
+    pluginDataRoot(readyFixture.env),
+    "capabilities",
+    "provider-capability-v1.json"
+  );
+  assert.equal(fs.existsSync(receipt), true);
+
+  const failedFake = installFakeGrok(tempDir("fake-grok-setup-revocation-"), {
+    helpText: "Usage: grok --sandbox PROFILE\n"
+  });
+  const failedEnv = {
+    ...readyFixture.env,
+    GROK_BIN: failedFake.binary,
+    GROK_AUTH_PATH: failedFake.authPath
+  };
+  const failed = parseJson(runCompanion(["setup", "--json"], { cwd: root, env: failedEnv }));
+  assert.equal(failed.ready, false);
+  assert.equal(failed.grok.error.code, "E_CAPABILITY");
+  assert.equal(fs.existsSync(receipt), false);
 });
 
 function transferFixture(config = {}) {
@@ -353,6 +380,67 @@ test("runtime write task forwards model and effort under the write security prof
   assert.equal(invocation.args.includes("explore"), false);
   assert.ok(providerLog.some((entry) => entry.event === "rpc" && entry.message.method === "session/prompt"));
   assert.equal(providerLog.some((entry) => entry.event === "headless"), false);
+});
+
+test("successful task storage digests duplicate private objectives and preserves a distinct public objective", () => {
+  const root = initRepo();
+  const { env, pluginData } = fixture({ taskText: taskReport("Stored request privacy complete", ["AC-01"]) });
+  const privateRequest = "private terminal request literal 8de43c3f";
+  const expectedDigest = crypto.createHash("sha256").update(privateRequest).digest("hex");
+  const launchEnvelope = buildTaskEnvelope({ userRequest: privateRequest, objective: privateRequest });
+  const launchJob = {
+    id: "task-launch-privacy",
+    kind: "task",
+    jobClass: "task",
+    write: false,
+    title: privateRequest,
+    host: { kind: "codex", sessionId: "privacy-test-thread" },
+    controlWorkspaceId: "privacy-test-workspace",
+    profile: null,
+    role: null,
+    model: null,
+    effort: null,
+    request: {
+      prompt: "assembled provider prompt",
+      promptDigest: null,
+      providerPromptDigest: crypto.createHash("sha256").update("assembled provider prompt").digest("hex"),
+      publicObjective: privateRequest,
+      envelope: launchEnvelope,
+      spawn: {}
+    }
+  };
+  const scrubbedLaunchJob = scrubStoredJob(launchJob);
+  assert.equal(launchContractDigest(scrubbedLaunchJob), launchContractDigest(launchJob));
+  assert.equal(scrubbedLaunchJob.title, `task:${expectedDigest.slice(0, 24)}`);
+
+  const duplicate = parseJson(runCompanion(
+    ["task", "--wait", "--write", "--envelope-stdin", "--json"],
+    { cwd: root, env, input: writeEnvelope(privateRequest) }
+  ));
+  assert.equal(duplicate.status, "completed");
+  const duplicateStored = persistedJob(pluginData, duplicate.id);
+  assert.equal(duplicateStored.request.prompt, null);
+  assert.match(duplicateStored.request.promptDigest, /^[a-f0-9]{64}$/);
+  assert.equal(duplicateStored.request.envelope.userRequest, null);
+  assert.equal(duplicateStored.request.envelope.userRequestDigest, expectedDigest);
+  assert.equal(duplicateStored.request.envelope.objective, expectedDigest);
+  assert.equal(duplicateStored.request.publicObjective, null);
+  assert.equal(duplicateStored.title, `task:${expectedDigest.slice(0, 24)}`);
+  assert.equal(JSON.stringify(duplicateStored).includes(privateRequest), false);
+
+  const publicObjective = "Summarize the bounded fixture change";
+  const distinct = parseJson(runCompanion(
+    ["task", "--wait", "--write", "--envelope-stdin", "--json"],
+    { cwd: root, env, input: writeEnvelope(privateRequest, { objective: publicObjective }) }
+  ));
+  assert.equal(distinct.status, "completed");
+  const distinctStored = persistedJob(pluginData, distinct.id);
+  assert.equal(distinctStored.request.envelope.userRequest, null);
+  assert.equal(distinctStored.request.envelope.userRequestDigest, expectedDigest);
+  assert.equal(distinctStored.request.envelope.objective, publicObjective);
+  assert.equal(distinctStored.request.publicObjective, publicObjective);
+  assert.equal(distinctStored.title, publicObjective);
+  assert.equal(JSON.stringify(distinctStored).includes(privateRequest), false);
 });
 
 test("resume candidates preserve read/write profiles and never escalate an existing session", () => {
@@ -800,7 +888,7 @@ test("legacy CLI cancel extracts the broker object authorization nonce", async (
   assert.equal(JSON.parse(completed.stdout).status, "cancelled");
 });
 
-test("legacy CLI cancel retains every launch-unsettled broker boundary before cleanup", { timeout: 30_000 }, async () => {
+test("CLI cancel terminalizes only cleanup-proven broker boundaries and retains ambiguous launch states", { timeout: 30_000 }, async () => {
   const root = fs.realpathSync(initRepo());
   const runtime = codexBrokerFixture();
   const stateRoot = workspaceState(root, runtime.env);
@@ -808,7 +896,7 @@ test("legacy CLI cancel retains every launch-unsettled broker boundary before cl
     {
       name: "pending",
       launch: { providerLaunchPending: true, providerLaunchInFlight: false, providerLaunchOutcome: null },
-      retained: true
+      retained: false
     },
     {
       name: "inflight",
@@ -883,18 +971,21 @@ test("legacy CLI cancel retains every launch-unsettled broker boundary before cl
       continue;
     }
 
-    assert.equal(projected.status, "running");
-    assert.equal(projected.phase, "launch-unsettled");
-    assert.equal(stored.status, "running");
-    assert.equal(stored.phase, "launch-unsettled");
+    assert.equal(projected.status, "queued");
+    assert.equal(projected.phase, "cancellation-requested");
+    assert.equal(stored.status, "queued");
+    assert.equal(stored.phase, "cancellation-requested");
     assert.equal(stored.completedAt, null);
     assert.deepEqual(stored.request, fixture.before.request, `${fixture.name} launch state must remain intact`);
     assert.deepEqual(stored.workerAuthorization, fixture.before.workerAuthorization);
-    assert.deepEqual(stored.lifecycleEvents, fixture.before.lifecycleEvents);
-    assert.equal(stored.error?.code, "E_STATE");
-    assert.match(stored.error?.message || "", /launch settlement is incomplete/i);
-    assert.equal(stored.result?.taskRuntimeCleaned, false);
-    assert.match(stored.result?.privacyWarning || "", /task runtime artifacts retained/i);
+    assert.equal(
+      stored.lifecycleEvents.length,
+      fixture.before.lifecycleEvents.length + 1,
+      `${fixture.name} must append exactly one durable cancellation event`
+    );
+    assert.equal(stored.lifecycleEvents.at(-1).type, "cancellation.requested");
+    assert.equal(stored.error, null);
+    assert.equal(stored.result?.taskRuntimeCleaned, undefined);
     assert.equal(fs.existsSync(fixture.runtimeFile), true, `${fixture.name} runtime must be retained`);
     assert.doesNotMatch(stored.error?.message || "", new RegExp(fixture.id));
     assert.doesNotMatch(stored.error?.message || "", new RegExp(fixture.nonce));

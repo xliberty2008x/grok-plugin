@@ -5,7 +5,10 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
+import {
+  buildTaskEnvelope,
+  captureContextManifest
+} from "../plugins/grok/scripts/lib/task-contract.mjs";
 import { spawnReadOnlyWorker, cancelWorker } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import {
   acpDeliveryCapability,
@@ -215,7 +218,7 @@ test("followup preserves lineage and rejects profile/context drift", () => {
     root,
     principal: principal(root),
     envelope,
-    contextManifest: { manifestId: "m1", digest: "a".repeat(64) },
+    contextManifest: captureContextManifest(root),
     idempotencyKey: "mb-parent-0001",
     env
   });
@@ -268,7 +271,7 @@ test("followup preserves lineage and rejects profile/context drift", () => {
   );
 });
 
-test("followup launch state survives reconciliation, prelaunch cancel, and another continuation", () => {
+test("legacy followup launch state survives reconciliation and cancellation fails closed without dispatch authority", () => {
   const root = initRepo();
   const env = envFor();
   const owner = principal(root);
@@ -320,20 +323,23 @@ test("followup launch state survives reconciliation, prelaunch cancel, and anoth
     idempotencyKey: "mb-launch-followup-1-cancel",
     env
   });
-  const cancelled = tryReadJob(root, first.handle.id, env);
-  assert.equal(cancelled.status, "cancelled");
-  assert.equal(cancelled.result.taskRuntimeCleaned, true);
+  const retained = tryReadJob(root, first.handle.id, env);
+  assert.equal(retained.status, "queued");
+  assert.equal(retained.phase, "cancellation-requested");
+  assert.equal(retained.result.taskRuntimeCleaned, false);
+  assert.match(retained.result.privacyWarning, /dispatch metadata is malformed|launch-safe/i);
 
-  const second = followupWorker({
-    root,
-    principal: owner,
-    workerId: first.handle.id,
-    message: "Second continuation",
-    idempotencyKey: "mb-launch-followup-2",
-    env
-  });
-  assert.equal(second.handle.parentWorkerId, first.handle.id);
-  assert.equal(tryReadJob(root, second.handle.id, env).request.spawn.providerLaunchPending, true);
+  assert.throws(
+    () => followupWorker({
+      root,
+      principal: owner,
+      workerId: first.handle.id,
+      message: "Second continuation",
+      idempotencyKey: "mb-launch-followup-2",
+      env
+    }),
+    (error) => error?.code === "E_JOB_ACTIVE"
+  );
 });
 
 test("followup idempotency is owner-bound and write parents cannot bypass write gating", () => {

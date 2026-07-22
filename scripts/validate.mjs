@@ -303,6 +303,12 @@ if (!versionsOnly) {
     if (packageJson.scripts?.["test:installed-codex"] !== "node --test tests/installed-codex.test.mjs") {
       problem("test:installed-codex must execute the installed Codex gate directly.", "package.json");
     }
+    if (packageJson.scripts?.["test:deterministic"] !== "node scripts/test-deterministic.mjs") {
+      problem("test:deterministic must execute the zero-skip deterministic runner directly.", "package.json");
+    }
+    if (packageJson.scripts?.check !== "npm run validate && npm run test:deterministic") {
+      problem("check must run validation and the zero-skip deterministic suite.", "package.json");
+    }
     if (packageJson.scripts?.["codex:update-local"] !== "node scripts/update-local-codex.mjs") {
       problem("codex:update-local must execute the verified local-cache updater directly.", "package.json");
     }
@@ -430,9 +436,27 @@ if (!versionsOnly) {
     const proofProducer = workerEvidenceSchema.properties?.proofProducer;
     if (proofProducer?.additionalProperties !== false
       || proofProducer?.properties?.id?.const !== "worker-broker-gate-runner"
-      || proofProducer?.properties?.version?.const !== 1
+      || proofProducer?.properties?.version?.const !== 2
       || !proofProducer?.required?.includes("manifestDigest")) {
       problem("Worker Broker evidence schema must bind exact gate-runner provenance.", file);
+    }
+    const reviewReceipt = workerEvidenceSchema.properties?.independentReviewReceipt;
+    const phaseOnePromotionProhibition = (workerEvidenceSchema.allOf || []).find((rule) => (
+      rule?.not?.properties?.phase?.const === "1"
+      && rule?.not?.required?.includes("phase")
+      && rule?.not?.required?.includes("status")
+      && ["verified_on_draft", "qualified"].every((status) => (
+        rule?.not?.properties?.status?.enum?.includes(status)
+      ))
+    ));
+    if (reviewReceipt?.additionalProperties !== false
+      || reviewReceipt?.properties?.producerId?.const !== "codex-native-review-runner"
+      || reviewReceipt?.properties?.producerVersion?.const !== 1
+      || reviewReceipt?.properties?.outcome?.const !== "pass"
+      || reviewReceipt?.properties?.unresolvedFindings?.const !== 0
+      || !reviewReceipt?.required?.includes("receiptDigest")
+      || !phaseOnePromotionProhibition) {
+      problem("Worker Broker Phase 1 evidence schema must forbid unauthenticated verified promotion.", file);
     }
     if (workerEvidenceSchema.properties?.scenarios?.items?.properties?.measurements?.additionalProperties !== false) {
       problem("Worker Broker scenario measurements must be a bounded allowlist.", file);
@@ -590,6 +614,7 @@ if (!versionsOnly) {
     if (!/permissions:\s*\n\s+contents:\s*read/m.test(workflow)) problem("CI must declare read-only contents permission.", ".github/workflows/ci.yml");
     if (/GROK_E2E\s*[:=]\s*["']?1/i.test(workflow) || /test:e2e/.test(workflow)) problem("Default CI must not run quota-consuming Grok E2E tests.", ".github/workflows/ci.yml");
     if (!/npm run test:pty-ingress/.test(workflow)) problem("CI must expose the source nonblocking PTY regression as a named gate.", ".github/workflows/ci.yml");
+    if (!/npm run test:deterministic/.test(workflow)) problem("Linux/macOS CI must run the deterministic zero-skip suite.", ".github/workflows/ci.yml");
     if (!/CODEX_PLUGIN_RUNNER_ENABLED/.test(workflow) || !/npm run test:installed-codex/.test(workflow)) {
       problem("CI must define the opt-in Codex-equipped installed-snapshot gate.", ".github/workflows/ci.yml");
     }

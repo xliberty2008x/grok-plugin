@@ -9,7 +9,7 @@ import {
   resolveWorkspaceStateDir,
   resolveAdmissionLockName
 } from "./workspace.mjs";
-import { sameHostSession } from "./host.mjs";
+import { pluginDataRoot, sameHostSession } from "./host.mjs";
 
 const JOB_ID_PATTERN = /^(review|adversarial-review|task|stop-review)-[a-f0-9]{16,64}$/;
 const JOB_STATUSES = new Set(["queued", "running", "completed", "failed", "cancelled"]);
@@ -24,6 +24,13 @@ const ACTIVE = new Set(["queued", "running"]);
 const LOCK_OWNER_START_TOKEN = processStartToken(process.pid);
 const LOCK_CONSTRUCTION_GRACE_MS = 30_000;
 const LOCK_TRANSITION_FILE = "transition.json";
+const BROKER_RECOVERY_LIMITS = Object.freeze({
+  maxStateEntries: 128,
+  maxJobEntries: 4_096,
+  maxCandidates: 512,
+  maxJobBytes: 8 * 1024 * 1024,
+  maxTotalJobBytes: 32 * 1024 * 1024
+});
 export const terminal = (job) => !ACTIVE.has(job?.status);
 export const now = () => new Date().toISOString();
 
@@ -207,13 +214,45 @@ function inspectLock(lock) {
   const identity = lockDirectoryIdentity(stat);
   let owner = null;
   let ownerFingerprint = null;
+  let ownerMissing = false;
   try {
     const ownerContents = readPrivateFile(path.join(lock, "owner.json"), { maxBytes: 4096 });
     owner = JSON.parse(ownerContents);
     ownerFingerprint = crypto.createHash("sha256").update(ownerContents).digest("hex");
   } catch (error) {
     if (error instanceof CompanionError) throw error;
-    if (error?.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+    ownerMissing = error?.code === "ENOENT";
+    if (!ownerMissing && !(error instanceof SyntaxError)) throw error;
+  }
+  // A process can die after fsyncing the exclusive owner temp file but before
+  // link(2) publishes owner.json. When exactly one complete provisional owner
+  // is bound to this lock generation, use its PID/start token for liveness so
+  // a proven-dead constructor is recoverable without weakening the grace for
+  // genuinely ownerless or ambiguous construction windows.
+  if (ownerMissing) {
+    let provisionalNames = [];
+    try {
+      provisionalNames = fs.readdirSync(lock).filter((name) => (
+        /^owner\.json\.\d+\.[a-f0-9]{12}\.tmp$/.test(name)
+      ));
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    if (provisionalNames.length === 1) {
+      const provisionalName = provisionalNames[0];
+      const pid = Number(provisionalName.match(/^owner\.json\.(\d+)\./)?.[1]);
+      try {
+        const ownerContents = readPrivateFile(path.join(lock, provisionalName), { maxBytes: 4096 });
+        const provisional = JSON.parse(ownerContents);
+        if (provisional?.schemaVersion === 2 && provisional.pid === pid) {
+          owner = provisional;
+          ownerFingerprint = crypto.createHash("sha256").update(ownerContents).digest("hex");
+        }
+      } catch (error) {
+        if (error instanceof CompanionError) throw error;
+        if (error?.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+      }
+    }
   }
   return {
     identity,
@@ -712,6 +751,193 @@ export function listJobsReadonly(root, env = process.env) {
       }
     })
     .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+}
+
+function exactRecoveryLimit(value, key) {
+  const hardMaximum = BROKER_RECOVERY_LIMITS[key];
+  if (value == null) return hardMaximum;
+  if (!Number.isSafeInteger(value) || value < 1 || value > hardMaximum) {
+    throw new CompanionError("E_USAGE", `Invalid broker recovery scan limit ${key}.`);
+  }
+  return value;
+}
+
+function privateRecoveryDirectory(directory) {
+  try {
+    const stat = fs.lstatSync(directory);
+    if (!stat.isDirectory()
+      || stat.isSymbolicLink()
+      || (stat.mode & 0o077) !== 0
+      || fs.realpathSync(directory) !== directory
+      || (typeof process.getuid === "function" && stat.uid !== process.getuid())) return null;
+    return stat;
+  } catch {
+    return null;
+  }
+}
+
+function boundedDirectoryEntries(directory, budget, label) {
+  const handle = fs.opendirSync(directory);
+  const entries = [];
+  try {
+    for (;;) {
+      const entry = handle.readSync();
+      if (!entry) break;
+      if (entries.length >= budget) {
+        throw new CompanionError("E_STATE", `Broker recovery ${label} exceeded its bounded scan budget.`);
+      }
+      entries.push(entry);
+    }
+  } finally {
+    handle.closeSync();
+  }
+  return entries;
+}
+
+function readBrokerRecoveryJobBytes(file, maxJobBytes) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const before = fs.fstatSync(descriptor);
+    if (!before.isFile()
+      || before.nlink !== 1
+      || before.size < 1
+      || before.size > maxJobBytes
+      || (before.mode & 0o077) !== 0
+      || (typeof process.getuid === "function" && before.uid !== process.getuid())) {
+      throw authoritativeJobStateError();
+    }
+    const pathStat = fs.lstatSync(file);
+    if (pathStat.isSymbolicLink()
+      || !pathStat.isFile()
+      || pathStat.dev !== before.dev
+      || pathStat.ino !== before.ino
+      || fs.realpathSync(file) !== file) {
+      throw authoritativeJobStateError();
+    }
+    const contents = Buffer.alloc(Number(before.size));
+    let offset = 0;
+    while (offset < contents.length) {
+      const count = fs.readSync(descriptor, contents, offset, contents.length - offset, offset);
+      if (count === 0) break;
+      offset += count;
+    }
+    const after = fs.fstatSync(descriptor);
+    if (offset !== contents.length
+      || before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs) {
+      throw authoritativeJobStateError();
+    }
+    return {
+      contents,
+      size: contents.length
+    };
+  } catch (error) {
+    if (error instanceof CompanionError) throw error;
+    throw authoritativeJobStateError();
+  } finally {
+    if (descriptor != null) fs.closeSync(descriptor);
+  }
+}
+
+/**
+ * Bounded, read-only discovery for autonomous broker startup recovery.
+ *
+ * Only the fixed plugin-data/state/<control>/jobs depth is inspected. Unsafe
+ * entries are ignored; exceeding any global budget rejects the entire scan so
+ * directory ordering can never decide which queued job receives authority.
+ */
+export function listBrokerRecoveryCandidates({
+  env = process.env,
+  limits = null
+} = {}) {
+  const configured = {
+    maxStateEntries: exactRecoveryLimit(limits?.maxStateEntries, "maxStateEntries"),
+    maxJobEntries: exactRecoveryLimit(limits?.maxJobEntries, "maxJobEntries"),
+    maxCandidates: exactRecoveryLimit(limits?.maxCandidates, "maxCandidates"),
+    maxJobBytes: exactRecoveryLimit(limits?.maxJobBytes, "maxJobBytes"),
+    maxTotalJobBytes: exactRecoveryLimit(limits?.maxTotalJobBytes, "maxTotalJobBytes")
+  };
+  let configuredDataRoot;
+  let dataRoot;
+  try {
+    configuredDataRoot = path.resolve(pluginDataRoot(env));
+    const configuredStat = fs.lstatSync(configuredDataRoot);
+    if (!configuredStat.isDirectory()
+      || configuredStat.isSymbolicLink()
+      || (configuredStat.mode & 0o077) !== 0
+      || (typeof process.getuid === "function" && configuredStat.uid !== process.getuid())) return [];
+    dataRoot = fs.realpathSync(configuredDataRoot);
+  } catch {
+    return [];
+  }
+  if (!privateRecoveryDirectory(dataRoot)) return [];
+  const stateParent = path.join(dataRoot, "state");
+  if (!privateRecoveryDirectory(stateParent)) return [];
+  const stateEntries = boundedDirectoryEntries(
+    stateParent,
+    configured.maxStateEntries,
+    "state directory"
+  );
+  const candidates = [];
+  let jobEntryCount = 0;
+  let totalJobBytes = 0;
+  for (const stateEntry of stateEntries) {
+    if (!/^control-[a-f0-9]{16}$/.test(stateEntry.name) || !stateEntry.isDirectory()) continue;
+    const stateDirectory = path.join(stateParent, stateEntry.name);
+    if (!privateRecoveryDirectory(stateDirectory)) continue;
+    const jobsDirectory = path.join(stateDirectory, "jobs");
+    if (!privateRecoveryDirectory(jobsDirectory)) continue;
+    const remainingEntries = configured.maxJobEntries - jobEntryCount;
+    if (remainingEntries < 1) {
+      throw new CompanionError("E_STATE", "Broker recovery job directories exceeded their bounded scan budget.");
+    }
+    const entries = boundedDirectoryEntries(jobsDirectory, remainingEntries, "job directory");
+    jobEntryCount += entries.length;
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const expectedId = jobIdFromJsonFileName(entry.name);
+      if (!expectedId || !expectedId.startsWith("task-")) continue;
+      const file = path.join(jobsDirectory, entry.name);
+      let loaded;
+      try {
+        loaded = readBrokerRecoveryJobBytes(file, configured.maxJobBytes);
+      } catch {
+        continue;
+      }
+      totalJobBytes += loaded.size;
+      if (totalJobBytes > configured.maxTotalJobBytes) {
+        throw new CompanionError("E_STATE", "Broker recovery job data exceeded its bounded byte budget.");
+      }
+      let job;
+      try {
+        job = validateAuthoritativeJobCore(
+          JSON.parse(loaded.contents.toString("utf8")),
+          { expectedId }
+        );
+      } catch {
+        continue;
+      }
+      if (candidates.length >= configured.maxCandidates) {
+        throw new CompanionError("E_STATE", "Broker recovery candidates exceeded their bounded result budget.");
+      }
+      candidates.push(Object.freeze({
+        stateSegment: stateEntry.name,
+        stateDirectory,
+        jobsDirectory,
+        file,
+        job
+      }));
+    }
+  }
+  return Object.freeze(candidates.sort((left, right) => (
+    left.stateSegment.localeCompare(right.stateSegment)
+    || String(left.job.createdAt).localeCompare(String(right.job.createdAt))
+    || left.job.id.localeCompare(right.job.id)
+  )));
 }
 
 export function readJob(root, id, env = process.env) {

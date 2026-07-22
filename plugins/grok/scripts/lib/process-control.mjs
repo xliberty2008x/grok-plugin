@@ -3,12 +3,68 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
-function ps(args) {
-  return spawnSync("ps", args, {
+import { CompanionError } from "./errors.mjs";
+
+const MAX_PROCESS_START_TOKEN_LENGTH = 256;
+const SYSTEM_PS_CANDIDATES = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
+
+function assertCompleteDetachedOwnedIdentity(identity) {
+  const rawStartToken = typeof identity?.startToken === "string"
+    ? identity.startToken
+    : "";
+  const startToken = rawStartToken.trim();
+  const validStartToken = (
+    startToken.length > 0
+    && rawStartToken.length <= MAX_PROCESS_START_TOKEN_LENGTH
+    && rawStartToken === startToken
+    && startToken.toUpperCase() !== "[REDACTED]"
+  );
+  if (
+    !Number.isSafeInteger(identity?.pid)
+    || identity.pid <= 0
+    || !validStartToken
+    || !Number.isSafeInteger(identity?.processGroupId)
+    || identity.processGroupId !== identity.pid
+  ) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Refusing to inspect or signal an incomplete detached process identity."
+    );
+  }
+}
+
+export function systemPsBinary() {
+  if (process.platform === "win32") return null;
+  return SYSTEM_PS_CANDIDATES.find((candidate) => {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return true;
+    } catch { return false; }
+  }) || null;
+}
+
+export function runSystemPs(args, options = {}) {
+  const binary = systemPsBinary();
+  if (!binary) {
+    return {
+      status: null,
+      stdout: "",
+      stderr: "",
+      error: new CompanionError("E_PROCESS_IDENTITY", "A trusted system ps executable is unavailable.")
+    };
+  }
+  return spawnSync(binary, args, {
     encoding: "utf8",
     shell: false,
-    timeout: 2000
+    timeout: 2000,
+    ...options,
+    // Never permit a caller to re-enable shell lookup around identity probes.
+    shell: false
   });
+}
+
+function ps(args) {
+  return runSystemPs(args);
 }
 
 export function processStartToken(pid) {
@@ -56,7 +112,16 @@ export function processGroupGone(identity) {
       return error.code === "ESRCH";
     }
   }
-  return processStartToken(identity.pid) !== identity.startToken || processIsZombie(identity.pid);
+  const current = processStartToken(identity.pid);
+  if (current == null) {
+    try {
+      process.kill(identity.pid, 0);
+      return false;
+    } catch (error) {
+      return error.code === "ESRCH";
+    }
+  }
+  return current !== identity.startToken || processIsZombie(identity.pid);
 }
 
 export function processCommand(pid) {
@@ -98,8 +163,18 @@ export function identityMatches(identity, marker, kind) {
   if (processIsZombie(identity.pid)) return false;
   const command = processCommand(identity.pid);
   if (!command || !command.includes(String(marker))) return false;
+  if (kind === "provider-bootstrap") {
+    const escapedMarker = String(marker).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return /(?:^|\/)provider-bootstrap\.mjs(?:\s|$)/.test(command)
+      && new RegExp(`(?:^|\\s)--job-marker\\s+${escapedMarker}(?:\\s|$)`).test(command)
+      && /(?:^|\s)--provider-generation\s+[1-9]\d*(?:\s|$)/.test(command)
+      && /(?:^|\s)--spawn-intent-id\s+[0-9a-f]{32}(?:\s|$)/.test(command);
+  }
   if (kind === "provider") {
-    return /(?:^|\s)agent(?:\s+[^\r\n]*)?\s+stdio(?:\s|$)/.test(command) || command.includes("--prompt-file") || command.includes("--single");
+    return /(?:^|\s)agent(?:\s+[^\r\n]*)?\s+stdio(?:\s|$)/.test(command)
+      || command.includes("--prompt-file")
+      || command.includes("--single")
+      || identityMatches(identity, marker, "provider-bootstrap");
   }
   if (kind === "import") {
     // Live `grok import --json` transfer processes are registered as import-kind providers.
@@ -108,7 +183,74 @@ export function identityMatches(identity, marker, kind) {
   if (kind === "worker") {
     return command.includes("grok-companion.mjs") && command.includes("--worker");
   }
+  if (kind === "controller") {
+    return command.includes("grok-companion.mjs") && command.includes("--launch-worker");
+  }
   return false;
+}
+
+/**
+ * Terminate only a process whose birth token, command marker, and process kind
+ * still prove ownership. The complete process group must be gone before this
+ * function reports success.
+ */
+export async function terminateOwnedProcess(identity, marker, kind, {
+  termTimeoutMs = 2_000,
+  killTimeoutMs = 1_500,
+  pollMs = 50
+} = {}) {
+  if (!identity) return false;
+  if (process.platform === "win32") {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Owned process cleanup is unavailable on this platform."
+    );
+  }
+  // Validate the complete detached identity before even probing group
+  // liveness. In particular, a corrupted guard must never redirect a probe or
+  // signal from the recorded leader PID to an unrelated process group.
+  assertCompleteDetachedOwnedIdentity(identity);
+  if (processGroupGone(identity)) return false;
+  const current = processStartToken(identity.pid);
+  const groupAlive = Boolean(identity.processGroupId && processGroupAlive(identity.processGroupId));
+  if (!current) {
+    if (groupAlive) {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "The recorded process leader exited while its process group remained active."
+      );
+    }
+    return false;
+  }
+  if (current !== identity.startToken || !identityMatches(identity, marker, kind)) {
+    throw new CompanionError("E_PROCESS_IDENTITY", "Refusing to signal an unverified owned process.");
+  }
+
+  const target = identity.processGroupId ? -identity.processGroupId : identity.pid;
+  const signal = (name) => {
+    try { process.kill(target, name); }
+    catch (error) { if (error.code !== "ESRCH") throw error; }
+  };
+  const stillAlive = () => (
+    processStartToken(identity.pid) === identity.startToken
+    || Boolean(identity.processGroupId && processGroupAlive(identity.processGroupId))
+  );
+  const waitGone = async (timeoutMs) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!stillAlive()) return true;
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+    return !stillAlive();
+  };
+
+  signal("SIGTERM");
+  if (await waitGone(termTimeoutMs)) return true;
+  signal("SIGKILL");
+  if (!await waitGone(killTimeoutMs)) {
+    throw new CompanionError("E_PROCESS_IDENTITY", "Verified owned process cleanup did not complete.");
+  }
+  return true;
 }
 
 export function hasGrokAncestor(pid = process.ppid) {

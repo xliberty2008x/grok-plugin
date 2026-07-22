@@ -2,28 +2,57 @@ import assert from "node:assert/strict";
 import { spawn as spawnProcess } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
+import {
+  assertTaskEnvelope,
+  buildTaskEnvelope,
+  captureContextManifest
+} from "../plugins/grok/scripts/lib/task-contract.mjs";
+import {
+  createWorkerAuthorization,
+  launchContractDigest
+} from "../plugins/grok/scripts/lib/worker-launch-contract.mjs";
 import { projectWorkerSnapshot } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
 import {
   cancelWorker,
+  claimWorkerDispatch,
+  assertDispatchContract,
+  prepareDispatchProcessSpawn,
   spawnReadOnlyWorker,
   SPAWN_SUCCESS_DEFINITION
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import { reconcileOwnedWorkers } from "../plugins/grok/scripts/lib/worker-reconcile.mjs";
 import { createWorkerService } from "../plugins/grok/scripts/lib/worker-service.mjs";
-import { callWorkerTool, handleMcpRequest } from "../plugins/grok/mcp/broker.mjs";
+import {
+  callWorkerTool,
+  createMcpBrokerRuntime,
+  handleMcpRequest
+} from "../plugins/grok/mcp/broker.mjs";
+import { ROOT_READ_PROVIDER_CAPABILITY } from "../plugins/grok/scripts/lib/provider-capability.mjs";
+import { processGroupGone, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
+import {
+  loadProviderGuard,
+  registerProviderGuard,
+  unregisterProviderGuard
+} from "../plugins/grok/scripts/lib/recursion-guard.mjs";
 import {
   cancelFile,
+  generateId,
   listJobs,
   tryReadJob,
-  updateJob
+  updateJob,
+  writeJob
 } from "../plugins/grok/scripts/lib/state.mjs";
-import { workspaceState, workspaceStateSegment } from "../plugins/grok/scripts/lib/workspace.mjs";
-import { initRepo, tempDir } from "./helpers.mjs";
+import {
+  gitCommonDir,
+  workspaceState,
+  workspaceStateSegment
+} from "../plugins/grok/scripts/lib/workspace.mjs";
+import { initRepo, tempDir, waitFor } from "./helpers.mjs";
 
 const THREAD = "019f666a-6469-7cc1-9a8d-8c1adf61e103";
 const THREAD_B = "019f666b-1e72-74b1-b27c-9d186d7f1016";
@@ -82,40 +111,140 @@ function cancelIdempotencyFile(root, key, env) {
   return path.join(workspaceState(root, env), "idempotency", "cancel", `${keyDigest}.json`);
 }
 
+function spawnIdempotencyFile(root, key, env) {
+  const keyDigest = crypto.createHash("sha256").update(key).digest("hex");
+  return path.join(workspaceState(root, env), "idempotency", "spawn", `${keyDigest}.json`);
+}
+
+function providerGuardFile(root, marker) {
+  const scopeDigest = crypto.createHash("sha256").update(gitCommonDir(root)).digest("hex");
+  const guardRoot = path.join(
+    os.tmpdir(),
+    `grok-companion-guards-${typeof process.getuid === "function" ? process.getuid() : "user"}`
+  );
+  return path.join(guardRoot, scopeDigest, `${marker}.json`);
+}
+
 test("spawn commits durable job without provider launch; retry is idempotent", () => {
   const root = initRepo();
   const { env } = envFor(root);
   const envelope = buildTaskEnvelope({ userRequest: "Inspect package.json", mode: "read" });
-  let launches = 0;
   const first = spawnReadOnlyWorker({
     root,
     principal: principal(root),
     envelope,
     idempotencyKey: "spawn-key-0001",
-    env,
-    providerLaunch: () => { launches += 1; return { providerLaunched: true }; }
+    env
   });
   assert.equal(first.replayed, false);
   assert.equal(first.spawnSuccessDefinition, SPAWN_SUCCESS_DEFINITION);
   assert.equal(first.handle.status, "queued");
   assert.equal(first.handle.externalWorkerLabel, "external-grok-worker");
-  assert.equal(launches, 1);
+  assert.equal(first.providerLaunched, false);
 
   const second = spawnReadOnlyWorker({
     root,
     principal: principal(root),
     envelope,
     idempotencyKey: "spawn-key-0001",
-    env,
-    providerLaunch: () => { launches += 1; return { providerLaunched: true }; }
+    env
   });
   assert.equal(second.replayed, true);
   assert.equal(second.handle.id, first.handle.id);
-  assert.equal(launches, 1, "provider launch must not re-run on idempotent retry");
+  assert.equal(second.providerLaunched, false);
 
   const job = tryReadJob(root, first.handle.id, env);
   assert.ok(job);
   assert.equal(job.host.sessionId, THREAD);
+});
+
+test("spawn validates and canonically rebinds TaskEnvelope identity to trusted context", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const unbound = buildTaskEnvelope({ userRequest: "Inspect canonical task envelope", mode: "read" });
+  const spawned = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope: unbound,
+    idempotencyKey: "spawn-canonical-envelope-0001",
+    env
+  });
+  const stored = tryReadJob(root, spawned.handle.id, env);
+  assert.equal(stored.request.envelope.contextManifestId, stored.request.contextManifest.manifestId);
+  assert.notEqual(stored.request.envelope.digest, unbound.digest);
+  assert.doesNotThrow(() => assertTaskEnvelope(stored.request.envelope));
+
+  const forged = [
+    { ...unbound, schemaVersion: 999 },
+    { ...unbound, digest: "0".repeat(64) },
+    { ...unbound, envelopeId: `env-${"1".repeat(24)}` },
+    { ...unbound, unsupportedAuthority: true },
+    { ...unbound, objective: { hidden: "not-text" } },
+    { ...unbound, userRequest: "x".repeat((64 * 1024) + 1) }
+  ];
+  for (const [index, envelope] of forged.entries()) {
+    assert.throws(
+      () => spawnReadOnlyWorker({
+        root,
+        principal: principal(root),
+        envelope,
+        idempotencyKey: `spawn-forged-envelope-${String(index).padStart(4, "0")}`,
+        env
+      }),
+      (error) => error?.code === "E_SCHEMA"
+    );
+  }
+  assert.throws(
+    () => spawnReadOnlyWorker({
+      root,
+      principal: principal(root),
+      envelope: buildTaskEnvelope({
+        userRequest: "Forged context binding",
+        mode: "read",
+        contextManifestId: `ctx-${"0".repeat(24)}`
+      }),
+      idempotencyKey: "spawn-forged-context-0001",
+      env
+    }),
+    (error) => error?.code === "E_CONTEXT_DRIFT"
+  );
+  assert.equal(listJobs(root, env).length, 1);
+});
+
+test("default task text is never projected as a public objective while an explicit objective is preserved", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const canary = "CANARY_RAW_USER_REQUEST_4a88";
+  const defaultSpawn = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope: buildTaskEnvelope({ userRequest: canary, mode: "read" }),
+    idempotencyKey: "spawn-private-default-objective-0001",
+    env
+  });
+  const defaultJob = tryReadJob(root, defaultSpawn.handle.id, env);
+  const defaultProjection = projectWorkerSnapshot(defaultJob);
+  assert.equal(defaultJob.request.publicObjective, null);
+  assert.equal(defaultProjection.taskContract.objective, null);
+  assert.equal(JSON.stringify(defaultProjection).includes(canary), false);
+
+  const publicObjective = "Inspect the bounded worker contract";
+  const explicitSpawn = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope: buildTaskEnvelope({
+      userRequest: `${canary}-private-details`,
+      objective: publicObjective,
+      mode: "read"
+    }),
+    idempotencyKey: "spawn-explicit-public-objective-0001",
+    env
+  });
+  const explicitJob = tryReadJob(root, explicitSpawn.handle.id, env);
+  const explicitProjection = projectWorkerSnapshot(explicitJob);
+  assert.equal(explicitJob.request.publicObjective, publicObjective);
+  assert.equal(explicitProjection.taskContract.objective, publicObjective);
+  assert.equal(JSON.stringify(explicitProjection).includes(`${canary}-private-details`), false);
 });
 
 test("spawn idempotency binds the exact owner and complete request without leaking handles", () => {
@@ -151,15 +280,160 @@ test("spawn idempotency binds the exact owner and complete request without leaki
     (error) => error?.code === "E_IDEMPOTENCY_CONFLICT"
       && !String(error.message).includes(first.handle.id)
   );
+  assert.throws(
+    () => spawnReadOnlyWorker({
+      root,
+      principal: principal(root, { hostKind: "claude-code" }),
+      envelope,
+      idempotencyKey: "spawn-bound-request-0001",
+      env
+    }),
+    (error) => error?.code === "E_IDEMPOTENCY_CONFLICT"
+      && !String(error.message).includes(first.handle.id)
+  );
+});
+
+test("spawn idempotency requires one unique durable digest owner with and without its adjacent record", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const idempotencyKey = "spawn-unique-digest-owner-0001";
+  const envelope = buildTaskEnvelope({ userRequest: "Inspect duplicate ownership", mode: "read" });
+  const first = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey,
+    env
+  });
+  const original = tryReadJob(root, first.handle.id, env);
+  const duplicateCreatedAt = new Date(Date.parse(original.createdAt) + 1).toISOString();
+  const duplicate = {
+    ...structuredClone(original),
+    id: generateId("task"),
+    createdAt: duplicateCreatedAt,
+    updatedAt: duplicateCreatedAt,
+    heartbeatAt: duplicateCreatedAt,
+    workerAuthorization: null
+  };
+  duplicate.workerAuthorization = createWorkerAuthorization({
+    job: duplicate,
+    principal: principal(root),
+    issuedAt: duplicateCreatedAt
+  });
+  writeJob(root, duplicate, env);
+
+  const replay = () => spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey,
+    env
+  });
+  assert.throws(
+    replay,
+    (error) => error?.code === "E_STATE"
+      && !String(error.message).includes(first.handle.id)
+      && !String(error.message).includes(duplicate.id)
+  );
+
+  fs.rmSync(spawnIdempotencyFile(root, idempotencyKey, env));
+  assert.throws(
+    replay,
+    (error) => error?.code === "E_STATE"
+      && !String(error.message).includes(first.handle.id)
+      && !String(error.message).includes(duplicate.id)
+  );
+  assert.equal(listJobs(root, env).length, 2);
+});
+
+test("spawn idempotency replay cross-checks its durable job binding", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const envelope = buildTaskEnvelope({ userRequest: "Inspect durable binding", mode: "read" });
+  const idempotencyKey = "spawn-durable-binding-0001";
+  const first = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey,
+    env
+  });
+  const file = spawnIdempotencyFile(root, idempotencyKey, env);
+  const record = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(record.schemaVersion, 3);
+  record.committedAt = new Date(Date.parse(record.committedAt) + 1000).toISOString();
+  fs.writeFileSync(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+
+  assert.throws(
+    () => spawnReadOnlyWorker({
+      root,
+      principal: principal(root),
+      envelope,
+      idempotencyKey,
+      env
+    }),
+    (error) => error?.code === "E_STATE"
+      && !String(error.message).includes(first.handle.id)
+  );
+  assert.equal(listJobs(root, env).length, 1);
+});
+
+test("spawn idempotency replay rejects a launch-contract-corrupted durable job without a handle", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const envelope = buildTaskEnvelope({
+    userRequest: "Inspect the launch-contract binding",
+    mode: "read"
+  });
+  const idempotencyKey = "spawn-launch-contract-corruption-0001";
+  const first = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey,
+    env
+  });
+  const record = JSON.parse(fs.readFileSync(spawnIdempotencyFile(root, idempotencyKey, env), "utf8"));
+  const admitted = tryReadJob(root, first.handle.id, env);
+  assert.match(record.launchContractDigest, /^[0-9a-f]{64}$/);
+  assert.equal(record.launchContractDigest, launchContractDigest(admitted));
+
+  updateJob(root, first.handle.id, (job) => ({
+    ...job,
+    request: {
+      ...job.request,
+      envelope: {
+        ...job.request.envelope,
+        objective: "Tampered objective after durable admission"
+      }
+    }
+  }), env);
+  const corrupted = tryReadJob(root, first.handle.id, env);
+  assert.notEqual(record.launchContractDigest, launchContractDigest(corrupted));
+
+  let replayResult;
+  let replayError;
+  try {
+    replayResult = spawnReadOnlyWorker({
+      root,
+      principal: principal(root),
+      envelope,
+      idempotencyKey,
+      env
+    });
+  } catch (error) {
+    replayError = error;
+  }
+  assert.equal(replayResult, undefined, "corrupt replay returned a worker handle");
+  assert.equal(replayError?.code, "E_STATE");
+  assert.equal(String(replayError?.message).includes(first.handle.id), false);
+  assert.equal(listJobs(root, env).length, 1);
 });
 
 test("spawn and cancel are cross-process idempotent under the workspace transaction", async () => {
   const root = initRepo();
   const { env } = envFor(root);
-  const markerDir = tempDir("grok-spawn-launch-marker-");
-  const launchMarker = path.join(markerDir, "launches.log");
   const source = `
-    import fs from "node:fs";
     import { spawnReadOnlyWorker } from ${JSON.stringify(MUTATION_MODULE)};
     import { buildTaskEnvelope } from ${JSON.stringify(TASK_CONTRACT_MODULE)};
     const root = ${JSON.stringify(root)};
@@ -170,11 +444,7 @@ test("spawn and cancel are cross-process idempotent under the workspace transact
       env,
       principal,
       envelope: buildTaskEnvelope({ userRequest: "Concurrent spawn", mode: "read" }),
-      idempotencyKey: "spawn-cross-process-0001",
-      providerLaunch: () => {
-        fs.appendFileSync(${JSON.stringify(launchMarker)}, "launch\\n");
-        return { providerLaunched: false };
-      }
+      idempotencyKey: "spawn-cross-process-0001"
     });
     console.log(JSON.stringify(result));
   `;
@@ -183,7 +453,6 @@ test("spawn and cancel are cross-process idempotent under the workspace transact
   const spawnResults = spawnRuns.map((run) => lastJson(run.stdout));
   assert.equal(spawnResults[0].handle.id, spawnResults[1].handle.id);
   assert.deepEqual(spawnResults.map((result) => result.replayed).sort(), [false, true]);
-  assert.equal(fs.readFileSync(launchMarker, "utf8").trim().split(/\r?\n/).length, 1);
   assert.equal(listJobs(root, env).length, 1);
 
   const workerId = spawnResults[0].handle.id;
@@ -280,6 +549,15 @@ test("cancel is idempotent with exactly one cancellation-request event", () => {
     idempotencyKey: "spawn-cancel-0001",
     env
   });
+  const runtimeAuth = path.join(
+    workspaceState(root, env),
+    "task-homes",
+    spawned.handle.id,
+    ".grok",
+    "auth.json"
+  );
+  fs.mkdirSync(path.dirname(runtimeAuth), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(runtimeAuth, "transient-auth\n", { mode: 0o600 });
   const first = cancelWorker({
     root,
     principal: principal(root),
@@ -319,10 +597,177 @@ test("cancel is idempotent with exactly one cancellation-request event", () => {
   assert.equal(job.status, "cancelled");
   assert.equal(job.result.hostVerification, "not_run");
   assert.equal(job.result.taskRuntimeCleaned, true);
+  assert.equal(fs.existsSync(runtimeAuth), false);
   assert.equal(job.request.spawn.providerLaunchPending, false);
   assert.equal(job.request.spawn.providerLaunchInFlight, false);
   assert.equal(job.request.spawn.providerLaunchOutcome, "not-launched");
+  assert.equal(job.workerAuthorization, null);
+  assert.equal(job.request.spawn.dispatch.state, "failed");
+  assert.equal(job.request.spawn.dispatch.lease, null);
+  assert.equal(job.request.spawn.dispatch.nextProviderGeneration, null);
+  assert.equal(job.request.spawn.dispatch.failedAt, first.receipt.terminalRecordCommittedAt);
+  assert.equal(job.request.spawn.dispatch.updatedAt, first.receipt.terminalRecordCommittedAt);
+  assert.doesNotThrow(() => assertDispatchContract(job));
+
+  const spawnReplay = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey: "spawn-cancel-0001",
+    env
+  });
+  assert.equal(spawnReplay.replayed, true);
+  assert.equal(spawnReplay.handle.status, "cancelled");
+  const replayedJob = tryReadJob(root, spawned.handle.id, env);
+  assert.equal(replayedJob.workerAuthorization, null);
+  assert.equal(replayedJob.request.spawn.dispatch.state, "failed");
+  assert.doesNotThrow(() => assertDispatchContract(replayedJob));
 });
+
+test("queued cancellation never terminalizes a claimed dispatch with a pending spawn intent", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const spawned = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope: buildTaskEnvelope({ userRequest: "Cancel after a durable controller claim", mode: "read" }),
+    idempotencyKey: "spawn-cancel-claimed-intent-0001",
+    env
+  });
+  const workerId = spawned.handle.id;
+  const claim = claimWorkerDispatch({ root, principal: principal(root), workerId, env });
+  const intent = prepareDispatchProcessSpawn({
+    root,
+    workerId,
+    attemptId: claim.attemptId,
+    processKind: "controller",
+    nonce: claim.nonce,
+    fence: claim.fence,
+    env
+  });
+  assert.equal(intent.prepared, true);
+
+  const runtimeAuth = path.join(
+    workspaceState(root, env),
+    "task-homes",
+    workerId,
+    ".grok",
+    "auth.json"
+  );
+  fs.mkdirSync(path.dirname(runtimeAuth), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(runtimeAuth, "transient-auth\n", { mode: 0o600 });
+  updateJob(root, workerId, (job) => ({
+    ...job,
+    request: {
+      ...job.request,
+      spawn: {
+        ...job.request.spawn,
+        // Reproduce stale public launch flags without changing the authoritative
+        // claimed dispatch, lease, or pending spawn boundary.
+        providerLaunchPending: true,
+        providerLaunchInFlight: false,
+        providerLaunchOutcome: "pending"
+      }
+    }
+  }), env);
+
+  cancelWorker({
+    root,
+    principal: principal(root),
+    workerId,
+    idempotencyKey: "cancel-claimed-intent-0001",
+    env
+  });
+
+  const job = tryReadJob(root, workerId, env);
+  assert.equal(job.status, "queued");
+  assert.equal(job.phase, "cancellation-requested");
+  assert.equal(job.request.spawn.dispatch.state, "claimed");
+  assert.ok(job.request.spawn.dispatch.lease);
+  assert.equal(job.request.spawn.controllerSpawnIntent.status, "pending");
+  assert.ok(job.workerAuthorization);
+  assert.equal(fs.existsSync(runtimeAuth), true);
+});
+
+for (const guardCase of [
+  { label: "live provider guard", corrupt: false },
+  { label: "corrupt provider guard", corrupt: true }
+]) {
+  test(`queued cancel retains private runtime artifacts with a ${guardCase.label}`, {
+    skip: process.platform === "win32"
+  }, async (t) => {
+    const root = initRepo();
+    const { env } = envFor(root);
+    const spawned = spawnReadOnlyWorker({
+      root,
+      principal: principal(root),
+      envelope: buildTaskEnvelope({ userRequest: `Guarded cancellation: ${guardCase.label}`, mode: "read" }),
+      idempotencyKey: `spawn-guarded-cancel-${guardCase.corrupt ? "corrupt" : "live"}-0001`,
+      env
+    });
+    const workerId = spawned.handle.id;
+    const grokHome = path.join(workspaceState(root, env), "task-homes", workerId, ".grok");
+    const runtimeAuth = path.join(grokHome, "auth.json");
+    const agentProfile = path.join(grokHome, "agent-profiles", "audit-profile.md");
+    fs.mkdirSync(path.dirname(agentProfile), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(runtimeAuth, "transient-auth\n", { mode: 0o600 });
+    fs.writeFileSync(agentProfile, "private-profile\n", { mode: 0o600 });
+
+    const provider = spawnProcess(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)", workerId, "agent", "stdio"],
+      { detached: true, stdio: "ignore" }
+    );
+    let providerIdentity = null;
+    t.after(async () => {
+      try { unregisterProviderGuard(root, workerId); } catch {}
+      try { process.kill(-provider.pid, "SIGKILL"); } catch {}
+      if (providerIdentity) {
+        try {
+          await waitFor(() => processGroupGone(providerIdentity), { timeoutMs: 5_000, intervalMs: 25 });
+        } catch {}
+      }
+    });
+    providerIdentity = {
+      pid: provider.pid,
+      startToken: await waitFor(() => processStartToken(provider.pid), {
+        timeoutMs: 5_000,
+        intervalMs: 25
+      }),
+      processGroupId: provider.pid
+    };
+    registerProviderGuard(root, workerId, providerIdentity, THREAD);
+    const guardFile = providerGuardFile(root, workerId);
+    if (guardCase.corrupt) fs.writeFileSync(guardFile, "{malformed-provider-guard", { mode: 0o600 });
+
+    const cancellation = cancelWorker({
+      root,
+      principal: principal(root),
+      workerId,
+      idempotencyKey: `cancel-guarded-${guardCase.corrupt ? "corrupt" : "live"}-0001`,
+      env
+    });
+    const job = tryReadJob(root, workerId, env);
+
+    assert.equal(cancellation.receipt.status, "accepted");
+    assert.equal(cancellation.receipt.processGroupGoneAt, null);
+    assert.equal(cancellation.receipt.terminalRecordCommittedAt, null);
+    assert.equal(["completed", "failed", "cancelled"].includes(job.status), false);
+    assert.equal(job.status, "queued");
+    assert.equal(job.phase, "cancellation-requested");
+    assert.equal(job.result.taskRuntimeCleaned, false);
+    assert.equal(fs.readFileSync(runtimeAuth, "utf8"), "transient-auth\n");
+    assert.equal(fs.readFileSync(agentProfile, "utf8"), "private-profile\n");
+    assert.equal(fs.existsSync(guardFile), true);
+    if (guardCase.corrupt) {
+      assert.equal(fs.readFileSync(guardFile, "utf8"), "{malformed-provider-guard");
+    } else {
+      assert.equal(loadProviderGuard(root, workerId)?.providerProcess?.pid, provider.pid);
+    }
+    assert.equal(processStartToken(provider.pid), providerIdentity.startToken);
+    assert.equal(processGroupGone(providerIdentity), false);
+  });
+}
 
 test("terminal cancellation recovers the exact receipt after adjacent idempotency publication loss", () => {
   const root = initRepo();
@@ -558,7 +1003,7 @@ test("cancellation recovery history fails closed at its bound without pruning ol
   );
 });
 
-test("running cancellation stays nonterminal without explicit process-group confirmation", () => {
+test("running cancellation stays nonterminal even when a caller claims process-group exit", () => {
   const root = initRepo();
   const { env } = envFor(root);
   const spawned = spawnReadOnlyWorker({
@@ -589,20 +1034,25 @@ test("running cancellation stays nonterminal without explicit process-group conf
   assert.equal(tryReadJob(root, spawned.handle.id, env).status, "running");
   assert.equal(fs.readFileSync(cancelFile(root, spawned.handle.id, env), "utf8").trim().length > 0, true);
 
-  const confirmed = cancelWorker({
+  let obsoleteSignals = 0;
+  const repeated = cancelWorker({
     root,
     principal: principal(root),
     workerId: spawned.handle.id,
     idempotencyKey: "cancel-running-confirmed-0001",
     env,
-    signalProcess: () => ({ processGroupGone: true })
+    signalProcess: () => {
+      obsoleteSignals += 1;
+      return { processGroupGone: true };
+    }
   });
-  assert.ok(confirmed.receipt.processGroupGoneAt);
-  assert.ok(confirmed.receipt.terminalRecordCommittedAt);
-  assert.equal(tryReadJob(root, spawned.handle.id, env).status, "cancelled");
+  assert.equal(obsoleteSignals, 0);
+  assert.equal(repeated.receipt.processGroupGoneAt, null);
+  assert.equal(repeated.receipt.terminalRecordCommittedAt, null);
+  assert.equal(tryReadJob(root, spawned.handle.id, env).status, "running");
 });
 
-test("cancel uses the live worker-process nonce after launch authorization handoff", () => {
+test("cancel uses the live worker-process nonce without caller-driven terminalization", () => {
   const root = initRepo();
   const { env } = envFor(root);
   const spawned = spawnReadOnlyWorker({
@@ -629,17 +1079,22 @@ test("cancel uses the live worker-process nonce after launch authorization hando
     }
   }), env);
 
+  let obsoleteSignals = 0;
   const cancelled = cancelWorker({
     root,
     principal: principal(root),
     workerId: spawned.handle.id,
     idempotencyKey: "cancel-attached-worker-0001",
     env,
-    signalProcess: () => ({ processGroupGone: true })
+    signalProcess: () => {
+      obsoleteSignals += 1;
+      return { processGroupGone: true };
+    }
   });
-  assert.ok(cancelled.receipt.terminalRecordCommittedAt);
+  assert.equal(obsoleteSignals, 0);
+  assert.equal(cancelled.receipt.terminalRecordCommittedAt, null);
   assert.equal(fs.readFileSync(cancelFile(root, spawned.handle.id, env), "utf8").trim(), liveNonce);
-  assert.equal(tryReadJob(root, spawned.handle.id, env).status, "cancelled");
+  assert.equal(tryReadJob(root, spawned.handle.id, env).status, "running");
 });
 
 test("cancel marker publication failure is propagated without a false terminal record", () => {
@@ -709,7 +1164,7 @@ test("foreign worker id is observationally equivalent to missing id on cancel", 
   );
 });
 
-test("reconciler never replays prompts and marks lost processes", () => {
+test("legacy reconciler never replays prompts and delegates Worker Dispatch v1 recovery", () => {
   const root = initRepo();
   const { env } = envFor(root);
   const envelope = buildTaskEnvelope({ userRequest: "Reconcile me", mode: "read" });
@@ -748,35 +1203,55 @@ test("reconciler never replays prompts and marks lost processes", () => {
   assert.ok(pending.results.some((item) => (
     item.workerId === spawned.handle.id
     && item.action === "none"
-    && item.reason === "provider-launch-unsettled"
+    && item.reason === "dispatch-pending-recoverable"
   )));
   assert.equal(tryReadJob(root, spawned.handle.id, env).status, "queued");
 
+  const dispatchAttemptId = "a".repeat(32);
   updateJob(root, spawned.handle.id, (job) => ({
     ...job,
     status: "running",
+    workerAuthorization: null,
+    providerProcess: {
+      pid: 12345,
+      startToken: "provider-token",
+      processGroupId: process.platform === "win32" ? null : 12345,
+      commandMarker: job.id,
+      dispatchAttemptId
+    },
     request: {
       ...job.request,
       spawn: {
         ...job.request.spawn,
         providerLaunchPending: false,
         providerLaunchInFlight: false,
-        providerLaunchOutcome: "launched"
+        providerLaunchOutcome: "launched",
+        dispatch: {
+          ...job.request.spawn.dispatch,
+          state: "provider-started",
+          attemptId: dispatchAttemptId,
+          updatedAt: new Date().toISOString()
+        }
       }
     }
   }), env);
+  let legacyLivenessCalls = 0;
   const alive = reconcileOwnedWorkers({
     root,
     principal: principal(root),
     trusted: true,
-    processAlive: () => true,
+    processAlive: () => {
+      legacyLivenessCalls += 1;
+      return true;
+    },
     env
   });
   assert.ok(alive.results.some((item) => (
     item.workerId === spawned.handle.id
     && item.action === "none"
-    && item.reason === "process-alive"
+    && item.reason === "authoritative-broker-recovery-required"
   )));
+  assert.equal(legacyLivenessCalls, 0);
   assert.equal(tryReadJob(root, spawned.handle.id, env).status, "running");
 
   const result = reconcileOwnedWorkers({
@@ -787,29 +1262,45 @@ test("reconciler never replays prompts and marks lost processes", () => {
     env
   });
   assert.equal(result.replayedPrompt, false);
-  assert.ok(result.results.some((item) => item.workerId === spawned.handle.id && item.action === "marked-lost"));
+  assert.ok(result.results.some((item) => (
+    item.workerId === spawned.handle.id
+    && item.action === "none"
+    && item.reason === "authoritative-broker-recovery-required"
+  )));
   const job = tryReadJob(root, spawned.handle.id, env);
-  assert.equal(job.status, "failed");
-  assert.equal(job.result.runtimeEvidence.reconciler.replayedPrompt, false);
-  assert.equal(job.result.hostVerification, "not_run");
+  assert.equal(job.status, "running");
+  assert.equal(job.completedAt, null);
+  assert.equal(job.result, null);
 });
 
-test("spawn with throw after commit still left job on disk (two-step simulation)", () => {
+test("service restart replays an unchanged spawn despite a fresh context capture timestamp", () => {
   const root = initRepo();
   const { env } = envFor(root);
-  const envelope = buildTaskEnvelope({ userRequest: "Two process", mode: "read" });
-  const first = spawnReadOnlyWorker({
+  const stableManifest = captureContextManifest(root);
+  let captures = 0;
+  const captureContext = () => ({
+    ...stableManifest,
+    capturedAt: new Date(Date.parse(stableManifest.capturedAt) + (++captures * 1000)).toISOString()
+  });
+  const launchWorker = () => ({ providerLaunchState: "pending", providerLaunched: false });
+  const firstService = createWorkerService({
     root,
     principal: principal(root),
-    envelope,
-    idempotencyKey: "spawn-two-proc-0001",
-    env
+    env,
+    launchWorker,
+    captureContext
+  });
+  const first = firstService.spawn({
+    userRequest: "Two process",
+    idempotencyKey: "spawn-two-proc-0001"
   });
   // Simulate broker restart: new service reads same env/state.
   const service = createWorkerService({
     root,
     principal: principal(root),
-    env
+    env,
+    launchWorker,
+    captureContext
   });
   const snapshot = service.get(first.handle.id);
   assert.equal(snapshot.id, first.handle.id);
@@ -827,10 +1318,24 @@ test("MCP worker_spawn and worker_cancel drive real service functions", async ()
   const root = initRepo();
   const { env } = envFor(root);
   const auth = principal(root);
+  const providerCapabilityReceipt = {
+    capabilityDigest: "d".repeat(64),
+    capabilities: [ROOT_READ_PROVIDER_CAPABILITY]
+  };
+  const runtime = createMcpBrokerRuntime({
+    providerCapabilityReceipt
+  });
   const options = {
+    runtime,
+    readProviderCapabilityReceipt: () => providerCapabilityReceipt,
     resolveAuthority: () => auth,
     env,
-    createService: () => createWorkerService({ root, principal: auth, env })
+    createService: () => createWorkerService({
+      root,
+      principal: auth,
+      env,
+      launchWorker: () => ({ providerLaunchState: "pending", providerLaunched: false })
+    })
   };
   const spawned = await callWorkerTool({
     name: "worker_spawn",
@@ -842,6 +1347,7 @@ test("MCP worker_spawn and worker_cancel drive real service functions", async ()
   assert.equal(spawned.structuredContent.ok, true);
   assert.equal(spawned.structuredContent.providerLaunched, false);
   assert.ok(spawned.structuredContent.worker.id);
+  assert.equal(tryReadJob(root, spawned.structuredContent.worker.id, env).write, false);
 
   const again = await callWorkerTool({
     name: "worker_spawn",
@@ -862,7 +1368,7 @@ test("MCP worker_spawn and worker_cancel drive real service functions", async ()
     }
   }, options);
   assert.equal(writeRejected.isError, true);
-  assert.equal(writeRejected.structuredContent.error.code, "E_CAPABILITY");
+  assert.equal(writeRejected.structuredContent.error.code, "E_USAGE");
 
   const cancelled = await callWorkerTool({
     name: "worker_cancel",
@@ -887,165 +1393,19 @@ test("MCP worker_spawn and worker_cancel drive real service functions", async ()
   assert.ok(listed.structuredContent.workers.some((worker) => worker.id === spawned.structuredContent.worker.id));
 });
 
-// Fix crash-path test: spawn should commit even if we don't call providerLaunch
-test("provider launch failure after durable commit does not delete the job", () => {
+test("low-level spawn rejects a second provider launch lifecycle before durable commit", () => {
   const root = initRepo();
   const { env } = envFor(root);
-  const envelope = buildTaskEnvelope({ userRequest: "Launch fail", mode: "read" });
-  let threw = false;
-  try {
-    spawnReadOnlyWorker({
-      root,
-      principal: principal(root),
-      envelope,
-      idempotencyKey: "spawn-launch-fail-0001",
-      env,
-      providerLaunch: () => {
-        throw new Error("provider boom");
-      }
-    });
-  } catch {
-    threw = true;
-  }
-  assert.equal(threw, true);
-  // Idempotency record may or may not exist depending on order — job must exist if commit-before-launch.
-  // Our implementation writes idempotency then launches; if launch throws, job+idempotency remain.
-  const replay = spawnReadOnlyWorker({
-    root,
-    principal: principal(root),
-    envelope,
-    idempotencyKey: "spawn-launch-fail-0001",
-    env
-  });
-  assert.equal(replay.replayed, true);
-  assert.ok(tryReadJob(root, replay.handle.id, env));
-});
-
-test("provider launch truth requires an explicit positive hook outcome", () => {
-  const root = initRepo();
-  const { env } = envFor(root);
-  let invoked = 0;
-  const envelope = buildTaskEnvelope({ userRequest: "Ambiguous launch outcome", mode: "read" });
   assert.throws(
     () => spawnReadOnlyWorker({
-      root,
-      principal: principal(root),
-      envelope,
-      idempotencyKey: "spawn-launch-ambiguous-0001",
-      env,
-      providerLaunch: () => { invoked += 1; }
-    }),
-    (error) => error?.code === "E_CAPABILITY"
-  );
-  assert.equal(invoked, 1);
-  const replay = spawnReadOnlyWorker({
-    root,
-    principal: principal(root),
-    envelope,
-    idempotencyKey: "spawn-launch-ambiguous-0001",
-    env
-  });
-  assert.equal(replay.replayed, true);
-  const current = tryReadJob(root, replay.handle.id, env);
-  assert.equal(current.request.spawn.providerLaunchInFlight, true);
-  assert.equal(current.request.spawn.providerLaunchOutcome, "unknown");
-  assert.equal(current.request.spawn.providerLaunchCompletedAt, null);
-});
-
-test("provider launch rejects async and thenable adapters without losing launch ambiguity", async () => {
-  const asyncRoot = initRepo();
-  const asyncEnv = envFor(asyncRoot).env;
-  assert.throws(
-    () => spawnReadOnlyWorker({
-      root: asyncRoot,
-      principal: principal(asyncRoot),
-      envelope: buildTaskEnvelope({ userRequest: "Async adapter", mode: "read" }),
-      idempotencyKey: "spawn-launch-async-0001",
-      env: asyncEnv,
-      providerLaunch: async () => ({ providerLaunched: true })
-    }),
-    (error) => error?.code === "E_CAPABILITY"
-  );
-  assert.equal(listJobs(asyncRoot, asyncEnv).length, 0, "declared async adapters fail before commit");
-
-  const root = initRepo();
-  const { env } = envFor(root);
-  const envelope = buildTaskEnvelope({ userRequest: "Thenable adapter", mode: "read" });
-  let launchedLater = false;
-  assert.throws(
-    () => spawnReadOnlyWorker({
-      root,
-      principal: principal(root),
-      envelope,
-      idempotencyKey: "spawn-launch-thenable-0001",
-      env,
-      providerLaunch: () => new Promise((resolve) => {
-        setTimeout(() => {
-          launchedLater = true;
-          resolve({ providerLaunched: true });
-        }, 20);
-      })
-    }),
-    (error) => error?.code === "E_CAPABILITY"
-  );
-  const replay = spawnReadOnlyWorker({
-    root,
-    principal: principal(root),
-    envelope,
-    idempotencyKey: "spawn-launch-thenable-0001",
-    env
-  });
-  await new Promise((resolve) => setTimeout(resolve, 40));
-  assert.equal(launchedLater, true);
-  const current = tryReadJob(root, replay.handle.id, env);
-  assert.equal(current.request.spawn.providerLaunchOutcome, "unknown");
-  assert.equal(current.request.spawn.providerLaunchInFlight, true);
-  assert.equal(current.request.spawn.providerLaunchCompletedAt, null);
-});
-
-test("provider launch hook observes a cancel marker created in the commit-to-launch window", () => {
-  const root = initRepo();
-  const { env } = envFor(root);
-  let markerObserved = false;
-  let processStarted = false;
-  let immutableReceipt = null;
-  const spawned = spawnReadOnlyWorker({
-    root,
-    principal: principal(root),
-    envelope: buildTaskEnvelope({ userRequest: "Cancel launch window", mode: "read" }),
-    idempotencyKey: "spawn-launch-window-0001",
-    env,
-    providerLaunch: ({ job, cancelRequested }) => {
-      immutableReceipt = cancelWorker({
         root,
         principal: principal(root),
-        workerId: job.id,
-        idempotencyKey: "cancel-launch-window-0001",
-        env
-      }).receipt;
-      markerObserved = cancelRequested();
-      if (!markerObserved) {
-        processStarted = true;
-        return { providerLaunched: true };
-      }
-      return { providerLaunched: false };
-    }
-  });
-  assert.equal(spawned.providerLaunched, false);
-  assert.equal(spawned.handle.status, "cancelled");
-  assert.equal(spawned.handle.phase, "cancelled");
-  assert.equal(markerObserved, true);
-  assert.equal(processStarted, false);
-  const current = tryReadJob(root, spawned.handle.id, env);
-  assert.equal(current.status, "cancelled");
-  assert.equal(current.phase, "cancelled");
-  assert.equal(current.request.spawn.providerLaunchInFlight, false);
-  assert.equal(current.request.spawn.providerLaunchOutcome, "not-launched");
-  assert.ok(current.completedAt);
-  assert.equal(current.result.taskRuntimeCleaned, true);
-  assert.equal(current.result.cancellation.terminalRecordCommittedAt, null);
-  const storedReceipt = current.result.cancellationReceiptsByKey[
-    immutableReceipt.idempotencyKeyDigest
-  ].receipt;
-  assert.deepEqual(storedReceipt, immutableReceipt);
+        envelope: buildTaskEnvelope({ userRequest: "Reject split launch", mode: "read" }),
+        idempotencyKey: "spawn-split-launch-0001",
+        env,
+        providerLaunch: () => ({ providerLaunched: true })
+      }),
+    (error) => error?.code === "E_CAPABILITY"
+  );
+  assert.equal(listJobs(root, env).length, 0);
 });

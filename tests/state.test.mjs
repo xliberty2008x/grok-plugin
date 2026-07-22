@@ -193,6 +193,33 @@ test("cross-process contender does not reclaim the mkdir-to-owner construction w
   }
 });
 
+test("a dead provisional owner is reclaimed before the ownerless construction grace expires", () => {
+  const pluginData = tempDir("grok-state-data-");
+  const env = { ...process.env, CLAUDE_PLUGIN_DATA: pluginData };
+  const root = initRepo();
+  config(root, env);
+  const locks = path.join(workspaceState(root, env), "locks");
+  const lock = path.join(locks, "config.lock");
+  fs.mkdirSync(lock, { mode: 0o700 });
+  const stat = fs.lstatSync(lock);
+  const identity = { dev: String(stat.dev), ino: String(stat.ino) };
+  const deadPid = 99_999_999;
+  fs.writeFileSync(
+    path.join(lock, `owner.json.${deadPid}.${"a".repeat(12)}.tmp`),
+    `${JSON.stringify({
+      schemaVersion: 2,
+      token: "b".repeat(32),
+      pid: deadPid,
+      startToken: "dead-provisional-owner",
+      directory: identity
+    })}\n`,
+    { mode: 0o600 }
+  );
+
+  assert.equal(setConfig(root, { recoveredProvisionalOwner: true }, env).recoveredProvisionalOwner, true);
+  assert.equal(fs.existsSync(lock), false);
+});
+
 test("a delayed owner publisher cannot overwrite an owned successor generation", async () => {
   const pluginData = tempDir("grok-state-data-");
   const env = { ...process.env, CLAUDE_PLUGIN_DATA: pluginData };

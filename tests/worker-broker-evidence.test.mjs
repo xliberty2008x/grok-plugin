@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 import {
   REPO_ROOT,
@@ -11,6 +12,10 @@ import {
   PHASE_PROOF_GATE_MANIFEST,
   PROOF_PRODUCER_ID,
   PROOF_PRODUCER_VERSION,
+  INDEPENDENT_REVIEW_PRODUCER_ID,
+  INDEPENDENT_REVIEW_PRODUCER_VERSION,
+  INDEPENDENT_REVIEW_MANIFEST_DIGEST,
+  attachIndependentReviewReceiptDigest,
   attachRecordDigest,
   buildEvidenceRecord,
   computeInventoryDigest,
@@ -22,11 +27,15 @@ import {
   gitIdentity,
   isEvidenceOnlyPath,
   isNonEvidenceTreeClean,
+  listLocalStaticImportSpecifiers,
+  listSourceInventory,
   loadLedger,
   parsePorcelainV1ZChanges,
   provePhaseZero,
+  proveWorkerBrokerPhase,
   runCommandCapture,
   sanitizeProofEnvironment,
+  statusSatisfiesVerifiedPrerequisite,
   updateLedger,
   validateEvidenceRecord,
   verifyLedger,
@@ -35,11 +44,217 @@ import {
   sha256Text,
   digestsIgnoreEvidenceOnly
 } from "../scripts/lib/worker-broker-evidence.mjs";
+import {
+  EXTERNAL_BOUNDARY_TESTS,
+  listDeterministicTestFiles,
+  runDeterministicTestFiles
+} from "../scripts/test-deterministic.mjs";
+import {
+  PHASE1_FOCUSED_TEST_FILES,
+  runPhaseOneFocusedTests
+} from "../scripts/test-phase1-focused.mjs";
 import { ROOT, git, initRepo, run, tempDir, waitFor } from "./helpers.mjs";
 
 const STARTED_AT = "2026-07-16T10:00:00.000Z";
 const ENDED_AT = "2026-07-16T10:00:01.000Z";
 const EVIDENCE_MODULE_URL = new URL("../scripts/lib/worker-broker-evidence.mjs", import.meta.url).href;
+const ZERO_SKIP_REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
+const DETERMINISTIC_CHECK_RUNNER = path.join(ROOT, "scripts/check-deterministic.mjs");
+const DETERMINISTIC_TEST_LIBRARY = path.join(ROOT, "scripts/lib/deterministic-test-runner.mjs");
+const STATIC_ESM_IMPORT_PARSER = path.join(ROOT, "scripts/lib/static-esm-import-parser.mjs");
+const PHASE_ONE_FOCUSED_RUNNER = path.join(ROOT, "scripts/test-phase1-focused.mjs");
+
+function installZeroSkipReporter(root) {
+  const destination = path.join(root, "scripts/lib/zero-skip-test-reporter.mjs");
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.copyFileSync(ZERO_SKIP_REPORTER, destination);
+}
+
+function installPhaseOneFocusedRunner(root) {
+  for (const source of [
+    DETERMINISTIC_TEST_LIBRARY,
+    STATIC_ESM_IMPORT_PARSER,
+    PHASE_ONE_FOCUSED_RUNNER
+  ]) {
+    const relative = path.relative(ROOT, source);
+    const destination = path.join(root, relative);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(source, destination);
+  }
+}
+
+test("deterministic zero-skip runner excludes only explicit external boundaries", () => {
+  assert.deepEqual(EXTERNAL_BOUNDARY_TESTS, [
+    "installed-codex.test.mjs",
+    "live-grok.test.mjs"
+  ]);
+  const all = fs.readdirSync(path.join(ROOT, "tests"), { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".test.mjs"))
+    .map((entry) => `tests/${entry.name}`)
+    .sort();
+  const expected = all.filter((relative) => (
+    !EXTERNAL_BOUNDARY_TESTS.includes(path.basename(relative))
+  ));
+  assert.deepEqual(listDeterministicTestFiles(), expected);
+});
+
+function zeroSkipSummary(overrides = {}) {
+  return `${JSON.stringify({
+    reporter: "zero-skip-v1",
+    passed: 1,
+    failed: 0,
+    cancelled: 0,
+    skipped: 0,
+    todo: 0,
+    ...overrides
+  })}\n`;
+}
+
+test("deterministic runner executes files sequentially and aggregates exact zero-skip summaries", () => {
+  const calls = [];
+  let output = "";
+  let diagnostic = "";
+  const files = ["tests/first.test.mjs", "tests/second.test.mjs"];
+  const status = runDeterministicTestFiles({
+    files,
+    root: "/exact/root",
+    reporter: "/exact/reporter.mjs",
+    node: "/exact/node",
+    env: { PROOF_ENV: "fixed" },
+    run(binary, args, options) {
+      calls.push({ binary, args, options });
+      return {
+        status: 0,
+        signal: null,
+        stdout: zeroSkipSummary({ passed: calls.length }),
+        stderr: ""
+      };
+    },
+    stdout: { write(value) { output += value; } },
+    stderr: { write(value) { diagnostic += value; } }
+  });
+  assert.equal(status, 0);
+  assert.equal(diagnostic, "");
+  assert.deepEqual(calls.map((call) => call.args), files.map((file) => [
+    "--test",
+    "--test-reporter=/exact/reporter.mjs",
+    file
+  ]));
+  assert.ok(calls.every((call) => call.binary === "/exact/node"));
+  assert.ok(calls.every((call) => call.options.cwd === "/exact/root"));
+  assert.ok(calls.every((call) => call.options.shell === false));
+  assert.deepEqual(JSON.parse(output), {
+    reporter: "zero-skip-v1",
+    passed: 3,
+    failed: 0,
+    cancelled: 0,
+    skipped: 0,
+    todo: 0
+  });
+});
+
+test("Phase 1 focused runner executes its fixed inventory in exact serial order", () => {
+  const calls = [];
+  let output = "";
+  const status = runPhaseOneFocusedTests({
+    run(_binary, args) {
+      calls.push(args.at(-1));
+      return { status: 0, signal: null, stdout: zeroSkipSummary(), stderr: "" };
+    },
+    stdout: { write(value) { output += value; } },
+    stderr: { write() {} }
+  });
+  assert.equal(status, 0);
+  assert.deepEqual(calls, PHASE1_FOCUSED_TEST_FILES);
+  assert.equal(new Set(calls).size, PHASE1_FOCUSED_TEST_FILES.length);
+  assert.deepEqual(JSON.parse(output), {
+    reporter: "zero-skip-v1",
+    passed: PHASE1_FOCUSED_TEST_FILES.length,
+    failed: 0,
+    cancelled: 0,
+    skipped: 0,
+    todo: 0
+  });
+});
+
+test("deterministic runner fails closed on malformed, partial, or non-passing child results", () => {
+  const cases = [
+    {
+      label: "malformed-summary",
+      result: { status: 0, signal: null, stdout: "{}\n", stderr: "" },
+      message: /invalid zero-skip summary/
+    },
+    {
+      label: "extra-summary-field",
+      result: {
+        status: 0,
+        signal: null,
+        stdout: zeroSkipSummary({ unexpected: 1 }),
+        stderr: ""
+      },
+      message: /invalid zero-skip summary/
+    },
+    {
+      label: "skip",
+      result: { status: 1, signal: null, stdout: zeroSkipSummary({ passed: 0, skipped: 1 }), stderr: "" },
+      message: /failed its zero-skip gate/
+    },
+    {
+      label: "empty-test-file",
+      result: { status: 0, signal: null, stdout: zeroSkipSummary({ passed: 0 }), stderr: "" },
+      message: /failed its zero-skip gate/
+    },
+    {
+      label: "signal",
+      result: { status: null, signal: "SIGTERM", stdout: "", stderr: "" },
+      message: /ended by signal SIGTERM/
+    },
+    {
+      label: "spawn-error",
+      result: { status: null, signal: null, stdout: "", stderr: "", error: new Error("spawn") },
+      message: /could not start/
+    }
+  ];
+  for (const fixture of cases) {
+    let output = "";
+    let diagnostic = "";
+    const status = runDeterministicTestFiles({
+      files: [`tests/${fixture.label}.test.mjs`],
+      run: () => fixture.result,
+      stdout: { write(value) { output += value; } },
+      stderr: { write(value) { diagnostic += value; } }
+    });
+    assert.equal(status, 1, fixture.label);
+    assert.match(diagnostic, fixture.message, fixture.label);
+    assert.equal(JSON.parse(output).reporter, "zero-skip-v1", fixture.label);
+  }
+
+  let diagnostic = "";
+  assert.equal(runDeterministicTestFiles({
+    files: [],
+    stdout: { write() {} },
+    stderr: { write(value) { diagnostic += value; } }
+  }), 1);
+  assert.match(diagnostic, /No deterministic test files/);
+});
+
+function installProofRepositoryGate(root, command) {
+  const checkRunner = path.join(root, "scripts/check-deterministic.mjs");
+  fs.mkdirSync(path.dirname(checkRunner), { recursive: true });
+  fs.copyFileSync(DETERMINISTIC_CHECK_RUNNER, checkRunner);
+  fs.writeFileSync(path.join(root, "scripts/validate.mjs"), "process.exit(0);\n");
+  fs.writeFileSync(
+    path.join(root, "scripts/test-deterministic.mjs"),
+    [
+      'import { spawnSync } from "node:child_process";',
+      `const result = spawnSync(${JSON.stringify(command)}, [], {`,
+      '  cwd: process.cwd(), env: process.env, shell: true, stdio: "inherit"',
+      '});',
+      'process.exit(Number.isInteger(result.status) ? result.status : 1);',
+      ''
+    ].join("\n")
+  );
+}
 
 function rawEvidenceFixturePath(root, record) {
   const phaseDirectory = record.phase === "aggregate" ? "aggregate" : `phase-${record.phase}`;
@@ -173,12 +388,44 @@ function exactPhaseZeroProof() {
   }));
 }
 
+function exactPhaseProof(phase) {
+  return PHASE_PROOF_GATE_MANIFEST[String(phase)].map((gate) => ({
+    gateId: gate.gateId,
+    argv: [...gate.argv],
+    boundary: gate.boundary,
+    outcome: "pass",
+    startedAt: STARTED_AT,
+    endedAt: ENDED_AT,
+    exitCode: 0,
+    outputDigest: sha256Text(`${gate.gateId}:phase-${phase}-proof`)
+  }));
+}
+
 function proofProducer(phase = "0") {
   return {
     id: PROOF_PRODUCER_ID,
     version: PROOF_PRODUCER_VERSION,
     manifestDigest: computeProofManifestDigest(phase)
   };
+}
+
+function independentReviewReceipt(record, overrides = {}) {
+  return attachIndependentReviewReceiptDigest({
+    schemaVersion: 1,
+    producerId: INDEPENDENT_REVIEW_PRODUCER_ID,
+    producerVersion: INDEPENDENT_REVIEW_PRODUCER_VERSION,
+    manifestDigest: INDEPENDENT_REVIEW_MANIFEST_DIGEST,
+    reviewerRuntimeDigest: sha256Text("bound codex reviewer runtime"),
+    headCommit: record.source.headCommit,
+    headTree: record.source.headTree,
+    sourceInventoryDigest: record.source.sourceInventoryDigest,
+    phaseScopeDigest: record.source.phaseScopeDigest,
+    startedAt: STARTED_AT,
+    endedAt: ENDED_AT,
+    outcome: "pass",
+    unresolvedFindings: 0,
+    ...overrides
+  });
 }
 
 function initPhaseZeroEvidenceFixture(name = "evidence-fixture") {
@@ -203,6 +450,8 @@ function initPhaseZeroEvidenceFixture(name = "evidence-fixture") {
 
 function initProofRunnerFixture(name, checkScript = "node --test tests/proof-smoke.test.mjs") {
   const { root, evidenceDir } = initPhaseZeroEvidenceFixture(name);
+  installZeroSkipReporter(root);
+  installProofRepositoryGate(root, checkScript);
   fs.writeFileSync(path.join(root, "package.json"), `${JSON.stringify({
     name,
     version: "1.0.0",
@@ -218,6 +467,137 @@ function initProofRunnerFixture(name, checkScript = "node --test tests/proof-smo
     path.join(root, "tests/proof-smoke.test.mjs"),
     'import test from "node:test";\nimport assert from "node:assert/strict";\ntest("smoke", () => assert.equal(1, 1));\n'
   );
+  git(root, "add", ".");
+  git(root, "commit", "-m", `configure ${name}`);
+  return { root, evidenceDir };
+}
+
+function locateAmbientExecutable(name) {
+  const locator = process.platform === "win32" ? "where.exe" : "/usr/bin/which";
+  const result = run(locator, [name]);
+  assert.equal(result.status, 0, `cannot locate honest ${name}: ${result.stderr}`);
+  const candidates = result.stdout.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean);
+  const candidate = process.platform === "win32" && name === "npm"
+    ? candidates.find((entry) => /\.cmd$/i.test(entry)) || candidates[0]
+    : candidates[0];
+  assert.equal(path.isAbsolute(candidate || ""), true, `honest ${name} path must be absolute`);
+  return candidate;
+}
+
+function shellSingleQuote(value) {
+  return "'" + String(value).replace(/'/g, "'\"'\"'") + "'";
+}
+
+function writePathPoisonForwarder(directory, name, honestExecutable, marker) {
+  fs.mkdirSync(directory, { recursive: true });
+  if (process.platform === "win32") {
+    const executable = path.join(directory, `${name}.cmd`);
+    const invoke = /\.(?:cmd|bat)$/i.test(honestExecutable)
+      ? `call "${honestExecutable}" %*`
+      : `"${honestExecutable}" %*`;
+    fs.writeFileSync(executable, [
+      "@echo off",
+      `> "${marker}" echo poisoned`,
+      invoke,
+      "exit /b %ERRORLEVEL%",
+      ""
+    ].join("\r\n"));
+    return executable;
+  }
+  const executable = path.join(directory, name);
+  fs.writeFileSync(executable, [
+    "#!/bin/sh",
+    `printf '%s\\n' poisoned > ${shellSingleQuote(marker)}`,
+    `exec ${shellSingleQuote(honestExecutable)} "$@"`,
+    ""
+  ].join("\n"), { mode: 0o755 });
+  fs.chmodSync(executable, 0o755);
+  return executable;
+}
+
+function initPhaseOneProofRunnerFixture(name, {
+  failingFocusedGate = false,
+  driftingFocusedGate = false,
+  skippingFocusedGate = false
+} = {}) {
+  const root = initRepo();
+  const scopedPaths = new Set([
+    ...PHASE_SCOPE["0"],
+    ...PHASE_SCOPE["1"],
+    ...PHASE_SCOPE["2"]
+  ]);
+  for (const relative of scopedPaths) {
+    const absolute = path.join(root, relative);
+    fs.mkdirSync(path.dirname(absolute), { recursive: true });
+    let content = `fixture for ${relative}\n`;
+    if (/\.(?:m?js)$/i.test(relative)) content = "export {};\n";
+    else if (/\.cjs$/i.test(relative)) content = "module.exports = {};\n";
+    else if (/\.json$/i.test(relative)) content = "{}\n";
+    fs.writeFileSync(absolute, content);
+  }
+  fs.writeFileSync(path.join(root, "package.json"), `${JSON.stringify({
+    name,
+    version: "1.0.0",
+    private: true,
+    type: "module",
+    scripts: { check: "node --test tests/proof-smoke.test.mjs" }
+  }, null, 2)}\n`);
+  installZeroSkipReporter(root);
+  installProofRepositoryGate(root, "node --test tests/proof-smoke.test.mjs");
+  installPhaseOneFocusedRunner(root);
+  const passingTest = 'import test from "node:test";\nimport assert from "node:assert/strict";\ntest("focused", () => assert.equal(1, 1));\n';
+  for (const relative of [
+    "tests/worker-broker-evidence.test.mjs",
+    "tests/proof-smoke.test.mjs",
+    ...PHASE1_FOCUSED_TEST_FILES
+  ]) {
+    const absolute = path.join(root, relative);
+    fs.mkdirSync(path.dirname(absolute), { recursive: true });
+    fs.writeFileSync(absolute, passingTest);
+  }
+  if (failingFocusedGate) {
+    fs.writeFileSync(
+      path.join(root, "tests/worker-protocol.test.mjs"),
+      'import test from "node:test";\ntest("focused failure", () => { throw new Error("expected"); });\n'
+    );
+  }
+  if (driftingFocusedGate) {
+    fs.writeFileSync(
+      path.join(root, "tests/worker-protocol.test.mjs"),
+      'import test from "node:test";\nimport fs from "node:fs";\ntest("focused drift", () => fs.writeFileSync("tracked.txt", "drifted\\n"));\n'
+    );
+  }
+  if (skippingFocusedGate) {
+    fs.writeFileSync(
+      path.join(root, "tests/worker-protocol.test.mjs"),
+      'import test from "node:test";\ntest("forbidden proof skip", { skip: true }, () => {});\n'
+    );
+  }
+  const evidenceDir = path.join(root, "tests/e2e-results/worker-broker");
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(path.join(evidenceDir, ".gitkeep"), "");
+  git(root, "add", ".");
+  git(root, "commit", "-m", `configure ${name}`);
+  return { root, evidenceDir };
+}
+
+function initRunnableEvidenceCliFixture(name) {
+  const root = initRepo();
+  for (const relative of listSourceInventory(ROOT)) {
+    const source = path.join(ROOT, relative);
+    const destination = path.join(root, relative);
+    const stat = fs.lstatSync(source);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    if (stat.isSymbolicLink()) {
+      fs.symlinkSync(fs.readlinkSync(source), destination);
+    } else if (stat.isFile()) {
+      fs.copyFileSync(source, destination);
+      fs.chmodSync(destination, stat.mode);
+    }
+  }
+  const evidenceDir = path.join(root, "tests/e2e-results/worker-broker");
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(path.join(evidenceDir, ".gitkeep"), "");
   git(root, "add", ".");
   git(root, "commit", "-m", `configure ${name}`);
   return { root, evidenceDir };
@@ -250,6 +630,37 @@ function seedPreRunnerCurrent(root, phase, slice = `legacy-${phase}`) {
     recordedAt: legacy.recordedAt
   }, root);
   return { record: legacy, recordPath };
+}
+
+function seedPriorProofRunnerCurrent(root, phase = "0", slice = `runner-v1-${phase}`) {
+  let record = buildEvidenceRecord({
+    root,
+    phase,
+    slice,
+    status: phase === "0" ? "verified_on_draft" : "implemented_unverified",
+    verification: exactPhaseProof(phase),
+    qualification: deterministicQualification(),
+    evidenceSystemQualification: true
+  });
+  record = attachRecordDigest({
+    ...record,
+    proofProducer: {
+      id: PROOF_PRODUCER_ID,
+      version: 1,
+      manifestDigest: computeProofManifestDigest(phase)
+    }
+  });
+  const recordPath = rawEvidenceFixturePath(root, record);
+  updateLedger({
+    phase: record.phase,
+    slice: record.slice,
+    status: record.status,
+    path: recordPath,
+    recordDigest: record.recordDigest,
+    sourceCommit: record.source.headCommit,
+    recordedAt: record.recordedAt
+  }, root);
+  return { record, recordPath };
 }
 
 function spawnProofWriter({ root, slice, ready, barrier }) {
@@ -533,6 +944,57 @@ test("every declared phase-scope path exists and participates fail-closed", () =
   }
 });
 
+test("parser-backed import discovery follows Node grammar without evaluating source", () => {
+  const cases = [
+    {
+      source: 'if (ok) {} /"/.test(value);\nimport "./after-block.mjs"; // "',
+      expected: ["./after-block.mjs"]
+    },
+    {
+      source: 'const pattern = new /"/.constructor();\nimport "./after-new.mjs"; // "',
+      expected: ["./after-new.mjs"]
+    },
+    {
+      source: 'class Pattern extends /"/.constructor {}\nimport "./after-extends.mjs"; // "',
+      expected: ["./after-extends.mjs"]
+    },
+    {
+      source: 'let quotient = 1; quotient++ / 2; import "./after-division.mjs"; // "',
+      expected: ["./after-division.mjs"]
+    },
+    {
+      source: String.raw`import "./\u0064ep.mjs";`,
+      expected: ["./dep.mjs"]
+    },
+    {
+      source: [
+        'const stringCanary = \'import "./fake-string.mjs"\';',
+        'const regexCanary = /import "\\.\\/fake-regex\\.mjs"/;',
+        'const templateCanary = `import "./fake-template.mjs"`;',
+        'const loadLater = () => import("./dynamic.mjs");',
+        'const moduleIdentity = import.meta.url;',
+        'const legacy = require("./legacy.cjs");'
+      ].join("\n"),
+      expected: []
+    },
+    {
+      source: 'throw new Error("must not execute");\nimport "./parsed-only.mjs";',
+      expected: ["./parsed-only.mjs"]
+    },
+    {
+      source: 'import "node:fs";\nimport "#mapped-local-code";\nimport "package-code";',
+      expected: ["#mapped-local-code", "package-code"]
+    }
+  ];
+  for (const { source, expected } of cases) {
+    assert.deepEqual(listLocalStaticImportSpecifiers(source), expected);
+  }
+  assert.throws(
+    () => listLocalStaticImportSpecifiers("import {"),
+    /Static ESM dependency parsing failed/
+  );
+});
+
 test("phase scopes recursively close over repository-local static imports", () => {
   for (const [phase, paths] of Object.entries(PHASE_SCOPE)) {
     assert.deepEqual(
@@ -545,25 +1007,60 @@ test("phase scopes recursively close over repository-local static imports", () =
   const root = tempDir("grok-phase-scope-closure-");
   fs.mkdirSync(path.join(root, "src/nested"), { recursive: true });
   fs.writeFileSync(path.join(root, "src/entry.mjs"), `
-import "./side.mjs";
-import { first } from "./nested/first.mjs";
-export { reexported } from "./nested/reexport.mjs";
+	import "./side.mjs";
+	import { first } from "./nested/first.mjs";
+	export { reexported } from "./nested/reexport.mjs";
+	import"./compact-side.mjs";
+	import{compactFirst}from"./nested/compact-first.mjs";
+	export{compactReexport}from"./nested/compact-reexport.mjs";
+	export*from"./nested/compact-star.mjs";
+	if (true) {} import"./after-block-side.mjs";
+	if (true) {} import{afterBlockFirst}from"./nested/after-block-first.mjs";
+	if (true) {} export{afterBlockReexport}from"./nested/after-block-reexport.mjs";
+	if (true) {} export*from"./nested/after-block-star.mjs";
+	const stringCanary = 'import"./fake-string.mjs"';
+	const regexCanary = /export\\*from"\\.\\/fake-regex\\.mjs"/;
+	if (true) /import"\\.\\/fake-control-regex\\.mjs"/.test("value");
+	const templateCanary = \`outer \${\`nested import"./fake-template.mjs"\`} tail\`;
+	// import"./fake-line-comment.mjs";
+	/* export*from"./fake-block-comment.mjs"; */
 const loadLater = () => import("./dynamic.mjs");
+const moduleIdentity = import.meta.url;
+let quotient = 1;
+quotient++ / 2; import"./after-division.mjs"; // "
 const legacy = require("./legacy.cjs");
-export { first, loadLater, legacy };
+export { first, loadLater, legacy, moduleIdentity, quotient, regexCanary, stringCanary, templateCanary };
 `);
   fs.writeFileSync(path.join(root, "src/side.mjs"), "export const side = true;\n");
+  fs.writeFileSync(path.join(root, "src/compact-side.mjs"), "export const compactSide = true;\n");
+  fs.writeFileSync(path.join(root, "src/after-block-side.mjs"), "export const afterBlockSide = true;\n");
+  fs.writeFileSync(path.join(root, "src/after-division.mjs"), "export const afterDivision = true;\n");
   fs.writeFileSync(
     path.join(root, "src/nested/first.mjs"),
     'export { deep as first } from "./deep.mjs";\n'
   );
   fs.writeFileSync(path.join(root, "src/nested/deep.mjs"), "export const deep = 1;\n");
   fs.writeFileSync(path.join(root, "src/nested/reexport.mjs"), "export const reexported = 2;\n");
+  fs.writeFileSync(path.join(root, "src/nested/compact-first.mjs"), "export const compactFirst = 3;\n");
+  fs.writeFileSync(path.join(root, "src/nested/compact-reexport.mjs"), "export const compactReexport = 4;\n");
+  fs.writeFileSync(path.join(root, "src/nested/compact-star.mjs"), "export const compactStar = 5;\n");
+  fs.writeFileSync(path.join(root, "src/nested/after-block-first.mjs"), "export const afterBlockFirst = 6;\n");
+  fs.writeFileSync(path.join(root, "src/nested/after-block-reexport.mjs"), "export const afterBlockReexport = 7;\n");
+  fs.writeFileSync(path.join(root, "src/nested/after-block-star.mjs"), "export const afterBlockStar = 8;\n");
   fs.writeFileSync(path.join(root, "src/dynamic.mjs"), "export const dynamic = true;\n");
   fs.writeFileSync(path.join(root, "src/legacy.cjs"), "module.exports = true;\n");
 
   const omitted = findMissingLocalStaticImportDependencies(["src/entry.mjs"], root);
   assert.deepEqual(omitted, [
+    { importer: "src/entry.mjs", dependency: "src/after-block-side.mjs" },
+    { importer: "src/entry.mjs", dependency: "src/after-division.mjs" },
+    { importer: "src/entry.mjs", dependency: "src/compact-side.mjs" },
+    { importer: "src/entry.mjs", dependency: "src/nested/after-block-first.mjs" },
+    { importer: "src/entry.mjs", dependency: "src/nested/after-block-reexport.mjs" },
+    { importer: "src/entry.mjs", dependency: "src/nested/after-block-star.mjs" },
+    { importer: "src/entry.mjs", dependency: "src/nested/compact-first.mjs" },
+    { importer: "src/entry.mjs", dependency: "src/nested/compact-reexport.mjs" },
+    { importer: "src/entry.mjs", dependency: "src/nested/compact-star.mjs" },
     { importer: "src/entry.mjs", dependency: "src/nested/first.mjs" },
     { importer: "src/entry.mjs", dependency: "src/nested/reexport.mjs" },
     { importer: "src/entry.mjs", dependency: "src/side.mjs" }
@@ -571,7 +1068,16 @@ export { first, loadLater, legacy };
 
   const expanded = expandLocalStaticImportClosure(["src/entry.mjs"], root);
   assert.deepEqual(expanded, [
+    "src/after-block-side.mjs",
+    "src/after-division.mjs",
+    "src/compact-side.mjs",
     "src/entry.mjs",
+    "src/nested/after-block-first.mjs",
+    "src/nested/after-block-reexport.mjs",
+    "src/nested/after-block-star.mjs",
+    "src/nested/compact-first.mjs",
+    "src/nested/compact-reexport.mjs",
+    "src/nested/compact-star.mjs",
     "src/nested/deep.mjs",
     "src/nested/first.mjs",
     "src/nested/reexport.mjs",
@@ -580,6 +1086,90 @@ export { first, loadLater, legacy };
   assert.deepEqual(findMissingLocalStaticImportDependencies(expanded, root), []);
   assert.equal(expanded.includes("src/dynamic.mjs"), false);
   assert.equal(expanded.includes("src/legacy.cjs"), false);
+
+  fs.mkdirSync(path.join(root, "tests/e2e-results/worker-broker"), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, "tests/e2e-results/worker-broker/executable.mjs"),
+    "export const mutableEvidenceCode = true;\n"
+  );
+  fs.writeFileSync(
+    path.join(root, "src/evidence-import.mjs"),
+    'if (true) {} /"/.test("value");\n'
+      + 'import "../tests/e2e-results/worker-broker/executable.mjs"; // "\n'
+  );
+  assert.throws(
+    () => expandLocalStaticImportClosure(["src/evidence-import.mjs"], root),
+    /Evidence-only paths cannot be executable static import dependencies/
+  );
+  assert.throws(
+    () => expandLocalStaticImportClosure([
+      "tests/e2e-results/worker-broker/executable.mjs"
+    ], root),
+    /Evidence-only paths cannot seed executable phase scope/
+  );
+
+  const safeFileUrlTarget = path.join(root, "src/file-url-target.mjs");
+  fs.writeFileSync(safeFileUrlTarget, "export const safeFileUrlTarget = true;\n");
+  fs.writeFileSync(
+    path.join(root, "src/file-url-entry.mjs"),
+    `import ${JSON.stringify(pathToFileURL(safeFileUrlTarget).href)};\n`
+  );
+  assert.deepEqual(
+    expandLocalStaticImportClosure(["src/file-url-entry.mjs"], root),
+    ["src/file-url-entry.mjs", "src/file-url-target.mjs"]
+  );
+
+  for (const directory of ["cache-a", "cache-b"]) {
+    fs.mkdirSync(path.join(root, "src", directory), { recursive: true });
+    fs.writeFileSync(path.join(root, "src", directory, "entry.mjs"), 'import "./target.mjs";\n');
+    fs.writeFileSync(path.join(root, "src", directory, "target.mjs"), `export const source = ${JSON.stringify(directory)};\n`);
+  }
+  assert.deepEqual(
+    expandLocalStaticImportClosure(["src/cache-a/entry.mjs", "src/cache-b/entry.mjs"], root),
+    [
+      "src/cache-a/entry.mjs",
+      "src/cache-a/target.mjs",
+      "src/cache-b/entry.mjs",
+      "src/cache-b/target.mjs"
+    ],
+    "content-hash parser caching must resolve identical requests from each importer"
+  );
+
+  const evidenceExecutable = path.join(
+    root,
+    "tests/e2e-results/worker-broker/executable.mjs"
+  );
+  fs.writeFileSync(path.join(root, "package.json"), `${JSON.stringify({
+    type: "module",
+    imports: { "#mutable": "./tests/e2e-results/worker-broker/executable.mjs" }
+  })}\n`);
+
+  for (const [name, specifier, expected] of [
+    ["absolute-evidence", pathToFileURL(evidenceExecutable).pathname, /Evidence-only paths/],
+    ["file-url-evidence", pathToFileURL(evidenceExecutable).href, /Evidence-only paths/],
+    ["package-import", "#mutable", /Unsupported static ESM specifier/],
+    ["bare-package", "mutable-package", /Unsupported static ESM specifier/],
+    ["data-url", "data:text/javascript,export default true", /Unsupported static ESM specifier/],
+    ["encoded-dot", "./%2e%2e/tests/e2e-results/worker-broker/executable.mjs", /Evidence-only paths/]
+  ]) {
+    const relative = `src/${name}.mjs`;
+    fs.writeFileSync(path.join(root, relative), `import ${JSON.stringify(specifier)};\n`);
+    assert.throws(() => expandLocalStaticImportClosure([relative], root), expected, name);
+  }
+
+  fs.mkdirSync(path.join(root, "tests/e2e-results/%77orker-broker"), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, "tests/e2e-results/%77orker-broker/executable.mjs"),
+    "export const decoy = true;\n"
+  );
+  fs.writeFileSync(
+    path.join(root, "src/encoded-name.mjs"),
+    'import "../tests/e2e-results/%77orker-broker/executable.mjs";\n'
+  );
+  assert.throws(
+    () => expandLocalStaticImportClosure(["src/encoded-name.mjs"], root),
+    /Evidence-only paths cannot be executable static import dependencies/
+  );
 });
 
 test("strict validator rejects fabricated Phase 5 proof, skipped gates, missing digest, and raw fields", () => {
@@ -614,7 +1204,8 @@ test("strict validator rejects fabricated Phase 5 proof, skipped gates, missing 
   assert.equal(rejected.ok, false);
   assert.ok(rejected.errors.some((message) => /recordDigest is required/i.test(message)));
   assert.ok(rejected.errors.some((message) => /unsupported top-level fields/i.test(message)));
-  assert.ok(rejected.errors.some((message) => /cannot include verification/i.test(message)));
+  assert.ok(rejected.errors.some((message) => /requires exact broker-owned proofProducer provenance/i.test(message)));
+  assert.ok(rejected.errors.some((message) => /Missing passing mandatory gate/i.test(message)));
   assert.ok(rejected.errors.some((message) => /Missing prerequisite evidence digest/i.test(message)));
 });
 
@@ -1402,6 +1993,11 @@ test("Phase 0 proof manifest and persisted producer provenance are exact", () =>
   assert.match(computeProofManifestDigest("0"), /^[0-9a-f]{64}$/);
   assert.equal(Object.isFrozen(PHASE_PROOF_GATE_MANIFEST["0"]), true);
   assert.equal(Object.isFrozen(PHASE_PROOF_GATE_MANIFEST["0"][0].argv), true);
+  assert.equal(
+    PHASE_SCOPE["0"].filter((candidate) => candidate === ".github/workflows/ci.yml").length,
+    1,
+    "the Phase 0 proof scope must bind the supported OS/Node CI policy"
+  );
 
   const { root } = initProofRunnerFixture("proof-provenance");
   let record = buildEvidenceRecord({
@@ -1472,9 +2068,12 @@ test("present null or undefined proofProducer values fail validation and publica
 });
 
 test("proof command capture strips ambient authority and never returns secret-bearing output", () => {
+  const ambientAuthorityCanary = path.join(tempDir("proof-ambient-authority-"), "poison-bin");
   const secret = ["xai", "A".repeat(24)].join("-");
   const environment = sanitizeProofEnvironment({
     ...process.env,
+    PATH: ambientAuthorityCanary,
+    HOME: ambientAuthorityCanary,
     XAI_API_KEY: secret,
     GROK_E2E: "1",
     GROK_E2E_CANCEL: "1",
@@ -1491,6 +2090,8 @@ test("proof command capture strips ambient authority and never returns secret-be
     "PASSWORD"
   ]) assert.equal(Object.hasOwn(environment, key), false, key);
   assert.equal(environment.CI, "1");
+  assert.equal(environment.PATH.includes(ambientAuthorityCanary), false);
+  assert.equal(Object.hasOwn(environment, "HOME"), false);
 
   const secretResult = runCommandCapture(
     process.execPath,
@@ -1532,6 +2133,87 @@ test("proof command capture strips ambient authority and never returns secret-be
   assert.equal(missingExecutable.failureKind, "spawn_error");
 });
 
+test("mandatory proof reporter fails an otherwise successful test command with skip or TODO", () => {
+  const root = tempDir("zero-skip-reporter-");
+  const passing = path.join(root, "passing.test.mjs");
+  const partial = path.join(root, "partial.test.mjs");
+  fs.writeFileSync(
+    passing,
+    'import test from "node:test";\ntest("pass", () => {});\n'
+  );
+  fs.writeFileSync(
+    partial,
+    [
+      'import test from "node:test";',
+      'test("pass", () => {});',
+      'test("skip", { skip: true }, () => {});',
+      'test("todo", { todo: true }, () => {});',
+      ''
+    ].join("\n")
+  );
+  const reporterArg = `--test-reporter=${ZERO_SKIP_REPORTER}`;
+  const childEnvironment = { ...process.env };
+  delete childEnvironment.NODE_TEST_CONTEXT;
+  const complete = run(process.execPath, ["--test", reporterArg, passing], {
+    cwd: root,
+    env: childEnvironment
+  });
+  assert.equal(complete.status, 0, complete.stderr || complete.stdout);
+  assert.match(complete.stdout, /"skipped":0/);
+  assert.match(complete.stdout, /"todo":0/);
+  const rejected = run(process.execPath, ["--test", reporterArg, partial], {
+    cwd: root,
+    env: childEnvironment
+  });
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stdout, /"skipped":1/);
+  assert.match(rejected.stdout, /"todo":1/);
+});
+
+test("proof publication ignores caller-prepended fake npm and git and survives honest strict replay", () => {
+  const { root } = initProofRunnerFixture("proof-path-poison");
+  const poisonRoot = tempDir("proof-path-poison-bin-");
+  const fakeBin = path.join(poisonRoot, "bin");
+  const npmMarker = path.join(poisonRoot, "fake-npm-invoked");
+  const gitMarker = path.join(poisonRoot, "fake-git-invoked");
+  writePathPoisonForwarder(fakeBin, "npm", locateAmbientExecutable("npm"), npmMarker);
+  writePathPoisonForwarder(fakeBin, "git", locateAmbientExecutable("git"), gitMarker);
+
+  const source = `
+import { proveWorkerBrokerPhase } from ${JSON.stringify(EVIDENCE_MODULE_URL)};
+const result = proveWorkerBrokerPhase({
+  phase: "0",
+  slice: "path-poison",
+  root: process.env.PROOF_ROOT,
+  write: true
+});
+process.stdout.write(JSON.stringify({
+  ok: result.ok,
+  code: result.code || null,
+  path: result.path || null
+}) + "\\n");
+process.exitCode = result.ok ? 0 : 1;
+`;
+  const poisoned = run(process.execPath, ["--input-type=module", "-e", source], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ""}`,
+      PROOF_ROOT: root
+    },
+    timeout: 120_000
+  });
+  assert.equal(poisoned.status, 0, poisoned.stderr || poisoned.stdout);
+  const result = JSON.parse(poisoned.stdout.trim());
+  assert.equal(result.ok, true, result.code);
+  assert.match(result.path, /^tests\/e2e-results\/worker-broker\/phase-0\//);
+  assert.equal(fs.existsSync(npmMarker), false, "fake npm must never execute");
+  assert.equal(fs.existsSync(gitMarker), false, "fake git must never execute");
+
+  const strict = verifyPhase("0", root, { strict: true });
+  assert.equal(strict.ok, true, strict.errors.join("; "));
+});
+
 test("Phase 0 proof fails without publication on dirty, drifting, failed, or secret-output gates", () => {
   const failed = initProofRunnerFixture("proof-failed", 'node -e "process.exit(7)"');
   const failedResult = provePhaseZero({ phase: "0", slice: "proof-failed", root: failed.root, write: true });
@@ -1561,6 +2243,692 @@ test("Phase 0 proof fails without publication on dirty, drifting, failed, or sec
   assert.equal(driftResult.ok, false);
   assert.equal(driftResult.code, "E_PROOF_SOURCE_DRIFT");
   assert.equal(fs.existsSync(path.join(drift.evidenceDir, "ledger.json")), false);
+});
+
+test("proof execution rejects clean tracked scope symlinks to mutable external code", {
+  skip: process.platform === "win32"
+}, () => {
+  const { root, evidenceDir } = initProofRunnerFixture("proof-external-symlink");
+  const externalRoot = tempDir("proof-external-target-");
+  const external = path.join(externalRoot, "check.mjs");
+  fs.writeFileSync(external, "process.exit(0);\n");
+  const runner = path.join(root, "scripts/check-deterministic.mjs");
+  fs.unlinkSync(runner);
+  fs.symlinkSync(external, runner);
+  git(root, "add", "scripts/check-deterministic.mjs");
+  git(root, "commit", "-m", "track unsafe external proof runner");
+
+  const first = provePhaseZero({
+    phase: "0",
+    slice: "external-symlink",
+    root,
+    write: true
+  });
+  assert.equal(first.ok, false);
+  assert.equal(first.code, "E_PROOF_SOURCE");
+  fs.writeFileSync(external, "process.exit(7);\n");
+  const mutated = provePhaseZero({
+    phase: "0",
+    slice: "external-symlink-mutated",
+    root,
+    write: true
+  });
+  assert.equal(mutated.ok, false);
+  assert.equal(mutated.code, "E_PROOF_SOURCE");
+  assert.equal(fs.existsSync(path.join(evidenceDir, "ledger.json")), false);
+});
+
+test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () => {
+  assert.deepEqual(
+    PHASE_PROOF_GATE_MANIFEST["1"].map((gate) => gate.gateId),
+    PHASE_MANDATORY_GATE_IDS["1"]
+  );
+  assert.deepEqual(
+    exactPhaseProof("1").map((entry) => entry.argv),
+    PHASE_PROOF_GATE_MANIFEST["1"].map((gate) => [...gate.argv])
+  );
+  assert.match(computeProofManifestDigest("1"), /^[0-9a-f]{64}$/);
+  assert.equal(Object.isFrozen(PHASE_PROOF_GATE_MANIFEST["1"]), true);
+  assert.equal(Object.isFrozen(PHASE_PROOF_GATE_MANIFEST["1"][1].argv), true);
+  for (const relative of [
+    "plugins/grok/.codex-plugin/plugin.json",
+    "plugins/grok/.mcp.json",
+    "plugins/grok/provider-agents/report-repair.md",
+    "plugins/grok/provider-agents/rescue-read.md",
+    "plugins/grok/provider-agents/rescue-write.md",
+    "plugins/grok/provider-agents/setup-probe.md",
+    "plugins/grok/schemas/review-output.schema.json",
+    "plugins/grok/scripts/grok-companion.mjs",
+    "plugins/grok/scripts/lib/process-control.mjs",
+    "plugins/grok/scripts/lib/provider-bootstrap.mjs",
+    "plugins/grok/scripts/lib/provider-capability.mjs",
+    "plugins/grok/scripts/lib/recursion-guard.mjs",
+    "plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs",
+    "plugins/grok/scripts/lib/worker-launch-contract.mjs",
+    "plugins/grok/scripts/lib/worker-recovery.mjs",
+    "plugins/grok/scripts/lib/worker-runtime.mjs",
+    "plugins/grok/skills/rescue/SKILL.md",
+    "plugins/grok/skills/result/SKILL.md",
+    "plugins/grok/skills/status/SKILL.md",
+    "scripts/lib/static-esm-import-parser.mjs",
+    "scripts/lib/zero-skip-test-reporter.mjs",
+    "scripts/lib/deterministic-test-runner.mjs",
+    "scripts/test-phase1-focused.mjs",
+    "tests/control-plane.test.mjs",
+    "tests/mcp-worker-runtime.test.mjs",
+    "tests/process-control.test.mjs",
+    "tests/provider.test.mjs",
+    "tests/provider-bootstrap-crash-window.test.mjs",
+    "tests/provider-capability.test.mjs",
+    "tests/provider-startup-cancel.test.mjs",
+    "tests/recursion-guard.test.mjs",
+    "tests/runtime.test.mjs",
+    "tests/worker-mailbox.test.mjs",
+    "tests/worker-provider-rotation-intent.test.mjs",
+    "tests/worker-reconcile-safety.test.mjs",
+    "tests/worker-recovery-fence.test.mjs",
+    "tests/worker-runtime-teardown.test.mjs",
+    "tests/worker-startup-crash-window.test.mjs",
+    "tests/worker-launch-outbox.test.mjs",
+    "tests/worker-dispatch-supervisor.test.mjs",
+    "tests/worker-cli-authority.test.mjs",
+    "tests/worker-terminal-intent.test.mjs",
+    "tests/process-control-owned-identity.test.mjs",
+    "tests/worker-safety-proofs.test.mjs"
+  ]) {
+    assert.equal(
+      PHASE_SCOPE["1"].filter((candidate) => candidate === relative).length,
+      1,
+      `${relative} must occur exactly once in the Phase 1 source scope`
+    );
+  }
+  assert.equal(
+    JSON.stringify(PHASE_PROOF_GATE_MANIFEST["1"][1].argv),
+    JSON.stringify(["node", "scripts/test-phase1-focused.mjs"]),
+    "the Phase 1 focused gate must use only the fixed serial runner"
+  );
+  for (const relative of [
+    "tests/worker-launch-outbox.test.mjs",
+    "tests/provider-bootstrap-crash-window.test.mjs",
+    "tests/provider-capability.test.mjs",
+    "tests/worker-dispatch-supervisor.test.mjs"
+  ]) {
+    assert.equal(
+      PHASE1_FOCUSED_TEST_FILES.filter((candidate) => candidate === relative).length,
+      1,
+      `the Phase 1 focused gate must execute ${relative} exactly once`
+    );
+  }
+  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 25);
+});
+
+test("Phase 1 proof rejects unsupported slices and caller-supplied execution authority", () => {
+  const legacyPhaseZeroEntrypoint = provePhaseZero({ phase: "1", slice: "worker-api" });
+  assert.equal(legacyPhaseZeroEntrypoint.ok, false);
+  assert.equal(legacyPhaseZeroEntrypoint.code, "E_PROOF_ARGUMENT");
+  for (const options of [
+    { phase: "1", slice: "not-worker-api" },
+    { phase: "2", slice: "worker-api" },
+    { phase: "1", slice: "worker-api", commands: [["node", "-e", "process.exit(0)"]] },
+    { phase: "1", slice: "worker-api", outcomes: ["pass"] },
+    { phase: "1", slice: "worker-api", env: { XAI_API_KEY: "caller-value" } }
+  ]) {
+    const result = proveWorkerBrokerPhase(options);
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "E_PROOF_ARGUMENT");
+  }
+
+  const cli = path.join(ROOT, "scripts/worker-broker-evidence.mjs");
+  const unsupported = run(process.execPath, [
+    cli,
+    "prove",
+    "--phase",
+    "1",
+    "--slice",
+    "not-worker-api"
+  ], { cwd: ROOT });
+  assert.equal(unsupported.status, 2);
+  assert.match(unsupported.stderr, /phase 1 --slice worker-api/i);
+  const injected = run(process.execPath, [
+    cli,
+    "prove",
+    "--phase",
+    "1",
+    "--slice",
+    "worker-api",
+    "--command",
+    "node"
+  ], { cwd: ROOT });
+  assert.equal(injected.status, 2);
+});
+
+test("Phase 1 rejects the reserved self-digested review receipt as unauthenticated", () => {
+  assert.equal(statusSatisfiesVerifiedPrerequisite("implemented_unverified"), false);
+  assert.equal(statusSatisfiesVerifiedPrerequisite("verified_on_draft"), true);
+  assert.equal(statusSatisfiesVerifiedPrerequisite("verified_on_draft", "1"), false);
+  assert.equal(statusSatisfiesVerifiedPrerequisite("qualified", "1"), false);
+  const { root } = initPhaseOneProofRunnerFixture("phase-one-review-receipt");
+  let base = buildEvidenceRecord({
+    root,
+    phase: "1",
+    slice: "worker-api",
+    status: "verified_on_draft",
+    verification: exactPhaseProof("1"),
+    qualification: deterministicQualification(),
+    evidenceSystemQualification: true,
+    authorities: {
+      workerClaims: "none",
+      runtimeObservations: "broker-owned bounded Phase 1 gate runner",
+      hostVerification: "not_run",
+      independentValidation: "pass"
+    }
+  });
+  base = attachRecordDigest({ ...base, proofProducer: proofProducer("1") });
+
+  const missing = validateEvidenceRecord(base, { root });
+  assert.equal(missing.ok, false);
+  assert.ok(missing.errors.includes(
+    "verified_on_draft Phase 1 evidence requires signed issuer-verified independent review proof."
+  ));
+  assert.throws(() => writeEvidenceRecord(base, root), /invalid/i);
+
+  const proofProducedUnreviewed = attachRecordDigest({
+    ...base,
+    status: "implemented_unverified",
+    authorities: {
+      ...base.authorities,
+      independentValidation: "not_run"
+    }
+  });
+  const unreviewedValidation = validateEvidenceRecord(proofProducedUnreviewed, { root });
+  assert.equal(unreviewedValidation.ok, true, unreviewedValidation.errors.join("; "));
+  assert.throws(
+    () => writeEvidenceRecord(proofProducedUnreviewed, root),
+    /invalid/i,
+    "caller-authored proofProducer provenance cannot use the generic writer"
+  );
+  const wrongManifestGate = structuredClone(proofProducedUnreviewed);
+  wrongManifestGate.verification[1].argv = ["node", "-e", "process.exit(0)"];
+  const wrongManifestValidation = validateEvidenceRecord(
+    attachRecordDigest(wrongManifestGate),
+    { root }
+  );
+  assert.equal(wrongManifestValidation.ok, false);
+  assert.ok(wrongManifestValidation.errors.some((message) => /argv.*code-owned proof manifest/i.test(message)));
+
+  const receipt = independentReviewReceipt(base);
+  const accepted = attachRecordDigest({ ...base, independentReviewReceipt: receipt });
+  const acceptedValidation = validateEvidenceRecord(accepted, { root });
+  assert.equal(acceptedValidation.ok, false);
+  assert.ok(acceptedValidation.errors.includes(
+    "independentReviewReceipt is reserved but unauthenticated; signed issuer verification is required."
+  ));
+  assert.ok(acceptedValidation.errors.includes(
+    "verified_on_draft Phase 1 evidence requires signed issuer-verified independent review proof."
+  ));
+  const publishedSchema = JSON.parse(fs.readFileSync(
+    path.join(ROOT, "plugins/grok/schemas/worker-broker-evidence.schema.json"),
+    "utf8"
+  ));
+  const phaseOnePromotionProhibition = publishedSchema.allOf.find((rule) => (
+    rule?.not?.properties?.phase?.const === "1"
+    && rule?.not?.properties?.status?.enum?.includes("verified_on_draft")
+    && rule?.not?.properties?.status?.enum?.includes("qualified")
+  ));
+  assert.ok(phaseOnePromotionProhibition, "published schema must reject unsigned Phase 1 promotion");
+  assert.ok(phaseOnePromotionProhibition.not.required.every((field) => (
+    Object.hasOwn(accepted, field)
+  )));
+  assert.equal(accepted.phase, phaseOnePromotionProhibition.not.properties.phase.const);
+  assert.ok(phaseOnePromotionProhibition.not.properties.status.enum.includes(accepted.status));
+  assert.throws(
+    () => writeEvidenceRecord(accepted, root),
+    /invalid/i,
+    "a locally constructed receipt cannot promote or publish Phase 1"
+  );
+  const receiptOnlyUnverified = attachRecordDigest({
+    ...proofProducedUnreviewed,
+    independentReviewReceipt: receipt
+  });
+  assert.throws(
+    () => writeEvidenceRecord(receiptOnlyUnverified, root),
+    /invalid/i,
+    "caller-authored review receipts cannot use the generic writer at any status"
+  );
+
+  for (const [field, value] of [
+    ["manifestDigest", "9".repeat(64)],
+    ["headCommit", "0".repeat(40)],
+    ["headTree", "1".repeat(40)],
+    ["sourceInventoryDigest", "2".repeat(64)],
+    ["phaseScopeDigest", "3".repeat(64)],
+    ["outcome", "fail"],
+    ["unresolvedFindings", 1]
+  ]) {
+    const forgedReceipt = independentReviewReceipt(base, { [field]: value });
+    const forged = attachRecordDigest({ ...base, independentReviewReceipt: forgedReceipt });
+    const result = validateEvidenceRecord(forged, { root });
+    assert.equal(result.ok, false, field);
+    assert.ok(result.errors.some((message) => /independentReviewReceipt|independent review receipt/i.test(message)));
+  }
+
+  const tamperedReceipt = { ...receipt, reviewerRuntimeDigest: "4".repeat(64) };
+  const tampered = attachRecordDigest({ ...base, independentReviewReceipt: tamperedReceipt });
+  const tamperedValidation = validateEvidenceRecord(tampered, { root });
+  assert.equal(tamperedValidation.ok, false);
+  assert.ok(tamperedValidation.errors.some((message) => /receiptDigest/i.test(message)));
+});
+
+test("Phase 1 proof fails closed when its current Phase 0 prerequisite is absent", () => {
+  const { root, evidenceDir } = initPhaseOneProofRunnerFixture("phase-one-no-prerequisite");
+  const result = proveWorkerBrokerPhase({
+    phase: "1",
+    slice: "worker-api",
+    root,
+    write: true
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "E_PROOF_PREREQUISITE");
+  assert.equal(fs.existsSync(path.join(evidenceDir, "ledger.json")), false);
+});
+
+test("Phase 1 proof does not publish when a code-owned gate fails", () => {
+  const { root } = initPhaseOneProofRunnerFixture("phase-one-gate-failure", {
+    failingFocusedGate: true
+  });
+  const phaseZero = proveWorkerBrokerPhase({
+    phase: "0",
+    slice: "phase-zero-baseline",
+    root,
+    write: true
+  });
+  assert.equal(phaseZero.ok, true, phaseZero.code);
+  const failed = proveWorkerBrokerPhase({
+    phase: "1",
+    slice: "worker-api",
+    root,
+    write: true
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.code, "E_PROOF_GATE");
+  assert.equal(failed.gateId, "phase-1-focused-tests");
+  const ledger = loadLedger(root);
+  assert.equal(ledger.entries.filter((entry) => entry.phase === "1").length, 0);
+  assert.equal(ledger.entries.filter((entry) => entry.phase === "0" && entry.currency === "current").length, 1);
+});
+
+test("Phase 1 proof does not publish when a mandatory focused test is skipped", () => {
+  const { root } = initPhaseOneProofRunnerFixture("phase-one-gate-skip", {
+    skippingFocusedGate: true
+  });
+  const phaseZero = proveWorkerBrokerPhase({
+    phase: "0",
+    slice: "phase-zero-baseline",
+    root,
+    write: true
+  });
+  assert.equal(phaseZero.ok, true, phaseZero.code);
+  const failed = proveWorkerBrokerPhase({
+    phase: "1",
+    slice: "worker-api",
+    root,
+    write: true
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.code, "E_PROOF_GATE");
+  assert.equal(failed.gateId, "phase-1-focused-tests");
+  assert.equal(loadLedger(root).entries.filter((entry) => entry.phase === "1").length, 0);
+});
+
+test("Phase 1 proof rejects source drift produced during its focused gate", () => {
+  const { root } = initPhaseOneProofRunnerFixture("phase-one-source-drift", {
+    driftingFocusedGate: true
+  });
+  const phaseZero = proveWorkerBrokerPhase({
+    phase: "0",
+    slice: "phase-zero-baseline",
+    root,
+    write: true
+  });
+  assert.equal(phaseZero.ok, true, phaseZero.code);
+  const drifted = proveWorkerBrokerPhase({
+    phase: "1",
+    slice: "worker-api",
+    root,
+    write: true
+  });
+  assert.equal(drifted.ok, false);
+  assert.equal(drifted.code, "E_PROOF_SOURCE_DRIFT");
+  assert.equal(loadLedger(root).entries.filter((entry) => entry.phase === "1").length, 0);
+});
+
+test("Phase 1 proof separates strict integrity from verified readiness", () => {
+  const { root } = initPhaseOneProofRunnerFixture("phase-one-publication");
+  const phaseZero = proveWorkerBrokerPhase({
+    phase: "0",
+    slice: "phase-zero-baseline",
+    root,
+    write: true
+  });
+  assert.equal(phaseZero.ok, true, phaseZero.code);
+  const phaseZeroReadiness = verifyPhase("0", root, {
+    strict: true,
+    requireVerified: true
+  });
+  assert.equal(phaseZeroReadiness.ok, true, phaseZeroReadiness.errors.join("; "));
+  assert.equal(phaseZeroReadiness.integrityOk, true);
+  assert.equal(phaseZeroReadiness.status, "verified_on_draft");
+  assert.equal(phaseZeroReadiness.verified, true);
+  assert.equal(phaseZeroReadiness.readinessRequired, true);
+  assert.equal(phaseZeroReadiness.readinessReady, true);
+
+  const first = proveWorkerBrokerPhase({
+    phase: "1",
+    slice: "worker-api",
+    root,
+    write: true
+  });
+  assert.equal(first.ok, true, first.code);
+  assert.equal(first.status, "implemented_unverified");
+  assert.match(first.path, /^tests\/e2e-results\/worker-broker\/phase-1\//);
+  const firstRecord = JSON.parse(fs.readFileSync(path.join(root, first.path), "utf8"));
+  assert.equal(firstRecord.status, "implemented_unverified");
+  assert.equal(firstRecord.authorities.independentValidation, "not_run");
+  assert.equal(Object.hasOwn(firstRecord, "independentReviewReceipt"), false);
+  assert.deepEqual(firstRecord.prerequisites, [{
+    phase: "0",
+    recordDigest: phaseZero.recordDigest,
+    gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]]
+  }]);
+  assert.deepEqual(first.gateIds, [...PHASE_MANDATORY_GATE_IDS["1"]]);
+  assert.equal(first.manifestDigest, computeProofManifestDigest("1"));
+  const firstStrict = verifyPhase("1", root, { strict: true });
+  assert.equal(firstStrict.ok, true, firstStrict.errors.join("; "));
+  assert.equal(firstStrict.integrityOk, true);
+  assert.equal(firstStrict.phase, "1");
+  assert.equal(firstStrict.slice, "worker-api");
+  assert.equal(firstStrict.status, "implemented_unverified");
+  assert.equal(firstStrict.recordDigest, first.recordDigest);
+  assert.equal(firstStrict.verified, false);
+  assert.equal(firstStrict.readinessRequired, false);
+  assert.equal(firstStrict.readinessReady, false);
+
+  const firstReadiness = verifyPhase("1", root, {
+    strict: true,
+    requireVerified: true
+  });
+  assert.equal(firstReadiness.ok, false);
+  assert.equal(firstReadiness.integrityOk, true);
+  assert.equal(firstReadiness.verified, false);
+  assert.deepEqual(firstReadiness.readinessErrors, [
+    "Verified readiness requires phase 1 current status verified_on_draft or qualified; found implemented_unverified."
+  ]);
+  assert.deepEqual(firstReadiness.errors, firstReadiness.readinessErrors);
+
+  const replay = proveWorkerBrokerPhase({
+    phase: "1",
+    slice: "worker-api",
+    root,
+    write: true
+  });
+  assert.equal(replay.ok, true, replay.code);
+  const ledger = loadLedger(root);
+  assert.equal(ledger.entries.filter((entry) => entry.phase === "0" && entry.currency === "current").length, 1);
+  assert.equal(ledger.entries.filter((entry) => entry.phase === "1" && entry.currency === "current").length, 1);
+  assert.equal(ledger.entries.filter((entry) => entry.phase === "1" && entry.currency === "historical").length, 1);
+  const replayStrict = verifyPhase("1", root, { strict: true });
+  assert.equal(replayStrict.ok, true, replayStrict.errors.join("; "));
+});
+
+test("verify CLI exits independently for integrity and verified readiness", () => {
+  const { root } = initRunnableEvidenceCliFixture("verified-readiness-cli");
+  let phaseZero = buildEvidenceRecord({
+    root,
+    phase: "0",
+    slice: "evidence-system",
+    status: "verified_on_draft",
+    verification: exactPhaseProof("0"),
+    qualification: deterministicQualification(),
+    evidenceSystemQualification: true
+  });
+  phaseZero = attachRecordDigest({
+    ...phaseZero,
+    proofProducer: proofProducer("0")
+  });
+  assert.equal(
+    validateEvidenceRecord(phaseZero, { strict: true, root }).ok,
+    true
+  );
+  const phaseZeroPath = rawEvidenceFixturePath(root, phaseZero);
+  updateLedger({
+    phase: phaseZero.phase,
+    slice: phaseZero.slice,
+    status: phaseZero.status,
+    path: phaseZeroPath,
+    recordDigest: phaseZero.recordDigest,
+    sourceCommit: phaseZero.source.headCommit,
+    recordedAt: phaseZero.recordedAt
+  }, root);
+
+  let phaseOne = buildEvidenceRecord({
+    root,
+    phase: "1",
+    slice: "worker-api",
+    status: "implemented_unverified",
+    verification: exactPhaseProof("1"),
+    qualification: deterministicQualification(),
+    evidenceSystemQualification: true,
+    prerequisites: [{
+      phase: "0",
+      recordDigest: phaseZero.recordDigest,
+      gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]]
+    }]
+  });
+  phaseOne = attachRecordDigest({
+    ...phaseOne,
+    proofProducer: proofProducer("1")
+  });
+  assert.equal(
+    validateEvidenceRecord(phaseOne, { strict: true, root }).ok,
+    true
+  );
+  const phaseOnePath = rawEvidenceFixturePath(root, phaseOne);
+  updateLedger({
+    phase: phaseOne.phase,
+    slice: phaseOne.slice,
+    status: phaseOne.status,
+    path: phaseOnePath,
+    recordDigest: phaseOne.recordDigest,
+    sourceCommit: phaseOne.source.headCommit,
+    recordedAt: phaseOne.recordedAt
+  }, root);
+
+  const fixtureCli = path.join(root, "scripts/worker-broker-evidence.mjs");
+  const strictCli = run(process.execPath, [
+    fixtureCli,
+    "verify",
+    "--phase",
+    "1",
+    "--strict"
+  ], { cwd: root, timeout: 30_000 });
+  assert.equal(strictCli.status, 0, `${strictCli.stderr}\n${strictCli.stdout}`);
+  const strictPayload = JSON.parse(strictCli.stdout);
+  assert.equal(strictPayload.ok, true);
+  assert.equal(strictPayload.integrityOk, true);
+  assert.equal(strictPayload.status, "implemented_unverified");
+  assert.equal(strictPayload.verified, false);
+
+  const requiredCli = run(process.execPath, [
+    fixtureCli,
+    "verify",
+    "--phase",
+    "1",
+    "--strict",
+    "--require-verified"
+  ], { cwd: root, timeout: 30_000 });
+  assert.equal(requiredCli.status, 1);
+  assert.equal(requiredCli.stderr, "");
+  const requiredPayload = JSON.parse(requiredCli.stdout);
+  assert.equal(requiredPayload.ok, false);
+  assert.equal(requiredPayload.integrityOk, true);
+  assert.equal(requiredPayload.status, "implemented_unverified");
+  assert.equal(requiredPayload.verified, false);
+  assert.deepEqual(requiredPayload.readinessErrors, [
+    "Verified readiness requires phase 1 current status verified_on_draft or qualified; found implemented_unverified."
+  ]);
+
+  const passingCli = run(process.execPath, [
+    fixtureCli,
+    "verify",
+    "--phase",
+    "0",
+    "--strict",
+    "--require-verified"
+  ], { cwd: root, timeout: 30_000 });
+  assert.equal(passingCli.status, 0, `${passingCli.stderr}\n${passingCli.stdout}`);
+  const passingPayload = JSON.parse(passingCli.stdout);
+  assert.equal(passingPayload.status, "verified_on_draft");
+  assert.equal(passingPayload.verified, true);
+  assert.equal(passingPayload.readinessReady, true);
+});
+
+test("re-proving Phase 0 atomically supersedes Phase 1 and permits strict chain rebuild", () => {
+  const { root } = initPhaseOneProofRunnerFixture("phase-zero-chain-replacement");
+  const firstPhaseZero = proveWorkerBrokerPhase({
+    phase: "0",
+    slice: "phase-zero-initial",
+    root,
+    write: true
+  });
+  assert.equal(firstPhaseZero.ok, true, firstPhaseZero.code);
+  const firstPhaseOne = proveWorkerBrokerPhase({
+    phase: "1",
+    slice: "worker-api",
+    root,
+    write: true
+  });
+  assert.equal(firstPhaseOne.ok, true, firstPhaseOne.code);
+
+  const replacementPhaseZero = proveWorkerBrokerPhase({
+    phase: "0",
+    slice: "phase-zero-replacement",
+    root,
+    write: true
+  });
+  assert.equal(replacementPhaseZero.ok, true, replacementPhaseZero.code);
+  let ledger = loadLedger(root);
+  assert.equal(
+    ledger.entries.find((entry) => entry.recordDigest === replacementPhaseZero.recordDigest)?.currency,
+    "current"
+  );
+  assert.equal(
+    ledger.entries.find((entry) => entry.recordDigest === firstPhaseZero.recordDigest)?.currency,
+    "historical"
+  );
+  assert.equal(
+    ledger.entries.find((entry) => entry.recordDigest === firstPhaseOne.recordDigest)?.currency,
+    "historical"
+  );
+  assert.equal(ledger.entries.filter((entry) => entry.currency === "invalidated").length, 0);
+  const replacementStrict = verifyLedger(root, { strict: true });
+  assert.equal(replacementStrict.ok, true, replacementStrict.errors.join("; "));
+
+  const rebuiltPhaseOne = proveWorkerBrokerPhase({
+    phase: "1",
+    slice: "worker-api",
+    root,
+    write: true
+  });
+  assert.equal(rebuiltPhaseOne.ok, true, rebuiltPhaseOne.code);
+  ledger = loadLedger(root);
+  assert.equal(ledger.entries.filter((entry) => entry.phase === "0" && entry.currency === "current").length, 1);
+  assert.equal(ledger.entries.filter((entry) => entry.phase === "1" && entry.currency === "current").length, 1);
+  const rebuiltStrict = verifyPhase("1", root, { strict: true });
+  assert.equal(rebuiltStrict.ok, true, rebuiltStrict.errors.join("; "));
+});
+
+test("re-proving Phase 1 demotes a current Phase 2 while retaining unaffected Phase 0", () => {
+  const { root } = initPhaseOneProofRunnerFixture("phase-one-dependent-replacement");
+  const phaseZero = proveWorkerBrokerPhase({
+    phase: "0",
+    slice: "phase-zero-baseline",
+    root,
+    write: true
+  });
+  assert.equal(phaseZero.ok, true, phaseZero.code);
+  const firstPhaseOne = proveWorkerBrokerPhase({
+    phase: "1",
+    slice: "worker-api",
+    root,
+    write: true
+  });
+  assert.equal(firstPhaseOne.ok, true, firstPhaseOne.code);
+
+  const phaseTwo = buildEvidenceRecord({
+    phase: "2",
+    slice: "phase-two-current",
+    root,
+    verification: [passedCommand("phase-two-fixture", "phase two fixture observation")],
+    prerequisites: [
+      {
+        phase: "0",
+        recordDigest: phaseZero.recordDigest,
+        gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]]
+      },
+      {
+        phase: "1",
+        recordDigest: firstPhaseOne.recordDigest,
+        gateIds: [...PHASE_MANDATORY_GATE_IDS["1"]]
+      }
+    ]
+  });
+  const phaseTwoPath = writeEvidenceRecord(phaseTwo, root);
+  updateLedger({
+    phase: phaseTwo.phase,
+    slice: phaseTwo.slice,
+    status: phaseTwo.status,
+    path: phaseTwoPath,
+    recordDigest: phaseTwo.recordDigest,
+    sourceCommit: phaseTwo.source.headCommit,
+    recordedAt: phaseTwo.recordedAt
+  }, root);
+  const beforeReplacement = verifyLedger(root, { strict: true });
+  assert.equal(beforeReplacement.ok, true, beforeReplacement.errors.join("; "));
+
+  const replacementPhaseOne = proveWorkerBrokerPhase({
+    phase: "1",
+    slice: "worker-api",
+    root,
+    write: true
+  });
+  assert.equal(replacementPhaseOne.ok, true, replacementPhaseOne.code);
+  const ledger = loadLedger(root);
+  assert.equal(
+    ledger.entries.find((entry) => entry.recordDigest === phaseZero.recordDigest)?.currency,
+    "current",
+    "the unaffected upstream prerequisite remains current"
+  );
+  assert.equal(
+    ledger.entries.find((entry) => entry.recordDigest === firstPhaseOne.recordDigest)?.currency,
+    "historical"
+  );
+  assert.equal(
+    ledger.entries.find((entry) => entry.recordDigest === phaseTwo.recordDigest)?.currency,
+    "historical",
+    "the dependent cannot remain current against the replaced Phase 1 digest"
+  );
+  assert.equal(
+    ledger.entries.find((entry) => entry.recordDigest === replacementPhaseOne.recordDigest)?.currency,
+    "current"
+  );
+  assert.equal(ledger.entries.filter((entry) => entry.currency === "invalidated").length, 0);
+  const replayStrict = verifyLedger(root, { strict: true });
+  assert.equal(replayStrict.ok, true, replayStrict.errors.join("; "));
+  const phaseOneStrict = verifyPhase("1", root, { strict: true });
+  assert.equal(phaseOneStrict.ok, true, phaseOneStrict.errors.join("; "));
+  const phaseTwoStrict = verifyPhase("2", root, { strict: true });
+  assert.equal(phaseTwoStrict.ok, false);
+  assert.ok(phaseTwoStrict.errors.some((message) => /no current ledger entry for phase 2/i.test(message)));
 });
 
 test("strict validator rejects caller-authored promotion without exact producer provenance", () => {
@@ -1825,6 +3193,60 @@ test("proof publication atomically invalidates canonical pre-runner current clai
   assert.ok(readiness.errors.some((message) => /phase 1/i.test(message)));
 });
 
+test("Phase 0 proof safely supersedes a canonical current v1 proof runner record", () => {
+  const { root } = initProofRunnerFixture("proof-runner-v1-cutover");
+  const prior = seedPriorProofRunnerCurrent(root);
+
+  const result = provePhaseZero({
+    phase: "0",
+    slice: "phase-zero-v2-baseline",
+    root,
+    write: true
+  });
+  assert.equal(result.ok, true, result.code);
+  const ledger = loadLedger(root);
+  assert.equal(
+    ledger.entries.find((entry) => entry.recordDigest === prior.record.recordDigest)?.currency,
+    "historical"
+  );
+  assert.equal(
+    ledger.entries.find((entry) => entry.recordDigest === result.recordDigest)?.currency,
+    "current"
+  );
+  const strict = verifyLedger(root, { strict: true });
+  assert.equal(strict.ok, true, strict.errors.join("; "));
+
+  const malformedFixture = initProofRunnerFixture("proof-runner-v1-malformed");
+  const malformedPrior = seedPriorProofRunnerCurrent(malformedFixture.root);
+  const malformed = attachRecordDigest({
+    ...malformedPrior.record,
+    proofProducer: {
+      ...malformedPrior.record.proofProducer,
+      callerVerdict: "pass"
+    }
+  });
+  fs.writeFileSync(
+    path.join(malformedFixture.root, malformedPrior.recordPath),
+    `${JSON.stringify(malformed, null, 2)}\n`
+  );
+  const ledgerPath = path.join(
+    malformedFixture.root,
+    "tests/e2e-results/worker-broker/ledger.json"
+  );
+  const malformedLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  malformedLedger.entries[0].recordDigest = malformed.recordDigest;
+  fs.writeFileSync(ledgerPath, `${JSON.stringify(malformedLedger, null, 2)}\n`);
+  const rejected = provePhaseZero({
+    phase: "0",
+    slice: "must-reject-malformed-v1",
+    root: malformedFixture.root,
+    write: true
+  });
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.code, "E_PROOF_PUBLICATION");
+  assert.equal(loadLedger(malformedFixture.root).entries[0].currency, "current");
+});
+
 test("baseline cutover refuses current captures, private history, and identity tampering", () => {
   {
     const { root } = initProofRunnerFixture("proof-cutover-current-capture");
@@ -2020,6 +3442,25 @@ test("prove CLI rejects injection-shaped and duplicate arguments before executio
     ], { cwd: ROOT });
     assert.notEqual(result.status, 0, args.join(" "));
     assert.match(result.stderr, /Usage:/);
+  }
+});
+
+test("verify CLI keeps require-verified code-owned and rejects ambiguous or injected modes", () => {
+  const cli = path.join(ROOT, "scripts/worker-broker-evidence.mjs");
+  const cases = [
+    ["verify", "--phase", "1", "--require-verified", "--require-verified"],
+    ["verify", "--phase", "1", "--require-verified", "--slice", "worker-api"],
+    ["verify", "--phase", "1;touch-readiness-sentinel", "--require-verified"],
+    ["verify", "--all", "--require-verified"],
+    ["verify", "--phase", "1", "--require-complete"],
+    ["status", "--require-verified"],
+    ["capture", "--phase", "1", "--slice", "worker-api", "--require-verified"]
+  ];
+  for (const args of cases) {
+    const result = run(process.execPath, [cli, ...args], { cwd: ROOT });
+    assert.equal(result.status, 2, args.join(" "));
+    assert.match(result.stderr, /^Usage:\n/);
+    assert.equal(result.stdout, "");
   }
 });
 

@@ -4,7 +4,7 @@ Status: Active roadmap; foundations are implemented but unverified in the curren
 
 Roadmap version: `1.0`
 
-Audit snapshot: `2026-07-21`
+Audit snapshot: `2026-07-23`
 
 Canonical issue: [#25 — Make Grok Companion workers native-like through a structured worker broker](https://github.com/xliberty2008x/grok-plugin/issues/25)
 
@@ -22,16 +22,88 @@ Current conservative phase status:
 
 | Phase | Current state | What exists | Why the phase is not complete |
 | --- | --- | --- | --- |
-| 0 — Evidence system | `implemented_unverified` | Schema, validator, capture/verify CLI, phase scopes, immutable-record and ledger logic, fail-closed tests | Current records must be superseded from a clean integrated commit with complete gate metadata and prerequisite closure |
-| 1 — Worker API | `implemented_unverified` | Protocol/schema projections, durable events/cursors, authority-bound reads, spawn/cancel/reconcile foundations | No current exact-source evidence; complete restart, compatibility, installed-host, and live orchestration exit criteria are not proven |
-| 2 — Mailbox/context/roles | `implemented_unverified` | Durable mailbox/follow-up, explicit-envelope context, immutable roles, ambiguity handling | No current exact-source record or live ACP acknowledgement/dedup proof; strong transcript modes remain capability-gated |
-| 3 — Worktrees/artifacts | `implemented_unverified` | Control-workspace identity, shared state, clean-parent rejection/fingerprinting, worktree and artifact validation foundations | No current exact-source record or natural-host proof of concurrent real writers and explicit parent integration; dirty-source materialization is not implemented |
-| 4 — Host presentation | `implemented_unverified` | Structured presentation, aliases/tree, capability fallbacks, external-worker labeling | No current exact-source record or installed natural Codex/Claude end-to-end proof |
+| 0 — Evidence system | `implemented_unverified` | Schema, validator, capture/verify CLI, parser-backed static-import phase closure, fixed serial proof runners, immutable-record and ledger logic, and fail-closed tests | Current records must be superseded from a clean integrated commit with complete gate metadata and prerequisite closure |
+| 1 — Worker API | `implemented_unverified` | Protocol/schema projections, durable events/cursors, authority-bound reads, exact context-bound launch authorization, intent-bound private-channel provider bootstrap, exact controller/worker/provider identities, autonomous capability-bound startup recovery, atomic cleanup-safe terminalization, cancellation, and root host-claim suppression | Source is still uncommitted; the last pre-final-review fixed Phase 1 gate was 324/324 and full gate was 543/543, followed by narrow empty-file and host-claim hardening regressions; exact-commit replay remains pending, with no current exact-source Phase 0/1 records, installed-host proof, authenticated-provider proof, or signed independent-review proof |
+| 2 — Mailbox/context/roles | `implemented_unverified` foundations only | Idempotent mailbox records, follow-up/ContextPacket/role helpers, explicit ambiguity states | Production send has no ACP consumer; follow-up is not dispatchable; ordering, autonomous crash settlement, runtime ContextPacket/role enforcement, host-action persistence, and a Phase 2 proof producer are missing |
+| 3 — Worktrees/artifacts | `implemented_unverified` foundations only | Control-workspace identity, shared state, clean-parent fingerprinting, managed-worktree and artifact validation helpers | The broker never provisions or launches in a worktree, globally rejects concurrent writers, has no durable artifact/integration lifecycle, and has no Phase 3 proof producer |
+| 4 — Host presentation | `implemented_unverified` foundations plus root MCP subset | Raw task-owned Worker Protocol MCP operations, provider-capability-gated explorer-only spawn advertisement, host-claim suppression, presentation/alias/tree helpers, and external-worker labels | Native-shaped presentation, role-specific public spawn, persistent aliases, multi-wait, positive broker-owned host verification, MCP-first skills, installed natural MCP flow, Claude qualification, and a Phase 4 proof producer are missing |
 | 5 — Qualification | `implemented_unverified` | Deterministic safety-proof tests only | Paired native/Grok corpus, measurements, live boundaries, aggregate record, and release decision are not complete |
 
 Issue #25 must remain open. This plan does not claim live provider proof, installed-host proof, natural-host proof, aggregate qualification, or release readiness.
 
-The Native MCP Control Surface ADR is a follow-on design, not evidence that its E0-E7 execution slices are delivered. In particular, the production provider-launch adapter, live mailbox delivery/follow-up adapter, native-shaped MCP facade and multi-wait, host-verification operation, skill preference changes, and natural MCP execution-loop proof remain future work. They must enter this plan as separately bounded deliveries with the same exact-source evidence rules before any related checklist item can be marked complete.
+The Native MCP Control Surface ADR is a follow-on design, not evidence that all E0-E7 execution slices are delivered. A raw task-owned MCP list/get/events/wait/result/spawn/cancel surface and the production Phase 1 provider-launch adapter now exist in the working tree. The live mailbox delivery/follow-up adapter, native-shaped presentation and multi-wait, positive broker-owned host-verification operation, skill preference changes, and natural MCP execution-loop proof remain future work. They must enter this plan as separately bounded deliveries with the same exact-source evidence rules before any related checklist item can be marked complete.
+
+### Progress calibration and pre-E2E audit delta
+
+The source-backed audit in [issue comment 5048315213](https://github.com/xliberty2008x/grok-plugin/issues/25#issuecomment-5048315213) is an execution-plan correction pinned to `dc9c9cd`, not qualification evidence. The current working tree is newer, so each finding is reconciled against the current implementation rather than copied as if no work had happened.
+
+These bars are planning estimates, not evidence states or time estimates. They are recalculated from implemented behavior, unresolved safety contracts, and missing installed/live proof; only the phase states and immutable records can support readiness claims.
+
+| View | Current estimate | Interpretation |
+| --- | ---: | --- |
+| Full roadmap source implementation | `39%` — `████████░░░░░░░░░░░░` | Transparent rubric: production-wired plus negative-tested = 1, partial production = 0.5, helper/fail-closed scaffold = 0.25, absent = 0; the stationary focused gate supports 18.0 of 46 non-deferred deliverables (48 total IDs minus P4-D6/P4-D7 deferred) |
+| First read-only vertical E2E readiness | `75%` — `███████████████░░░░░` | Six of eight explicit checkpoints pass locally; installed exact-artifact MCP proof and authenticated provider cancellation/restart proof remain |
+| Actual exact-source qualification evidence | `0%` — `░░░░░░░░░░░░░░░░░░░░` | No immutable current record exists for this source identity; installed/live Codex, authenticated Grok, Claude, paired corpus, and aggregate qualification are also absent; implementation progress and moving-tree tests are not qualification proof |
+
+Reproducible roadmap score after the stationary focused gate:
+
+| Phase | Earned units | Basis |
+| --- | ---: | --- |
+| Phase 0 | `4.00 / 8` | Evidence machinery is production-wired; current records and installed/provider proof are absent |
+| Phase 1 | `6.25 / 8` | Root read API, autonomous outbox recovery, process safety, and cancellation are wired; compatibility/live provider proof remains |
+| Phase 2 | `2.50 / 8` | Mailbox/context/role foundations exist without production ACP delivery/follow-up |
+| Phase 3 | `1.75 / 8` | Identity/worktree/artifact helpers exist without a production write lifecycle |
+| Phase 4 | `2.50 / 6` non-deferred | Raw root MCP, capability filtering, and host-claim suppression exist; native presentation/live adapters remain |
+| Phase 5 | `1.00 / 8` | Deterministic safety slice only |
+| **Total** | **`18.00 / 46`** | The two deferred Phase 4 IDs are excluded |
+
+Per-delivery score ledger (ordered exactly as each phase table; `D` is deferred and excluded):
+
+| Phase | Delivery-unit awards |
+| --- | --- |
+| P0 | `D1=1, D2=1, D3=1, D4=0.5, D5=0, D6=0, D7=0, D8=0.5` |
+| P1 | `D1=1, D2=1, D3=1, D4=1, D5=1, D6=1, D7=0.25, D8=0` |
+| P2 | `D1=0.25, D2=0.5, D3=0.25, D4=0.25, D5=0.25, D6=0.5, D7=0.25, D8=0.25` |
+| P3 | `D1=0.5, D2=0.25, D3=0.25, D4=0.25, D4b=0, D5=0.25, D6=0.25, D7=0` |
+| P4 | `D1=0.5, D2=0.25, D3=0.5, D4=1, D5=0.25, D6=D, D7=D, D8=0` |
+| P5 | `D1=1, D2=0, D3=0, D4=0, D5=0, D6=0, D7=0, D8=0` |
+
+Recalculation rule: change an award only after the corresponding production path and required negative tests change, record the evidence in that delivery row, then sum all non-`D` awards and divide by 46. This score is implementation planning, never qualification evidence.
+
+First read-only vertical checkpoints:
+
+| Checkpoint | State | Required replay/evidence |
+| --- | --- | --- |
+| Versioned root authorization and one production launcher | `implemented_unverified` | Phase 1 focused manifest plus exact-source record |
+| Exact root context and provider-prompt binding | `implemented_unverified` | Context drift/ID mismatch negatives plus exact-source record |
+| Autonomous committed-outbox restart | `implemented_unverified` | Supervisor restart/concurrency/cancel/intent/process negatives |
+| Bootstrap and process-group crash safety | `implemented_unverified` | Bootstrap/process/rotation/recovery focused gates |
+| Provider capability receipt and exact tool filtering | `implemented_unverified` | Setup receipt lifecycle, immutable tools/list, hidden-call negatives |
+| Host-claim non-forgery | `implemented_unverified` | MCP list/get/events/wait/result/spawn projections omit positive host-attested wording/authority, suppress embedded proof, and keep `hostVerification:not_run` |
+| Installed exact-artifact MCP loop | `not_started` | Clean install, setup receipt, MCP spawn/wait/result with no source-tree bypass |
+| Authenticated provider cancellation and restart | `not_started` | One real provider prompt, restart recovery, cancellation, terminal cleanup |
+
+Pre-E2E finding alignment:
+
+| Audit finding | Current state in the newer tree | Required placement |
+| --- | --- | --- |
+| 1. One versioned launch authorization and one production launcher | `root subset implemented_unverified`: broker jobs use exact v2 launch authorization and MCP dispatches only through `launchCommittedWorker`; legacy CLI compatibility remains separate and cannot widen the MCP path | Bind idempotent no-double-launch and legacy migration negatives to the clean Phase 1 record, then replay the installed root loop |
+| 2. Durable launch lease/outbox | `implemented_unverified`: attempt-bound dispatch, fencing, pre-spawn intents, exact identities, no-replay recovery, and a bounded startup supervisor autonomously claim a committed capability-bound pending job after restart | Bind restart/concurrent-claim/crash-window proof to the clean Phase 1 record, then repeat through the installed process |
+| 3. Exact broker-owned repository context | `root subset implemented_unverified`: admission validates or captures the exact context, binds the canonical envelope to its manifest ID, includes it in request/provider-prompt authorization, and revalidates before execution; follow-up compatibility against exact final context remains incomplete | Bind the root drift/ID-mismatch regressions to the clean Phase 1 record; follow-up supersession belongs before follow-up is advertised |
+| 4. Verified `ExecutionBinding` for writes | `not_started` in production: worktree/fingerprint helpers exist, but `allowWriteSpawn` is still only a boolean gate and runtime executes from the control root | Phase 3 write vertical; no write capability may be advertised before this exits |
+| 5. Advertise only installed live capabilities | `root-read subset implemented_unverified`: a private setup receipt binds plugin/MCP contract/provider binary/version/platform/profiles/expiry; the frozen MCP surface advertises six control tools and adds explorer-only read spawn only for a valid receipt; send/follow-up/write and unbound read roles remain hidden | Bind the focused negatives to exact-source evidence and prove the same seven-tool set from the installed artifact; role-specific policy, ACP acknowledgement, and write capabilities remain separate work |
+| 6. Separate broker-owned host-verification receipt | `non-forgery subset implemented_unverified`: MCP projections suppress embedded verification/runtime proof and force `hostVerification:not_run` | Bind forged-claim negatives to exact-source evidence. Positive broker-owned verification is still `not_started` and must not be inferred from suppression |
+| 7. Bind every root task to its provider lineage | `partial`: public projection uses a fallback lineage, but root admission does not persist the canonical lineage used by cleanup fencing | Phase 1/2 before the first follow-up vertical; prove uncleared root runtime blocks continuation. It need not block the minimal root spawn/wait/result vertical while follow-up is hidden |
+
+The three post-first-vertical improvements are accepted but do not delay the smallest read-only loop. They have stable delivery IDs and must gain code-owned gates and evidence-scope membership before aggregate qualification:
+
+| ID | Post-first-vertical delivery | Required proof target |
+| --- | --- | --- |
+| P2-D8 | Non-silent Context Receipt bound to the actual prompt context | Persist/publicly project body-free packet digest, mode, provenance, omissions, bounds, truncation markers, and `hiddenRecordsExported:false`; reject semantically unsafe clipping |
+| P4-D8 | Durable completion-consumption accounting without unsupported auto-wake claims | Prove wait, explicit result, and optional notification channels produce one durable consumption outcome across restart; timeout/foreign reads do not consume |
+| P5-D8 | Observed runtime evidence | Record requested versus ACP-observed protocol/model/effort/provider/host values, use null when unobserved, and invalidate qualification on identity drift |
+
+The local implementation subset for the immediate vertical is now present and focused-negative-tested. The remaining proof milestone is **installed MCP setup receipt → exact seven-tool list → spawn → real provider start → wait → result with `hostVerification:not_run` → cancellation/restart recovery**, on one exact clean source/install identity. This is an honest root read-only loop, not a positive host-verification receipt. Finding 7 and the follow-up subset of finding 3 gate the first follow-up vertical. Finding 4 gates the separate write-worker vertical.
 
 ## 2. Outcome and scope boundaries
 
@@ -180,13 +252,14 @@ The current capture command records identity and an honest `implemented_unverifi
 npm run worker:evidence -- capture --phase <N> --slice <slice-id> --write
 ```
 
-It must not promote a phase. Phase 0 now has a code-owned execution-only proof producer; it accepts no caller-supplied command, argv, outcome, environment, or result input:
+It must not promote a phase. Phase 0 and Phase 1 now have code-owned execution-only proof manifests; neither accepts caller-supplied command, argv, outcome, environment, or result input:
 
 ```sh
 npm run worker:prove -- --phase 0 --slice evidence-system --write
+npm run worker:prove -- --phase 1 --slice worker-api --write
 ```
 
-The producer runs the fixed Phase 0 manifest, binds a clean stable source identity before/after execution and publication, stores only bounded redacted output digests, and performs a locked fail-closed baseline cutover. Its implementation remains `implemented_unverified` until committed and used to publish a current exact-source immutable record. The current qualification command is also capture-only and exits nonzero when live work is skipped:
+Producer v2 runs the fixed direct manifests, binds a clean stable source and phase-scope file identity before/after every gate and publication, rejects symlinked scope code plus evidence-only executable seeds/dependencies, closes local static ESM imports with Node's non-evaluating module parser, runs the fixed Phase 1 inventory one file at a time through a structured zero-skip/TODO reporter, stores only bounded redacted output digests, and performs a locked fail-closed baseline cutover. Phase 0 may publish `verified_on_draft` after its exact gates pass. Phase 1 deliberately publishes only `implemented_unverified` with `independentValidation: not_run`: both the runtime validator and published schema reject Phase 1 verified/qualified status until authenticated issuer proof exists. The reserved `independentReviewReceipt` checks historical shape/source binding but is not reviewer authentication. A local caller, copied subagent report, or self-computed digest cannot promote Phase 1. Honest promotion requires a code-owned request/import/promote flow plus a signed attestation from a separately protected reviewer issuer, with strict offline signature and exact source/diff/proof replay. Until that authority exists, Phase 1 cannot satisfy a downstream verified prerequisite. The current qualification command is also capture-only and exits nonzero when live work is skipped:
 
 ```sh
 npm run worker:qualify -- --phase <N> --host <codex|claude-code> --record
@@ -206,12 +279,12 @@ Phase 0 establishes the fail-closed evidence machinery used by every downstream 
 | --- | --- | --- | --- | --- |
 | P0-D1 | Machine-readable evidence schema and nested allowlists | `implemented_unverified` | Evidence schema and validator | Bind to clean integrated commit and record passing schema tests |
 | P0-D2 | Canonical digest, immutable write, safe ledger identity, historical compatibility | `implemented_unverified` | Evidence library and focused regression tests | Rerun after integration and preserve command outcome digest |
-| P0-D3 | Phase scopes, mandatory gates, and prerequisite digest closure | `implemented_unverified` | Phase manifests in evidence library | Supersede all stale phase records with exact prerequisites |
-| P0-D4 | Proof-producing capture/replay workflow | `implemented_unverified` | Fixed Phase 0 manifest, broker-owned producer provenance, bounded sanitized execution, private promotion authority, post-publication source recheck/rollback, strict resulting-ledger validation, and locked legacy-current cutover in evidence library/CLI; focused suite passes 50/50 | Commit this source slice; generalize the code-owned producer before final qualification, then publish Phase 0 only after all evidence-source changes are frozen |
-| P0-D5 | Current immutable records and ledger | `implemented_unverified` | Existing records and ledger are migration inputs | Create new current records after clean commit; keep old entries historical |
+| P0-D3 | Phase scopes, mandatory gates, parser-backed local-static-import closure, and prerequisite digest closure | `implemented_unverified` | Phase manifests plus compact/after-block/division/regex/transitive/evidence-path negative regressions | Supersede all stale phase records with exact prerequisites |
+| P0-D4 | Proof-producing capture/replay workflow | `implemented_unverified` | Producer v2; fixed direct Phase 0/1 manifests; exact serial Phase 1 runner; zero-skip reporter; scope-file identity, symlink, and executable-evidence-path defense; broker-owned provenance; absolute toolchain binding; private proof environment/promotion authority; v1 cutover; post-publication source rollback; strict ledger validation; schema/runtime unsigned-promotion prohibition | Freeze and commit the evidence source, rerun the stationary focused/full gates, publish Phase 0, and keep Phase 1 unverified until a signed external reviewer attestation can be requested, imported, and replayed offline |
+| P0-D5 | Current immutable records and ledger | `not_started` (supersession pending) | Existing records and ledger are historical migration inputs only | Publish new exact-source Phase 0 then Phase 1 records after the clean source commit; retain old entries as non-qualifying history |
 | P0-D6 | Exact-source installed natural Codex proof | `not_started` | Installed inventory and natural-host trace | Install exact artifact and run natural task without source-tree bypass |
 | P0-D7 | Current authenticated macOS Grok lifecycle proof | `not_started` | Redacted provider qualification record | Run provider lifecycle against same source/install identity |
-| P0-D8 | Honest platform declarations | `implemented_unverified` | Limits in schema/records | Reconfirm Linux and Windows cells in final evidence |
+| P0-D8 | Honest platform declarations | `implemented_unverified` | Limits in schema/records and OS-specific CI policy | Reconfirm Linux/macOS deterministic cells; Windows remains provider-neutral and cannot claim the POSIX zero-skip full suite |
 
 ### Phase 0 authoritative checks
 
@@ -240,12 +313,12 @@ Phase 1 covers the public protocol, authority-bound read surface, safe initial m
 
 | ID | Deliverable | Current state | Artifact or proof | Remaining work |
 | --- | --- | --- | --- | --- |
-| P1-D1 | WorkerHandle/Event/Snapshot/Result/Error schemas and version policy | `implemented_unverified` | [worker-protocol.schema.json](plugins/grok/schemas/worker-protocol.schema.json), protocol tests | Exact-source schema conformance and oldest/future version fixtures in current record |
-| P1-D2 | Durable monotonic events, bounded retention, worker-bound cursors and gaps | `implemented_unverified` | Worker protocol implementation/tests | Current restart/reconnect proof and evidence |
-| P1-D3 | Authority-bound list/get/events/wait/result reads | `implemented_unverified` | Worker service and MCP broker tests | Exact-source spoof/conflict/privacy proof and installed-host replay |
-| P1-D4 | Idempotent atomic read-only spawn | `implemented_unverified` | Worker mutation implementation/tests | Current crash/concurrency result, durable commit-before-launch proof, natural host flow |
-| P1-D5 | Idempotent cancel receipt and one request event | `implemented_unverified` | Worker mutation implementation/tests | Measure request/process/terminal timestamps separately; live process-group proof |
-| P1-D6 | Trusted reconciler that never replays prompts | `implemented_unverified` | Worker reconcile and safety tests | Two-process restart/crash replay on exact commit |
+| P1-D1 | WorkerHandle/Event/Snapshot/Result/Error schemas and version policy | `implemented_unverified` | [worker-protocol.schema.json](plugins/grok/schemas/worker-protocol.schema.json) and focused schema/projection regressions | Rerun on the stationary tree, commit it, and bind schema conformance to the current Phase 1 record |
+| P1-D2 | Durable monotonic events, bounded retention, worker-bound cursors and gaps | `implemented_unverified` | Worker protocol implementation/tests; reconnect/cursor regressions are included in the expanded focused gate | Commit-bound restart/reconnect evidence and installed-host replay |
+| P1-D3 | Authority-bound list/get/events/wait/result reads | `implemented_unverified` | Worker service and MCP broker tests; spoof/privacy negative cases pass | Exact-source current record and installed-host replay |
+| P1-D4 | Idempotent atomic read-only spawn plus production launch adapter | `implemented_unverified` | Canonical TaskEnvelope validation, exact context binding, durable commit-before-launch, capability-bound autonomous startup drain, single-use provider spawn intent, intent-bound bootstrap, no-ACP-before-promotion acknowledgement, and no-duplicate launch regressions | Bind the stationary gates to exact-source evidence and execute the installed natural-host flow |
+| P1-D5 | Idempotent cancel receipt and one request event | `implemented_unverified` | Pre-claim, commit-to-launch, active-provider, TERM-resistant controller, and exact group-shutdown tests pass | Persist commit-bound timing evidence; run authenticated live cancellation |
+| P1-D6 | Trusted reconciler that never replays prompts | `implemented_unverified` | Controller/worker/provider loss, autonomous pre-intent claim recovery, intent revocation, exact bootstrap guard recovery, provider-rotation promotion, cleanup-blocked retry, malformed-PGID, terminal-intent restoration, and no-replay regressions | Publish the exact-source record only after authenticated independent review, then repeat through installed-host restart |
 | P1-D7 | CLI/skill/Claude compatibility | `implemented_unverified` | Existing compatibility surface | Golden replay on final integrated source and clean install |
 | P1-D8 | Authenticated provider orchestration | `not_started` | Provider-bound record | Run spawn/wait/cancel/result with exact installed artifact |
 
@@ -254,20 +327,20 @@ Write spawn remains gated until Phase 3 isolation and integration authority are 
 ### Phase 1 authoritative checks
 
 ```sh
-node --test \
-  tests/worker-protocol.test.mjs \
-  tests/worker-service.test.mjs \
-  tests/mcp-worker-broker.test.mjs \
-  tests/worker-mutation.test.mjs \
-  tests/worker-safety-proofs.test.mjs
 npm run check
 git show --check --format= HEAD
+npm run worker:prove -- --phase 1 --slice worker-api --write
 npm run worker:verify -- --phase 1 --strict
+npm run worker:verify -- --phase 1 --strict --require-verified
 ```
 
-Required scenarios include owner success, foreign/nonexistent equivalence, missing/malformed/spoofed authority, unsupported protocol, cursor gaps, cross-process idempotency, crash before/after durable commit, cancel in the commit-to-launch window, no mutating replay, provider-launch failure preservation, and privacy sentinels.
+The first verify command checks record integrity, freshness, source identity, and prerequisite structure; it may pass for an honest `implemented_unverified` record. `--require-verified` is the readiness gate and must remain nonzero until the current record is at least `verified_on_draft` with authenticated independent-review proof.
 
-Phase 1 exits only when all public schemas and operations pass on one clean exact commit, current Phase 0 prerequisite digest/gates close, restart/crash behavior is proven, and the current record validates. Installed/live boundaries remain separately named until run.
+The code-owned `phase-1-focused-tests` manifest invokes `scripts/test-phase1-focused.mjs`; that script's frozen 25-file list is the authoritative focused inventory. It includes protocol/service/MCP runtime, process control, provider/bootstrap, recursion guard, mailbox, cancellation, reconciliation, rotation, recovery-fence, terminal-intent, CLI-authority, mutation, and safety-proof suites. `scripts/lib/deterministic-test-runner.mjs` launches exactly one file at a time and aggregates exact zero-skip summaries, including on Node 18.18 where `--test-concurrency` is unavailable. Do not copy a shorter hand-maintained test list into an evidence claim.
+
+Required scenarios include owner success, foreign/nonexistent equivalence, missing/malformed/spoofed authority, unsupported protocol, cursor gaps, cross-process idempotency, crash before/after durable commit, cancel in the commit-to-launch window, no mutating replay, provider-launch failure preservation, raw-vs-redacted identity separation, null birth-token cleanup witnesses, corrupted PGID rejection, report-repair rotation promotion before guard removal, and terminal/privacy publication only after verified cleanup.
+
+Phase 1 exits only when all public schemas and operations pass on one clean exact commit, current Phase 0 prerequisite digest/gates close, restart/crash behavior is proven, the current record is at least `verified_on_draft`, authenticated signed independent-review proof validates, and `--require-verified` passes. Plain strict integrity success for `implemented_unverified` is not phase exit. Installed/live boundaries remain separately named until run.
 
 ## 8. Phase 2 — Mailbox, follow-up, context packets, and roles
 
@@ -279,13 +352,14 @@ Phase 2 adds durable communication and lineage-preserving follow-up without inve
 
 | ID | Deliverable | Current state | Artifact or proof | Remaining work |
 | --- | --- | --- | --- | --- |
-| P2-D1 | ACP acknowledgement/dedup capability record | `implemented_unverified` | Conservative spike fixture/test | Prove capability live; otherwise retain explicit ambiguity |
-| P2-D2 | Ordered durable mailbox and outcome state machine | `implemented_unverified` | Worker mailbox implementation/tests | Current exact-source crash and multi-message record |
-| P2-D3 | Active send and terminal/idle lineage follow-up | `implemented_unverified` | Mailbox/follow-up tests | Natural provider delivery/follow-up proof |
-| P2-D4 | Explicit-envelope Context Packet v1 | `implemented_unverified` | Worker context implementation/tests | Exact-source privacy and provenance evidence |
+| P2-D1 | ACP acknowledgement/dedup capability record | `not_started` | Caller-constructed conservative helper/fixture only | Replace caller booleans with provider/session/attempt-bound capability evidence; otherwise retain explicit ambiguity |
+| P2-D2 | Ordered durable mailbox and outcome state machine | `implemented_unverified` foundation | Idempotent private records, body-free receipts, explicit outcome states, no retry of unknown | Add per-worker sequence, claim/inflight/close barriers, autonomous recovery settlement, and private-body cleanup without caller replay |
+| P2-D3 | Active send and terminal/idle lineage follow-up | `not_started` in production | Helper-level send/follow-up tests | Add worker-owned ACP safe-boundary pump; make follow-up a valid dispatch, launch it, and bind same-session resume |
+| P2-D4 | Explicit-envelope Context Packet v1 | `implemented_unverified` helper only | Bounded/redacted/deep-frozen ContextPacket library/tests | Broker must build/store it; runtime prompt and public projection must consume only bounded packet provenance, never raw hidden envelope facts |
 | P2-D5 | `recent:N` and broader transcript modes | `implemented_unverified` | Capability gates exist | Trusted transcript acquisition remains unproven; keep modes fail-closed |
-| P2-D6 | Immutable explorer/implementer/reviewer/security/test roles | `implemented_unverified` | Worker roles implementation/tests | Current role-digest and self-escalation proof |
-| P2-D7 | `awaiting_host_action` authority request | `implemented_unverified` | Mailbox/role state model | Natural host grant/deny flow and evidence |
+| P2-D6 | Immutable explorer/implementer/reviewer/security/test roles | `implemented_unverified` internal foundation; only `explorer` is publicly advertised | Durable role digests and dispatch tamper checks; root MCP rejects unbound roles | Add role-bound provider instructions/capability policy and runtime proof before reviewer/security/test or implementer is advertised |
+| P2-D7 | `awaiting_host_action` authority request | `not_started` | Ephemeral helper only; public snapshot remains null | Persist request state and add owner-bound idempotent host grant/deny operations and evidence |
+| P2-D8 | Non-silent Context Receipt | `not_started` in production | ContextPacket helper only | Bind the actual provider prompt to a body-free receipt with counts/digests, provenance, omissions, bounds, truncation markers, and unsafe-clipping rejection |
 
 Delivery states remain `accepted`, `pending`, `delivered`, `delivery_unknown`, and `rejected`. Never automatically retry `delivery_unknown`. Exactly-once delivery may be claimed only with provider acknowledgement or deduplication proof across crash.
 
@@ -300,7 +374,7 @@ git show --check --format= HEAD
 npm run worker:verify -- --phase 2 --strict
 ```
 
-Required live proof queues multiple messages during a bounded job, restarts the broker, and accounts for every message as delivered, rejected, or delivery_unknown. Follow-up must bind parent/lineage and reject context/profile drift. Evidence excludes raw message bodies and hidden host records.
+Required live proof queues multiple messages during a bounded job, restarts the broker, and accounts for every message as delivered, rejected, or delivery_unknown. Follow-up must bind parent/lineage and reject context/profile drift. The Context Receipt must match the effective prompt context without exporting bodies or hidden records. Evidence excludes raw message bodies and hidden host records.
 
 Phase 2 exits only when guarantees match proven ACP capability, every accepted message has an explicit durable outcome, no ambiguity is auto-retried, hidden context and self-escalation tests pass, Phase 0/1 prerequisite digests close, and a current exact-source record validates.
 
@@ -314,13 +388,13 @@ Phase 3 moves write workers out of the parent checkout and keeps integration an 
 
 | ID | Deliverable | Current state | Artifact or proof | Remaining work |
 | --- | --- | --- | --- | --- |
-| P3-D1 | Stable `controlWorkspaceId`, `controlRoot`, and `executionRoot` | `implemented_unverified` | Workspace/worktree implementation/tests | Current exact-source migration and linked-root record |
-| P3-D2 | Shared admission and lineage state across linked worktrees | `implemented_unverified` | State/worktree tests | Real concurrent admission proof |
-| P3-D3 | Host-owned worktree creation from exact base | `implemented_unverified` | Worktree manager tests | Natural host create/run/retain/cleanup trace |
+| P3-D1 | Stable `controlWorkspaceId`, `controlRoot`, and `executionRoot` | `implemented_unverified` foundation | Workspace/control-identity and worktree helper tests | Persist a private job-to-execution-root binding and project only its digest; production runtime still uses the parent root |
+| P3-D2 | Shared admission and lineage state across linked worktrees | `not_started` for real writers | Shared state visibility exists, but active-writer admission is globally exclusive | Replace global exclusivity with distinct managed-root leases and prove two concurrent broker workers |
+| P3-D3 | Host-owned worktree creation from exact base | `implemented_unverified` helper only | Exact detached-worktree creation tests | Add crash-safe provisioning journal, orphan recovery, launch split between control root and execution root, retention, and cleanup lifecycle |
 | P3-D4 | Clean-parent fingerprint and dirty-parent rejection | `implemented_unverified` | Parent fingerprint and negative integration tests | Bind tracked/untracked/ignored/binary/symlink/mode rejection to a clean exact-source record |
 | P3-D4b | Dirty-source materialization contract | `not_started` | No implementation; worker worktrees start from an exact commit and integration requires a clean parent | Define and prove an explicit materialization design before claiming dirty-parent support |
-| P3-D5 | Tamper-evident artifact manifest and scope checks | `implemented_unverified` | Artifact validation tests | Bind final patch/tree/content hashes in current record |
-| P3-D6 | Preview, conflict, explicit integration, verification, retention, cleanup | `implemented_unverified` | Worktree integration primitives/tests | End-to-end parent integration and post-integration host checks |
+| P3-D5 | Tamper-evident artifact manifest and scope checks | `implemented_unverified` helper only | Strong manifest recomputation and scope/tamper tests | Publish immutable job-bound artifact plus retrievable integration payload from the real terminal write path |
+| P3-D6 | Preview, conflict, explicit integration, verification, retention, cleanup | `not_started` in production | Validation/readiness helpers only | Add authority-bound idempotent preview/integrate/verify/retain/abandon/cleanup operations with no partial parent mutation |
 | P3-D7 | Two separable real writers | `not_started` | Concurrent natural-host trace | Prove parent content/index stays unchanged before explicit integration |
 
 Never automatically cherry-pick or apply worker output into the parent checkout. Worker-tree checks do not qualify the integrated parent; host checks must rerun after explicit integration.
@@ -358,13 +432,14 @@ Phase 4 presents only structured public records and labels Grok workers honestly
 
 | ID | Deliverable | Current state | Artifact or proof | Remaining work |
 | --- | --- | --- | --- | --- |
-| P4-D1 | Structured status/result presentation without shell parsing | `implemented_unverified` | Worker presentation implementation/tests | Installed natural host proof |
-| P4-D2 | Spoof-resistant aliases and parent/lineage tree | `implemented_unverified` | Presentation tests | Exact-source persistence/restart proof |
-| P4-D3 | Capability matrix and fail-closed degraded state | `implemented_unverified` | Presentation and MCP tests | Replay against supported Codex versions and missing metadata |
-| P4-D4 | Honest external-worker labeling and privacy projection | `implemented_unverified` | Presentation/protocol tests | Natural host injection/privacy evidence |
-| P4-D5 | Compatibility Claude presentation/fallback | `implemented_unverified` | Compatibility command surface | Clean installed Claude flow and drift policy proof |
+| P4-D1 | Structured status/result presentation without shell parsing | `partial production` | Raw task-owned MCP list/get/events/wait/result/spawn/cancel returns structured Worker Protocol records; pure presentation helpers also exist | Add native-shaped presentation, multi-wait, persistent aliases, and installed natural MCP proof |
+| P4-D2 | Spoof-resistant aliases and parent/lineage tree | `not_started` end to end | Pure alias/tree helpers only | Persist a task-owned alias registry and descriptions; add collision, restart, cycle, and foreign-ID tests |
+| P4-D3 | Capability matrix and fail-closed degraded state | `partial production` | Private provider receipt plus frozen six/seven-tool MCP inventory and hidden-operation rejection; authority metadata still fails closed | Add ACP acknowledgement/write capability records and prove full/degraded routing across installed supported hosts |
+| P4-D4 | Honest external-worker labeling and privacy projection | `implemented_unverified` | External labels plus protocol/MCP forged-host-claim suppression tests | Add installed natural host injection/privacy evidence; positive broker-owned host verification remains separate |
+| P4-D5 | Compatibility Claude presentation/fallback | `not_started` qualification | Legacy Markdown/shell command surface only | Freeze an honest MCP-or-command fallback contract and add installed/natural Claude scripts, version binding, and CI |
 | P4-D6 | Optional dashboard ADR | `deferred` | None required for issue #25 | Add only after separate value/authority decision |
 | P4-D7 | Official native extension adoption | `deferred` | No stable official contract assumed | Revisit only if an official host API exists |
+| P4-D8 | Durable completion-consumption accounting | `not_started` | No delivery ledger or channel arbitration | Persist exactly one consumption outcome across wait/result/optional notification and restart; never claim unsupported host auto-wake |
 
 ### Phase 4 authoritative checks
 
@@ -380,7 +455,7 @@ git show --check --format= HEAD
 npm run worker:verify -- --phase 4 --strict
 ```
 
-Required natural-host scenarios cover list, spawn, wait, message/follow-up, cancel, result, restart, stale cursor, retention gap, inaccessible worker, and degraded capability without manual shell intervention. Repository/provider text must not synthesize actions or false success.
+Required natural-host scenarios cover list, spawn, wait, message/follow-up, cancel, result, restart, stale cursor, retention gap, inaccessible worker, degraded capability, and completion-consumption arbitration without manual shell intervention. Repository/provider text must not synthesize actions or false success.
 
 There is no dedicated natural Claude replay command in the current package scripts. Add and document one before claiming P4-D5; compatibility prose or unit fixtures alone are not natural-host proof.
 
@@ -403,6 +478,7 @@ Phase 5 compares equivalent native and Grok control loops and publishes the only
 | P5-D5 | Exact-source aggregate qualification record | `not_started` | `phase-5` plus aggregate immutable record | Require current Phase 0–4 prerequisite digests and all boundaries |
 | P5-D6 | Parity scorecard and remaining-gap report | `not_started` | Issue/PR-linked report | Separate achieved control-loop parity from irreducible native gaps |
 | P5-D7 | Issue closeout | `not_started` | Final #25 update | Close only after strict aggregate and required live boundaries pass |
+| P5-D8 | Observed negotiated runtime evidence | `not_started` in evidence | Provider negotiation validates requested values but observations are not persisted into qualification | Record requested and ACP-observed protocol/model/effort/provider/host values separately, null when unobserved, and fail qualification on identity drift |
 
 ### Phase 5 authoritative checks
 
@@ -435,23 +511,27 @@ This ledger distinguishes implementation found in the working tree from proof st
 
 | Audit item | Observed/done | Authoritative check or artifact | Remaining remediation |
 | --- | --- | --- | --- |
-| A-01 Evidence contract | Schema, canonical digest, bounded command outcomes, qualification boundaries, nested allowlists, phase scopes, prerequisites, historical compatibility, and the fixed Phase 0 proof producer are implemented | Evidence schema/library/CLI; `node --test tests/worker-broker-evidence.test.mjs` | Commit integrated source, run the code-owned producer, supersede stale current claims through its locked cutover, and run strict replay |
-| A-02 Evidence regression | Focused suite passed 50/50 in the proof-runner working tree | `node --test tests/worker-broker-evidence.test.mjs` | Repeat through the producer on the exact clean commit and preserve its bounded timestamps/output digests in the new Phase 0 record |
-| A-03 Repository validation | Phase 0 stationary pre-commit run passed 377 tests with 0 failures and 1 expected authenticated-live skip; validation emitted only the historical profile-v2 warning | `npm run validate`; `npm run check` | Repeat on the exact clean commit and again after every later integrated source slice; record the final commit-bound count in issue #25/PR #26 |
+| A-01 Evidence contract | Schema, canonical digest, bounded command outcomes, qualification boundaries, nested allowlists, exact phase scopes, prerequisites, historical compatibility, producer v2, direct deterministic gate, serial zero-skip runners, parser-backed static-import closure, executable-evidence-path rejection, symlink/file-identity defense, and schema/runtime unsigned Phase 1 promotion prohibition are implemented | Evidence schema/library/CLI; `node --test tests/worker-broker-evidence.test.mjs` | Commit integrated source, run the code-owned producers, supersede stale claims through locked cutover, and run strict replay |
+| A-02 Evidence regression | Phase 0/1 regressions cover PATH/toolchain poisoning, generic-writer authority, parser grammar adversaries, Node-compatible file-URL resolution, encoded-path decoys, unsupported static requests, transitive imports, dynamic-import/non-ESM non-edges, evidence-only seed/dependency rejection, serial fixed Phase 1 gates, scope symlinks, v1 cutover, transitive dependent demotion, prerequisite closure, immutable publication, strict replay, drift rejection, schema/runtime parity, and honest unverified Phase 1 publication | Pre-final-review evidence suite: 71/71, zero skip/TODO; post-review focused regressions: 6/6; exact-commit producer replay pending | Repeat through producer v2 on the exact clean commit and preserve bounded timestamps/output digests in the new Phase 0/1 records |
+| A-03 Repository validation | The repository gate enumerates deterministic tests directly, excludes only installed-Codex and authenticated-Grok external boundaries, runs files serially on the Node 18.18 baseline, and fails on every empty/malformed/failed/cancelled/skipped/TODO child summary | Pre-final-review snapshot: fixed Phase 1 324/324 and full gate 543/543, both zero failed/cancelled/skipped/TODO; post-review host-claim/empty-file/role-advertisement regressions pass 6/6 | Repeat on the exact Phase 1 commit and record the commit-bound count in issue #25/PR #26 |
 | A-04 Current ledger | Entries exist for Phases 0–5 but bind older source and evidence shape | Ledger and phase JSON files | Keep immutable, supersede from clean final source, prove identity/prerequisite closure |
 | A-05 Strict replay | Hardened strict replay fails closed on stale records | `npm run worker:verify -- --all --strict` returns nonzero | This becomes a required pass only after supersession; do not weaken validator |
-| A-06 Phase 1 foundation | Protocol, read broker, mutation, cancellation, and reconcile code/tests exist | Worker protocol/service/mutation files and focused test files | Run focused/full gates, restart/crash and installed/live flows, write current record |
-| A-07 Phase 2 foundation | Mailbox, follow-up, explicit context, role and ambiguity logic/tests exist | Worker mailbox/context/roles files and tests | Run exact-source proof and live ACP/provider scenarios; retain honest weak guarantees |
-| A-08 Phase 3 foundation | Control identity, worktree, parent fingerprint, artifact and cleanup code/tests exist | Workspace/worktree/state files and tests | Run real concurrent writers plus explicit natural-host integration and current evidence |
-| A-09 Phase 4 foundation | Structured presentation, alias/tree, capability and labeling tests exist | Worker presentation/protocol/MCP tests | Run clean installed natural Codex and Claude compatibility flows |
-| A-10 Phase 5 safety slice | Deterministic safety fixtures exist | `tests/worker-safety-proofs.test.mjs` | Run on clean final source; build paired corpus, metrics, live matrix, aggregate evidence |
+| A-06 Phase 1 foundation | Protocol/read broker, exact context-bound authorization, capability-bound autonomous pending-outbox startup drain, intent-bound provider bootstrap and acknowledgement, exact attempt/process identities, atomic cleanup-safe terminalization, cancellation, provider-intent recovery, and report-repair rotation promotion are implemented in source | Worker protocol/service/runtime/mutation/recovery/supervisor/process-control/bootstrap files and focused process tests; fresh integrated review has no remaining actionable finding | Commit, replay exact-source gates, publish Phase 0 and honest unverified Phase 1 records, implement authenticated review promotion, and run installed/authenticated live flows |
+| A-07 Phase 2 foundation | Mailbox, follow-up, ContextPacket, role, and ambiguity helpers/tests exist; production runtime wiring was audited and is absent | Worker mailbox/context/roles files and tests | Implement ordered autonomous mailbox delivery, dispatchable same-session follow-up, runtime context/role contracts, host-action persistence, and a Phase 2 producer before any live claim |
+| A-08 Phase 3 foundation | Strong control identity, worktree, fingerprint, artifact, and cleanup guardrail helpers exist; production write-worker/integration wiring was audited and is absent | Workspace/worktree/state files and tests | Add durable managed-root binding, real concurrent writers, terminal artifacts, explicit integration/verification/retention, and a Phase 3 producer |
+| A-09 Phase 4 foundation | Raw task-owned MCP operations, immutable receipt-gated explorer-only spawn advertisement, external labeling, structured-proof suppression, and normalized host-attested summary/progress/event suppression exist; installed flows still use legacy CLI/PTY rather than the MCP broker | Provider capability, worker presentation/protocol/service/MCP tests, and host scripts; pre-final-review projection/supervisor batch 40/40 plus post-review focused regressions | Build native-shaped presentation/multi-wait, role-specific runtime policy, persistence, positive broker-owned verification, MCP-first skill routing, installed natural Codex/Claude flows, and a Phase 4 producer |
+| A-10 Phase 5 safety slice | Six deterministic Grok-side safety fixtures exist; no paired native adapter, scenario corpus, measurement harness, failure matrix, or aggregate producer exists | `tests/worker-safety-proofs.test.mjs` | Build typed paired corpus and >=5 samples per adapter/scenario, then bind live matrix and aggregate evidence without raw prompts/transcripts |
 | A-11 Independent Grok review | Review lifecycle ended with explicit `E_STATE`; native/manual audit continued | No qualifying repository artifact was produced; preserve the typed failure in task history | Optional fresh Grok review after lifecycle recovery; never count failed/fallback review as proof |
 | A-12 Plan/issue synchronization | This plan links open issue #25 and now records conservative truth | This file | After commit, update issue with exact commit, commands, outcomes, record paths, and unchecked residuals |
-| A-13 Native MCP enhancement | Draft ADR defines the E0-E7 path from durable broker foundations to a production native-shaped MCP control loop | `docs/superpowers/specs/2026-07-16-native-mcp-control-surface-design.md` | Do not count the ADR as implementation; contract and execute provider launch, live delivery, facade/multi-wait, host verification, skill teaching, and natural MCP proof as future bounded slices |
-| A-14 Independent native safety audit | Multiple stationary read-only reviews reproduced and remediated state-lock, cancellation, reconciliation, mailbox, evidence privacy/publication, ledger lost-update, legacy cutover/class normalization, dirty-parent, authoritative-record corruption, CLI/SessionEnd launch-window, unmerged-index, publication-drift, and producer-presence failures | Prior integrated audit passed focused 195/195 and full 366 plus 1 expected live-auth skip; the fresh Phase 0 review passed focused 50/50 and the full tree passed 377 plus 1 expected live-auth skip, with no remaining P0/P1/P2 defect in this slice | Repeat fresh independent validation on the final integrated commit; reviewer findings do not promote any phase without exact-source records |
+| A-13 Native MCP enhancement | Draft ADR defines the E0-E7 path from durable broker foundations to a production native-shaped MCP control loop; only the Phase 1 provider launch slice is implemented in this tree | `docs/superpowers/specs/2026-07-16-native-mcp-control-surface-design.md` | Execute live delivery, facade/multi-wait, host verification, skill teaching, and natural MCP proof as bounded slices; do not count the ADR as implementation |
+| A-14 Independent native safety audit | Fresh Phase 1 reviews found and remediation addressed wait mutation authority, replacement-generation witness loss, terminal-intent loss, unsafe legacy reconciliation, startup cancellation, unsafe cancel terminal hook, evidence-chain supersession, duplicate/foreign provider-bootstrap cleanup, promotion-pipe failure, detached startup crash windows, process-group/PATH hardening, autonomous outbox recovery, live capability revalidation, private bootstrap argv, normalized host-claim suppression, unbound public role advertisement, serial proof execution, static-import grammar/resolution bypasses, and unsigned schema promotion | Final integrated, runtime, and parser/evidence rereviews report no remaining actionable findings; review-only targeted batch was 30/30 and does not promote evidence status | Complete exact-commit gates; reviewer findings do not promote any phase without an authenticated exact-source receipt |
 | A-15 Legacy cutover boundary | Immutable snapshot receipts, global quiescence preflight, late terminal import, and divergent-content failure are implemented | `workspace.mjs` and worktree migration regressions | Operate only after old workers finish/stop; retain legacy directories; do not claim live cross-version fencing |
-| A-16 Evidence publication concurrency/privacy | Repository-local generation-bound ledger serialization, crash/reclaim transitions, raw publication validation, exact ledger allowlists, concurrent append regressions, private proof promotion, property-presence producer validation, strict producer-current validation, post-ledger source rollback, and atomic pre-runner baseline cutover are implemented | Evidence library/CLI and 50 focused evidence tests | Bind to the exact clean commit and publish the current Phase 0 record; no implementation-only test result promotes the phase |
-| A-17 Cross-version CI remediation | Secret-shaped test canaries are composed only at runtime; the legacy cache probe observes the exact retained payload instead of Node internals; foreground crash recovery is verified by one bounded recovery actor with a cleared timer and persisted terminal assertions | Node 18.18.2 focused/full worktree and runtime suites; `npm run check`; GitGuardian and GitHub Actions OS/Node matrix | Repeat on the exact remote commit, require the supported deterministic matrix and secret scan to pass, and continue treating skipped live-host/provider jobs as absent proof |
+| A-16 Evidence publication concurrency/privacy | Repository-local generation-bound ledger serialization, crash/reclaim transitions, raw publication validation, exact ledger allowlists, concurrent append regressions, private proof promotion, strict producer-current validation, post-ledger rollback, atomic v1 cutover, transitive supersession, absolute toolchain binding, exact scope-file identity, and fixed Phase 0/1 producer manifests are implemented | Pre-final-review evidence 71/71, fixed Phase 1 324/324, and full gate 543/543 were zero failed/cancelled/skipped/TODO; exact-commit producer replay is intentionally still pending | Bind to the exact clean commit and publish current Phase 0 plus honest unverified Phase 1 records; no implementation-only test result promotes the phase |
+| A-17 Cross-version CI remediation | Linux/macOS CI now names the deterministic zero-skip suite; installed-host and authenticated-provider tests are separate qualification jobs; Windows remains an explicit provider-neutral cell | Node 18.18.2 and 22.x supported CI matrix; `npm run check`; GitGuardian; `.github/workflows/ci.yml` | Repeat on the exact remote commit and require supported Linux/macOS deterministic plus secret-scan jobs; do not present Windows provider-neutral tests as a full POSIX/provider qualification |
+| A-18 Completion-model contradiction | Current `--require-complete` requires every Phase 0–5 record to be `qualified`, while fixed proof producers can create only deterministic `verified_on_draft` records | Evidence validator and Phase 0/1 proof manifests | Make Phase 0–5 require current deterministic verification and aggregate alone require installed/live/provider/release qualification, or add a separately trusted composable qualification producer; prove both incomplete and complete states |
+| A-19 Host/qualification proof surface | Phase 1 scope now explicitly binds MCP broker/server, provider bootstrap/capability, autonomous dispatch supervisor, provider agents, relevant skills, direct gate scripts, and crash/recovery tests; Phase 4/5/aggregate producers still do not bind the full install/natural/Claude/paired-corpus qualification surface | Evidence manifests/scopes, package scripts, CI, and stale historical records | Add code-owned Phase 4/5/aggregate producers and their remaining runtime-surface seeds/drift tests, then derive release qualification from the validated aggregate record |
+| A-20 Source-backed pre-E2E audit delta | Issue comment 5048315213 supplied seven commit-pinned blockers and three post-first-vertical improvements; current-tree reconciliation classifies them individually above | Current source, acceptance mapping, and this plan's progress rubric | Close the root vertical subset before live E2E, hide unsupported tools, then execute the separate follow-up and write verticals; add P2-D8/P4-D8/P5-D8 gates before aggregate qualification |
+| A-21 Independent-review authentication boundary | The reserved receipt is source-bound and tamper-evident but locally forgeable; Codex cannot authenticate a collaboration subagent, fresh independent session, exact remote runtime, or copied output from repository code alone | Evidence schema/library review and fresh native design audit | Add immutable review request, bounded signed-attestation import, pinned production public keys/revocation, separate promotion authority, atomic supersession, and strict offline signature/source/diff/proof replay; until then keep Phase 1 `implemented_unverified` |
 
 ## 13. Acceptance target definitions
 
@@ -484,12 +564,12 @@ Issue #25 must link this plan near the top and mirror stable deliverable IDs. Fo
 
 ## 15. Execution order and final closeout checklist
 
-1. [Done for this delivery] Integrate all concurrent implementation and remediation edits without overlapping or discarding unrelated work.
-2. [Done for pre-commit remediation] Run phase-focused deterministic suites, independent negative review, and fix every P0/P1/P2 finding accepted into scope.
-3. [Done for Phase 0 source slice; repeat on final stationary tree] Run `npm run check`, `git diff --check`, and `git diff --cached --check` on the complete pre-commit integrated tree.
-4. [Pending final commit] Commit the source, then run `git show --check --format= HEAD` and `npm run check` so proof binds to that exact commit/tree and stable phase-scope digests.
-5. [Pending final evidence-source freeze] Generalize the code-owned producer, then run `npm run worker:prove -- --phase 0 --slice evidence-system --write` on the final clean source and require Phase 0 and all-ledger strict integrity replay to pass while `--require-complete` remains honestly red.
-6. Generate Phase 1–4 current records in dependency order, each referencing current predecessor digests and mandatory gate IDs.
+1. [Complete] Integrate all concurrent Phase 0/1 implementation and remediation edits without overlapping or discarding unrelated work; both writers are stopped and their integrated surfaces have been inspected.
+2. [Done at the remediation/review layer] All accepted runtime/evidence findings have source fixes. Fresh integrated, runtime, and parser/evidence rereviews report no remaining actionable findings; their reports are review input, not qualifying evidence.
+3. [In progress toward exact commit] Writers are stopped; pre-final-review `git diff --check`, validator, evidence 71/71, fixed Phase 1 324/324, and full repository 543/543 passed with zero failed/cancelled/skipped/TODO. Narrow empty-file, host-claim, and role-advertisement regressions then passed 6/6. Commit and replay the authoritative gates; do not reuse either the earlier 540/541 pre-parser snapshot or the pre-final-review counts as exact-commit evidence.
+4. [After stationary green review] Commit the Phase 1 source and this audit update, then run `git show --check --format= HEAD` and `npm run check` so proof binds to that exact commit/tree and stable phase-scope digests.
+5. [Pending final evidence-source freeze] Run producer v2 with `npm run worker:prove -- --phase 0 --slice evidence-system --write` on the final clean source and require Phase 0 plus all-ledger strict integrity replay to pass while `--require-complete` remains honestly red.
+6. Publish the Phase 1 producer-v2 record as `implemented_unverified`; implement the signed independent-review request/import/promote boundary before any Phase 1 promotion. A local subagent report or structural receipt is non-qualifying. Phase 2–5/aggregate producers remain separate deliverables and must be generated in dependency order with exact predecessor digests and mandatory gate IDs.
 7. Run clean installed natural Codex and compatibility Claude scenarios for the exact installed artifact.
 8. Run authenticated Grok lifecycle scenarios without exposing credentials or private runtime data.
 9. Execute the paired Phase 5 corpus and bounded measurements; write the aggregate record.

@@ -197,7 +197,7 @@ test("presentation does not trust authority when forged snapshots omit version f
 
   const presented = presentWorker(forged);
   assert.equal(presented.result.hostVerification, "not_run");
-  assert.equal(presented.result.runtimeEvidence.hostVerification, "not_run");
+  assert.equal(Object.hasOwn(presented.result, "runtimeEvidence"), false);
   assert.equal(Object.hasOwn(presented.result, "verification"), false);
   assert.equal(JSON.stringify(presented).includes(canary), false);
 });

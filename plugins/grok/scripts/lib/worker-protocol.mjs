@@ -174,6 +174,26 @@ function nullableText(value, max = MAX_PUBLIC_TEXT_CHARS) {
   return typeof value === "string" ? boundedText(value, { max }) : null;
 }
 
+function containsHostVerificationClaim(value) {
+  if (typeof value !== "string") return false;
+  const tokens = value
+    .normalize("NFKC")
+    .replace(/([\p{Ll}\p{N}])(\p{Lu})/gu, "$1 $2")
+    .toLowerCase()
+    .match(/[\p{L}\p{N}]+/gu) || [];
+  const hasHost = tokens.includes("host");
+  const hasVerification = tokens.some((token) => (
+    /^verif(?:y|ies|ied|ying|ication|ications|ier|iers)$/u.test(token)
+  ));
+  return hasHost && hasVerification;
+}
+
+function authorityBoundText(value, { trustHostAuthority = true, max = MAX_PUBLIC_TEXT_CHARS } = {}) {
+  const projected = nullableText(value, max);
+  if (!trustHostAuthority && containsHostVerificationClaim(projected)) return null;
+  return projected;
+}
+
 function nullableInteger(value) {
   return Number.isSafeInteger(value) ? value : null;
 }
@@ -418,6 +438,7 @@ function projectCommandOutcomes(value) {
 
 function projectRuntimeEvidence(value, { trustHostAuthority = true } = {}) {
   if (!isPlainObject(value)) return null;
+  if (!trustHostAuthority) return null;
   const reconciler = isPlainObject(value.reconciler)
     ? {
       privilege: nullableText(value.reconciler.privilege, 128),
@@ -623,7 +644,7 @@ export function projectLifecycleEvent(event, { trustHostAuthority = true } = {})
     eventSchemaVersion: WORKER_EVENT_SCHEMA_VERSION,
     type: PUBLIC_LIFECYCLE_EVENT_TYPES.has(event.type) ? event.type : "checkpoint",
     at: nullableText(event.at, 64),
-    summary: boundedText(event.summary),
+    summary: authorityBoundText(event.summary, { trustHostAuthority }),
     sequence: Number.isSafeInteger(event.sequence) && event.sequence >= 1 ? event.sequence : null
   };
   const detail = projectLifecycleDetail(event.detail, { trustHostAuthority });
@@ -647,7 +668,7 @@ export function projectLifecycleEvents(events, { trustHostAuthority = true } = {
  *
  * @param {unknown} events stored lifecycle array (sequenced or legacy)
  * @param {number} cursor nonnegative integer; returns events with sequence > cursor
- * @param {{ terminal?: boolean }} [options]
+ * @param {{ terminal?: boolean, trustHostAuthority?: boolean }} [options]
  * @returns {{
  *   workerProtocolVersion: number,
  *   eventCursorSchemaVersion: number,
@@ -690,7 +711,9 @@ export function projectLifecycleEventsAfterCursor(events, cursor = 0, options = 
   const gap = firstAvailableSequence != null && firstAvailableSequence > cursor + 1;
   const selected = normalized
     .filter((event) => event.sequence > cursor)
-    .map((event) => projectLifecycleEvent(event))
+    .map((event) => projectLifecycleEvent(event, {
+      trustHostAuthority: options.trustHostAuthority !== false
+    }))
     .filter(Boolean);
   // When already current (no new events), nextCursor stays at the supplied cursor.
   const nextCursor = selected.length
@@ -778,13 +801,18 @@ function projectWorkerIdentityMetadata(job) {
  * Public broker callers use structured tokens so an in-range cursor from another
  * worker cannot silently skip this worker's events.
  */
-export function projectWorkerLifecycleCursor(job, cursor = null) {
+export function projectWorkerLifecycleCursor(
+  job,
+  cursor = null,
+  { trustHostAuthority = true } = {}
+) {
   if (!job || typeof job !== "object") {
     throw new CompanionError("E_STATE", "Worker cursor projection requires a job record.");
   }
   const sequence = parseWorkerEventCursor(job, cursor);
   const projected = projectLifecycleEventsAfterCursor(job.lifecycleEvents, sequence, {
-    terminal: isWorkerTerminal(job)
+    terminal: isWorkerTerminal(job),
+    trustHostAuthority
   });
   return {
     ...projected,
@@ -799,7 +827,7 @@ export function projectWorkerLifecycleCursor(job, cursor = null) {
  * Lightweight public worker handle — identity and liveness without detail payload.
  * Omits prompts, raw host identity, provider session IDs, process identity, and credentials.
  */
-export function projectWorkerHandle(job) {
+export function projectWorkerHandle(job, { trustHostAuthority = true } = {}) {
   if (!job || typeof job !== "object") {
     throw new CompanionError("E_STATE", "Worker handle projection requires a job record.");
   }
@@ -812,8 +840,8 @@ export function projectWorkerHandle(job) {
     write: Boolean(job.write),
     status: publicWorkerStatus(job.status),
     phase: nullableText(job.phase, 128),
-    summary: nullableText(job.summary),
-    progress: nullableText(job.progress),
+    summary: authorityBoundText(job.summary, { trustHostAuthority }),
+    progress: authorityBoundText(job.progress, { trustHostAuthority }),
     createdAt: nullableText(job.createdAt, 64),
     startedAt: nullableText(job.startedAt, 64),
     updatedAt: nullableText(job.updatedAt, 64),
@@ -928,8 +956,8 @@ export function projectWorkerSnapshot(job, { detail = true, trustHostAuthority =
     write: Boolean(job.write),
     status: publicWorkerStatus(job.status),
     phase: nullableText(job.phase, 128),
-    summary: nullableText(job.summary),
-    progress: nullableText(job.progress),
+    summary: authorityBoundText(job.summary, { trustHostAuthority }),
+    progress: authorityBoundText(job.progress, { trustHostAuthority }),
     createdAt: nullableText(job.createdAt, 64),
     startedAt: nullableText(job.startedAt, 64),
     updatedAt: nullableText(job.updatedAt, 64),

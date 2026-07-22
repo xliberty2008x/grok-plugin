@@ -43,9 +43,87 @@ const TASK_ENVELOPE_INPUT_KEYS = new Set([
   "requiredVerification",
   "expectedReturnFormat"
 ]);
+const TASK_ENVELOPE_KEYS = new Set([
+  "schemaVersion",
+  "userRequest",
+  "objective",
+  "mode",
+  "scope",
+  "context",
+  "nonGoals",
+  "acceptanceCriteria",
+  "requiredVerification",
+  "expectedReturnFormat",
+  "contextManifestId",
+  "envelopeId",
+  "digest"
+]);
 
 function sha(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+const SHA256_HEX = /^[a-f0-9]{64}$/;
+const CONTEXT_MANIFEST_ID = /^ctx-[a-f0-9]{24}$/;
+
+function retainedTextDigest(literal, existingDigest) {
+  if (typeof literal === "string") return sha(literal);
+  return SHA256_HEX.test(existingDigest || "") ? existingDigest : null;
+}
+
+/**
+ * Remove raw provider/request text before a job record is durably retained.
+ *
+ * Literal text is authoritative when present: its digest replaces any stale or
+ * forged pre-existing digest. Without a literal, only a well-formed SHA-256
+ * witness is retained. A default objective is another copy of userRequest, so
+ * replace it with the same digest; a distinct caller-supplied objective remains
+ * available as the bounded public task description.
+ */
+export function scrubStoredRequest(request) {
+  if (!request || typeof request !== "object" || Array.isArray(request)) return null;
+
+  const prompt = typeof request.prompt === "string" ? request.prompt : null;
+  const envelope = request.envelope && typeof request.envelope === "object" && !Array.isArray(request.envelope)
+    ? request.envelope
+    : null;
+  const userRequest = typeof envelope?.userRequest === "string" ? envelope.userRequest : null;
+  const userRequestDigest = retainedTextDigest(userRequest, envelope?.userRequestDigest);
+  const defaultObjective = userRequest !== null && envelope?.objective === userRequest;
+  const duplicatePublicObjective = userRequest !== null && request.publicObjective === userRequest;
+
+  return {
+    ...request,
+    prompt: null,
+    promptDigest: retainedTextDigest(prompt, request.promptDigest),
+    ...(duplicatePublicObjective ? { publicObjective: null } : {}),
+    envelope: envelope ? {
+      ...envelope,
+      userRequest: null,
+      userRequestDigest,
+      ...(defaultObjective ? { objective: userRequestDigest } : {})
+    } : null
+  };
+}
+
+/** Normalize the request and any title derived from its default objective. */
+export function scrubStoredJob(job) {
+  if (!job || typeof job !== "object" || Array.isArray(job)) return null;
+  const userRequest = typeof job.request?.envelope?.userRequest === "string"
+    ? job.request.envelope.userRequest
+    : null;
+  const defaultTitle = userRequest !== null
+    && typeof job.title === "string"
+    && job.title === userRequest.slice(0, 100);
+  const request = scrubStoredRequest(job.request);
+  const digest = request?.envelope?.userRequestDigest;
+  return {
+    ...job,
+    request,
+    ...(defaultTitle && SHA256_HEX.test(digest || "")
+      ? { title: `task:${digest.slice(0, 24)}` }
+      : {})
+  };
 }
 
 function clip(value, limit = MAX_TEXT) {
@@ -180,6 +258,75 @@ export function buildTaskEnvelope({
     envelopeId: `env-${digest.slice(0, 24)}`,
     digest
   };
+}
+
+function taskEnvelopeSchemaError() {
+  return new CompanionError(
+    "E_SCHEMA",
+    "TaskEnvelope does not match its canonical versioned contract."
+  );
+}
+
+function taskEnvelopeBuilderInput(envelope, contextManifestId = envelope?.contextManifestId ?? null) {
+  return {
+    userRequest: envelope.userRequest,
+    objective: envelope.objective,
+    mode: envelope.mode,
+    scope: envelope.scope,
+    context: envelope.context,
+    nonGoals: envelope.nonGoals,
+    acceptanceCriteria: envelope.acceptanceCriteria,
+    requiredVerification: envelope.requiredVerification,
+    expectedReturnFormat: envelope.expectedReturnFormat,
+    contextManifestId
+  };
+}
+
+/**
+ * Validate an executable TaskEnvelope before it enters durable launch state.
+ *
+ * Canonically rebuilding the envelope enforces the same key, type, bound,
+ * normalization, digest, and envelope-id contract used by the sole builder.
+ * Privacy-scrubbed durable envelopes are deliberately not accepted here: this
+ * boundary is for a new executable request while its literal text is present.
+ */
+export function assertTaskEnvelope(envelope) {
+  try {
+    if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+      throw taskEnvelopeSchemaError();
+    }
+    const keys = Object.keys(envelope);
+    if (keys.length !== TASK_ENVELOPE_KEYS.size
+      || keys.some((key) => !TASK_ENVELOPE_KEYS.has(key))
+      || envelope.schemaVersion !== TASK_ENVELOPE_VERSION
+      || typeof envelope.userRequest !== "string"
+      || typeof envelope.objective !== "string"
+      || !["read", "write"].includes(envelope.mode)
+      || (envelope.contextManifestId !== null
+        && !CONTEXT_MANIFEST_ID.test(envelope.contextManifestId || ""))
+      || typeof envelope.expectedReturnFormat !== "string"
+      || !/^env-[a-f0-9]{24}$/.test(envelope.envelopeId || "")
+      || !SHA256_HEX.test(envelope.digest || "")) {
+      throw taskEnvelopeSchemaError();
+    }
+    const rebuilt = buildTaskEnvelope(taskEnvelopeBuilderInput(envelope));
+    if (canonicalJson(envelope) !== canonicalJson(rebuilt)) {
+      throw taskEnvelopeSchemaError();
+    }
+    return envelope;
+  } catch (error) {
+    if (error instanceof CompanionError && error.code === "E_SCHEMA") throw error;
+    throw taskEnvelopeSchemaError();
+  }
+}
+
+/** Rebuild a validated envelope after binding the trusted context identity. */
+export function bindTaskEnvelopeContext(envelope, contextManifestId) {
+  const validated = assertTaskEnvelope(envelope);
+  if (typeof contextManifestId !== "string" || !contextManifestId) {
+    throw taskEnvelopeSchemaError();
+  }
+  return buildTaskEnvelope(taskEnvelopeBuilderInput(validated, contextManifestId));
 }
 
 /** Parse and validate the bounded JSON object accepted by --envelope-stdin. */

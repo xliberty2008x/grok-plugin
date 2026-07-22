@@ -263,11 +263,31 @@ function optionValue(args, name) {
   return index >= 0 ? args[index + 1] ?? null : null;
 }
 
-function stubbornDescendant(config, transport) {
-  const child = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});process.on('SIGHUP',()=>{});setInterval(()=>{},1000)"], {
+async function stubbornDescendant(config, transport) {
+  const child = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});process.on('SIGHUP',()=>{});process.send?.({ready:true});setInterval(()=>{},1000)"], {
     detached: false,
-    stdio: "ignore"
+    stdio: ["ignore", "ignore", "ignore", "ipc"]
   });
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      child.off("message", onMessage);
+      child.off("error", onError);
+      child.off("exit", onExit);
+      callback(value);
+    };
+    const onMessage = (message) => {
+      if (message?.ready === true) finish(resolve);
+    };
+    const onError = (error) => finish(reject, error);
+    const onExit = (code, signal) => finish(reject, new Error(`Stubborn descendant exited before readiness (${code ?? signal}).`));
+    child.on("message", onMessage);
+    child.once("error", onError);
+    child.once("exit", onExit);
+  });
+  if (child.connected) child.disconnect();
   child.unref();
   appendLog(config, { event: "descendant", transport, pid: child.pid, processGroupId: process.pid });
   return child;
@@ -282,7 +302,7 @@ async function serveHeadless(binary, config, args) {
   const sessionId = config.headlessSessionId || resumeSessionId || optionValue(args, "--session-id") || "fake-headless-session-00000001";
   appendLog(config, { event: "headless", promptNumber, prompt, sessionId, structured, args });
   appendLog(config, { event: "prompt", promptNumber, prompt, sessionId, transport: "headless" });
-  if (config.headlessSpawnStubbornDescendant) stubbornDescendant(config, "headless");
+  if (config.headlessSpawnStubbornDescendant) await stubbornDescendant(config, "headless");
 
   if (config.headlessStderr) process.stderr.write(config.headlessStderr);
   if (config.headlessExitCode) {
@@ -488,7 +508,7 @@ async function main() {
       home: process.env.HOME || null,
       grokHome: process.env.GROK_HOME || null
     });
-    if (effective.importSpawnStubbornDescendant) stubbornDescendant(effective, "import");
+    if (effective.importSpawnStubbornDescendant) await stubbornDescendant(effective, "import");
     if (effective.importStderr) process.stderr.write(String(effective.importStderr));
     let importedId = null;
     if (Object.hasOwn(effective, "importOutput")) {

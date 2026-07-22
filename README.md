@@ -566,7 +566,7 @@ Contributor commands match `package.json` and [`.github/workflows/ci.yml`](.gith
 npm ci --ignore-scripts   # as in CI
 npm run validate          # structure, versions, manifests, contracts
 npm test                  # full offline suite, including three concurrent read jobs
-npm run check             # validate && test
+npm run check             # validate + deterministic offline tests; skip/TODO fails; installed/authenticated boundaries run separately
 npm run test:pty-ingress  # issue #2 real nonblocking PTY + negative-input gate
 npm run test:installed-codex # clean CODEX_HOME install and cached-wrapper gate
 npm run codex:update-local # verify, reinstall into this Codex home, compare source/cache

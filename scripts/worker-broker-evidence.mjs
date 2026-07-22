@@ -4,10 +4,10 @@
  *
  * Usage:
  *   node scripts/worker-broker-evidence.mjs status [--strict]
- *   node scripts/worker-broker-evidence.mjs verify --phase <N> [--strict]
+ *   node scripts/worker-broker-evidence.mjs verify --phase <N> [--strict] [--require-verified]
  *   node scripts/worker-broker-evidence.mjs verify --all [--strict] [--require-complete]
  *   node scripts/worker-broker-evidence.mjs capture --phase <N> --slice <id> [--write]
- *   node scripts/worker-broker-evidence.mjs prove --phase 0 --slice <slug> [--write]
+ *   node scripts/worker-broker-evidence.mjs prove --phase <0|1> --slice <supported-slice> [--write]
  *   node scripts/worker-broker-evidence.mjs qualify --phase <N> --host <codex|claude-code> [--record]
  */
 import { spawnSync } from "node:child_process";
@@ -19,7 +19,7 @@ import {
   computePhaseScopeDigest,
   evidenceStatus,
   gitIdentity,
-  provePhaseZero,
+  proveWorkerBrokerPhase,
   sha256Text,
   updateLedger,
   validateEvidenceRecord,
@@ -31,9 +31,11 @@ import {
 function usage(exitCode = 2) {
   process.stderr.write(`Usage:
   node scripts/worker-broker-evidence.mjs status [--strict]
-  node scripts/worker-broker-evidence.mjs verify --phase <N>|--all [--strict] [--require-complete]
+  node scripts/worker-broker-evidence.mjs verify --phase <N> [--strict] [--require-verified]
+  node scripts/worker-broker-evidence.mjs verify --all [--strict] [--require-complete]
   node scripts/worker-broker-evidence.mjs capture --phase <N> --slice <id> [--status <s>] [--write]
   node scripts/worker-broker-evidence.mjs prove --phase 0 --slice <bounded-slug> [--write]
+  node scripts/worker-broker-evidence.mjs prove --phase 1 --slice worker-api [--write]
   node scripts/worker-broker-evidence.mjs qualify --phase <N> --host <codex|claude-code> [--record]
 `);
   process.exit(exitCode);
@@ -75,8 +77,50 @@ function parseProveArgs(argv) {
     if (token === "--phase") args.phase = value;
     else args.slice = value;
   }
-  if (args.phase !== "0"
-    || !/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(args.slice || "")) usage();
+  const phaseZero = args.phase === "0"
+    && /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(args.slice || "");
+  const phaseOne = args.phase === "1" && args.slice === "worker-api";
+  if (!phaseZero && !phaseOne) usage();
+  return args;
+}
+
+function parseVerifyArgs(argv) {
+  if (argv.length === 1 && ["--help", "-h"].includes(argv[0])) usage(0);
+  const args = {
+    phase: null,
+    all: false,
+    strict: false,
+    requireComplete: false,
+    requireVerified: false
+  };
+  const booleanFlags = new Set([
+    "--all",
+    "--strict",
+    "--require-complete",
+    "--require-verified"
+  ]);
+  const seen = new Set();
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (seen.has(token)) usage();
+    seen.add(token);
+    if (booleanFlags.has(token)) {
+      if (token === "--all") args.all = true;
+      else if (token === "--strict") args.strict = true;
+      else if (token === "--require-complete") args.requireComplete = true;
+      else args.requireVerified = true;
+      continue;
+    }
+    if (token !== "--phase") usage();
+    const value = argv[index + 1];
+    if (typeof value !== "string"
+      || !new Set(["0", "1", "2", "3", "4", "5", "aggregate"]).has(value)) usage();
+    args.phase = value;
+    index += 1;
+  }
+  if (args.all === Boolean(args.phase)) usage();
+  if (args.requireComplete && !args.all) usage();
+  if (args.requireVerified && args.all) usage();
   return args;
 }
 
@@ -130,7 +174,10 @@ function commandVerify(args) {
   }
   if (args.requireComplete) usage();
   if (!args.phase) usage();
-  const result = verifyPhase(args.phase, REPO_ROOT, { strict: Boolean(args.strict) });
+  const result = verifyPhase(args.phase, REPO_ROOT, {
+    strict: Boolean(args.strict),
+    requireVerified: Boolean(args.requireVerified)
+  });
   printJson(result);
   if (!result.ok) process.exit(1);
 }
@@ -209,7 +256,7 @@ function commandCapture(args) {
 }
 
 function commandProve(args) {
-  const result = provePhaseZero({
+  const result = proveWorkerBrokerPhase({
     phase: args.phase,
     slice: args.slice,
     write: args.write,
@@ -321,12 +368,13 @@ function commandQualify(args) {
 const rawArgs = process.argv.slice(2);
 if (rawArgs[0] === "prove") {
   commandProve(parseProveArgs(rawArgs.slice(1)));
+} else if (rawArgs[0] === "verify") {
+  commandVerify(parseVerifyArgs(rawArgs.slice(1)));
 } else {
   const args = parseArgs(rawArgs);
   if (args.help || !args._.length) usage(args.help ? 0 : 2);
   const command = args._[0];
   if (command === "status") commandStatus(args);
-  else if (command === "verify") commandVerify(args);
   else if (command === "capture") commandCapture(args);
   else if (command === "qualify") commandQualify(args);
   else usage();

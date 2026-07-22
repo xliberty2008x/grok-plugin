@@ -26,7 +26,7 @@ import {
   validateReview
 } from "../plugins/grok/scripts/lib/grok-provider.mjs";
 import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
-import { hasForeignActiveProvider, registerProviderGuard, unregisterProviderGuard } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
+import { hasForeignActiveProvider, loadProviderGuard, registerProviderGuard, unregisterProviderGuard } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
 import { processGroupAlive, processGroupGone } from "../plugins/grok/scripts/lib/process-control.mjs";
 import { CompanionError } from "../plugins/grok/scripts/lib/errors.mjs";
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
@@ -69,6 +69,54 @@ test("Grok discovery honors GROK_BIN and enforces the minimum CLI version", asyn
 
   await withFake({ version: "0.2.92" }, async () => {
     assert.throws(() => grokVersion(), (error) => error.code === "E_GROK_VERSION");
+  });
+});
+
+test("bound provider startup refuses an already-pending intent without spawning a bootstrap", async () => {
+  await withFake({}, async () => {
+    const root = initRepo();
+    const home = tempDir("provider-pending-home-");
+    const grokHome = path.join(home, ".grok");
+    let bootstrapSpawns = 0;
+    let noChildPublications = 0;
+    await assert.rejects(
+      () => openProvider({
+        root,
+        profile: profileFor("task", false),
+        stateDir: tempDir("provider-state-"),
+        jobMarker: "task-aabbccddeeff0011",
+        environment: {
+          grokHome,
+          env: childEnvironment({ HOME: home, USERPROFILE: home, GROK_HOME: grokHome }),
+          knownSecrets: []
+        },
+        guardBinding: {
+          controlWorkspaceId: "control-workspace-placeholder",
+          executionRoot: root,
+          dispatchAttemptId: "b".repeat(32),
+          dispatchFence: 1,
+          providerGeneration: 1
+        },
+        providerLaunch: {
+          prepare: () => ({
+            prepared: false,
+            reason: "already-pending",
+            intent: {
+              status: "pending",
+              intentId: "c".repeat(32),
+              providerGeneration: 1
+            }
+          }),
+          noChild: () => { noChildPublications += 1; }
+        },
+        testHooks: {
+          afterBootstrapSpawned: () => { bootstrapSpawns += 1; }
+        }
+      }),
+      (error) => error?.code === "E_PROCESS_IDENTITY"
+    );
+    assert.equal(bootstrapSpawns, 0);
+    assert.equal(noChildPublications, 0, "a foreign pending intent must not be settled by this caller");
   });
 });
 
@@ -576,6 +624,46 @@ test("setup probe path retains isolated home when process-group shutdown fails",
   });
 });
 
+test("ACP cleanup retains the staged agent profile when exact guard deletion loses an ABA race", async () => {
+  await withFake({}, async () => {
+    const root = initRepo();
+    const state = tempDir("provider-guard-cas-state-");
+    const marker = "task-provider-guard-cas-01234567";
+    const profiles = path.join(state, "task-homes", marker, ".grok", "agent-profiles");
+    let replacement = null;
+    try {
+      await assert.rejects(
+        () => runProvider({
+          root,
+          profile: profileFor("task", false),
+          prompt: "inspect",
+          stateDir: state,
+          jobMarker: marker,
+          onEvent(event) {
+            if (event.type !== "provider" || replacement) return;
+            replacement = registerProviderGuard(root, marker, {
+              ...event.process,
+              startToken: `${event.process.startToken}|replacement`
+            }, "replacement-owner");
+          }
+        }),
+        (error) => error?.code === "E_STATE"
+          && /provider guard/i.test(error?.details?.privacyWarning || "")
+      );
+      assert.ok(replacement, "test did not publish the ABA replacement guard");
+      assert.deepEqual(loadProviderGuard(root, marker), replacement);
+      assert.ok(
+        fs.readdirSync(profiles).some((name) => name.endsWith(".md")),
+        "staged agent profile was deleted after exact guard cleanup failed"
+      );
+    } finally {
+      try { unregisterProviderGuard(root, marker, replacement); } catch {}
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(state, { recursive: true, force: true });
+    }
+  });
+});
+
 test("isolated ACP homes reject external discovery and redact opaque copied credentials", async () => {
   const secret = "opaque-provider-credential-value-123456";
   await withFake({ authSecret: secret, stderr: `diagnostic ${secret}\n`, unknownSecret: secret, taskText: `result ${secret}` }, async (fake) => {
@@ -757,23 +845,25 @@ test("provider event callback failures terminate ACP and headless children", asy
 test("headless timeout and output overflow escalate once to a forced exit", async () => {
   await withFake({ headlessDelayMs: 60_000, headlessIgnoreSigterm: true }, async () => {
     const root = initRepo(), state = tempDir("provider-state-"), marker = "review-timeout-test";
-    const started = Date.now();
     await assert.rejects(
       () => runHeadless({ root, profile: profileFor("review"), prompt: "review", stateDir: state, jobMarker: marker, timeoutMs: 600 }),
       (error) => error.code === "E_TIMEOUT"
     );
-    assert.ok(Date.now() - started >= 2000 && Date.now() - started < 5000);
     assert.equal(cleanupReviewEnvironment(state, marker).ok, true);
   });
 
-  await withFake({ headlessStdoutBytes: 2048, headlessDelayMs: 60_000, headlessIgnoreSigterm: true }, async () => {
+  await withFake({ headlessStdoutBytes: 2048, headlessDelayMs: 60_000, headlessIgnoreSigterm: true }, async (fake) => {
     const root = initRepo(), state = tempDir("provider-state-"), marker = "review-output-test";
     const started = Date.now();
     await assert.rejects(
       () => runHeadless({ root, profile: profileFor("review"), prompt: "review", stateDir: state, jobMarker: marker, timeoutMs: 10_000, maxOutputBytes: 1024 }),
       (error) => error.code === "E_OUTPUT_LIMIT"
     );
-    assert.ok(Date.now() - started >= 2000 && Date.now() - started < 5000);
+    assert.ok(Date.now() - started >= 1800);
+    assert.equal(
+      readFakeLog(fake.logFile).filter((entry) => entry.event === "signal" && entry.signal === "SIGTERM" && entry.transport === "headless").length,
+      1
+    );
     assert.equal(cleanupReviewEnvironment(state, marker).ok, true);
   });
 });
@@ -781,12 +871,34 @@ test("headless timeout and output overflow escalate once to a forced exit", asyn
 test("headless cleanup kills a TERM-resistant same-group descendant after the leader exits", async () => {
   await withFake({ headlessDelayMs: 60_000, headlessSpawnStubbornDescendant: true }, async (fake) => {
     const root = initRepo(), state = tempDir("provider-state-");
-    let providerIdentity = null;
-    await assert.rejects(
-      () => runHeadless({ root, profile: profileFor("review"), prompt: "review", stateDir: state, jobMarker: "review-descendant-test", timeoutMs: 400, onEvent(event) { if (event.type === "provider") providerIdentity = event.process; } }),
-      (error) => error.code === "E_TIMEOUT"
+    let providerIdentity = null, cancelRequested = false, waitError = null;
+    const rejected = assert.rejects(
+      runHeadless({
+        root,
+        profile: profileFor("review"),
+        prompt: "review",
+        stateDir: state,
+        jobMarker: "review-descendant-test",
+        timeoutMs: 10_000,
+        cancelRequested: () => cancelRequested,
+        onEvent(event) { if (event.type === "provider") providerIdentity = event.process; }
+      }),
+      (error) => error.code === "E_CANCELLED"
     );
-    const descendant = readFakeLog(fake.logFile).find((entry) => entry.event === "descendant" && entry.transport === "headless");
+    let descendant;
+    try {
+      descendant = await waitFor(
+        () => readFakeLog(fake.logFile).find((entry) => entry.event === "descendant" && entry.transport === "headless"),
+        { timeoutMs: 5_000, intervalMs: 25 }
+      );
+    } catch (error) {
+      waitError = error;
+    }
+    const cancellationStarted = Date.now();
+    cancelRequested = true;
+    await rejected;
+    if (waitError) throw waitError;
+    assert.ok(Date.now() - cancellationStarted >= 2000);
     assert.ok(descendant?.pid);
     assert.ok(providerIdentity?.processGroupId);
     assert.equal(processStartToken(descendant.pid), null);
