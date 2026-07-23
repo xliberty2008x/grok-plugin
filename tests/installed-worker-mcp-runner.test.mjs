@@ -533,6 +533,50 @@ test("installed Worker MCP runner preserves original stages and lets cleanup fai
   );
 });
 
+test("installed Worker MCP cleanup waits for exact process closure and proves durable cancellation markers", () => {
+  const source = fs.readFileSync(RUNNER, "utf8");
+  assert.match(
+    source,
+    /const TERMINAL_PROCESS_CLOSURE_TIMEOUT_MS = 30_000;/
+  );
+  assert.match(
+    source,
+    /async function waitForTerminalProcessClosure\([\s\S]*?stableScans >= 2[\s\S]*?setTimeout\(resolve, STATE_POLL_MS\)/
+  );
+  assert.match(
+    source,
+    /job = await waitForTerminalProcessClosure\(context, tracker, expectedStatus\);/
+  );
+  assert.match(
+    source,
+    /await proveTerminalCleanup\(context, tracker, "completed"\)/
+  );
+  assert.match(
+    source,
+    /await proveTerminalCleanup\(context, tracker, "cancelled"\)/
+  );
+  assert.match(source, /const markerName = `\$\{job\.id\}\.cancel`;/);
+  assert.match(source, /name\.startsWith\(`\$\{markerName\}\.`\)/);
+  assert.match(
+    source,
+    /const nonce = context\.mutation\.cancellationNonce\(job\);/
+  );
+  assert.match(source, /nonce !== workerNonce/);
+  assert.match(source, /\(opened\.mode & 0o777\) !== 0o600/);
+  assert.match(
+    source,
+    /opened\.size !== Buffer\.byteLength\(`\$\{nonce\}\\n`\)/
+  );
+  assert.match(
+    source,
+    /fs\.readFileSync\(descriptor, "utf8"\) !== `\$\{nonce\}\\n`/
+  );
+  assert.match(
+    source,
+    /if \(expectedStatus !== "cancelled"\) \{[\s\S]*?fs\.lstatSync\(marker\);[\s\S]*?error\?\.code !== "ENOENT"/
+  );
+});
+
 test("package and repository validator pin the installed Worker MCP runner wiring", () => {
   const packageJson = JSON.parse(
     fs.readFileSync(path.join(ROOT, "package.json"), "utf8")

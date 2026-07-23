@@ -39,7 +39,11 @@ import {
 } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
 import { materializeRole } from "../plugins/grok/scripts/lib/worker-roles.mjs";
 import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
-import { tryReadJob, updateJob } from "../plugins/grok/scripts/lib/state.mjs";
+import {
+  cancelFile,
+  tryReadJob,
+  updateJob
+} from "../plugins/grok/scripts/lib/state.mjs";
 import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
@@ -1874,6 +1878,20 @@ test("MCP cancellation of an active provider reaches terminal state and leaves n
   const log = readFakeLog(fake.logFile);
   assert.equal(log.filter((entry) => entry.event === "prompt").length, 1);
   assert.equal(log.filter((entry) => entry.event === "cancel").length, 1);
+  const marker = cancelFile(root, workerId, env);
+  const markerStat = fs.lstatSync(marker);
+  assert.equal(markerStat.isFile(), true);
+  assert.equal(markerStat.isSymbolicLink(), false);
+  assert.equal(markerStat.mode & 0o777, 0o600);
+  assert.equal(
+    fs.readFileSync(marker, "utf8"),
+    `${terminal.workerProcess.nonce}\n`
+  );
+  assert.deepEqual(
+    fs.readdirSync(path.dirname(marker))
+      .filter((name) => name.startsWith(`${workerId}.cancel.`)),
+    []
+  );
   await assertAllProcessesGone(terminal);
 });
 

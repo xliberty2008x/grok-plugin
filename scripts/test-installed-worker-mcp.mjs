@@ -79,6 +79,7 @@ const LIVE_GATES = Object.freeze([
 const RPC_TIMEOUT_MS = 35_000;
 const MCP_SHUTDOWN_TIMEOUT_MS = 2_000;
 const SCENARIO_TIMEOUT_MS = 20 * 60_000;
+const TERMINAL_PROCESS_CLOSURE_TIMEOUT_MS = 30_000;
 const STATE_POLL_MS = 100;
 const MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_RECEIPT_BYTES = 1024 * 1024;
@@ -3164,17 +3165,113 @@ async function deleteAndProveSessionAbsent(context, tracker, {
   context.runner.sessions.delete(tracker.sessionId);
 }
 
-function proveTerminalCleanup(context, tracker, expectedStatus) {
-  const job = readPrivateJob(context, tracker, {
-    recordProviderObservation: tracker.observedProviderGenerations.length === 0
-  });
+function terminalCleanupRecordMatches(job, expectedStatus) {
+  return (
+    job.status === expectedStatus
+    && job.result?.hostVerification === "not_run"
+    && job.result?.taskRuntimeCleaned === true
+  );
+}
+
+async function waitForTerminalProcessClosure(
+  context,
+  tracker,
+  expectedStatus
+) {
+  const deadline = Date.now() + TERMINAL_PROCESS_CLOSURE_TIMEOUT_MS;
+  let stableScans = 0;
+  let latest = null;
+  while (Date.now() <= deadline) {
+    checkInterrupted(context.runner);
+    latest = readPrivateJob(context, tracker);
+    if (!terminalCleanupRecordMatches(latest, expectedStatus)) {
+      fail("E_CLEANUP");
+    }
+    const allGone = [...tracker.processIdentities.values()]
+      .every((identity) => context.processControl.processGroupGone(identity));
+    stableScans = allGone ? stableScans + 1 : 0;
+    if (stableScans >= 2) return latest;
+    await new Promise((resolve) => setTimeout(resolve, STATE_POLL_MS));
+  }
+  fail("E_CLEANUP");
+}
+
+function proveExactCancellationMarker(
+  context,
+  tracker,
+  jobsDirectory,
+  job,
+  expectedStatus
+) {
+  const markerName = `${job.id}.cancel`;
+  const marker = path.join(jobsDirectory, markerName);
+  let names;
+  try {
+    names = fs.readdirSync(jobsDirectory);
+  } catch {
+    fail("E_CLEANUP");
+  }
+  if (names.some((name) => name.startsWith(`${markerName}.`))) {
+    fail("E_CLEANUP");
+  }
+  if (expectedStatus !== "cancelled") {
+    try {
+      fs.lstatSync(marker);
+      fail("E_CLEANUP");
+    } catch (error) {
+      if (error instanceof QualificationError) throw error;
+      if (error?.code !== "ENOENT") fail("E_CLEANUP");
+    }
+    return;
+  }
+
+  const nonce = context.mutation.cancellationNonce(job);
+  const workerNonce = tracker.processIdentities.get("worker")?.nonce;
   if (
-    job.status !== expectedStatus
-    || job.result?.hostVerification !== "not_run"
-    || job.result?.taskRuntimeCleaned !== true
+    typeof nonce !== "string"
+    || nonce.length < 1
+    || nonce.length > 256
+    || /[\r\n]/.test(nonce)
+    || nonce !== workerNonce
   ) {
     fail("E_CLEANUP");
   }
+  let descriptor;
+  try {
+    const entry = fs.lstatSync(marker);
+    if (!entry.isFile() || entry.isSymbolicLink()) fail("E_CLEANUP");
+    descriptor = fs.openSync(
+      marker,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+    );
+    const opened = fs.fstatSync(descriptor);
+    if (
+      !opened.isFile()
+      || opened.dev !== entry.dev
+      || opened.ino !== entry.ino
+      || (opened.mode & 0o777) !== 0o600
+      || (
+        typeof process.getuid === "function"
+        && opened.uid !== process.getuid()
+      )
+      || opened.size !== Buffer.byteLength(`${nonce}\n`)
+      || fs.readFileSync(descriptor, "utf8") !== `${nonce}\n`
+    ) {
+      fail("E_CLEANUP");
+    }
+  } catch (error) {
+    if (error instanceof QualificationError) throw error;
+    fail("E_CLEANUP");
+  } finally {
+    if (descriptor != null) fs.closeSync(descriptor);
+  }
+}
+
+async function proveTerminalCleanup(context, tracker, expectedStatus) {
+  let job = readPrivateJob(context, tracker, {
+    recordProviderObservation: tracker.observedProviderGenerations.length === 0
+  });
+  if (!terminalCleanupRecordMatches(job, expectedStatus)) fail("E_CLEANUP");
   if (tracker.processIdentities.size !== 3) fail("E_CLEANUP");
   const distinctIdentities = new Set(
     [...tracker.processIdentities.values()].map((identity) => (
@@ -3182,9 +3279,7 @@ function proveTerminalCleanup(context, tracker, expectedStatus) {
     ))
   );
   if (distinctIdentities.size !== 3) fail("E_CLEANUP");
-  for (const identity of tracker.processIdentities.values()) {
-    if (!context.processControl.processGroupGone(identity)) fail("E_CLEANUP");
-  }
+  job = await waitForTerminalProcessClosure(context, tracker, expectedStatus);
   let guard;
   try {
     guard = context.guard.loadProviderGuard(context.fixtureRoot, tracker.workerId);
@@ -3200,13 +3295,20 @@ function proveTerminalCleanup(context, tracker, expectedStatus) {
   );
   if (!jobFile) fail("E_CLEANUP");
   const stateDirectory = path.dirname(path.dirname(jobFile));
+  const jobsDirectory = path.dirname(jobFile);
   const homeMarker = job.request?.providerHomeId || job.id;
   const transient = [
     path.join(stateDirectory, "task-homes", homeMarker, ".grok", "auth.json"),
-    path.join(stateDirectory, "task-homes", homeMarker, ".grok", "agent-profiles"),
-    path.join(path.dirname(jobFile), `${job.id}.cancel`)
+    path.join(stateDirectory, "task-homes", homeMarker, ".grok", "agent-profiles")
   ];
   if (transient.some((candidate) => fs.existsSync(candidate))) fail("E_CLEANUP");
+  proveExactCancellationMarker(
+    context,
+    tracker,
+    jobsDirectory,
+    job,
+    expectedStatus
+  );
   let stateNames;
   try {
     stateNames = fs.readdirSync(stateDirectory);
@@ -3376,7 +3478,7 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   client = null;
 
   enterQualificationStage("completion-cleanup-private");
-  const terminalJob = proveTerminalCleanup(context, tracker, "completed");
+  const terminalJob = await proveTerminalCleanup(context, tracker, "completed");
   enterQualificationStage("completion-cleanup-snapshot");
   validateTerminalWorkerSnapshot(
     result.worker,
@@ -3556,7 +3658,7 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
   client = null;
 
   enterQualificationStage("cancellation-cleanup-private");
-  const terminalJob = proveTerminalCleanup(context, tracker, "cancelled");
+  const terminalJob = await proveTerminalCleanup(context, tracker, "cancelled");
   enterQualificationStage("cancellation-cleanup-snapshot");
   validateTerminalWorkerSnapshot(
     result.worker,
