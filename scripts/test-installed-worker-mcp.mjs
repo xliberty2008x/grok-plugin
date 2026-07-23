@@ -20,6 +20,14 @@ import {
   validateProviderCapabilityAgreement
 } from "./lib/installed-worker-mcp-contract.mjs";
 import { selectInstalledWorkerMcpFailure } from "./lib/installed-worker-mcp-failure.mjs";
+import {
+  SETUP_COMMAND_IDENTITY_INTERVAL_MS,
+  SETUP_COMMAND_IDENTITY_TIMEOUT_MS,
+  captureSetupCommandIdentityWithPolling,
+  decideSetupScanObservationDisposition,
+  setupCleanupRequiresObservation,
+  unownedSetupCommandGroupGone
+} from "./lib/installed-worker-mcp-setup-boundary.mjs";
 import { spawnMcpStdioClient } from "./lib/mcp-stdio-client.mjs";
 import {
   canonicalPath,
@@ -315,6 +323,7 @@ function createSetupBoundary({
     scanFailed: false,
     child: null,
     commandIdentity: null,
+    commandObservationIdentity: null,
     commandPath: null,
     childExited: false,
     cleaned: false
@@ -354,14 +363,34 @@ function validateSetupGuard(boundary, marker, record) {
   } catch {
     fail("E_CLEANUP");
   }
-  if (
-    !boundary.processControl.processGroupGone(record.providerProcess)
-    && !boundary.processControl.identityMatches(
+  let verifiedMatch = false;
+  try {
+    verifiedMatch = boundary.processControl.identityMatches(
       record.providerProcess,
       marker,
       "provider"
-    )
-  ) {
+    );
+  } catch {
+    fail("E_CLEANUP");
+  }
+  if (verifiedMatch) return;
+  let firstProcessGroupGone = false;
+  let secondProcessGroupGone = false;
+  try {
+    firstProcessGroupGone = boundary.processControl.processGroupGone(
+      record.providerProcess
+    );
+    secondProcessGroupGone = boundary.processControl.processGroupGone(
+      record.providerProcess
+    );
+  } catch {
+    fail("E_CLEANUP");
+  }
+  if (decideSetupScanObservationDisposition({
+    verifiedMatch,
+    firstProcessGroupGone,
+    secondProcessGroupGone
+  }) !== "ignore-stale") {
     fail("E_CLEANUP");
   }
 }
@@ -404,7 +433,11 @@ function scanSetupBoundary(boundary) {
       } catch {
         fail("E_CLEANUP");
       }
-      if (!record) fail("E_CLEANUP");
+      // The provider may remove its exact guard between readdir and load.
+      // That observation is not evidence, but it is also not ambiguous live
+      // state; successful setup still has to produce another validated guard
+      // observation before cleanup can pass.
+      if (!record) continue;
       validateSetupGuard(boundary, marker, record);
       const previous = boundary.guardRecords.get(marker);
       if (previous && !sameJson(previous, record)) fail("E_CLEANUP");
@@ -448,16 +481,69 @@ function scanSetupBoundary(boundary) {
     const marker = setupMarkerFromCommand(boundary, command);
     if (!marker) continue;
     const startToken = boundary.processControl.processStartToken(pid);
-    if (!startToken) fail("E_CLEANUP");
+    if (!startToken) {
+      const incompleteIdentity = {
+        pid,
+        startToken: null,
+        processGroupId: pid
+      };
+      let firstProcessGroupGone = false;
+      let secondProcessGroupGone = false;
+      try {
+        firstProcessGroupGone = boundary.processControl.processGroupGone(
+          incompleteIdentity
+        );
+        secondProcessGroupGone = boundary.processControl.processGroupGone(
+          incompleteIdentity
+        );
+      } catch {
+        fail("E_CLEANUP");
+      }
+      if (decideSetupScanObservationDisposition({
+        verifiedMatch: false,
+        firstProcessGroupGone,
+        secondProcessGroupGone
+      }) === "ignore-stale") {
+        continue;
+      }
+      fail("E_CLEANUP");
+    }
     const identity = { pid, startToken, processGroupId: pid };
     try {
       boundary.processControl.assertCompleteDetachedOwnedIdentity(identity);
     } catch {
       fail("E_CLEANUP");
     }
-    if (
-      !boundary.processControl.identityMatches(identity, marker, "provider")
-    ) {
+    let verifiedMatch = false;
+    try {
+      verifiedMatch = boundary.processControl.identityMatches(
+        identity,
+        marker,
+        "provider"
+      );
+    } catch {
+      fail("E_CLEANUP");
+    }
+    if (!verifiedMatch) {
+      let firstProcessGroupGone = false;
+      let secondProcessGroupGone = false;
+      try {
+        firstProcessGroupGone = boundary.processControl.processGroupGone(
+          identity
+        );
+        secondProcessGroupGone = boundary.processControl.processGroupGone(
+          identity
+        );
+      } catch {
+        fail("E_CLEANUP");
+      }
+      if (decideSetupScanObservationDisposition({
+        verifiedMatch,
+        firstProcessGroupGone,
+        secondProcessGroupGone
+      }) === "ignore-stale") {
+        continue;
+      }
       fail("E_CLEANUP");
     }
     const previous = boundary.identities.get(marker);
@@ -472,13 +558,18 @@ function scanSetupBoundary(boundary) {
 async function stopSetupCommand(boundary) {
   const child = boundary?.child;
   const identity = boundary?.commandIdentity;
-  if (
-    !child
-    || !identity
-    || boundary.processControl.processGroupGone(identity)
-  ) {
-    return true;
+  if (!child) return true;
+  if (!identity) {
+    if (boundary.commandObservationIdentity) {
+      return unownedSetupCommandGroupGone({
+        identity: boundary.commandObservationIdentity,
+        processGroupGone: boundary.processControl.processGroupGone
+      });
+    }
+    return boundary.childExited === true
+      && (child.exitCode != null || child.signalCode != null);
   }
+  if (boundary.processControl.processGroupGone(identity)) return true;
   const commandStillOwned = () => (
     boundary.processControl.processStartToken(identity.pid)
       === identity.startToken
@@ -593,6 +684,14 @@ async function cleanupSetupBoundary(boundary, {
       boundary.commandIdentity
       && !boundary.processControl.processGroupGone(boundary.commandIdentity)
     )
+    || (boundary.child && !boundary.commandIdentity && (
+      boundary.commandObservationIdentity
+        ? !unownedSetupCommandGroupGone({
+            identity: boundary.commandObservationIdentity,
+            processGroupGone: boundary.processControl.processGroupGone
+          })
+        : boundary.childExited !== true
+    ))
     || (requireObservation && (
       !boundary.observedProvider
       || !boundary.observedGuard
@@ -625,31 +724,7 @@ async function runSetupJson(command, args, {
     });
     boundary.child = child;
     boundary.commandPath = path.resolve(command);
-    if (Number.isSafeInteger(child.pid) && child.pid > 0) {
-      boundary.commandPids.add(child.pid);
-      const startToken = boundary.processControl.processStartToken(child.pid);
-      const commandText = boundary.processControl.processCommand(child.pid);
-      const identity = {
-        pid: child.pid,
-        startToken,
-        processGroupId: child.pid
-      };
-      try {
-        boundary.processControl.assertCompleteDetachedOwnedIdentity(identity);
-      } catch {
-        abortCode = "E_CLEANUP";
-      }
-      if (
-        !commandText.includes(boundary.commandPath)
-        || !commandText.includes("setup")
-        || !commandText.includes("--json")
-      ) {
-        abortCode = "E_CLEANUP";
-      }
-      boundary.commandIdentity = identity;
-    } else {
-      abortCode = "E_SETUP";
-    }
+    let commandCapture = Promise.resolve({ status: "invalid-pid" });
     const abort = (code) => {
       abortCode ||= code;
       const identity = boundary.commandIdentity;
@@ -668,6 +743,34 @@ async function runSetupJson(command, args, {
         }
       } catch {}
     };
+    if (Number.isSafeInteger(child.pid) && child.pid > 0) {
+      boundary.commandPids.add(child.pid);
+      boundary.commandObservationIdentity = Object.freeze({
+        pid: child.pid,
+        startToken: null,
+        processGroupId: child.pid
+      });
+      commandCapture = captureSetupCommandIdentityWithPolling({
+        pid: child.pid,
+        commandPath: boundary.commandPath,
+        readStartToken: boundary.processControl.processStartToken,
+        readCommand: boundary.processControl.processCommand,
+        processGroupGone: boundary.processControl.processGroupGone,
+        assertOwnedIdentity:
+          boundary.processControl.assertCompleteDetachedOwnedIdentity,
+        onOwned: (identity) => {
+          boundary.commandIdentity = structuredClone(identity);
+        },
+        timeoutMs: SETUP_COMMAND_IDENTITY_TIMEOUT_MS,
+        intervalMs: SETUP_COMMAND_IDENTITY_INTERVAL_MS
+      }).catch(() => ({ status: "incomplete-live" }));
+      commandCapture.then((outcome) => {
+        if (outcome.status === "incomplete-live") abort("E_CLEANUP");
+        else if (outcome.status === "invalid-pid") abort("E_SETUP");
+      });
+    } else {
+      abortCode = "E_SETUP";
+    }
     const collect = (kind, chunk) => {
       if (kind === "stdout") stdout += String(chunk);
       else stderr += String(chunk);
@@ -704,6 +807,8 @@ async function runSetupJson(command, args, {
             -boundary.commandIdentity.processGroupId,
             "SIGKILL"
           );
+        } else {
+          child.kill("SIGKILL");
         }
       } catch {}
       settled = true;
@@ -712,32 +817,40 @@ async function runSetupJson(command, args, {
       reject(new QualificationError(abortCode || "E_SETUP"));
     }, timeoutMs + 2_000);
     child.on("close", (code, signal) => {
-      if (settled) return;
-      settled = true;
-      clearInterval(poll);
-      clearTimeout(timeout);
-      clearTimeout(hardTimeout);
-      boundary.childExited = true;
-      try {
-        scanSetupBoundary(boundary);
-      } catch {
-        boundary.scanFailed = true;
-        abortCode ||= "E_CLEANUP";
-      }
-      if (
-        abortCode
-        || code !== 0
-        || signal
-        || String(stderr).trim() !== ""
-      ) {
-        reject(new QualificationError(abortCode || "E_SETUP"));
-        return;
-      }
-      try {
-        resolve(safeParseJson(stdout, "E_SETUP"));
-      } catch (error) {
-        reject(error);
-      }
+      void (async () => {
+        const commandCaptureOutcome = await commandCapture;
+        if (settled) return;
+        settled = true;
+        clearInterval(poll);
+        clearTimeout(timeout);
+        clearTimeout(hardTimeout);
+        boundary.childExited = true;
+        if (commandCaptureOutcome.status === "incomplete-live") {
+          abortCode ||= "E_CLEANUP";
+        } else if (commandCaptureOutcome.status === "invalid-pid") {
+          abortCode ||= "E_SETUP";
+        }
+        try {
+          scanSetupBoundary(boundary);
+        } catch {
+          boundary.scanFailed = true;
+          abortCode ||= "E_CLEANUP";
+        }
+        if (
+          abortCode
+          || code !== 0
+          || signal
+          || String(stderr).trim() !== ""
+        ) {
+          reject(new QualificationError(abortCode || "E_SETUP"));
+          return;
+        }
+        try {
+          resolve(safeParseJson(stdout, "E_SETUP"));
+        } catch (error) {
+          reject(error);
+        }
+      })();
     });
   });
 }
@@ -3893,12 +4006,20 @@ async function qualify(runner) {
   enterQualificationStage("provider-setup-cleanup");
   if (!await cleanupSetupBoundary(
     runner.setupBoundary,
-    { terminate: false, requireObservation: true }
+    {
+      terminate: false,
+      requireObservation: setupCleanupRequiresObservation(setupJson)
+    }
   )) {
     fail("E_CLEANUP");
   }
   enterQualificationStage("provider-setup-contract");
-  const setup = validateInstalledSetup(setupJson);
+  let setup;
+  try {
+    setup = validateInstalledSetup(setupJson);
+  } catch {
+    fail("E_SETUP");
+  }
   const setupFixtureStatus = runBounded("git", [
     "status", "--porcelain=v1", "-z", "--untracked-files=all"
   ], {

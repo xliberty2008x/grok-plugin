@@ -329,6 +329,19 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /assertDispatchContract\(job\)/);
   assert.match(source, /assertDurableSpawnRequestBinding\(job, context\.env\)/);
   assert.match(source, /const setupJson = await runSetupJson\(/);
+  assert.match(source, /captureSetupCommandIdentityWithPolling\(\{/);
+  assert.match(source, /decideSetupScanObservationDisposition\(\{/);
+  assert.match(source, /if \(!record\) continue;/);
+  assert.match(source, /setupCleanupRequiresObservation\(setupJson\)/);
+  assert.match(source, /commandObservationIdentity = Object\.freeze\(\{/);
+  assert.match(source, /unownedSetupCommandGroupGone\(\{/);
+  assert.match(source, /setup = validateInstalledSetup\(setupJson\);/);
+  assert.match(source, /catch \{\s*fail\("E_SETUP"\);\s*\}/);
+  assert.match(
+    source,
+    /if \(!identity\) \{\s*if \(boundary\.commandObservationIdentity\)/
+  );
+  assert.match(source, /return boundary\.childExited === true/);
   for (const stage of [
     "provider-setup-command",
     "provider-setup-cleanup",
@@ -423,7 +436,9 @@ test("package and repository validator pin the installed Worker MCP runner wirin
   );
   for (const required of [
     '"scripts/test-installed-worker-mcp.mjs"',
+    '"scripts/lib/installed-worker-mcp-setup-boundary.mjs"',
     '"tests/installed-worker-mcp-runner.test.mjs"',
+    '"tests/installed-worker-mcp-setup-boundary.test.mjs"',
     '"test:installed-worker-mcp"'
   ]) {
     assert.ok(validator.includes(required), required);
