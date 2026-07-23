@@ -9,6 +9,7 @@ import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import {
   CODEX_COMPANION,
   initRepo,
+  ptyPythonAvailable,
   run,
   runCodexCompanion,
   runPtyStdin,
@@ -17,7 +18,24 @@ import {
   waitFor
 } from "./helpers.mjs";
 
-const PYTHON_AVAILABLE = run("python3", ["--version"], { timeout: 5_000 }).status === 0;
+const PYTHON_AVAILABLE = ptyPythonAvailable();
+const PYTHON_BINDING = (() => {
+  const proofBinding = process.env.GROK_PROOF_PYTHON;
+  if (typeof proofBinding === "string" && path.isAbsolute(proofBinding)) return proofBinding;
+  const probe = run("python3", [
+    "-I",
+    "-S",
+    "-B",
+    "-c",
+    "import os,sys; print(os.path.realpath(sys.executable))"
+  ], { timeout: 5_000 });
+  const candidate = probe.status === 0 ? probe.stdout.trim() : "";
+  return path.isAbsolute(candidate) ? candidate : null;
+})();
+
+function shellSingleQuote(value) {
+  return "'" + String(value).replace(/'/g, "'\"'\"'") + "'";
+}
 
 function jobRecordFiles(root) {
   if (!fs.existsSync(root)) return [];
@@ -32,6 +50,59 @@ function jobRecordFiles(root) {
   visit(root);
   return found;
 }
+
+test("PTY harness uses but does not expose the proof-only Python binding", {
+  skip: process.platform === "win32"
+    ? "PTY harness is POSIX-only"
+    : (!(PYTHON_AVAILABLE && PYTHON_BINDING) ? "Python 3 PTY harness is unavailable" : false)
+}, (t) => {
+  const root = tempDir("grok-proof-python-control-");
+  const target = path.join(root, "inspect-proof-python.mjs");
+  const wrapper = path.join(root, "bound-python-wrapper");
+  const argumentLog = path.join(root, "python-arguments.log");
+  const exposedMarker = path.join(root, "proof-python-was-exposed");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(wrapper, [
+    "#!/bin/sh",
+    `printf '%s\\n' "$*" >> ${shellSingleQuote(argumentLog)}`,
+    `if [ "\${GROK_PROOF_PYTHON+x}" = x ]; then : > ${shellSingleQuote(exposedMarker)}; fi`,
+    `exec ${shellSingleQuote(PYTHON_BINDING)} "$@"`,
+    ""
+  ].join("\n"), { mode: 0o755 });
+  fs.chmodSync(wrapper, 0o755);
+  fs.writeFileSync(target, [
+    'process.stdout.write(JSON.stringify({',
+    '  proofPythonVisible: Object.hasOwn(process.env, "GROK_PROOF_PYTHON"),',
+    '  ordinaryMarker: process.env.GROK_TEST_ORDINARY_MARKER || null',
+    '}));',
+    ''
+  ].join("\n"));
+
+  const environment = {
+    ...process.env,
+    GROK_PROOF_PYTHON: wrapper,
+    GROK_TEST_ORDINARY_MARKER: "preserved"
+  };
+  assert.equal(ptyPythonAvailable({ env: environment }), true);
+  const invocation = runPtyStdin(target, [], {
+    cwd: root,
+    env: environment,
+    input: "",
+    timeout: 10_000
+  });
+  assert.equal(invocation.driver.status, 0, invocation.driver.stderr || invocation.driver.stdout);
+  assert.ok(invocation.result);
+  assert.equal(invocation.result.code, 0, invocation.result.stderr);
+  assert.deepEqual(JSON.parse(invocation.result.stdout), {
+    proofPythonVisible: false,
+    ordinaryMarker: "preserved"
+  });
+  assert.equal(fs.existsSync(exposedMarker), false, "proof selector must be scrubbed before Python starts");
+  const invocations = fs.readFileSync(argumentLog, "utf8").trim().split("\n");
+  assert.equal(invocations.length, 2);
+  assert.match(invocations[0], /^-I -S -B -c import pty$/);
+  assert.match(invocations[1], /^-I -S -B .*pty-stdin-driver\.py /);
+});
 
 test("source Codex wrapper survives delayed input on a genuinely nonblocking PTY", {
   skip: process.platform === "win32"

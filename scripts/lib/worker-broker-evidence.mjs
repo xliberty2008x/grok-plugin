@@ -2006,6 +2006,73 @@ function resolveProofNodeBinding() {
   return Object.freeze({ executable: binding, pathEntry: namedBinding });
 }
 
+function trustedPythonCandidates() {
+  const sibling = path.join(
+    path.dirname(process.execPath),
+    process.platform === "win32" ? "python.exe" : "python3"
+  );
+  if (process.platform === "darwin") {
+    return uniqueAbsolutePaths([
+      sibling,
+      "/opt/homebrew/bin/python3",
+      "/usr/local/bin/python3",
+      "/opt/local/bin/python3",
+      "/usr/bin/python3"
+    ]);
+  }
+  return uniqueAbsolutePaths([
+    sibling,
+    "/usr/bin/python3",
+    "/bin/python3",
+    "/usr/local/bin/python3",
+    "/run/current-system/sw/bin/python3",
+    "/nix/var/nix/profiles/default/bin/python3"
+  ]);
+}
+
+function isShebangScript(binding) {
+  try {
+    const descriptor = fs.openSync(binding.canonicalPath, fs.constants.O_RDONLY);
+    try {
+      const prefix = Buffer.alloc(2);
+      return fs.readSync(descriptor, prefix, 0, prefix.length, 0) === 2
+        && prefix[0] === 0x23
+        && prefix[1] === 0x21;
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  } catch {
+    return true;
+  }
+}
+
+function resolveProofPythonBinding(pathEntries) {
+  for (const candidate of trustedPythonCandidates()) {
+    try {
+      const binding = captureBoundFile(candidate, { executable: true });
+      // Shell-based pyenv/asdf-style shims would add an unbound interpreter
+      // behind the captured file identity. Proof production accepts only a
+      // fixed native interpreter at one of the reviewed platform locations.
+      if (isShebangScript(binding)) continue;
+      if (probeBoundExecutable(binding, [
+        "-I",
+        "-S",
+        "-B",
+        "-c",
+        "import errno,json,os,pty,subprocess,sys,threading,time"
+      ], {
+        // Probe under the same PATH later inherited by proof gates. The bound
+        // Python itself is invoked by absolute canonical path, never via PATH.
+        pathEntries
+      })) return binding;
+    } catch {
+      // A fixed candidate is absent, unusable, lacks the POSIX PTY modules, or
+      // changed while probed. Never fall back to caller-controlled PATH.
+    }
+  }
+  throw proofToolchainError();
+}
+
 function trustedNpmLauncherCandidates(nodeBinding) {
   const nodeDirectory = path.dirname(nodeBinding.pathEntry.entryPath);
   const executableName = process.platform === "win32" ? "npm.cmd" : "npm";
@@ -2077,12 +2144,14 @@ function assertProofToolchainIdentity(toolchain) {
     || !toolchain?.node?.pathEntry
     || !toolchain?.npm?.launcher
     || !toolchain?.npm?.cli
-    || !toolchain?.git) throw proofToolchainError();
+    || !toolchain?.git
+    || !toolchain?.python) throw proofToolchainError();
   assertBoundFileIdentity(toolchain.node.executable);
   assertBoundFileIdentity(toolchain.node.pathEntry);
   assertBoundFileIdentity(toolchain.npm.launcher);
   assertBoundFileIdentity(toolchain.npm.cli);
   assertBoundFileIdentity(toolchain.git);
+  assertBoundFileIdentity(toolchain.python);
 }
 
 function proofToolchainDigest(toolchain) {
@@ -2107,7 +2176,8 @@ function proofToolchainDigest(toolchain) {
       launcher: identity(toolchain.npm.launcher),
       cli: identity(toolchain.npm.cli)
     },
-    git: identity(toolchain.git)
+    git: identity(toolchain.git),
+    python: identity(toolchain.python)
   }));
 }
 
@@ -2344,7 +2414,14 @@ function createProofExecutionContext() {
   const node = resolveProofNodeBinding();
   const npm = resolveTrustedNpmBinding(node);
   const git = trustedGitBinding();
-  const toolchain = Object.freeze({ node, npm, git });
+  const pathEntries = uniqueAbsolutePaths([
+    path.dirname(node.pathEntry.entryPath),
+    path.dirname(node.executable.canonicalPath),
+    path.dirname(npm.launcher.entryPath),
+    path.dirname(git.canonicalPath)
+  ]);
+  const python = resolveProofPythonBinding(pathEntries);
+  const toolchain = Object.freeze({ node, npm, git, python });
   assertProofToolchainIdentity(toolchain);
   const digest = proofToolchainDigest(toolchain);
   const temporaryBase = proofTemporaryBase();
@@ -2362,13 +2439,13 @@ function createProofExecutionContext() {
     throw error;
   }
   const proofHome = homeIdentity.path;
-  const pathEntries = uniqueAbsolutePaths([
-    path.dirname(node.pathEntry.entryPath),
-    path.dirname(node.executable.canonicalPath),
-    path.dirname(npm.launcher.entryPath),
-    path.dirname(git.canonicalPath)
-  ]);
-  const environment = Object.freeze(baseProofEnvironment(pathEntries, proofHome));
+  const environment = Object.freeze({
+    ...baseProofEnvironment(pathEntries, proofHome),
+    // PTY tests consume the already captured and digested interpreter by
+    // absolute canonical path. Keep its directory out of PATH so a same-name
+    // executable beside Node, npm, or Git cannot shadow the validated binding.
+    GROK_PROOF_PYTHON: python.canonicalPath
+  });
   let cleaned = false;
   return {
     toolchain,

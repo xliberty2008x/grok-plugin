@@ -2095,6 +2095,7 @@ test("proof command capture strips ambient authority and never returns secret-be
     XAI_API_KEY: secret,
     GROK_E2E: "1",
     GROK_E2E_CANCEL: "1",
+    GROK_PROOF_PYTHON: path.join(ambientAuthorityCanary, "python3"),
     NODE_OPTIONS: "--inspect",
     GIT_DIR: "elsewhere",
     PASSWORD: secret
@@ -2103,6 +2104,7 @@ test("proof command capture strips ambient authority and never returns secret-be
     "XAI_API_KEY",
     "GROK_E2E",
     "GROK_E2E_CANCEL",
+    "GROK_PROOF_PYTHON",
     "NODE_OPTIONS",
     "GIT_DIR",
     "PASSWORD"
@@ -2188,14 +2190,24 @@ test("mandatory proof reporter fails an otherwise successful test command with s
   assert.match(rejected.stdout, /"todo":1/);
 });
 
-test("proof publication ignores caller-prepended fake npm and git and survives honest strict replay", () => {
-  const { root } = initProofRunnerFixture("proof-path-poison");
+test("proof publication ignores caller-prepended fake npm, git, and python and survives honest strict replay", () => {
+  const { root } = initProofRunnerFixture(
+    "proof-path-poison",
+    '"$GROK_PROOF_PYTHON" -I -S -B -c "import pty"'
+  );
   const poisonRoot = tempDir("proof-path-poison-bin-");
   const fakeBin = path.join(poisonRoot, "bin");
   const npmMarker = path.join(poisonRoot, "fake-npm-invoked");
   const gitMarker = path.join(poisonRoot, "fake-git-invoked");
+  const pythonMarker = path.join(poisonRoot, "fake-python-invoked");
   writePathPoisonForwarder(fakeBin, "npm", locateAmbientExecutable("npm"), npmMarker);
   writePathPoisonForwarder(fakeBin, "git", locateAmbientExecutable("git"), gitMarker);
+  const fakePython = writePathPoisonForwarder(
+    fakeBin,
+    "python3",
+    locateAmbientExecutable("python3"),
+    pythonMarker
+  );
 
   const source = `
 import { proveWorkerBrokerPhase } from ${JSON.stringify(EVIDENCE_MODULE_URL)};
@@ -2217,6 +2229,7 @@ process.exitCode = result.ok ? 0 : 1;
     env: {
       ...process.env,
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ""}`,
+      GROK_PROOF_PYTHON: fakePython,
       PROOF_ROOT: root
     },
     timeout: 120_000
@@ -2227,6 +2240,7 @@ process.exitCode = result.ok ? 0 : 1;
   assert.match(result.path, /^tests\/e2e-results\/worker-broker\/phase-0\//);
   assert.equal(fs.existsSync(npmMarker), false, "fake npm must never execute");
   assert.equal(fs.existsSync(gitMarker), false, "fake git must never execute");
+  assert.equal(fs.existsSync(pythonMarker), false, "fake python must never execute");
 
   const strict = verifyPhase("0", root, { strict: true });
   assert.equal(strict.ok, true, strict.errors.join("; "));
@@ -2399,6 +2413,40 @@ test("proof producer rejects unsupported cleanup platforms before publication", 
   } finally {
     Object.defineProperty(process, "platform", originalPlatform);
   }
+});
+
+test("proof producer fails closed before publication when no fixed Python binding is usable", {
+  skip: !POSIX_PROOF_PLATFORM
+}, () => {
+  const { root, evidenceDir } = initProofRunnerFixture("proof-python-unavailable");
+  const originalLstat = fs.lstatSync;
+  try {
+    fs.lstatSync = (candidate, ...args) => {
+      const basename = path.basename(String(candidate));
+      if (basename === "python3" || basename === "python.exe") {
+        const error = new Error("fixed Python candidate unavailable");
+        error.code = "ENOENT";
+        throw error;
+      }
+      return originalLstat.call(fs, candidate, ...args);
+    };
+    assert.deepEqual(proveWorkerBrokerPhase({
+      phase: "0",
+      slice: "python-unavailable",
+      root,
+      write: true
+    }), { ok: false, code: "E_PROOF_TOOLCHAIN" });
+  } finally {
+    fs.lstatSync = originalLstat;
+  }
+  assert.equal(fs.existsSync(path.join(evidenceDir, "ledger.json")), false);
+  const phaseDirectory = path.join(evidenceDir, "phase-0");
+  assert.equal(
+    fs.existsSync(phaseDirectory)
+      && fs.readdirSync(phaseDirectory).some((entry) => entry.endsWith(".json")),
+    false,
+    "toolchain failure must not publish a record"
+  );
 });
 
 test("Phase 0 proof fails without publication on dirty, drifting, failed, or secret-output gates", () => {

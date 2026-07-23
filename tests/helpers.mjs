@@ -9,6 +9,18 @@ export const COMPANION = path.join(ROOT, "plugins", "grok", "scripts", "grok-com
 export const CODEX_COMPANION = path.join(ROOT, "plugins", "grok", "scripts", "grok-codex.mjs");
 export const NONBLOCKING_STDIN_CHILD = path.join(ROOT, "tests", "nonblocking-stdin-child.mjs");
 export const PTY_STDIN_DRIVER = path.join(ROOT, "tests", "pty-stdin-driver.py");
+const PTY_PYTHON_FLAGS = Object.freeze(["-I", "-S", "-B"]);
+
+function ptyPythonCommand(env = process.env) {
+  const bound = env?.GROK_PROOF_PYTHON;
+  return typeof bound === "string" && path.isAbsolute(bound) ? bound : "python3";
+}
+
+function withoutProofPythonControl(env = process.env) {
+  const forwarded = { ...(env || {}) };
+  delete forwarded.GROK_PROOF_PYTHON;
+  return forwarded;
+}
 
 export function tempDir(prefix = "grok-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -103,9 +115,18 @@ export function spawnNonblockingStdin(target, args, { cwd, env, timeout = 20000 
 }
 
 export function runPtyStdin(target, args, { cwd, env, input, timeout = 30000 } = {}) {
-  const result = run("python3", [PTY_STDIN_DRIVER, process.execPath, target, ...args], {
+  const sourceEnvironment = env ?? process.env;
+  const result = run(ptyPythonCommand(sourceEnvironment), [
+    ...PTY_PYTHON_FLAGS,
+    PTY_STDIN_DRIVER,
+    process.execPath,
+    target,
+    ...args
+  ], {
     cwd,
-    env,
+    // The absolute interpreter selector is proof-runner control data, not part
+    // of the product runtime contract inherited by the PTY driver or target.
+    env: withoutProofPythonControl(sourceEnvironment),
     input,
     timeout
   });
@@ -115,6 +136,19 @@ export function runPtyStdin(target, args, { cwd, env, input, timeout = 30000 } =
   } catch {
     return { driver: result, result: null };
   }
+}
+
+export function ptyPythonAvailable({ env = process.env, timeout = 5_000 } = {}) {
+  const sourceEnvironment = env ?? process.env;
+  const result = run(ptyPythonCommand(sourceEnvironment), [
+    ...PTY_PYTHON_FLAGS,
+    "-c",
+    "import pty"
+  ], {
+    env: withoutProofPythonControl(sourceEnvironment),
+    timeout
+  });
+  return result.status === 0 && !result.error && !result.signal;
 }
 
 export async function waitFor(predicate, { timeoutMs = 10000, intervalMs = 50 } = {}) {
