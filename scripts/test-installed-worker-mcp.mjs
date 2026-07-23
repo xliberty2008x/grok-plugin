@@ -115,6 +115,13 @@ const QUALIFICATION_STAGES = new Set([
   "completion-spawn-handle-shape",
   "completion-spawn-handle-order",
   "completion-spawn-handle-mode",
+  "completion-spawn-handle-state",
+  "completion-spawn-handle-text",
+  "completion-spawn-handle-start",
+  "completion-spawn-handle-cursor",
+  "completion-spawn-handle-time",
+  "completion-spawn-handle-tracker",
+  "completion-spawn-handle-replay",
   "completion-spawn-witness-read",
   "completion-spawn-witness-contract",
   "completion-spawn-witness-record",
@@ -140,6 +147,13 @@ const QUALIFICATION_STAGES = new Set([
   "cancellation-spawn-handle-shape",
   "cancellation-spawn-handle-order",
   "cancellation-spawn-handle-mode",
+  "cancellation-spawn-handle-state",
+  "cancellation-spawn-handle-text",
+  "cancellation-spawn-handle-start",
+  "cancellation-spawn-handle-cursor",
+  "cancellation-spawn-handle-time",
+  "cancellation-spawn-handle-tracker",
+  "cancellation-spawn-handle-replay",
   "cancellation-spawn-witness-read",
   "cancellation-spawn-witness-contract",
   "cancellation-spawn-witness-record",
@@ -2455,25 +2469,48 @@ function validateActiveSpawnHandle(
   }
   enterScenarioStage(tracker, "spawn-handle-mode");
   if (!replayed) {
+    enterScenarioStage(tracker, "spawn-handle-state");
     if (
       publicWorker.status !== "queued"
       || publicWorker.phase !== "accepted"
-      || publicWorker.summary !== "Spawn committed"
-      || publicWorker.progress
-        !== "Durable job record committed; provider not started by broker spawn."
-      || publicWorker.startedAt !== null
-      || publicWorker.model !== null
-      || publicWorker.effort !== null
-      || publicWorker.eventCursor.sequence !== 1
-      || publicWorker.createdAt !== publicWorker.updatedAt
-      || publicWorker.createdAt !== publicWorker.heartbeatAt
-      || tracker.initialSpawnHandle !== null
     ) {
       fail("E_PRIVATE_STATE");
     }
+    enterScenarioStage(tracker, "spawn-handle-text");
+    if (
+      publicWorker.summary !== "Spawn committed"
+      || publicWorker.progress
+        !== "Durable job record committed; provider not started by broker spawn."
+    ) {
+      fail("E_PRIVATE_STATE");
+    }
+    enterScenarioStage(tracker, "spawn-handle-start");
+    if (
+      publicWorker.startedAt !== null
+      || publicWorker.model !== null
+      || publicWorker.effort !== null
+    ) {
+      fail("E_PRIVATE_STATE");
+    }
+    enterScenarioStage(tracker, "spawn-handle-cursor");
+    if (
+      publicWorker.eventCursor.sequence !== 1
+    ) {
+      fail("E_PRIVATE_STATE");
+    }
+    enterScenarioStage(tracker, "spawn-handle-time");
+    if (
+      publicWorker.createdAt !== publicWorker.updatedAt
+      || publicWorker.createdAt !== publicWorker.heartbeatAt
+    ) {
+      fail("E_PRIVATE_STATE");
+    }
+    enterScenarioStage(tracker, "spawn-handle-tracker");
+    if (tracker.initialSpawnHandle !== null) fail("E_PRIVATE_STATE");
     tracker.initialSpawnHandle = structuredClone(publicWorker);
     return;
   }
+  enterScenarioStage(tracker, "spawn-handle-replay");
   if (
     !tracker.initialSpawnHandle
     || publicWorker.status !== "running"
