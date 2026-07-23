@@ -5,9 +5,9 @@
 import crypto from "node:crypto";
 
 import { CompanionError } from "./errors.mjs";
-import { sanitizeDisplayText } from "./redact.mjs";
 import {
   normalizeWorkerSnapshot,
+  projectWorkerPublicText,
   projectWorkerSnapshot
 } from "./worker-protocol.mjs";
 
@@ -19,17 +19,10 @@ const WORKER_ID_PATTERN = /^(?:review|adversarial-review|task|stop-review)-[a-f0
 const PUBLIC_STATUS = new Set(["queued", "running", "completed", "succeeded", "failed", "cancelled", "unknown"]);
 
 function displayText(value, max = 2000) {
-  return sanitizeDisplayText(typeof value === "string" ? value : "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "")
-    .replace(/[\u0080-\u009F]/g, "")
-    .replace(/(?:file:\/\/)?\/(?:private\/)?tmp(?:\/[^\s"'`;,\)\]}]*)?/g, "[PRIVATE_PATH]")
-    .replace(/(?:file:\/\/)?\/(?:private\/)?var\/folders(?:\/[^\s"'`;,\)\]}]*)?/g, "[PRIVATE_PATH]")
-    .replace(/(?:file:\/\/)?\/(?:Users|home)\/[^/\s"'`]+(?:\/[^\s"'`;,\)\]}]*)?/g, "[PRIVATE_PATH]")
-    .replace(/(?:file:\/\/)?\/root(?:\/[^\s"'`;,\)\]}]*)?/g, "[PRIVATE_PATH]")
-    .replace(/~\/(?:[^\s"'`;,\)\]}]*)?/g, "[PRIVATE_PATH]")
-    .replace(/\b[A-Za-z]:\\Users\\[^\\\s"'`]+(?:\\[^\s"'`;,\)\]}]*)?/g, "[PRIVATE_PATH]")
-    .slice(0, max);
+  return projectWorkerPublicText(
+    typeof value === "string" ? value : "",
+    { maxBytes: max }
+  );
 }
 
 function publicWorkerId(value) {

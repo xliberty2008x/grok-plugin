@@ -206,9 +206,18 @@ test("presentation strips display controls and rejects forged lineage fields", (
   const canary = "PRESENTATION_RAW_CANARY_7f92";
   const privatePath = "/home/alice/private/notes.txt";
   const runtimePath = "/private/var/folders/aa/bb/T/grok-worker/private.txt";
+  const broadPrivatePaths = [
+    "/opt/grok/private.json",
+    "file:///etc/passwd",
+    "C:\\Windows\\System32\\secret.txt",
+    "\\\\server\\share\\secret.txt",
+    "//server/share/secret.txt",
+    "\\Windows\\System32\\secret.txt",
+    "/秘密/文件"
+  ];
   const forged = {
     ...projectWorkerSnapshot(sampleJob()),
-    summary: `\u001b[31mWorking\u0007\u009B31m\u202E A\rOVER ${privatePath} ${runtimePath}`,
+    summary: `\u001b[31mWorking\u0007\u009B31m\u202E A\rOVER ${privatePath} ${runtimePath} ${broadPrivatePaths.join(" ")}`,
     result: {
       workerProtocolVersion: 1,
       resultSchemaVersion: 1,
@@ -226,11 +235,27 @@ test("presentation strips display controls and rejects forged lineage fields", (
   };
   const presented = presentWorker(forged, { alias: `bad\u202E${canary}` });
   const serialized = JSON.stringify(presented);
-  for (const forbidden of ["\u001b", "\u0007", "\u009B", "\u202E", "\r", privatePath, runtimePath, canary]) {
+  for (const forbidden of [
+    "\u001b",
+    "\u0007",
+    "\u009B",
+    "\u202E",
+    "\r",
+    privatePath,
+    runtimePath,
+    ...broadPrivatePaths,
+    canary
+  ]) {
     assert.equal(serialized.includes(forbidden), false);
   }
   assert.equal(presented.alias, null);
   assert.equal(presented.summary.includes("[PRIVATE_PATH]"), true);
+
+  const multibyte = presentWorker({
+    ...projectWorkerSnapshot(sampleJob()),
+    summary: "界".repeat(2_000)
+  });
+  assert.equal(Buffer.byteLength(multibyte.summary, "utf8"), 1_998);
 
   const tree = presentLineageTree([
     { id: "task-aaaaaaaaaaaaaaaa", status: `running\u202E${canary}`, alias: `bad\u202E${canary}` },

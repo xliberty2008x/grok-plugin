@@ -765,22 +765,24 @@ function canonicalIsoTimestamp(value) {
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
 }
 
-function containsPrivatePath(value) {
+const CANONICAL_PRIVATE_PATH_MARKER = "[PRIVATE_PATH]";
+
+function containsRawPrivatePath(value) {
   if (typeof value !== "string") return false;
   return (
-    value.includes("[PRIVATE_PATH]")
-    || /file:\/\//i.test(value)
-    || /(?:^|[^A-Za-z0-9._~\/-])\/(?!\/)[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._@%+=~-]+)*/.test(value)
+    /file:\/\//i.test(value)
+    || /(?:^|[^A-Za-z0-9._~\/-])\/(?!\/)[^\s"'`;,\)\]}]+/.test(value)
     || /(?:^|[^:])\/\/[^/\s]+\/[^/\s]+/.test(value)
     || /~\//.test(value)
-    || /[A-Za-z]:[\\/]/.test(value)
+    || /(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]/.test(value)
     || /\\\\[^\\\s]+\\[^\\\s]+/.test(value)
+    || /(?:^|[^A-Za-z0-9._~-])\\(?!\\)[^\\\s]+(?:\\[^\\\s]+)*/.test(value)
   );
 }
 
 function validPublicText(value, maximumBytes = 2_000, { nullable = false } = {}) {
   if (nullable && value === null) return true;
-  return boundedString(value, maximumBytes) && !containsPrivatePath(value);
+  return boundedString(value, maximumBytes) && !containsRawPrivatePath(value);
 }
 
 function validPublicTextArray(
@@ -802,6 +804,7 @@ function validPublicTextArray(
 function validRepositoryRelativePath(value) {
   if (
     !validPublicText(value, 1_024)
+    || value.includes(CANONICAL_PRIVATE_PATH_MARKER)
     || value.length === 0
     || value.startsWith("/")
     || value.startsWith("\\")
@@ -825,7 +828,7 @@ function validPathArray(value, maximumItems = 200) {
 
 function assertNoPrivateProjectionData(value, code) {
   if (typeof value === "string") {
-    if (containsPrivatePath(value)) fail(code);
+    if (containsRawPrivatePath(value)) fail(code);
     return;
   }
   if (!value || typeof value !== "object") return;

@@ -72,7 +72,7 @@ const PUBLIC_WORKER_STATUSES = new Set(["queued", "running", "completed", "faile
 const PUBLIC_LIFECYCLE_EVENT_TYPES = new Set(LIFECYCLE_EVENT_TYPES);
 const PUBLIC_WORKER_ERROR_CODE_SET = new Set(PUBLIC_WORKER_ERROR_CODES);
 const WORKER_ID_PATTERN = /^(?:review|adversarial-review|task|stop-review)-[a-f0-9]{16,64}$/;
-const MAX_PUBLIC_TEXT_CHARS = 2000;
+const MAX_PUBLIC_TEXT_BYTES = 2000;
 const MAX_PUBLIC_PLAN_ITEMS = 128;
 const MAX_PUBLIC_LIST_ITEMS = 64;
 const MAX_PUBLIC_PATH_ITEMS = 200;
@@ -147,16 +147,30 @@ function sanitizePublicProjection(value) {
 }
 
 function sanitizePublicText(value) {
-  return sanitizeDisplayText(value)
+  let text = sanitizeDisplayText(value)
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "")
-    .replace(/[\u0080-\u009F]/g, "")
-    .replace(/(?:file:\/\/)?\/(?:private\/)?tmp(?:\/[^\s"'`;,\)\]}]*)?/g, "[PRIVATE_PATH]")
-    .replace(/(?:file:\/\/)?\/(?:private\/)?var\/folders(?:\/[^\s"'`;,\)\]}]*)?/g, "[PRIVATE_PATH]")
-    .replace(/(?:file:\/\/)?\/(?:Users|home)\/[^/\s"'`]+(?:\/[^\s"'`;,\)\]}]*)?/g, "[PRIVATE_PATH]")
-    .replace(/(?:file:\/\/)?\/root(?:\/[^\s"'`;,\)\]}]*)?/g, "[PRIVATE_PATH]")
-    .replace(/~\/(?:[^\s"'`;,\)\]}]*)?/g, "[PRIVATE_PATH]")
-    .replace(/\b[A-Za-z]:\\Users\\[^\\\s"'`]+(?:\\[^\s"'`;,\)\]}]*)?/g, "[PRIVATE_PATH]");
+    .replace(/[\u0080-\u009F]/g, "");
+  text = text
+    .replace(/file:\/\/[^\s"'`;,\)\]}]*/gi, "[PRIVATE_PATH]")
+    .replace(/~\/[^\s"'`;,\)\]}]*/g, "[PRIVATE_PATH]")
+    .replace(/\\\\[^\\\s"'`;,\)\]}]+\\[^\s"'`;,\)\]}]*/g, "[PRIVATE_PATH]");
+  text = text.replace(
+    /(^|[^A-Za-z0-9])[A-Za-z]:[\\/][^\s"'`;,\)\]}]*/g,
+    (_match, prefix) => `${prefix}[PRIVATE_PATH]`
+  );
+  text = text.replace(
+    /(^|[^:])\/\/[^/\s"'`;,\)\]}]+\/[^\s"'`;,\)\]}]*/g,
+    (_match, prefix) => `${prefix}[PRIVATE_PATH]`
+  );
+  text = text.replace(
+    /(^|[^A-Za-z0-9._~\/-])\/(?!\/)[^\s"'`;,\)\]}]+/g,
+    (_match, prefix) => `${prefix}[PRIVATE_PATH]`
+  );
+  return text.replace(
+    /(^|[^A-Za-z0-9._~-])\\(?!\\)[^\s"'`;,\)\]}]+/g,
+    (_match, prefix) => `${prefix}[PRIVATE_PATH]`
+  );
 }
 
 function isPlainObject(value) {
@@ -165,12 +179,34 @@ function isPlainObject(value) {
   return prototype === Object.prototype || prototype === null;
 }
 
-function boundedText(value, { fallback = "", max = MAX_PUBLIC_TEXT_CHARS } = {}) {
-  const text = typeof value === "string" ? sanitizePublicText(value) : sanitizePublicText(fallback);
-  return String(text || fallback).slice(0, max);
+function truncateUtf8(value, maximumBytes) {
+  const characters = [];
+  let bytes = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maximumBytes) break;
+    characters.push(character);
+    bytes += characterBytes;
+  }
+  return characters.join("");
 }
 
-function nullableText(value, max = MAX_PUBLIC_TEXT_CHARS) {
+export function projectWorkerPublicText(
+  value,
+  { fallback = "", maxBytes = MAX_PUBLIC_TEXT_BYTES } = {}
+) {
+  const sanitizedFallback = sanitizePublicText(fallback);
+  const sanitized = typeof value === "string"
+    ? sanitizePublicText(value)
+    : sanitizedFallback;
+  return truncateUtf8(String(sanitized || sanitizedFallback), maxBytes);
+}
+
+function boundedText(value, { fallback = "", max = MAX_PUBLIC_TEXT_BYTES } = {}) {
+  return projectWorkerPublicText(value, { fallback, maxBytes: max });
+}
+
+function nullableText(value, max = MAX_PUBLIC_TEXT_BYTES) {
   return typeof value === "string" ? boundedText(value, { max }) : null;
 }
 
@@ -188,7 +224,7 @@ function containsHostVerificationClaim(value) {
   return hasHost && hasVerification;
 }
 
-function authorityBoundText(value, { trustHostAuthority = true, max = MAX_PUBLIC_TEXT_CHARS } = {}) {
+function authorityBoundText(value, { trustHostAuthority = true, max = MAX_PUBLIC_TEXT_BYTES } = {}) {
   const projected = nullableText(value, max);
   if (!trustHostAuthority && containsHostVerificationClaim(projected)) return null;
   return projected;
@@ -218,11 +254,11 @@ function projectPublicPlan(value) {
     .slice(0, MAX_PUBLIC_PLAN_ITEMS);
 }
 
-function publicStringList(value, { maxItems = MAX_PUBLIC_LIST_ITEMS, maxChars = MAX_PUBLIC_TEXT_CHARS } = {}) {
+function publicStringList(value, { maxItems = MAX_PUBLIC_LIST_ITEMS, maxBytes = MAX_PUBLIC_TEXT_BYTES } = {}) {
   if (!Array.isArray(value)) return [];
   return value
     .filter((item) => typeof item === "string")
-    .map((item) => boundedText(item, { max: maxChars }))
+    .map((item) => boundedText(item, { max: maxBytes }))
     .filter(Boolean)
     .slice(0, maxItems);
 }
@@ -230,7 +266,11 @@ function publicStringList(value, { maxItems = MAX_PUBLIC_LIST_ITEMS, maxChars = 
 function repositoryRelativePath(value) {
   if (typeof value !== "string") return null;
   const raw = sanitizePublicText(value).trim().replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
-  if (!raw || raw.includes("[PRIVATE_PATH]") || raw.length > 1024) return null;
+  if (
+    !raw
+    || raw.includes("[PRIVATE_PATH]")
+    || Buffer.byteLength(raw, "utf8") > 1024
+  ) return null;
   if (/^\[[A-Z0-9_]{1,80}\]$/.test(raw)) return raw;
   // A URI is never a repository-relative path. In particular, `file:` can
   // otherwise conceal an absolute local path from the leading-slash check and
@@ -349,7 +389,7 @@ function projectPublicErrorDetails(code, value) {
     if (typeof value.signal === "string") projected.signal = boundedText(value.signal, { max: 64 });
   } else if (code === "E_SCHEMA") {
     if (typeof value.hint === "string") projected.hint = boundedText(value.hint);
-    if (Array.isArray(value.rootKeys)) projected.rootKeys = publicStringList(value.rootKeys, { maxItems: 24, maxChars: 128 });
+    if (Array.isArray(value.rootKeys)) projected.rootKeys = publicStringList(value.rootKeys, { maxItems: 24, maxBytes: 128 });
     if (typeof value.hasUnknownRootKeys === "boolean") projected.hasUnknownRootKeys = value.hasUnknownRootKeys;
     if (typeof value.summaryType === "string") projected.summaryType = boundedText(value.summaryType, { max: 64 });
     if (Number.isSafeInteger(value.findingsCount) && value.findingsCount >= 0) {
@@ -516,7 +556,7 @@ function projectLifecycleDetail(value, { trustHostAuthority = true } = {}) {
     }
   }
   if (Array.isArray(value.plan)) {
-    projected.plan = publicStringList(value.plan, { maxItems: 20, maxChars: 500 });
+    projected.plan = publicStringList(value.plan, { maxItems: 20, maxBytes: 500 });
   }
   if (Array.isArray(value.questions)) projected.questions = publicStringList(value.questions);
   if (Array.isArray(value.validationIssues)) {

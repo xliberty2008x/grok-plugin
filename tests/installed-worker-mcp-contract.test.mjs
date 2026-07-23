@@ -1027,6 +1027,25 @@ test("spawn accepts the actual public handle and rejects every shape or identity
 });
 
 test("public evidence rejects local paths after every punctuation and in nested values", () => {
+  const redacted = completionBundle();
+  redacted.terminalResult.worker.lifecycleEvents[1].summary =
+    "Read [PRIVATE_PATH] and https://example.test/source.mjs";
+  redacted.terminalResult.worker.lifecycleEvents[1].detail = {
+    eventType: "tool",
+    name: "Read [PRIVATE_PATH] and https://example.test/source.mjs",
+    status: "completed"
+  };
+  assert.doesNotThrow(() => validateInstalledCompletionScenario(redacted));
+
+  const markerAsRepositoryPath = completionBundle();
+  markerAsRepositoryPath.terminalResult.worker.context.projectMarkers = [
+    "[PRIVATE_PATH]"
+  ];
+  assert.throws(
+    () => validateInstalledCompletionScenario(markerAsRepositoryPath),
+    assertContractError("E_LIVE_COMPLETION")
+  );
+
   const pathEscapes = [
     "secret=/private/tmp/provider.json",
     "secret:/Users/alice/provider.json",
@@ -1036,8 +1055,13 @@ test("public evidence rejects local paths after every punctuation and in nested 
     "source=~/provider.json",
     "source=file:///etc/passwd",
     "source=C:\\Users\\alice\\provider.json",
+    "source=C:\\Windows\\System32\\provider.json",
+    "source=_C:\\private\\provider.json",
     "source=\\\\server\\share\\provider.json",
-    "source=//server/share/provider.json"
+    "source=//server/share/provider.json",
+    "source=\\Windows\\System32\\provider.json",
+    "source=/秘密/文件",
+    "source=[PRIVATE_PATH]/etc/passwd"
   ];
   for (const escaped of pathEscapes) {
     const handleEvidence = completionBundle();
@@ -1610,11 +1634,27 @@ test("cancellation replay preserves immutable admission receipt and one public e
 
 test("terminal event history compares the installed projection and rejects malformed streams", () => {
   const privateTerminal = privateJob("completed");
+  privateTerminal.lifecycleEvents[1] = {
+    ...privateTerminal.lifecycleEvents[1],
+    summary: "界".repeat(2_000),
+    detail: {
+      eventType: "tool",
+      name: "界".repeat(300),
+      status: "completed"
+    }
+  };
   privateTerminal.lifecycleEvents[3] = {
     ...privateTerminal.lifecycleEvents[3],
-    summary: "Runtime\u0007 cleanup completed",
+    summary: "Runtime\u0007 cleanup read /opt/fixture/tracked.txt",
     detail: {
-      plan: ["Inspect\u001b[31m tracked.txt"],
+      plan: [
+        "Inspect\u001b[31m /Users/alice/fixture/tracked.txt",
+        "Inspect file:///etc/passwd",
+        "Inspect C:\\Windows\\System32\\secret.txt",
+        "Inspect \\\\server\\share\\secret.txt",
+        "Inspect \\Windows\\System32\\secret.txt",
+        "Inspect /秘密/文件"
+      ],
       rawDiagnostics: "private field must be omitted"
     }
   };
@@ -1623,9 +1663,20 @@ test("terminal event history compares the installed projection and rejects malfo
     trustHostAuthority: false
   });
   assert.equal(privateTerminal.lifecycleEvents[3].summary.includes("\u0007"), true);
-  assert.equal(projected.lifecycleEvents[3].summary, "Runtime cleanup completed");
+  assert.equal(
+    Buffer.byteLength(projected.lifecycleEvents[1].summary, "utf8"),
+    1_998
+  );
+  assert.equal(
+    Buffer.byteLength(projected.lifecycleEvents[1].detail.name, "utf8"),
+    300
+  );
+  assert.equal(
+    projected.lifecycleEvents[3].summary,
+    "Runtime cleanup read [PRIVATE_PATH]"
+  );
   assert.deepEqual(projected.lifecycleEvents[3].detail, {
-    plan: ["Inspect tracked.txt"]
+    plan: Array(6).fill("Inspect [PRIVATE_PATH]")
   });
 
   const valid = {
@@ -1665,6 +1716,11 @@ test("terminal event history compares the installed projection and rejects malfo
     (value) => {
       for (const key of ["trackedEvents", "publicEvents", "projectedEvents"]) {
         value[key][0].detail = { rawDiagnostics: "private" };
+      }
+    },
+    (value) => {
+      for (const key of ["trackedEvents", "publicEvents", "projectedEvents"]) {
+        value[key][1].summary = "Read /private/tmp/private.txt";
       }
     },
     (value) => { value.publicCursor.sequence -= 1; },

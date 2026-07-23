@@ -22,6 +22,7 @@ import {
   projectLifecycleEventsAfterCursor,
   projectWorkerHandle,
   projectWorkerLifecycleCursor,
+  projectWorkerPublicText,
   projectWorkerSnapshot
 } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
 import { initRepo, runCompanion, tempDir } from "./helpers.mjs";
@@ -814,6 +815,8 @@ test("public nested result shapes are exact, bounded, and display-safe", () => {
 });
 
 test("public path projections reject URI-shaped and absolute path disguises", () => {
+  const acceptedMultibytePath = "界".repeat(341);
+  const rejectedMultibytePath = "界".repeat(342);
   const snapshot = projectWorkerSnapshot(job({
     status: "completed",
     phase: "done",
@@ -823,6 +826,8 @@ test("public path projections reject URI-shaped and absolute path disguises", ()
         summary: "Completed",
         changedFiles: [
           "src/index.mjs",
+          acceptedMultibytePath,
+          rejectedMultibytePath,
           "file:///etc/hosts",
           "./file:///etc/hosts",
           "file:///Volumes/Private/project.txt",
@@ -837,8 +842,44 @@ test("public path projections reject URI-shaped and absolute path disguises", ()
     }
   }));
 
-  assert.deepEqual(snapshot.result.workerReport.changedFiles, ["src/index.mjs"]);
+  assert.deepEqual(snapshot.result.workerReport.changedFiles, [
+    "src/index.mjs",
+    acceptedMultibytePath
+  ]);
   assertConforms("WorkerSnapshot", snapshot);
+});
+
+test("public text redacts every absolute path form and clips at UTF-8 boundaries", () => {
+  for (const privatePath of [
+    "/opt/grok/private.json",
+    "file:///etc/passwd",
+    "C:\\Windows\\System32\\secret.txt",
+    "\\\\server\\share\\secret.txt",
+    "//server/share/secret.txt",
+    "\\Windows\\System32\\secret.txt",
+    "/秘密/文件"
+  ]) {
+    assert.equal(
+      projectWorkerPublicText(`before ${privatePath} after`),
+      "before [PRIVATE_PATH] after"
+    );
+  }
+  assert.equal(
+    projectWorkerPublicText("https://example.test/source.mjs"),
+    "https://example.test/source.mjs"
+  );
+  assert.equal(
+    projectWorkerPublicText("before _C:\\private\\secret.txt after"),
+    "before _[PRIVATE_PATH] after"
+  );
+  assert.equal(projectWorkerPublicText("[PRIVATE_PATH]"), "[PRIVATE_PATH]");
+
+  const exact = `${"a".repeat(297)}界`;
+  assert.equal(Buffer.byteLength(exact, "utf8"), 300);
+  assert.equal(projectWorkerPublicText(exact, { maxBytes: 300 }), exact);
+  assert.equal(projectWorkerPublicText(`${exact}界`, { maxBytes: 300 }), exact);
+  assert.equal(projectWorkerPublicText("🙂🙂", { maxBytes: 5 }), "🙂");
+  assert.equal(projectWorkerPublicText("🙂🙂", { maxBytes: 3 }), "");
 });
 
 test("CLI public JSON preserves legacy fields and adds Worker Protocol metadata", (t) => {
