@@ -92,6 +92,55 @@ function differentSha(value) {
   return `${value?.startsWith("0") ? "1" : "0"}${String(value || "").slice(1).padEnd(63, "0")}`;
 }
 
+function canonicalize(value) {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => canonicalize(item));
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .filter((key) => value[key] !== undefined)
+      .map((key) => [key, canonicalize(value[key])])
+  );
+}
+
+function stableDigest(value) {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(canonicalize(value)))
+    .digest("hex");
+}
+
+function stableEnvelopeDigestBinding(envelope) {
+  const userRequestDigest = crypto
+    .createHash("sha256")
+    .update(envelope.userRequest)
+    .digest("hex");
+  const stable = {};
+  for (const [key, value] of Object.entries(envelope)) {
+    if (key === "userRequest" || key === "userRequestDigest" || value === undefined) continue;
+    stable[key] = key === "objective" && value === envelope.userRequest
+      ? userRequestDigest
+      : value;
+  }
+  stable.userRequestDigest = userRequestDigest;
+  return stable;
+}
+
+function legacySpawnRequestDigest(job) {
+  return stableDigest({
+    owner: {
+      hostKind: job.host?.kind || "codex",
+      sessionId: job.host?.sessionId || null
+    },
+    controlWorkspaceId: job.controlWorkspaceId,
+    executionRoot: job.request.spawn.executionRoot,
+    envelope: stableEnvelopeDigestBinding(job.request.envelope),
+    contextManifestDigest: job.request.contextManifest?.digest || null,
+    roleId: job.request.roleId,
+    write: Boolean(job.write)
+  });
+}
+
 function dispatchIdentity(state, claim, extra = {}) {
   return {
     pid: process.pid,
@@ -173,6 +222,22 @@ function consumeLaunchAuthorization(state) {
 function downgradePendingDispatchToV1(state, mutate = (job) => job) {
   return updateJob(state.root, state.workerId, (job) => {
     const legacy = structuredClone(job);
+    delete legacy.request.contextBindingMode;
+    delete legacy.request.contextPacket;
+    delete legacy.request.runtimeRolePolicy;
+    delete legacy.request.contextReceipt;
+    delete legacy.request.providerHomeId;
+    delete legacy.request.spawn.contextBindingDigest;
+    delete legacy.profile.providerToolIds;
+    delete legacy.profile.deniedProviderToolIds;
+    legacy.request.providerPromptDigest = crypto
+      .createHash("sha256")
+      .update(composeProviderPrompt(legacy.request.envelope, {
+        root: legacy.request.spawn.executionRoot,
+        contextManifest: legacy.request.contextManifest
+      }))
+      .digest("hex");
+    legacy.request.spawn.requestDigest = legacySpawnRequestDigest(legacy);
     legacy.workerAuthorization = {
       schemaVersion: 1,
       nonce: job.workerAuthorization.nonce,
@@ -288,14 +353,18 @@ test("provider-prompt authorization uses the canonical execution root across pat
     .createHash("sha256")
     .update(composeProviderPrompt(job.request.envelope, {
       root: executionRoot,
-      contextManifest: job.request.contextManifest
+      contextManifest: job.request.contextManifest,
+      contextPacket: job.request.contextPacket,
+      runtimeRolePolicy: job.request.runtimeRolePolicy
     }))
     .digest("hex");
   const aliasDigest = crypto
     .createHash("sha256")
     .update(composeProviderPrompt(job.request.envelope, {
       root: aliasRoot,
-      contextManifest: job.request.contextManifest
+      contextManifest: job.request.contextManifest,
+      contextPacket: job.request.contextPacket,
+      runtimeRolePolicy: job.request.runtimeRolePolicy
     }))
     .digest("hex");
   assert.equal(job.request.providerPromptDigest, expectedDigest);
@@ -1107,106 +1176,46 @@ test("restarted worker_wait reclaims an expired pre-intent lease without another
 
 test("only an unambiguous pending v1 object authorization migrates to v2", (t) => {
   const safe = fixture("launch-outbox-v1-safe-0001");
-  updateJob(safe.root, safe.workerId, (job) => ({
-    ...job,
-    workerAuthorization: {
-      schemaVersion: 1,
-      nonce: job.workerAuthorization.nonce,
-      ownerThreadId: THREAD_ID,
-      purpose: "launch-worker",
-      issuedAt: job.createdAt
-    },
-    request: {
-      ...job.request,
-      spawn: {
-        ...job.request.spawn,
-        dispatch: {
-          ...job.request.spawn.dispatch,
-          schemaVersion: 1,
-          fence: undefined,
-          lease: undefined
-        }
-      }
-    }
-  }), safe.env);
+  downgradePendingDispatchToV1(safe);
   const migrated = claimWorkerDispatch({ ...safe, holderId: "host:migration" });
   assert.equal(migrated.claimed, true);
   assert.equal(migrated.job.request.spawn.dispatch.schemaVersion, 2);
   assert.equal(migrated.job.workerAuthorization.schemaVersion, 2);
+  assert.deepEqual(migrated.job.profile.providerToolIds, [
+    "GrokBuild:read_file",
+    "GrokBuild:list_dir",
+    "GrokBuild:grep"
+  ]);
+  assert.ok(migrated.job.profile.deniedProviderToolIds.includes("GrokBuild:run_terminal_cmd"));
 
   const raw = fixture("launch-outbox-v1-raw-0001");
-  updateJob(raw.root, raw.workerId, (job) => ({
-    ...job,
-    workerAuthorization: job.workerAuthorization.nonce,
-    request: {
-      ...job.request,
-      spawn: {
-        ...job.request.spawn,
-        dispatch: {
-          ...job.request.spawn.dispatch,
-          schemaVersion: 1,
-          fence: undefined,
-          lease: undefined
-        }
-      }
-    }
-  }), raw.env);
+  downgradePendingDispatchToV1(raw, (job) => {
+    job.workerAuthorization = job.workerAuthorization.nonce;
+    return job;
+  });
   const refused = claimWorkerDispatch({ ...raw, holderId: "host:migration" });
   assert.equal(refused.claimed, false);
   assert.equal(refused.reason, "already-claimed");
   assert.equal(refused.job.request.spawn.dispatch.schemaVersion, 1);
 
   const foreign = fixture("launch-outbox-v1-foreign-0001");
-  updateJob(foreign.root, foreign.workerId, (job) => ({
-    ...job,
-    workerAuthorization: {
+  downgradePendingDispatchToV1(foreign, (job) => {
+    job.workerAuthorization = {
       schemaVersion: 1,
       nonce: job.workerAuthorization.nonce,
       ownerThreadId: "019f6a2f-8e34-7db1-a101-b9ca29e5ffff",
       purpose: "wrong-purpose",
       issuedAt: job.createdAt,
       unexpected: true
-    },
-    request: {
-      ...job.request,
-      spawn: {
-        ...job.request.spawn,
-        dispatch: {
-          ...job.request.spawn.dispatch,
-          schemaVersion: 1,
-          fence: undefined,
-          lease: undefined
-        }
-      }
-    }
-  }), foreign.env);
+    };
+    return job;
+  });
   const foreignRefused = claimWorkerDispatch({ ...foreign, holderId: "host:migration" });
   assert.equal(foreignRefused.claimed, false);
   assert.equal(foreignRefused.job.request.spawn.dispatch.schemaVersion, 1);
 
   const guarded = fixture("launch-outbox-v1-guarded-0001");
-  updateJob(guarded.root, guarded.workerId, (job) => ({
-    ...job,
-    workerAuthorization: {
-      schemaVersion: 1,
-      nonce: job.workerAuthorization.nonce,
-      ownerThreadId: THREAD_ID,
-      purpose: "launch-worker",
-      issuedAt: job.createdAt
-    },
-    request: {
-      ...job.request,
-      spawn: {
-        ...job.request.spawn,
-        dispatch: {
-          ...job.request.spawn.dispatch,
-          schemaVersion: 1,
-          fence: undefined,
-          lease: undefined
-        }
-      }
-    }
-  }), guarded.env);
+  downgradePendingDispatchToV1(guarded);
   registerProviderGuard(guarded.root, guarded.workerId, {
     pid: process.pid,
     startToken: processStartToken(process.pid),
@@ -1226,29 +1235,10 @@ test("only an unambiguous pending v1 object authorization migrates to v2", (t) =
     }]
   ]) {
     const ambiguous = fixture(`launch-outbox-v1-${field}-0001`);
-    updateJob(ambiguous.root, ambiguous.workerId, (job) => ({
-      ...job,
-      [field]: witness,
-      workerAuthorization: {
-        schemaVersion: 1,
-        nonce: job.workerAuthorization.nonce,
-        ownerThreadId: THREAD_ID,
-        purpose: "launch-worker",
-        issuedAt: job.createdAt
-      },
-      request: {
-        ...job.request,
-        spawn: {
-          ...job.request.spawn,
-          dispatch: {
-            ...job.request.spawn.dispatch,
-            schemaVersion: 1,
-            fence: undefined,
-            lease: undefined
-          }
-        }
-      }
-    }), ambiguous.env);
+    downgradePendingDispatchToV1(ambiguous, (job) => {
+      job[field] = witness;
+      return job;
+    });
     const ambiguousRefused = claimWorkerDispatch({
       ...ambiguous,
       holderId: "host:migration"
@@ -1286,6 +1276,10 @@ test("v1 migration rejects each legacy ambiguity independently", () => {
       label: "non-codex-host-principal",
       mutate(job) { job.host = { ...job.host, kind: "claude-code" }; },
       principal(principal) { return { ...principal, hostKind: "claude-code" }; }
+    },
+    {
+      label: "legacy-profile-drift",
+      mutate(job) { job.profile.permissionMode = "acceptEdits"; }
     }
   ];
 
@@ -1312,7 +1306,21 @@ test("v1 migration rejects each legacy ambiguity independently", () => {
     ["worker-spawn-intent", (job) => { job.request.spawn.workerSpawnIntent = null; }],
     ["controller-process", (job) => { job.controllerProcess = null; }],
     ["worker-process", (job) => { job.workerProcess = null; }],
-    ["provider-process", (job) => { job.providerProcess = null; }]
+    ["provider-process", (job) => { job.providerProcess = null; }],
+    ["context-binding-mode", (job) => { job.request.contextBindingMode = null; }],
+    ["context-packet", (job) => { job.request.contextPacket = null; }],
+    ["runtime-role-policy", (job) => { job.request.runtimeRolePolicy = null; }],
+    ["context-receipt", (job) => { job.request.contextReceipt = null; }],
+    ["provider-home-id", (job) => { job.request.providerHomeId = job.id; }],
+    ["context-binding-digest", (job) => {
+      job.request.spawn.contextBindingDigest = "f".repeat(64);
+    }],
+    ["provider-tool-ids", (job) => {
+      job.profile.providerToolIds = ["GrokBuild:read_file"];
+    }],
+    ["denied-provider-tool-ids", (job) => {
+      job.profile.deniedProviderToolIds = ["GrokBuild:run_terminal_cmd"];
+    }]
   ];
   for (const [label, addPresentField] of presentFieldCases) {
     const state = fixture(`launch-outbox-v1-present-${label}-0001`);

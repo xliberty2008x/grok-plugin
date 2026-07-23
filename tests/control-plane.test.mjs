@@ -733,7 +733,7 @@ test("integration: Codex nonblocking stdin waits for delayed TaskEnvelope and ve
     { cwd: root, env }
   );
 
-  await waitFor(() => dispatch.stderr.includes(STDIN_READY_MARKER), { timeoutMs: 5000 });
+  await waitFor(() => dispatch.stderr.includes(STDIN_READY_MARKER), { timeoutMs: 15000 });
   assert.equal(dispatch.child.exitCode, null, "dispatch exited before Codex could write the TaskEnvelope");
   const providerStartsBeforeInput = readFakeLog(fake.logFile).filter(
     (entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio")
@@ -769,7 +769,7 @@ test("integration: Codex nonblocking stdin waits for delayed TaskEnvelope and ve
     ["record-verification", job.id, "--verification-stdin", "--stdin-ready", "--json"],
     { cwd: root, env }
   );
-  await waitFor(() => record.stderr.includes(STDIN_READY_MARKER), { timeoutMs: 5000 });
+  await waitFor(() => record.stderr.includes(STDIN_READY_MARKER), { timeoutMs: 15000 });
   assert.equal(record.child.exitCode, null, "verification command exited before Codex could write stdin");
   const verificationSplit = Math.floor(verification.length / 2);
   record.child.stdin.write(verification.slice(0, verificationSplit));

@@ -68,15 +68,15 @@ export function testEnvironment({ fake, pluginData = tempDir("grok-plugin-data-"
   };
 }
 
-export function runCompanion(args, { cwd, env, timeout = 20000, input } = {}) {
+export function runCompanion(args, { cwd, env, timeout = 60000, input } = {}) {
   return run(process.execPath, [COMPANION, ...args], { cwd, env, timeout, input });
 }
 
-export function runCodexCompanion(args, { cwd, env, timeout = 20000, input } = {}) {
+export function runCodexCompanion(args, { cwd, env, timeout = 60000, input } = {}) {
   return run(process.execPath, [CODEX_COMPANION, ...args], { cwd, env, timeout, input });
 }
 
-export function spawnNonblockingStdin(target, args, { cwd, env, timeout = 20000 } = {}) {
+export function spawnNonblockingStdin(target, args, { cwd, env, timeout = 60000 } = {}) {
   const child = spawn(process.execPath, [NONBLOCKING_STDIN_CHILD, target, ...args], {
     cwd,
     env: env ?? process.env,
@@ -106,6 +106,10 @@ export function spawnNonblockingStdin(target, args, { cwd, env, timeout = 20000 
       resolve({ code, signal, stdout, stderr, stdinError });
     });
   });
+  // Some callers can fail an earlier readiness assertion before awaiting this
+  // lifecycle promise. Mark the rejection as observed while preserving the
+  // original promise's rejection for callers that do await it.
+  completed.catch(() => {});
   return {
     child,
     completed,

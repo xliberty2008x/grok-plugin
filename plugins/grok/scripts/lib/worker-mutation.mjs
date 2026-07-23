@@ -1187,9 +1187,34 @@ function exactLegacyPendingAuthorization(job, principal) {
   );
 }
 
+function exactLegacyTaskSecurityProfile(profile, write) {
+  if (!isPlainRecord(profile)) return false;
+  const expected = { ...profileFor("task", Boolean(write)) };
+  delete expected.providerToolIds;
+  delete expected.deniedProviderToolIds;
+  const expectedKeys = Object.keys(expected).sort();
+  const observedKeys = Object.keys(profile).sort();
+  return observedKeys.length === expectedKeys.length
+    && observedKeys.every((key, index) => key === expectedKeys[index])
+    && expectedKeys.every((key) => (
+      JSON.stringify(profile[key]) === JSON.stringify(expected[key])
+    ));
+}
+
 function legacyPendingMigrationEligible(root, job, principal, env = process.env) {
   const spawn = job?.request?.spawn;
+  const postV1RequestFields = [
+    "contextBindingMode",
+    "contextPacket",
+    "runtimeRolePolicy",
+    "contextReceipt",
+    "providerHomeId"
+  ];
   if (!exactLegacyPendingAuthorization(job, principal)
+    || postV1RequestFields.some((field) => (
+      Object.hasOwn(job?.request || {}, field)
+    ))
+    || Object.hasOwn(spawn || {}, "contextBindingDigest")
     || Object.hasOwn(spawn || {}, "controllerSpawnIntent")
     || Object.hasOwn(spawn || {}, "workerSpawnIntent")
     || Object.hasOwn(spawn || {}, "unsettledWorkerProcess")
@@ -1198,9 +1223,13 @@ function legacyPendingMigrationEligible(root, job, principal, env = process.env)
     || Object.hasOwn(job || {}, "controllerProcess")
     || Object.hasOwn(job || {}, "workerProcess")
     || Object.hasOwn(job || {}, "providerProcess")
-    || Object.hasOwn(job || {}, "pendingTerminal")) return false;
+    || Object.hasOwn(job || {}, "pendingTerminal")
+    || !exactLegacyTaskSecurityProfile(job?.profile, job?.write)) return false;
   try {
-    assertDispatchContract(job);
+    assertDispatchContract({
+      ...job,
+      profile: profileFor("task", Boolean(job?.write))
+    });
     const callerControl = resolveControlWorkspace(root, env);
     const executionRoot = spawn?.executionRoot;
     if (typeof executionRoot !== "string"
@@ -2062,7 +2091,12 @@ export function claimWorkerDispatch({
     if ((!pending && !reclaimable) || (dispatch.schemaVersion === 1 && !legacyPending)) {
       return Object.freeze({ claimed: false, reason: "already-claimed", job: current });
     }
-    assertDispatchContract(current);
+    assertDispatchContract(legacyPending
+      ? {
+          ...current,
+          profile: profileFor("task", Boolean(current.write))
+        }
+      : current);
     const nonce = cancellationNonce(current);
     if (
       !["queued", "running"].includes(current.status)
@@ -2103,7 +2137,13 @@ export function claimWorkerDispatch({
           || (latestDispatch?.schemaVersion === 1 && !latestLegacyPending))) {
         throw new CompanionError("E_STATE", "Worker dispatch changed before its durable claim could be published.");
       }
-      assertDispatchContract(latest);
+      const dispatchContractJob = latestLegacyPending
+        ? {
+            ...latest,
+            profile: profileFor("task", Boolean(latest.write))
+          }
+        : latest;
+      assertDispatchContract(dispatchContractJob);
       const upgradedDispatch = latestLegacyPending
         ? createDispatchOutbox({ createdAt: latestDispatch.createdAt || latest.createdAt || claimedAt })
         : latestDispatch;
@@ -2118,11 +2158,11 @@ export function claimWorkerDispatch({
       const boundExecutionRoot = latest.request?.spawn?.executionRoot;
       const authorizationJob = latestLegacyPending
         ? {
-            ...latest,
+            ...dispatchContractJob,
             request: {
-              ...latest.request,
+              ...dispatchContractJob.request,
               spawn: {
-                ...latest.request?.spawn,
+                ...dispatchContractJob.request?.spawn,
                 executionRoot: boundExecutionRoot
               }
             }
