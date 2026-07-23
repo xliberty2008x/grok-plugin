@@ -110,6 +110,11 @@ const QUALIFICATION_STAGES = new Set([
   "completion-spawn-call",
   "completion-spawn-private",
   "completion-spawn-witness",
+  "completion-spawn-handle-project",
+  "completion-spawn-handle-binding",
+  "completion-spawn-handle-shape",
+  "completion-spawn-handle-order",
+  "completion-spawn-handle-mode",
   "completion-spawn-witness-read",
   "completion-spawn-witness-contract",
   "completion-spawn-witness-record",
@@ -130,6 +135,11 @@ const QUALIFICATION_STAGES = new Set([
   "cancellation-spawn-call",
   "cancellation-spawn-private",
   "cancellation-spawn-witness",
+  "cancellation-spawn-handle-project",
+  "cancellation-spawn-handle-binding",
+  "cancellation-spawn-handle-shape",
+  "cancellation-spawn-handle-order",
+  "cancellation-spawn-handle-mode",
   "cancellation-spawn-witness-read",
   "cancellation-spawn-witness-contract",
   "cancellation-spawn-witness-record",
@@ -2409,6 +2419,7 @@ function validateActiveSpawnHandle(
   { replayed }
 ) {
   let laterHandle;
+  enterScenarioStage(tracker, "spawn-handle-project");
   try {
     laterHandle = context.workerProtocol.projectWorkerHandle(laterJob, {
       trustHostAuthority: false
@@ -2416,7 +2427,9 @@ function validateActiveSpawnHandle(
   } catch {
     fail("E_PRIVATE_STATE");
   }
+  enterScenarioStage(tracker, "spawn-handle-binding");
   assertPublicPrivateBinding(publicWorker, laterJob);
+  enterScenarioStage(tracker, "spawn-handle-shape");
   if (
     !hasExactKeys(publicWorker, HANDLE_KEYS)
     || publicWorker.workerProtocolVersion !== 1
@@ -2428,13 +2441,19 @@ function validateActiveSpawnHandle(
     || !canonicalTimestamp(publicWorker.heartbeatAt)
     || Date.parse(publicWorker.updatedAt) < Date.parse(publicWorker.createdAt)
     || Date.parse(publicWorker.heartbeatAt) < Date.parse(publicWorker.createdAt)
-    || publicWorker.createdAt !== laterHandle.createdAt
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  enterScenarioStage(tracker, "spawn-handle-order");
+  if (
+    publicWorker.createdAt !== laterHandle.createdAt
     || Date.parse(publicWorker.updatedAt) > Date.parse(laterHandle.updatedAt)
     || Date.parse(publicWorker.heartbeatAt) > Date.parse(laterHandle.heartbeatAt)
     || publicWorker.eventCursor.sequence > laterHandle.eventCursor.sequence
   ) {
     fail("E_PRIVATE_STATE");
   }
+  enterScenarioStage(tracker, "spawn-handle-mode");
   if (!replayed) {
     if (
       publicWorker.status !== "queued"
