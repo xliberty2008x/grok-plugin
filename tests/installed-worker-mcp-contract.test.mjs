@@ -1549,6 +1549,43 @@ test("cancellation replay preserves immutable admission receipt and one public e
     assertContractError("E_LIVE_CANCELLATION")
   );
 
+  const priorLifecycleAcceptance = cancellationBundle();
+  const priorLifecycleAcceptedAt = "2026-07-23T10:01:49.999Z";
+  priorLifecycleAcceptance.cancel.receipt.requestAcceptedAt =
+    priorLifecycleAcceptedAt;
+  priorLifecycleAcceptance.cancelReplay.receipt.requestAcceptedAt =
+    priorLifecycleAcceptedAt;
+  priorLifecycleAcceptance.terminalResult.worker.result.cancellation
+    .requestAcceptedAt = priorLifecycleAcceptedAt;
+  priorLifecycleAcceptance.terminalResult.worker.lifecycleEvents
+    .find((event) => event.type === "cancellation.requested")
+    .detail.requestAcceptedAt = priorLifecycleAcceptedAt;
+  assert.throws(
+    () => validateInstalledCancellationReplayScenario(
+      priorLifecycleAcceptance
+    ),
+    assertContractError("E_LIVE_CANCELLATION")
+  );
+
+  const replayObservationDrift = cancellationBundle();
+  const replayObservedAt = "2026-07-23T10:01:59.999Z";
+  const beforeReplayAcceptedAt = "2026-07-23T10:01:59.998Z";
+  replayObservationDrift.spawnReplay.worker.updatedAt = replayObservedAt;
+  replayObservationDrift.spawnReplay.worker.heartbeatAt = replayObservedAt;
+  replayObservationDrift.cancel.receipt.requestAcceptedAt =
+    beforeReplayAcceptedAt;
+  replayObservationDrift.cancelReplay.receipt.requestAcceptedAt =
+    beforeReplayAcceptedAt;
+  replayObservationDrift.terminalResult.worker.result.cancellation
+    .requestAcceptedAt = beforeReplayAcceptedAt;
+  replayObservationDrift.terminalResult.worker.lifecycleEvents
+    .find((event) => event.type === "cancellation.requested")
+    .detail.requestAcceptedAt = beforeReplayAcceptedAt;
+  assert.throws(
+    () => validateInstalledCancellationReplayScenario(replayObservationDrift),
+    assertContractError("E_LIVE_CANCELLATION")
+  );
+
   const receiptDrift = cancellationBundle();
   receiptDrift.cancelReplay.receipt.receiptId = "cancel-ffffffffffffffffffffffff";
   assert.throws(

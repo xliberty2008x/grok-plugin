@@ -1504,11 +1504,15 @@ function validLifecycleEvents(events, worker, status) {
       cancellationEvents[0]?.detail?.requestAcceptedAt
     );
     const cancellationEventAt = Date.parse(cancellationEvents[0]?.at);
+    const cancellationEventIndex = events.indexOf(cancellationEvents[0]);
+    const priorEventAt = cancellationEventIndex > 0
+      ? Date.parse(events[cancellationEventIndex - 1].at)
+      : createdAt;
     if (
       cancellationEvents.length !== 1
       || finalReports.length !== 0
       || !Number.isFinite(cancellationAcceptedAt)
-      || cancellationAcceptedAt < createdAt
+      || cancellationAcceptedAt < priorEventAt
       || cancellationAcceptedAt > cancellationEventAt
       || Date.parse(cancellationEvents[0].at) > completedAt
     ) {
@@ -2085,6 +2089,8 @@ export function validateInstalledCancellationReplayScenario(value) {
       !== evidence.cancel.receipt.receiptId
     || evidence.terminalResult.worker.result.cancellation.requestAcceptedAt
       !== evidence.cancel.receipt.requestAcceptedAt
+    || Date.parse(evidence.cancel.receipt.requestAcceptedAt)
+      < Date.parse(evidence.spawnReplay.worker.updatedAt)
     || evidence.terminalResult.worker.result.cancellation.processGroupGoneAt !== null
     || evidence.terminalResult.worker.result.cancellation.terminalRecordCommittedAt !== null
     || !Array.isArray(evidence.terminalResult.worker.lifecycleEvents)
