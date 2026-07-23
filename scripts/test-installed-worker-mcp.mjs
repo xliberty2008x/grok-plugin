@@ -110,6 +110,8 @@ const QUALIFICATION_STAGES = new Set([
   "completion-spawn-call",
   "completion-spawn-private",
   "completion-spawn-witness",
+  "completion-spawn-witness-read",
+  "completion-spawn-witness-contract",
   "completion-spawn-witness-record",
   "completion-spawn-witness-binding",
   "completion-spawn-witness-handle",
@@ -128,6 +130,8 @@ const QUALIFICATION_STAGES = new Set([
   "cancellation-spawn-call",
   "cancellation-spawn-private",
   "cancellation-spawn-witness",
+  "cancellation-spawn-witness-read",
+  "cancellation-spawn-witness-contract",
   "cancellation-spawn-witness-record",
   "cancellation-spawn-witness-binding",
   "cancellation-spawn-witness-handle",
@@ -2477,13 +2481,19 @@ function validateSpawnResponseWitness(
     .update(spawnKey)
     .digest("hex");
   let record;
-  let expectedLaunchContractDigest;
+  enterScenarioStage(tracker, "spawn-witness-read");
   try {
     record = context.mutation.getSpawnIdempotencyRecord(
       context.fixtureRoot,
       spawnKey,
       context.env
     );
+  } catch {
+    fail("E_PRIVATE_STATE");
+  }
+  let expectedLaunchContractDigest;
+  enterScenarioStage(tracker, "spawn-witness-contract");
+  try {
     expectedLaunchContractDigest =
       context.launchContract.launchContractDigest(job);
   } catch {
