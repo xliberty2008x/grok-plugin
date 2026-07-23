@@ -714,6 +714,9 @@ if (!versionsOnly) {
     if (/GROK_E2E\s*[:=]\s*["']?1/i.test(workflow) || /test:e2e/.test(workflow)) problem("Default CI must not run quota-consuming Grok E2E tests.", ".github/workflows/ci.yml");
     if (!/npm run test:pty-ingress/.test(workflow)) problem("CI must expose the source nonblocking PTY regression as a named gate.", ".github/workflows/ci.yml");
     if (!/npm run test:deterministic/.test(workflow)) problem("Linux/macOS CI must run the deterministic zero-skip suite.", ".github/workflows/ci.yml");
+    if (!/validate-and-test:[\s\S]{0,220}?timeout-minutes:\s*30\b/.test(workflow)) {
+      problem("The deterministic validation matrix must retain its 30-minute completion budget.", ".github/workflows/ci.yml");
+    }
     if (!/CODEX_PLUGIN_RUNNER_ENABLED/.test(workflow) || !/npm run test:installed-codex/.test(workflow)) {
       problem("CI must define the opt-in Codex-equipped installed-snapshot gate.", ".github/workflows/ci.yml");
     }

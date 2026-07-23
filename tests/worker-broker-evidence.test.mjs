@@ -68,6 +68,17 @@ import {
   PHASE1_FOCUSED_TEST_FILES,
   runPhaseOneFocusedTests
 } from "../scripts/test-phase1-focused.mjs";
+import zeroSkipTestReporter, {
+  ZERO_SKIP_MAX_SUMMARY_BYTES,
+  ZERO_SKIP_MAX_VIOLATIONS,
+  ZERO_SKIP_REPORTER_ID,
+  ZERO_SKIP_SUMMARY_FIELDS,
+  ZERO_SKIP_VIOLATION_FIELDS,
+  collectZeroSkipKnownSecrets,
+  sanitizeZeroSkipFile,
+  sanitizeZeroSkipName,
+  validateZeroSkipSummary
+} from "../scripts/lib/zero-skip-test-reporter.mjs";
 import { ROOT, git, initRepo, run, tempDir, waitFor } from "./helpers.mjs";
 
 const STARTED_AT = "2026-07-16T10:00:00.000Z";
@@ -76,14 +87,32 @@ const EVIDENCE_MODULE_URL = new URL("../scripts/lib/worker-broker-evidence.mjs",
 const ZERO_SKIP_REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
 const DETERMINISTIC_CHECK_RUNNER = path.join(ROOT, "scripts/check-deterministic.mjs");
 const DETERMINISTIC_TEST_LIBRARY = path.join(ROOT, "scripts/lib/deterministic-test-runner.mjs");
+const REDACT_LIBRARY = path.join(ROOT, "plugins/grok/scripts/lib/redact.mjs");
 const STATIC_ESM_IMPORT_PARSER = path.join(ROOT, "scripts/lib/static-esm-import-parser.mjs");
 const PHASE_ONE_FOCUSED_RUNNER = path.join(ROOT, "scripts/test-phase1-focused.mjs");
 const POSIX_PROOF_PLATFORM = process.platform === "darwin" || process.platform === "linux";
+const SHORT_ABSOLUTE_PATH_NAMES = Object.freeze([
+  "file=/tmp/a",
+  String.raw`path:C:\a\b`,
+  String.raw`unc=\\server\share`,
+  "FILE:///tmp/a",
+  "uri=file://host/a",
+  "p=//srv/a",
+  "p=//srv",
+  "p=C:\\",
+  "p=C:/",
+  String.raw`p=\\server`,
+  "p=/",
+  "p=(/tmp/a)",
+  "p=!/tmp/a"
+]);
 
 function installZeroSkipReporter(root) {
-  const destination = path.join(root, "scripts/lib/zero-skip-test-reporter.mjs");
-  fs.mkdirSync(path.dirname(destination), { recursive: true });
-  fs.copyFileSync(ZERO_SKIP_REPORTER, destination);
+  for (const source of [ZERO_SKIP_REPORTER, REDACT_LIBRARY]) {
+    const destination = path.join(root, path.relative(ROOT, source));
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(source, destination);
+  }
 }
 
 function installPhaseOneFocusedRunner(root) {
@@ -114,16 +143,52 @@ test("deterministic zero-skip runner excludes only explicit external boundaries"
   assert.deepEqual(listDeterministicTestFiles(), expected);
 });
 
+function zeroSkipViolation(overrides = {}) {
+  return {
+    outcome: "failed",
+    file: "tests/fixture.test.mjs",
+    name: "fixture",
+    testNumber: 1,
+    nesting: 0,
+    line: null,
+    column: null,
+    errorName: "Error",
+    errorCode: "ERR_TEST_FAILURE",
+    operator: null,
+    ...overrides
+  };
+}
+
 function zeroSkipSummary(overrides = {}) {
   return `${JSON.stringify({
-    reporter: "zero-skip-v1",
+    reporter: ZERO_SKIP_REPORTER_ID,
     passed: 1,
     failed: 0,
     cancelled: 0,
     skipped: 0,
     todo: 0,
+    violations: [],
+    omittedViolations: 0,
     ...overrides
   })}\n`;
+}
+
+async function collectZeroSkipReport(events, options = {}) {
+  let output = "";
+  const previousExitCode = process.exitCode;
+  process.exitCode = 0;
+  try {
+    const source = (async function* eventSource() {
+      for (const event of events) yield event;
+    })();
+    for await (const chunk of zeroSkipTestReporter(source, options)) output += chunk;
+    return {
+      exitCode: process.exitCode,
+      summary: JSON.parse(output)
+    };
+  } finally {
+    process.exitCode = previousExitCode;
+  }
 }
 
 test("deterministic runner executes files sequentially and aggregates exact zero-skip summaries", () => {
@@ -159,13 +224,16 @@ test("deterministic runner executes files sequentially and aggregates exact zero
   assert.ok(calls.every((call) => call.binary === "/exact/node"));
   assert.ok(calls.every((call) => call.options.cwd === "/exact/root"));
   assert.ok(calls.every((call) => call.options.shell === false));
+  assert.ok(calls.every((call) => call.options.maxBuffer === 1024 * 1024));
   assert.deepEqual(JSON.parse(output), {
-    reporter: "zero-skip-v1",
+    reporter: ZERO_SKIP_REPORTER_ID,
     passed: 3,
     failed: 0,
     cancelled: 0,
     skipped: 0,
-    todo: 0
+    todo: 0,
+    violations: [],
+    omittedViolations: 0
   });
 });
 
@@ -184,12 +252,14 @@ test("Phase 1 focused runner executes its fixed inventory in exact serial order"
   assert.deepEqual(calls, PHASE1_FOCUSED_TEST_FILES);
   assert.equal(new Set(calls).size, PHASE1_FOCUSED_TEST_FILES.length);
   assert.deepEqual(JSON.parse(output), {
-    reporter: "zero-skip-v1",
+    reporter: ZERO_SKIP_REPORTER_ID,
     passed: PHASE1_FOCUSED_TEST_FILES.length,
     failed: 0,
     cancelled: 0,
     skipped: 0,
-    todo: 0
+    todo: 0,
+    violations: [],
+    omittedViolations: 0
   });
 });
 
@@ -211,8 +281,27 @@ test("deterministic runner fails closed on malformed, partial, or non-passing ch
       message: /invalid zero-skip summary/
     },
     {
+      label: "legacy-summary",
+      result: {
+        status: 0,
+        signal: null,
+        stdout: zeroSkipSummary().replace(ZERO_SKIP_REPORTER_ID, "zero-skip-v1"),
+        stderr: ""
+      },
+      message: /invalid zero-skip summary/
+    },
+    {
       label: "skip",
-      result: { status: 1, signal: null, stdout: zeroSkipSummary({ passed: 0, skipped: 1 }), stderr: "" },
+      result: {
+        status: 1,
+        signal: null,
+        stdout: zeroSkipSummary({
+          passed: 0,
+          skipped: 1,
+          violations: [zeroSkipViolation({ outcome: "skipped" })]
+        }),
+        stderr: ""
+      },
       message: /failed its zero-skip gate/
     },
     {
@@ -223,7 +312,7 @@ test("deterministic runner fails closed on malformed, partial, or non-passing ch
     {
       label: "signal",
       result: { status: null, signal: "SIGTERM", stdout: "", stderr: "" },
-      message: /ended by signal SIGTERM/
+      message: /ended by a signal/
     },
     {
       label: "spawn-error",
@@ -242,7 +331,7 @@ test("deterministic runner fails closed on malformed, partial, or non-passing ch
     });
     assert.equal(status, 1, fixture.label);
     assert.match(diagnostic, fixture.message, fixture.label);
-    assert.equal(JSON.parse(output).reporter, "zero-skip-v1", fixture.label);
+    assert.equal(JSON.parse(output).reporter, ZERO_SKIP_REPORTER_ID, fixture.label);
   }
 
   let diagnostic = "";
@@ -252,6 +341,670 @@ test("deterministic runner fails closed on malformed, partial, or non-passing ch
     stderr: { write(value) { diagnostic += value; } }
   }), 1);
   assert.match(diagnostic, /No deterministic test files/);
+});
+
+test("zero-skip v2 classifies Node 18 events exclusively and never reads forbidden error fields", async () => {
+  const forbiddenSecret = "xai-FORBIDDENREPORTER000000";
+  let getterExecutions = 0;
+  const accessorEvent = {};
+  Object.defineProperty(accessorEvent, "type", {
+    get() {
+      getterExecutions += 1;
+      return "test:fail";
+    }
+  });
+  const directFailure = {
+    name: "AssertionError",
+    code: "ERR_ASSERTION",
+    operator: "strictEqual",
+    failureType: "testCodeFailure"
+  };
+  for (const field of ["message", "stack", "cause", "actual", "expected"]) {
+    Object.defineProperty(directFailure, field, {
+      configurable: true,
+      get() {
+        throw new Error(`${field}-${forbiddenSecret}`);
+      }
+    });
+  }
+  const testFile = path.join(ROOT, "tests/reporter-node18.test.mjs");
+  const { exitCode, summary } = await collectZeroSkipReport([
+    {
+      type: "test:pass",
+      data: { file: testFile, name: "passing test", nesting: 0, testNumber: 1 }
+    },
+    {
+      type: "test:pass",
+      data: {
+        file: testFile,
+        name: "skipped test",
+        nesting: 0,
+        testNumber: 2,
+        skip: forbiddenSecret
+      }
+    },
+    {
+      type: "test:fail",
+      data: {
+        file: testFile,
+        name: "todo test",
+        nesting: 0,
+        testNumber: 3,
+        todo: true,
+        details: { error: directFailure }
+      }
+    },
+    {
+      type: "test:fail",
+      data: {
+        file: testFile,
+        name: "cancelled child",
+        nesting: 1,
+        testNumber: 1,
+        details: { error: { failureType: "cancelledByParent", name: "Error", code: "ERR_TEST_FAILURE" } }
+      }
+    },
+    {
+      type: "test:fail",
+      data: {
+        file: testFile,
+        name: "details type is not cancellation",
+        nesting: 0,
+        testNumber: 4,
+        details: { type: "cancelledByParent", error: directFailure }
+      }
+    },
+    {
+      type: "test:fail",
+      data: {
+        file: `/Users/private/${forbiddenSecret}.test.mjs`,
+        name: `unsafe \u001b[31m\u202e ${forbiddenSecret} /Users/private/file ${"x".repeat(300)}`,
+        nesting: 0,
+        testNumber: 5,
+        details: { error: directFailure }
+      }
+    },
+    {
+      type: "test:fail",
+      data: {
+        file: testFile,
+        name: "suite wrapper",
+        nesting: 0,
+        testNumber: 6,
+        details: { type: "suite", error: directFailure }
+      }
+    },
+    accessorEvent
+  ]);
+
+  assert.equal(getterExecutions, 0);
+  assert.equal(exitCode, 1);
+  assert.deepEqual(
+    Object.fromEntries(["passed", "failed", "cancelled", "skipped", "todo"].map((field) => [field, summary[field]])),
+    { passed: 1, failed: 2, cancelled: 1, skipped: 1, todo: 1 }
+  );
+  assert.equal(summary.violations.length, 5);
+  assert.equal(summary.omittedViolations, 0);
+  assert.deepEqual(summary.violations.map((entry) => entry.outcome), [
+    "skipped",
+    "todo",
+    "cancelled",
+    "failed",
+    "failed"
+  ]);
+  assert.equal(summary.violations[2].line, null, "Node 18 does not provide line/column");
+  assert.equal(summary.violations[2].column, null);
+  assert.equal(summary.violations[3].errorName, "AssertionError");
+  assert.equal(summary.violations[3].errorCode, "ERR_ASSERTION");
+  assert.equal(summary.violations[3].operator, "strictEqual");
+  assert.equal(summary.violations[4].file, null);
+  assert.equal(summary.violations[4].name, "[redacted]");
+  assert.equal(JSON.stringify(summary).includes(forbiddenSecret), false);
+  assert.equal(validateZeroSkipSummary(summary, { root: ROOT }), true);
+});
+
+test("zero-skip path and name sanitization remain bounded and fail-closed", () => {
+  assert.equal(sanitizeZeroSkipFile("tests/first\u202e.test.mjs", ROOT), null);
+  assert.equal(sanitizeZeroSkipFile("tests/second\u202e.test.mjs", ROOT), null);
+  assert.equal(sanitizeZeroSkipFile("C:\\Users\\private\\fixture.test.mjs", ROOT), null);
+  assert.equal(sanitizeZeroSkipFile(path.join(ROOT, "tests/safe.test.mjs"), ROOT), "tests/safe.test.mjs");
+  const knownSecrets = collectZeroSkipKnownSecrets({ REPORTER_SECRET: "tiny" });
+  assert.equal(sanitizeZeroSkipFile("tests/tiny.test.mjs", ROOT, knownSecrets), null);
+  assert.equal(sanitizeZeroSkipFile(
+    "tests/xai-COMMONSECRET000000.test.mjs",
+    ROOT,
+    []
+  ), null);
+  assert.equal(sanitizeZeroSkipFile("tests/ordinary.test.mjs", ROOT, knownSecrets), "tests/ordinary.test.mjs");
+  const boundedName = sanitizeZeroSkipName(
+    Array.from({ length: 100 }, (_, index) => `part ${index}`).join(" "),
+    { root: ROOT }
+  );
+  assert.equal(Array.from(boundedName).length, 160);
+  assert.match(boundedName, /…$/u);
+  assert.equal(sanitizeZeroSkipName("contains short-canary", {
+    root: ROOT,
+    knownSecrets: ["short-canary"]
+  }), "[redacted]");
+  for (const [index, name] of SHORT_ABSOLUTE_PATH_NAMES.entries()) {
+    assert.equal(
+      sanitizeZeroSkipName(name, { root: ROOT }) === "[redacted]",
+      true,
+      `absolute path case ${index + 1}`
+    );
+  }
+  assert.equal(sanitizeZeroSkipName("ordinary fraction 1/2", { root: ROOT }), "ordinary fraction 1/2");
+  assert.equal(sanitizeZeroSkipName("slash /   ", { root: ROOT }), "slash /");
+});
+
+test("zero-skip reporter suppresses short absolute paths after common delimiters", async () => {
+  const testFile = path.join(ROOT, "tests/reporter-short-path.test.mjs");
+  for (const [index, rawName] of SHORT_ABSOLUTE_PATH_NAMES.entries()) {
+    const label = `absolute path case ${index + 1}`;
+    const { exitCode, summary } = await collectZeroSkipReport([
+      {
+        type: "test:fail",
+        data: {
+          file: testFile,
+          name: rawName,
+          nesting: 0,
+          testNumber: index + 1,
+          details: {
+            error: {
+              failureType: "testCodeFailure",
+              name: "Error",
+              code: "ERR_TEST_FAILURE"
+            }
+          }
+        }
+      }
+    ], {
+      root: ROOT,
+      environment: {}
+    });
+    assert.equal(exitCode, 1, label);
+    assert.equal(summary.failed, 1, label);
+    assert.equal(summary.violations[0].name === "[redacted]", true, label);
+    const serialized = `${JSON.stringify(summary)}\n`;
+    assert.equal(serialized.includes(rawName), false, label);
+    assert.equal(serialized.includes(JSON.stringify(rawName).slice(1, -1)), false, label);
+    assert.equal(validateZeroSkipSummary(summary, {
+      root: ROOT,
+      environment: {}
+    }), true, label);
+  }
+});
+
+test("zero-skip maximum-width legal v2 summary remains below its byte limit", () => {
+  const maximumFile = `tests/${"a".repeat(246)}.mjs`;
+  const maximumName = "😀".repeat(160);
+  const maximumToken = `${"E".repeat(23)}:${"F".repeat(23)}:${"G".repeat(16)}`;
+  assert.equal(maximumFile.length, 256);
+  assert.equal(Array.from(maximumName).length, 160);
+  assert.equal(maximumToken.length, 64);
+
+  const summary = {
+    reporter: ZERO_SKIP_REPORTER_ID,
+    passed: 0,
+    failed: Number.MAX_SAFE_INTEGER,
+    cancelled: 0,
+    skipped: 0,
+    todo: 0,
+    violations: Array.from({ length: ZERO_SKIP_MAX_VIOLATIONS }, (_, index) => ({
+      outcome: "failed",
+      file: maximumFile,
+      name: maximumName,
+      testNumber: Number.MAX_SAFE_INTEGER - index,
+      nesting: Number.MAX_SAFE_INTEGER,
+      line: Number.MAX_SAFE_INTEGER,
+      column: Number.MAX_SAFE_INTEGER,
+      errorName: maximumToken,
+      errorCode: maximumToken,
+      operator: maximumToken
+    })),
+    omittedViolations: Number.MAX_SAFE_INTEGER - ZERO_SKIP_MAX_VIOLATIONS
+  };
+  assert.equal(validateZeroSkipSummary(summary, {
+    root: ROOT,
+    environment: {}
+  }), true);
+  assert.deepEqual(Object.keys(summary.violations[0]), ZERO_SKIP_VIOLATION_FIELDS);
+  assert.ok(
+    Buffer.byteLength(`${JSON.stringify(summary)}\n`, "utf8") < ZERO_SKIP_MAX_SUMMARY_BYTES
+  );
+});
+
+test("zero-skip secret discovery exposes incompleteness and suppresses the uncollected 65th value", async () => {
+  const lastSecret = "last-canary";
+  const environment = {};
+  for (let index = 0; index < 65; index += 1) {
+    environment[`REPORTER_SECRET_${String(index).padStart(2, "0")}`] = (
+      index === 64 ? lastSecret : `known-canary-${index}`
+    );
+  }
+
+  const knownSecrets = collectZeroSkipKnownSecrets(environment);
+  assert.equal(knownSecrets.length, 64);
+  assert.equal(knownSecrets.complete, false);
+  assert.equal(Object.keys(knownSecrets).includes("complete"), false);
+  assert.equal(Object.getOwnPropertyDescriptor(knownSecrets, "complete")?.enumerable, false);
+
+  const { exitCode, summary } = await collectZeroSkipReport([
+    {
+      type: "test:fail",
+      data: {
+        file: path.join(ROOT, "tests", `${lastSecret}.test.mjs`),
+        name: `failure ${lastSecret}`,
+        nesting: 0,
+        testNumber: 1,
+        details: {
+          error: {
+            failureType: "testCodeFailure",
+            name: lastSecret,
+            code: lastSecret,
+            operator: lastSecret
+          }
+        }
+      }
+    }
+  ], { root: ROOT, environment });
+
+  assert.equal(exitCode, 1);
+  assert.equal(summary.failed, 1);
+  assert.deepEqual(Object.keys(summary).sort(), [
+    "reporter",
+    ...ZERO_SKIP_SUMMARY_FIELDS,
+    "violations",
+    "omittedViolations"
+  ].sort());
+  assert.deepEqual(Object.keys(summary.violations[0]), ZERO_SKIP_VIOLATION_FIELDS);
+  assert.deepEqual(summary.violations[0], {
+    outcome: "failed",
+    file: null,
+    name: "[redacted]",
+    testNumber: 1,
+    nesting: 0,
+    line: null,
+    column: null,
+    errorName: null,
+    errorCode: null,
+    operator: null
+  });
+  const serialized = `${JSON.stringify(summary)}\n`;
+  assert.ok(Buffer.byteLength(serialized, "utf8") <= ZERO_SKIP_MAX_SUMMARY_BYTES);
+  assert.equal(serialized.includes(lastSecret), false);
+  assert.equal(validateZeroSkipSummary(summary, { root: ROOT, environment }), true);
+
+  let aggregateOutput = "";
+  let aggregateDiagnostic = "";
+  const aggregateStatus = runDeterministicTestFiles({
+    files: [`tests/${lastSecret}.test.mjs`],
+    root: ROOT,
+    env: environment,
+    run: () => ({
+      status: 1,
+      signal: null,
+      stdout: serialized,
+      stderr: lastSecret
+    }),
+    stdout: { write(value) { aggregateOutput += value; } },
+    stderr: { write(value) { aggregateDiagnostic += value; } }
+  });
+  assert.equal(aggregateStatus, 1);
+  assert.equal(JSON.parse(aggregateOutput).violations[0].file, null);
+  assert.equal(`${aggregateOutput}${aggregateDiagnostic}`.includes(lastSecret), false);
+
+  let rejectedOutput = "";
+  let rejectedDiagnostic = "";
+  const rejectedStatus = runDeterministicTestFiles({
+    files: ["tests/malicious.test.mjs"],
+    root: ROOT,
+    env: environment,
+    run: () => ({
+      status: 1,
+      signal: null,
+      stdout: zeroSkipSummary({
+        failed: 1,
+        violations: [zeroSkipViolation({
+          file: `tests/${lastSecret}.test.mjs`,
+          name: lastSecret,
+          errorName: lastSecret,
+          errorCode: lastSecret,
+          operator: lastSecret
+        })]
+      }),
+      stderr: lastSecret
+    }),
+    stdout: { write(value) { rejectedOutput += value; } },
+    stderr: { write(value) { rejectedDiagnostic += value; } }
+  });
+  assert.equal(rejectedStatus, 1);
+  assert.match(rejectedDiagnostic, /invalid zero-skip summary/);
+  assert.equal(`${rejectedOutput}${rejectedDiagnostic}`.includes(lastSecret), false);
+});
+
+test("zero-skip secret discovery never invokes accessors and fails closed on incomplete values", async () => {
+  const accessorSecret = "accessor-canary";
+  let getterExecutions = 0;
+  const accessorEnvironment = {};
+  Object.defineProperty(accessorEnvironment, "REPORTER_SECRET", {
+    enumerable: true,
+    get() {
+      getterExecutions += 1;
+      return accessorSecret;
+    }
+  });
+  const accessorKnowledge = collectZeroSkipKnownSecrets(accessorEnvironment);
+  assert.equal(getterExecutions, 0);
+  assert.equal(accessorKnowledge.complete, false);
+  assert.deepEqual([...accessorKnowledge], []);
+
+  const oversizedKnowledge = collectZeroSkipKnownSecrets({
+    REPORTER_SECRET: "x".repeat(4_097)
+  });
+  assert.equal(oversizedKnowledge.complete, false);
+  assert.deepEqual([...oversizedKnowledge], []);
+
+  const failedCollection = collectZeroSkipKnownSecrets(new Proxy({}, {
+    ownKeys() {
+      throw new Error("descriptor failure");
+    }
+  }));
+  assert.equal(failedCollection.complete, false);
+
+  const { summary } = await collectZeroSkipReport([
+    {
+      type: "test:fail",
+      data: {
+        file: path.join(ROOT, "tests/accessor-visible.test.mjs"),
+        name: "accessor visible name",
+        nesting: 0,
+        testNumber: 1,
+        details: {
+          error: {
+            failureType: "testCodeFailure",
+            name: "VisibleError",
+            code: "VISIBLE_CODE",
+            operator: "visibleOperator"
+          }
+        }
+      }
+    }
+  ], { root: ROOT, environment: accessorEnvironment });
+  assert.equal(getterExecutions, 0);
+  assert.deepEqual(summary.violations[0], {
+    outcome: "failed",
+    file: null,
+    name: "[redacted]",
+    testNumber: 1,
+    nesting: 0,
+    line: null,
+    column: null,
+    errorName: null,
+    errorCode: null,
+    operator: null
+  });
+  assert.equal(JSON.stringify(summary).includes(accessorSecret), false);
+  assert.equal(validateZeroSkipSummary(summary, {
+    root: ROOT,
+    environment: accessorEnvironment
+  }), true);
+  assert.equal(getterExecutions, 0);
+});
+
+test("zero-skip v2 retains the first eight violations and counts every omitted outcome", async () => {
+  const testFile = path.join(ROOT, "tests/reporter-cap.test.mjs");
+  const events = Array.from({ length: 10 }, (_, index) => ({
+    type: "test:fail",
+    data: {
+      file: testFile,
+      name: `failure ${index + 1}`,
+      nesting: 0,
+      testNumber: index + 1,
+      details: {
+        error: {
+          failureType: "testCodeFailure",
+          name: "Error",
+          code: "ERR_TEST_FAILURE"
+        }
+      }
+    }
+  }));
+  const { exitCode, summary } = await collectZeroSkipReport(events);
+  assert.equal(exitCode, 1);
+  assert.equal(summary.failed, 10);
+  assert.equal(summary.violations.length, ZERO_SKIP_MAX_VIOLATIONS);
+  assert.equal(summary.omittedViolations, 2);
+  assert.deepEqual(
+    summary.violations.map((entry) => entry.name),
+    Array.from({ length: ZERO_SKIP_MAX_VIOLATIONS }, (_, index) => `failure ${index + 1}`)
+  );
+  assert.equal(validateZeroSkipSummary(summary, { root: ROOT }), true);
+});
+
+test("deterministic runner rejects malformed v2 summaries without echoing raw values", () => {
+  const secret = "xai-RUNNERMALFORMED000000";
+  const baseViolation = zeroSkipViolation();
+  const cases = [
+    "{}\n",
+    zeroSkipSummary({ skipped: 1 }),
+    zeroSkipSummary({ failed: 1, omittedViolations: 1 }),
+    zeroSkipSummary({
+      failed: 1,
+      violations: [{ ...baseViolation, outcome: "skipped" }]
+    }),
+    zeroSkipSummary({
+      failed: 1,
+      violations: [{ ...baseViolation, file: `/Users/private/${secret}.test.mjs` }]
+    }),
+    zeroSkipSummary({
+      failed: 1,
+      violations: [{ ...baseViolation, name: secret }]
+    }),
+    zeroSkipSummary({
+      failed: 1,
+      violations: [{ ...baseViolation, unexpected: null }]
+    }),
+    zeroSkipSummary({
+      failed: ZERO_SKIP_MAX_VIOLATIONS + 1,
+      violations: Array.from(
+        { length: ZERO_SKIP_MAX_VIOLATIONS + 1 },
+        (_, index) => zeroSkipViolation({ name: `failure ${index}` })
+      )
+    }),
+    zeroSkipSummary({ passed: -1 }),
+    `${zeroSkipSummary()}${zeroSkipSummary()}`,
+    "x".repeat(ZERO_SKIP_MAX_SUMMARY_BYTES + 1)
+  ];
+
+  for (const [index, childOutput] of cases.entries()) {
+    let output = "";
+    let diagnostic = "";
+    const privateInput = `/Users/private/${secret}-${index}.test.mjs`;
+    const status = runDeterministicTestFiles({
+      files: [privateInput],
+      run: () => ({
+        status: 0,
+        signal: null,
+        stdout: childOutput,
+        stderr: `${secret}-stderr-${index}`
+      }),
+      stdout: { write(value) { output += value; } },
+      stderr: { write(value) { diagnostic += value; } }
+    });
+    assert.equal(status, 1, String(index));
+    assert.match(diagnostic, /child 1 emitted an invalid zero-skip summary/, String(index));
+    assert.equal(`${output}${diagnostic}`.includes(secret), false, String(index));
+    assert.equal(`${output}${diagnostic}`.includes(privateInput), false, String(index));
+  }
+
+  const environmentSecret = "short-canary";
+  const secretViolations = [
+    zeroSkipViolation({ name: environmentSecret }),
+    zeroSkipViolation({ file: `tests/${environmentSecret}.test.mjs` }),
+    zeroSkipViolation({ errorCode: environmentSecret })
+  ];
+  for (const [index, violation] of secretViolations.entries()) {
+    let output = "";
+    let diagnostic = "";
+    const status = runDeterministicTestFiles({
+      files: [`tests/environment-secret-${index}.test.mjs`],
+      env: { REPORTER_SECRET: environmentSecret },
+      run: () => ({
+        status: 1,
+        signal: null,
+        stdout: zeroSkipSummary({
+          failed: 1,
+          violations: [violation]
+        }),
+        stderr: environmentSecret
+      }),
+      stdout: { write(value) { output += value; } },
+      stderr: { write(value) { diagnostic += value; } }
+    });
+    assert.equal(status, 1, String(index));
+    assert.match(diagnostic, /invalid zero-skip summary/, String(index));
+    assert.equal(`${output}${diagnostic}`.includes(environmentSecret), false, String(index));
+  }
+
+  let fallbackOutput = "";
+  let fallbackDiagnostic = "";
+  const fallbackStatus = runDeterministicTestFiles({
+    files: [`tests/${environmentSecret}.test.mjs`],
+    env: { REPORTER_SECRET: environmentSecret },
+    run: () => ({
+      status: 1,
+      signal: null,
+      stdout: zeroSkipSummary({
+        failed: 1,
+        violations: [zeroSkipViolation({ file: null })]
+      }),
+      stderr: environmentSecret
+    }),
+    stdout: { write(value) { fallbackOutput += value; } },
+    stderr: { write(value) { fallbackDiagnostic += value; } }
+  });
+  assert.equal(fallbackStatus, 1);
+  assert.equal(JSON.parse(fallbackOutput).violations[0].file, null);
+  assert.equal(`${fallbackOutput}${fallbackDiagnostic}`.includes(environmentSecret), false);
+});
+
+test("zero-skip validator and deterministic parser reject raw short absolute paths", () => {
+  for (const [index, rawName] of SHORT_ABSOLUTE_PATH_NAMES.entries()) {
+    const label = `absolute path case ${index + 1}`;
+    const childOutput = zeroSkipSummary({
+      passed: 0,
+      failed: 1,
+      violations: [zeroSkipViolation({ name: rawName })]
+    });
+    assert.equal(validateZeroSkipSummary(JSON.parse(childOutput), {
+      root: ROOT,
+      environment: {}
+    }), false, label);
+
+    let output = "";
+    let diagnostic = "";
+    const status = runDeterministicTestFiles({
+      files: [`tests/absolute-path-${index}.test.mjs`],
+      root: ROOT,
+      env: {},
+      run: () => ({
+        status: 1,
+        signal: null,
+        stdout: childOutput,
+        stderr: rawName
+      }),
+      stdout: { write(value) { output += value; } },
+      stderr: { write(value) { diagnostic += value; } }
+    });
+    assert.equal(status, 1, label);
+    assert.match(diagnostic, /invalid zero-skip summary/, label);
+    assert.equal(`${output}${diagnostic}`.includes(rawName), false, label);
+    assert.equal(
+      `${output}${diagnostic}`.includes(JSON.stringify(rawName).slice(1, -1)),
+      false,
+      label
+    );
+  }
+});
+
+test("deterministic runner suppresses child stderr and globally caps structural violations", () => {
+  const secret = "xai-RUNNERSTDERR000000";
+  const childSummaries = [
+    zeroSkipSummary({
+      failed: 6,
+      violations: Array.from(
+        { length: 6 },
+        (_, index) => zeroSkipViolation({ name: `failed ${index + 1}` })
+      )
+    }),
+    zeroSkipSummary({
+      skipped: 4,
+      violations: Array.from(
+        { length: 4 },
+        (_, index) => zeroSkipViolation({ outcome: "skipped", name: `skipped ${index + 1}` })
+      )
+    })
+  ];
+  let call = 0;
+  let output = "";
+  let diagnostic = "";
+  const status = runDeterministicTestFiles({
+    files: ["tests/first.test.mjs", "tests/second.test.mjs"],
+    run: () => ({
+      status: 1,
+      signal: null,
+      stdout: childSummaries[call++],
+      stderr: `${secret}-must-not-be-forwarded`
+    }),
+    stdout: { write(value) { output += value; } },
+    stderr: { write(value) { diagnostic += value; } }
+  });
+  const aggregate = JSON.parse(output);
+  assert.equal(status, 1);
+  assert.equal(`${output}${diagnostic}`.includes(secret), false);
+  assert.deepEqual(
+    Object.fromEntries(["passed", "failed", "cancelled", "skipped", "todo"].map((field) => [field, aggregate[field]])),
+    { passed: 2, failed: 6, cancelled: 0, skipped: 4, todo: 0 }
+  );
+  assert.equal(aggregate.violations.length, ZERO_SKIP_MAX_VIOLATIONS);
+  assert.equal(aggregate.omittedViolations, 2);
+  assert.deepEqual(aggregate.violations.map((entry) => entry.name), [
+    "failed 1",
+    "failed 2",
+    "failed 3",
+    "failed 4",
+    "failed 5",
+    "failed 6",
+    "skipped 1",
+    "skipped 2"
+  ]);
+  assert.equal(validateZeroSkipSummary(aggregate, { root: ROOT }), true);
+});
+
+test("deterministic runner fails closed on safe-integer aggregation overflow", () => {
+  const summaries = [
+    zeroSkipSummary({ passed: Number.MAX_SAFE_INTEGER }),
+    zeroSkipSummary()
+  ];
+  let call = 0;
+  let output = "";
+  let diagnostic = "";
+  const status = runDeterministicTestFiles({
+    files: ["tests/first.test.mjs", "tests/second.test.mjs"],
+    run: () => ({
+      status: 0,
+      signal: null,
+      stdout: summaries[call++],
+      stderr: ""
+    }),
+    stdout: { write(value) { output += value; } },
+    stderr: { write(value) { diagnostic += value; } }
+  });
+  assert.equal(status, 1);
+  assert.match(diagnostic, /child 2 could not be aggregated safely/);
+  assert.equal(JSON.parse(output).passed, Number.MAX_SAFE_INTEGER);
+  assert.equal(validateZeroSkipSummary(JSON.parse(output), { root: ROOT }), true);
 });
 
 function installProofRepositoryGate(root, command) {
@@ -3337,10 +4090,16 @@ test("proof command capture strips ambient authority and never returns secret-be
   assert.equal(missingExecutable.failureKind, "spawn_error");
 });
 
-test("mandatory proof reporter fails an otherwise successful test command with skip or TODO", () => {
+test("mandatory proof reporter emits secret-safe v2 identities for pass, skip, TODO, failure, and cancellation", () => {
   const root = tempDir("zero-skip-reporter-");
   const passing = path.join(root, "passing.test.mjs");
   const partial = path.join(root, "partial.test.mjs");
+  const failing = path.join(root, "failing.test.mjs");
+  const cancelled = path.join(root, "cancelled.test.mjs");
+  const directiveSecret = "xai-DIRECTIVEREPORTER000000";
+  const assertionSecret = "xai-ASSERTIONREPORTER000000";
+  const actualSecret = "xai-ACTUALREPORTER000000";
+  const unsafeName = `unsafe \u001b[31m\u202e xai-NAMEREPORTER000000 /Users/private/file ${"z".repeat(300)}`;
   fs.writeFileSync(
     passing,
     'import test from "node:test";\ntest("pass", () => {});\n'
@@ -3350,8 +4109,29 @@ test("mandatory proof reporter fails an otherwise successful test command with s
     [
       'import test from "node:test";',
       'test("pass", () => {});',
-      'test("skip", { skip: true }, () => {});',
-      'test("todo", { todo: true }, () => {});',
+      `test("skip", { skip: ${JSON.stringify(directiveSecret)} }, () => {});`,
+      `test("todo", { todo: ${JSON.stringify(directiveSecret)} }, () => {});`,
+      ''
+    ].join("\n")
+  );
+  fs.writeFileSync(
+    failing,
+    [
+      'import assert from "node:assert/strict";',
+      'import test from "node:test";',
+      `test(${JSON.stringify(unsafeName)}, () => {`,
+      `  assert.equal(${JSON.stringify(actualSecret)}, "expected", ${JSON.stringify(assertionSecret)});`,
+      "});",
+      ''
+    ].join("\n")
+  );
+  fs.writeFileSync(
+    cancelled,
+    [
+      'import test from "node:test";',
+      'test("cancelled by timeout", { timeout: 25 }, async () => {',
+      '  await new Promise(() => {});',
+      '});',
       ''
     ].join("\n")
   );
@@ -3363,15 +4143,49 @@ test("mandatory proof reporter fails an otherwise successful test command with s
     env: childEnvironment
   });
   assert.equal(complete.status, 0, complete.stderr || complete.stdout);
-  assert.match(complete.stdout, /"skipped":0/);
-  assert.match(complete.stdout, /"todo":0/);
+  const completeSummary = JSON.parse(complete.stdout);
+  assert.equal(completeSummary.reporter, ZERO_SKIP_REPORTER_ID);
+  assert.equal(completeSummary.skipped, 0);
+  assert.equal(completeSummary.todo, 0);
+  assert.deepEqual(completeSummary.violations, []);
+  assert.equal(completeSummary.omittedViolations, 0);
   const rejected = run(process.execPath, ["--test", reporterArg, partial], {
     cwd: root,
     env: childEnvironment
   });
   assert.notEqual(rejected.status, 0);
-  assert.match(rejected.stdout, /"skipped":1/);
-  assert.match(rejected.stdout, /"todo":1/);
+  const partialSummary = JSON.parse(rejected.stdout);
+  assert.equal(partialSummary.skipped, 1);
+  assert.equal(partialSummary.todo, 1);
+  assert.deepEqual(partialSummary.violations.map((entry) => entry.outcome), ["skipped", "todo"]);
+  assert.equal(`${rejected.stdout}${rejected.stderr}`.includes(directiveSecret), false);
+
+  const failed = run(process.execPath, ["--test", reporterArg, failing], {
+    cwd: root,
+    env: childEnvironment
+  });
+  assert.notEqual(failed.status, 0);
+  const failedSummary = JSON.parse(failed.stdout);
+  assert.ok(failedSummary.failed >= 1);
+  assert.ok(failedSummary.violations.some((entry) => (
+    entry.outcome === "failed" && entry.name === "[redacted]"
+  )));
+  const failureOutput = `${failed.stdout}${failed.stderr}`;
+  for (const secret of [assertionSecret, actualSecret, "xai-NAMEREPORTER000000"]) {
+    assert.equal(failureOutput.includes(secret), false, secret);
+  }
+  assert.equal(failureOutput.includes("/Users/private"), false);
+  assert.equal(failureOutput.includes("\u001b"), false);
+  assert.equal(failureOutput.includes("\u202e"), false);
+
+  const cancelledResult = run(process.execPath, ["--test", reporterArg, cancelled], {
+    cwd: root,
+    env: childEnvironment
+  });
+  assert.notEqual(cancelledResult.status, 0);
+  const cancelledSummary = JSON.parse(cancelledResult.stdout);
+  assert.ok(cancelledSummary.cancelled >= 1);
+  assert.ok(cancelledSummary.violations.some((entry) => entry.outcome === "cancelled"));
 });
 
 test("proof publication ignores caller-prepended fake npm, git, and python and survives honest strict replay", () => {
