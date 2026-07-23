@@ -15,6 +15,7 @@ import {
   validateInstalledInitialize,
   validateInstalledScenarioEvidence,
   validateInstalledSetup,
+  validateInstalledTerminalEventHistory,
   validateInstalledToolInventory,
   validateInstalledToolResult,
   validateProviderCapabilityAgreement
@@ -2381,32 +2382,23 @@ function validateTerminalWorkerSnapshot(worker, tracker, job, expectedStatus) {
   }
 }
 
-function assertTerminalEventHistory(tracker, publicEvents, privateEvents) {
-  if (
-    !Array.isArray(publicEvents)
-    || !Array.isArray(privateEvents)
-    || !sameJson(tracker.events.values(), publicEvents)
-    || publicEvents.length !== privateEvents.length
-  ) {
+function assertTerminalEventHistory(context, tracker, publicWorker, terminalJob) {
+  let projected;
+  try {
+    projected = context.workerProtocol.projectWorkerSnapshot(terminalJob, {
+      detail: true,
+      trustHostAuthority: false
+    });
+    validateInstalledTerminalEventHistory({
+      workerId: tracker.workerId,
+      trackedEvents: tracker.events.values(),
+      publicEvents: publicWorker.lifecycleEvents,
+      publicCursor: publicWorker.eventCursor,
+      projectedEvents: projected.lifecycleEvents,
+      projectedCursor: projected.eventCursor
+    });
+  } catch {
     fail("E_PRIVATE_STATE");
-  }
-  for (let index = 0; index < publicEvents.length; index += 1) {
-    const observed = publicEvents[index];
-    const stored = privateEvents[index];
-    if (
-      observed.sequence !== stored?.sequence
-      || observed.type !== stored?.type
-      || observed.at !== stored?.at
-      || observed.summary !== stored?.summary
-      || (
-        Object.hasOwn(observed, "detail")
-        && Object.entries(observed.detail).some(
-          ([key, value]) => !sameJson(value, stored?.detail?.[key])
-        )
-      )
-    ) {
-      fail("E_PRIVATE_STATE");
-    }
   }
 }
 
@@ -3260,9 +3252,10 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   );
   enterQualificationStage("completion-cleanup-events");
   assertTerminalEventHistory(
+    context,
     tracker,
-    result.worker.lifecycleEvents,
-    terminalJob.lifecycleEvents
+    result.worker,
+    terminalJob
   );
   enterQualificationStage("completion-cleanup-binding");
   assertPublicPrivateBinding(result.worker, terminalJob);
@@ -3440,9 +3433,10 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
   );
   enterQualificationStage("cancellation-cleanup-events");
   assertTerminalEventHistory(
+    context,
     tracker,
-    result.worker.lifecycleEvents,
-    terminalJob.lifecycleEvents
+    result.worker,
+    terminalJob
   );
   enterQualificationStage("cancellation-cleanup-binding");
   assertPublicPrivateBinding(result.worker, terminalJob);

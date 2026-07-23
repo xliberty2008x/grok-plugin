@@ -345,6 +345,11 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /validateIntermediateWorkerSnapshot\(/);
   assert.match(source, /validateTerminalWorkerSnapshot\(/);
   assert.match(source, /assertTerminalEventHistory\(/);
+  assert.match(source, /projectWorkerSnapshot\(terminalJob, \{/);
+  assert.match(source, /validateInstalledTerminalEventHistory\(\{/);
+  assert.match(source, /projectedEvents: projected\.lifecycleEvents/);
+  assert.match(source, /projectedCursor: projected\.eventCursor/);
+  assert.doesNotMatch(source, /publicEvents\.length !== privateEvents\.length/);
   assert.match(source, /eventCursorSchemaVersion !== 1/);
   assert.match(source, /\{ wait: true, cursor: currentCursor \}/);
   assert.match(source, /stream\.timedOut !== \(/);

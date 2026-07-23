@@ -2124,6 +2124,83 @@ export function validateInstalledCancellationReplayScenario(value) {
   return evidence;
 }
 
+function validTerminalLifecycleProjection(events, cursor, workerId) {
+  if (
+    !Array.isArray(events)
+    || events.length < 1
+    || events.length > 128
+    || !exactKeys(cursor, EVENT_CURSOR_KEYS)
+    || cursor.schemaVersion !== 1
+    || cursor.workerId !== workerId
+    || !Number.isSafeInteger(cursor.sequence)
+    || cursor.sequence < 1
+    || events[0]?.type !== "task.accepted"
+    || events[0]?.sequence !== 1
+    || events.filter((event) => event?.type === "task.accepted").length !== 1
+  ) {
+    return false;
+  }
+  let previousSequence = 0;
+  for (const event of events) {
+    if (
+      !allowedKeys(
+        event,
+        LIFECYCLE_EVENT_KEYS,
+        new Set([...LIFECYCLE_EVENT_KEYS, "detail"])
+      )
+      || event.workerProtocolVersion !== 1
+      || event.eventSchemaVersion !== 1
+      || !PUBLIC_LIFECYCLE_EVENT_TYPES.has(event.type)
+      || !canonicalIsoTimestamp(event.at)
+      || !validPublicText(event.summary, 2_000, { nullable: true })
+      || !Number.isSafeInteger(event.sequence)
+      || event.sequence !== previousSequence + 1
+      || (
+        Object.hasOwn(event, "detail")
+        && !validLifecycleDetail(event.detail)
+      )
+    ) {
+      return false;
+    }
+    previousSequence = event.sequence;
+  }
+  return cursor.sequence === previousSequence;
+}
+
+/**
+ * Bind a terminal public lifecycle stream to the exact installed projection of
+ * the durable private record. Private lifecycle text is intentionally compared
+ * only after projection because that boundary sanitizes paths and control text.
+ */
+export function validateInstalledTerminalEventHistory(value) {
+  const evidence = boundedJson(value, "E_LIVE_PRIVATE_STATE");
+  if (
+    !exactKeys(evidence, new Set([
+      "workerId",
+      "trackedEvents",
+      "publicEvents",
+      "publicCursor",
+      "projectedEvents",
+      "projectedCursor"
+    ]))
+    || !WORKER_ID.test(evidence.workerId || "")
+    || !Array.isArray(evidence.trackedEvents)
+    || !Array.isArray(evidence.publicEvents)
+    || !Array.isArray(evidence.projectedEvents)
+    || !sameJson(evidence.trackedEvents, evidence.publicEvents)
+    || !sameJson(evidence.publicEvents, evidence.projectedEvents)
+    || !sameJson(evidence.publicCursor, evidence.projectedCursor)
+    || !validTerminalLifecycleProjection(
+      evidence.publicEvents,
+      evidence.publicCursor,
+      evidence.workerId
+    )
+  ) {
+    fail("E_LIVE_PRIVATE_STATE");
+  }
+  return evidence;
+}
+
 function sameNonemptyValues(values, pattern = null) {
   return (
     Array.isArray(values)

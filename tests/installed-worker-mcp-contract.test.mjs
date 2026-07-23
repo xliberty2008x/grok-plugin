@@ -24,6 +24,7 @@ import {
   validateInstalledPrivateObservation,
   validateInstalledScenarioEvidence,
   validateInstalledSetup,
+  validateInstalledTerminalEventHistory,
   validateInstalledToolInventory,
   validateInstalledToolResult,
   validateProviderCapabilityAgreement
@@ -1603,6 +1604,77 @@ test("cancellation replay preserves immutable admission receipt and one public e
     assert.throws(
       () => validateInstalledCancellationReplayScenario(drift),
       assertContractError("E_LIVE_CANCELLATION")
+    );
+  }
+});
+
+test("terminal event history compares the installed projection and rejects malformed streams", () => {
+  const privateTerminal = privateJob("completed");
+  privateTerminal.lifecycleEvents[3] = {
+    ...privateTerminal.lifecycleEvents[3],
+    summary: "Runtime\u0007 cleanup completed",
+    detail: {
+      plan: ["Inspect\u001b[31m tracked.txt"],
+      rawDiagnostics: "private field must be omitted"
+    }
+  };
+  const projected = projectWorkerSnapshot(privateTerminal, {
+    detail: true,
+    trustHostAuthority: false
+  });
+  assert.equal(privateTerminal.lifecycleEvents[3].summary.includes("\u0007"), true);
+  assert.equal(projected.lifecycleEvents[3].summary, "Runtime cleanup completed");
+  assert.deepEqual(projected.lifecycleEvents[3].detail, {
+    plan: ["Inspect tracked.txt"]
+  });
+
+  const valid = {
+    workerId: WORKER_ID,
+    trackedEvents: clone(projected.lifecycleEvents),
+    publicEvents: clone(projected.lifecycleEvents),
+    publicCursor: clone(projected.eventCursor),
+    projectedEvents: clone(projected.lifecycleEvents),
+    projectedCursor: clone(projected.eventCursor)
+  };
+  assert.doesNotThrow(() => validateInstalledTerminalEventHistory(valid));
+
+  for (const mutate of [
+    (value) => {
+      value.trackedEvents = [];
+      value.publicEvents = [];
+      value.projectedEvents = [];
+      value.publicCursor.sequence = 0;
+      value.projectedCursor.sequence = 0;
+    },
+    (value) => {
+      value.trackedEvents = [1];
+      value.publicEvents = [1];
+      value.projectedEvents = [1];
+      value.publicCursor.sequence = 1;
+      value.projectedCursor.sequence = 1;
+    },
+    (value) => { value.trackedEvents.pop(); },
+    (value) => { value.publicEvents[0].summary = "drift"; },
+    (value) => { value.projectedEvents.push(clone(value.projectedEvents.at(-1))); },
+    (value) => { value.projectedEvents[0].sequence = 99; },
+    (value) => {
+      for (const key of ["trackedEvents", "publicEvents", "projectedEvents"]) {
+        delete value[key][0].eventSchemaVersion;
+      }
+    },
+    (value) => {
+      for (const key of ["trackedEvents", "publicEvents", "projectedEvents"]) {
+        value[key][0].detail = { rawDiagnostics: "private" };
+      }
+    },
+    (value) => { value.publicCursor.sequence -= 1; },
+    (value) => { value.projectedCursor.workerId = "task-ffffffffffffffff"; }
+  ]) {
+    const drift = clone(valid);
+    mutate(drift);
+    assert.throws(
+      () => validateInstalledTerminalEventHistory(drift),
+      assertContractError("E_LIVE_PRIVATE_STATE")
     );
   }
 });

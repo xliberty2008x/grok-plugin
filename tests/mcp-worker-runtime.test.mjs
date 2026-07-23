@@ -18,6 +18,7 @@ import {
   prepareDispatchProcessSpawn,
   providerLaunchState,
   recordUnsettledProviderProcess,
+  settleProviderStartedWorkerFinalization,
   settlePreProviderWorkerFinalization,
   spawnReadOnlyWorker,
   transitionWorkerDispatch
@@ -1513,6 +1514,111 @@ test("settled initial provider loss retains a self-valid generation-bound termin
   assert.equal(terminal.providerProcess.providerGeneration, 1);
   assert.equal(terminal.result.taskRuntimeCleaned, true);
   assert.doesNotThrow(() => assertDispatchContract(terminal));
+});
+
+test("provider finalization publishes one stable terminal snapshot with cleanup checkpoint", { skip: process.platform === "win32" }, async (t) => {
+  const { root, env } = fixture();
+  const principal = { hostKind: "codex", threadId: THREAD_ID };
+  const admitted = spawnReadOnlyWorker({
+    root,
+    principal,
+    envelope: buildTaskEnvelope({ userRequest: "Publish one stable terminal result", mode: "read" }),
+    idempotencyKey: "provider-terminal-snapshot-stable-0001",
+    env
+  });
+  const workerId = admitted.handle.id;
+  const claim = claimWorkerDispatch({ root, principal, workerId, env });
+  const controllerChild = spawnIdleProcess(t);
+  const workerChild = spawnIdleProcess(t);
+  const providerChild = spawnIdleProcess(t);
+  const controllerProcess = await boundProcessIdentity(controllerChild, workerId, claim);
+  const workerProcess = await boundProcessIdentity(workerChild, workerId, claim);
+  const providerProcess = await boundProcessIdentity(providerChild, workerId, claim, {
+    providerGeneration: 1
+  });
+  installProviderStartedFixture({
+    root,
+    workerId,
+    claim,
+    controllerProcess,
+    workerProcess,
+    providerProcess,
+    env
+  });
+  const completedAt = new Date().toISOString();
+  updateJob(root, workerId, (job) => ({
+    ...job,
+    phase: "finalizing",
+    pendingTerminal: {
+      status: "completed",
+      phase: "done",
+      completedAt,
+      error: null,
+      summary: "Stable terminal result"
+    },
+    result: {
+      ...(job.result || {}),
+      hostVerification: "not_run",
+      taskRuntimeCleaned: false
+    }
+  }), env);
+
+  process.kill(-providerChild.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(providerProcess), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  let cleanupCalls = 0;
+  const settled = settleProviderStartedWorkerFinalization({
+    root,
+    workerId,
+    attemptId: claim.attemptId,
+    workerProcess,
+    providerProcess,
+    runtimeCleanup: () => {
+      cleanupCalls += 1;
+      return { ok: true };
+    },
+    env
+  });
+  assert.equal(cleanupCalls, 1);
+  assert.equal(settled.status, "completed");
+  assert.equal(settled.phase, "done");
+  assert.equal(settled.completedAt, completedAt);
+  assert.equal(settled.result.taskRuntimeCleaned, true);
+  assert.equal(settled.pendingTerminal, undefined);
+  assert.deepEqual(settled.lifecycleEvents.at(-1), {
+    type: "checkpoint",
+    at: settled.lifecycleEvents.at(-1).at,
+    summary: "Task runtime cleanup completed; durable terminal intent published.",
+    sequence: settled.lifecycleEvents.at(-1).sequence,
+    detail: { replayedPrompt: false }
+  });
+
+  const options = { env };
+  const firstResult = await callTool(root, "worker_result", { id: workerId }, options);
+  const secondResult = await callTool(root, "worker_result", { id: workerId }, options);
+  assert.deepEqual(secondResult, firstResult);
+  assert.equal(firstResult.worker.status, "completed");
+  assert.equal(firstResult.worker.result.taskRuntimeCleaned, true);
+  assert.equal(
+    firstResult.worker.lifecycleEvents.at(-1).summary,
+    "Task runtime cleanup completed; durable terminal intent published."
+  );
+
+  const beforeReconcile = tryReadJob(root, workerId, env);
+  await reconcileBrokerWorkers({
+    root,
+    principal,
+    dispatchStartupGraceMs: 0,
+    env
+  });
+  const afterReconcile = tryReadJob(root, workerId, env);
+  assert.deepEqual(afterReconcile, beforeReconcile);
+  assert.deepEqual(
+    await callTool(root, "worker_result", { id: workerId }, options),
+    firstResult
+  );
 });
 
 test("pre-provider cleanup failure remains nonterminal until recovery proves every group gone", { skip: process.platform === "win32" }, async (t) => {
