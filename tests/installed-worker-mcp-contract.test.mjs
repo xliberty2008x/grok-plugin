@@ -1505,6 +1505,50 @@ test("cancellation replay preserves immutable admission receipt and one public e
     message: "Cancelled."
   });
 
+  const delayedLifecycleEvent = cancellationBundle();
+  const delayedAcceptedAt = "2026-07-23T10:01:59.963Z";
+  delayedLifecycleEvent.cancel.receipt.requestAcceptedAt = delayedAcceptedAt;
+  delayedLifecycleEvent.cancelReplay.receipt.requestAcceptedAt =
+    delayedAcceptedAt;
+  delayedLifecycleEvent.terminalResult.worker.result.cancellation
+    .requestAcceptedAt = delayedAcceptedAt;
+  delayedLifecycleEvent.terminalResult.worker.lifecycleEvents
+    .find((event) => event.type === "cancellation.requested")
+    .detail.requestAcceptedAt = delayedAcceptedAt;
+  assert.doesNotThrow(
+    () => validateInstalledCancellationReplayScenario(delayedLifecycleEvent)
+  );
+
+  const futureAcceptance = cancellationBundle();
+  const futureAcceptedAt = "2026-07-23T10:02:00.001Z";
+  futureAcceptance.cancel.receipt.requestAcceptedAt = futureAcceptedAt;
+  futureAcceptance.cancelReplay.receipt.requestAcceptedAt = futureAcceptedAt;
+  futureAcceptance.terminalResult.worker.result.cancellation.requestAcceptedAt =
+    futureAcceptedAt;
+  futureAcceptance.terminalResult.worker.lifecycleEvents
+    .find((event) => event.type === "cancellation.requested")
+    .detail.requestAcceptedAt = futureAcceptedAt;
+  assert.throws(
+    () => validateInstalledCancellationReplayScenario(futureAcceptance),
+    assertContractError("E_LIVE_CANCELLATION")
+  );
+
+  const preAdmissionAcceptance = cancellationBundle();
+  const preAdmissionAcceptedAt = "2026-07-23T09:59:59.999Z";
+  preAdmissionAcceptance.cancel.receipt.requestAcceptedAt =
+    preAdmissionAcceptedAt;
+  preAdmissionAcceptance.cancelReplay.receipt.requestAcceptedAt =
+    preAdmissionAcceptedAt;
+  preAdmissionAcceptance.terminalResult.worker.result.cancellation
+    .requestAcceptedAt = preAdmissionAcceptedAt;
+  preAdmissionAcceptance.terminalResult.worker.lifecycleEvents
+    .find((event) => event.type === "cancellation.requested")
+    .detail.requestAcceptedAt = preAdmissionAcceptedAt;
+  assert.throws(
+    () => validateInstalledCancellationReplayScenario(preAdmissionAcceptance),
+    assertContractError("E_LIVE_CANCELLATION")
+  );
+
   const receiptDrift = cancellationBundle();
   receiptDrift.cancelReplay.receipt.receiptId = "cancel-ffffffffffffffffffffffff";
   assert.throws(

@@ -1500,10 +1500,16 @@ function validLifecycleEvents(events, worker, status) {
     return false;
   }
   if (status === "cancelled") {
+    const cancellationAcceptedAt = Date.parse(
+      cancellationEvents[0]?.detail?.requestAcceptedAt
+    );
+    const cancellationEventAt = Date.parse(cancellationEvents[0]?.at);
     if (
       cancellationEvents.length !== 1
       || finalReports.length !== 0
-      || cancellationEvents[0].detail?.requestAcceptedAt !== cancellationEvents[0].at
+      || !Number.isFinite(cancellationAcceptedAt)
+      || cancellationAcceptedAt < createdAt
+      || cancellationAcceptedAt > cancellationEventAt
       || Date.parse(cancellationEvents[0].at) > completedAt
     ) {
       return false;

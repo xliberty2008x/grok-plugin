@@ -916,6 +916,17 @@ test("cancel is idempotent with exactly one cancellation-request event", () => {
   const job = tryReadJob(root, spawned.handle.id, env);
   const cancelEvents = (job.lifecycleEvents || []).filter((event) => event.type === "cancellation.requested");
   assert.equal(cancelEvents.length, 1);
+  assert.equal(
+    cancelEvents[0].detail.requestAcceptedAt,
+    first.receipt.requestAcceptedAt
+  );
+  assert.equal(
+    cancelEvents[0].sequence,
+    first.receipt.cancellationRequestSequence
+  );
+  assert.ok(
+    Date.parse(cancelEvents[0].at) >= Date.parse(first.receipt.requestAcceptedAt)
+  );
   assert.equal(job.status, "cancelled");
   assert.equal(job.result.hostVerification, "not_run");
   assert.equal(job.result.taskRuntimeCleaned, true);
