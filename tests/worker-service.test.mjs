@@ -503,6 +503,12 @@ test("worker spawn returns a stable admission snapshot while dispatch advances p
   assert.equal(afterDispatch.status, "queued");
   assert.equal(afterDispatch.phase, "provider-launching");
   assert.equal(afterDispatch.lifecycleEvents.at(-1).sequence, 2);
+  assert.equal(afterDispatch.lifecycleEvents.at(-1).type, "checkpoint");
+  assert.equal(
+    afterDispatch.lifecycleEvents.at(-1).summary,
+    "Worker dispatch claimed"
+  );
+  assert.equal(afterDispatch.startedAt, null);
   assert.equal(afterDispatch.request.spawn.dispatch.state, "claimed");
 
   const replay = service.spawn({

@@ -1853,7 +1853,6 @@ function validSpawnPayload(value, { replayed, state, launched }, code) {
         && worker?.summary === "Spawn committed"
         && worker?.progress
           === "Durable job record committed; provider not started by broker spawn."
-        && worker?.createdAt === worker?.updatedAt
         && worker?.createdAt === worker?.heartbeatAt
         && worker?.model === null
         && worker?.effort === null

@@ -407,7 +407,7 @@ function privateJob(status, { cancellation = false } = {}) {
       ? "2026-07-23T10:03:00.000Z"
       : status === "running"
         ? "2026-07-23T10:01:30.000Z"
-        : "2026-07-23T10:00:00.000Z",
+        : "2026-07-23T10:00:00.017Z",
     startedAt: status === "queued" ? null : "2026-07-23T10:01:30.000Z",
     completedAt: terminal
       ? cancellation
@@ -1176,6 +1176,47 @@ test("worker and lifecycle chronology is state-aware and keeps later cleanup che
   assert.doesNotThrow(
     () => validateInstalledCompletionScenario(finalReportAtIntent)
   );
+
+  const withPreStartEvent = (type, detail = null) => {
+    const evidence = completionBundle();
+    const events = evidence.terminalResult.worker.lifecycleEvents;
+    events.splice(1, 0, {
+      workerProtocolVersion: 1,
+      eventSchemaVersion: 1,
+      type,
+      at: "2026-07-23T10:00:30.000Z",
+      summary: "Worker dispatch claimed",
+      ...(detail === null ? {} : { detail }),
+      sequence: 2
+    });
+    events.forEach((event, index) => { event.sequence = index + 1; });
+    evidence.terminalResult.worker.eventCursor.sequence = events.length;
+    return evidence;
+  };
+
+  assert.doesNotThrow(
+    () => validateInstalledCompletionScenario(withPreStartEvent("checkpoint"))
+  );
+  for (const [type, detail] of [
+    ["activity.started", null],
+    ["activity.completed", {
+      eventType: "tool",
+      name: "dispatch",
+      status: "completed"
+    }],
+    ["plan.updated", { plan: ["Dispatch"] }],
+    ["final.report", { outcome: "complete", structured: true }],
+    ["cancellation.requested", {
+      requestAcceptedAt: "2026-07-23T10:00:30.000Z"
+    }]
+  ]) {
+    assert.throws(
+      () => validateInstalledCompletionScenario(
+        withPreStartEvent(type, detail)
+      ),
+      assertContractError("E_LIVE_COMPLETION")
+    );
+  }
 
   const mutations = [
     (value) => {

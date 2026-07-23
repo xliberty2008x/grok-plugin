@@ -2148,7 +2148,7 @@ export function claimWorkerDispatch({
         },
         lifecycleEvents: appendLifecycleEvent(
           latest.lifecycleEvents || [],
-          "activity.started",
+          "checkpoint",
           "Worker dispatch claimed",
           { dispatchSchemaVersion: WORKER_DISPATCH_SCHEMA_VERSION, dispatchFence: fence }
         )
