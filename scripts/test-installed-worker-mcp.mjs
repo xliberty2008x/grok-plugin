@@ -28,6 +28,9 @@ import {
   setupCleanupRequiresObservation,
   unownedSetupCommandGroupGone
 } from "./lib/installed-worker-mcp-setup-boundary.mjs";
+import {
+  bindInstalledWorkerSessionBoundary
+} from "./lib/installed-worker-mcp-session-boundary.mjs";
 import { spawnMcpStdioClient } from "./lib/mcp-stdio-client.mjs";
 import {
   canonicalPath,
@@ -134,7 +137,12 @@ const QUALIFICATION_STAGES = new Set([
   "completion-wait",
   "completion-result",
   "completion-cleanup",
-  "completion-session-cleanup",
+  "completion-session-id",
+  "completion-session-binding",
+  "completion-session-credential-revoked",
+  "completion-session-presence",
+  "completion-session-delete",
+  "completion-session-absence",
   "completion-contract",
   "cancellation-mcp-surface",
   "cancellation-spawn",
@@ -170,7 +178,12 @@ const QUALIFICATION_STAGES = new Set([
   "cancellation-wait",
   "cancellation-result",
   "cancellation-cleanup",
-  "cancellation-session-cleanup",
+  "cancellation-session-id",
+  "cancellation-session-binding",
+  "cancellation-session-credential-revoked",
+  "cancellation-session-presence",
+  "cancellation-session-delete",
+  "cancellation-session-absence",
   "cancellation-contract",
   "global-cleanup",
   "installed-recheck",
@@ -1546,6 +1559,7 @@ function immutablePrivateBinding(job) {
     contextManifestId: job?.request?.contextManifest?.manifestId,
     contextDigest: job?.request?.contextManifest?.digest,
     workspaceSnapshotDigest: job?.request?.contextManifest?.digest,
+    lineageWorkerId: job?.request?.providerHomeId || job?.id,
     controlWorkspaceId: job?.controlWorkspaceId,
     hostTaskBinding: hostTaskBindingFor(job),
     ownerThreadId: job?.request?.spawn?.ownerThreadId,
@@ -1696,7 +1710,9 @@ function observePrivateJob(context, tracker, job, {
       fail("E_PRIVATE_STATE");
     }
     tracker.sessionId = job.grokSessionId;
-    context.runner.sessions.add(job.grokSessionId);
+    if (!context.runner.sessions.has(job.grokSessionId)) {
+      context.runner.sessions.set(job.grokSessionId, null);
+    }
   }
   if (job.providerProcess) {
     const generation = job.providerProcess.providerGeneration;
@@ -2701,6 +2717,8 @@ function createTracker(scenarioId, fixtureStatus) {
     cancelIdempotencyKey: null,
     latestJob: null,
     sessionId: null,
+    sessionBoundary: null,
+    emergencySessionCleanupReady: false,
     providerGeneration: null,
     providerStartEvidence: new Set(),
     authenticatedGuard: null,
@@ -2758,14 +2776,126 @@ async function waitForTerminal(context, client, tracker, cursor) {
   fail("E_SCENARIO");
 }
 
+function sessionBoundaryIdentity(binding) {
+  return {
+    stateDirectory: binding.stateDirectory,
+    homeMarker: binding.homeMarker,
+    home: binding.home,
+    grokHome: binding.grokHome,
+    directoryIdentity: binding.directoryIdentity
+  };
+}
+
+function bindSessionBoundary(context, tracker) {
+  const job = tracker.latestJob;
+  if (
+    !job
+    || job.id !== tracker.workerId
+    || !CANONICAL_UUID.test(tracker.sessionId || "")
+  ) {
+    fail("E_SESSION");
+  }
+  let jobFile;
+  try {
+    jobFile = context.state.jobFileIfPresent(
+      context.fixtureRoot,
+      tracker.workerId,
+      context.env
+    );
+  } catch {
+    fail("E_SESSION");
+  }
+  if (!jobFile) fail("E_SESSION");
+  const stateDirectory = path.dirname(path.dirname(jobFile));
+  const homeMarker = job.request?.providerHomeId || job.id;
+  if (homeMarker !== tracker.privateBinding?.lineageWorkerId) {
+    fail("E_SESSION");
+  }
+  let binding;
+  try {
+    binding = bindInstalledWorkerSessionBoundary({
+      stateDirectory,
+      homeMarker,
+      childEnvironment: context.provider.childEnvironment
+    });
+  } catch {
+    fail("E_SESSION");
+  }
+  const identity = sessionBoundaryIdentity(binding);
+  if (
+    tracker.sessionBoundary
+    && !sameJson(sessionBoundaryIdentity(tracker.sessionBoundary), identity)
+  ) {
+    fail("E_SESSION");
+  }
+  const registered = context.runner.sessions.get(tracker.sessionId);
+  if (
+    registered
+    && (
+      registered.workerId !== tracker.workerId
+      || registered.fixtureRoot !== context.fixtureRoot
+      || !sameJson(sessionBoundaryIdentity(registered.binding), identity)
+    )
+  ) {
+    fail("E_SESSION");
+  }
+  tracker.sessionBoundary = binding;
+  context.runner.sessions.set(tracker.sessionId, Object.freeze({
+    workerId: tracker.workerId,
+    fixtureRoot: context.fixtureRoot,
+    binding
+  }));
+  return binding;
+}
+
+function exactAuthFileAbsent(binding) {
+  try {
+    const stat = fs.lstatSync(binding.authFile);
+    if (!stat.isFile() || stat.isSymbolicLink()) fail("E_CLEANUP");
+    return false;
+  } catch (error) {
+    if (error?.code === "ENOENT") return true;
+    if (error instanceof QualificationError) throw error;
+    fail("E_CLEANUP");
+  }
+}
+
+function exactPrivateAuthFile(binding) {
+  try {
+    const stat = fs.lstatSync(binding.authFile);
+    return stat.isFile()
+      && !stat.isSymbolicLink()
+      && (stat.mode & 0o077) === 0;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForSessionCredentialRevocation(context, tracker) {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() <= deadline) {
+    checkInterrupted(context.runner);
+    const binding = bindSessionBoundary(context, tracker);
+    if (exactAuthFileAbsent(binding)) return binding;
+    await new Promise((resolve) => setTimeout(resolve, STATE_POLL_MS));
+  }
+  fail("E_CLEANUP");
+}
+
 async function waitForSessionPresence(context, tracker) {
+  enterScenarioStage(tracker, "session-binding");
+  bindSessionBoundary(context, tracker);
+  enterScenarioStage(tracker, "session-credential-revoked");
+  await waitForSessionCredentialRevocation(context, tracker);
+  enterScenarioStage(tracker, "session-presence");
   const deadline = Date.now() + 60_000;
   while (Date.now() <= deadline) {
     checkInterrupted(context.runner);
+    const binding = bindSessionBoundary(context, tracker);
     const observed = context.provider.inspectImportedSessionPresence(
       tracker.sessionId,
       context.providerBinary,
-      context.env,
+      binding.env,
       context.fixtureRoot
     );
     if (observed?.ok === true && observed.present === true) {
@@ -2778,27 +2908,117 @@ async function waitForSessionPresence(context, tracker) {
   fail("E_SESSION");
 }
 
+function runAuthenticatedSessionDelete(context, tracker) {
+  const binding = bindSessionBoundary(context, tracker);
+  const job = tracker.latestJob;
+  let environment = null;
+  let deleteOk = false;
+  let cleanupOk = true;
+  try {
+    environment = context.provider.taskEnvironment(
+      binding.stateDirectory,
+      context.fixtureRoot,
+      job.profile,
+      binding.homeMarker
+    );
+    if (
+      environment?.home !== binding.home
+      || environment?.grokHome !== binding.grokHome
+      || environment?.env?.HOME !== binding.home
+      || environment?.env?.GROK_HOME !== binding.grokHome
+    ) {
+      cleanupOk = false;
+    } else {
+      const rebound = bindSessionBoundary(context, tracker);
+      if (!exactPrivateAuthFile(rebound)) {
+        cleanupOk = false;
+      } else {
+        const authenticatedModels = runBounded(
+          context.providerBinary,
+          ["models"],
+          {
+            cwd: context.fixtureRoot,
+            env: environment.env,
+            timeoutMs: 30_000,
+            code: "E_SESSION"
+          }
+        );
+        const advertised = context.provider.parseAdvertisedModels(
+          authenticatedModels.stdout
+        );
+        if (!Array.isArray(advertised) || advertised.length === 0) {
+          fail("E_SESSION");
+        }
+        const authenticatedBinding = bindSessionBoundary(context, tracker);
+        if (!exactPrivateAuthFile(authenticatedBinding)) {
+          fail("E_CLEANUP");
+        }
+        const deleted = context.provider.deleteSession(
+          tracker.sessionId,
+          context.providerBinary,
+          environment.env
+        );
+        deleteOk = deleted?.ok === true;
+      }
+    }
+  } catch (error) {
+    deleteOk = false;
+    if (error instanceof QualificationError && error.code === "E_CLEANUP") {
+      cleanupOk = false;
+    }
+  } finally {
+    try {
+      environment?.revokeCredential();
+    } catch {
+      cleanupOk = false;
+    }
+    try {
+      context.provider.revokeTaskCredential(
+        binding.stateDirectory,
+        binding.homeMarker
+      );
+    } catch {
+      cleanupOk = false;
+    }
+    try {
+      const rebound = bindSessionBoundary(context, tracker);
+      if (!exactAuthFileAbsent(rebound)) cleanupOk = false;
+    } catch {
+      cleanupOk = false;
+    }
+  }
+  return Object.freeze({ deleteOk, cleanupOk });
+}
+
 async function deleteAndProveSessionAbsent(context, tracker) {
   if (!tracker.sessionPresent || !CANONICAL_UUID.test(tracker.sessionId || "")) {
     fail("E_SESSION");
   }
-  const deleted = context.provider.deleteSession(
-    tracker.sessionId,
-    context.providerBinary,
-    context.env
-  );
-  if (deleted?.ok !== true) fail("E_SESSION");
+  enterScenarioStage(tracker, "session-binding");
+  bindSessionBoundary(context, tracker);
+  enterScenarioStage(tracker, "session-delete");
+  const deleted = runAuthenticatedSessionDelete(context, tracker);
+  if (deleted.cleanupOk !== true) fail("E_CLEANUP");
+  if (deleted.deleteOk !== true) fail("E_SESSION");
+  enterScenarioStage(tracker, "session-absence");
   const deadline = Date.now() + 60_000;
+  let consecutiveAbsenceProofs = 0;
   while (Date.now() <= deadline) {
     checkInterrupted(context.runner);
+    const binding = bindSessionBoundary(context, tracker);
     const observed = context.provider.inspectImportedSessionPresence(
       tracker.sessionId,
       context.providerBinary,
-      context.env,
+      binding.env,
       context.fixtureRoot
     );
     if (observed?.ok !== true) fail("E_SESSION");
     if (observed.present === false) {
+      consecutiveAbsenceProofs += 1;
+    } else {
+      consecutiveAbsenceProofs = 0;
+    }
+    if (consecutiveAbsenceProofs >= 2) {
       tracker.sessionDeleted = true;
       context.runner.sessions.delete(tracker.sessionId);
       return;
@@ -3047,7 +3267,7 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   ) {
     fail("E_SCENARIO");
   }
-  enterQualificationStage("completion-session-cleanup");
+  enterQualificationStage("completion-session-id");
   if (!tracker.sessionId) fail("E_SESSION");
   await waitForSessionPresence(context, tracker);
   await deleteAndProveSessionAbsent(context, tracker);
@@ -3098,6 +3318,8 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
       recordProviderObservation: true
     }
   );
+  enterQualificationStage("cancellation-session-id");
+  if (!tracker.sessionId) fail("E_SESSION");
   await waitForSessionPresence(context, tracker);
 
   enterQualificationStage("cancellation-reconnect");
@@ -3222,7 +3444,6 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
   ) {
     fail("E_SCENARIO");
   }
-  enterQualificationStage("cancellation-session-cleanup");
   await deleteAndProveSessionAbsent(context, tracker);
 
   const publicEvidence = {
@@ -3378,12 +3599,12 @@ async function emergencyCleanup(runner) {
         return;
       }
       if (!latest) return;
-      if (latest.grokSessionId != null) {
-        if (CANONICAL_UUID.test(latest.grokSessionId)) {
-          runner.sessions.add(latest.grokSessionId);
-        } else {
-          clean = false;
-        }
+      try {
+        latest = observePrivateJob(context, tracker, latest);
+      } catch {
+        latest = null;
+        clean = false;
+        return;
       }
       for (const [kind, field] of [
         ["controller", "controllerProcess"],
@@ -3633,46 +3854,75 @@ async function emergencyCleanup(runner) {
     ) {
       clean = false;
     }
+    const observedKinds = new Set(
+      [...owned.values()].map(({ kind }) => kind)
+    );
+    tracker.emergencySessionCleanupReady = (
+      stableClosureScans >= 2
+      && ["controller", "worker", "provider"]
+        .every((kind) => observedKinds.has(kind))
+      && [...owned.values()].every(
+        ({ identity }) => context.processControl.processGroupGone(identity)
+      )
+    );
   }
   if (runner.provider && runner.providerBinary) {
-    for (const sessionId of [...runner.sessions]) {
+    for (const [sessionId] of [...runner.sessions]) {
+      const entry = runner.trackers.find(
+        ({ tracker }) => tracker.sessionId === sessionId
+      );
+      if (!entry || entry.tracker.emergencySessionCleanupReady !== true) {
+        clean = false;
+        continue;
+      }
+      const { context, tracker } = entry;
       try {
+        const binding = bindSessionBoundary(context, tracker);
         let observed = runner.provider.inspectImportedSessionPresence(
           sessionId,
           runner.providerBinary,
-          runner.baseEnvironment,
-          ROOT
+          binding.env,
+          context.fixtureRoot
         );
         if (observed?.ok !== true) {
           clean = false;
           continue;
         }
-        if (observed.present === true) {
-          const deletion = runner.provider.deleteSession(
-            sessionId,
-            runner.providerBinary,
-            runner.baseEnvironment
-          );
-          if (deletion?.ok !== true) {
-            clean = false;
-            continue;
-          }
+        if (observed.present !== true) {
+          clean = false;
+          continue;
+        }
+        tracker.sessionPresent = true;
+        const deletion = runAuthenticatedSessionDelete(context, tracker);
+        if (deletion.cleanupOk !== true || deletion.deleteOk !== true) {
+          clean = false;
+          continue;
         }
         const deadline = Date.now() + 30_000;
-        while (observed.present !== false && Date.now() <= deadline) {
+        let consecutiveAbsenceProofs = 0;
+        while (Date.now() <= deadline && consecutiveAbsenceProofs < 2) {
           await new Promise((resolve) => setTimeout(resolve, STATE_POLL_MS));
+          const rebound = bindSessionBoundary(context, tracker);
           observed = runner.provider.inspectImportedSessionPresence(
             sessionId,
             runner.providerBinary,
-            runner.baseEnvironment,
-            ROOT
+            rebound.env,
+            context.fixtureRoot
           );
           if (observed?.ok !== true) {
             clean = false;
             break;
           }
+          consecutiveAbsenceProofs = observed.present === false
+            ? consecutiveAbsenceProofs + 1
+            : 0;
         }
-        if (observed?.ok === true && observed.present === false) {
+        if (
+          observed?.ok === true
+          && observed.present === false
+          && consecutiveAbsenceProofs >= 2
+        ) {
+          tracker.sessionDeleted = true;
           runner.sessions.delete(sessionId);
         } else {
           clean = false;
@@ -3959,7 +4209,6 @@ async function qualify(runner) {
   const threadId = crypto.randomUUID();
   if (!CANONICAL_UUID.test(threadId)) fail("E_MCP");
   const env = buildChildEnvironment({ codexHome, pluginData, threadId });
-  runner.baseEnvironment = env;
   initializeFixtureRepository(setupFixture, env);
 
   enterQualificationStage("private-install");
@@ -4273,12 +4522,11 @@ async function main() {
     interrupted: false,
     temporaryRoot: null,
     temporaryRemoved: false,
-    baseEnvironment: null,
     provider: null,
     providerBinary: null,
     setupBoundary: null,
     clients: new Set(),
-    sessions: new Set(),
+    sessions: new Map(),
     turnIds: new Set(),
     trackers: []
   };

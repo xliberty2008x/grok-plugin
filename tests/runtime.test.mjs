@@ -230,6 +230,8 @@ Available models:
   const header = "SESSION ID                            CREATED     UPDATED     STATUS      SUMMARY\n";
   for (const [label, output, stderr, expected] of [
     ["empty", "", "", { ok: false, present: false }],
+    ["official-empty", "No sessions found.\n", "", { ok: true, present: false }],
+    ["header-only", header, "", { ok: false, present: false }],
     ["malformed", "not a session table\n", "", { ok: false, present: false }],
     [
       "summary-only",
@@ -238,6 +240,30 @@ Available models:
       { ok: true, present: false }
     ],
     ["stderr-only", header, `${sessionId}\n`, { ok: false, present: false }],
+    [
+      "sentinel-with-table",
+      `No sessions found.\n${header}`,
+      "",
+      { ok: false, present: false }
+    ],
+    [
+      "malformed-label",
+      `Label:\n${header}${sessionId}  2026-07-14  2026-07-14  local  imported\n`,
+      "",
+      { ok: false, present: false }
+    ],
+    [
+      "empty-labeled-group",
+      `Label: empty\n${header}`,
+      "",
+      { ok: false, present: false }
+    ],
+    [
+      "duplicate-label",
+      `Label: duplicate\n${header}aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa  2026-07-14  2026-07-14  local  one\nLabel: duplicate\n${header}bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb  2026-07-14  2026-07-14  local  two\n`,
+      "",
+      { ok: false, present: false }
+    ],
     [
       "warning-row",
       `${header}WARNING partial output truncated now\n`,
@@ -273,6 +299,13 @@ Available models:
     sessionsListOutput: `(no label)\n${header}${sessionId}  2026-07-14  2026-07-14  local  imported\n`
   });
   assert.deepEqual(inspectImportedSessionPresence(sessionId, grouped.binary), {
+    ok: true,
+    present: true
+  });
+  const officiallyGrouped = installFakeGrok(tempDir("fake-grok-ready-official-grouped-"), {
+    sessionsListOutput: `Label: qualification\n${header}${sessionId}  2026-07-14  2026-07-14  local  imported\n`
+  });
+  assert.deepEqual(inspectImportedSessionPresence(sessionId, officiallyGrouped.binary), {
     ok: true,
     present: true
   });

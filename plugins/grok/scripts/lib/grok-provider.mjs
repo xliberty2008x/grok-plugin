@@ -1840,12 +1840,22 @@ export function inspectImportedSessionPresence(sessionId, binary = null, env = n
     return Object.freeze({ ok: false, present: false });
   }
   const lines = String(run.stdout || "").split(/\r?\n/);
+  const nonemptyLines = lines.map((line) => line.trim()).filter(Boolean);
+  if (
+    nonemptyLines.length === 1
+    && nonemptyLines[0] === "No sessions found."
+  ) {
+    return Object.freeze({ ok: true, present: false });
+  }
   const observed = new Set();
   let present = false;
   let headers = 0;
   let inTable = false;
   let expectingHeader = false;
   let tableHasSummary = false;
+  let currentGroupLabel = null;
+  let currentTableRows = 0;
+  const observedGroupLabels = new Set();
   for (const rawLine of lines) {
     const line = rawLine.trim();
     if (line === "") continue;
@@ -1867,10 +1877,23 @@ export function inspectImportedSessionPresence(sessionId, binary = null, env = n
       inTable = true;
       expectingHeader = false;
       tableHasSummary = columns.length === 6;
+      currentTableRows = 0;
       continue;
     }
-    if (/^\([^()\r\n]{1,256}\)$/.test(line)) {
-      if (expectingHeader) return Object.freeze({ ok: false, present: false });
+    if (
+      /^\([^()\r\n]{1,256}\)$/.test(line)
+      || /^Label: [^\r\n]{1,256}$/.test(line)
+    ) {
+      if (
+        expectingHeader
+        || (inTable && currentGroupLabel === null)
+        || (currentGroupLabel !== null && currentTableRows === 0)
+        || observedGroupLabels.has(line)
+      ) {
+        return Object.freeze({ ok: false, present: false });
+      }
+      observedGroupLabels.add(line);
+      currentGroupLabel = line;
       inTable = false;
       expectingHeader = true;
       continue;
@@ -1890,9 +1913,14 @@ export function inspectImportedSessionPresence(sessionId, binary = null, env = n
       return Object.freeze({ ok: false, present: false });
     }
     observed.add(normalizedId);
+    currentTableRows += 1;
     if (normalizedId === sessionId.toLowerCase()) present = true;
   }
-  if (headers === 0 || expectingHeader) {
+  if (
+    headers === 0
+    || expectingHeader
+    || currentTableRows === 0
+  ) {
     return Object.freeze({ ok: false, present: false });
   }
   if (!present && observed.size >= 200) {

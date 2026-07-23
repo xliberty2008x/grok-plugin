@@ -49,6 +49,13 @@ function nextPromptNumber(binary) {
   return state.prompts;
 }
 
+function sessionsStoreFile(binary, config) {
+  if (config.sessionsStoreByGrokHome && process.env.GROK_HOME) {
+    return path.join(process.env.GROK_HOME, "sessions.json");
+  }
+  return `${binary}.sessions.json`;
+}
+
 function reviewValue(config) {
   const value = config.review ?? {
     summary: "No material findings in the fake review.",
@@ -458,7 +465,8 @@ async function main() {
       }
       return;
     }
-    const store = readJson(`${binary}.sessions.json`, { sessions: [] });
+    const storeFile = sessionsStoreFile(binary, effective);
+    const store = readJson(storeFile, { sessions: [] });
     const now = Date.now();
     let pollStateChanged = false;
     const visible = (store.sessions || []).filter((entry) => {
@@ -472,7 +480,7 @@ async function main() {
       if (typeof entry.readyAt === "number" && entry.readyAt > now) return false;
       return true;
     });
-    if (pollStateChanged) writeJson(`${binary}.sessions.json`, store);
+    if (pollStateChanged) writeJson(storeFile, store);
     appendLog(effective, {
       event: "sessions-list",
       home: process.env.HOME || null,
@@ -480,6 +488,10 @@ async function main() {
       count: visible.length,
       sessionIds: visible.map((entry) => entry.id)
     });
+    if (visible.length === 0) {
+      process.stdout.write("No sessions found.\n");
+      return;
+    }
     process.stdout.write("SESSION ID                            CREATED     UPDATED     STATUS      SUMMARY\n");
     for (const entry of visible) {
       process.stdout.write(`${entry.id}  2026-07-14  2026-07-14  local  imported\n`);
@@ -488,10 +500,16 @@ async function main() {
   }
 
   if (args[0] === "sessions" && args[1] === "delete") {
-    appendLog(effective, { event: "delete-session", sessionId: args[2] ?? null });
-    const store = readJson(`${binary}.sessions.json`, { sessions: [] });
+    appendLog(effective, {
+      event: "delete-session",
+      sessionId: args[2] ?? null,
+      home: process.env.HOME || null,
+      grokHome: process.env.GROK_HOME || null
+    });
+    const storeFile = sessionsStoreFile(binary, effective);
+    const store = readJson(storeFile, { sessions: [] });
     store.sessions = (store.sessions || []).filter((entry) => entry?.id !== args[2]);
-    writeJson(`${binary}.sessions.json`, store);
+    writeJson(storeFile, store);
     if (effective.deleteSessionFails) {
       process.stderr.write("delete failed with xai-FAKESECRET000000\n");
       process.exitCode = 1;
@@ -544,7 +562,8 @@ async function main() {
     }
     // Register imported session for readiness checks. Never store transcript content.
     if (importedId && !effective.importExitCode) {
-      const store = readJson(`${binary}.sessions.json`, { sessions: [] });
+      const storeFile = sessionsStoreFile(binary, effective);
+      const store = readJson(storeFile, { sessions: [] });
       const readyDelayMs = Number(effective.importReadyAfterMs);
       const readyAfterPolls = Number(effective.importReadyAfterPolls);
       const entry = {
@@ -556,7 +575,7 @@ async function main() {
           : {})
       };
       store.sessions = [...(store.sessions || []).filter((item) => item?.id !== importedId), entry];
-      writeJson(`${binary}.sessions.json`, store);
+      writeJson(storeFile, store);
       appendLog(effective, {
         event: "import-session-registered",
         sessionId: importedId,

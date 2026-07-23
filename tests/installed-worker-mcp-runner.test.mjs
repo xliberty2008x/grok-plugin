@@ -223,6 +223,28 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
     false
   );
   assert.equal(source.includes("fake-grok"), false);
+  assert.equal(source.includes("baseEnvironment"), false);
+  assert.match(source, /sessions: new Map\(\)/);
+  assert.match(
+    source,
+    /lineageWorkerId: job\?\.request\?\.providerHomeId \|\| job\?\.id/
+  );
+  assert.match(
+    source,
+    /bindInstalledWorkerSessionBoundary\(\{[\s\S]*?childEnvironment: context\.provider\.childEnvironment[\s\S]*?\}\)/
+  );
+  assert.match(
+    source,
+    /context\.provider\.taskEnvironment\([\s\S]*?\["models"\][\s\S]*?context\.provider\.parseAdvertisedModels\([\s\S]*?context\.provider\.deleteSession\([\s\S]*?environment\.env/
+  );
+  assert.doesNotMatch(
+    source,
+    /inspectImportedSessionPresence\([\s\S]{0,160}context\.env/
+  );
+  assert.doesNotMatch(
+    source,
+    /deleteSession\([\s\S]{0,160}context\.env/
+  );
   for (const forbidden of [
     "--receipt",
     "--evidence",
@@ -445,8 +467,10 @@ test("package and repository validator pin the installed Worker MCP runner wirin
   for (const required of [
     '"scripts/test-installed-worker-mcp.mjs"',
     '"scripts/lib/installed-worker-mcp-setup-boundary.mjs"',
+    '"scripts/lib/installed-worker-mcp-session-boundary.mjs"',
     '"tests/installed-worker-mcp-runner.test.mjs"',
     '"tests/installed-worker-mcp-setup-boundary.test.mjs"',
+    '"tests/installed-worker-mcp-session-boundary.test.mjs"',
     '"test:installed-worker-mcp"'
   ]) {
     assert.ok(validator.includes(required), required);
