@@ -92,6 +92,9 @@ const QUALIFICATION_STAGES = new Set([
   "private-install",
   "installed-imports",
   "provider-setup",
+  "provider-setup-command",
+  "provider-setup-cleanup",
+  "provider-setup-contract",
   "provider-capability",
   "completion-mcp-surface",
   "completion-spawn",
@@ -3875,6 +3878,7 @@ async function qualify(runner) {
     processControl,
     guard
   });
+  enterQualificationStage("provider-setup-command");
   const setupJson = await runSetupJson(
     process.execPath,
     [path.join(installedRoot, "scripts", "grok-codex.mjs"), "setup", "--json"],
@@ -3886,12 +3890,14 @@ async function qualify(runner) {
       runner
     }
   );
+  enterQualificationStage("provider-setup-cleanup");
   if (!await cleanupSetupBoundary(
     runner.setupBoundary,
     { terminate: false, requireObservation: true }
   )) {
     fail("E_CLEANUP");
   }
+  enterQualificationStage("provider-setup-contract");
   const setup = validateInstalledSetup(setupJson);
   const setupFixtureStatus = runBounded("git", [
     "status", "--porcelain=v1", "-z", "--untracked-files=all"

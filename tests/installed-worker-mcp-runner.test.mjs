@@ -329,6 +329,25 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /assertDispatchContract\(job\)/);
   assert.match(source, /assertDurableSpawnRequestBinding\(job, context\.env\)/);
   assert.match(source, /const setupJson = await runSetupJson\(/);
+  for (const stage of [
+    "provider-setup-command",
+    "provider-setup-cleanup",
+    "provider-setup-contract"
+  ]) {
+    assert.match(source, new RegExp(`enterQualificationStage\\("${stage}"\\)`));
+  }
+  assert.ok(
+    source.indexOf('enterQualificationStage("provider-setup-command")')
+      < source.indexOf("const setupJson = await runSetupJson(")
+  );
+  assert.ok(
+    source.indexOf('enterQualificationStage("provider-setup-cleanup")')
+      > source.indexOf("const setupJson = await runSetupJson(")
+  );
+  assert.ok(
+    source.indexOf('enterQualificationStage("provider-setup-contract")')
+      > source.indexOf("cleanupSetupBoundary(")
+  );
   assert.match(source, /detached: true/);
   assert.match(source, /commandIdentity/);
   assert.match(source, /cleanupSetupBoundary\(/);
