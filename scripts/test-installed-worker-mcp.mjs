@@ -95,6 +95,12 @@ const QUALIFICATION_STAGES = new Set([
   "provider-capability",
   "completion-mcp-surface",
   "completion-spawn",
+  "completion-owned-list",
+  "completion-spawn-call",
+  "completion-spawn-private",
+  "completion-spawn-witness",
+  "completion-get",
+  "completion-events",
   "completion-wait",
   "completion-result",
   "completion-cleanup",
@@ -102,6 +108,12 @@ const QUALIFICATION_STAGES = new Set([
   "completion-contract",
   "cancellation-mcp-surface",
   "cancellation-spawn",
+  "cancellation-owned-list",
+  "cancellation-spawn-call",
+  "cancellation-spawn-private",
+  "cancellation-spawn-witness",
+  "cancellation-get",
+  "cancellation-events",
   "cancellation-live-provider",
   "cancellation-reconnect",
   "cancellation-replay",
@@ -2667,6 +2679,16 @@ function scenarioPrompt(label, { activeWindow = false } = {}) {
   return instructions.join(" ");
 }
 
+function enterScenarioStage(tracker, suffix) {
+  const prefix = tracker.scenarioId === "authenticated-completion"
+    ? "completion"
+    : tracker.scenarioId === "mcp-restart-reconnect-cancellation"
+      ? "cancellation"
+      : null;
+  if (prefix === null) throw new Error("Unknown installed Worker MCP scenario.");
+  enterQualificationStage(`${prefix}-${suffix}`);
+}
+
 async function beginScenario(
   context,
   tracker,
@@ -2675,6 +2697,7 @@ async function beginScenario(
   label,
   { activeWindow = false } = {}
 ) {
+  enterScenarioStage(tracker, "owned-list");
   const empty = await callTool(
     context,
     client,
@@ -2692,6 +2715,7 @@ async function beginScenario(
     roleId: "explorer"
   });
   tracker.spawnIdempotencyKey = key;
+  enterScenarioStage(tracker, "spawn-call");
   const spawn = await callTool(
     context,
     client,
@@ -2708,9 +2732,11 @@ async function beginScenario(
   tracker.calls.spawn += 1;
   tracker.workerId = spawn.worker?.id;
   if (!tracker.workerId) fail("E_SCENARIO");
+  enterScenarioStage(tracker, "spawn-private");
   observePublicWorker(tracker, spawn.worker);
   const spawnedJob = readPrivateJob(context, tracker);
   assertPublicPrivateBinding(spawn.worker, spawnedJob);
+  enterScenarioStage(tracker, "spawn-witness");
   recordPrivateIdentityObservation(
     context,
     tracker,
@@ -2719,6 +2745,7 @@ async function beginScenario(
     { spawnKey: key, replayed: false }
   );
 
+  enterScenarioStage(tracker, "get");
   const got = await callTool(
     context,
     client,
@@ -2732,6 +2759,7 @@ async function beginScenario(
   tracker.events.observe(got.worker.lifecycleEvents);
   assertPublicPrivateBinding(got.worker, gotJob);
 
+  enterScenarioStage(tracker, "events");
   const events = await callTool(
     context,
     client,
