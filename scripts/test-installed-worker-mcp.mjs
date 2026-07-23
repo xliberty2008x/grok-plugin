@@ -136,7 +136,12 @@ const QUALIFICATION_STAGES = new Set([
   "completion-events",
   "completion-wait",
   "completion-result",
-  "completion-cleanup",
+  "completion-cleanup-private",
+  "completion-cleanup-snapshot",
+  "completion-cleanup-events",
+  "completion-cleanup-binding",
+  "completion-cleanup-identity",
+  "completion-cleanup-report",
   "completion-session-id",
   "completion-session-binding",
   "completion-session-credential-revoked",
@@ -177,7 +182,12 @@ const QUALIFICATION_STAGES = new Set([
   "cancellation-request",
   "cancellation-wait",
   "cancellation-result",
-  "cancellation-cleanup",
+  "cancellation-cleanup-private",
+  "cancellation-cleanup-snapshot",
+  "cancellation-cleanup-events",
+  "cancellation-cleanup-binding",
+  "cancellation-cleanup-identity",
+  "cancellation-cleanup-report",
   "cancellation-session-id",
   "cancellation-session-binding",
   "cancellation-session-credential-revoked",
@@ -3239,20 +3249,24 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   await closeMcp(context, client);
   client = null;
 
-  enterQualificationStage("completion-cleanup");
+  enterQualificationStage("completion-cleanup-private");
   const terminalJob = proveTerminalCleanup(context, tracker, "completed");
+  enterQualificationStage("completion-cleanup-snapshot");
   validateTerminalWorkerSnapshot(
     result.worker,
     tracker,
     terminalJob,
     "completed"
   );
+  enterQualificationStage("completion-cleanup-events");
   assertTerminalEventHistory(
     tracker,
     result.worker.lifecycleEvents,
     terminalJob.lifecycleEvents
   );
+  enterQualificationStage("completion-cleanup-binding");
   assertPublicPrivateBinding(result.worker, terminalJob);
+  enterQualificationStage("completion-cleanup-identity");
   recordPrivateIdentityObservation(
     context,
     tracker,
@@ -3260,6 +3274,7 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
     result.worker,
     { terminal: true }
   );
+  enterQualificationStage("completion-cleanup-report");
   if (
     terminalJob.result?.workerReport?.valid !== true
     || terminalJob.result?.workerReport?.outcome !== "complete"
@@ -3414,20 +3429,24 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
   await closeMcp(context, client);
   client = null;
 
-  enterQualificationStage("cancellation-cleanup");
+  enterQualificationStage("cancellation-cleanup-private");
   const terminalJob = proveTerminalCleanup(context, tracker, "cancelled");
+  enterQualificationStage("cancellation-cleanup-snapshot");
   validateTerminalWorkerSnapshot(
     result.worker,
     tracker,
     terminalJob,
     "cancelled"
   );
+  enterQualificationStage("cancellation-cleanup-events");
   assertTerminalEventHistory(
     tracker,
     result.worker.lifecycleEvents,
     terminalJob.lifecycleEvents
   );
+  enterQualificationStage("cancellation-cleanup-binding");
   assertPublicPrivateBinding(result.worker, terminalJob);
+  enterQualificationStage("cancellation-cleanup-identity");
   recordPrivateIdentityObservation(
     context,
     tracker,
@@ -3435,6 +3454,7 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
     result.worker,
     { terminal: true }
   );
+  enterQualificationStage("cancellation-cleanup-report");
   const cancellationEvents = (terminalJob.lifecycleEvents || [])
     .filter((event) => event?.type === "cancellation.requested");
   if (
