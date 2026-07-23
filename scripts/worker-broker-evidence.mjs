@@ -8,6 +8,7 @@
  *   node scripts/worker-broker-evidence.mjs verify --all [--strict] [--require-complete]
  *   node scripts/worker-broker-evidence.mjs capture --phase <N> --slice <id> [--write]
  *   node scripts/worker-broker-evidence.mjs prove --phase <0|1> --slice <supported-slice> [--write]
+ *   node scripts/worker-broker-evidence.mjs review-request --base <commit> [--expires-at <iso>] [--write]
  *   node scripts/worker-broker-evidence.mjs qualify --phase <N> --host <codex|claude-code> [--record]
  */
 import { spawnSync } from "node:child_process";
@@ -17,6 +18,7 @@ import {
   buildEvidenceRecord,
   computeInventoryDigest,
   computePhaseScopeDigest,
+  createPhaseOneReviewRequest,
   evidenceStatus,
   gitIdentity,
   proveWorkerBrokerPhase,
@@ -36,9 +38,35 @@ function usage(exitCode = 2) {
   node scripts/worker-broker-evidence.mjs capture --phase <N> --slice <id> [--status <s>] [--write]
   node scripts/worker-broker-evidence.mjs prove --phase 0 --slice <bounded-slug> [--write]
   node scripts/worker-broker-evidence.mjs prove --phase 1 --slice worker-api [--write]
+  node scripts/worker-broker-evidence.mjs review-request --base <commit> [--expires-at <iso>] [--write]
   node scripts/worker-broker-evidence.mjs qualify --phase <N> --host <codex|claude-code> [--record]
 `);
   process.exit(exitCode);
+}
+
+function parseReviewRequestArgs(argv) {
+  const args = { baseCommit: null, expiresAt: null, write: false };
+  const seen = new Set();
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!new Set(["--base", "--expires-at", "--write"]).has(token)
+      || seen.has(token)) usage();
+    seen.add(token);
+    if (token === "--write") {
+      args.write = true;
+      continue;
+    }
+    const value = argv[index + 1];
+    if (typeof value !== "string" || !value || value.startsWith("--")) usage();
+    index += 1;
+    if (token === "--base") args.baseCommit = value;
+    else args.expiresAt = value;
+  }
+  if (!/^[0-9a-f]{40}$/.test(args.baseCommit || "")) usage();
+  if (args.expiresAt != null
+    && (!Number.isFinite(Date.parse(args.expiresAt))
+      || new Date(Date.parse(args.expiresAt)).toISOString() !== args.expiresAt)) usage();
+  return args;
 }
 
 function parseArgs(argv) {
@@ -285,6 +313,33 @@ function commandProve(args) {
   });
 }
 
+function commandReviewRequest(args) {
+  try {
+    const result = createPhaseOneReviewRequest({
+      root: REPO_ROOT,
+      baseCommit: args.baseCommit,
+      ...(args.expiresAt ? { expiresAt: args.expiresAt } : {}),
+      write: args.write
+    });
+    printJson({
+      ok: true,
+      path: result.path,
+      requestDigest: result.request.requestDigest,
+      headCommit: result.request.source.headCommit,
+      baseCommit: result.request.diff.baseCommit,
+      expiresAt: result.request.expiresAt
+    });
+  } catch (error) {
+    printJson({
+      ok: false,
+      code: error?.code === "E_REVIEW_REQUEST_INVALID"
+        ? error.code
+        : "E_REVIEW_REQUEST_INVALID"
+    });
+    process.exit(1);
+  }
+}
+
 function commandQualify(args) {
   if (!args.phase || !args.host) usage();
   if (!["codex", "claude-code"].includes(args.host)) usage();
@@ -368,6 +423,8 @@ function commandQualify(args) {
 const rawArgs = process.argv.slice(2);
 if (rawArgs[0] === "prove") {
   commandProve(parseProveArgs(rawArgs.slice(1)));
+} else if (rawArgs[0] === "review-request") {
+  commandReviewRequest(parseReviewRequestArgs(rawArgs.slice(1)));
 } else if (rawArgs[0] === "verify") {
   commandVerify(parseVerifyArgs(rawArgs.slice(1)));
 } else {

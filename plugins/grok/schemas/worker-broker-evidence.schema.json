@@ -40,12 +40,23 @@
       "then": { "required": ["proofProducer"] }
     },
     {
-      "not": {
+      "if": {
         "properties": {
           "phase": { "const": "1" },
-          "status": { "enum": ["verified_on_draft", "qualified"] }
+          "status": { "const": "verified_on_draft" }
         },
         "required": ["phase", "status"]
+      },
+      "then": {
+        "required": ["independentReviewReceipt"],
+        "properties": {
+          "independentReviewReceipt": {
+            "properties": {
+              "schemaVersion": { "const": 2 }
+            },
+            "required": ["schemaVersion"]
+          }
+        }
       }
     },
     {
@@ -387,43 +398,76 @@
     },
     "independentReviewReceipt": {
       "type": "object",
-      "description": "Reserved structural format for historical parsing. It is not authenticated and cannot promote Phase 1 until signed issuer verification is implemented.",
-      "additionalProperties": false,
-      "required": [
-        "schemaVersion",
-        "producerId",
-        "producerVersion",
-        "manifestDigest",
-        "reviewerRuntimeDigest",
-        "headCommit",
-        "headTree",
-        "sourceInventoryDigest",
-        "phaseScopeDigest",
-        "startedAt",
-        "endedAt",
-        "outcome",
-        "unresolvedFindings",
-        "receiptDigest"
-      ],
-      "properties": {
-        "schemaVersion": { "type": "integer", "const": 1 },
-        "producerId": { "type": "string", "const": "codex-native-review-runner" },
-        "producerVersion": { "type": "integer", "const": 1 },
-        "manifestDigest": {
-          "type": "string",
-          "const": "82792debed04937a264e759a1812ba1e33e0417aa555f87ce13e7f5417fd6f12"
+      "description": "Receipt v1 remains parseable historical structure but cannot authenticate promotion. Receipt v2 references an exact immutable request and external signed attestation and still requires protected trust replay in runtime code.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "producerId",
+            "producerVersion",
+            "manifestDigest",
+            "reviewerRuntimeDigest",
+            "headCommit",
+            "headTree",
+            "sourceInventoryDigest",
+            "phaseScopeDigest",
+            "startedAt",
+            "endedAt",
+            "outcome",
+            "unresolvedFindings",
+            "receiptDigest"
+          ],
+          "properties": {
+            "schemaVersion": { "type": "integer", "const": 1 },
+            "producerId": { "type": "string", "const": "codex-native-review-runner" },
+            "producerVersion": { "type": "integer", "const": 1 },
+            "manifestDigest": {
+              "type": "string",
+              "const": "82792debed04937a264e759a1812ba1e33e0417aa555f87ce13e7f5417fd6f12"
+            },
+            "reviewerRuntimeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "headCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            "headTree": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            "sourceInventoryDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "phaseScopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "startedAt": { "type": "string", "format": "date-time" },
+            "endedAt": { "type": "string", "format": "date-time" },
+            "outcome": { "type": "string", "const": "pass" },
+            "unresolvedFindings": { "type": "integer", "const": 0 },
+            "receiptDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
         },
-        "reviewerRuntimeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "headCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-        "headTree": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-        "sourceInventoryDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "phaseScopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "startedAt": { "type": "string", "format": "date-time" },
-        "endedAt": { "type": "string", "format": "date-time" },
-        "outcome": { "type": "string", "const": "pass" },
-        "unresolvedFindings": { "type": "integer", "const": 0 },
-        "receiptDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
-      }
+        {
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "producerId",
+            "producerVersion",
+            "reviewRequest",
+            "attestation",
+            "issuer",
+            "keyFingerprint",
+            "receiptDigest"
+          ],
+          "properties": {
+            "schemaVersion": { "type": "integer", "const": 2 },
+            "producerId": {
+              "type": "string",
+              "const": "worker-broker-protected-review-promoter"
+            },
+            "producerVersion": { "type": "integer", "const": 1 },
+            "reviewRequest": { "$ref": "#/$defs/signedReviewReference" },
+            "attestation": { "$ref": "#/$defs/signedReviewReference" },
+            "issuer": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$"
+            },
+            "keyFingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "receiptDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
+        }
+      ]
     },
     "qualification": {
       "type": "object",
@@ -771,6 +815,17 @@
       "type": "string",
       "pattern": "^[0-9a-f]{64}$",
       "description": "SHA-256 of the canonical record body excluding this field."
+    }
+  },
+  "$defs": {
+    "signedReviewReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "digest"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
     }
   }
 }

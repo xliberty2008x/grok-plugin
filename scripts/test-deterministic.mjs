@@ -13,7 +13,8 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TEST_ROOT = path.join(ROOT, "tests");
 export const EXTERNAL_BOUNDARY_TESTS = Object.freeze([
   "installed-codex.test.mjs",
-  "live-grok.test.mjs"
+  "live-grok.test.mjs",
+  "worker-broker-protected-review.test.mjs"
 ]);
 
 export function listDeterministicTestFiles(testRoot = TEST_ROOT) {

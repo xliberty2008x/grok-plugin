@@ -22,8 +22,8 @@ Current conservative phase status:
 
 | Phase | Current state | What exists | Why the phase is not complete |
 | --- | --- | --- | --- |
-| 0 — Evidence system | `implemented_unverified` | Schema, validator, capture/verify CLI, parser-backed static-import phase closure, fixed serial proof runners, immutable-record and ledger logic, fail-closed tests, pre-publication proof-home cleanup, fixed absolute Python/PTTY binding, provisional live-receipt replay, bounded zero-skip v2 diagnostics, and a code-owned installed Worker MCP observation/publisher runner | Exact source `2b39e13` passed Phase 1 324/324 and full 552/552 and produced a strictly valid ledger-current Phase 0 record. Later source commits through `fda21c2` supersede that identity; exact clean-source replay and replacement records remain required |
-| 1 — Worker API | `implemented_unverified` | Protocol/schema projections, durable events/cursors, authority-bound reads, exact context-bound launch authorization, intent-bound private-channel provider bootstrap, exact controller/worker/provider identities, autonomous capability-bound startup recovery, atomic cleanup-safe terminalization, cancellation, root host-claim suppression, a bounded strict MCP STDIO client, stable transaction-time spawn responses, and durable private response witnesses | Exact source `2b39e13` produced a strictly valid ledger-current, honest `implemented_unverified` Phase 1 record. Commits `858ceea` and `fda21c2` require new Phase 0/1 records; signed independent review, installed MCP proof, and authenticated-provider proof also remain |
+| 0 — Evidence system | `implemented_unverified` | Schema, validator, capture/verify CLI, parser-backed static-import phase closure, fixed serial proof runners, immutable-record and ledger logic, fail-closed tests, pre-publication proof-home cleanup, fixed absolute Python/PTTY binding, provisional live-receipt replay, bounded zero-skip v2 diagnostics, a code-owned installed Worker MCP observation/publisher runner, and a protected signed-review request/attestation/promotion boundary | Exact source `2b39e13` passed Phase 1 324/324 and full 552/552 and produced a strictly valid ledger-current Phase 0 record. The current Q2 draft passed the evidence suite 121/121 and the root-owned Docker boundary 1/1 with 14 hostile scenarios, but later source work and the synthetic Docker signer mean exact clean-source replay and replacement records remain required |
+| 1 — Worker API | `implemented_unverified` | Protocol/schema projections, durable events/cursors, authority-bound reads, exact context-bound launch authorization, intent-bound private-channel provider bootstrap, exact controller/worker/provider identities, autonomous capability-bound startup recovery, atomic cleanup-safe terminalization, cancellation, root host-claim suppression, a bounded strict MCP STDIO client, stable transaction-time spawn responses, durable private response witnesses, and an atomic externally signed Phase 1 promotion path | Exact source `2b39e13` produced a strictly valid ledger-current, honest `implemented_unverified` Phase 1 record. Q2 implements the signed promotion boundary, but the final source still needs fresh Phase 0/1 proofs, a real protected independent issuer, installed MCP proof, and authenticated-provider proof |
 | 2 — Mailbox/context/roles | `implemented_unverified` foundations only | Idempotent mailbox records, follow-up/ContextPacket/role helpers, explicit ambiguity states | Production send has no ACP consumer; follow-up is not dispatchable; ordering, autonomous crash settlement, runtime ContextPacket/role enforcement, host-action persistence, and a Phase 2 proof producer are missing |
 | 3 — Worktrees/artifacts | `implemented_unverified` foundations only | Control-workspace identity, shared state, clean-parent fingerprinting, managed-worktree and artifact validation helpers | The broker never provisions or launches in a worktree, globally rejects concurrent writers, has no durable artifact/integration lifecycle, and has no Phase 3 proof producer |
 | 4 — Host presentation | `implemented_unverified` foundations plus root MCP subset | Raw task-owned Worker Protocol MCP operations, provider-capability-gated explorer-only spawn advertisement, host-claim suppression, presentation/alias/tree helpers, and external-worker labels | Native-shaped presentation, role-specific public spawn, persistent aliases, multi-wait, positive broker-owned host verification, MCP-first skills, installed natural MCP flow, Claude qualification, and a Phase 4 proof producer are missing |
@@ -41,7 +41,7 @@ These bars are planning estimates, not evidence states or time estimates. They a
 
 | View | Current estimate | Interpretation |
 | --- | ---: | --- |
-| Full roadmap source implementation | `39%` — `████████░░░░░░░░░░░░` | Transparent rubric: production-wired plus negative-tested = 1, partial production = 0.5, helper/fail-closed scaffold = 0.25, absent = 0; the stationary focused gate supports 18.0 of 46 non-deferred deliverables (48 total IDs minus P4-D6/P4-D7 deferred) |
+| Full roadmap source implementation | `40%` — `████████░░░░░░░░░░░░` | Transparent rubric: production-wired plus negative-tested = 1, partial production = 0.5, helper/fail-closed scaffold = 0.25, absent = 0; Q2 completes the protected signed-review construction boundary, so the current draft supports 18.5 of 46 non-deferred deliverables (48 total IDs minus P4-D6/P4-D7 deferred) |
 | First read-only vertical E2E readiness | `89%` — `██████████████████░░` | Eight of nine explicit checkpoints are implemented locally: the code-owned runner now owns exact installation, setup/capability/MCP observations, completion, reconnect/replay/cancellation, cleanup, session deletion, and provisional publication; the authenticated installed provider run remains |
 | Actual exact-source qualification evidence | `0%` — `░░░░░░░░░░░░░░░░░░░░` | No immutable current record exists for this source identity; installed/live Codex, authenticated Grok, Claude, paired corpus, and aggregate qualification are also absent; implementation progress and moving-tree tests are not qualification proof |
 
@@ -49,19 +49,19 @@ Reproducible roadmap score after the stationary focused gate:
 
 | Phase | Earned units | Basis |
 | --- | ---: | --- |
-| Phase 0 | `4.00 / 8` | Evidence machinery is production-wired; current records and installed/provider proof are absent |
+| Phase 0 | `4.50 / 8` | Evidence machinery plus the protected signed-review boundary are production-wired; final current records and real-issuer/live proof are absent |
 | Phase 1 | `6.25 / 8` | Root read API, autonomous outbox recovery, process safety, and cancellation are wired; compatibility/live provider proof remains |
 | Phase 2 | `2.50 / 8` | Mailbox/context/role foundations exist without production ACP delivery/follow-up |
 | Phase 3 | `1.75 / 8` | Identity/worktree/artifact helpers exist without a production write lifecycle |
 | Phase 4 | `2.50 / 6` non-deferred | Raw root MCP, capability filtering, and host-claim suppression exist; native presentation/live adapters remain |
 | Phase 5 | `1.00 / 8` | Deterministic safety slice only |
-| **Total** | **`18.00 / 46`** | The two deferred Phase 4 IDs are excluded |
+| **Total** | **`18.50 / 46`** | The two deferred Phase 4 IDs are excluded |
 
 Per-delivery score ledger (ordered exactly as each phase table; `D` is deferred and excluded):
 
 | Phase | Delivery-unit awards |
 | --- | --- |
-| P0 | `D1=1, D2=1, D3=1, D4=0.5, D5=0, D6=0, D7=0, D8=0.5` |
+| P0 | `D1=1, D2=1, D3=1, D4=1, D5=0, D6=0, D7=0, D8=0.5` |
 | P1 | `D1=1, D2=1, D3=1, D4=1, D5=1, D6=1, D7=0.25, D8=0` |
 | P2 | `D1=0.25, D2=0.5, D3=0.25, D4=0.25, D5=0.25, D6=0.5, D7=0.25, D8=0.25` |
 | P3 | `D1=0.5, D2=0.25, D3=0.25, D4=0.25, D4b=0, D5=0.25, D6=0.25, D7=0` |
@@ -230,12 +230,28 @@ Current audit replay:
 
 ```sh
 node --test tests/worker-broker-evidence.test.mjs
+npm run test:protected-review
 npm run validate
 npm run worker:verify -- --all --strict
 npm run worker:verify -- --all --strict --require-complete
 ```
 
-At this audit snapshot, the focused evidence tests and validator pass, while the current strict commands expose stale records plus a completion-model contradiction. The validator simultaneously forces live-supporting records to remain provisional/`implemented_unverified`, requires `qualified` to contain live passes, forbids provider/installed passes outside Phase 1/4, and requires every Phase 0–5 plus aggregate record to be `qualified`. Therefore `--require-complete` is structurally unsatisfiable today; that failure is a source blocker, not merely missing execution evidence.
+`test:protected-review` is an explicit external supporting gate: it must run
+without a skip and bind the root-owned runtime, exact Git, Docker
+client/Buildx/socket/daemon, immutable image ID, container IDs, restart replay,
+and hostile scenarios. It does not by itself promote Phase 1 because its signer
+and phase proofs are synthetic. Final Phase 1 promotion must repeat the same
+boundary from the frozen exact source with the actual proof chain and a real
+protected independent issuer, then persist the signed request, attestation,
+receipt, record, and ledger transition for offline replay.
+
+The original audit exposed both stale records and a structurally unsatisfiable
+completion model. Q1 corrected the model: numbered phases terminate at
+`verified_on_draft`, only the private aggregate may be `qualified`, and
+`--require-complete` requires exactly six current numbered records plus that
+aggregate. The command remains expected to fail until the final source has a
+complete current chain; that red result is missing qualification evidence, not
+permission to weaken the model.
 
 `--all --strict` is an integrity/freshness replay. It may pass for an honestly incomplete ledger and therefore is never a completion claim. The corrected release model must make `--require-complete` require current `verified_on_draft` Phase 0–5 records and exactly one producer-owned `qualified` aggregate that composes signed review, matched live receipts, corpus, CI, and release proof. Standalone direct/natural receipts remain provisional supporting evidence and never become ledger-current phase records.
 
@@ -294,7 +310,7 @@ Phase 0 establishes the fail-closed evidence machinery used by every downstream 
 | P0-D1 | Machine-readable evidence schema and nested allowlists | `implemented_unverified` | Evidence schema and validator | Bind to clean integrated commit and record passing schema tests |
 | P0-D2 | Canonical digest, immutable write, safe ledger identity, historical compatibility | `implemented_unverified` | Evidence library and focused regression tests | Rerun after integration and preserve command outcome digest |
 | P0-D3 | Phase scopes, mandatory gates, parser-backed local-static-import closure, and prerequisite digest closure | `implemented_unverified` | Phase manifests plus compact/after-block/division/regex/transitive/evidence-path negative regressions | Supersede all stale phase records with exact prerequisites |
-| P0-D4 | Proof-producing capture/replay workflow | `implemented_unverified` | Producer v3; aggregate-only qualification semantics; fixed direct Phase 0/1 manifests; exact serial Phase 1 runner; zero-skip reporter; scope-file identity, symlink, and executable-evidence-path defense; broker-owned provenance; absolute toolchain binding; private proof environment/promotion authority; safe v1/v2 cutover; post-publication source rollback; strict ledger validation; schema/runtime unsigned-promotion prohibition | Freeze and commit the evidence source, rerun the stationary focused/full gates, publish Phase 0, and keep Phase 1 unverified until a signed external reviewer attestation can be requested, imported, and replayed offline |
+| P0-D4 | Proof-producing capture/replay workflow | `implemented_unverified` | Producer v3; aggregate-only qualification semantics; fixed direct Phase 0/1 manifests; exact serial Phase 1 runner; zero-skip reporter; scope-file identity, symlink, and executable-evidence-path defense; broker-owned provenance; absolute toolchain binding; private proof environment/promotion authority; immutable signed review request/attestation; root-owned protected Ed25519 trust/runtime/Git boundary; atomic Phase 1 promotion; safe cutover and strict ledger replay. Current draft evidence: 121/121 evidence tests, external Docker 1/1 with restart and 14 hostile cases, and independent P0/P1-clear rereview | Commit Q2, continue source-changing phases, then freeze once. On the final exact source publish Phase 0/1 proofs, obtain a real protected independent issuer attestation, run protected promotion, and persist the exact request/attestation/receipt/record/ledger proof. The synthetic Docker signer is supporting evidence only |
 | P0-D5 | Current immutable records and ledger | `not_started` (supersession pending) | Existing records and ledger are historical migration inputs only | Publish new exact-source Phase 0 then Phase 1 records after the clean source commit; retain old entries as non-qualifying history |
 | P0-D6 | Exact-source installed natural Codex proof | `not_started` | Installed inventory and natural-host trace | Install exact artifact and run natural task without source-tree bypass |
 | P0-D7 | Current authenticated macOS Grok lifecycle proof | `not_started` | Redacted provider qualification record | Run provider lifecycle against same source/install identity |
@@ -594,7 +610,8 @@ Issue #25 must link this plan near the top and mirror stable deliverable IDs. Fo
 
 - The first installed/authenticated direct-MCP Phase 1 rehearsal passed the full completion → reconnect/replay → active cancellation → cleanup → exact session-deletion lifecycle on source `b533ff6`; cancellation chronology was then tightened through `0fadd62`. The immutable receipt at `tests/e2e-results/worker-broker/live-receipts/v1/synthetic-direct-mcp/9e109ac49369cb53-2babb2f1362e0b7e.json` is intentionally provisional and became stale as soon as later source work began.
 - Q1 is complete in the commit containing this checkpoint: producer v3 reserves `qualified` for one aggregate record, requires six current `verified_on_draft` numbered phases plus that aggregate for `--require-complete`, binds aggregate scope to the complete non-evidence source inventory, and rejects generic aggregate mint/link/prove paths. The final focused gate passed 111/111 and repository validation passed.
-- Q2 is the active next source boundary. It must add immutable review requests, protected Ed25519 attestation verification, and atomic Phase 1 promotion without placing signing authority or caller-selectable production trust in the reviewed repository.
+- Q2 is source-complete and awaiting its dedicated commit: immutable review requests, Ed25519 attestations, private immutable import, and atomic Phase 1 promotion are implemented behind a root-owned non-writable bootstrap, fixed trust descriptor/runtime bundle/Git identity, empty hooks directory, scrubbed Git configuration, and exact ledger convergence checks. The evidence suite passed 121/121; the protected Docker gate passed 1/1 with restart replay and 14 hostile scenarios; a fresh native security rereview is P0/P1-clear. These are moving-tree and synthetic-signer results, not final Phase 1 qualification.
+- P2.1 is the next source boundary after the Q2 commit: broker-built ContextPacket, immutable runtime role/profile/tool binding needed by that packet, body-free Context Receipt, exact effective-prompt binding, and root provider lineage.
 - Final exact-source qualification remains `0%`: there is no final current six-phase chain, matched final live receipts, paired corpus, protected signed Phase 1 promotion, or qualified aggregate.
 
 ### Dependency-ordered source completion map
@@ -604,7 +621,7 @@ The early read-only rehearsal intentionally precedes this source work so live de
 | Slice | Expected deliverable | How the main agent proves the slice is done |
 | --- | --- | --- |
 | Q1 | Aggregate-only qualification semantics: Phase 0–5 accept `verified_on_draft`; only the aggregate accepts `qualified`; `--require-complete` requires six current phase records plus one current aggregate | Constructed complete-chain acceptance; per-phase `qualified`, stale/incomplete aggregate, generic mint/link, and prerequisite-drift rejection |
-| Q2 | Code-owned review request plus protected Ed25519 attestation import and exact-source Phase 1 promotion | Forged/swapped/replayed/expired/revoked signatures, stale source/diff/proof, concurrent promotion, and generic-writer rejection; real issuer attestation waits for final freeze |
+| Q2 | **Source-complete, qualification pending:** code-owned immutable review request plus protected Ed25519 attestation import and exact-source Phase 1 promotion. The runtime binds root ownership/non-writability, fixed bundle/Git/policy/trust identity, scrubbed executable Git behavior, immutable attestation publication, exact convergence, and commit-ambiguity recovery | Evidence 121/121; external protected Docker 1/1 with immutable image/container identity, restart replay, complete evidence-tree oracle, and 14 hostile scenarios; validator/diff checks pass; independent rereview is P0/P1-clear. After commit, this remains `implemented_unverified`; real issuer attestation and durable final records wait for final source freeze |
 | P2.1 | Broker-built ContextPacket and body-free Context Receipt bound to the actual provider prompt and canonical lineage | Prompt/receipt digest equality, hidden-body exclusion, unsafe clipping rejection, restart/replay tamper, and cleanup-fence tests |
 | P2.2 | Immutable runtime role/profile/tool binding plus durable owner-only host-action grant/deny requests | Role/profile/tool drift, forged role, foreign/replayed grant, restart, resume mismatch, and hidden write-role tests |
 | P2.3 | Same-session follow-up enters the normal durable launch outbox and resumes exactly one parent provider session | Commit-before-launch, replay/restart exactly-once launch, same-lineage session, context/profile drift, cancellation-window, and no-prompt-replay tests |
@@ -638,7 +655,7 @@ The main agent owns trust material, publication authority, integration decisions
 9. [Client, stable witness, and installed runner complete; authenticated proof pending] Commits `0cafff7`, `858ceea`, and `fda21c2` supply the bounded strict MCP STDIO client, exact transaction-time spawn witness, and the opt-in installed runner for exact bytes, seven tools, authenticated completion, MCP reconnect without duplicate launch, idempotent cancellation, repository immutability, session deletion, and runner-owned cleanup. The next action is the early live execution, not more runner design.
 10. [Local observability complete; hosted replay pending] Commit `98e2596` supplies bounded zero-skip v2 identities and a 30-minute matrix budget. Push it, rerun the supported hosted matrix, and remediate any newly named cross-host failure before calling CI green.
 11. [Complete as a provisional rehearsal] The direct installed/authenticated vertical passed at `b533ff6`, including completion, reconnect/replay, active cancellation, cleanup, and exact session deletion; chronology hardening continued through `0fadd62`. Its immutable receipt is retained as stale rehearsal evidence and cannot qualify later source.
-12. [In progress: Q1 complete; Q2 next] Complete every remaining source-changing prerequisite: the signed independent-review request/import/promote boundary; Phase 2–5 runtime/features and fixed deterministic producers; private aggregate producer/publication boundary; aggregate full-scope and canonical dual-host artifact binding. A local subagent report or structural receipt is non-qualifying. Generic writers must remain unable to mint or link qualification. Generate no final record or receipt while these source surfaces are still moving.
+12. [In progress: Q1 and Q2 source boundaries complete; P2.1 next] Complete every remaining source-changing prerequisite: Phase 2–5 runtime/features and fixed deterministic producers; private aggregate producer/publication boundary; aggregate full-scope and canonical dual-host artifact binding. Q2's synthetic protected Docker gate and native review do not replace a real final-source issuer attestation. A local subagent report or structural receipt is non-qualifying. Generic writers must remain unable to mint or link qualification. Generate no final record or receipt while these source surfaces are still moving.
 13. Freeze the final source exactly once after step 12, replay fixed Phase 1 plus the full repository gate, and refresh the exact plugin cache through byte-identical inventory verification. Do not publish final phase or aggregate records before the live and corpus observations below exist.
 14. Repeat the full eight-step installed/authenticated direct-MCP completion and reconnect/cancel scenarios on the final source/install identity. For every scenario session, require successful presence → delete → absence proof before its receipt is published. Do not describe MCP-server restart as worker-crash recovery.
 15. Run a separate fresh natural-Codex task on that same final source/install/capability identity without caller-supplied `_meta`, and require successful presence → delete → absence proof for its session before receipt publication. The natural receipt proves host authority; only the matched synthetic-provider plus natural-Codex receipt pair may satisfy installed-host qualification.

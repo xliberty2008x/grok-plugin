@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -15,6 +16,13 @@ import {
   INDEPENDENT_REVIEW_PRODUCER_ID,
   INDEPENDENT_REVIEW_PRODUCER_VERSION,
   INDEPENDENT_REVIEW_MANIFEST_DIGEST,
+  REVIEW_ATTESTATION_ALGORITHM,
+  REVIEW_ATTESTATION_DOMAIN,
+  REVIEW_ATTESTATION_ROOT,
+  REVIEW_REQUEST_DOMAIN,
+  REVIEW_REQUEST_ROOT,
+  PROTECTED_REVIEW_RUNTIME_BUNDLE_PATHS,
+  SIGNED_REVIEW_MANIFEST_DIGEST,
   LIVE_RECEIPT_AUTHORITY_CONFIG,
   LIVE_RECEIPT_AUTHORITY_NATURAL,
   LIVE_RECEIPT_AUTHORITY_SYNTHETIC,
@@ -27,6 +35,8 @@ import {
   LIVE_RECEIPT_SCENARIO_IDS,
   assessCompleteEvidenceChain,
   attachIndependentReviewReceiptDigest,
+  attachReviewAttestationDigest,
+  attachReviewRequestDigest,
   attachRecordDigest,
   buildEvidenceRecord,
   computeInventoryDigest,
@@ -34,9 +44,15 @@ import {
   computeLiveReceiptManifestDigest,
   computePhaseScopeDigest,
   computeProofManifestDigest,
+  computeReviewAttestationDigest,
+  computeReviewPublicKeyFingerprint,
+  computeReviewRequestDigest,
   computeRecordDigest,
   captureProofTemporaryHomeIdentity,
+  canonicalReviewAttestationSigningBody,
   cleanupProofTemporaryHome,
+  createPhaseOneReviewRequest,
+  digestsIgnoreEvidenceOnly,
   expandLocalStaticImportClosure,
   findMissingLocalStaticImportDependencies,
   gitIdentity,
@@ -49,17 +65,20 @@ import {
   phaseScopePaths,
   provePhaseZero,
   proveWorkerBrokerPhase,
+  promotePhaseOneFromProtectedRuntime,
   runCommandCapture,
   sanitizeProofEnvironment,
   statusSatisfiesVerifiedPrerequisite,
   updateLedger,
   validateEvidenceRecord,
+  validateIndependentReviewAttestation,
   validateLiveQualificationReceipt,
+  validatePhaseOneReviewRequest,
   verifyLedger,
   verifyPhase,
+  verifySignedLedgerFromProtectedRuntime,
   writeEvidenceRecord,
-  sha256Text,
-  digestsIgnoreEvidenceOnly
+  sha256Text
 } from "../scripts/lib/worker-broker-evidence.mjs";
 import {
   EXTERNAL_BOUNDARY_TESTS,
@@ -94,6 +113,10 @@ const ZERO_SKIP_REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.
 const DETERMINISTIC_CHECK_RUNNER = path.join(ROOT, "scripts/check-deterministic.mjs");
 const DETERMINISTIC_TEST_LIBRARY = path.join(ROOT, "scripts/lib/deterministic-test-runner.mjs");
 const REDACT_LIBRARY = path.join(ROOT, "plugins/grok/scripts/lib/redact.mjs");
+const PROTECTED_REVIEW_BOOTSTRAP = path.join(
+  ROOT,
+  "scripts/trusted/worker-broker-review.mjs"
+);
 const STATIC_ESM_IMPORT_PARSER = path.join(ROOT, "scripts/lib/static-esm-import-parser.mjs");
 const PHASE_ONE_FOCUSED_RUNNER = path.join(ROOT, "scripts/test-phase1-focused.mjs");
 const POSIX_PROOF_PLATFORM = process.platform === "darwin" || process.platform === "linux";
@@ -137,7 +160,8 @@ function installPhaseOneFocusedRunner(root) {
 test("deterministic zero-skip runner excludes only explicit external boundaries", () => {
   assert.deepEqual(EXTERNAL_BOUNDARY_TESTS, [
     "installed-codex.test.mjs",
-    "live-grok.test.mjs"
+    "live-grok.test.mjs",
+    "worker-broker-protected-review.test.mjs"
   ]);
   const all = fs.readdirSync(path.join(ROOT, "tests"), { withFileTypes: true })
     .filter((entry) => entry.isFile() && entry.name.endsWith(".test.mjs"))
@@ -1059,6 +1083,39 @@ function rawEvidenceFixturePath(root, record) {
   return relative.split(path.sep).join("/");
 }
 
+function seedLedgerFixtureEntry(root, entry) {
+  const ledgerPath = path.join(root, "tests/e2e-results/worker-broker/ledger.json");
+  fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
+  let ledger = {
+    schemaVersion: 1,
+    roadmapVersion: "1.0",
+    issue: "https://github.com/xliberty2008x/grok-plugin/issues/25",
+    updatedAt: null,
+    entries: []
+  };
+  try {
+    ledger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const next = {
+    ...entry,
+    currency: entry.currency || "current",
+    recordedAt: entry.recordedAt || STARTED_AT
+  };
+  if (next.currency === "current") {
+    for (const existing of ledger.entries) {
+      if (existing.phase === next.phase && existing.currency === "current") {
+        existing.currency = "historical";
+      }
+    }
+  }
+  ledger.entries.push(next);
+  ledger.updatedAt = next.recordedAt;
+  fs.writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`, { mode: 0o600 });
+  return ledger;
+}
+
 function syntheticLedgerEntry(phase, slice, overrides = {}) {
   const recordDigest = sha256Text(`${phase}:${slice}:record`);
   const directory = phase === "aggregate" ? "aggregate" : `phase-${phase}`;
@@ -1628,6 +1685,301 @@ function initRunnableEvidenceCliFixture(name) {
   return { root, evidenceDir };
 }
 
+function initPhaseOneSignedReviewFixture(name = "signed-review") {
+  const fixture = initRunnableEvidenceCliFixture(name);
+  const baseCommit = git(fixture.root, "rev-parse", "HEAD").trim();
+  const reviewedFile = path.join(
+    fixture.root,
+    "plugins/grok/scripts/lib/errors.mjs"
+  );
+  fs.appendFileSync(reviewedFile, `\n// ${name} reviewed source delta\n`);
+  git(fixture.root, "add", "plugins/grok/scripts/lib/errors.mjs");
+  git(fixture.root, "commit", "-m", `add ${name} reviewed delta`);
+
+  let phaseZero = buildEvidenceRecord({
+    root: fixture.root,
+    phase: "0",
+    slice: "evidence-system",
+    status: "verified_on_draft",
+    verification: exactPhaseProof("0"),
+    qualification: deterministicQualification(),
+    evidenceSystemQualification: true
+  });
+  phaseZero = attachRecordDigest({
+    ...phaseZero,
+    proofProducer: proofProducer("0")
+  });
+  const phaseZeroPath = rawEvidenceFixturePath(fixture.root, phaseZero);
+  seedLedgerFixtureEntry(fixture.root, {
+    phase: phaseZero.phase,
+    slice: phaseZero.slice,
+    status: phaseZero.status,
+    path: phaseZeroPath,
+    recordDigest: phaseZero.recordDigest,
+    sourceCommit: phaseZero.source.headCommit,
+    recordedAt: phaseZero.recordedAt
+  });
+
+  let phaseOne = buildEvidenceRecord({
+    root: fixture.root,
+    phase: "1",
+    slice: "worker-api",
+    status: "implemented_unverified",
+    verification: exactPhaseProof("1"),
+    qualification: deterministicQualification(),
+    evidenceSystemQualification: true,
+    prerequisites: [{
+      phase: "0",
+      recordDigest: phaseZero.recordDigest,
+      gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]]
+    }],
+    authorities: {
+      workerClaims: "none",
+      runtimeObservations: "broker-owned bounded Phase 1 gate runner",
+      hostVerification: "not_run",
+      independentValidation: "not_run"
+    }
+  });
+  phaseOne = attachRecordDigest({
+    ...phaseOne,
+    proofProducer: proofProducer("1")
+  });
+  const phaseOnePath = rawEvidenceFixturePath(fixture.root, phaseOne);
+  seedLedgerFixtureEntry(fixture.root, {
+    phase: phaseOne.phase,
+    slice: phaseOne.slice,
+    status: phaseOne.status,
+    path: phaseOnePath,
+    recordDigest: phaseOne.recordDigest,
+    sourceCommit: phaseOne.source.headCommit,
+    recordedAt: phaseOne.recordedAt
+  });
+  const strict = verifyLedger(fixture.root, { strict: true });
+  assert.equal(strict.ok, true, strict.errors.join("; "));
+  return {
+    ...fixture,
+    baseCommit,
+    phaseZero,
+    phaseZeroPath,
+    phaseOne,
+    phaseOnePath
+  };
+}
+
+function createReviewRequestFixture(fixture, {
+  createdAt = new Date(Date.now() - 60_000).toISOString(),
+  expiresAt = new Date(Date.now() + 60 * 60_000).toISOString(),
+  nonce = crypto.randomBytes(32).toString("base64url"),
+  write = true
+} = {}) {
+  return createPhaseOneReviewRequest({
+    root: fixture.root,
+    baseCommit: fixture.baseCommit,
+    createdAt,
+    expiresAt,
+    nonce,
+    write
+  });
+}
+
+function signedReviewAttestation(requestResult, keyPair, overrides = {}) {
+  const request = requestResult.request;
+  const requestPath = requestResult.path
+    || `${REVIEW_REQUEST_ROOT}/${request.source.headCommit.slice(0, 16)}-${request.requestDigest.slice(0, 16)}.json`;
+  const startedAt = new Date(Date.parse(request.createdAt) + 1_000).toISOString();
+  const endedAt = new Date(Date.parse(request.createdAt) + 2_000).toISOString();
+  const body = {
+    schemaVersion: 1,
+    domain: REVIEW_ATTESTATION_DOMAIN,
+    issuer: "test-protected-reviewer",
+    keyFingerprint: computeReviewPublicKeyFingerprint(keyPair.publicKey),
+    algorithm: REVIEW_ATTESTATION_ALGORITHM,
+    requestPath,
+    requestDigest: request.requestDigest,
+    nonce: request.nonce,
+    manifestDigest: SIGNED_REVIEW_MANIFEST_DIGEST,
+    reviewerRuntimeDigest: sha256Text("ephemeral-test-reviewer-runtime"),
+    headCommit: request.source.headCommit,
+    headTree: request.source.headTree,
+    sourceInventoryDigest: request.source.sourceInventoryDigest,
+    phaseScopeDigest: request.source.phaseScopeDigest,
+    diffBaseCommit: request.diff.baseCommit,
+    diffPatchDigest: request.diff.patchDigest,
+    diffPathsDigest: request.diff.pathsDigest,
+    proofRecordDigest: request.proof.recordDigest,
+    prerequisiteRecordDigest: request.prerequisite.recordDigest,
+    startedAt,
+    endedAt,
+    outcome: "pass",
+    unresolvedFindings: 0,
+    ...overrides
+  };
+  const unsigned = { ...body };
+  delete unsigned.signature;
+  delete unsigned.attestationDigest;
+  const signature = crypto.sign(
+    null,
+    Buffer.from(canonicalReviewAttestationSigningBody(unsigned), "utf8"),
+    keyPair.privateKey
+  ).toString("base64url");
+  return attachReviewAttestationDigest({ ...unsigned, signature });
+}
+
+function writeReviewAttestationFixture(root, attestation) {
+  const relative = `${REVIEW_ATTESTATION_ROOT}/${attestation.requestDigest.slice(0, 16)}-${attestation.attestationDigest.slice(0, 16)}.json`;
+  const absolute = path.join(root, ...relative.split("/"));
+  fs.mkdirSync(path.dirname(absolute), { recursive: true });
+  fs.writeFileSync(absolute, `${JSON.stringify(attestation, null, 2)}\n`, { mode: 0o600 });
+  return relative;
+}
+
+async function loadPrivateReviewPromotionHarness(
+  root,
+  { faultMode = null, importApi = true } = {}
+) {
+  const modulePath = path.join(root, "scripts/lib/worker-broker-evidence.mjs");
+  const redactorUrl = pathToFileURL(path.join(
+    root,
+    "plugins/grok/scripts/lib/redact.mjs"
+  )).href;
+  const inventoryUrl = pathToFileURL(path.join(
+    root,
+    "scripts/lib/plugin-inventory.mjs"
+  )).href;
+  let source = fs.readFileSync(modulePath, "utf8");
+  source = source
+    .replace(
+      '"../../plugins/grok/scripts/lib/redact.mjs"',
+      JSON.stringify(redactorUrl)
+    )
+    .replace(
+      '"./plugin-inventory.mjs"',
+      JSON.stringify(inventoryUrl)
+    )
+    .replace(
+      'const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");',
+      `const REPO_ROOT = ${JSON.stringify(root)};`
+    );
+  if (faultMode === "post-ledger-rename-fsync") {
+    source += `
+const __testOriginalRenameSync = fs.renameSync.bind(fs);
+const __testOriginalFsyncSync = fs.fsyncSync.bind(fs);
+let __testLedgerRenameObserved = false;
+fs.renameSync = (from, to) => {
+  const result = __testOriginalRenameSync(from, to);
+  if (path.basename(String(to)) === "ledger.json") __testLedgerRenameObserved = true;
+  return result;
+};
+fs.fsyncSync = (descriptor) => {
+  if (__testLedgerRenameObserved && fs.fstatSync(descriptor).isDirectory()) {
+    __testLedgerRenameObserved = false;
+    const error = new Error("injected post-ledger-rename directory fsync failure");
+    error.code = "EIO";
+    throw error;
+  }
+  return __testOriginalFsyncSync(descriptor);
+};
+`;
+  } else if (faultMode === "post-lock-release") {
+    source = source.replace(
+      "releaseEvidenceLedgerLock(lease);",
+      `releaseEvidenceLedgerLock(lease);
+    throw Object.assign(new Error("injected lock release acknowledgement failure"), {
+      code: "E_EVIDENCE_LEDGER_LOCK"
+    });`
+    );
+  } else if (faultMode !== null) {
+    throw new Error(`Unsupported signed-review fault mode ${faultMode}.`);
+  }
+  source += `
+export function __testPromoteSignedReview(options) {
+  return promotePhaseOneSignedReviewInternal(
+    options,
+    REVIEW_PROMOTION_PUBLICATION_AUTHORITY
+  );
+}
+export function __testVerifySignedLedger(root, trust) {
+  return verifyLedger(root, {
+    strict: true,
+    signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
+    signedReviewTrust: trust
+  });
+}
+export function __testImportSignedReview(options) {
+  return importPhaseOneReviewAttestationInternal(
+    options,
+    REVIEW_PROMOTION_PUBLICATION_AUTHORITY
+  );
+}
+`;
+  const harnessDirectory = tempDir("review-promotion-harness-");
+  const harnessPath = path.join(harnessDirectory, "worker-broker-evidence-harness.mjs");
+  fs.writeFileSync(harnessPath, source);
+  const api = importApi
+    ? await import(
+      `${pathToFileURL(harnessPath).href}?nonce=${crypto.randomBytes(8).toString("hex")}`
+    )
+    : null;
+  return { api, harnessPath, harnessDirectory };
+}
+
+function spawnPrivateReviewPromoter({
+  harnessPath,
+  root,
+  requestPath,
+  attestationPath,
+  publicKey,
+  now,
+  ready,
+  barrier
+}) {
+  const source = `
+import fs from "node:fs";
+import { __testPromoteSignedReview } from ${JSON.stringify(pathToFileURL(harnessPath).href)};
+fs.writeFileSync(${JSON.stringify(ready)}, "ready\\n");
+while (!fs.existsSync(${JSON.stringify(barrier)})) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+}
+try {
+  const result = __testPromoteSignedReview({
+    root: ${JSON.stringify(root)},
+    requestPath: ${JSON.stringify(requestPath)},
+    attestationPath: ${JSON.stringify(attestationPath)},
+    now: ${JSON.stringify(now)},
+    trust: {
+      publicKey: ${JSON.stringify(publicKey)},
+      expectedIssuer: "test-protected-reviewer",
+      revokedKeyFingerprints: []
+    }
+  });
+  process.stdout.write(JSON.stringify(result) + "\\n");
+} catch (error) {
+  process.stderr.write(JSON.stringify({
+    code: error?.code || "E_UNKNOWN",
+    commitState: error?.commitState || null,
+    recoveryRequired: error?.recoveryRequired === true,
+    recordDigest: error?.recordDigest || null
+  }) + "\\n");
+  process.exitCode = 1;
+}
+`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
+    cwd: root,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const completed = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => resolve({ code, signal, stdout, stderr }));
+  });
+  return { child, completed };
+}
+
 function seedPreRunnerCurrent(root, phase, slice = `legacy-${phase}`) {
   const base = buildEvidenceRecord({
     root,
@@ -1645,7 +1997,7 @@ function seedPreRunnerCurrent(root, phase, slice = `legacy-${phase}`) {
     qualification: deterministicQualification()
   });
   const recordPath = rawEvidenceFixturePath(root, legacy);
-  updateLedger({
+  seedLedgerFixtureEntry(root, {
     phase: legacy.phase,
     slice: legacy.slice,
     status: legacy.status,
@@ -1653,7 +2005,7 @@ function seedPreRunnerCurrent(root, phase, slice = `legacy-${phase}`) {
     recordDigest: legacy.recordDigest,
     sourceCommit: legacy.source.headCommit,
     recordedAt: legacy.recordedAt
-  }, root);
+  });
   return { record: legacy, recordPath };
 }
 
@@ -1683,7 +2035,7 @@ function seedPriorProofRunnerCurrent(
     }
   });
   const recordPath = rawEvidenceFixturePath(root, record);
-  updateLedger({
+  seedLedgerFixtureEntry(root, {
     phase: record.phase,
     slice: record.slice,
     status: record.status,
@@ -1691,7 +2043,7 @@ function seedPriorProofRunnerCurrent(
     recordDigest: record.recordDigest,
     sourceCommit: record.source.headCommit,
     recordedAt: record.recordedAt
-  }, root);
+  });
   return { record, recordPath };
 }
 
@@ -5008,7 +5360,7 @@ test("Phase 1 rejects the reserved self-digested review receipt as unauthenticat
   const acceptedValidation = validateEvidenceRecord(accepted, { root });
   assert.equal(acceptedValidation.ok, false);
   assert.ok(acceptedValidation.errors.includes(
-    "independentReviewReceipt is reserved but unauthenticated; signed issuer verification is required."
+    "independentReviewReceipt v1 is historical and permanently unauthenticated."
   ));
   assert.ok(acceptedValidation.errors.includes(
     "verified_on_draft Phase 1 evidence requires signed issuer-verified independent review proof."
@@ -5017,17 +5369,17 @@ test("Phase 1 rejects the reserved self-digested review receipt as unauthenticat
     path.join(ROOT, "plugins/grok/schemas/worker-broker-evidence.schema.json"),
     "utf8"
   ));
-  const phaseOnePromotionProhibition = publishedSchema.allOf.find((rule) => (
-    rule?.not?.properties?.phase?.const === "1"
-    && rule?.not?.properties?.status?.enum?.includes("verified_on_draft")
-    && rule?.not?.properties?.status?.enum?.includes("qualified")
+  const signedPhaseOnePromotionRule = publishedSchema.allOf.find((rule) => (
+    rule?.if?.properties?.phase?.const === "1"
+    && rule?.if?.properties?.status?.const === "verified_on_draft"
+    && rule?.then?.required?.includes("independentReviewReceipt")
   ));
-  assert.ok(phaseOnePromotionProhibition, "published schema must reject unsigned Phase 1 promotion");
-  assert.ok(phaseOnePromotionProhibition.not.required.every((field) => (
-    Object.hasOwn(accepted, field)
-  )));
-  assert.equal(accepted.phase, phaseOnePromotionProhibition.not.properties.phase.const);
-  assert.ok(phaseOnePromotionProhibition.not.properties.status.enum.includes(accepted.status));
+  assert.equal(
+    signedPhaseOnePromotionRule.then.properties.independentReviewReceipt
+      .properties.schemaVersion.const,
+    2,
+    "published schema must require signed receipt v2 for Phase 1 promotion"
+  );
   assert.throws(
     () => writeEvidenceRecord(accepted, root),
     /invalid/i,
@@ -5064,6 +5416,986 @@ test("Phase 1 rejects the reserved self-digested review receipt as unauthenticat
   const tamperedValidation = validateEvidenceRecord(tampered, { root });
   assert.equal(tamperedValidation.ok, false);
   assert.ok(tamperedValidation.errors.some((message) => /receiptDigest/i.test(message)));
+});
+
+test("Phase 1 review requests bind immutable source, diff, proof, and prerequisite identities", () => {
+  const fixture = initPhaseOneSignedReviewFixture("review-request-bindings");
+  const createdAt = new Date(Date.now() - 60_000).toISOString();
+  const expiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  const nonce = crypto.randomBytes(32).toString("base64url");
+  const first = createReviewRequestFixture(fixture, {
+    createdAt,
+    expiresAt,
+    nonce,
+    write: true
+  });
+  assert.equal(first.ok, true);
+  assert.match(
+    first.path,
+    new RegExp(`^${REVIEW_REQUEST_ROOT}/[0-9a-f]{16}-[0-9a-f]{16}\\.json$`)
+  );
+  assert.equal(first.request.domain, REVIEW_REQUEST_DOMAIN);
+  assert.equal(first.request.manifestDigest, SIGNED_REVIEW_MANIFEST_DIGEST);
+  assert.equal(first.request.source.headCommit, gitIdentity(fixture.root).headCommit);
+  assert.equal(
+    first.request.source.sourceInventoryDigest,
+    computeInventoryDigest(fixture.root, { includeEvidence: false })
+  );
+  assert.equal(
+    first.request.source.phaseScopeDigest,
+    computePhaseScopeDigest("1", fixture.root)
+  );
+  assert.deepEqual(first.request.source.phaseScopePaths, phaseScopePaths("1", fixture.root));
+  assert.equal(first.request.diff.baseCommit, fixture.baseCommit);
+  assert.deepEqual(first.request.diff.paths, ["plugins/grok/scripts/lib/errors.mjs"]);
+  assert.equal(first.request.proof.path, fixture.phaseOnePath);
+  assert.equal(first.request.proof.recordDigest, fixture.phaseOne.recordDigest);
+  assert.equal(first.request.prerequisite.path, fixture.phaseZeroPath);
+  assert.equal(first.request.prerequisite.recordDigest, fixture.phaseZero.recordDigest);
+  assert.equal(first.request.requestDigest, computeReviewRequestDigest(first.request));
+  const valid = validatePhaseOneReviewRequest(first.request, {
+    root: fixture.root,
+    now: createdAt
+  });
+  assert.equal(valid.ok, true, valid.errors.join("; "));
+
+  const requestFile = path.join(fixture.root, ...first.path.split("/"));
+  const originalBytes = fs.readFileSync(requestFile, "utf8");
+  const replay = createReviewRequestFixture(fixture, {
+    createdAt,
+    expiresAt,
+    nonce,
+    write: true
+  });
+  assert.equal(replay.path, first.path);
+  assert.equal(fs.readFileSync(requestFile, "utf8"), originalBytes);
+
+  assert.throws(
+    () => createPhaseOneReviewRequest({
+      root: fixture.root,
+      baseCommit: "f".repeat(40),
+      createdAt,
+      expiresAt,
+      nonce,
+      write: false
+    }),
+    (error) => error?.code === "E_REVIEW_REQUEST_INVALID"
+  );
+  const privateRequest = attachReviewRequestDigest({
+    ...structuredClone(first.request),
+    diff: {
+      ...structuredClone(first.request.diff),
+      paths: ["/private/tmp/review-canary"],
+      pathsDigest: sha256Text(JSON.stringify(["/private/tmp/review-canary"]))
+    }
+  });
+  const privateValidation = validatePhaseOneReviewRequest(privateRequest, {
+    now: createdAt
+  });
+  assert.equal(privateValidation.ok, false);
+  assert.ok(privateValidation.errors.some((message) => /unsafe|diff binding/i.test(message)));
+
+  const external = tempDir("review-request-symlink-");
+  const requestDirectory = path.join(fixture.root, REVIEW_REQUEST_ROOT);
+  fs.rmSync(requestDirectory, { recursive: true, force: true });
+  fs.symlinkSync(external, requestDirectory);
+  assert.throws(
+    () => createReviewRequestFixture(fixture, {
+      createdAt,
+      expiresAt,
+      nonce: crypto.randomBytes(32).toString("base64url"),
+      write: true
+    }),
+    (error) => error?.code === "E_REVIEW_REQUEST_INVALID"
+  );
+  assert.deepEqual(fs.readdirSync(external), []);
+});
+
+test("Phase 1 review request rejects dirty and stale source identities", () => {
+  const dirtyFixture = initPhaseOneSignedReviewFixture("review-request-dirty");
+  const dirtyFile = path.join(dirtyFixture.root, "plugins/grok/scripts/lib/errors.mjs");
+  fs.appendFileSync(dirtyFile, "\n// uncommitted dirty review\n");
+  assert.throws(
+    () => createReviewRequestFixture(dirtyFixture, { write: false }),
+    (error) => error?.code === "E_REVIEW_REQUEST_INVALID"
+  );
+
+  const staleFixture = initPhaseOneSignedReviewFixture("review-request-stale");
+  const result = createReviewRequestFixture(staleFixture, { write: true });
+  const staleFile = path.join(staleFixture.root, "plugins/grok/scripts/lib/errors.mjs");
+  fs.appendFileSync(staleFile, "\n// source moved after request\n");
+  git(staleFixture.root, "add", "plugins/grok/scripts/lib/errors.mjs");
+  git(staleFixture.root, "commit", "-m", "move source after review request");
+  const stale = validatePhaseOneReviewRequest(result.request, {
+    root: staleFixture.root,
+    now: result.request.createdAt
+  });
+  assert.equal(stale.ok, false);
+  assert.ok(stale.errors.some((message) => /stale|current bindings/i.test(message)));
+
+  const symlinkFixture = initPhaseOneSignedReviewFixture("review-request-source-symlink");
+  const symlinkRequest = createReviewRequestFixture(symlinkFixture, { write: true });
+  const sourceDirectory = path.join(
+    symlinkFixture.root,
+    "plugins/grok/scripts/lib"
+  );
+  const externalMirror = path.join(tempDir("review-source-mirror-"), "lib");
+  fs.renameSync(sourceDirectory, externalMirror);
+  fs.symlinkSync(externalMirror, sourceDirectory);
+  const symlinked = validatePhaseOneReviewRequest(symlinkRequest.request, {
+    root: symlinkFixture.root,
+    now: symlinkRequest.request.createdAt
+  });
+  assert.equal(symlinked.ok, false);
+  assert.ok(symlinked.errors.some((message) => /clean|symlink|bindings/i.test(message)));
+});
+
+test("review canonicalization, Ed25519 SPKI, fingerprint, and signature match a fixed vector", () => {
+  const spkiBase64 = "MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+  const fingerprint = "06e3fd8fda29bb60ab59557de61edb0aecdb231134be30e75b455f8e1b792fa9";
+  const signature = "c7-LfcysTSUWuQiPO7uXKxYVXSK8QdDUUyR-v9RetBlVWn7sHvtka73Qv1Rg7MHyE-rH-xjWPVOLdu1ywHo0Bw";
+  const expectedBody = '{"a":{"x":1,"y":2},"list":[3,"x"],"z":"last"}';
+  const unordered = {
+    z: "last",
+    list: [3, "x"],
+    a: { y: 2, x: 1 },
+    signature: "not-part-of-the-signing-body",
+    attestationDigest: "not-part-of-the-signing-body"
+  };
+  const body = canonicalReviewAttestationSigningBody(unordered);
+  assert.equal(body, expectedBody);
+  const publicKey = crypto.createPublicKey({
+    key: Buffer.from(spkiBase64, "base64"),
+    type: "spki",
+    format: "der"
+  });
+  assert.equal(publicKey.asymmetricKeyType, "ed25519");
+  assert.equal(computeReviewPublicKeyFingerprint(publicKey), fingerprint);
+  assert.equal(Buffer.from(signature, "base64url").length, 64);
+  assert.equal(
+    crypto.verify(
+      null,
+      Buffer.from(expectedBody, "utf8"),
+      publicKey,
+      Buffer.from(signature, "base64url")
+    ),
+    true
+  );
+  assert.equal(
+    computeReviewAttestationDigest({
+      ...unordered,
+      signature,
+      attestationDigest: "ignored"
+    }),
+    "ab3d72d8d3a4a8827cc9b808c0d1f92aea9b1c8c938b9f9d9535608bba733c5c"
+  );
+});
+
+test("external Ed25519 review attestations verify exact bindings and fail closed", () => {
+  const fixture = initPhaseOneSignedReviewFixture("review-attestation");
+  const requestResult = createReviewRequestFixture(fixture, { write: true });
+  const keyPair = crypto.generateKeyPairSync("ed25519");
+  const otherKeyPair = crypto.generateKeyPairSync("ed25519");
+  const attestation = signedReviewAttestation(requestResult, keyPair);
+  const now = new Date(Date.parse(attestation.endedAt) + 1_000).toISOString();
+  const valid = validateIndependentReviewAttestation(attestation, {
+    request: requestResult.request,
+    requestPath: requestResult.path,
+    publicKey: keyPair.publicKey,
+    expectedIssuer: "test-protected-reviewer",
+    revokedKeyFingerprints: [],
+    now
+  });
+  assert.equal(valid.ok, true, valid.errors.join("; "));
+  assert.equal(attestation.attestationDigest, computeReviewAttestationDigest(attestation));
+  assert.equal(valid.keyFingerprint, computeReviewPublicKeyFingerprint(keyPair.publicKey));
+
+  const cases = [
+    ["wrong-key", attestation, { publicKey: otherKeyPair.publicKey }],
+    ["wrong-issuer", attestation, { expectedIssuer: "different-protected-reviewer" }],
+    ["wrong-fingerprint", signedReviewAttestation(requestResult, keyPair, {
+      keyFingerprint: "f".repeat(64)
+    }), {}],
+    ["wrong-algorithm", signedReviewAttestation(requestResult, keyPair, {
+      algorithm: "RSA-PSS"
+    }), {}],
+    ["malformed-signature", attachReviewAttestationDigest({
+      ...attestation,
+      signature: "A".repeat(85)
+    }), {}],
+    ["tampered-after-sign", attachReviewAttestationDigest({
+      ...attestation,
+      reviewerRuntimeDigest: "e".repeat(64)
+    }), {}],
+    ["revoked", attestation, {
+      revokedKeyFingerprints: [attestation.keyFingerprint]
+    }],
+    ["non-pass", signedReviewAttestation(requestResult, keyPair, {
+      outcome: "fail"
+    }), {}],
+    ["findings", signedReviewAttestation(requestResult, keyPair, {
+      unresolvedFindings: 1
+    }), {}],
+    ["future-attestation", signedReviewAttestation(requestResult, keyPair, {
+      startedAt: new Date(Date.parse(now) + 10_000).toISOString(),
+      endedAt: new Date(Date.parse(now) + 20_000).toISOString()
+    }), {}]
+  ];
+  for (const [label, candidate, overrides] of cases) {
+    const result = validateIndependentReviewAttestation(candidate, {
+      request: requestResult.request,
+      requestPath: requestResult.path,
+      publicKey: keyPair.publicKey,
+      expectedIssuer: "test-protected-reviewer",
+      revokedKeyFingerprints: [],
+      now,
+      ...overrides
+    });
+    assert.equal(result.ok, false, label);
+  }
+  const futureAttestation = signedReviewAttestation(requestResult, keyPair, {
+    startedAt: new Date(Date.parse(now) + 10_000).toISOString(),
+    endedAt: new Date(Date.parse(now) + 20_000).toISOString()
+  });
+  const futureDurableReplay = validateIndependentReviewAttestation(
+    futureAttestation,
+    {
+      request: requestResult.request,
+      requestPath: requestResult.path,
+      publicKey: keyPair.publicKey,
+      expectedIssuer: "test-protected-reviewer",
+      revokedKeyFingerprints: [],
+      now,
+      requireFreshRequest: false
+    }
+  );
+  assert.equal(futureDurableReplay.ok, false);
+  assert.ok(futureDurableReplay.errors.some((message) => /chronology/i.test(message)));
+  const replayedRequest = attachReviewRequestDigest({
+    ...structuredClone(requestResult.request),
+    nonce: crypto.randomBytes(32).toString("base64url")
+  });
+  assert.equal(validateIndependentReviewAttestation(attestation, {
+    request: replayedRequest,
+    publicKey: keyPair.publicKey,
+    expectedIssuer: "test-protected-reviewer",
+    now
+  }).ok, false);
+  const expired = validateIndependentReviewAttestation(attestation, {
+    request: requestResult.request,
+    requestPath: requestResult.path,
+    publicKey: keyPair.publicKey,
+    expectedIssuer: "test-protected-reviewer",
+    now: new Date(Date.parse(requestResult.request.expiresAt) + 1).toISOString()
+  });
+  assert.equal(expired.ok, false);
+  assert.ok(expired.errors.some((message) => /expired request/i.test(message)));
+  const rsaKey = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 }).publicKey;
+  const wrongKeyType = validateIndependentReviewAttestation(attestation, {
+    request: requestResult.request,
+    requestPath: requestResult.path,
+    publicKey: rsaKey,
+    expectedIssuer: "test-protected-reviewer",
+    now
+  });
+  assert.equal(wrongKeyType.ok, false);
+  assert.ok(wrongKeyType.errors.some((message) => /Ed25519 key/i.test(message)));
+});
+
+test("protected attestation import validates, publishes immutably, and promotes", async () => {
+  const fixture = initPhaseOneSignedReviewFixture("review-import");
+  const requestResult = createReviewRequestFixture(fixture, { write: true });
+  const keyPair = crypto.generateKeyPairSync("ed25519");
+  const attestation = signedReviewAttestation(requestResult, keyPair);
+  const now = new Date(Date.parse(attestation.endedAt) + 1_000).toISOString();
+  const trust = {
+    publicKey: keyPair.publicKey,
+    expectedIssuer: "test-protected-reviewer",
+    revokedKeyFingerprints: []
+  };
+  const { api } = await loadPrivateReviewPromotionHarness(fixture.root);
+  const attestationPath = api.__testImportSignedReview({
+    root: fixture.root,
+    requestPath: requestResult.path,
+    attestation,
+    trust,
+    now
+  });
+  assert.match(
+    attestationPath,
+    new RegExp(`^${REVIEW_ATTESTATION_ROOT}/[0-9a-f]{16}-[0-9a-f]{16}\\.json$`)
+  );
+  const absolute = path.join(fixture.root, ...attestationPath.split("/"));
+  const originalBytes = fs.readFileSync(absolute, "utf8");
+  assert.deepEqual(JSON.parse(originalBytes), attestation);
+  assert.equal(api.__testImportSignedReview({
+    root: fixture.root,
+    requestPath: requestResult.path,
+    attestation,
+    trust,
+    now
+  }), attestationPath);
+  assert.equal(fs.readFileSync(absolute, "utf8"), originalBytes);
+
+  const promoted = api.__testPromoteSignedReview({
+    root: fixture.root,
+    requestPath: requestResult.path,
+    attestationPath,
+    trust,
+    now
+  });
+  assert.equal(promoted.ok, true);
+  assert.equal(promoted.converged, false);
+  assert.equal(api.__testImportSignedReview({
+    root: fixture.root,
+    requestPath: requestResult.path,
+    attestation,
+    trust,
+    now: new Date(
+      Date.parse(requestResult.request.expiresAt) + 60_000
+    ).toISOString()
+  }), attestationPath);
+
+  const rejectedFixture = initPhaseOneSignedReviewFixture("review-import-reject");
+  const rejectedRequest = createReviewRequestFixture(rejectedFixture, { write: true });
+  const rejectedHarness = await loadPrivateReviewPromotionHarness(rejectedFixture.root);
+  const rejectedRoot = path.join(
+    rejectedFixture.root,
+    REVIEW_ATTESTATION_ROOT
+  );
+  const ledgerBefore = fs.readFileSync(
+    path.join(rejectedFixture.root, "tests/e2e-results/worker-broker/ledger.json"),
+    "utf8"
+  );
+  const malformed = {
+    ...signedReviewAttestation(rejectedRequest, keyPair),
+    unsupported: "caller-controlled"
+  };
+  assert.throws(
+    () => rejectedHarness.api.__testImportSignedReview({
+      root: rejectedFixture.root,
+      requestPath: rejectedRequest.path,
+      attestation: malformed,
+      trust,
+      now
+    }),
+    (error) => error?.code === "E_REVIEW_ATTESTATION_INVALID"
+  );
+  const oversized = {
+    ...signedReviewAttestation(rejectedRequest, keyPair),
+    unsupported: "x".repeat(2 * 1024 * 1024)
+  };
+  assert.throws(
+    () => rejectedHarness.api.__testImportSignedReview({
+      root: rejectedFixture.root,
+      requestPath: rejectedRequest.path,
+      attestation: oversized,
+      trust,
+      now
+    }),
+    (error) => error?.code === "E_REVIEW_ATTESTATION_INVALID"
+  );
+  assert.equal(fs.existsSync(rejectedRoot), false);
+  assert.equal(
+    fs.readFileSync(
+      path.join(rejectedFixture.root, "tests/e2e-results/worker-broker/ledger.json"),
+      "utf8"
+    ),
+    ledgerBefore
+  );
+
+  const collisionFixture = initPhaseOneSignedReviewFixture("review-import-collision");
+  const collisionRequest = createReviewRequestFixture(collisionFixture, { write: true });
+  const collisionAttestation = signedReviewAttestation(collisionRequest, keyPair);
+  const collisionNow = new Date(
+    Date.parse(collisionAttestation.endedAt) + 1_000
+  ).toISOString();
+  const collisionRelative = `${REVIEW_ATTESTATION_ROOT}/${
+    collisionAttestation.requestDigest.slice(0, 16)
+  }-${collisionAttestation.attestationDigest.slice(0, 16)}.json`;
+  const collisionAbsolute = path.join(
+    collisionFixture.root,
+    ...collisionRelative.split("/")
+  );
+  fs.mkdirSync(path.dirname(collisionAbsolute), { recursive: true });
+  const collisionBytes = "{\"immutable\":\"foreign\"}\n";
+  fs.writeFileSync(collisionAbsolute, collisionBytes, { mode: 0o600 });
+  const collisionLedger = path.join(
+    collisionFixture.root,
+    "tests/e2e-results/worker-broker/ledger.json"
+  );
+  const collisionLedgerBefore = fs.readFileSync(collisionLedger, "utf8");
+  const collisionHarness = await loadPrivateReviewPromotionHarness(
+    collisionFixture.root
+  );
+  assert.throws(
+    () => collisionHarness.api.__testImportSignedReview({
+      root: collisionFixture.root,
+      requestPath: collisionRequest.path,
+      attestation: collisionAttestation,
+      trust,
+      now: collisionNow
+    }),
+    (error) => error?.code === "E_REVIEW_ATTESTATION_INVALID"
+  );
+  assert.equal(fs.readFileSync(collisionAbsolute, "utf8"), collisionBytes);
+  assert.equal(fs.readFileSync(collisionLedger, "utf8"), collisionLedgerBefore);
+
+  const symlinkFixture = initPhaseOneSignedReviewFixture("review-import-symlink");
+  const symlinkRequest = createReviewRequestFixture(symlinkFixture, { write: true });
+  const symlinkHarness = await loadPrivateReviewPromotionHarness(symlinkFixture.root);
+  const external = tempDir("review-import-external-");
+  const symlinkAttestation = signedReviewAttestation(symlinkRequest, keyPair);
+  const symlinkNow = new Date(
+    Date.parse(symlinkAttestation.endedAt) + 1_000
+  ).toISOString();
+  const attestationDirectory = path.join(
+    symlinkFixture.root,
+    REVIEW_ATTESTATION_ROOT
+  );
+  fs.mkdirSync(path.dirname(attestationDirectory), { recursive: true });
+  fs.symlinkSync(external, attestationDirectory);
+  assert.throws(
+    () => symlinkHarness.api.__testImportSignedReview({
+      root: symlinkFixture.root,
+      requestPath: symlinkRequest.path,
+      attestation: symlinkAttestation,
+      trust,
+      now: symlinkNow
+    }),
+    (error) => error?.code === "E_REVIEW_ATTESTATION_INVALID"
+  );
+  assert.deepEqual(fs.readdirSync(external), []);
+});
+
+test("protected review entrypoints fail closed outside the fixed host runtime", () => {
+  const fixture = initPhaseOneSignedReviewFixture("review-protected-bootstrap");
+  const requestResult = createReviewRequestFixture(fixture, { write: true });
+  const keyPair = crypto.generateKeyPairSync("ed25519");
+  const attestation = signedReviewAttestation(requestResult, keyPair);
+  const ledgerPath = path.join(
+    fixture.root,
+    "tests/e2e-results/worker-broker/ledger.json"
+  );
+  const ledgerBefore = fs.readFileSync(ledgerPath, "utf8");
+  const cleanEnvironment = { PATH: "/usr/bin:/bin" };
+  const cases = [
+    {
+      label: "ordinary source checkout",
+      args: ["verify", "--workspace", fixture.root],
+      env: cleanEnvironment
+    },
+    {
+      label: "caller PATH",
+      args: ["verify", "--workspace", fixture.root],
+      env: { PATH: `/caller-controlled${path.delimiter}/usr/bin:/bin` }
+    },
+    {
+      label: "Node preload controls",
+      args: ["verify", "--workspace", fixture.root],
+      env: { ...cleanEnvironment, NODE_OPTIONS: "--no-warnings" }
+    },
+    {
+      label: "caller-selected trust",
+      args: ["verify", "--workspace", fixture.root, "--key", "attacker-key"],
+      env: cleanEnvironment
+    },
+    {
+      label: "caller-selected attestation path",
+      args: [
+        "promote",
+        "--workspace",
+        fixture.root,
+        "--request",
+        requestResult.path,
+        "--attestation",
+        "attacker.json"
+      ],
+      env: cleanEnvironment,
+      input: `${JSON.stringify(attestation)}\n`
+    }
+  ];
+  for (const scenario of cases) {
+    const result = run(process.execPath, [
+      PROTECTED_REVIEW_BOOTSTRAP,
+      ...scenario.args
+    ], {
+      cwd: ROOT,
+      env: scenario.env,
+      input: scenario.input,
+      timeout: 10_000
+    });
+    assert.equal(result.status, 1, scenario.label);
+    assert.equal(result.signal, null, scenario.label);
+    assert.equal(result.stderr, "", scenario.label);
+    assert.deepEqual(
+      JSON.parse(result.stdout),
+      { ok: false, code: "E_REVIEW_TRUST_UNAVAILABLE" },
+      scenario.label
+    );
+    assert.equal(fs.readFileSync(ledgerPath, "utf8"), ledgerBefore, scenario.label);
+  }
+
+  assert.throws(
+    () => promotePhaseOneFromProtectedRuntime({
+      workspace: fixture.root,
+      requestPath: requestResult.path,
+      attestation
+    }),
+    (error) => error?.code === "E_REVIEW_TRUST_UNAVAILABLE"
+  );
+  assert.throws(
+    () => verifySignedLedgerFromProtectedRuntime({ workspace: fixture.root }),
+    (error) => error?.code === "E_REVIEW_TRUST_UNAVAILABLE"
+  );
+  assert.throws(
+    () => promotePhaseOneFromProtectedRuntime({
+      workspace: fixture.root,
+      requestPath: requestResult.path,
+      attestation,
+      publicKey: keyPair.publicKey
+    }),
+    (error) => error?.code === "E_REVIEW_TRUST_UNAVAILABLE"
+  );
+  assert.equal(fs.readFileSync(ledgerPath, "utf8"), ledgerBefore);
+});
+
+test("private signed review promotion is atomic, immutable, concurrent, and restart-fail-closed", async () => {
+  const fixture = initPhaseOneSignedReviewFixture("review-promotion");
+  const requestResult = createReviewRequestFixture(fixture, { write: true });
+  const keyPair = crypto.generateKeyPairSync("ed25519");
+  const attestation = signedReviewAttestation(requestResult, keyPair);
+  const attestationPath = writeReviewAttestationFixture(fixture.root, attestation);
+  const now = new Date(Date.parse(attestation.endedAt) + 1_000).toISOString();
+  const trust = {
+    publicKey: keyPair.publicKey,
+    expectedIssuer: "test-protected-reviewer",
+    revokedKeyFingerprints: [],
+    now
+  };
+  const originalPath = path.join(fixture.root, ...fixture.phaseOnePath.split("/"));
+  const originalBytes = fs.readFileSync(originalPath, "utf8");
+  const { api, harnessPath, harnessDirectory } = await loadPrivateReviewPromotionHarness(
+    fixture.root
+  );
+  const publicKeyPem = keyPair.publicKey.export({
+    type: "spki",
+    format: "pem"
+  }).toString();
+  const barrier = path.join(harnessDirectory, "promotion.barrier");
+  const firstReady = path.join(harnessDirectory, "first.ready");
+  const secondReady = path.join(harnessDirectory, "second.ready");
+  const first = spawnPrivateReviewPromoter({
+    harnessPath,
+    root: fixture.root,
+    requestPath: requestResult.path,
+    attestationPath,
+    publicKey: publicKeyPem,
+    now,
+    ready: firstReady,
+    barrier
+  });
+  const second = spawnPrivateReviewPromoter({
+    harnessPath,
+    root: fixture.root,
+    requestPath: requestResult.path,
+    attestationPath,
+    publicKey: publicKeyPem,
+    now,
+    ready: secondReady,
+    barrier
+  });
+  await waitFor(() => fs.existsSync(firstReady) && fs.existsSync(secondReady), 10_000);
+  fs.writeFileSync(barrier, "go\n");
+  const results = await Promise.all([first.completed, second.completed]);
+  assert.deepEqual(
+    results.map((result) => result.code),
+    [0, 0],
+    results.map((result) => result.stderr).join("; ")
+  );
+  const payloads = results.map((result) => JSON.parse(result.stdout));
+  assert.deepEqual(payloads.map((payload) => payload.converged).sort(), [false, true]);
+  assert.equal(payloads[0].recordDigest, payloads[1].recordDigest);
+
+  const ledger = loadLedger(fixture.root);
+  const current = ledger.entries.find((entry) => (
+    entry.phase === "1" && entry.currency === "current"
+  ));
+  const original = ledger.entries.find((entry) => (
+    entry.path === fixture.phaseOnePath && entry.currency === "historical"
+  ));
+  assert.equal(current.status, "verified_on_draft");
+  assert.ok(original);
+  assert.equal(fs.readFileSync(originalPath, "utf8"), originalBytes);
+  const promoted = JSON.parse(fs.readFileSync(path.join(fixture.root, current.path), "utf8"));
+  assert.equal(promoted.independentReviewReceipt.schemaVersion, 2);
+  assert.equal(promoted.independentReviewReceipt.reviewRequest.path, requestResult.path);
+  assert.equal(promoted.independentReviewReceipt.attestation.path, attestationPath);
+  assert.equal(promoted.authorities.independentValidation, "pass");
+
+  const protectedReplay = api.__testVerifySignedLedger(fixture.root, trust);
+  assert.equal(protectedReplay.ok, true, protectedReplay.errors.join("; "));
+  const ordinaryRestart = verifyLedger(fixture.root, { strict: true });
+  assert.equal(ordinaryRestart.ok, false);
+  assert.ok(ordinaryRestart.errors.some((message) => /protected host trust/i.test(message)));
+  const restartedHarness = await loadPrivateReviewPromotionHarness(fixture.root);
+  const restartWithProtectedTrust = restartedHarness.api.__testVerifySignedLedger(
+    fixture.root,
+    trust
+  );
+  assert.equal(
+    restartWithProtectedTrust.ok,
+    true,
+    restartWithProtectedTrust.errors.join("; ")
+  );
+  const postExpiryTrust = {
+    ...trust,
+    now: new Date(Date.parse(requestResult.request.expiresAt) + 60_000).toISOString()
+  };
+  const postExpiryProtectedReplay = restartedHarness.api.__testVerifySignedLedger(
+    fixture.root,
+    postExpiryTrust
+  );
+  assert.equal(
+    postExpiryProtectedReplay.ok,
+    true,
+    postExpiryProtectedReplay.errors.join("; ")
+  );
+  const postExpiryUnprotectedReplay = verifyLedger(fixture.root, { strict: true });
+  assert.equal(postExpiryUnprotectedReplay.ok, false);
+  assert.ok(postExpiryUnprotectedReplay.errors.some((message) => /protected host trust/i.test(message)));
+  git(
+    fixture.root,
+    "add",
+    "-f",
+    "tests/e2e-results/worker-broker"
+  );
+  git(fixture.root, "commit", "-m", "commit immutable signed review evidence");
+  const evidenceOnlyHeadReplay = restartedHarness.api.__testVerifySignedLedger(
+    fixture.root,
+    postExpiryTrust
+  );
+  assert.equal(
+    evidenceOnlyHeadReplay.ok,
+    true,
+    evidenceOnlyHeadReplay.errors.join("; ")
+  );
+
+  assert.throws(
+    () => writeEvidenceRecord(promoted, fixture.root),
+    (error) => error?.code === "E_EVIDENCE_RECORD_INVALID"
+  );
+  assert.throws(
+    () => updateLedger({
+      ...current,
+      currency: "current"
+    }, fixture.root),
+    (error) => error?.code === "E_EVIDENCE_LEDGER_UPDATE_INVALID"
+  );
+  const converged = api.__testPromoteSignedReview({
+    root: fixture.root,
+    requestPath: requestResult.path,
+    attestationPath,
+    trust,
+    now
+  });
+  assert.equal(converged.converged, true);
+  const convergedAfterExpiry = api.__testPromoteSignedReview({
+    root: fixture.root,
+    requestPath: requestResult.path,
+    attestationPath,
+    trust,
+    now: postExpiryTrust.now
+  });
+  assert.equal(convergedAfterExpiry.converged, true);
+  assert.equal(convergedAfterExpiry.recordDigest, converged.recordDigest);
+
+  const publicModule = await import(
+    `${EVIDENCE_MODULE_URL}?public-surface=${crypto.randomBytes(8).toString("hex")}`
+  );
+  assert.equal(typeof publicModule.promotePhaseOneFromProtectedRuntime, "function");
+  assert.equal(typeof publicModule.verifySignedLedgerFromProtectedRuntime, "function");
+  assert.equal(
+    Object.keys(publicModule).some((name) => (
+      /promote.*review/i.test(name)
+      && name !== "promotePhaseOneFromProtectedRuntime"
+    )),
+    false
+  );
+  const publicFunctions = Object.entries(publicModule)
+    .filter(([, value]) => typeof value === "function")
+    .map(([name]) => name);
+  assert.deepEqual(
+    publicFunctions.filter((name) => (
+      /^(?:import|sign|mint|issue|load.*trust|create.*attestation|publish.*review|promote.*review)/i
+        .test(name)
+      && name !== "promotePhaseOneFromProtectedRuntime"
+    )),
+    []
+  );
+  for (const forbiddenAuthority of [
+    "REVIEW_PROMOTION_PUBLICATION_AUTHORITY",
+    "SIGNED_REVIEW_VALIDATION_AUTHORITY"
+  ]) {
+    assert.equal(Object.hasOwn(publicModule, forbiddenAuthority), false);
+  }
+  const cliSource = fs.readFileSync(
+    path.join(ROOT, "scripts/worker-broker-evidence.mjs"),
+    "utf8"
+  );
+  for (const forbidden of ["--trust", "--public-key", "--key", "--signature"]) {
+    assert.equal(cliSource.includes(forbidden), false, `${forbidden} must not be a CLI option`);
+  }
+  const genericLedgerPath = path.join(
+    ROOT,
+    "tests/e2e-results/worker-broker/ledger.json"
+  );
+  const genericLedgerBefore = fs.readFileSync(genericLedgerPath, "utf8");
+  const genericPromotion = run(process.execPath, [
+    path.join(ROOT, "scripts/worker-broker-evidence.mjs"),
+    "promote",
+    "--request",
+    requestResult.path,
+    "--attestation",
+    attestationPath
+  ], {
+    cwd: ROOT,
+    env: process.env,
+    timeout: 10_000
+  });
+  assert.equal(genericPromotion.status, 2);
+  assert.match(genericPromotion.stderr, /^Usage:/);
+  assert.equal(fs.readFileSync(genericLedgerPath, "utf8"), genericLedgerBefore);
+});
+
+test("signed review promotion reports durable ambiguity and converges after acknowledgement faults", async () => {
+  for (const scenario of [
+    {
+      faultMode: "post-ledger-rename-fsync",
+      expectedCommitState: "committed"
+    },
+    {
+      faultMode: "post-lock-release",
+      expectedCommitState: "committed_lock_unclean"
+    }
+  ]) {
+    const fixture = initPhaseOneSignedReviewFixture(
+      `review-${scenario.faultMode}`
+    );
+    const requestResult = createReviewRequestFixture(fixture, { write: true });
+    const keyPair = crypto.generateKeyPairSync("ed25519");
+    const attestation = signedReviewAttestation(requestResult, keyPair);
+    const attestationPath = writeReviewAttestationFixture(fixture.root, attestation);
+    const now = new Date(Date.parse(attestation.endedAt) + 1_000).toISOString();
+    const publicKeyPem = keyPair.publicKey.export({
+      type: "spki",
+      format: "pem"
+    }).toString();
+    const faulty = await loadPrivateReviewPromotionHarness(fixture.root, {
+      faultMode: scenario.faultMode,
+      importApi: false
+    });
+    const ready = path.join(faulty.harnessDirectory, "fault.ready");
+    const barrier = path.join(faulty.harnessDirectory, "fault.barrier");
+    const child = spawnPrivateReviewPromoter({
+      harnessPath: faulty.harnessPath,
+      root: fixture.root,
+      requestPath: requestResult.path,
+      attestationPath,
+      publicKey: publicKeyPem,
+      now,
+      ready,
+      barrier
+    });
+    await waitFor(() => fs.existsSync(ready), 10_000);
+    fs.writeFileSync(barrier, "go\n");
+    const failed = await child.completed;
+    assert.equal(failed.code, 1, failed.stderr);
+    assert.equal(failed.stdout, "");
+    const failure = JSON.parse(failed.stderr);
+    assert.equal(failure.code, "E_REVIEW_PROMOTION_COMMIT_UNKNOWN");
+    assert.equal(failure.commitState, scenario.expectedCommitState);
+    assert.equal(failure.recoveryRequired, true);
+    assert.match(failure.recordDigest, /^[0-9a-f]{64}$/);
+
+    const normal = await loadPrivateReviewPromotionHarness(fixture.root);
+    const trust = {
+      publicKey: keyPair.publicKey,
+      expectedIssuer: "test-protected-reviewer",
+      revokedKeyFingerprints: [],
+      now
+    };
+    const replay = normal.api.__testVerifySignedLedger(fixture.root, trust);
+    assert.equal(replay.ok, true, replay.errors.join("; "));
+    const afterExpiry = new Date(
+      Date.parse(requestResult.request.expiresAt) + 60_000
+    ).toISOString();
+    const converged = normal.api.__testPromoteSignedReview({
+      root: fixture.root,
+      requestPath: requestResult.path,
+      attestationPath,
+      trust,
+      now: afterExpiry
+    });
+    assert.equal(converged.ok, true);
+    assert.equal(converged.converged, true);
+    assert.equal(converged.recordDigest, failure.recordDigest);
+    const postExpiryReplay = normal.api.__testVerifySignedLedger(fixture.root, {
+      ...trust,
+      now: afterExpiry
+    });
+    assert.equal(
+      postExpiryReplay.ok,
+      true,
+      postExpiryReplay.errors.join("; ")
+    );
+  }
+});
+
+test("signed review convergence rejects a foreign current prerequisite chain", async () => {
+  const fixture = initPhaseOneSignedReviewFixture("review-foreign-prerequisite");
+  const requestResult = createReviewRequestFixture(fixture, { write: true });
+  const keyPair = crypto.generateKeyPairSync("ed25519");
+  const attestation = signedReviewAttestation(requestResult, keyPair);
+  const attestationPath = writeReviewAttestationFixture(fixture.root, attestation);
+  const now = new Date(Date.parse(attestation.endedAt) + 1_000).toISOString();
+  const trust = {
+    publicKey: keyPair.publicKey,
+    expectedIssuer: "test-protected-reviewer",
+    revokedKeyFingerprints: [],
+    now
+  };
+  const { api } = await loadPrivateReviewPromotionHarness(fixture.root);
+  const promoted = api.__testPromoteSignedReview({
+    root: fixture.root,
+    requestPath: requestResult.path,
+    attestationPath,
+    trust,
+    now
+  });
+  assert.equal(promoted.ok, true);
+  assert.equal(promoted.converged, false);
+
+  let foreignPhaseZero = buildEvidenceRecord({
+    root: fixture.root,
+    phase: "0",
+    slice: "foreign-current-prerequisite",
+    status: "verified_on_draft",
+    verification: exactPhaseProof("0"),
+    qualification: deterministicQualification(),
+    evidenceSystemQualification: true
+  });
+  foreignPhaseZero = attachRecordDigest({
+    ...foreignPhaseZero,
+    proofProducer: proofProducer("0")
+  });
+  const foreignPath = rawEvidenceFixturePath(fixture.root, foreignPhaseZero);
+  const ledgerPath = path.join(
+    fixture.root,
+    "tests/e2e-results/worker-broker/ledger.json"
+  );
+  const ledger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  for (const entry of ledger.entries) {
+    if (entry.phase === "0" && entry.currency === "current") {
+      entry.currency = "historical";
+    }
+  }
+  ledger.entries.push({
+    phase: "0",
+    slice: foreignPhaseZero.slice,
+    status: foreignPhaseZero.status,
+    path: foreignPath,
+    recordDigest: foreignPhaseZero.recordDigest,
+    sourceCommit: foreignPhaseZero.source.headCommit,
+    currency: "current",
+    recordedAt: foreignPhaseZero.recordedAt
+  });
+  ledger.updatedAt = foreignPhaseZero.recordedAt;
+  fs.writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`);
+  const ledgerBefore = fs.readFileSync(ledgerPath, "utf8");
+
+  const protectedReplay = api.__testVerifySignedLedger(fixture.root, trust);
+  assert.equal(protectedReplay.ok, false);
+  assert.ok(protectedReplay.errors.some((message) => /prerequisite|current/i.test(message)));
+  assert.throws(
+    () => api.__testPromoteSignedReview({
+      root: fixture.root,
+      requestPath: requestResult.path,
+      attestationPath,
+      trust,
+      now
+    }),
+    (error) => error?.code === "E_REVIEW_PROMOTION_CONFLICT"
+  );
+  assert.equal(fs.readFileSync(ledgerPath, "utf8"), ledgerBefore);
+});
+
+test("signed review promotion fails unchanged on source, prerequisite, and attestation swaps", async () => {
+  for (const scenario of ["source", "prerequisite", "attestation"]) {
+    const fixture = initPhaseOneSignedReviewFixture(`review-race-${scenario}`);
+    const requestResult = createReviewRequestFixture(fixture, { write: true });
+    const keyPair = crypto.generateKeyPairSync("ed25519");
+    const attestation = signedReviewAttestation(requestResult, keyPair);
+    const attestationPath = writeReviewAttestationFixture(fixture.root, attestation);
+    const now = new Date(Date.parse(attestation.endedAt) + 1_000).toISOString();
+    const { api } = await loadPrivateReviewPromotionHarness(fixture.root);
+    if (scenario === "source") {
+      fs.appendFileSync(
+        path.join(fixture.root, "plugins/grok/scripts/lib/errors.mjs"),
+        "\n// raced source\n"
+      );
+    } else if (scenario === "prerequisite") {
+      const ledgerPath = path.join(
+        fixture.root,
+        "tests/e2e-results/worker-broker/ledger.json"
+      );
+      const ledger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+      ledger.entries.find((entry) => (
+        entry.phase === "0" && entry.currency === "current"
+      )).recordDigest = "f".repeat(64);
+      fs.writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`);
+    } else {
+      const absolute = path.join(fixture.root, ...attestationPath.split("/"));
+      const swapped = {
+        ...attestation,
+        reviewerRuntimeDigest: "f".repeat(64)
+      };
+      fs.writeFileSync(absolute, `${JSON.stringify(swapped, null, 2)}\n`);
+    }
+    const ledgerPath = path.join(
+      fixture.root,
+      "tests/e2e-results/worker-broker/ledger.json"
+    );
+    const ledgerBefore = fs.readFileSync(ledgerPath, "utf8");
+    const originalBefore = fs.readFileSync(
+      path.join(fixture.root, ...fixture.phaseOnePath.split("/")),
+      "utf8"
+    );
+    assert.throws(
+      () => api.__testPromoteSignedReview({
+        root: fixture.root,
+        requestPath: requestResult.path,
+        attestationPath,
+        now,
+        trust: {
+          publicKey: keyPair.publicKey,
+          expectedIssuer: "test-protected-reviewer",
+          revokedKeyFingerprints: []
+        }
+      }),
+      /review|evidence|ledger/i,
+      scenario
+    );
+    assert.equal(fs.readFileSync(ledgerPath, "utf8"), ledgerBefore, scenario);
+    assert.equal(
+      fs.readFileSync(
+        path.join(fixture.root, ...fixture.phaseOnePath.split("/")),
+        "utf8"
+      ),
+      originalBefore,
+      scenario
+    );
+  }
 });
 
 test("Phase 1 proof fails closed when its current Phase 0 prerequisite is absent", () => {
@@ -5248,7 +6580,7 @@ test("verify CLI exits independently for integrity and verified readiness", () =
     true
   );
   const phaseZeroPath = rawEvidenceFixturePath(root, phaseZero);
-  updateLedger({
+  seedLedgerFixtureEntry(root, {
     phase: phaseZero.phase,
     slice: phaseZero.slice,
     status: phaseZero.status,
@@ -5256,7 +6588,7 @@ test("verify CLI exits independently for integrity and verified readiness", () =
     recordDigest: phaseZero.recordDigest,
     sourceCommit: phaseZero.source.headCommit,
     recordedAt: phaseZero.recordedAt
-  }, root);
+  });
 
   let phaseOne = buildEvidenceRecord({
     root,
@@ -5691,7 +7023,7 @@ test("strict ledger preserves immutable legacy history without trusting it as cu
   // Intentionally invalid legacy bytes bypass the hardened production writer;
   // verification must retain compatibility without making them publishable.
   const legacyPath = rawEvidenceFixturePath(root, legacy);
-  updateLedger({
+  seedLedgerFixtureEntry(root, {
     phase: legacy.phase,
     slice: legacy.slice,
     status: legacy.status,
@@ -5699,7 +7031,7 @@ test("strict ledger preserves immutable legacy history without trusting it as cu
     recordDigest: legacy.recordDigest,
     sourceCommit: legacy.source.headCommit,
     recordedAt: legacy.recordedAt
-  }, root);
+  });
 
   const current = buildEvidenceRecord({
     root,
@@ -5770,7 +7102,7 @@ test("strict ledger applies raw privacy checks to historical and invalidated leg
     // Privacy-negative legacy fixtures are seeded as bytes. Production
     // publication must reject these records before creating a path.
     const recordPath = rawEvidenceFixturePath(root, legacy);
-    updateLedger({
+    seedLedgerFixtureEntry(root, {
       phase: legacy.phase,
       slice: legacy.slice,
       status: legacy.status,
@@ -5779,7 +7111,7 @@ test("strict ledger applies raw privacy checks to historical and invalidated leg
       sourceCommit: legacy.source.headCommit,
       currency,
       recordedAt: legacy.recordedAt
-    }, root);
+    });
   }
 
   const result = verifyLedger(root, { strict: true });

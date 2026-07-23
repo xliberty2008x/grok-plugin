@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xliberty2008x/grok-plugin/schemas/worker-broker-review-attestation.schema.json",
+  "title": "Worker Broker Phase 1 Review Attestation",
+  "description": "Externally signed Ed25519 attestation over one exact immutable Phase 1 review request.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "domain",
+    "issuer",
+    "keyFingerprint",
+    "algorithm",
+    "requestPath",
+    "requestDigest",
+    "nonce",
+    "manifestDigest",
+    "reviewerRuntimeDigest",
+    "headCommit",
+    "headTree",
+    "sourceInventoryDigest",
+    "phaseScopeDigest",
+    "diffBaseCommit",
+    "diffPatchDigest",
+    "diffPathsDigest",
+    "proofRecordDigest",
+    "prerequisiteRecordDigest",
+    "startedAt",
+    "endedAt",
+    "outcome",
+    "unresolvedFindings",
+    "signature",
+    "attestationDigest"
+  ],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "domain": {
+      "type": "string",
+      "const": "grok-plugin/worker-broker/phase-1-review-attestation/v1"
+    },
+    "issuer": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$"
+    },
+    "keyFingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "algorithm": { "type": "string", "const": "Ed25519" },
+    "requestPath": {
+      "type": "string",
+      "pattern": "^tests/e2e-results/worker-broker/review-requests/v1/[0-9a-f]{16}-[0-9a-f]{16}\\.json$"
+    },
+    "requestDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+    "manifestDigest": {
+      "type": "string",
+      "const": "16adb6811c1e0d16c3b8919a7cc31c9ab6f725df062ae6fadfcc0c7d62529c65"
+    },
+    "reviewerRuntimeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "headCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "headTree": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sourceInventoryDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "phaseScopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "diffBaseCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "diffPatchDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "diffPathsDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "proofRecordDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "prerequisiteRecordDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "endedAt": { "type": "string", "format": "date-time" },
+    "outcome": { "type": "string", "const": "pass" },
+    "unresolvedFindings": { "type": "integer", "const": 0 },
+    "signature": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{86}$"
+    },
+    "attestationDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

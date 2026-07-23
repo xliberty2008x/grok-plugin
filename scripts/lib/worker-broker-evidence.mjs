@@ -39,6 +39,39 @@ export const PROOF_PRODUCER_VERSION = 3;
 export const INDEPENDENT_REVIEW_PRODUCER_ID = "codex-native-review-runner";
 export const INDEPENDENT_REVIEW_PRODUCER_VERSION = 1;
 export const INDEPENDENT_REVIEW_MANIFEST_DIGEST = "82792debed04937a264e759a1812ba1e33e0417aa555f87ce13e7f5417fd6f12";
+export const REVIEW_REQUEST_SCHEMA_VERSION = 1;
+export const REVIEW_REQUEST_PRODUCER_ID = "worker-broker-review-request-runner";
+export const REVIEW_REQUEST_PRODUCER_VERSION = 1;
+export const REVIEW_REQUEST_DOMAIN = "grok-plugin/worker-broker/phase-1-review-request/v1";
+export const REVIEW_REQUEST_ROOT = `${EVIDENCE_ROOT}/review-requests/v1`;
+export const REVIEW_ATTESTATION_SCHEMA_VERSION = 1;
+export const REVIEW_ATTESTATION_DOMAIN = "grok-plugin/worker-broker/phase-1-review-attestation/v1";
+export const REVIEW_ATTESTATION_ALGORITHM = "Ed25519";
+export const REVIEW_ATTESTATION_ROOT = `${EVIDENCE_ROOT}/review-attestations/v1`;
+export const SIGNED_REVIEW_RECEIPT_SCHEMA_VERSION = 2;
+export const SIGNED_REVIEW_RECEIPT_PRODUCER_ID = "worker-broker-protected-review-promoter";
+export const SIGNED_REVIEW_RECEIPT_PRODUCER_VERSION = 1;
+export const SIGNED_REVIEW_MANIFEST = Object.freeze({
+  schemaVersion: 2,
+  phase: "1",
+  requiredOutcome: "pass",
+  unresolvedFindings: 0,
+  requiredBindings: Object.freeze([
+    "review-request",
+    "nonce",
+    "source-commit",
+    "source-tree",
+    "source-inventory",
+    "phase-scope",
+    "diff-base",
+    "diff-patch",
+    "diff-paths",
+    "phase-1-proof",
+    "phase-0-prerequisite",
+    "reviewer-runtime"
+  ])
+});
+export const SIGNED_REVIEW_MANIFEST_DIGEST = sha256Text(stableStringify(SIGNED_REVIEW_MANIFEST));
 export const LIVE_RECEIPT_SCHEMA_VERSION = 1;
 export const LIVE_RECEIPT_PRODUCER_ID = "worker-broker-live-receipt-runner";
 export const LIVE_RECEIPT_PRODUCER_VERSION = 1;
@@ -184,6 +217,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "plugins/grok/scripts/lib/redact.mjs",
     "scripts/lib/worker-broker-evidence.mjs",
     "scripts/lib/static-esm-import-parser.mjs",
+    "scripts/trusted/worker-broker-review.mjs",
     "scripts/lib/zero-skip-test-reporter.mjs",
     "scripts/check-deterministic.mjs",
     "scripts/test-deterministic.mjs",
@@ -191,7 +225,10 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "scripts/validate.mjs",
     "plugins/grok/schemas/worker-broker-evidence.schema.json",
     "plugins/grok/schemas/worker-broker-live-receipt.schema.json",
+    "plugins/grok/schemas/worker-broker-review-request.schema.json",
+    "plugins/grok/schemas/worker-broker-review-attestation.schema.json",
     "tests/worker-broker-evidence.test.mjs",
+    "tests/worker-broker-protected-review.test.mjs",
     "tests/helpers.mjs",
     "package.json"
   ],
@@ -230,12 +267,15 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "plugins/grok/schemas/worker-protocol.schema.json",
     "plugins/grok/schemas/worker-broker-evidence.schema.json",
     "plugins/grok/schemas/worker-broker-live-receipt.schema.json",
+    "plugins/grok/schemas/worker-broker-review-request.schema.json",
+    "plugins/grok/schemas/worker-broker-review-attestation.schema.json",
     "plugins/grok/skills/rescue/SKILL.md",
     "plugins/grok/skills/result/SKILL.md",
     "plugins/grok/skills/status/SKILL.md",
     "scripts/lib/zero-skip-test-reporter.mjs",
     "scripts/lib/worker-broker-evidence.mjs",
     "scripts/lib/static-esm-import-parser.mjs",
+    "scripts/trusted/worker-broker-review.mjs",
     "scripts/check-deterministic.mjs",
     "scripts/test-deterministic.mjs",
     "scripts/test-installed-worker-mcp.mjs",
@@ -267,6 +307,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "tests/worker-cli-authority.test.mjs",
     "tests/worker-terminal-intent.test.mjs",
     "tests/worker-broker-evidence.test.mjs",
+    "tests/worker-broker-protected-review.test.mjs",
     "tests/process-control-owned-identity.test.mjs",
     "tests/worker-mutation.test.mjs",
     "tests/worker-safety-proofs.test.mjs",
@@ -318,6 +359,8 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "plugins/grok/mcp/broker.mjs",
     "plugins/grok/schemas/worker-broker-evidence.schema.json",
     "plugins/grok/schemas/worker-broker-live-receipt.schema.json",
+    "plugins/grok/schemas/worker-broker-review-request.schema.json",
+    "plugins/grok/schemas/worker-broker-review-attestation.schema.json",
     "plugins/grok/schemas/worker-protocol.schema.json",
     "scripts/lib/worker-broker-evidence.mjs",
     "tests/worker-presentation.test.mjs",
@@ -925,7 +968,7 @@ const PROOF_PRODUCER_FIELDS = new Set([
   "version",
   "manifestDigest"
 ]);
-const INDEPENDENT_REVIEW_RECEIPT_FIELDS = new Set([
+const INDEPENDENT_REVIEW_RECEIPT_V1_FIELDS = new Set([
   "schemaVersion",
   "producerId",
   "producerVersion",
@@ -940,6 +983,86 @@ const INDEPENDENT_REVIEW_RECEIPT_FIELDS = new Set([
   "outcome",
   "unresolvedFindings",
   "receiptDigest"
+]);
+const SIGNED_REVIEW_REFERENCE_FIELDS = new Set(["path", "digest"]);
+const INDEPENDENT_REVIEW_RECEIPT_V2_FIELDS = new Set([
+  "schemaVersion",
+  "producerId",
+  "producerVersion",
+  "reviewRequest",
+  "attestation",
+  "issuer",
+  "keyFingerprint",
+  "receiptDigest"
+]);
+const REVIEW_REQUEST_FIELDS = new Set([
+  "schemaVersion",
+  "domain",
+  "producerId",
+  "producerVersion",
+  "manifestDigest",
+  "phase",
+  "createdAt",
+  "expiresAt",
+  "nonce",
+  "source",
+  "diff",
+  "proof",
+  "prerequisite",
+  "requestDigest"
+]);
+const REVIEW_REQUEST_SOURCE_FIELDS = new Set([
+  "headCommit",
+  "headTree",
+  "sourceInventoryDigest",
+  "phaseScopeDigest",
+  "phaseScopePaths"
+]);
+const REVIEW_REQUEST_DIFF_FIELDS = new Set([
+  "baseCommit",
+  "headCommit",
+  "patchDigest",
+  "pathsDigest",
+  "paths"
+]);
+const REVIEW_REQUEST_PROOF_FIELDS = new Set([
+  "path",
+  "recordDigest",
+  "producerManifestDigest",
+  "gateIds"
+]);
+const REVIEW_REQUEST_PREREQUISITE_FIELDS = new Set([
+  "phase",
+  "path",
+  "recordDigest",
+  "gateIds"
+]);
+const REVIEW_ATTESTATION_FIELDS = new Set([
+  "schemaVersion",
+  "domain",
+  "issuer",
+  "keyFingerprint",
+  "algorithm",
+  "requestPath",
+  "requestDigest",
+  "nonce",
+  "manifestDigest",
+  "reviewerRuntimeDigest",
+  "headCommit",
+  "headTree",
+  "sourceInventoryDigest",
+  "phaseScopeDigest",
+  "diffBaseCommit",
+  "diffPatchDigest",
+  "diffPathsDigest",
+  "proofRecordDigest",
+  "prerequisiteRecordDigest",
+  "startedAt",
+  "endedAt",
+  "outcome",
+  "unresolvedFindings",
+  "signature",
+  "attestationDigest"
 ]);
 
 const SOURCE_FIELDS = new Set([
@@ -1142,7 +1265,15 @@ const EVIDENCE_PATH_FIELDS = new Set([
   ...RECORD_TOP_LEVEL_FIELDS,
   ...VERIFICATION_FIELDS,
   ...PROOF_PRODUCER_FIELDS,
-  ...INDEPENDENT_REVIEW_RECEIPT_FIELDS,
+  ...INDEPENDENT_REVIEW_RECEIPT_V1_FIELDS,
+  ...INDEPENDENT_REVIEW_RECEIPT_V2_FIELDS,
+  ...SIGNED_REVIEW_REFERENCE_FIELDS,
+  ...REVIEW_REQUEST_FIELDS,
+  ...REVIEW_REQUEST_SOURCE_FIELDS,
+  ...REVIEW_REQUEST_DIFF_FIELDS,
+  ...REVIEW_REQUEST_PROOF_FIELDS,
+  ...REVIEW_REQUEST_PREREQUISITE_FIELDS,
+  ...REVIEW_ATTESTATION_FIELDS,
   ...SOURCE_FIELDS,
   ...INSTALLATION_FIELDS,
   ...RUNTIME_FIELDS,
@@ -1185,12 +1316,57 @@ const MAX_EVIDENCE_STRING_CHARS = 4096;
 const MAX_EVIDENCE_ARRAY_ITEMS = 128;
 const MAX_PHASE_SCOPE_PATHS = 512;
 const MAX_EVIDENCE_DEPTH = 10;
+const PROTECTED_REVIEW_TRUST_FILE = ".worker-broker-host-state/review-trust-v1.json";
+const PROTECTED_REVIEW_TRUST_MAX_BYTES = 64 * 1024;
+const PROTECTED_REVIEW_MODULE_MAX_BYTES = 2 * 1024 * 1024;
+const PROTECTED_REVIEW_GIT_PATH = "/usr/bin/git";
+const PROTECTED_REVIEW_EMPTY_HOOKS_PATH = ".worker-broker-host-state/empty-hooks";
+export const PROTECTED_REVIEW_RUNTIME_BUNDLE_PATHS = Object.freeze([
+  "plugins/grok/scripts/lib/redact.mjs",
+  "scripts/lib/plugin-inventory.mjs",
+  "scripts/lib/static-esm-import-parser.mjs",
+  "scripts/lib/worker-broker-evidence.mjs",
+  "scripts/trusted/worker-broker-review.mjs"
+]);
+const PROTECTED_REVIEW_TRUST_FIELDS = new Set([
+  "schemaVersion",
+  "domain",
+  "issuer",
+  "algorithm",
+  "publicKeySpkiBase64",
+  "keyFingerprint",
+  "revokedKeyFingerprints",
+  "gitDigest",
+  "runtimeBundle",
+  "runtimeBundleDigest",
+  "policyDigest",
+  "descriptorDigest"
+]);
+const PROTECTED_REVIEW_RUNTIME_BUNDLE_ENTRY_FIELDS = new Set(["path", "digest"]);
+const PROTECTED_REVIEW_POLICY = Object.freeze({
+  schemaVersion: 1,
+  attestationDomain: REVIEW_ATTESTATION_DOMAIN,
+  algorithm: REVIEW_ATTESTATION_ALGORITHM,
+  trustSource: "fixed-root-owned-runtime-sibling",
+  runtimeOwnerUid: 0,
+  gitPath: PROTECTED_REVIEW_GIT_PATH,
+  emptyHooksPath: PROTECTED_REVIEW_EMPTY_HOOKS_PATH,
+  runtimeBundlePaths: PROTECTED_REVIEW_RUNTIME_BUNDLE_PATHS,
+  workspaceRole: "data-only",
+  privateKeyLocation: "external-issuer-only"
+});
+export const PROTECTED_REVIEW_POLICY_DIGEST = sha256Text(
+  stableStringify(PROTECTED_REVIEW_POLICY)
+);
 const LEDGER_LOCK_NAME = ".ledger.lock";
 const LEDGER_LOCK_OWNER_FILE = "owner.json";
 const LEDGER_LOCK_TRANSITION_FILE = "transition.json";
 const LEDGER_LOCK_WAIT_MS = 5_000;
 const LEDGER_LOCK_CONSTRUCTION_GRACE_MS = 30_000;
 const LEDGER_LOCK_RECORD_BYTES = 4 * 1024;
+const ATOMIC_REPLACE_COMMIT_STATE = Symbol("atomic-replace-commit-state");
+const LEDGER_LOCK_RELEASE_FAILURE = Symbol("ledger-lock-release-failure");
+const LEDGER_LOCK_ACTION_COMPLETED = Symbol("ledger-lock-action-completed");
 const LEDGER_CURRENCIES = new Set(["current", "historical", "invalidated"]);
 const PRIVATE_EVIDENCE_PATH = /(?:^|[\s"'(=])(?:file:\/\/(?:localhost)?)?(?:\/(?:private\/)?tmp(?:\/|\b)|\/(?:private\/)?var\/folders(?:\/|\b)|\/root(?:\/|\b)|~\/|\/(?:Users|home)\/[^\s"'`;,)\]}]+|[A-Za-z]:[\\/]Users[\\/][^\s"'`;,)\]}]+)/i;
 const PRIVATE_EVIDENCE_FIELD = /(?:^|_)(?:raw|private|authorization|api_key|access_token|refresh_token|tokens?|password|passwd|pwd|secret|credential|cookie)(?:_|$)/;
@@ -1545,6 +1721,7 @@ function atomicReplaceEvidenceFile(root, file, contents, expected) {
     `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`
   );
   let descriptor;
+  let renamed = false;
   try {
     descriptor = fs.openSync(temporary, "wx", 0o600);
     fs.writeFileSync(descriptor, contents, "utf8");
@@ -1559,6 +1736,7 @@ function atomicReplaceEvidenceFile(root, file, contents, expected) {
     assertExpectedEvidenceDestination(root, file, expected);
 
     fs.renameSync(temporary, path.join(directoryAfter.canonicalAbsolute, path.basename(file)));
+    renamed = true;
     if (process.platform !== "win32") {
       const directoryDescriptor = fs.openSync(directoryAfter.canonicalAbsolute, fs.constants.O_RDONLY);
       try {
@@ -1572,6 +1750,32 @@ function atomicReplaceEvidenceFile(root, file, contents, expected) {
       try { fs.closeSync(descriptor); } catch {}
     }
     try { fs.unlinkSync(temporary); } catch {}
+    let commitState = "unknown";
+    try {
+      const observed = readBoundedEvidenceFileSnapshot(root, file);
+      if (observed.contents === contents) {
+        commitState = "committed";
+      } else if (expected.exists
+        && observed.contents === expected.contents
+        && sameFileSnapshot(observed.fileSnapshot, expected.fileSnapshot)) {
+        commitState = "not_committed";
+      }
+    } catch (readError) {
+      if (!expected.exists && readError?.code === "ENOENT") {
+        commitState = "not_committed";
+      }
+    }
+    if (!renamed && commitState === "committed" && contents !== expected.contents) {
+      commitState = "unknown";
+    }
+    try {
+      Object.defineProperty(error, ATOMIC_REPLACE_COMMIT_STATE, {
+        configurable: false,
+        enumerable: false,
+        value: commitState,
+        writable: false
+      });
+    } catch {}
     throw error;
   }
 }
@@ -2201,11 +2405,44 @@ function releaseEvidenceLedgerLock(lease) {
 
 function withEvidenceLedgerLock(root, action) {
   const lease = acquireEvidenceLedgerLock(root);
+  let result;
+  let actionError;
   try {
-    return action();
-  } finally {
-    releaseEvidenceLedgerLock(lease);
+    result = action();
+  } catch (error) {
+    actionError = error;
   }
+  let releaseError;
+  try {
+    releaseEvidenceLedgerLock(lease);
+  } catch (error) {
+    releaseError = error;
+  }
+  if (actionError) {
+    if (releaseError) {
+      try {
+        Object.defineProperty(actionError, LEDGER_LOCK_RELEASE_FAILURE, {
+          configurable: false,
+          enumerable: false,
+          value: releaseError,
+          writable: false
+        });
+      } catch {}
+    }
+    throw actionError;
+  }
+  if (releaseError) {
+    try {
+      Object.defineProperty(releaseError, LEDGER_LOCK_ACTION_COMPLETED, {
+        configurable: false,
+        enumerable: false,
+        value: true,
+        writable: false
+      });
+    } catch {}
+    throw releaseError;
+  }
+  return result;
 }
 
 function defaultQualification() {
@@ -2254,6 +2491,7 @@ function sha256File(absolute) {
 const PROOF_TOOLCHAIN_ERROR = "E_PROOF_TOOLCHAIN";
 const PROOF_PLATFORM_ERROR = "E_PROOF_PLATFORM";
 let trustedGitBindingCache = null;
+let protectedReviewGitBinding = null;
 
 function proofToolchainError() {
   const error = new Error("The proof toolchain could not be resolved or its identity changed.");
@@ -2446,6 +2684,10 @@ function resolveTrustedGitBinding() {
 }
 
 function trustedGitBinding() {
+  if (protectedReviewGitBinding) {
+    assertBoundFileIdentity(protectedReviewGitBinding);
+    return protectedReviewGitBinding;
+  }
   if (trustedGitBindingCache) {
     assertBoundFileIdentity(trustedGitBindingCache);
     return trustedGitBindingCache;
@@ -2454,16 +2696,89 @@ function trustedGitBinding() {
   return trustedGitBindingCache;
 }
 
+function withProtectedReviewGitBinding(binding, action) {
+  if (protectedReviewGitBinding || typeof action !== "function") {
+    throw protectedReviewTrustError();
+  }
+  assertBoundFileIdentity(binding);
+  if (typeof binding.emptyHooksPath !== "string"
+    || !path.isAbsolute(binding.emptyHooksPath)) {
+    throw protectedReviewTrustError();
+  }
+  try {
+    assertProtectedHostPath(binding.emptyHooksPath, "directory");
+    if (fs.readdirSync(binding.emptyHooksPath).length !== 0) {
+      throw protectedReviewTrustError();
+    }
+  } catch {
+    throw protectedReviewTrustError();
+  }
+  protectedReviewGitBinding = binding;
+  try {
+    return action();
+  } finally {
+    protectedReviewGitBinding = null;
+  }
+}
+
+function protectedReviewGitArguments(args, cwd, binding) {
+  if (!protectedReviewGitBinding || args[0] === "--version") return args;
+  if (typeof cwd !== "string"
+    || !path.isAbsolute(cwd)
+    || typeof binding.emptyHooksPath !== "string"
+    || !path.isAbsolute(binding.emptyHooksPath)) {
+    throw protectedReviewTrustError();
+  }
+  return [
+    "--no-pager",
+    "-c", "core.fsmonitor=false",
+    "-c", `core.hooksPath=${binding.emptyHooksPath}`,
+    "-c", `core.worktree=${cwd}`,
+    "-c", "core.bare=false",
+    "-c", "core.fileMode=true",
+    "-c", "core.ignoreCase=false",
+    "-c", "core.symlinks=true",
+    "-c", "core.attributesFile=/dev/null",
+    "-c", "core.excludesFile=/dev/null",
+    "-c", "core.pager=cat",
+    "-c", "diff.external=",
+    "-c", "diff.trustExitCode=false",
+    "-c", "interactive.diffFilter=",
+    "-c", "submodule.recurse=false",
+    "-c", "status.showUntrackedFiles=all",
+    "-c", "status.submoduleSummary=false",
+    ...args
+  ];
+}
+
 function execTrustedGit(args, options = {}) {
   const binding = trustedGitBinding();
   assertBoundFileIdentity(binding);
   const { env: ignoredEnvironment, ...safeOptions } = options;
   void ignoredEnvironment;
-  return execFileSync(binding.canonicalPath, args, {
+  const environment = baseProofEnvironment([path.dirname(binding.canonicalPath)]);
+  if (protectedReviewGitBinding) {
+    Object.assign(environment, {
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_PAGER: "cat",
+      PAGER: "cat",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_ATTR_NOSYSTEM: "1",
+      GIT_NO_LAZY_FETCH: "1",
+      GIT_NO_REPLACE_OBJECTS: "1"
+    });
+  }
+  return execFileSync(
+    binding.canonicalPath,
+    protectedReviewGitArguments(args, safeOptions.cwd, binding),
+    {
     ...safeOptions,
-    env: baseProofEnvironment([path.dirname(binding.canonicalPath)]),
+    env: environment,
     shell: false
-  });
+    }
+  );
 }
 
 function resolveProofNodeBinding() {
@@ -3402,7 +3717,14 @@ export function isNonEvidenceTreeClean(root = REPO_ROOT) {
     // modes/tags, malformed records, and index changes during the capture.
     const indexBefore = readVisibleGitIndex(root);
     if (!isSupportedVisibleGitIndex(indexBefore)) return false;
-    const status = execTrustedGit(["status", "--porcelain=v1", "-z"], {
+    const status = execTrustedGit([
+      "status",
+      "--porcelain=v1",
+      "-z",
+      "--untracked-files=all",
+      "--ignore-submodules=all",
+      "--no-renames"
+    ], {
       cwd: root,
       encoding: "utf8",
       maxBuffer: 32 * 1024 * 1024
@@ -3469,6 +3791,689 @@ export function computeIndependentReviewReceiptDigest(receipt) {
   const body = structuredClone(receipt);
   delete body.receiptDigest;
   return sha256Text(stableStringify(body));
+}
+
+export function computeReviewRequestDigest(request) {
+  const body = structuredClone(request);
+  delete body.requestDigest;
+  return sha256Text(stableStringify(body));
+}
+
+export function attachReviewRequestDigest(request) {
+  const next = structuredClone(request);
+  delete next.requestDigest;
+  next.requestDigest = computeReviewRequestDigest(next);
+  return next;
+}
+
+export function canonicalReviewAttestationSigningBody(attestation) {
+  const body = structuredClone(attestation);
+  delete body.signature;
+  delete body.attestationDigest;
+  return stableStringify(body);
+}
+
+export function computeReviewAttestationDigest(attestation) {
+  const body = structuredClone(attestation);
+  delete body.attestationDigest;
+  return sha256Text(stableStringify(body));
+}
+
+export function attachReviewAttestationDigest(attestation) {
+  const next = structuredClone(attestation);
+  delete next.attestationDigest;
+  next.attestationDigest = computeReviewAttestationDigest(next);
+  return next;
+}
+
+export function computeReviewPublicKeyFingerprint(publicKey) {
+  let key;
+  try {
+    key = publicKey?.type === "public" && publicKey?.asymmetricKeyType
+      ? publicKey
+      : crypto.createPublicKey(publicKey);
+  } catch {
+    throw fixedEvidenceError("E_REVIEW_ATTESTATION_INVALID", "Review public key is invalid.");
+  }
+  if (key.asymmetricKeyType !== "ed25519") {
+    throw fixedEvidenceError("E_REVIEW_ATTESTATION_INVALID", "Review public key must be Ed25519.");
+  }
+  let spki;
+  try {
+    spki = key.export({ type: "spki", format: "der" });
+  } catch {
+    throw fixedEvidenceError("E_REVIEW_ATTESTATION_INVALID", "Review public key SPKI export failed.");
+  }
+  return sha256Text(spki);
+}
+
+function reviewRequestRelativePath(request) {
+  return `${REVIEW_REQUEST_ROOT}/${request.source.headCommit.slice(0, 16)}-${request.requestDigest.slice(0, 16)}.json`;
+}
+
+function reviewAttestationRelativePath(attestation) {
+  return `${REVIEW_ATTESTATION_ROOT}/${attestation.requestDigest.slice(0, 16)}-${attestation.attestationDigest.slice(0, 16)}.json`;
+}
+
+function normalizedReviewArtifactPath(value, prefix, pattern) {
+  return typeof value === "string"
+    && value.startsWith(`${prefix}/`)
+    && !value.includes("\\")
+    && !value.includes("\0")
+    && !value.split("/").includes("..")
+    && path.posix.normalize(value) === value
+    && pattern.test(value);
+}
+
+function canonicalBase64UrlBytes(value, expectedBytes) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  let bytes;
+  try {
+    bytes = Buffer.from(value, "base64url");
+  } catch {
+    return null;
+  }
+  if (bytes.length !== expectedBytes || bytes.toString("base64url") !== value) return null;
+  return bytes;
+}
+
+function safeReviewDiffPath(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= MAX_EVIDENCE_STRING_CHARS
+    && !value.includes("\0")
+    && !value.includes("\\")
+    && !path.posix.isAbsolute(value)
+    && path.posix.normalize(value) === value
+    && value !== "."
+    && value !== ".."
+    && !value.startsWith("../")
+    && !isEvidenceOnlyPath(value)
+    && redactText(value) === value
+    && !PRIVATE_EVIDENCE_PATH.test(value);
+}
+
+function captureReviewSourcePathSet(root, paths) {
+  const snapshots = new Map();
+  for (const relative of [...new Set(paths)].sort()) {
+    const absolute = path.join(root, ...relative.split("/"));
+    let stat;
+    try {
+      stat = fs.lstatSync(absolute, { bigint: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Review source path is unreadable.");
+    }
+    if (stat.isSymbolicLink()) {
+      throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Review source paths cannot contain symlinks.");
+    }
+    const chain = captureEvidencePathChain(root, absolute);
+    const leaf = chain.snapshots.at(-1);
+    if (!leaf?.isFile() && !leaf?.isDirectory()) {
+      throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Review source path type is unsupported.");
+    }
+    snapshots.set(relative, chain);
+  }
+  return snapshots;
+}
+
+function sameReviewSourcePathSets(left, right) {
+  if (!(left instanceof Map)
+    || !(right instanceof Map)
+    || left.size !== right.size) return false;
+  for (const [relative, before] of left) {
+    const after = right.get(relative);
+    if (!after
+      || before.canonicalRoot !== after.canonicalRoot
+      || before.canonicalAbsolute !== after.canonicalAbsolute
+      || before.snapshots.length !== after.snapshots.length
+      || !after.snapshots.every((stat, index) => (
+        sameFileSnapshot(stat, before.snapshots[index])
+      ))) return false;
+  }
+  return true;
+}
+
+function deriveReviewDiff(root, baseCommit, headCommit) {
+  if (!/^[0-9a-f]{40}$/.test(baseCommit || "")
+    || !/^[0-9a-f]{40}$/.test(headCommit || "")
+    || baseCommit === headCommit) {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Review diff base is invalid.");
+  }
+  try {
+    execTrustedGit(["cat-file", "-e", `${baseCommit}^{commit}`], {
+      cwd: root,
+      encoding: "buffer",
+      maxBuffer: 1024,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    execTrustedGit(["merge-base", "--is-ancestor", baseCommit, headCommit], {
+      cwd: root,
+      encoding: "buffer",
+      maxBuffer: 1024,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+  } catch {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Review diff base is not an ancestor commit.");
+  }
+  let changed;
+  try {
+    changed = execTrustedGit([
+      "diff",
+      "--name-only",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-renames",
+      "-z",
+      baseCommit,
+      headCommit,
+      "--"
+    ], {
+      cwd: root,
+      encoding: "buffer",
+      maxBuffer: 16 * 1024 * 1024
+    }).toString("utf8").split("\0").filter(Boolean)
+      .filter((relative) => !isEvidenceOnlyPath(relative));
+  } catch {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Review diff paths could not be derived.");
+  }
+  const paths = [...new Set(changed)].sort();
+  if (paths.length < 1
+    || paths.length > MAX_PHASE_SCOPE_PATHS
+    || paths.some((relative) => !safeReviewDiffPath(relative))) {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Review diff paths are invalid or empty.");
+  }
+  let patch;
+  try {
+    patch = execTrustedGit([
+      "diff",
+      "--binary",
+      "--full-index",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-renames",
+      baseCommit,
+      headCommit,
+      "--",
+      ...paths.map((relative) => `:(literal)${relative}`)
+    ], {
+      cwd: root,
+      encoding: "buffer",
+      maxBuffer: 64 * 1024 * 1024
+    });
+  } catch {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Review diff patch could not be derived.");
+  }
+  return Object.freeze({
+    baseCommit,
+    headCommit,
+    patchDigest: sha256Text(patch),
+    pathsDigest: sha256Text(stableStringify(paths)),
+    paths
+  });
+}
+
+function currentPhaseOneReviewBindings(root) {
+  const verified = verifyLedger(root, { strict: true });
+  if (!verified.ok) {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Current evidence ledger is not strictly valid.");
+  }
+  let loaded;
+  try {
+    loaded = loadLedgerDocument(root);
+  } catch {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Current evidence ledger is unreadable.");
+  }
+  if (!ledgerDocumentShapeIsValid(loaded.ledger)) {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Current evidence ledger is invalid.");
+  }
+  const current = loaded.ledger.entries.filter((entry) => entry.currency === "current");
+  const phaseZeroEntry = current.find((entry) => entry.phase === "0");
+  const phaseOneEntry = current.find((entry) => entry.phase === "1");
+  if (!phaseZeroEntry || !phaseOneEntry) {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Phase 0 and Phase 1 current evidence are required.");
+  }
+  let phaseZero;
+  let phaseOne;
+  try {
+    phaseZero = loadCanonicalCutoverRecord(phaseZeroEntry, root);
+    phaseOne = loadCanonicalCutoverRecord(phaseOneEntry, root);
+  } catch {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Current review evidence could not be loaded safely.");
+  }
+  if (phaseZero.status !== "verified_on_draft"
+    || phaseOne.status !== "implemented_unverified"
+    || phaseZero.proofProducer?.id !== PROOF_PRODUCER_ID
+    || phaseZero.proofProducer?.version !== PROOF_PRODUCER_VERSION
+    || phaseOne.proofProducer?.id !== PROOF_PRODUCER_ID
+    || phaseOne.proofProducer?.version !== PROOF_PRODUCER_VERSION
+    || phaseOne.prerequisites?.length !== 1
+    || phaseOne.prerequisites[0]?.phase !== "0"
+    || phaseOne.prerequisites[0]?.recordDigest !== phaseZero.recordDigest
+    || JSON.stringify(phaseOne.prerequisites[0]?.gateIds)
+      !== JSON.stringify(PHASE_MANDATORY_GATE_IDS["0"])) {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Current Phase 1 proof prerequisite is not exact.");
+  }
+  const phaseZeroGates = [...passedGateIds(phaseZero)].sort();
+  const phaseOneGates = [...passedGateIds(phaseOne)].sort();
+  if (JSON.stringify(phaseZeroGates) !== JSON.stringify([...PHASE_MANDATORY_GATE_IDS["0"]].sort())
+    || JSON.stringify(phaseOneGates) !== JSON.stringify([...PHASE_MANDATORY_GATE_IDS["1"]].sort())) {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Current proof gates are incomplete.");
+  }
+  return Object.freeze({
+    phaseZeroEntry: cloneLedgerEntry(phaseZeroEntry),
+    phaseOneEntry: cloneLedgerEntry(phaseOneEntry),
+    phaseZero,
+    phaseOne
+  });
+}
+
+function reviewRequestShapeErrors(request, {
+  now = new Date().toISOString(),
+  requireFresh = true
+} = {}) {
+  const errors = [];
+  const fail = (message) => errors.push(message);
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    return ["Review request must be a JSON object."];
+  }
+  if (!rawEvidenceValueIsSafe(request, "$reviewRequest")
+    || unexpectedFields(request, REVIEW_REQUEST_FIELDS).length) {
+    fail("Review request contains unsafe or unsupported fields.");
+  }
+  if (request.schemaVersion !== REVIEW_REQUEST_SCHEMA_VERSION
+    || request.domain !== REVIEW_REQUEST_DOMAIN
+    || request.producerId !== REVIEW_REQUEST_PRODUCER_ID
+    || request.producerVersion !== REVIEW_REQUEST_PRODUCER_VERSION
+    || request.manifestDigest !== SIGNED_REVIEW_MANIFEST_DIGEST
+    || request.phase !== "1") {
+    fail("Review request producer, domain, phase, or manifest identity is invalid.");
+  }
+  if (!isCanonicalIsoDateTime(request.createdAt)
+    || !isCanonicalIsoDateTime(request.expiresAt)
+    || (isCanonicalIsoDateTime(request.createdAt)
+      && isCanonicalIsoDateTime(request.expiresAt)
+      && (Date.parse(request.expiresAt) <= Date.parse(request.createdAt)
+        || Date.parse(request.expiresAt) - Date.parse(request.createdAt) > 7 * 24 * 60 * 60_000))) {
+    fail("Review request validity window is invalid.");
+  }
+  if (requireFresh && (!isCanonicalIsoDateTime(now)
+    || Date.parse(now) < Date.parse(request.createdAt || "")
+    || Date.parse(now) > Date.parse(request.expiresAt || ""))) {
+    fail("Review request is not currently valid.");
+  }
+  if (!canonicalBase64UrlBytes(request.nonce, 32)) {
+    fail("Review request nonce must be canonical 32-byte base64url.");
+  }
+  const source = request.source;
+  if (!exactFields(source, REVIEW_REQUEST_SOURCE_FIELDS)
+    || !/^[0-9a-f]{40}$/.test(source?.headCommit || "")
+    || !/^[0-9a-f]{40}$/.test(source?.headTree || "")
+    || !SHA256.test(source?.sourceInventoryDigest || "")
+    || !SHA256.test(source?.phaseScopeDigest || "")
+    || !Array.isArray(source?.phaseScopePaths)
+    || source.phaseScopePaths.length < 1
+    || source.phaseScopePaths.length > MAX_PHASE_SCOPE_PATHS
+    || JSON.stringify(source.phaseScopePaths)
+      !== JSON.stringify([...new Set(source.phaseScopePaths)].sort())
+    || source.phaseScopePaths.some((relative) => !safeReviewDiffPath(relative))) {
+    fail("Review request source binding is invalid.");
+  }
+  const diff = request.diff;
+  if (!exactFields(diff, REVIEW_REQUEST_DIFF_FIELDS)
+    || !/^[0-9a-f]{40}$/.test(diff?.baseCommit || "")
+    || diff?.headCommit !== source?.headCommit
+    || !SHA256.test(diff?.patchDigest || "")
+    || !SHA256.test(diff?.pathsDigest || "")
+    || !Array.isArray(diff?.paths)
+    || diff.paths.length < 1
+    || diff.paths.length > MAX_PHASE_SCOPE_PATHS
+    || JSON.stringify(diff.paths) !== JSON.stringify([...new Set(diff.paths)].sort())
+    || diff.paths.some((relative) => !safeReviewDiffPath(relative))
+    || (Array.isArray(diff?.paths)
+      && diff.pathsDigest !== sha256Text(stableStringify(diff.paths)))) {
+    fail("Review request diff binding is invalid.");
+  }
+  const proof = request.proof;
+  if (!exactFields(proof, REVIEW_REQUEST_PROOF_FIELDS)
+    || !normalizedReviewArtifactPath(
+      proof?.path,
+      `${EVIDENCE_ROOT}/phase-1`,
+      new RegExp(`^${EVIDENCE_ROOT}/phase-1/[0-9a-f]{16}-[0-9a-f]{12}\\.json$`)
+    )
+    || !SHA256.test(proof?.recordDigest || "")
+    || proof?.producerManifestDigest !== computeProofManifestDigest("1")
+    || JSON.stringify(proof?.gateIds) !== JSON.stringify(PHASE_MANDATORY_GATE_IDS["1"])) {
+    fail("Review request Phase 1 proof binding is invalid.");
+  }
+  const prerequisite = request.prerequisite;
+  if (!exactFields(prerequisite, REVIEW_REQUEST_PREREQUISITE_FIELDS)
+    || prerequisite?.phase !== "0"
+    || !normalizedReviewArtifactPath(
+      prerequisite?.path,
+      `${EVIDENCE_ROOT}/phase-0`,
+      new RegExp(`^${EVIDENCE_ROOT}/phase-0/[0-9a-f]{16}-[0-9a-f]{12}\\.json$`)
+    )
+    || !SHA256.test(prerequisite?.recordDigest || "")
+    || JSON.stringify(prerequisite?.gateIds) !== JSON.stringify(PHASE_MANDATORY_GATE_IDS["0"])) {
+    fail("Review request Phase 0 prerequisite binding is invalid.");
+  }
+  if (!SHA256.test(request.requestDigest || "")
+    || request.requestDigest !== computeReviewRequestDigest(request)) {
+    fail("Review request digest does not match its canonical body.");
+  }
+  return errors;
+}
+
+export function validatePhaseOneReviewRequest(request, options = {}) {
+  const errors = reviewRequestShapeErrors(request, options);
+  const fail = (message) => errors.push(message);
+  if (errors.length || !options.root) return { ok: errors.length === 0, errors };
+  const root = options.root;
+  try {
+    if (!isNonEvidenceTreeClean(root)) {
+      fail("Review request requires a clean non-evidence source tree.");
+      return { ok: false, errors };
+    }
+    const protectedSourcePaths = [
+      ...request.source.phaseScopePaths,
+      ...request.diff.paths
+    ];
+    const pathsBefore = captureReviewSourcePathSet(root, protectedSourcePaths);
+    const identity = gitIdentity(root);
+    const expectedScopePaths = phaseScopePaths("1", root);
+    const currentSourceInventoryDigest = computeInventoryDigest(
+      root,
+      { includeEvidence: false }
+    );
+    const currentPhaseScopeDigest = computePhaseScopeDigest("1", root);
+    const pathsAfter = captureReviewSourcePathSet(root, protectedSourcePaths);
+    if (!sameReviewSourcePathSets(pathsBefore, pathsAfter)) {
+      fail("Review request source paths changed during validation.");
+    }
+    const sourceEquivalent = request.source.sourceInventoryDigest
+      === currentSourceInventoryDigest
+      && request.source.phaseScopeDigest === currentPhaseScopeDigest;
+    const allowEvidenceOnlyIdentityDrift = options.allowEvidenceOnlyIdentityDrift === true;
+    let reviewedHeadIsCurrentAncestor = request.source.headCommit === identity.headCommit;
+    if (allowEvidenceOnlyIdentityDrift && !reviewedHeadIsCurrentAncestor) {
+      try {
+        execTrustedGit([
+          "merge-base",
+          "--is-ancestor",
+          request.source.headCommit,
+          identity.headCommit
+        ], {
+          cwd: root,
+          encoding: "buffer",
+          maxBuffer: 1024,
+          stdio: ["ignore", "pipe", "pipe"]
+        });
+        reviewedHeadIsCurrentAncestor = true;
+      } catch {
+        reviewedHeadIsCurrentAncestor = false;
+      }
+    }
+    if ((!allowEvidenceOnlyIdentityDrift
+        && (request.source.headCommit !== identity.headCommit
+          || request.source.headTree !== identity.headTree))
+      || (allowEvidenceOnlyIdentityDrift && !reviewedHeadIsCurrentAncestor)
+      || !sourceEquivalent
+      || JSON.stringify(request.source.phaseScopePaths) !== JSON.stringify(expectedScopePaths)) {
+      fail("Review request source binding is stale.");
+    }
+    const diff = deriveReviewDiff(
+      root,
+      request.diff.baseCommit,
+      request.source.headCommit
+    );
+    if (JSON.stringify(request.diff) !== JSON.stringify(diff)) {
+      fail("Review request diff binding is stale or mismatched.");
+    }
+    if (options.requireCurrentProof !== false) {
+      const bindings = currentPhaseOneReviewBindings(root);
+      if (request.proof.path !== bindings.phaseOneEntry.path
+        || request.proof.recordDigest !== bindings.phaseOne.recordDigest
+        || request.proof.producerManifestDigest !== bindings.phaseOne.proofProducer.manifestDigest
+        || JSON.stringify(request.proof.gateIds)
+          !== JSON.stringify(PHASE_MANDATORY_GATE_IDS["1"])
+        || request.prerequisite.path !== bindings.phaseZeroEntry.path
+        || request.prerequisite.recordDigest !== bindings.phaseZero.recordDigest
+        || JSON.stringify(request.prerequisite.gateIds)
+          !== JSON.stringify(PHASE_MANDATORY_GATE_IDS["0"])) {
+        fail("Review request no longer matches the exact current proof chain.");
+      }
+    } else {
+      const phaseOne = JSON.parse(readBoundedEvidenceFile(
+        root,
+        path.join(root, ...request.proof.path.split("/"))
+      ));
+      const phaseZero = JSON.parse(readBoundedEvidenceFile(
+        root,
+        path.join(root, ...request.prerequisite.path.split("/"))
+      ));
+      const phaseOneValidation = validateEvidenceRecord(phaseOne, {
+        strict: true,
+        root,
+        requireEvidenceSystem: true
+      });
+      const phaseZeroValidation = validateEvidenceRecord(phaseZero, {
+        strict: true,
+        root,
+        requireEvidenceSystem: true
+      });
+      if (!phaseOneValidation.ok
+        || !phaseZeroValidation.ok
+        || phaseOne.phase !== "1"
+        || phaseOne.status !== "implemented_unverified"
+        || phaseOne.recordDigest !== request.proof.recordDigest
+        || phaseOne.proofProducer?.manifestDigest !== request.proof.producerManifestDigest
+        || phaseZero.phase !== "0"
+        || phaseZero.status !== "verified_on_draft"
+        || phaseZero.recordDigest !== request.prerequisite.recordDigest
+        || phaseOne.prerequisites?.length !== 1
+        || phaseOne.prerequisites[0]?.recordDigest !== phaseZero.recordDigest) {
+        fail("Review request referenced proof records are stale, unsafe, or mismatched.");
+      }
+    }
+  } catch {
+    fail("Review request current bindings could not be verified.");
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+export function validateIndependentReviewAttestation(attestation, {
+  request,
+  requestPath = request ? reviewRequestRelativePath(request) : null,
+  publicKey = null,
+  expectedIssuer = null,
+  revokedKeyFingerprints = [],
+  now = new Date().toISOString(),
+  requireFreshRequest = true
+} = {}) {
+  const errors = [];
+  const fail = (message) => errors.push(message);
+  if (!attestation || typeof attestation !== "object" || Array.isArray(attestation)) {
+    return { ok: false, errors: ["Review attestation must be a JSON object."] };
+  }
+  if (!rawEvidenceValueIsSafe(attestation, "$reviewAttestation")
+    || unexpectedFields(attestation, REVIEW_ATTESTATION_FIELDS).length) {
+    fail("Review attestation contains unsafe or unsupported fields.");
+  }
+  const requestValidation = validatePhaseOneReviewRequest(request, {
+    now,
+    requireFresh: requireFreshRequest
+  });
+  if (!requestValidation.ok) fail("Review attestation references an invalid or expired request.");
+  if (attestation.schemaVersion !== REVIEW_ATTESTATION_SCHEMA_VERSION
+    || attestation.domain !== REVIEW_ATTESTATION_DOMAIN
+    || attestation.algorithm !== REVIEW_ATTESTATION_ALGORITHM) {
+    fail("Review attestation domain, version, or algorithm is invalid.");
+  }
+  if (typeof expectedIssuer !== "string"
+    || !/^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/.test(expectedIssuer)
+    || attestation.issuer !== expectedIssuer) {
+    fail("Review attestation issuer is not the protected expected issuer.");
+  }
+  if (!normalizedReviewArtifactPath(
+    attestation.requestPath,
+    REVIEW_REQUEST_ROOT,
+    new RegExp(`^${REVIEW_REQUEST_ROOT}/[0-9a-f]{16}-[0-9a-f]{16}\\.json$`)
+  )
+    || attestation.requestPath !== requestPath
+    || attestation.requestDigest !== request?.requestDigest
+    || attestation.nonce !== request?.nonce
+    || attestation.manifestDigest !== SIGNED_REVIEW_MANIFEST_DIGEST
+    || !SHA256.test(attestation.reviewerRuntimeDigest || "")
+    || attestation.headCommit !== request?.source?.headCommit
+    || attestation.headTree !== request?.source?.headTree
+    || attestation.sourceInventoryDigest !== request?.source?.sourceInventoryDigest
+    || attestation.phaseScopeDigest !== request?.source?.phaseScopeDigest
+    || attestation.diffBaseCommit !== request?.diff?.baseCommit
+    || attestation.diffPatchDigest !== request?.diff?.patchDigest
+    || attestation.diffPathsDigest !== request?.diff?.pathsDigest
+    || attestation.proofRecordDigest !== request?.proof?.recordDigest
+    || attestation.prerequisiteRecordDigest !== request?.prerequisite?.recordDigest) {
+    fail("Review attestation does not bind the exact request, source, diff, proof, and prerequisite.");
+  }
+  if (!isCanonicalIsoDateTime(attestation.startedAt)
+    || !isCanonicalIsoDateTime(attestation.endedAt)
+    || !isCanonicalIsoDateTime(now)
+    || Date.parse(attestation.startedAt || "") < Date.parse(request?.createdAt || "")
+    || Date.parse(attestation.endedAt || "") < Date.parse(attestation.startedAt || "")
+    || Date.parse(attestation.endedAt || "") > Date.parse(request?.expiresAt || "")
+    || Date.parse(attestation.endedAt || "") > Date.parse(now || "")) {
+    fail("Review attestation chronology is invalid.");
+  }
+  if (attestation.outcome !== "pass" || attestation.unresolvedFindings !== 0) {
+    fail("Review attestation must record pass with zero unresolved findings.");
+  }
+  if (!SHA256.test(attestation.keyFingerprint || "")) {
+    fail("Review attestation key fingerprint is invalid.");
+  }
+  if (!Array.isArray(revokedKeyFingerprints)
+    || revokedKeyFingerprints.some((fingerprint) => !SHA256.test(fingerprint || ""))
+    || revokedKeyFingerprints.includes(attestation.keyFingerprint)) {
+    fail("Review attestation key is revoked or revocation state is invalid.");
+  }
+  const signature = canonicalBase64UrlBytes(attestation.signature, 64);
+  if (!signature) fail("Review attestation signature must be canonical 64-byte base64url.");
+  let key = null;
+  try {
+    key = publicKey?.type === "public" && publicKey?.asymmetricKeyType
+      ? publicKey
+      : crypto.createPublicKey(publicKey);
+    if (key.asymmetricKeyType !== "ed25519") throw new Error("wrong key type");
+    const fingerprint = computeReviewPublicKeyFingerprint(key);
+    if (fingerprint !== attestation.keyFingerprint) {
+      fail("Review attestation key fingerprint does not match the protected key.");
+    }
+  } catch {
+    fail("Review attestation protected Ed25519 key is unavailable or invalid.");
+  }
+  if (key && signature) {
+    let verified = false;
+    try {
+      verified = crypto.verify(
+        null,
+        Buffer.from(canonicalReviewAttestationSigningBody(attestation), "utf8"),
+        key,
+        signature
+      );
+    } catch {
+      verified = false;
+    }
+    if (!verified) fail("Review attestation signature verification failed.");
+  }
+  if (!SHA256.test(attestation.attestationDigest || "")
+    || attestation.attestationDigest !== computeReviewAttestationDigest(attestation)) {
+    fail("Review attestation digest does not match its canonical body.");
+  }
+  return {
+    ok: errors.length === 0,
+    errors,
+    keyFingerprint: errors.length === 0 ? attestation.keyFingerprint : null
+  };
+}
+
+export function createPhaseOneReviewRequest({
+  root = REPO_ROOT,
+  baseCommit,
+  createdAt = new Date().toISOString(),
+  expiresAt = new Date(Date.parse(createdAt) + 24 * 60 * 60_000).toISOString(),
+  nonce = crypto.randomBytes(32).toString("base64url"),
+  write = false
+} = {}) {
+  if (typeof root !== "string"
+    || !root
+    || typeof write !== "boolean"
+    || !isCanonicalIsoDateTime(createdAt)
+    || !isCanonicalIsoDateTime(expiresAt)
+    || !canonicalBase64UrlBytes(nonce, 32)) {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Review request arguments are invalid.");
+  }
+  if (!isNonEvidenceTreeClean(root)) {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Review request source tree is dirty.");
+  }
+  const identity = gitIdentity(root);
+  const bindings = currentPhaseOneReviewBindings(root);
+  const diff = deriveReviewDiff(root, baseCommit, identity.headCommit);
+  const request = attachReviewRequestDigest({
+    schemaVersion: REVIEW_REQUEST_SCHEMA_VERSION,
+    domain: REVIEW_REQUEST_DOMAIN,
+    producerId: REVIEW_REQUEST_PRODUCER_ID,
+    producerVersion: REVIEW_REQUEST_PRODUCER_VERSION,
+    manifestDigest: SIGNED_REVIEW_MANIFEST_DIGEST,
+    phase: "1",
+    createdAt,
+    expiresAt,
+    nonce,
+    source: {
+      headCommit: identity.headCommit,
+      headTree: identity.headTree,
+      sourceInventoryDigest: computeInventoryDigest(root, { includeEvidence: false }),
+      phaseScopeDigest: computePhaseScopeDigest("1", root),
+      phaseScopePaths: phaseScopePaths("1", root)
+    },
+    diff,
+    proof: {
+      path: bindings.phaseOneEntry.path,
+      recordDigest: bindings.phaseOne.recordDigest,
+      producerManifestDigest: bindings.phaseOne.proofProducer.manifestDigest,
+      gateIds: [...PHASE_MANDATORY_GATE_IDS["1"]]
+    },
+    prerequisite: {
+      phase: "0",
+      path: bindings.phaseZeroEntry.path,
+      recordDigest: bindings.phaseZero.recordDigest,
+      gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]]
+    }
+  });
+  const validation = validatePhaseOneReviewRequest(request, {
+    root,
+    now: createdAt,
+    requireFresh: true
+  });
+  if (!validation.ok) {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Review request bindings are invalid.");
+  }
+  const relative = reviewRequestRelativePath(request);
+  if (write) {
+    const absolute = path.join(root, ...relative.split("/"));
+    const serialized = `${JSON.stringify(request, null, 2)}\n`;
+    try {
+      ensureEvidenceDirectory(root, path.dirname(absolute));
+      publishImmutableEvidenceFile(root, absolute, serialized);
+    } catch {
+      try {
+        if (readBoundedEvidenceFile(root, absolute) === serialized) {
+          return { ok: true, path: relative, request };
+        }
+      } catch {}
+      throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Immutable review request publication failed.");
+    }
+  }
+  return { ok: true, path: write ? relative : null, request };
 }
 
 export function computeLiveReceiptManifestDigest() {
@@ -3813,6 +4818,131 @@ function receiptsShareRuntimeIdentity(left, right) {
   ].every((field) => left?.[field] === right?.[field]);
 }
 
+function promotedPhaseOneMatchesOriginal(record, original, attestation) {
+  if (record?.phase !== "1"
+    || record?.status !== "verified_on_draft"
+    || record?.recordedAt !== attestation?.endedAt
+    || original?.phase !== "1"
+    || original?.status !== "implemented_unverified"
+    || original?.authorities?.independentValidation !== "not_run"
+    || record?.authorities?.independentValidation !== "pass") return false;
+  let promotedBody;
+  let originalBody;
+  try {
+    promotedBody = structuredClone(record);
+    originalBody = structuredClone(original);
+  } catch {
+    return false;
+  }
+  for (const body of [promotedBody, originalBody]) {
+    delete body.recordDigest;
+    delete body.status;
+    delete body.recordedAt;
+    delete body.independentReviewReceipt;
+    if (body.authorities && typeof body.authorities === "object") {
+      body.authorities.independentValidation = "not_run";
+    }
+  }
+  return stableStringify(promotedBody) === stableStringify(originalBody);
+}
+
+function loadSignedReviewArtifacts(receipt, record, root, trust) {
+  if (!trust || typeof trust !== "object" || Array.isArray(trust)) {
+    throw fixedEvidenceError("E_REVIEW_TRUST_UNAVAILABLE", "Protected review trust is unavailable.");
+  }
+  const requestReference = receipt.reviewRequest;
+  const attestationReference = receipt.attestation;
+  if (!exactFields(requestReference, SIGNED_REVIEW_REFERENCE_FIELDS)
+    || !exactFields(attestationReference, SIGNED_REVIEW_REFERENCE_FIELDS)
+    || !normalizedReviewArtifactPath(
+      requestReference.path,
+      REVIEW_REQUEST_ROOT,
+      new RegExp(`^${REVIEW_REQUEST_ROOT}/[0-9a-f]{16}-[0-9a-f]{16}\\.json$`)
+    )
+    || !normalizedReviewArtifactPath(
+      attestationReference.path,
+      REVIEW_ATTESTATION_ROOT,
+      new RegExp(`^${REVIEW_ATTESTATION_ROOT}/[0-9a-f]{16}-[0-9a-f]{16}\\.json$`)
+    )
+    || !SHA256.test(requestReference.digest || "")
+    || !SHA256.test(attestationReference.digest || "")) {
+    throw fixedEvidenceError("E_REVIEW_ATTESTATION_INVALID", "Signed review references are invalid.");
+  }
+  let requestSnapshot;
+  let attestationSnapshot;
+  let request;
+  let attestation;
+  try {
+    requestSnapshot = readBoundedEvidenceFileSnapshot(
+      root,
+      path.join(root, ...requestReference.path.split("/"))
+    );
+    attestationSnapshot = readBoundedEvidenceFileSnapshot(
+      root,
+      path.join(root, ...attestationReference.path.split("/"))
+    );
+    request = JSON.parse(requestSnapshot.contents);
+    attestation = JSON.parse(attestationSnapshot.contents);
+  } catch {
+    throw fixedEvidenceError("E_REVIEW_ATTESTATION_INVALID", "Signed review artifacts are unreadable or unsafe.");
+  }
+  if (request.requestDigest !== requestReference.digest
+    || requestReference.path !== reviewRequestRelativePath(request)
+    || attestation.attestationDigest !== attestationReference.digest
+    || attestationReference.path !== reviewAttestationRelativePath(attestation)) {
+    throw fixedEvidenceError("E_REVIEW_ATTESTATION_INVALID", "Signed review artifact paths or digests are mismatched.");
+  }
+  const requestValidation = validatePhaseOneReviewRequest(request, {
+    root,
+    now: trust.now,
+    requireFresh: trust.requireFresh === true,
+    requireCurrentProof: false,
+    allowEvidenceOnlyIdentityDrift: trust.requireFresh !== true
+  });
+  if (!requestValidation.ok) {
+    throw fixedEvidenceError("E_REVIEW_REQUEST_INVALID", "Signed review request is stale or invalid.");
+  }
+  const attestationValidation = validateIndependentReviewAttestation(attestation, {
+    request,
+    requestPath: requestReference.path,
+    publicKey: trust.publicKey,
+    expectedIssuer: trust.expectedIssuer,
+    revokedKeyFingerprints: trust.revokedKeyFingerprints || [],
+    now: trust.now,
+    requireFreshRequest: trust.requireFresh === true
+  });
+  if (!attestationValidation.ok) {
+    throw fixedEvidenceError("E_REVIEW_ATTESTATION_INVALID", "Signed review attestation is invalid.");
+  }
+  let original;
+  try {
+    original = JSON.parse(readBoundedEvidenceFile(
+      root,
+      path.join(root, ...request.proof.path.split("/"))
+    ));
+  } catch {
+    throw fixedEvidenceError("E_REVIEW_ATTESTATION_INVALID", "Original Phase 1 proof is unavailable.");
+  }
+  if (receipt.issuer !== attestation.issuer
+    || receipt.keyFingerprint !== attestation.keyFingerprint
+    || !promotedPhaseOneMatchesOriginal(record, original, attestation)
+    || record.source?.headCommit !== request.source.headCommit
+    || record.source?.headTree !== request.source.headTree
+    || record.source?.sourceInventoryDigest !== request.source.sourceInventoryDigest
+    || record.source?.phaseScopeDigest !== request.source.phaseScopeDigest
+    || record.prerequisites?.length !== 1
+    || record.prerequisites[0]?.recordDigest !== request.prerequisite.recordDigest) {
+    throw fixedEvidenceError("E_REVIEW_ATTESTATION_INVALID", "Promoted Phase 1 record does not match the signed review.");
+  }
+  return {
+    request,
+    attestation,
+    original,
+    requestSnapshot,
+    attestationSnapshot
+  };
+}
+
 /**
  * Lightweight structural validator (no external JSON Schema dependency).
  * Returns { ok, errors[] }.
@@ -4023,15 +5153,12 @@ export function validateEvidenceRecord(record, options = {}) {
       || typeof independentReviewReceipt !== "object"
       || Array.isArray(independentReviewReceipt)) {
       fail("independentReviewReceipt must be an object when present.");
-    } else {
+    } else if (independentReviewReceipt.schemaVersion === 1) {
       if (unexpectedFields(
         independentReviewReceipt,
-        INDEPENDENT_REVIEW_RECEIPT_FIELDS
+        INDEPENDENT_REVIEW_RECEIPT_V1_FIELDS
       ).length) {
         fail("independentReviewReceipt contains unsupported fields.");
-      }
-      if (independentReviewReceipt.schemaVersion !== 1) {
-        fail("independentReviewReceipt.schemaVersion is invalid.");
       }
       if (independentReviewReceipt.producerId !== INDEPENDENT_REVIEW_PRODUCER_ID
         || independentReviewReceipt.producerVersion !== INDEPENDENT_REVIEW_PRODUCER_VERSION) {
@@ -4077,8 +5204,41 @@ export function validateEvidenceRecord(record, options = {}) {
       if (!sourceMatches) {
         fail("independentReviewReceipt does not match the exact record source identity.");
       }
+      fail("independentReviewReceipt v1 is historical and permanently unauthenticated.");
+    } else if (independentReviewReceipt.schemaVersion === SIGNED_REVIEW_RECEIPT_SCHEMA_VERSION) {
+      if (unexpectedFields(
+        independentReviewReceipt,
+        INDEPENDENT_REVIEW_RECEIPT_V2_FIELDS
+      ).length
+        || independentReviewReceipt.producerId !== SIGNED_REVIEW_RECEIPT_PRODUCER_ID
+        || independentReviewReceipt.producerVersion !== SIGNED_REVIEW_RECEIPT_PRODUCER_VERSION
+        || typeof independentReviewReceipt.issuer !== "string"
+        || !independentReviewReceipt.issuer
+        || !SHA256.test(independentReviewReceipt.keyFingerprint || "")
+        || !SHA256.test(independentReviewReceipt.receiptDigest || "")
+        || independentReviewReceipt.receiptDigest
+          !== computeIndependentReviewReceiptDigest(independentReviewReceipt)) {
+        fail("Signed independentReviewReceipt v2 structure or digest is invalid.");
+      }
+      if (options.signedReviewAuthority !== SIGNED_REVIEW_VALIDATION_AUTHORITY) {
+        fail("Signed independent review requires protected host trust verification.");
+      } else if (!(options.strict && options.root)) {
+        fail("Signed independent review requires strict repository replay.");
+      } else {
+        try {
+          loadSignedReviewArtifacts(
+            independentReviewReceipt,
+            record,
+            options.root,
+            options.signedReviewTrust
+          );
+        } catch {
+          fail("Signed independent review artifacts or protected trust are invalid.");
+        }
+      }
+    } else {
+      fail("independentReviewReceipt.schemaVersion is invalid.");
     }
-    fail("independentReviewReceipt is reserved but unauthenticated; signed issuer verification is required.");
   }
 
   const installation = record.installation;
@@ -4453,7 +5613,8 @@ export function validateEvidenceRecord(record, options = {}) {
     if (!proofProducerValid) {
       fail(`${record.status} requires exact broker-owned proofProducer provenance.`);
     }
-    if (phase === "1") {
+    if (phase === "1"
+      && independentReviewReceipt?.schemaVersion !== SIGNED_REVIEW_RECEIPT_SCHEMA_VERSION) {
       fail(`${record.status} Phase 1 evidence requires signed issuer-verified independent review proof.`);
     }
   }
@@ -4847,8 +6008,10 @@ export function buildEvidenceRecord({
 }
 
 const PROOF_PUBLICATION_AUTHORITY = Symbol("proof-publication-authority");
+const REVIEW_PROMOTION_PUBLICATION_AUTHORITY = Symbol("review-promotion-publication-authority");
+const SIGNED_REVIEW_VALIDATION_AUTHORITY = Symbol("signed-review-validation-authority");
 
-function prepareEvidenceRecordForPublication(record, authority = null) {
+function prepareEvidenceRecordForPublication(record, authority = null, validationOptions = {}) {
   if (!rawEvidenceValueIsSafe(record, "$record")) throw invalidEvidencePublicationError();
   const suppliedDigest = Object.hasOwn(record, "recordDigest");
   let body;
@@ -4869,11 +6032,22 @@ function prepareEvidenceRecordForPublication(record, authority = null) {
     if (error?.code === "E_EVIDENCE_RECORD_INVALID") throw error;
     throw invalidEvidencePublicationError();
   }
-  const validated = validateEvidenceRecord(body, { strict: false });
+  const validated = validateEvidenceRecord(body, {
+    strict: false,
+    ...validationOptions
+  });
   if (!validated.ok) throw invalidEvidencePublicationError();
-  if ((VERIFIED_STATUS_SET.has(body.status)
-    || Object.hasOwn(body, "proofProducer")
-    || Object.hasOwn(body, "independentReviewReceipt"))
+  const signedPhaseOnePromotion = body.phase === "1"
+    && body.status === "verified_on_draft"
+    && body.independentReviewReceipt?.schemaVersion === SIGNED_REVIEW_RECEIPT_SCHEMA_VERSION;
+  if (signedPhaseOnePromotion
+    && authority !== REVIEW_PROMOTION_PUBLICATION_AUTHORITY) {
+    throw invalidEvidencePublicationError();
+  }
+  if (!signedPhaseOnePromotion
+    && (VERIFIED_STATUS_SET.has(body.status)
+      || Object.hasOwn(body, "proofProducer")
+      || Object.hasOwn(body, "independentReviewReceipt"))
     && authority !== PROOF_PUBLICATION_AUTHORITY) {
     throw invalidEvidencePublicationError();
   }
@@ -4885,10 +6059,10 @@ function prepareEvidenceRecordForPublication(record, authority = null) {
   return body;
 }
 
-function writeEvidenceRecordInternal(record, root, authority = null) {
+function writeEvidenceRecordInternal(record, root, authority = null, validationOptions = {}) {
   // Publication validation is deliberately complete before ensureEvidenceDirectory
   // can create even the evidence root. Invalid/private caller data leaves no files.
-  const body = prepareEvidenceRecordForPublication(record, authority);
+  const body = prepareEvidenceRecordForPublication(record, authority, validationOptions);
   const phase = body.phase;
   const declaredSourceDigest = body.source?.sourceInventoryDigest;
   const sourceDigest = declaredSourceDigest == null ? body.recordDigest : declaredSourceDigest;
@@ -5115,7 +6289,8 @@ export function updateLedger(entry, root = REPO_ROOT) {
   // evidence directory. The complete read/validate/mutate/replace transaction
   // is then serialized by the repository-local evidence lock.
   const incoming = prepareIncomingLedgerEntry(entry);
-  if (incoming.phase === "aggregate" && incoming.status === "qualified") {
+  if (incoming.currency === "current"
+    && VERIFIED_STATUS_SET.has(incoming.status)) {
     throw invalidLedgerUpdateError();
   }
   return withEvidenceLedgerLock(root, () => {
@@ -5240,6 +6415,993 @@ function invalidateAllCurrentLedgerEntriesUnderLock(root, loaded = null) {
 
 function invalidateAllCurrentLedgerEntries(root) {
   return withEvidenceLedgerLock(root, () => invalidateAllCurrentLedgerEntriesUnderLock(root));
+}
+
+function restoreLedgerAfterFailedReviewPromotion(root, expectedPublished, original) {
+  try {
+    const current = loadLedgerDocument(root);
+    if (current.expected.contents !== expectedPublished) return false;
+    const file = path.join(root, EVIDENCE_ROOT, "ledger.json");
+    atomicReplaceEvidenceFile(root, file, original.expected.contents, current.expected);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function reviewPromotionCommitUnknown(commitState, recordDigest = null) {
+  const error = fixedEvidenceError(
+    "E_REVIEW_PROMOTION_COMMIT_UNKNOWN",
+    "Review promotion requires protected recovery."
+  );
+  error.commitState = commitState;
+  error.recoveryRequired = true;
+  if (SHA256.test(recordDigest || "")) error.recordDigest = recordDigest;
+  return error;
+}
+
+function classifyReviewPromotionState(root, {
+  expectedPublished,
+  original,
+  recordDigest,
+  replayReviewTrust
+}) {
+  try {
+    const current = loadLedgerDocument(root);
+    if (current.expected.contents === expectedPublished) {
+      const currentPhaseOne = current.ledger.entries.find((entry) => (
+        entry.phase === "1"
+        && entry.currency === "current"
+        && entry.recordDigest === recordDigest
+      ));
+      if (!currentPhaseOne) return "unknown";
+      const replay = verifyLedger(root, {
+        strict: true,
+        signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
+        signedReviewTrust: replayReviewTrust
+      });
+      return replay.ok ? "committed" : "unknown";
+    }
+    if (current.expected.contents === original.expected.contents) {
+      return "restored";
+    }
+  } catch {
+    // The bounded exact re-read could not establish either durable state.
+  }
+  return "unknown";
+}
+
+/**
+ * Private promotion engine. This function is intentionally not exported and
+ * accepts a capability that is distinct from proof publication. A future
+ * protected host runtime may expose a narrow entrypoint after it supplies an
+ * OS/CI-owned trust resolver. The reviewed workspace itself has no way to mint
+ * this capability or select a key.
+ */
+function promotePhaseOneSignedReviewInternal(options = {}, authority = null) {
+  if (authority !== REVIEW_PROMOTION_PUBLICATION_AUTHORITY
+    || !options
+    || typeof options !== "object"
+    || Array.isArray(options)
+    || unexpectedFields(
+      options,
+      new Set(["root", "requestPath", "attestationPath", "trust", "now"])
+    ).length) {
+    throw fixedEvidenceError("E_REVIEW_PROMOTION_FORBIDDEN", "Protected review promotion is unavailable.");
+  }
+  const {
+    root = REPO_ROOT,
+    requestPath,
+    attestationPath,
+    trust,
+    now = new Date().toISOString()
+  } = options;
+  if (typeof root !== "string"
+    || !root
+    || !isCanonicalIsoDateTime(now)
+    || !normalizedReviewArtifactPath(
+      requestPath,
+      REVIEW_REQUEST_ROOT,
+      new RegExp(`^${REVIEW_REQUEST_ROOT}/[0-9a-f]{16}-[0-9a-f]{16}\\.json$`)
+    )
+    || !normalizedReviewArtifactPath(
+      attestationPath,
+      REVIEW_ATTESTATION_ROOT,
+      new RegExp(`^${REVIEW_ATTESTATION_ROOT}/[0-9a-f]{16}-[0-9a-f]{16}\\.json$`)
+    )
+    || !trust
+    || typeof trust !== "object"
+    || Array.isArray(trust)
+    || typeof trust.expectedIssuer !== "string"
+    || trust.expectedIssuer.length < 1
+    || !trust.publicKey) {
+    throw fixedEvidenceError("E_REVIEW_PROMOTION_FORBIDDEN", "Protected review promotion inputs are invalid.");
+  }
+  const signedReviewTrust = Object.freeze({
+    publicKey: trust.publicKey,
+    expectedIssuer: trust.expectedIssuer,
+    revokedKeyFingerprints: [...(trust.revokedKeyFingerprints || [])],
+    now
+  });
+  const promotionReviewTrust = Object.freeze({
+    ...signedReviewTrust,
+    requireFresh: true
+  });
+  const replayReviewTrust = Object.freeze({
+    ...signedReviewTrust,
+    requireFresh: false
+  });
+  let promotionResult = null;
+  let rollback = null;
+
+  try {
+    withEvidenceLedgerLock(root, () => {
+    let loaded;
+    try {
+      loaded = loadLedgerDocument(root);
+    } catch {
+      throw invalidLedgerDocumentError();
+    }
+    if (!ledgerDocumentShapeIsValid(loaded.ledger)) throw invalidLedgerDocumentError();
+    const inspected = loaded.ledger.entries.map((entry) => ({
+      entry: cloneLedgerEntry(entry),
+      record: loadCanonicalCutoverRecord(entry, root)
+    }));
+    const currentPhaseZero = inspected.find(({ entry }) => (
+      entry.currency === "current" && entry.phase === "0"
+    ));
+    const currentPhaseOne = inspected.find(({ entry }) => (
+      entry.currency === "current" && entry.phase === "1"
+    ));
+    if (!currentPhaseZero || !currentPhaseOne
+      || currentPhaseZero.record.status !== "verified_on_draft") {
+      throw fixedEvidenceError("E_REVIEW_PROMOTION_INVALID", "Current Phase 0/1 proof chain is unavailable.");
+    }
+
+    if (currentPhaseOne.record.status === "verified_on_draft") {
+      const receipt = currentPhaseOne.record.independentReviewReceipt;
+      const validation = validateEvidenceRecord(currentPhaseOne.record, {
+        strict: true,
+        root,
+        requireEvidenceSystem: true,
+        signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
+        signedReviewTrust: replayReviewTrust
+      });
+      const strictLedgerReplay = verifyLedger(root, {
+        strict: true,
+        signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
+        signedReviewTrust: replayReviewTrust
+      });
+      if (!validation.ok
+        || !strictLedgerReplay.ok
+        || receipt?.reviewRequest?.path !== requestPath
+        || receipt?.attestation?.path !== attestationPath) {
+        throw fixedEvidenceError("E_REVIEW_PROMOTION_CONFLICT", "A different Phase 1 promotion is already current.");
+      }
+      promotionResult = Object.freeze({
+        ok: true,
+        converged: true,
+        path: currentPhaseOne.entry.path,
+        recordDigest: currentPhaseOne.record.recordDigest
+      });
+      return;
+    }
+    if (currentPhaseOne.record.status !== "implemented_unverified"
+      || currentPhaseOne.record.proofProducer?.id !== PROOF_PRODUCER_ID
+      || currentPhaseOne.record.proofProducer?.version !== PROOF_PRODUCER_VERSION) {
+      throw fixedEvidenceError("E_REVIEW_PROMOTION_INVALID", "Current Phase 1 is not an unverified proof record.");
+    }
+
+    let requestSnapshot;
+    let attestationSnapshot;
+    let request;
+    let attestation;
+    try {
+      requestSnapshot = readBoundedEvidenceFileSnapshot(
+        root,
+        path.join(root, ...requestPath.split("/"))
+      );
+      attestationSnapshot = readBoundedEvidenceFileSnapshot(
+        root,
+        path.join(root, ...attestationPath.split("/"))
+      );
+      request = JSON.parse(requestSnapshot.contents);
+      attestation = JSON.parse(attestationSnapshot.contents);
+    } catch {
+      throw fixedEvidenceError("E_REVIEW_PROMOTION_INVALID", "Review artifacts are unreadable or unsafe.");
+    }
+    if (reviewRequestRelativePath(request) !== requestPath
+      || reviewAttestationRelativePath(attestation) !== attestationPath
+      || request.proof.path !== currentPhaseOne.entry.path
+      || request.proof.recordDigest !== currentPhaseOne.record.recordDigest
+      || request.prerequisite.path !== currentPhaseZero.entry.path
+      || request.prerequisite.recordDigest !== currentPhaseZero.record.recordDigest) {
+      throw fixedEvidenceError("E_REVIEW_PROMOTION_INVALID", "Review artifacts do not bind the current proof chain.");
+    }
+    const requestValidation = validatePhaseOneReviewRequest(request, {
+      root,
+      now,
+      requireFresh: true,
+      requireCurrentProof: true
+    });
+    const attestationValidation = validateIndependentReviewAttestation(attestation, {
+      request,
+      requestPath,
+      publicKey: signedReviewTrust.publicKey,
+      expectedIssuer: signedReviewTrust.expectedIssuer,
+      revokedKeyFingerprints: signedReviewTrust.revokedKeyFingerprints,
+      now
+    });
+    if (!requestValidation.ok || !attestationValidation.ok) {
+      throw fixedEvidenceError("E_REVIEW_PROMOTION_INVALID", "Review request or attestation verification failed.");
+    }
+
+    const receipt = attachIndependentReviewReceiptDigest({
+      schemaVersion: SIGNED_REVIEW_RECEIPT_SCHEMA_VERSION,
+      producerId: SIGNED_REVIEW_RECEIPT_PRODUCER_ID,
+      producerVersion: SIGNED_REVIEW_RECEIPT_PRODUCER_VERSION,
+      reviewRequest: {
+        path: requestPath,
+        digest: request.requestDigest
+      },
+      attestation: {
+        path: attestationPath,
+        digest: attestation.attestationDigest
+      },
+      issuer: attestation.issuer,
+      keyFingerprint: attestation.keyFingerprint
+    });
+    const promoted = attachRecordDigest({
+      ...structuredClone(currentPhaseOne.record),
+      status: "verified_on_draft",
+      recordedAt: attestation.endedAt,
+      independentReviewReceipt: receipt,
+      authorities: {
+        ...structuredClone(currentPhaseOne.record.authorities),
+        independentValidation: "pass"
+      }
+    });
+    const promotedValidationOptions = {
+      strict: true,
+      root,
+      requireEvidenceSystem: true,
+      signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
+      signedReviewTrust: promotionReviewTrust
+    };
+    const promotedValidation = validateEvidenceRecord(promoted, promotedValidationOptions);
+    if (!promotedValidation.ok) {
+      throw fixedEvidenceError("E_REVIEW_PROMOTION_INVALID", "Promoted Phase 1 record is invalid.");
+    }
+
+    const originalBefore = readBoundedEvidenceFileSnapshot(
+      root,
+      path.join(root, ...currentPhaseOne.entry.path.split("/"))
+    );
+    const relative = writeEvidenceRecordInternal(
+      promoted,
+      root,
+      REVIEW_PROMOTION_PUBLICATION_AUTHORITY,
+      promotedValidationOptions
+    );
+    const lockedRequest = readBoundedEvidenceFileSnapshot(
+      root,
+      path.join(root, ...requestPath.split("/"))
+    );
+    const lockedAttestation = readBoundedEvidenceFileSnapshot(
+      root,
+      path.join(root, ...attestationPath.split("/"))
+    );
+    const originalAfter = readBoundedEvidenceFileSnapshot(
+      root,
+      path.join(root, ...currentPhaseOne.entry.path.split("/"))
+    );
+    if (requestSnapshot.contents !== lockedRequest.contents
+      || attestationSnapshot.contents !== lockedAttestation.contents
+      || originalBefore.contents !== originalAfter.contents
+      || !sameFileSnapshot(requestSnapshot.fileSnapshot, lockedRequest.fileSnapshot)
+      || !sameFileSnapshot(attestationSnapshot.fileSnapshot, lockedAttestation.fileSnapshot)
+      || !sameFileSnapshot(originalBefore.fileSnapshot, originalAfter.fileSnapshot)) {
+      throw fixedEvidenceError("E_REVIEW_PROMOTION_RACE", "Review artifacts changed during promotion.");
+    }
+    const finalRequestValidation = validatePhaseOneReviewRequest(request, {
+      root,
+      now,
+      requireFresh: true,
+      requireCurrentProof: true
+    });
+    if (!finalRequestValidation.ok) {
+      throw fixedEvidenceError("E_REVIEW_PROMOTION_RACE", "Review source or prerequisite changed during promotion.");
+    }
+
+    const entries = inspected.map(({ entry }) => (
+      supersedeCurrentProofChainEntry(entry, "1")
+    ));
+    entries.push({
+      phase: promoted.phase,
+      slice: promoted.slice,
+      status: promoted.status,
+      path: relative,
+      recordDigest: promoted.recordDigest,
+      sourceCommit: promoted.source.headCommit,
+      currency: "current",
+      recordedAt: promoted.recordedAt
+    });
+    const next = {
+      schemaVersion: 1,
+      roadmapVersion: ROADMAP_VERSION,
+      issue: ISSUE_URL,
+      updatedAt: new Date().toISOString(),
+      entries
+    };
+    if (!ledgerDocumentShapeIsValid(next)) throw invalidLedgerUpdateError();
+    const ledgerFile = path.join(root, EVIDENCE_ROOT, "ledger.json");
+    const serializedNext = `${JSON.stringify(next, null, 2)}\n`;
+    rollback = { expectedPublished: serializedNext, original: loaded };
+    try {
+      atomicReplaceEvidenceFile(root, ledgerFile, serializedNext, loaded.expected);
+    } catch (error) {
+      const commitState = error?.[ATOMIC_REPLACE_COMMIT_STATE] || "unknown";
+      if (commitState === "not_committed") {
+        rollback = null;
+        throw fixedEvidenceError(
+          "E_REVIEW_PROMOTION_RACE",
+          "Review promotion ledger cutover did not commit."
+        );
+      }
+      if (commitState === "committed") {
+        const committedReplay = verifyLedger(root, {
+          strict: true,
+          signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
+          signedReviewTrust: replayReviewTrust
+        });
+        if (committedReplay.ok) {
+          promotionResult = Object.freeze({
+            ok: true,
+            converged: false,
+            path: relative,
+            recordDigest: promoted.recordDigest
+          });
+          throw reviewPromotionCommitUnknown("committed", promoted.recordDigest);
+        }
+        restoreLedgerAfterFailedReviewPromotion(root, serializedNext, loaded);
+        const recoveredState = classifyReviewPromotionState(root, {
+          expectedPublished: serializedNext,
+          original: loaded,
+          recordDigest: promoted.recordDigest,
+          replayReviewTrust
+        });
+        rollback = null;
+        throw reviewPromotionCommitUnknown(recoveredState, promoted.recordDigest);
+      }
+      throw reviewPromotionCommitUnknown("unknown", promoted.recordDigest);
+    }
+    const replay = verifyLedger(root, {
+      strict: true,
+      signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
+      signedReviewTrust: replayReviewTrust
+    });
+    const requestAfterCutover = validatePhaseOneReviewRequest(request, {
+      root,
+      now,
+      requireFresh: true,
+      requireCurrentProof: false
+    });
+    if (!replay.ok || !requestAfterCutover.ok) {
+      restoreLedgerAfterFailedReviewPromotion(root, serializedNext, loaded);
+      const recoveredState = classifyReviewPromotionState(root, {
+        expectedPublished: serializedNext,
+        original: loaded,
+        recordDigest: promoted.recordDigest,
+        replayReviewTrust
+      });
+      rollback = null;
+      throw reviewPromotionCommitUnknown(recoveredState, promoted.recordDigest);
+    }
+    promotionResult = Object.freeze({
+      ok: true,
+      converged: false,
+      path: relative,
+      recordDigest: promoted.recordDigest
+    });
+    });
+  } catch (error) {
+    const releaseFailed = Boolean(
+      error?.[LEDGER_LOCK_ACTION_COMPLETED]
+      || error?.[LEDGER_LOCK_RELEASE_FAILURE]
+    );
+    if (releaseFailed && promotionResult) {
+      let state = "unknown";
+      if (rollback) {
+        state = classifyReviewPromotionState(root, {
+          expectedPublished: rollback.expectedPublished,
+          original: rollback.original,
+          recordDigest: promotionResult.recordDigest,
+          replayReviewTrust
+        });
+      } else {
+        try {
+          const replay = verifyLedger(root, {
+            strict: true,
+            signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
+            signedReviewTrust: replayReviewTrust
+          });
+          if (replay.ok) state = "committed";
+        } catch {}
+      }
+      state = `${state}_lock_unclean`;
+      throw reviewPromotionCommitUnknown(state, promotionResult.recordDigest);
+    }
+    throw error;
+  }
+
+  if (!promotionResult) {
+    throw fixedEvidenceError("E_REVIEW_PROMOTION_INVALID", "Review promotion did not complete.");
+  }
+  const replayAfterRelease = verifyLedger(root, {
+    strict: true,
+    signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
+    signedReviewTrust: replayReviewTrust
+  });
+  if (!replayAfterRelease.ok) {
+    let recoveredState = "unknown";
+    if (rollback) {
+      try {
+        withEvidenceLedgerLock(root, () => {
+          restoreLedgerAfterFailedReviewPromotion(
+            root,
+            rollback.expectedPublished,
+            rollback.original
+          );
+        });
+      } catch {}
+      recoveredState = classifyReviewPromotionState(root, {
+        expectedPublished: rollback.expectedPublished,
+        original: rollback.original,
+        recordDigest: promotionResult.recordDigest,
+        replayReviewTrust
+      });
+    }
+    throw reviewPromotionCommitUnknown(
+      recoveredState,
+      promotionResult.recordDigest
+    );
+  }
+  return promotionResult;
+}
+
+function protectedReviewTrustError() {
+  return fixedEvidenceError(
+    "E_REVIEW_TRUST_UNAVAILABLE",
+    "Protected review trust is unavailable."
+  );
+}
+
+function assertProtectedHostPath(absolute, expectedType) {
+  if (process.platform === "win32" || typeof process.getuid !== "function") {
+    throw protectedReviewTrustError();
+  }
+  let chain;
+  try {
+    const filesystemRoot = path.parse(path.resolve(absolute)).root;
+    chain = captureEvidencePathChain(filesystemRoot, path.resolve(absolute));
+  } catch {
+    throw protectedReviewTrustError();
+  }
+  const relative = path.relative(chain.canonicalRoot, chain.canonicalAbsolute);
+  const componentPaths = [chain.canonicalRoot];
+  let cursor = chain.canonicalRoot;
+  for (const component of relative.split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, component);
+    componentPaths.push(cursor);
+  }
+  const snapshots = [
+    fs.lstatSync(chain.canonicalRoot, { bigint: true }),
+    ...chain.snapshots
+  ];
+  for (const [index, stat] of snapshots.entries()) {
+    if (stat.isSymbolicLink()
+      || stat.uid !== 0n
+      || (stat.mode & 0o022n) !== 0n) {
+      throw protectedReviewTrustError();
+    }
+    try {
+      fs.accessSync(componentPaths[index], fs.constants.W_OK);
+      throw protectedReviewTrustError();
+    } catch (error) {
+      if (error?.code === "E_REVIEW_TRUST_UNAVAILABLE") throw error;
+      if (!new Set(["EACCES", "EPERM", "EROFS"]).has(error?.code)) {
+        throw protectedReviewTrustError();
+      }
+    }
+  }
+  const leaf = snapshots.at(-1);
+  if ((expectedType === "file" && !leaf?.isFile())
+    || (expectedType === "directory" && !leaf?.isDirectory())) {
+    throw protectedReviewTrustError();
+  }
+  return chain;
+}
+
+function canonicalProtectedReviewDescriptorBody(descriptor) {
+  const body = structuredClone(descriptor);
+  delete body.descriptorDigest;
+  return stableStringify(body);
+}
+
+function loadProtectedReviewRuntimeBundle(runtimeRoot, descriptor) {
+  if (!Array.isArray(descriptor.runtimeBundle)
+    || descriptor.runtimeBundle.length !== PROTECTED_REVIEW_RUNTIME_BUNDLE_PATHS.length
+    || descriptor.runtimeBundle.some((entry, index) => (
+      !entry
+      || typeof entry !== "object"
+      || Array.isArray(entry)
+      || !exactFields(entry, PROTECTED_REVIEW_RUNTIME_BUNDLE_ENTRY_FIELDS)
+      || entry.path !== PROTECTED_REVIEW_RUNTIME_BUNDLE_PATHS[index]
+      || !SHA256.test(entry.digest || "")
+    ))
+    || !SHA256.test(descriptor.runtimeBundleDigest || "")
+    || descriptor.runtimeBundleDigest !== sha256Text(stableStringify(descriptor.runtimeBundle))) {
+    throw protectedReviewTrustError();
+  }
+  const before = [];
+  try {
+    for (const entry of descriptor.runtimeBundle) {
+      const absolute = path.join(runtimeRoot, ...entry.path.split("/"));
+      assertProtectedHostPath(absolute, "file");
+      const snapshot = readBoundedEvidenceFileSnapshot(
+        runtimeRoot,
+        absolute,
+        PROTECTED_REVIEW_MODULE_MAX_BYTES
+      );
+      if (sha256Text(snapshot.contents) !== entry.digest) {
+        throw protectedReviewTrustError();
+      }
+      before.push({ absolute, snapshot });
+    }
+  } catch {
+    throw protectedReviewTrustError();
+  }
+  return before;
+}
+
+function loadProtectedReviewTrust() {
+  const runtimeModule = fileURLToPath(import.meta.url);
+  const runtimeRoot = path.resolve(path.dirname(runtimeModule), "../..");
+  const descriptorPath = path.join(runtimeRoot, PROTECTED_REVIEW_TRUST_FILE);
+  const emptyHooksPath = path.join(runtimeRoot, PROTECTED_REVIEW_EMPTY_HOOKS_PATH);
+  try {
+    assertProtectedHostPath(runtimeRoot, "directory");
+    assertProtectedHostPath(path.dirname(descriptorPath), "directory");
+    assertProtectedHostPath(descriptorPath, "file");
+    assertProtectedHostPath(emptyHooksPath, "directory");
+    if (fs.readdirSync(emptyHooksPath).length !== 0) {
+      throw protectedReviewTrustError();
+    }
+  } catch {
+    throw protectedReviewTrustError();
+  }
+  let descriptorSnapshot;
+  let descriptor;
+  try {
+    descriptorSnapshot = readBoundedEvidenceFileSnapshot(
+      runtimeRoot,
+      descriptorPath,
+      PROTECTED_REVIEW_TRUST_MAX_BYTES
+    );
+    descriptor = JSON.parse(descriptorSnapshot.contents);
+  } catch {
+    throw protectedReviewTrustError();
+  }
+  if (!descriptor
+    || typeof descriptor !== "object"
+    || Array.isArray(descriptor)
+    || !exactFields(descriptor, PROTECTED_REVIEW_TRUST_FIELDS)
+    || descriptor.schemaVersion !== 1
+    || descriptor.domain !== REVIEW_ATTESTATION_DOMAIN
+    || descriptor.algorithm !== REVIEW_ATTESTATION_ALGORITHM
+    || typeof descriptor.issuer !== "string"
+    || !/^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/.test(descriptor.issuer)
+    || typeof descriptor.publicKeySpkiBase64 !== "string"
+    || !Array.isArray(descriptor.revokedKeyFingerprints)
+    || descriptor.revokedKeyFingerprints.some((fingerprint) => !SHA256.test(fingerprint || ""))
+    || !SHA256.test(descriptor.keyFingerprint || "")
+    || !SHA256.test(descriptor.gitDigest || "")
+    || descriptor.policyDigest !== PROTECTED_REVIEW_POLICY_DIGEST
+    || !SHA256.test(descriptor.descriptorDigest || "")
+    || descriptor.descriptorDigest
+      !== sha256Text(canonicalProtectedReviewDescriptorBody(descriptor))) {
+    throw protectedReviewTrustError();
+  }
+  const runtimeBundle = loadProtectedReviewRuntimeBundle(runtimeRoot, descriptor);
+  let spki;
+  let publicKey;
+  try {
+    spki = Buffer.from(descriptor.publicKeySpkiBase64, "base64");
+    if (spki.length < 1 || spki.toString("base64") !== descriptor.publicKeySpkiBase64) {
+      throw new Error("non-canonical SPKI");
+    }
+    publicKey = crypto.createPublicKey({
+      key: spki,
+      type: "spki",
+      format: "der"
+    });
+  } catch {
+    throw protectedReviewTrustError();
+  }
+  if (publicKey.asymmetricKeyType !== "ed25519"
+    || computeReviewPublicKeyFingerprint(publicKey) !== descriptor.keyFingerprint) {
+    throw protectedReviewTrustError();
+  }
+  let gitBinding;
+  try {
+    assertProtectedHostPath(PROTECTED_REVIEW_GIT_PATH, "file");
+    gitBinding = {
+      ...captureBoundFile(PROTECTED_REVIEW_GIT_PATH, { executable: true }),
+      emptyHooksPath
+    };
+    if (gitBinding.entryType !== "file"
+      || gitBinding.entryPath !== PROTECTED_REVIEW_GIT_PATH
+      || gitBinding.canonicalPath !== PROTECTED_REVIEW_GIT_PATH
+      || gitBinding.sha256 !== descriptor.gitDigest) {
+      throw protectedReviewTrustError();
+    }
+  } catch {
+    throw protectedReviewTrustError();
+  }
+  let descriptorAfter;
+  try {
+    descriptorAfter = readBoundedEvidenceFileSnapshot(
+      runtimeRoot,
+      descriptorPath,
+      PROTECTED_REVIEW_TRUST_MAX_BYTES
+    );
+  } catch {
+    throw protectedReviewTrustError();
+  }
+  if (descriptorAfter.contents !== descriptorSnapshot.contents
+    || !sameFileSnapshot(descriptorAfter.fileSnapshot, descriptorSnapshot.fileSnapshot)) {
+    throw protectedReviewTrustError();
+  }
+  for (const { absolute, snapshot } of runtimeBundle) {
+    let after;
+    try {
+      after = readBoundedEvidenceFileSnapshot(
+        runtimeRoot,
+        absolute,
+        PROTECTED_REVIEW_MODULE_MAX_BYTES
+      );
+    } catch {
+      throw protectedReviewTrustError();
+    }
+    if (after.contents !== snapshot.contents
+      || !sameFileSnapshot(after.fileSnapshot, snapshot.fileSnapshot)) {
+      throw protectedReviewTrustError();
+    }
+  }
+  return Object.freeze({
+    runtimeRoot,
+    publicKey,
+    gitBinding,
+    expectedIssuer: descriptor.issuer,
+    revokedKeyFingerprints: Object.freeze([...descriptor.revokedKeyFingerprints])
+  });
+}
+
+function protectedWorkspaceRoot(workspace, runtimeRoot) {
+  if (typeof workspace !== "string"
+    || !workspace
+    || !path.isAbsolute(workspace)
+    || path.normalize(workspace) !== workspace) {
+    throw protectedReviewTrustError();
+  }
+  let resolved;
+  let canonical;
+  let stat;
+  try {
+    resolved = path.resolve(workspace);
+    canonical = fs.realpathSync.native(resolved);
+    stat = fs.lstatSync(resolved);
+  } catch {
+    throw protectedReviewTrustError();
+  }
+  if (stat.isSymbolicLink()
+    || !stat.isDirectory()
+    || canonical !== resolved
+    || canonical === runtimeRoot
+    || canonical.startsWith(`${runtimeRoot}${path.sep}`)) {
+    throw protectedReviewTrustError();
+  }
+  const gitDirectory = path.join(canonical, ".git");
+  const requiredGitPaths = [
+    [gitDirectory, "directory"],
+    [path.join(gitDirectory, "config"), "file"],
+    [path.join(gitDirectory, "index"), "file"],
+    [path.join(gitDirectory, "objects"), "directory"]
+  ];
+  try {
+    for (const [absolute, expectedType] of requiredGitPaths) {
+      const gitStat = fs.lstatSync(absolute);
+      if (gitStat.isSymbolicLink()
+        || (expectedType === "file" && !gitStat.isFile())
+        || (expectedType === "directory" && !gitStat.isDirectory())) {
+        throw protectedReviewTrustError();
+      }
+    }
+    for (const forbidden of [
+      path.join(gitDirectory, "commondir"),
+      path.join(gitDirectory, "config.worktree"),
+      path.join(gitDirectory, "objects", "info", "alternates")
+    ]) {
+      if (fs.existsSync(forbidden)) throw protectedReviewTrustError();
+    }
+  } catch {
+    throw protectedReviewTrustError();
+  }
+  return canonical;
+}
+
+function assertProtectedWorkspaceGitConfiguration(root) {
+  const configPath = path.join(root, ".git", "config");
+  let before;
+  let names;
+  let after;
+  try {
+    before = readBoundedEvidenceFileSnapshot(root, configPath, 64 * 1024);
+    names = execTrustedGit([
+      "config",
+      "--file",
+      configPath,
+      "--no-includes",
+      "--null",
+      "--name-only",
+      "--list"
+    ], {
+      cwd: root,
+      encoding: "utf8",
+      maxBuffer: 256 * 1024
+    }).split("\0").filter(Boolean);
+    after = readBoundedEvidenceFileSnapshot(root, configPath, 64 * 1024);
+  } catch {
+    throw protectedReviewTrustError();
+  }
+  if (before.contents !== after.contents
+    || !sameFileSnapshot(before.fileSnapshot, after.fileSnapshot)
+    || names.length > 512
+    || names.some((name) => (
+      typeof name !== "string"
+      || name.length < 1
+      || name.length > 512
+      || /^(?:include|includeif)\./i.test(name)
+      || /^(?:alias|credential|diff|difftool|filter|gpg|gpgssh|merge|mergetool|submodule)\./i.test(name)
+      || /^core\.(?:askpass|attributesfile|editor|excludesfile|fsmonitor|gitproxy|hookspath|pager|sshcommand|worktree)$/i.test(name)
+      || /^extensions\.(?:partialclone|worktreeconfig)$/i.test(name)
+      || /^interactive\.difffilter$/i.test(name)
+      || /^remote\..*\.promisor$/i.test(name)
+      || /^sequence\.editor$/i.test(name)
+    ))) {
+    throw protectedReviewTrustError();
+  }
+}
+
+function importPhaseOneReviewAttestationInternal(options = {}, authority = null) {
+  if (authority !== REVIEW_PROMOTION_PUBLICATION_AUTHORITY
+    || !options
+    || typeof options !== "object"
+    || Array.isArray(options)
+    || unexpectedFields(
+      options,
+      new Set(["root", "requestPath", "attestation", "trust", "now"])
+    ).length) {
+    throw fixedEvidenceError(
+      "E_REVIEW_PROMOTION_FORBIDDEN",
+      "Protected review attestation import is unavailable."
+    );
+  }
+  const {
+    root,
+    requestPath,
+    attestation: suppliedAttestation,
+    trust,
+    now
+  } = options;
+  if (typeof root !== "string"
+    || !root
+    || !isCanonicalIsoDateTime(now)
+    || !normalizedReviewArtifactPath(
+      requestPath,
+      REVIEW_REQUEST_ROOT,
+      new RegExp(`^${REVIEW_REQUEST_ROOT}/[0-9a-f]{16}-[0-9a-f]{16}\\.json$`)
+    )
+    || !trust
+    || typeof trust !== "object"
+    || Array.isArray(trust)
+    || !trust.publicKey
+    || typeof trust.expectedIssuer !== "string"
+    || !Array.isArray(trust.revokedKeyFingerprints)
+    || !rawEvidenceValueIsSafe(suppliedAttestation, "$reviewAttestation")) {
+    throw fixedEvidenceError(
+      "E_REVIEW_ATTESTATION_INVALID",
+      "Protected review attestation import is invalid."
+    );
+  }
+  let attestation;
+  let request;
+  try {
+    attestation = structuredClone(suppliedAttestation);
+    request = JSON.parse(readBoundedEvidenceFile(
+      root,
+      path.join(root, ...requestPath.split("/"))
+    ));
+  } catch {
+    throw fixedEvidenceError(
+      "E_REVIEW_ATTESTATION_INVALID",
+      "Protected review attestation import is unreadable."
+    );
+  }
+  if (reviewRequestRelativePath(request) !== requestPath) {
+    throw fixedEvidenceError(
+      "E_REVIEW_REQUEST_INVALID",
+      "Protected review request path is invalid."
+    );
+  }
+  const attestationValidation = validateIndependentReviewAttestation(attestation, {
+    request,
+    requestPath,
+    publicKey: trust.publicKey,
+    expectedIssuer: trust.expectedIssuer,
+    revokedKeyFingerprints: trust.revokedKeyFingerprints,
+    now,
+    requireFreshRequest: false
+  });
+  if (!attestationValidation.ok) {
+    throw fixedEvidenceError(
+      "E_REVIEW_ATTESTATION_INVALID",
+      "Protected review attestation does not match the signed request."
+    );
+  }
+  const relative = reviewAttestationRelativePath(attestation);
+  if (!normalizedReviewArtifactPath(
+    relative,
+    REVIEW_ATTESTATION_ROOT,
+    new RegExp(`^${REVIEW_ATTESTATION_ROOT}/[0-9a-f]{16}-[0-9a-f]{16}\\.json$`)
+  )) {
+    throw fixedEvidenceError(
+      "E_REVIEW_ATTESTATION_INVALID",
+      "Protected review attestation path is invalid."
+    );
+  }
+  const serialized = `${JSON.stringify(attestation, null, 2)}\n`;
+  if (Buffer.byteLength(serialized) > MAX_EVIDENCE_RECORD_BYTES) {
+    throw fixedEvidenceError(
+      "E_REVIEW_ATTESTATION_INVALID",
+      "Protected review attestation exceeds its bound."
+    );
+  }
+  const absolute = path.join(root, ...relative.split("/"));
+  let existing = null;
+  try {
+    existing = readBoundedEvidenceFile(root, absolute);
+  } catch {}
+  if (existing !== null) {
+    const replayRequestValidation = validatePhaseOneReviewRequest(request, {
+      root,
+      now,
+      requireFresh: false,
+      requireCurrentProof: false,
+      allowEvidenceOnlyIdentityDrift: true
+    });
+    if (existing !== serialized || !replayRequestValidation.ok) {
+      throw fixedEvidenceError(
+        "E_REVIEW_ATTESTATION_INVALID",
+        "Immutable review attestation replay is invalid."
+      );
+    }
+    return relative;
+  }
+  let absent = false;
+  try {
+    absent = evidencePathIsStablyAbsent(root, absolute);
+  } catch {}
+  if (!absent) {
+    throw fixedEvidenceError(
+      "E_REVIEW_ATTESTATION_INVALID",
+      "Immutable review attestation destination is unsafe."
+    );
+  }
+  const requestValidation = validatePhaseOneReviewRequest(request, {
+    root,
+    now,
+    requireFresh: true,
+    requireCurrentProof: true
+  });
+  if (!requestValidation.ok) {
+    throw fixedEvidenceError(
+      "E_REVIEW_ATTESTATION_INVALID",
+      "Protected review request is not current for attestation admission."
+    );
+  }
+  try {
+    ensureEvidenceDirectory(root, path.dirname(absolute));
+    publishImmutableEvidenceFile(root, absolute, serialized);
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      try {
+        if (readBoundedEvidenceFile(root, absolute) === serialized) return relative;
+      } catch {}
+    }
+    throw fixedEvidenceError(
+      "E_REVIEW_ATTESTATION_INVALID",
+      "Immutable review attestation publication failed."
+    );
+  }
+  return relative;
+}
+
+/**
+ * Production promotion surface. Invocation is public; authorization is not.
+ * Trust is loaded only from a fixed protected-runtime sibling descriptor and
+ * the reviewed workspace is treated solely as signed data.
+ */
+export function promotePhaseOneFromProtectedRuntime(options = {}) {
+  if (!options
+    || typeof options !== "object"
+    || Array.isArray(options)
+    || unexpectedFields(
+      options,
+      new Set(["workspace", "requestPath", "attestation"])
+    ).length) {
+    throw protectedReviewTrustError();
+  }
+  const protectedTrust = loadProtectedReviewTrust();
+  const root = protectedWorkspaceRoot(options.workspace, protectedTrust.runtimeRoot);
+  const now = new Date().toISOString();
+  const trust = {
+    publicKey: protectedTrust.publicKey,
+    expectedIssuer: protectedTrust.expectedIssuer,
+    revokedKeyFingerprints: protectedTrust.revokedKeyFingerprints
+  };
+  return withProtectedReviewGitBinding(protectedTrust.gitBinding, () => {
+    assertProtectedWorkspaceGitConfiguration(root);
+    const attestationPath = importPhaseOneReviewAttestationInternal({
+      root,
+      requestPath: options.requestPath,
+      attestation: options.attestation,
+      trust,
+      now
+    }, REVIEW_PROMOTION_PUBLICATION_AUTHORITY);
+    return promotePhaseOneSignedReviewInternal({
+      root,
+      requestPath: options.requestPath,
+      attestationPath,
+      now,
+      trust
+    }, REVIEW_PROMOTION_PUBLICATION_AUTHORITY);
+  });
+}
+
+export function verifySignedLedgerFromProtectedRuntime(options = {}) {
+  if (!options
+    || typeof options !== "object"
+    || Array.isArray(options)
+    || unexpectedFields(options, new Set(["workspace"])).length) {
+    throw protectedReviewTrustError();
+  }
+  const protectedTrust = loadProtectedReviewTrust();
+  const root = protectedWorkspaceRoot(options.workspace, protectedTrust.runtimeRoot);
+  return withProtectedReviewGitBinding(protectedTrust.gitBinding, () => {
+    assertProtectedWorkspaceGitConfiguration(root);
+    return verifyLedger(root, {
+      strict: true,
+      signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
+      signedReviewTrust: {
+        publicKey: protectedTrust.publicKey,
+        expectedIssuer: protectedTrust.expectedIssuer,
+        revokedKeyFingerprints: protectedTrust.revokedKeyFingerprints,
+        now: new Date().toISOString(),
+        requireFresh: false
+      }
+    });
+  });
 }
 
 function prerequisiteSnapshotFromInspected(phase, inspected, root) {
@@ -5761,7 +7923,9 @@ export function assessCompleteEvidenceChain(records) {
 
 export function verifyLedger(root = REPO_ROOT, {
   strict = false,
-  requireComplete = false
+  requireComplete = false,
+  signedReviewAuthority = null,
+  signedReviewTrust = null
 } = {}) {
   const effectiveStrict = Boolean(strict || requireComplete);
   let ledger;
@@ -5907,7 +8071,9 @@ export function verifyLedger(root = REPO_ROOT, {
         const result = validateEvidenceRecord(record, {
           strict: effectiveStrict,
           root,
-          rejectProvisional: effectiveStrict && entry.status === "qualified"
+          rejectProvisional: effectiveStrict && entry.status === "qualified",
+          signedReviewAuthority,
+          signedReviewTrust
         });
         if (!result.ok) {
           errors.push(...result.errors.map((message) => `Ledger entry ${index}: ${message}`));
