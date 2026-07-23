@@ -14,6 +14,7 @@ const MARKETPLACE = "grok-companion";
 const SOURCE_PLUGIN = path.join(ROOT, "plugins", "grok");
 const CODEX_BIN = process.env.CODEX_BIN || "codex";
 const NPM_BIN = process.platform === "win32" ? "npm.cmd" : "npm";
+const REPOSITORY_CHECK_TIMEOUT_MS = 20 * 60_000;
 
 function fail(message, details = "") {
   const suffix = details.trim() ? `\n${details.trim()}` : "";
@@ -139,7 +140,10 @@ function main() {
   };
 
   step("[1/4] Running the complete repository check...");
-  runChecked(NPM_BIN, ["run", "check"]);
+  // The deterministic inventory is intentionally serial and can exceed the
+  // generic three-minute command timeout on supported laptops and CI hosts.
+  // Allow five minutes of headroom over the proof producer's 15-minute gate.
+  runChecked(NPM_BIN, ["run", "check"], { timeout: REPOSITORY_CHECK_TIMEOUT_MS });
 
   step("[2/4] Requiring the clean installed-Codex PTY regression...");
   runChecked(NPM_BIN, ["run", "test:installed-codex"], {
