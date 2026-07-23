@@ -15,10 +15,22 @@ import {
   INDEPENDENT_REVIEW_PRODUCER_ID,
   INDEPENDENT_REVIEW_PRODUCER_VERSION,
   INDEPENDENT_REVIEW_MANIFEST_DIGEST,
+  LIVE_RECEIPT_AUTHORITY_CONFIG,
+  LIVE_RECEIPT_AUTHORITY_NATURAL,
+  LIVE_RECEIPT_AUTHORITY_SYNTHETIC,
+  LIVE_RECEIPT_CAPABILITY_TOOL_IDS,
+  LIVE_RECEIPT_MANIFEST,
+  LIVE_RECEIPT_NATURAL_TOOL_IDS,
+  LIVE_RECEIPT_PRODUCER_ID,
+  LIVE_RECEIPT_PRODUCER_VERSION,
+  LIVE_RECEIPT_ROOT,
+  LIVE_RECEIPT_SCENARIO_IDS,
   attachIndependentReviewReceiptDigest,
   attachRecordDigest,
   buildEvidenceRecord,
   computeInventoryDigest,
+  computeLiveQualificationReceiptDigest,
+  computeLiveReceiptManifestDigest,
   computePhaseScopeDigest,
   computeProofManifestDigest,
   computeRecordDigest,
@@ -40,6 +52,7 @@ import {
   statusSatisfiesVerifiedPrerequisite,
   updateLedger,
   validateEvidenceRecord,
+  validateLiveQualificationReceipt,
   verifyLedger,
   verifyPhase,
   writeEvidenceRecord,
@@ -597,6 +610,246 @@ function initPhaseOneProofRunnerFixture(name, {
   git(root, "add", ".");
   git(root, "commit", "-m", `configure ${name}`);
   return { root, evidenceDir };
+}
+
+function initLiveReceiptFixture(name = "live-receipt-fixture") {
+  const root = fs.realpathSync.native(initRepo());
+  const scopedPaths = new Set([...PHASE_SCOPE["1"], ...PHASE_SCOPE["4"]]);
+  for (const relative of scopedPaths) {
+    const absolute = path.join(root, relative);
+    fs.mkdirSync(path.dirname(absolute), { recursive: true });
+    let content = `fixture for ${relative}\n`;
+    if (relative === "plugins/grok/.codex-plugin/plugin.json") {
+      content = `${JSON.stringify({ name: "grok", version: "1.0.0" })}\n`;
+    } else if (/\.json$/i.test(relative)) {
+      content = "{}\n";
+    } else if (/\.(?:m?js)$/i.test(relative)) {
+      content = "export {};\n";
+    } else if (/\.cjs$/i.test(relative)) {
+      content = "module.exports = {};\n";
+    }
+    fs.writeFileSync(absolute, content);
+  }
+  fs.writeFileSync(path.join(root, "package.json"), `${JSON.stringify({
+    name,
+    version: "1.0.0",
+    private: true,
+    type: "module"
+  }, null, 2)}\n`);
+  const evidenceDir = path.join(root, "tests/e2e-results/worker-broker");
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(path.join(evidenceDir, ".gitkeep"), "");
+  git(root, "add", ".");
+  git(root, "commit", "-m", `configure ${name}`);
+  return {
+    name,
+    root,
+    providerCapabilityDigest: sha256Text(`${name}:stable-provider-capability`),
+    hostTaskDigest: sha256Text(`${name}:opaque-host-task-authority`)
+  };
+}
+
+function structuralPluginInventory(pluginRoot) {
+  const entries = [];
+  let pluginVersion = null;
+  let installedEntrypointDigest = null;
+  const visit = (directory, prefix = "") => {
+    const children = fs.readdirSync(directory, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const child of children) {
+      const absolute = path.join(directory, child.name);
+      const relative = prefix ? `${prefix}/${child.name}` : child.name;
+      if (child.isDirectory()) {
+        visit(absolute, relative);
+        continue;
+      }
+      assert.equal(child.isFile(), true, `structural receipt fixture cannot include ${relative}`);
+      const stat = fs.statSync(absolute);
+      const bytes = fs.readFileSync(absolute);
+      const digest = sha256Text(bytes);
+      entries.push({
+        path: relative,
+        mode: stat.mode & 0o777,
+        size: bytes.byteLength,
+        sha256: digest
+      });
+      if (relative === ".codex-plugin/plugin.json") {
+        pluginVersion = JSON.parse(bytes.toString("utf8")).version;
+      }
+      if (relative === LIVE_RECEIPT_MANIFEST.installedEntrypoint) {
+        installedEntrypointDigest = digest;
+      }
+    }
+  };
+  visit(pluginRoot);
+  assert.equal(typeof pluginVersion, "string");
+  assert.match(installedEntrypointDigest, /^[0-9a-f]{64}$/);
+  return {
+    digest: sha256Text(JSON.stringify(entries)),
+    fileCount: entries.length,
+    pluginVersion,
+    installedEntrypointDigest
+  };
+}
+
+// These fixtures deliberately author JSON below the unsupported publication
+// boundary. They exercise strict offline replay only and are not proof that a
+// live runner observed or authenticated any provider or host event.
+function attachStructuralLiveReceiptDigest(receipt) {
+  const next = { ...receipt };
+  delete next.receiptDigest;
+  next.receiptDigest = computeLiveQualificationReceiptDigest(next);
+  return next;
+}
+
+function structuralLiveReceipt(fixture, authorityMode, overrides = {}) {
+  const config = LIVE_RECEIPT_AUTHORITY_CONFIG[authorityMode];
+  assert.ok(config, authorityMode);
+  const sourceInventoryDigest = computeInventoryDigest(
+    fixture.root,
+    { includeEvidence: false }
+  );
+  const identity = gitIdentity(fixture.root);
+  const pluginInventory = structuralPluginInventory(
+    path.join(fixture.root, "plugins/grok")
+  );
+  const natural = authorityMode === LIVE_RECEIPT_AUTHORITY_NATURAL;
+  const providerBinaryDigest = sha256Text(
+    `${fixture.name}:structural-provider-binary`
+  );
+  const receipt = {
+    schemaVersion: 1,
+    producerId: LIVE_RECEIPT_PRODUCER_ID,
+    producerVersion: LIVE_RECEIPT_PRODUCER_VERSION,
+    manifestDigest: computeLiveReceiptManifestDigest(),
+    authorityMode,
+    phase: config.phase,
+    pluginVersion: pluginInventory.pluginVersion,
+    headCommit: identity.headCommit,
+    headTree: identity.headTree,
+    sourceInventoryDigest,
+    phaseScopeDigest: computePhaseScopeDigest(config.phase, fixture.root),
+    repositoryBeforeDigest: sourceInventoryDigest,
+    repositoryAfterDigest: sourceInventoryDigest,
+    sourcePluginInventoryDigest: pluginInventory.digest,
+    installedPluginInventoryDigest: pluginInventory.digest,
+    installedFileCount: pluginInventory.fileCount,
+    installedEntrypointDigest: pluginInventory.installedEntrypointDigest,
+    providerCapabilityDigest: fixture.providerCapabilityDigest,
+    observedToolIds: [...config.observedToolIds],
+    providerBinaryDigest,
+    providerVersion: "0.2.106-fixture",
+    providerRevision: `binary-sha256-${providerBinaryDigest}`,
+    mcpProtocolVersion: LIVE_RECEIPT_MANIFEST.mcpProtocolVersion,
+    codexBinaryDigest: natural
+      ? sha256Text(`${fixture.name}:structural-codex-binary`)
+      : null,
+    codexVersion: natural ? "0.120.0-fixture" : null,
+    codexModel: natural ? "gpt-5.6-fixture" : null,
+    hostTaskDigest: natural ? fixture.hostTaskDigest : null,
+    installationMethod: "codex-local-plugin-cache",
+    scenarios: structuredClone(config.scenarios),
+    outcome: "pass",
+    startedAt: STARTED_AT,
+    endedAt: ENDED_AT,
+    ...overrides
+  };
+  delete receipt.receiptDigest;
+  return attachStructuralLiveReceiptDigest(receipt);
+}
+
+function seedStructuralLiveReceipt(root, receipt) {
+  const relative = [
+    LIVE_RECEIPT_ROOT,
+    receipt.authorityMode,
+    `${receipt.sourceInventoryDigest.slice(0, 16)}-${receipt.receiptDigest.slice(0, 16)}.json`
+  ].join("/");
+  const absolute = path.join(root, ...relative.split("/"));
+  fs.mkdirSync(path.dirname(absolute), { recursive: true });
+  fs.writeFileSync(absolute, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
+  return {
+    path: relative,
+    receiptDigest: receipt.receiptDigest
+  };
+}
+
+function liveQualificationRecord({
+  fixture,
+  phase,
+  syntheticReceipt,
+  syntheticReference,
+  naturalReceipt = null,
+  naturalReference = null
+}) {
+  const installationReceipt = naturalReceipt || syntheticReceipt;
+  const liveScenarios = [
+    ...LIVE_RECEIPT_AUTHORITY_CONFIG[LIVE_RECEIPT_AUTHORITY_SYNTHETIC].scenarios.map((scenario) => ({
+      id: scenario.id,
+      boundary: "provider-live",
+      outcome: "pass"
+    })),
+    ...(naturalReceipt
+      ? LIVE_RECEIPT_AUTHORITY_CONFIG[LIVE_RECEIPT_AUTHORITY_NATURAL].scenarios.map((scenario) => ({
+        id: scenario.id,
+        boundary: "installed-host",
+        outcome: "pass"
+      }))
+      : [])
+  ];
+  const base = buildEvidenceRecord({
+    root: fixture.root,
+    phase,
+    slice: phase === "1" ? "live-provider-transport" : "live-natural-host",
+    status: "implemented_unverified",
+    provisionalSupportingRecord: true,
+    verification: [
+      passedCommand("provider-live", "code-owned-live-runner", "provider-live"),
+      ...(naturalReceipt
+        ? [passedCommand("installed-host", "code-owned-natural-host-runner", "installed-host")]
+        : [])
+    ],
+    liveScenarios,
+    installation: {
+      method: installationReceipt.installationMethod,
+      sourcePluginInventoryDigest: installationReceipt.sourcePluginInventoryDigest,
+      installedPluginInventoryDigest: installationReceipt.installedPluginInventoryDigest,
+      installedFileCount: installationReceipt.installedFileCount,
+      sourceAndInstalledInventoriesEqual: true,
+      privateInstallPathRecorded: false
+    },
+    runtime: {
+      platform: "test",
+      architecture: "test",
+      node: process.versions.node,
+      git: "test",
+      codexStandalone: naturalReceipt?.codexVersion || "test",
+      codexDesktopBundled: null,
+      grokBuild: installationReceipt.providerVersion,
+      grokBuildRevision: installationReceipt.providerRevision,
+      mcpProtocolVersion: "2025-11-25"
+    },
+    qualification: {
+      deterministic: "not_run",
+      installedHost: naturalReceipt ? "pass" : "not_run",
+      provider: "pass",
+      release: "not_run"
+    },
+    authorities: {
+      workerClaims: "none",
+      runtimeObservations: "bounded live receipt",
+      hostVerification: "not_run",
+      independentValidation: "not_run"
+    }
+  });
+  const record = {
+    ...base,
+    liveQualificationReceipts: {
+      syntheticDirectMcp: syntheticReference,
+      naturalCodexHost: naturalReference
+    }
+  };
+  delete record.recordDigest;
+  return attachRecordDigest(record);
 }
 
 function initRunnableEvidenceCliFixture(name) {
@@ -1587,6 +1840,937 @@ test("evidence publication validates privacy, bounds, structure, and supplied di
   const published = JSON.parse(fs.readFileSync(path.join(root, relative), "utf8"));
   assert.match(published.recordDigest, /^[0-9a-f]{64}$/);
   assert.equal(published.recordDigest, computeRecordDigest(published));
+});
+
+test("live receipt v1 supports strict offline replay but exports no mint or publication authority", async () => {
+  const evidenceModule = await import(EVIDENCE_MODULE_URL);
+  for (const unsupported of [
+    "attachLiveQualificationReceiptDigest",
+    "buildLiveQualificationReceipt",
+    "publishLiveQualificationReceipt",
+    "writeLiveQualifiedEvidenceRecord"
+  ]) {
+    assert.equal(Object.hasOwn(evidenceModule, unsupported), false, unsupported);
+  }
+  assert.deepEqual(
+    Object.keys(evidenceModule).filter((name) => (
+      /(?:attach|build|create|mint|publish|write|link).*LiveQualification/i.test(name)
+      || /LiveQualification.*(?:attach|build|create|mint|publish|write|link)/i.test(name)
+    )),
+    []
+  );
+
+  const fixture = initLiveReceiptFixture("live-receipt-positive");
+  const ignoredLinkInput = buildEvidenceRecord({
+    root: fixture.root,
+    phase: "1",
+    slice: "unsupported-live-link-input",
+    liveQualificationReceipts: {
+      syntheticDirectMcp: {
+        path: `${LIVE_RECEIPT_ROOT}/synthetic-direct-mcp/${"a".repeat(16)}-${"b".repeat(16)}.json`,
+        receiptDigest: "c".repeat(64)
+      },
+      naturalCodexHost: null
+    }
+  });
+  assert.equal(Object.hasOwn(ignoredLinkInput, "liveQualificationReceipts"), false);
+  const synthetic = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+  assert.equal(synthetic.producerId, LIVE_RECEIPT_PRODUCER_ID);
+  assert.equal(synthetic.producerVersion, LIVE_RECEIPT_PRODUCER_VERSION);
+  assert.equal(synthetic.manifestDigest, computeLiveReceiptManifestDigest());
+  assert.equal(synthetic.phase, "1");
+  assert.deepEqual(synthetic.observedToolIds, LIVE_RECEIPT_CAPABILITY_TOOL_IDS);
+  assert.equal(
+    synthetic.sourcePluginInventoryDigest,
+    synthetic.installedPluginInventoryDigest
+  );
+  assert.equal(synthetic.repositoryBeforeDigest, synthetic.sourceInventoryDigest);
+  assert.equal(synthetic.repositoryAfterDigest, synthetic.sourceInventoryDigest);
+  assert.equal(
+    synthetic.receiptDigest,
+    computeLiveQualificationReceiptDigest(synthetic)
+  );
+  assert.equal(
+    synthetic.providerRevision,
+    `binary-sha256-${synthetic.providerBinaryDigest}`
+  );
+  assert.equal(LIVE_RECEIPT_MANIFEST.providerRevisionScheme, "binary-sha256-v1");
+  assert.deepEqual(
+    synthetic.scenarios,
+    LIVE_RECEIPT_AUTHORITY_CONFIG[LIVE_RECEIPT_AUTHORITY_SYNTHETIC].scenarios
+  );
+  assert.deepEqual(
+    {
+      spawnInvocationCount: synthetic.scenarios[1].spawnInvocationCount,
+      spawnReplayCount: synthetic.scenarios[1].spawnReplayCount,
+      providerLaunchCount: synthetic.scenarios[1].providerLaunchCount,
+      duplicateLaunchCount: synthetic.scenarios[1].duplicateLaunchCount,
+      cancelInvocationCount: synthetic.scenarios[1].cancelInvocationCount,
+      cancelReplayCount: synthetic.scenarios[1].cancelReplayCount,
+      uniqueCancelRequestCount: synthetic.scenarios[1].uniqueCancelRequestCount,
+      cancellationEventCount: synthetic.scenarios[1].cancellationEventCount
+    },
+    {
+      spawnInvocationCount: 2,
+      spawnReplayCount: 1,
+      providerLaunchCount: 1,
+      duplicateLaunchCount: 0,
+      cancelInvocationCount: 2,
+      cancelReplayCount: 1,
+      uniqueCancelRequestCount: 1,
+      cancellationEventCount: 1
+    }
+  );
+  assert.equal(
+    validateLiveQualificationReceipt(synthetic, { strict: true, root: fixture.root }).ok,
+    true
+  );
+
+  const natural = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_NATURAL);
+  assert.equal(natural.phase, "4");
+  assert.equal(natural.installationMethod, "codex-local-plugin-cache");
+  assert.match(natural.codexBinaryDigest, /^[0-9a-f]{64}$/);
+  assert.equal(natural.codexVersion, "0.120.0-fixture");
+  assert.equal(natural.codexModel, "gpt-5.6-fixture");
+  assert.equal(natural.hostTaskDigest, fixture.hostTaskDigest);
+  assert.equal(natural.providerCapabilityDigest, synthetic.providerCapabilityDigest);
+  assert.deepEqual(natural.observedToolIds, LIVE_RECEIPT_NATURAL_TOOL_IDS);
+  assert.equal(synthetic.codexBinaryDigest, null);
+  assert.equal(synthetic.codexVersion, null);
+  assert.equal(synthetic.codexModel, null);
+  assert.equal(synthetic.hostTaskDigest, null);
+  assert.deepEqual(
+    natural.scenarios,
+    LIVE_RECEIPT_AUTHORITY_CONFIG[LIVE_RECEIPT_AUTHORITY_NATURAL].scenarios
+  );
+  assert.ok(natural.scenarios.every((scenario) => (
+    scenario.workerHostVerification === "not_run"
+  )));
+
+  const serialized = JSON.stringify({ synthetic, natural });
+  for (const forbidden of [
+    fixture.root,
+    "\"pid\"",
+    "\"token\"",
+    "\"sessionId\"",
+    "\"prompt\"",
+    "\"transcript\"",
+    "\"rawOutput\""
+  ]) {
+    assert.equal(serialized.includes(forbidden), false, forbidden);
+  }
+
+  const schema = JSON.parse(fs.readFileSync(
+    path.join(ROOT, "plugins/grok/schemas/worker-broker-live-receipt.schema.json"),
+    "utf8"
+  ));
+  assert.equal(schema.properties.manifestDigest.const, computeLiveReceiptManifestDigest());
+  const syntheticRule = schema.allOf.find((rule) => (
+    rule?.if?.properties?.authorityMode?.const === LIVE_RECEIPT_AUTHORITY_SYNTHETIC
+  ));
+  const naturalRule = schema.allOf.find((rule) => (
+    rule?.if?.properties?.authorityMode?.const === LIVE_RECEIPT_AUTHORITY_NATURAL
+  ));
+  assert.deepEqual(
+    syntheticRule.then.properties.observedToolIds.const,
+    LIVE_RECEIPT_CAPABILITY_TOOL_IDS
+  );
+  assert.deepEqual(
+    naturalRule.then.properties.observedToolIds.const,
+    LIVE_RECEIPT_NATURAL_TOOL_IDS
+  );
+  assert.equal(
+    LIVE_RECEIPT_MANIFEST.authorityModes[LIVE_RECEIPT_AUTHORITY_NATURAL].phase,
+    "4"
+  );
+  assert.match(
+    schema.description,
+    /cannot authenticate historical origin.*protected signature or external immutable anchor/i
+  );
+});
+
+test("manually seeded structural receipts replay offline while generic publication rejects linkage", () => {
+  const fixture = initLiveReceiptFixture("live-linkage-positive");
+  const synthetic = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+  const syntheticReference = seedStructuralLiveReceipt(fixture.root, synthetic);
+  const phaseOne = liveQualificationRecord({
+    fixture,
+    phase: "1",
+    syntheticReceipt: synthetic,
+    syntheticReference
+  });
+  assert.equal(validateEvidenceRecord(phaseOne).ok, false);
+  assert.ok(validateEvidenceRecord(phaseOne).errors.some((message) => (
+    /strict offline receipt replay/i.test(message)
+  )));
+  assert.equal(
+    validateEvidenceRecord(phaseOne, { strict: true, root: fixture.root }).ok,
+    true
+  );
+  assert.throws(
+    () => writeEvidenceRecord(phaseOne, fixture.root),
+    /invalid/i,
+    "generic publication cannot publish provider pass or receipt linkage"
+  );
+  assert.equal(fs.existsSync(path.join(
+    fixture.root,
+    "tests/e2e-results/worker-broker/phase-1"
+  )), false);
+
+  const natural = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_NATURAL);
+  const naturalReference = seedStructuralLiveReceipt(fixture.root, natural);
+  const phaseFour = liveQualificationRecord({
+    fixture,
+    phase: "4",
+    syntheticReceipt: synthetic,
+    syntheticReference,
+    naturalReceipt: natural,
+    naturalReference
+  });
+  assert.equal(
+    validateEvidenceRecord(phaseFour, { strict: true, root: fixture.root }).ok,
+    true
+  );
+  assert.throws(
+    () => writeEvidenceRecord(phaseFour, fixture.root),
+    /invalid/i,
+    "generic publication cannot publish installed-host pass or receipt linkage"
+  );
+  assert.equal(fs.existsSync(path.join(
+    fixture.root,
+    "tests/e2e-results/worker-broker/phase-4"
+  )), false);
+});
+
+test("natural host receipts require bounded Codex identity and correlate through stable provider capability", () => {
+  const fixture = initLiveReceiptFixture("natural-host-identity");
+  const missingIdentity = structuralLiveReceipt(
+    fixture,
+    LIVE_RECEIPT_AUTHORITY_NATURAL,
+    {
+      codexBinaryDigest: null,
+      codexVersion: null,
+      codexModel: null,
+      hostTaskDigest: null
+    }
+  );
+  assert.equal(validateLiveQualificationReceipt(missingIdentity).ok, false);
+
+  const synthetic = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+  const syntheticReference = seedStructuralLiveReceipt(fixture.root, synthetic);
+  const natural = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_NATURAL, {
+    providerCapabilityDigest: "c".repeat(64)
+  });
+  const naturalReference = seedStructuralLiveReceipt(fixture.root, natural);
+  const confused = liveQualificationRecord({
+    fixture,
+    phase: "4",
+    syntheticReceipt: synthetic,
+    syntheticReference,
+    naturalReceipt: natural,
+    naturalReference
+  });
+  const result = validateEvidenceRecord(confused, { strict: true, root: fixture.root });
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((message) => /same source, install, capability, and provider/i.test(message)));
+
+  const leaked = structuredClone(natural);
+  delete leaked.receiptDigest;
+  leaked.hostThreadId = "RAW_HOST_THREAD_CANARY";
+  const leakedResult = validateLiveQualificationReceipt(
+    attachStructuralLiveReceiptDigest(leaked)
+  );
+  assert.equal(leakedResult.ok, false);
+  assert.equal(JSON.stringify(leakedResult).includes("hostThreadId"), false);
+  assert.equal(JSON.stringify(leakedResult).includes("RAW_HOST_THREAD_CANARY"), false);
+});
+
+test("live receipt validation rejects digest, method, authority, scenario, cleanup, count, drift, and raw-field forgeries", () => {
+  const fixture = initLiveReceiptFixture("live-receipt-adversarial");
+  const base = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+  const forgedCases = [
+    ["install-digest-mismatch", (receipt) => {
+      receipt.installedPluginInventoryDigest = "f".repeat(64);
+    }],
+    ["arbitrary-install-method", (receipt) => {
+      receipt.installationMethod = "caller-copy";
+    }],
+    ["tool-inventory-substitution", (receipt) => {
+      receipt.observedToolIds = receipt.observedToolIds.slice(0, -1);
+    }],
+    ["provider-revision-substitution", (receipt) => {
+      receipt.providerRevision = `binary-sha256-${"f".repeat(64)}`;
+    }],
+    ["authority-confusion", (receipt) => {
+      receipt.authorityMode = LIVE_RECEIPT_AUTHORITY_NATURAL;
+    }],
+    ["scenario-substitution", (receipt) => {
+      receipt.scenarios[0].id = "natural-codex-installed-host";
+    }],
+    ["scenario-order", (receipt) => {
+      receipt.scenarios.reverse();
+    }],
+    ["cleanup-false", (receipt) => {
+      receipt.scenarios[1].taskRuntimeCleaned = false;
+    }],
+    ["worker-host-overclaim", (receipt) => {
+      receipt.scenarios[0].workerHostVerification = "pass";
+    }],
+    ["duplicate-launch", (receipt) => {
+      receipt.scenarios[1].duplicateLaunchCount = 1;
+    }],
+    ["launch-count", (receipt) => {
+      receipt.scenarios[0].providerLaunchCount = 2;
+    }],
+    ["spawn-replay-count", (receipt) => {
+      receipt.scenarios[1].spawnReplayCount = 0;
+    }],
+    ["cancel-invocation-count", (receipt) => {
+      receipt.scenarios[1].cancelInvocationCount = 1;
+    }],
+    ["cancel-replay-count", (receipt) => {
+      receipt.scenarios[1].cancelReplayCount = 0;
+    }],
+    ["unique-cancel-request-count", (receipt) => {
+      receipt.scenarios[1].uniqueCancelRequestCount = 2;
+    }],
+    ["runner-temporary-artifacts", (receipt) => {
+      receipt.scenarios[1].runnerTemporaryArtifactsRemoved = false;
+    }],
+    ["qualification-session-delete", (receipt) => {
+      receipt.scenarios[1].qualificationSessionDeleted = false;
+    }],
+    ["manifest-drift", (receipt) => {
+      receipt.manifestDigest = "e".repeat(64);
+    }],
+    ["source-drift", (receipt) => {
+      receipt.sourceInventoryDigest = "d".repeat(64);
+      receipt.repositoryBeforeDigest = receipt.sourceInventoryDigest;
+      receipt.repositoryAfterDigest = receipt.sourceInventoryDigest;
+    }],
+    ["raw-private-field", (receipt) => {
+      receipt.rawTranscript = "PRIVATE_LIVE_TRANSCRIPT_CANARY";
+    }]
+  ];
+  for (const [label, mutate] of forgedCases) {
+    const candidate = structuredClone(base);
+    delete candidate.receiptDigest;
+    mutate(candidate);
+    const forged = attachStructuralLiveReceiptDigest(candidate);
+    const result = validateLiveQualificationReceipt(
+      forged,
+      { strict: label === "source-drift", root: fixture.root }
+    );
+    assert.equal(result.ok, false, label);
+    if (label === "raw-private-field") {
+      assert.equal(JSON.stringify(result).includes("rawTranscript"), false);
+      assert.equal(JSON.stringify(result).includes("PRIVATE_LIVE_TRANSCRIPT_CANARY"), false);
+    }
+  }
+});
+
+test("caller-authored live claims have no supported publication path", async () => {
+  const fixture = initLiveReceiptFixture("live-no-write");
+  const callerAuthored = structuralLiveReceipt(
+    fixture,
+    LIVE_RECEIPT_AUTHORITY_SYNTHETIC
+  );
+  const liveRoot = path.join(fixture.root, ...LIVE_RECEIPT_ROOT.split("/"));
+  assert.equal(fs.existsSync(liveRoot), false);
+  assert.equal(validateLiveQualificationReceipt(callerAuthored).ok, true);
+  const evidenceModule = await import(EVIDENCE_MODULE_URL);
+  assert.equal(Object.hasOwn(evidenceModule, "publishLiveQualificationReceipt"), false);
+  assert.equal(Object.hasOwn(evidenceModule, "writeLiveQualifiedEvidenceRecord"), false);
+  assert.equal(fs.existsSync(liveRoot), false);
+
+  const forgedProvider = buildEvidenceRecord({
+    root: fixture.root,
+    phase: "1",
+    slice: "forged-provider-pass",
+    verification: [passedCommand("provider-live", "caller-authored", "provider-live")],
+    liveScenarios: LIVE_RECEIPT_SCENARIO_IDS[LIVE_RECEIPT_AUTHORITY_SYNTHETIC].map((id) => ({
+      id,
+      boundary: "provider-live",
+      outcome: "pass"
+    })),
+    qualification: {
+      deterministic: "not_run",
+      installedHost: "not_run",
+      provider: "pass",
+      release: "not_run"
+    },
+    runtime: {
+      platform: "test",
+      architecture: "test",
+      node: process.versions.node,
+      git: "test",
+      codexStandalone: null,
+      codexDesktopBundled: null,
+      grokBuild: "0.2.106",
+      grokBuildRevision: "revision-1",
+      mcpProtocolVersion: "2025-11-25"
+    }
+  });
+  const forgedValidation = validateEvidenceRecord(forgedProvider);
+  assert.equal(forgedValidation.ok, false);
+  assert.ok(forgedValidation.errors.some((message) => /strict offline receipt replay/i.test(message)));
+  const strictForgedValidation = validateEvidenceRecord(
+    forgedProvider,
+    { strict: true, root: fixture.root }
+  );
+  assert.equal(strictForgedValidation.ok, false);
+  assert.ok(strictForgedValidation.errors.some((message) => /synthetic-direct-mcp receipt/i.test(message)));
+  assert.throws(
+    () => writeEvidenceRecord(forgedProvider, fixture.root),
+    (error) => error?.code === "E_EVIDENCE_RECORD_INVALID"
+  );
+  assert.equal(fs.existsSync(path.join(
+    fixture.root,
+    "tests/e2e-results/worker-broker/phase-1"
+  )), false);
+});
+
+test("live evidence runtime and JSON Schema enforce bidirectional provisional semantics", () => {
+  const fixture = initLiveReceiptFixture("live-schema-parity");
+  const synthetic = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+  const syntheticReference = seedStructuralLiveReceipt(fixture.root, synthetic);
+  const phaseOne = liveQualificationRecord({
+    fixture,
+    phase: "1",
+    syntheticReceipt: synthetic,
+    syntheticReference
+  });
+
+  const semanticForgeries = [
+    ["status", /remain implemented_unverified/i, (record) => {
+      record.status = "qualified";
+    }],
+    ["provisional", /provisionalSupportingRecord=true/i, (record) => {
+      record.provisionalSupportingRecord = false;
+    }],
+    ["release-boolean", /cannot claim release qualification/i, (record) => {
+      record.releaseQualification = true;
+    }],
+    ["release-result", /cannot claim release qualification/i, (record) => {
+      record.qualification.release = "pass";
+    }],
+    ["host-verification", /hostVerification=not_run/i, (record) => {
+      record.authorities.hostVerification = "pass";
+    }]
+  ];
+  for (const [label, expected, mutate] of semanticForgeries) {
+    const candidate = structuredClone(phaseOne);
+    delete candidate.recordDigest;
+    mutate(candidate);
+    const result = validateEvidenceRecord(attachRecordDigest(candidate));
+    assert.equal(result.ok, false, label);
+    assert.ok(result.errors.some((message) => expected.test(message)), label);
+  }
+
+  {
+    const candidate = structuredClone(phaseOne);
+    delete candidate.recordDigest;
+    candidate.qualification.provider = "not_run";
+    const result = validateEvidenceRecord(attachRecordDigest(candidate));
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((message) => (
+      /synthetic live receipt linkage is forbidden without provider qualification pass/i.test(message)
+    )));
+  }
+
+  const natural = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_NATURAL);
+  const naturalReference = seedStructuralLiveReceipt(fixture.root, natural);
+  const phaseFour = liveQualificationRecord({
+    fixture,
+    phase: "4",
+    syntheticReceipt: synthetic,
+    syntheticReference,
+    naturalReceipt: natural,
+    naturalReference
+  });
+  {
+    const candidate = structuredClone(phaseFour);
+    delete candidate.recordDigest;
+    candidate.qualification.installedHost = "not_run";
+    const result = validateEvidenceRecord(attachRecordDigest(candidate));
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((message) => (
+      /natural live receipt linkage is forbidden without installedHost qualification pass/i.test(message)
+    )));
+  }
+  {
+    const candidate = structuredClone(phaseOne);
+    delete candidate.recordDigest;
+    candidate.phase = "2";
+    const result = validateEvidenceRecord(attachRecordDigest(candidate));
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((message) => (
+      /provider live qualification may link only to Phase 1 or Phase 4/i.test(message)
+    )));
+  }
+
+  const evidenceSchema = JSON.parse(fs.readFileSync(
+    path.join(ROOT, "plugins/grok/schemas/worker-broker-evidence.schema.json"),
+    "utf8"
+  ));
+  const rules = evidenceSchema.allOf || [];
+  const providerPassRule = rules.find((rule) => (
+    rule?.if?.properties?.qualification?.properties?.provider?.const === "pass"
+  ));
+  const providerNonPassRule = rules.find((rule) => (
+    rule?.if?.properties?.qualification?.properties?.provider?.enum?.includes("not_run")
+  ));
+  const installedPassRule = rules.find((rule) => (
+    rule?.if?.properties?.qualification?.properties?.installedHost?.const === "pass"
+  ));
+  const installedNonPassRule = rules.find((rule) => (
+    rule?.if?.properties?.qualification?.properties?.installedHost?.enum?.includes("not_run")
+  ));
+  const syntheticConverse = rules.find((rule) => (
+    rule?.if?.properties?.liveQualificationReceipts
+      ?.properties?.syntheticDirectMcp?.type === "object"
+  ));
+  const naturalConverse = rules.find((rule) => (
+    rule?.if?.properties?.liveQualificationReceipts
+      ?.properties?.naturalCodexHost?.type === "object"
+  ));
+  const liveSemantics = rules.find((rule) => (
+    Array.isArray(rule?.if?.anyOf)
+    && rule?.then?.properties?.provisionalSupportingRecord?.const === true
+  ));
+  assert.deepEqual(providerPassRule.then.properties.phase.enum, ["1", "4"]);
+  assert.equal(
+    providerPassRule.then.properties.liveQualificationReceipts
+      .properties.syntheticDirectMcp.type,
+    "object"
+  );
+  assert.equal(
+    providerNonPassRule.then.properties.liveQualificationReceipts
+      .properties.syntheticDirectMcp.type,
+    "null"
+  );
+  assert.equal(installedPassRule.then.properties.phase.const, "4");
+  assert.equal(
+    installedPassRule.then.properties.qualification.properties.provider.const,
+    "pass"
+  );
+  assert.equal(
+    installedNonPassRule.then.properties.liveQualificationReceipts
+      .properties.naturalCodexHost.type,
+    "null"
+  );
+  assert.equal(
+    syntheticConverse.then.properties.qualification.properties.provider.const,
+    "pass"
+  );
+  assert.equal(naturalConverse.then.properties.phase.const, "4");
+  assert.equal(
+    naturalConverse.then.properties.qualification.properties.installedHost.const,
+    "pass"
+  );
+  assert.equal(liveSemantics.then.properties.status.const, "implemented_unverified");
+  assert.equal(liveSemantics.then.properties.releaseQualification.const, false);
+  assert.deepEqual(
+    liveSemantics.then.properties.qualification.properties.release.enum,
+    ["fail", "skip", "not_run"]
+  );
+  assert.equal(
+    liveSemantics.then.properties.authorities.properties.hostVerification.const,
+    "not_run"
+  );
+
+  const receiptSchema = JSON.parse(fs.readFileSync(
+    path.join(ROOT, "plugins/grok/schemas/worker-broker-live-receipt.schema.json"),
+    "utf8"
+  ));
+  assert.equal(receiptSchema.$schema, "https://json-schema.org/draft/2020-12/schema");
+  assert.equal(receiptSchema.properties.schemaVersion.const, 1);
+  assert.equal(receiptSchema.properties.producerId.const, LIVE_RECEIPT_PRODUCER_ID);
+  assert.equal(receiptSchema.properties.producerVersion.const, LIVE_RECEIPT_PRODUCER_VERSION);
+  assert.equal(receiptSchema.properties.manifestDigest.const, computeLiveReceiptManifestDigest());
+  assert.equal(
+    receiptSchema.properties.mcpProtocolVersion.const,
+    LIVE_RECEIPT_MANIFEST.mcpProtocolVersion
+  );
+  assert.equal(
+    receiptSchema.properties.providerRevision.pattern,
+    "^binary-sha256-[0-9a-f]{64}$"
+  );
+  assert.match(
+    receiptSchema.properties.scenarios.items.properties.providerTerminalCount.description,
+    /unique launched provider generations.*captured process group.*observed gone/i
+  );
+  assert.match(
+    receiptSchema.description,
+    /private installed state.*rather than public provider-start or session-created events/i
+  );
+  assert.ok(Object.keys(synthetic).every((field) => receiptSchema.required.includes(field)));
+  const syntheticRule = receiptSchema.allOf.find((rule) => (
+    rule?.if?.properties?.authorityMode?.const === LIVE_RECEIPT_AUTHORITY_SYNTHETIC
+  ));
+  const naturalRule = receiptSchema.allOf.find((rule) => (
+    rule?.if?.properties?.authorityMode?.const === LIVE_RECEIPT_AUTHORITY_NATURAL
+  ));
+  assert.equal(syntheticRule.then.properties.phase.const, "1");
+  assert.deepEqual(
+    syntheticRule.then.properties.installationMethod.enum,
+    LIVE_RECEIPT_AUTHORITY_CONFIG[LIVE_RECEIPT_AUTHORITY_SYNTHETIC].installationMethods
+  );
+  assert.deepEqual(
+    syntheticRule.then.properties.observedToolIds.const,
+    LIVE_RECEIPT_CAPABILITY_TOOL_IDS
+  );
+  assert.deepEqual(
+    syntheticRule.then.properties.scenarios.const,
+    LIVE_RECEIPT_AUTHORITY_CONFIG[LIVE_RECEIPT_AUTHORITY_SYNTHETIC].scenarios
+  );
+  assert.equal(naturalRule.then.properties.phase.const, "4");
+  assert.equal(naturalRule.then.properties.installationMethod.const, "codex-local-plugin-cache");
+  assert.deepEqual(
+    naturalRule.then.properties.observedToolIds.const,
+    LIVE_RECEIPT_NATURAL_TOOL_IDS
+  );
+  assert.deepEqual(
+    naturalRule.then.properties.scenarios.const,
+    LIVE_RECEIPT_AUTHORITY_CONFIG[LIVE_RECEIPT_AUTHORITY_NATURAL].scenarios
+  );
+});
+
+test("strict offline live receipt replay rejects symlinks, directory replacement, depth, and directory budgets", async (t) => {
+  await t.test("static symlink", () => {
+    const fixture = initLiveReceiptFixture("live-inventory-static-symlink");
+    const receipt = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+    const outside = tempDir("live-inventory-outside-");
+    fs.writeFileSync(path.join(outside, "outside.txt"), "outside\n");
+    const link = path.join(fixture.root, "plugins/grok/static-link");
+    fs.symlinkSync(outside, link, process.platform === "win32" ? "junction" : "dir");
+    const result = validateLiveQualificationReceipt(
+      receipt,
+      { strict: true, root: fixture.root }
+    );
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((message) => /source identity could not be verified/i.test(message)));
+  });
+
+  await t.test("nested directory replacement", () => {
+    const fixture = initLiveReceiptFixture("live-inventory-directory-replacement");
+    const target = path.join(fixture.root, "plugins/grok/snapshot-target");
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, "entry.txt"), "stable bytes\n");
+    git(fixture.root, "add", ".");
+    git(fixture.root, "commit", "-m", "add directory snapshot target");
+    const receipt = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+    const backup = `${target}-original`;
+    const originalOpendirSync = fs.opendirSync;
+    let swapped = false;
+    fs.opendirSync = function patchedOpendirSync(directory, ...args) {
+      const handle = originalOpendirSync.call(fs, directory, ...args);
+      if (path.resolve(String(directory)) !== target) return handle;
+      return {
+        readSync: handle.readSync.bind(handle),
+        closeSync() {
+          handle.closeSync();
+          if (!swapped) {
+            swapped = true;
+            fs.renameSync(target, backup);
+            fs.mkdirSync(target);
+            fs.writeFileSync(path.join(target, "entry.txt"), "stable bytes\n");
+          }
+        }
+      };
+    };
+    let validation;
+    try {
+      validation = validateLiveQualificationReceipt(
+        receipt,
+        { strict: true, root: fixture.root }
+      );
+    } finally {
+      fs.opendirSync = originalOpendirSync;
+      if (swapped) {
+        fs.rmSync(target, { recursive: true, force: true });
+        fs.renameSync(backup, target);
+      }
+    }
+    assert.equal(swapped, true);
+    assert.equal(validation.ok, false);
+    assert.ok(validation.errors.some((message) => /source identity could not be verified/i.test(message)));
+  });
+
+  await t.test("nested symlink replacement", () => {
+    const fixture = initLiveReceiptFixture("live-inventory-symlink-replacement");
+    const target = path.join(fixture.root, "plugins/grok/symlink-swap-target");
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, "entry.txt"), "stable bytes\n");
+    git(fixture.root, "add", ".");
+    git(fixture.root, "commit", "-m", "add symlink swap target");
+    const receipt = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+    const backup = `${target}-original`;
+    const originalOpendirSync = fs.opendirSync;
+    let swapped = false;
+    fs.opendirSync = function patchedOpendirSync(directory, ...args) {
+      const handle = originalOpendirSync.call(fs, directory, ...args);
+      if (path.resolve(String(directory)) !== target) return handle;
+      return {
+        readSync: handle.readSync.bind(handle),
+        closeSync() {
+          handle.closeSync();
+          if (!swapped) {
+            swapped = true;
+            fs.renameSync(target, backup);
+            fs.symlinkSync(
+              backup,
+              target,
+              process.platform === "win32" ? "junction" : "dir"
+            );
+          }
+        }
+      };
+    };
+    let validation;
+    try {
+      validation = validateLiveQualificationReceipt(
+        receipt,
+        { strict: true, root: fixture.root }
+      );
+    } finally {
+      fs.opendirSync = originalOpendirSync;
+      if (swapped) {
+        fs.rmSync(target, { recursive: true, force: true });
+        fs.renameSync(backup, target);
+      }
+    }
+    assert.equal(swapped, true);
+    assert.equal(validation.ok, false);
+    assert.ok(validation.errors.some((message) => /source identity could not be verified/i.test(message)));
+  });
+
+  await t.test("depth budget", () => {
+    const fixture = initLiveReceiptFixture("live-inventory-depth-budget");
+    const receipt = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+    let directory = path.join(fixture.root, "plugins/grok/deep");
+    for (let index = 0; index < 33; index += 1) {
+      fs.mkdirSync(directory);
+      directory = path.join(directory, "d");
+    }
+    fs.writeFileSync(path.join(path.dirname(directory), "leaf.txt"), "too deep\n");
+    const result = validateLiveQualificationReceipt(
+      receipt,
+      { strict: true, root: fixture.root }
+    );
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((message) => /source identity could not be verified/i.test(message)));
+  });
+
+  await t.test("directory budget", () => {
+    const fixture = initLiveReceiptFixture("live-inventory-directory-budget");
+    const receipt = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+    const parent = path.join(fixture.root, "plugins/grok/many-directories");
+    fs.mkdirSync(parent);
+    for (let index = 0; index < 512; index += 1) {
+      fs.mkdirSync(path.join(parent, `d-${String(index).padStart(3, "0")}`));
+    }
+    const result = validateLiveQualificationReceipt(
+      receipt,
+      { strict: true, root: fixture.root }
+    );
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((message) => /source identity could not be verified/i.test(message)));
+  });
+
+  await t.test("directory entry fan-out budget", () => {
+    const fixture = initLiveReceiptFixture("live-inventory-fanout-budget");
+    const receipt = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+    const parent = path.join(fixture.root, "plugins/grok/fanout");
+    fs.mkdirSync(parent);
+    for (let index = 0; index < 4097; index += 1) {
+      fs.mkdirSync(path.join(parent, `d-${String(index).padStart(4, "0")}`));
+    }
+    const originalOpendirSync = fs.opendirSync;
+    let targetReadCount = 0;
+    fs.opendirSync = function countedOpendirSync(directory, ...args) {
+      const handle = originalOpendirSync.call(fs, directory, ...args);
+      if (path.resolve(String(directory)) !== parent) return handle;
+      return {
+        readSync() {
+          targetReadCount += 1;
+          return handle.readSync();
+        },
+        closeSync: handle.closeSync.bind(handle)
+      };
+    };
+    let result;
+    try {
+      result = validateLiveQualificationReceipt(
+        receipt,
+        { strict: true, root: fixture.root }
+      );
+    } finally {
+      fs.opendirSync = originalOpendirSync;
+    }
+    assert.equal(result.ok, false);
+    assert.equal(targetReadCount, 4097);
+    assert.ok(result.errors.some((message) => /source identity could not be verified/i.test(message)));
+  });
+});
+
+test("provisional live supporting records cannot become current ledger evidence", () => {
+  const fixture = initLiveReceiptFixture("live-provisional-ledger");
+  const synthetic = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+  const syntheticReference = seedStructuralLiveReceipt(fixture.root, synthetic);
+  const record = liveQualificationRecord({
+    fixture,
+    phase: "1",
+    syntheticReceipt: synthetic,
+    syntheticReference
+  });
+  const recordPath = rawEvidenceFixturePath(fixture.root, record);
+  const entry = {
+    phase: record.phase,
+    slice: record.slice,
+    status: record.status,
+    path: recordPath,
+    recordDigest: record.recordDigest,
+    sourceCommit: record.source.headCommit,
+    currency: "current",
+    recordedAt: record.recordedAt
+  };
+  assert.throws(
+    () => updateLedger(entry, fixture.root),
+    (error) => error?.code === "E_EVIDENCE_LEDGER_UPDATE_INVALID"
+  );
+
+  const historical = updateLedger({ ...entry, currency: "historical" }, fixture.root);
+  assert.equal(historical.entries.at(-1).currency, "historical");
+  const ledgerPath = path.join(
+    fixture.root,
+    "tests/e2e-results/worker-broker/ledger.json"
+  );
+  fs.writeFileSync(ledgerPath, `${JSON.stringify({
+    schemaVersion: 1,
+    roadmapVersion: "1.0",
+    issue: "https://github.com/xliberty2008x/grok-plugin/issues/25",
+    updatedAt: STARTED_AT,
+    entries: [entry]
+  }, null, 2)}\n`, { mode: 0o600 });
+  const result = verifyLedger(fixture.root, { strict: true });
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((message) => (
+    /provisional\/live supporting records cannot be current evidence/i.test(message)
+  )));
+});
+
+test("ledger admission distinguishes absent records from existing malformed or mismatched live bytes", () => {
+  const fixture = initLiveReceiptFixture("live-ledger-existing-bytes");
+  const baseline = syntheticLedgerEntry("0", "missing-prepublication-reservation");
+  updateLedger(baseline, fixture.root);
+  const ledgerPath = path.join(
+    fixture.root,
+    "tests/e2e-results/worker-broker/ledger.json"
+  );
+  const ledgerBefore = fs.readFileSync(ledgerPath, "utf8");
+
+  const synthetic = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+  const syntheticReference = seedStructuralLiveReceipt(fixture.root, synthetic);
+  const record = liveQualificationRecord({
+    fixture,
+    phase: "1",
+    syntheticReceipt: synthetic,
+    syntheticReference
+  });
+  const recordPath = rawEvidenceFixturePath(fixture.root, record);
+  const entry = {
+    phase: record.phase,
+    slice: record.slice,
+    status: record.status,
+    path: recordPath,
+    recordDigest: record.recordDigest,
+    sourceCommit: record.source.headCommit,
+    currency: "current",
+    recordedAt: record.recordedAt
+  };
+  const mismatches = [
+    ["status", { status: "blocked" }],
+    ["recordDigest", { recordDigest: "f".repeat(64) }],
+    ["sourceCommit", { sourceCommit: "2".repeat(40) }],
+    ["recordedAt", { recordedAt: ENDED_AT }]
+  ];
+  for (const [label, mismatch] of mismatches) {
+    assert.throws(
+      () => updateLedger({ ...entry, ...mismatch }, fixture.root),
+      (error) => error?.code === "E_EVIDENCE_LEDGER_INVALID",
+      label
+    );
+    assert.equal(fs.readFileSync(ledgerPath, "utf8"), ledgerBefore, label);
+  }
+
+  fs.writeFileSync(path.join(fixture.root, recordPath), "{malformed-json\n");
+  assert.throws(
+    () => updateLedger(entry, fixture.root),
+    (error) => error?.code === "E_EVIDENCE_LEDGER_INVALID"
+  );
+  assert.equal(fs.readFileSync(ledgerPath, "utf8"), ledgerBefore);
+});
+
+test("installedHost boolean cannot mask digest mismatch and legacy not-run records stay deterministic", () => {
+  const fixture = initLiveReceiptFixture("live-digest-and-legacy");
+  const mismatched = buildEvidenceRecord({
+    root: fixture.root,
+    phase: "4",
+    slice: "forged-installed-host",
+    verification: [
+      passedCommand("provider-live", "caller-provider", "provider-live"),
+      passedCommand("installed-host", "caller-host", "installed-host")
+    ],
+    qualification: {
+      deterministic: "not_run",
+      installedHost: "pass",
+      provider: "pass",
+      release: "not_run"
+    },
+    installation: {
+      method: "codex-local-plugin-cache",
+      sourcePluginInventoryDigest: "a".repeat(64),
+      installedPluginInventoryDigest: "b".repeat(64),
+      installedFileCount: 1,
+      sourceAndInstalledInventoriesEqual: true,
+      privateInstallPathRecorded: false
+    },
+    runtime: {
+      platform: "test",
+      architecture: "test",
+      node: process.versions.node,
+      git: "test",
+      codexStandalone: null,
+      codexDesktopBundled: null,
+      grokBuild: "0.2.106",
+      grokBuildRevision: "revision-1",
+      mcpProtocolVersion: "2025-11-25"
+    }
+  });
+  const mismatchResult = validateEvidenceRecord(mismatched);
+  assert.equal(mismatchResult.ok, false);
+  assert.ok(mismatchResult.errors.some((message) => /matching source\/install digests/i.test(message)));
+
+  const legacy = buildEvidenceRecord({
+    root: fixture.root,
+    phase: "1",
+    slice: "legacy-not-run-compatible",
+    verification: [passedCommand("identity", "true", "source")]
+  });
+  assert.equal(Object.hasOwn(legacy, "liveQualificationReceipts"), false);
+  assert.equal(validateEvidenceRecord(legacy).ok, true);
+  assert.equal(computeRecordDigest(legacy), legacy.recordDigest);
+  assert.equal(
+    computeRecordDigest(structuredClone(legacy)),
+    legacy.recordDigest,
+    "optional live linkage must not perturb deterministic legacy digests"
+  );
+  const evidenceSchema = JSON.parse(fs.readFileSync(
+    path.join(ROOT, "plugins/grok/schemas/worker-broker-evidence.schema.json"),
+    "utf8"
+  ));
+  assert.equal(evidenceSchema.required.includes("liveQualificationReceipts"), false);
 });
 
 test("evidence publication rejects traversal-shaped phase and digest before filesystem access", () => {

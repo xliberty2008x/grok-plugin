@@ -266,6 +266,7 @@ if (!versionsOnly) {
     "plugins/grok/prompts/stop-review-gate.md",
     "plugins/grok/schemas/review-output.schema.json",
     "plugins/grok/schemas/worker-broker-evidence.schema.json",
+    "plugins/grok/schemas/worker-broker-live-receipt.schema.json",
     "plugins/grok/schemas/worker-protocol.schema.json",
     "plugins/grok/scripts/grok-companion.mjs",
     "plugins/grok/scripts/grok-codex.mjs",
@@ -460,6 +461,104 @@ if (!versionsOnly) {
     }
     if (workerEvidenceSchema.properties?.scenarios?.items?.properties?.measurements?.additionalProperties !== false) {
       problem("Worker Broker scenario measurements must be a bounded allowlist.", file);
+    }
+    const liveReferences = workerEvidenceSchema.properties?.liveQualificationReceipts;
+    const liveSemanticsRule = (workerEvidenceSchema.allOf || []).find((rule) => (
+      Array.isArray(rule?.if?.anyOf)
+      && rule?.then?.properties?.status?.const === "implemented_unverified"
+      && rule?.then?.properties?.provisionalSupportingRecord?.const === true
+      && rule?.then?.properties?.releaseQualification?.const === false
+      && rule?.then?.properties?.authorities?.properties?.hostVerification?.const === "not_run"
+    ));
+    if (liveReferences?.additionalProperties !== false
+      || !liveReferences?.required?.includes("syntheticDirectMcp")
+      || !liveReferences?.required?.includes("naturalCodexHost")
+      || !liveSemanticsRule) {
+      problem("Worker Broker evidence schema must bind bidirectional provisional live-receipt semantics.", file);
+    }
+  }
+
+  const liveReceiptSchema = readJson("plugins/grok/schemas/worker-broker-live-receipt.schema.json");
+  if (liveReceiptSchema) {
+    const file = "plugins/grok/schemas/worker-broker-live-receipt.schema.json";
+    if (liveReceiptSchema.$schema !== "https://json-schema.org/draft/2020-12/schema") {
+      problem("Worker Broker live receipt schema must use JSON Schema 2020-12.", file);
+    }
+    const expectedRequired = [
+      "schemaVersion",
+      "producerId",
+      "producerVersion",
+      "manifestDigest",
+      "authorityMode",
+      "phase",
+      "sourceInventoryDigest",
+      "phaseScopeDigest",
+      "sourcePluginInventoryDigest",
+      "installedPluginInventoryDigest",
+      "installedEntrypointDigest",
+      "providerCapabilityDigest",
+      "observedToolIds",
+      "providerBinaryDigest",
+      "mcpProtocolVersion",
+      "installationMethod",
+      "scenarios",
+      "outcome",
+      "receiptDigest"
+    ];
+    for (const field of expectedRequired) {
+      if (!liveReceiptSchema.required?.includes(field)
+        || !liveReceiptSchema.properties?.[field]) {
+        problem(`Worker Broker live receipt schema is missing required field ${field}.`, file);
+      }
+    }
+    const expectedManifestDigest = "0641afd02156262492b10f52dd71f4ce18aa6b338179324a34d6b2b111b6370b";
+    if (liveReceiptSchema.properties?.schemaVersion?.const !== 1
+      || liveReceiptSchema.properties?.producerId?.const !== "worker-broker-live-receipt-runner"
+      || liveReceiptSchema.properties?.producerVersion?.const !== 1
+      || liveReceiptSchema.properties?.manifestDigest?.const !== expectedManifestDigest
+      || liveReceiptSchema.properties?.mcpProtocolVersion?.const !== "2025-11-25"
+      || liveReceiptSchema.properties?.providerRevision?.pattern
+        !== "^binary-sha256-[0-9a-f]{64}$"
+      || liveReceiptSchema.properties?.outcome?.const !== "pass") {
+      problem("Worker Broker live receipt schema must bind exact producer and protocol identity.", file);
+    }
+    const scenarioSchema = liveReceiptSchema.properties?.scenarios?.items;
+    const requiredScenarioFields = [
+      "spawnInvocationCount",
+      "spawnReplayCount",
+      "providerLaunchCount",
+      "providerTerminalCount",
+      "cancelInvocationCount",
+      "cancelReplayCount",
+      "uniqueCancelRequestCount",
+      "runnerTemporaryArtifactsRemoved",
+      "qualificationSessionDeleted"
+    ];
+    if (!requiredScenarioFields.every((field) => (
+      scenarioSchema?.required?.includes(field) && scenarioSchema?.properties?.[field]
+    ))
+      || ["cancelRequestCount", "temporaryArtifactsRemoved", "providerSessionClosed"]
+        .some((field) => scenarioSchema?.required?.includes(field)
+          || scenarioSchema?.properties?.[field])
+      || !/unique launched provider generations/i.test(
+        scenarioSchema?.properties?.providerTerminalCount?.description || ""
+      )) {
+      problem("Worker Broker live receipt schema must bind exact invocation, replay, terminal, and cleanup semantics.", file);
+    }
+    const syntheticRule = (liveReceiptSchema.allOf || []).find((rule) => (
+      rule?.if?.properties?.authorityMode?.const === "synthetic-direct-mcp"
+    ));
+    const naturalRule = (liveReceiptSchema.allOf || []).find((rule) => (
+      rule?.if?.properties?.authorityMode?.const === "natural-codex-host"
+    ));
+    if (syntheticRule?.then?.properties?.phase?.const !== "1"
+      || syntheticRule?.then?.properties?.observedToolIds?.const?.length !== 7
+      || syntheticRule?.then?.properties?.scenarios?.const?.length !== 2
+      || naturalRule?.then?.properties?.phase?.const !== "4"
+      || naturalRule?.then?.properties?.installationMethod?.const !== "codex-local-plugin-cache"
+      || naturalRule?.then?.properties?.observedToolIds?.const?.length !== 4
+      || naturalRule?.then?.properties?.scenarios?.const?.length !== 1) {
+      problem("Worker Broker live receipt schema must bind exact authority scenarios and tool inventories.", file);
     }
   }
 

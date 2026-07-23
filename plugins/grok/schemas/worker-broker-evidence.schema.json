@@ -61,6 +61,211 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "qualification": {
+            "properties": {
+              "provider": { "enum": ["fail", "skip", "not_run"] }
+            },
+            "required": ["provider"]
+          }
+        },
+        "required": ["qualification"]
+      },
+      "then": {
+        "properties": {
+          "liveQualificationReceipts": {
+            "properties": {
+              "syntheticDirectMcp": { "type": "null" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "qualification": {
+            "properties": { "provider": { "const": "pass" } },
+            "required": ["provider"]
+          }
+        },
+        "required": ["qualification"]
+      },
+      "then": {
+        "required": ["liveQualificationReceipts"],
+        "properties": {
+          "phase": { "enum": ["1", "4"] },
+          "liveQualificationReceipts": {
+            "properties": {
+              "syntheticDirectMcp": { "type": "object" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "qualification": {
+            "properties": { "installedHost": { "const": "pass" } },
+            "required": ["installedHost"]
+          }
+        },
+        "required": ["qualification"]
+      },
+      "then": {
+        "required": ["liveQualificationReceipts"],
+        "properties": {
+          "phase": { "const": "4" },
+          "qualification": {
+            "properties": { "provider": { "const": "pass" } }
+          },
+          "liveQualificationReceipts": {
+            "properties": {
+              "syntheticDirectMcp": { "type": "object" },
+              "naturalCodexHost": { "type": "object" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "qualification": {
+            "properties": {
+              "installedHost": { "enum": ["fail", "skip", "not_run"] }
+            },
+            "required": ["installedHost"]
+          }
+        },
+        "required": ["qualification"]
+      },
+      "then": {
+        "properties": {
+          "liveQualificationReceipts": {
+            "properties": {
+              "naturalCodexHost": { "type": "null" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "liveQualificationReceipts": {
+            "properties": {
+              "syntheticDirectMcp": { "type": "object" }
+            },
+            "required": ["syntheticDirectMcp"]
+          }
+        },
+        "required": ["liveQualificationReceipts"]
+      },
+      "then": {
+        "properties": {
+          "phase": { "enum": ["1", "4"] },
+          "qualification": {
+            "properties": { "provider": { "const": "pass" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "liveQualificationReceipts": {
+            "properties": {
+              "naturalCodexHost": { "type": "object" }
+            },
+            "required": ["naturalCodexHost"]
+          }
+        },
+        "required": ["liveQualificationReceipts"]
+      },
+      "then": {
+        "properties": {
+          "phase": { "const": "4" },
+          "qualification": {
+            "properties": {
+              "provider": { "const": "pass" },
+              "installedHost": { "const": "pass" }
+            }
+          },
+          "liveQualificationReceipts": {
+            "properties": {
+              "syntheticDirectMcp": { "type": "object" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "anyOf": [
+          {
+            "properties": {
+              "qualification": {
+                "properties": { "provider": { "const": "pass" } },
+                "required": ["provider"]
+              }
+            },
+            "required": ["qualification"]
+          },
+          {
+            "properties": {
+              "qualification": {
+                "properties": { "installedHost": { "const": "pass" } },
+                "required": ["installedHost"]
+              }
+            },
+            "required": ["qualification"]
+          },
+          {
+            "properties": {
+              "liveQualificationReceipts": {
+                "properties": {
+                  "syntheticDirectMcp": { "type": "object" }
+                },
+                "required": ["syntheticDirectMcp"]
+              }
+            },
+            "required": ["liveQualificationReceipts"]
+          },
+          {
+            "properties": {
+              "liveQualificationReceipts": {
+                "properties": {
+                  "naturalCodexHost": { "type": "object" }
+                },
+                "required": ["naturalCodexHost"]
+              }
+            },
+            "required": ["liveQualificationReceipts"]
+          }
+        ]
+      },
+      "then": {
+        "properties": {
+          "status": { "const": "implemented_unverified" },
+          "provisionalSupportingRecord": { "const": true },
+          "releaseQualification": { "const": false },
+          "qualification": {
+            "properties": {
+              "release": { "enum": ["fail", "skip", "not_run"] }
+            }
+          },
+          "authorities": {
+            "properties": {
+              "hostVerification": { "const": "not_run" }
+            }
+          }
+        }
+      }
     }
   ],
   "properties": {
@@ -374,6 +579,54 @@
             "type": "string",
             "enum": ["pass", "fail", "skip", "not_run"]
           }
+        }
+      }
+    },
+    "liveQualificationReceipts": {
+      "type": "object",
+      "description": "Digest references for strict offline integrity replay only. The generic writer rejects this field, no supported publication API currently exists, and historical origin cannot be authenticated without a protected signature or external immutable anchor.",
+      "additionalProperties": false,
+      "required": ["syntheticDirectMcp", "naturalCodexHost"],
+      "properties": {
+        "syntheticDirectMcp": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "receiptDigest"],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "pattern": "^tests/e2e-results/worker-broker/live-receipts/v1/synthetic-direct-mcp/[0-9a-f]{16}-[0-9a-f]{16}\\.json$"
+                },
+                "receiptDigest": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              }
+            }
+          ]
+        },
+        "naturalCodexHost": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "receiptDigest"],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "pattern": "^tests/e2e-results/worker-broker/live-receipts/v1/natural-codex-host/[0-9a-f]{16}-[0-9a-f]{16}\\.json$"
+                },
+                "receiptDigest": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              }
+            }
+          ]
         }
       }
     },

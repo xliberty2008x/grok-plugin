@@ -35,6 +35,143 @@ export const PROOF_PRODUCER_VERSION = 2;
 export const INDEPENDENT_REVIEW_PRODUCER_ID = "codex-native-review-runner";
 export const INDEPENDENT_REVIEW_PRODUCER_VERSION = 1;
 export const INDEPENDENT_REVIEW_MANIFEST_DIGEST = "82792debed04937a264e759a1812ba1e33e0417aa555f87ce13e7f5417fd6f12";
+export const LIVE_RECEIPT_SCHEMA_VERSION = 1;
+export const LIVE_RECEIPT_PRODUCER_ID = "worker-broker-live-receipt-runner";
+export const LIVE_RECEIPT_PRODUCER_VERSION = 1;
+export const LIVE_RECEIPT_AUTHORITY_SYNTHETIC = "synthetic-direct-mcp";
+export const LIVE_RECEIPT_AUTHORITY_NATURAL = "natural-codex-host";
+export const LIVE_RECEIPT_ROOT = `${EVIDENCE_ROOT}/live-receipts/v1`;
+export const LIVE_RECEIPT_AUTHORITY_MODES = Object.freeze([
+  LIVE_RECEIPT_AUTHORITY_SYNTHETIC,
+  LIVE_RECEIPT_AUTHORITY_NATURAL
+]);
+export const LIVE_INSTALLATION_METHODS = Object.freeze([
+  "codex-local-plugin-cache",
+  "exact-source-plugin-install"
+]);
+export const LIVE_RECEIPT_CAPABILITY_TOOL_IDS = Object.freeze([
+  "worker_list_owned",
+  "worker_get",
+  "worker_events_after",
+  "worker_wait",
+  "worker_result",
+  "worker_spawn",
+  "worker_cancel"
+]);
+export const LIVE_RECEIPT_NATURAL_TOOL_IDS = Object.freeze([
+  "worker_list_owned",
+  "worker_spawn",
+  "worker_wait",
+  "worker_result"
+]);
+
+function freezeLiveScenario(scenario) {
+  return Object.freeze({ ...scenario });
+}
+
+// providerTerminalCount is the number of unique launched provider generations
+// whose captured process group the future runner/private installed state later
+// observes gone. It is never inferred from public provider-start or
+// session-created events.
+const LIVE_RECEIPT_SCENARIOS = Object.freeze({
+  [LIVE_RECEIPT_AUTHORITY_SYNTHETIC]: Object.freeze([
+    freezeLiveScenario({
+      id: "authenticated-completion",
+      spawnInvocationCount: 1,
+      spawnReplayCount: 0,
+      providerLaunchCount: 1,
+      providerTerminalCount: 1,
+      workerTerminalCount: 1,
+      resultReadCount: 1,
+      reconnectCount: 0,
+      cancelInvocationCount: 0,
+      cancelReplayCount: 0,
+      uniqueCancelRequestCount: 0,
+      cancellationEventCount: 0,
+      duplicateLaunchCount: 0,
+      workerHostVerification: "not_run",
+      processGroupGone: true,
+      taskRuntimeCleaned: true,
+      runnerTemporaryArtifactsRemoved: true,
+      qualificationSessionDeleted: true
+    }),
+    freezeLiveScenario({
+      id: "mcp-restart-reconnect-cancellation",
+      spawnInvocationCount: 2,
+      spawnReplayCount: 1,
+      providerLaunchCount: 1,
+      providerTerminalCount: 1,
+      workerTerminalCount: 1,
+      resultReadCount: 1,
+      reconnectCount: 1,
+      cancelInvocationCount: 2,
+      cancelReplayCount: 1,
+      uniqueCancelRequestCount: 1,
+      cancellationEventCount: 1,
+      duplicateLaunchCount: 0,
+      workerHostVerification: "not_run",
+      processGroupGone: true,
+      taskRuntimeCleaned: true,
+      runnerTemporaryArtifactsRemoved: true,
+      qualificationSessionDeleted: true
+    })
+  ]),
+  [LIVE_RECEIPT_AUTHORITY_NATURAL]: Object.freeze([
+    freezeLiveScenario({
+      id: "natural-codex-installed-host",
+      spawnInvocationCount: 1,
+      spawnReplayCount: 0,
+      providerLaunchCount: 1,
+      providerTerminalCount: 1,
+      workerTerminalCount: 1,
+      resultReadCount: 1,
+      reconnectCount: 0,
+      cancelInvocationCount: 0,
+      cancelReplayCount: 0,
+      uniqueCancelRequestCount: 0,
+      cancellationEventCount: 0,
+      duplicateLaunchCount: 0,
+      workerHostVerification: "not_run",
+      processGroupGone: true,
+      taskRuntimeCleaned: true,
+      runnerTemporaryArtifactsRemoved: true,
+      qualificationSessionDeleted: true
+    })
+  ])
+});
+export const LIVE_RECEIPT_SCENARIO_IDS = Object.freeze(Object.fromEntries(
+  Object.entries(LIVE_RECEIPT_SCENARIOS).map(([authorityMode, scenarios]) => [
+    authorityMode,
+    Object.freeze(scenarios.map((scenario) => scenario.id))
+  ])
+));
+export const LIVE_RECEIPT_AUTHORITY_CONFIG = Object.freeze({
+  [LIVE_RECEIPT_AUTHORITY_SYNTHETIC]: Object.freeze({
+    phase: "1",
+    qualifies: Object.freeze(["provider"]),
+    codexHostIdentity: false,
+    observedToolIds: LIVE_RECEIPT_CAPABILITY_TOOL_IDS,
+    installationMethods: LIVE_INSTALLATION_METHODS,
+    scenarios: LIVE_RECEIPT_SCENARIOS[LIVE_RECEIPT_AUTHORITY_SYNTHETIC]
+  }),
+  [LIVE_RECEIPT_AUTHORITY_NATURAL]: Object.freeze({
+    phase: "4",
+    qualifies: Object.freeze(["installedHost"]),
+    codexHostIdentity: true,
+    observedToolIds: LIVE_RECEIPT_NATURAL_TOOL_IDS,
+    installationMethods: Object.freeze(["codex-local-plugin-cache"]),
+    scenarios: LIVE_RECEIPT_SCENARIOS[LIVE_RECEIPT_AUTHORITY_NATURAL]
+  })
+});
+export const LIVE_RECEIPT_MANIFEST = Object.freeze({
+  schemaVersion: LIVE_RECEIPT_SCHEMA_VERSION,
+  producerId: LIVE_RECEIPT_PRODUCER_ID,
+  producerVersion: LIVE_RECEIPT_PRODUCER_VERSION,
+  mcpProtocolVersion: "2025-11-25",
+  providerRevisionScheme: "binary-sha256-v1",
+  installedEntrypoint: "mcp/server.mjs",
+  authorityModes: LIVE_RECEIPT_AUTHORITY_CONFIG
+});
 
 /** Explicit phase entrypoints; repository-local static imports are derived below. */
 const PHASE_SCOPE_SEEDS = freezeScopeMap({
@@ -49,6 +186,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "scripts/worker-broker-evidence.mjs",
     "scripts/validate.mjs",
     "plugins/grok/schemas/worker-broker-evidence.schema.json",
+    "plugins/grok/schemas/worker-broker-live-receipt.schema.json",
     "tests/worker-broker-evidence.test.mjs",
     "tests/helpers.mjs",
     "package.json"
@@ -86,10 +224,13 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "plugins/grok/provider-agents/setup-probe.md",
     "plugins/grok/schemas/review-output.schema.json",
     "plugins/grok/schemas/worker-protocol.schema.json",
+    "plugins/grok/schemas/worker-broker-evidence.schema.json",
+    "plugins/grok/schemas/worker-broker-live-receipt.schema.json",
     "plugins/grok/skills/rescue/SKILL.md",
     "plugins/grok/skills/result/SKILL.md",
     "plugins/grok/skills/status/SKILL.md",
     "scripts/lib/zero-skip-test-reporter.mjs",
+    "scripts/lib/worker-broker-evidence.mjs",
     "scripts/lib/static-esm-import-parser.mjs",
     "scripts/check-deterministic.mjs",
     "scripts/test-deterministic.mjs",
@@ -116,6 +257,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "tests/worker-recovery-fence.test.mjs",
     "tests/worker-cli-authority.test.mjs",
     "tests/worker-terminal-intent.test.mjs",
+    "tests/worker-broker-evidence.test.mjs",
     "tests/process-control-owned-identity.test.mjs",
     "tests/worker-mutation.test.mjs",
     "tests/worker-safety-proofs.test.mjs",
@@ -165,10 +307,14 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "plugins/grok/scripts/lib/worker-presentation.mjs",
     "plugins/grok/scripts/lib/worker-protocol.mjs",
     "plugins/grok/mcp/broker.mjs",
+    "plugins/grok/schemas/worker-broker-evidence.schema.json",
+    "plugins/grok/schemas/worker-broker-live-receipt.schema.json",
     "plugins/grok/schemas/worker-protocol.schema.json",
+    "scripts/lib/worker-broker-evidence.mjs",
     "tests/worker-presentation.test.mjs",
     "tests/worker-protocol.test.mjs",
     "tests/mcp-worker-broker.test.mjs",
+    "tests/worker-broker-evidence.test.mjs",
     "tests/args-redaction-profiles.test.mjs",
     "tests/redact.test.mjs",
     "tests/helpers.mjs"
@@ -612,6 +758,7 @@ const RECORD_TOP_LEVEL_FIELDS = new Set([
   "verification",
   "scenarios",
   "liveScenarios",
+  "liveQualificationReceipts",
   "ci",
   "authorities",
   "limits",
@@ -737,6 +884,89 @@ const LIVE_SCENARIO_FIELDS = new Set([
   "actual",
   "outcome"
 ]);
+const LIVE_QUALIFICATION_RECEIPTS_FIELDS = new Set([
+  "syntheticDirectMcp",
+  "naturalCodexHost"
+]);
+const LIVE_RECEIPT_REFERENCE_FIELDS = new Set([
+  "path",
+  "receiptDigest"
+]);
+const LIVE_RECEIPT_FIELDS = new Set([
+  "schemaVersion",
+  "producerId",
+  "producerVersion",
+  "manifestDigest",
+  "authorityMode",
+  "phase",
+  "pluginVersion",
+  "headCommit",
+  "headTree",
+  "sourceInventoryDigest",
+  "phaseScopeDigest",
+  "repositoryBeforeDigest",
+  "repositoryAfterDigest",
+  "sourcePluginInventoryDigest",
+  "installedPluginInventoryDigest",
+  "installedFileCount",
+  "installedEntrypointDigest",
+  "providerCapabilityDigest",
+  "observedToolIds",
+  "providerBinaryDigest",
+  "providerVersion",
+  "providerRevision",
+  "mcpProtocolVersion",
+  "codexBinaryDigest",
+  "codexVersion",
+  "codexModel",
+  "hostTaskDigest",
+  "installationMethod",
+  "scenarios",
+  "outcome",
+  "startedAt",
+  "endedAt",
+  "receiptDigest"
+]);
+const LIVE_RECEIPT_SCENARIO_FIELDS = new Set([
+  "id",
+  "spawnInvocationCount",
+  "spawnReplayCount",
+  "providerLaunchCount",
+  "providerTerminalCount",
+  "workerTerminalCount",
+  "resultReadCount",
+  "reconnectCount",
+  "cancelInvocationCount",
+  "cancelReplayCount",
+  "uniqueCancelRequestCount",
+  "cancellationEventCount",
+  "duplicateLaunchCount",
+  "workerHostVerification",
+  "processGroupGone",
+  "taskRuntimeCleaned",
+  "runnerTemporaryArtifactsRemoved",
+  "qualificationSessionDeleted"
+]);
+const LIVE_RECEIPT_SCENARIO_COUNT_FIELDS = new Set([
+  "spawnInvocationCount",
+  "spawnReplayCount",
+  "providerLaunchCount",
+  "providerTerminalCount",
+  "workerTerminalCount",
+  "resultReadCount",
+  "reconnectCount",
+  "cancelInvocationCount",
+  "cancelReplayCount",
+  "uniqueCancelRequestCount",
+  "cancellationEventCount",
+  "duplicateLaunchCount"
+]);
+const LIVE_RECEIPT_SCENARIO_BOOLEAN_FIELDS = new Set([
+  "processGroupGone",
+  "taskRuntimeCleaned",
+  "runnerTemporaryArtifactsRemoved",
+  "qualificationSessionDeleted"
+]);
 const AUTHORITIES_FIELDS = new Set([
   "workerClaims",
   "runtimeObservations",
@@ -779,6 +1009,10 @@ const EVIDENCE_PATH_FIELDS = new Set([
   ...RUNTIME_FIELDS,
   ...SCENARIO_FIELDS,
   ...LIVE_SCENARIO_FIELDS,
+  ...LIVE_QUALIFICATION_RECEIPTS_FIELDS,
+  ...LIVE_RECEIPT_REFERENCE_FIELDS,
+  ...LIVE_RECEIPT_FIELDS,
+  ...LIVE_RECEIPT_SCENARIO_FIELDS,
   ...AUTHORITIES_FIELDS,
   ...LIMITS_FIELDS,
   ...CI_FIELDS,
@@ -838,6 +1072,20 @@ function invalidEvidencePublicationError() {
   return fixedEvidenceError(
     "E_EVIDENCE_RECORD_INVALID",
     "Evidence record is invalid or unsafe for publication."
+  );
+}
+
+function invalidLiveReceiptError() {
+  return fixedEvidenceError(
+    "E_LIVE_RECEIPT_INVALID",
+    "Live qualification receipt is invalid or unsafe."
+  );
+}
+
+function invalidLiveQualificationPublicationError() {
+  return fixedEvidenceError(
+    "E_LIVE_QUALIFICATION_INVALID",
+    "Live-qualified evidence is invalid or unsafe for publication."
   );
 }
 
@@ -975,6 +1223,76 @@ function captureEvidencePathChain(root, absolute) {
     snapshots.push(stat);
   }
   return { canonicalRoot, canonicalAbsolute: cursor, snapshots };
+}
+
+function captureEvidencePathExistence(root, absolute) {
+  const lexicalRoot = path.resolve(root);
+  const lexicalAbsolute = path.resolve(absolute);
+  const relative = path.relative(lexicalRoot, lexicalAbsolute);
+  if (!relative
+    || relative === ".."
+    || relative.startsWith(`..${path.sep}`)
+    || path.isAbsolute(relative)) {
+    throw unsafeEvidenceFileError();
+  }
+  let canonicalRoot;
+  let rootSnapshot;
+  try {
+    canonicalRoot = fs.realpathSync.native(lexicalRoot);
+    rootSnapshot = fs.lstatSync(canonicalRoot, { bigint: true });
+  } catch {
+    throw unsafeEvidenceFileError();
+  }
+  if (!rootSnapshot.isDirectory() || rootSnapshot.isSymbolicLink()) {
+    throw unsafeEvidenceFileError();
+  }
+  const components = relative.split(path.sep).filter(Boolean);
+  const snapshots = [rootSnapshot];
+  let cursor = canonicalRoot;
+  for (const [index, component] of components.entries()) {
+    cursor = path.join(cursor, component);
+    let stat;
+    try {
+      stat = fs.lstatSync(cursor, { bigint: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        return {
+          exists: false,
+          canonicalRoot,
+          missingIndex: index,
+          snapshots
+        };
+      }
+      throw unsafeEvidenceFileError();
+    }
+    if (stat.isSymbolicLink()
+      || (index < components.length - 1 && !stat.isDirectory())) {
+      throw unsafeEvidenceFileError();
+    }
+    snapshots.push(stat);
+  }
+  return {
+    exists: true,
+    canonicalRoot,
+    missingIndex: null,
+    snapshots
+  };
+}
+
+function evidencePathIsStablyAbsent(root, absolute) {
+  const before = captureEvidencePathExistence(root, absolute);
+  if (before.exists) return false;
+  const after = captureEvidencePathExistence(root, absolute);
+  if (after.exists
+    || before.canonicalRoot !== after.canonicalRoot
+    || before.missingIndex !== after.missingIndex
+    || before.snapshots.length !== after.snapshots.length
+    || !after.snapshots.every((stat, index) => (
+      sameFileSnapshot(stat, before.snapshots[index])
+    ))) {
+    throw unsafeEvidenceFileError();
+  }
+  return true;
 }
 
 /**
@@ -1750,6 +2068,16 @@ function defaultQualification() {
     provider: "not_run",
     release: "not_run"
   };
+}
+
+function recordCarriesLiveQualification(record) {
+  const references = record?.liveQualificationReceipts;
+  return Boolean(
+    record?.qualification?.provider === "pass"
+    || record?.qualification?.installedHost === "pass"
+    || references?.syntheticDirectMcp
+    || references?.naturalCodexHost
+  );
 }
 
 function passedGateIds(record) {
@@ -2558,6 +2886,194 @@ export function computeInventoryDigest(root = REPO_ROOT, { includeEvidence = fal
   return sha256Text(JSON.stringify(inventory));
 }
 
+const MAX_LIVE_PLUGIN_FILES = 4096;
+const MAX_LIVE_PLUGIN_DIRECTORIES = 512;
+const MAX_LIVE_PLUGIN_DEPTH = 32;
+const MAX_LIVE_PLUGIN_DIRECTORY_ENTRIES = 4096;
+const MAX_LIVE_PLUGIN_FILE_BYTES = 128 * 1024 * 1024;
+const MAX_LIVE_PLUGIN_TOTAL_BYTES = 512 * 1024 * 1024;
+
+function readBoundedLiveDirectory(directory) {
+  const entries = [];
+  let handle;
+  let failure = null;
+  try {
+    handle = fs.opendirSync(directory);
+    while (true) {
+      const entry = handle.readSync();
+      if (entry === null) break;
+      if (entries.length >= MAX_LIVE_PLUGIN_DIRECTORY_ENTRIES) {
+        throw invalidLiveReceiptError();
+      }
+      entries.push(entry);
+    }
+  } catch {
+    failure = invalidLiveReceiptError();
+  } finally {
+    if (handle) {
+      try {
+        handle.closeSync();
+      } catch {
+        failure = invalidLiveReceiptError();
+      }
+    }
+  }
+  if (failure) throw failure;
+  return entries.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+/**
+ * Capture the portable plugin-tree inventory used by the installed-cache
+ * updater. No absolute path, inode, device, timestamp, or file content leaves
+ * this function; only the deterministic inventory digest/count are retained.
+ */
+function captureLivePluginInventory(pluginRoot) {
+  const lexicalRoot = path.resolve(pluginRoot);
+  let rootStat;
+  let canonicalRoot;
+  try {
+    rootStat = fs.lstatSync(lexicalRoot, { bigint: true });
+    canonicalRoot = fs.realpathSync.native(lexicalRoot);
+  } catch {
+    throw invalidLiveReceiptError();
+  }
+  if (!rootStat.isDirectory()
+    || rootStat.isSymbolicLink()
+    || canonicalRoot !== lexicalRoot) {
+    throw invalidLiveReceiptError();
+  }
+
+  const entries = [];
+  let totalBytes = 0;
+  let directoryCount = 0;
+  let pluginVersion = null;
+  let installedEntrypointDigest = null;
+  const contained = (candidate) => {
+    const relative = path.relative(canonicalRoot, candidate);
+    return relative === ""
+      || (relative !== ".."
+        && !relative.startsWith(`..${path.sep}`)
+        && !path.isAbsolute(relative));
+  };
+  const visit = (directory, prefix = "", depth = 0) => {
+    if (depth > MAX_LIVE_PLUGIN_DEPTH
+      || directoryCount >= MAX_LIVE_PLUGIN_DIRECTORIES
+      || !contained(directory)) {
+      throw invalidLiveReceiptError();
+    }
+    directoryCount += 1;
+    let directoryBefore;
+    let canonicalDirectory;
+    let children;
+    try {
+      directoryBefore = fs.lstatSync(directory, { bigint: true });
+      canonicalDirectory = fs.realpathSync.native(directory);
+      if (!directoryBefore.isDirectory()
+        || directoryBefore.isSymbolicLink()
+        || canonicalDirectory !== directory
+        || !contained(canonicalDirectory)) {
+        throw invalidLiveReceiptError();
+      }
+      children = readBoundedLiveDirectory(directory);
+    } catch {
+      throw invalidLiveReceiptError();
+    }
+    for (const child of children) {
+      const absolute = path.join(directory, child.name);
+      const relative = prefix ? `${prefix}/${child.name}` : child.name;
+      let pathBefore;
+      let canonical;
+      try {
+        pathBefore = fs.lstatSync(absolute, { bigint: true });
+        canonical = fs.realpathSync.native(absolute);
+      } catch {
+        throw invalidLiveReceiptError();
+      }
+      if (pathBefore.isSymbolicLink()
+        || canonical !== absolute
+        || !contained(canonical)) {
+        throw invalidLiveReceiptError();
+      }
+      if (pathBefore.isDirectory()) {
+        visit(absolute, relative, depth + 1);
+        continue;
+      }
+      if (!pathBefore.isFile() || entries.length >= MAX_LIVE_PLUGIN_FILES) {
+        throw invalidLiveReceiptError();
+      }
+      const noFollow = Number.isInteger(fs.constants.O_NOFOLLOW) ? fs.constants.O_NOFOLLOW : 0;
+      let descriptor;
+      try {
+        descriptor = fs.openSync(absolute, fs.constants.O_RDONLY | noFollow);
+        const before = fs.fstatSync(descriptor, { bigint: true });
+        if (!before.isFile()
+          || before.size < 0n
+          || before.size > BigInt(MAX_LIVE_PLUGIN_FILE_BYTES)
+          || !sameFileSnapshot(pathBefore, before)) {
+          throw invalidLiveReceiptError();
+        }
+        const bytes = fs.readFileSync(descriptor);
+        const after = fs.fstatSync(descriptor, { bigint: true });
+        const pathAfter = fs.lstatSync(absolute, { bigint: true });
+        if (BigInt(bytes.byteLength) !== before.size
+          || !sameFileSnapshot(before, after)
+          || !sameFileSnapshot(pathBefore, pathAfter)
+          || fs.realpathSync.native(absolute) !== absolute) {
+          throw invalidLiveReceiptError();
+        }
+        totalBytes += bytes.byteLength;
+        if (totalBytes > MAX_LIVE_PLUGIN_TOTAL_BYTES) throw invalidLiveReceiptError();
+        const digest = crypto.createHash("sha256").update(bytes).digest("hex");
+        entries.push({
+          path: relative,
+          mode: Number(before.mode & 0o777n),
+          size: bytes.byteLength,
+          sha256: digest
+        });
+        if (relative === ".codex-plugin/plugin.json") {
+          const manifest = JSON.parse(bytes.toString("utf8"));
+          if (typeof manifest?.version !== "string"
+            || !LIVE_RECEIPT_RUNTIME_ID.test(manifest.version)) {
+            throw invalidLiveReceiptError();
+          }
+          pluginVersion = manifest.version;
+        }
+        if (relative === LIVE_RECEIPT_MANIFEST.installedEntrypoint) {
+          installedEntrypointDigest = digest;
+        }
+      } finally {
+        if (descriptor !== undefined) fs.closeSync(descriptor);
+      }
+    }
+    let directoryAfter;
+    try {
+      directoryAfter = fs.lstatSync(directory, { bigint: true });
+      if (!sameFileSnapshot(directoryBefore, directoryAfter)
+        || fs.realpathSync.native(directory) !== canonicalDirectory) {
+        throw invalidLiveReceiptError();
+      }
+    } catch (error) {
+      if (error?.code === "E_LIVE_RECEIPT_INVALID") throw error;
+      throw invalidLiveReceiptError();
+    }
+  };
+  visit(canonicalRoot);
+  if (!entries.length || pluginVersion === null || installedEntrypointDigest === null) {
+    throw invalidLiveReceiptError();
+  }
+  const rootAfter = fs.lstatSync(lexicalRoot, { bigint: true });
+  if (!sameFileSnapshot(rootStat, rootAfter)
+    || fs.realpathSync.native(lexicalRoot) !== canonicalRoot) {
+    throw invalidLiveReceiptError();
+  }
+  return Object.freeze({
+    fileCount: entries.length,
+    digest: sha256Text(JSON.stringify(entries)),
+    pluginVersion,
+    installedEntrypointDigest
+  });
+}
+
 export function computePhaseScopeDigest(phase, root = REPO_ROOT) {
   const scope = PHASE_SCOPE[String(phase)] || [];
   const missing = scope.filter((relative) => !fs.existsSync(path.join(root, relative)));
@@ -2731,6 +3247,16 @@ export function computeIndependentReviewReceiptDigest(receipt) {
   return sha256Text(stableStringify(body));
 }
 
+export function computeLiveReceiptManifestDigest() {
+  return sha256Text(stableStringify(LIVE_RECEIPT_MANIFEST));
+}
+
+export function computeLiveQualificationReceiptDigest(receipt) {
+  const body = structuredClone(receipt);
+  delete body.receiptDigest;
+  return sha256Text(stableStringify(body));
+}
+
 export function attachIndependentReviewReceiptDigest(receipt) {
   const next = { ...receipt };
   delete next.receiptDigest;
@@ -2743,6 +3269,324 @@ export function attachRecordDigest(record) {
   delete next.recordDigest;
   next.recordDigest = computeRecordDigest(next);
   return next;
+}
+
+const LIVE_RECEIPT_RUNTIME_ID = /^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$/;
+
+function isCanonicalIsoDateTime(value) {
+  if (typeof value !== "string") return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+function liveReceiptRelativePath(receipt) {
+  return [
+    LIVE_RECEIPT_ROOT,
+    receipt.authorityMode,
+    `${receipt.sourceInventoryDigest.slice(0, 16)}-${receipt.receiptDigest.slice(0, 16)}.json`
+  ].join("/");
+}
+
+function fixedLiveReceiptScenarioProjection(scenarios) {
+  return scenarios.map((scenario) => ({
+    id: scenario.id,
+    spawnInvocationCount: scenario.spawnInvocationCount,
+    spawnReplayCount: scenario.spawnReplayCount,
+    providerLaunchCount: scenario.providerLaunchCount,
+    providerTerminalCount: scenario.providerTerminalCount,
+    workerTerminalCount: scenario.workerTerminalCount,
+    resultReadCount: scenario.resultReadCount,
+    reconnectCount: scenario.reconnectCount,
+    cancelInvocationCount: scenario.cancelInvocationCount,
+    cancelReplayCount: scenario.cancelReplayCount,
+    uniqueCancelRequestCount: scenario.uniqueCancelRequestCount,
+    cancellationEventCount: scenario.cancellationEventCount,
+    duplicateLaunchCount: scenario.duplicateLaunchCount,
+    workerHostVerification: scenario.workerHostVerification,
+    processGroupGone: scenario.processGroupGone,
+    taskRuntimeCleaned: scenario.taskRuntimeCleaned,
+    runnerTemporaryArtifactsRemoved: scenario.runnerTemporaryArtifactsRemoved,
+    qualificationSessionDeleted: scenario.qualificationSessionDeleted
+  }));
+}
+
+/**
+ * Validate one bounded live receipt for offline repository review. This is
+ * structural and source-bound integrity validation only: without a protected
+ * signature or external anchor it cannot distinguish manually authored JSON
+ * from runner output. No supported mint/publication API exists in this module.
+ *
+ * A future fixed runner must derive the cache root from verified Codex install
+ * output, the stable provider capability from the setup receipt and tools/list,
+ * binary identities from the files it actually launches, and natural task
+ * identity from trusted Codex host events. Invocation/replay counts must come
+ * from the runner and private installed state, not public provider-start or
+ * session-created events. It must keep observation and private publication end
+ * to end.
+ */
+export function validateLiveQualificationReceipt(receipt, options = {}) {
+  const errors = [];
+  const fail = (message) => errors.push(message);
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) {
+    return { ok: false, errors: ["Live receipt must be a JSON object."] };
+  }
+
+  let serialized;
+  try {
+    serialized = JSON.stringify(receipt);
+  } catch {
+    return { ok: false, errors: ["Live receipt is not serializable."] };
+  }
+  if (Buffer.byteLength(serialized) > MAX_EVIDENCE_RECORD_BYTES) {
+    fail(`Live receipt exceeds ${MAX_EVIDENCE_RECORD_BYTES} serialized bytes.`);
+  }
+  for (const message of boundedEvidenceErrors(receipt, "$receipt")) fail(message);
+  if (!exactFields(receipt, LIVE_RECEIPT_FIELDS)) {
+    fail("Live receipt fields do not match the fixed v1 manifest.");
+  }
+
+  if (receipt.schemaVersion !== LIVE_RECEIPT_SCHEMA_VERSION) {
+    fail(`schemaVersion must be ${LIVE_RECEIPT_SCHEMA_VERSION}.`);
+  }
+  if (receipt.producerId !== LIVE_RECEIPT_PRODUCER_ID
+    || receipt.producerVersion !== LIVE_RECEIPT_PRODUCER_VERSION) {
+    fail("Live receipt producer identity is invalid.");
+  }
+  if (receipt.manifestDigest !== computeLiveReceiptManifestDigest()) {
+    fail("Live receipt manifestDigest does not match the code-owned manifest.");
+  }
+
+  const config = LIVE_RECEIPT_AUTHORITY_CONFIG[receipt.authorityMode];
+  if (!config) {
+    fail("Live receipt authorityMode is invalid.");
+  } else {
+    if (receipt.phase !== config.phase) {
+      fail("Live receipt phase does not match its authority mode.");
+    }
+    if (!config.installationMethods.includes(receipt.installationMethod)) {
+      fail("Live receipt installationMethod is not allowed for its authority mode.");
+    }
+  }
+
+  if (typeof receipt.pluginVersion !== "string"
+    || !LIVE_RECEIPT_RUNTIME_ID.test(receipt.pluginVersion)) {
+    fail("Live receipt pluginVersion is invalid.");
+  }
+  for (const field of ["headCommit", "headTree"]) {
+    if (!/^[0-9a-f]{40}$/.test(receipt[field] || "")) {
+      fail(`Live receipt ${field} must be a full 40-char SHA.`);
+    }
+  }
+  for (const field of [
+    "sourceInventoryDigest",
+    "phaseScopeDigest",
+    "repositoryBeforeDigest",
+    "repositoryAfterDigest",
+    "sourcePluginInventoryDigest",
+    "installedPluginInventoryDigest",
+    "installedEntrypointDigest",
+    "providerCapabilityDigest",
+    "providerBinaryDigest"
+  ]) {
+    if (!SHA256.test(receipt[field] || "")) {
+      fail(`Live receipt ${field} must be sha256 hex.`);
+    }
+  }
+  if (receipt.repositoryBeforeDigest !== receipt.sourceInventoryDigest
+    || receipt.repositoryAfterDigest !== receipt.sourceInventoryDigest) {
+    fail("Live receipt repository before/after digests must equal the bound source inventory.");
+  }
+  if (receipt.sourcePluginInventoryDigest !== receipt.installedPluginInventoryDigest) {
+    fail("Live receipt source and installed plugin inventory digests differ.");
+  }
+  if (!Number.isInteger(receipt.installedFileCount)
+    || receipt.installedFileCount < 1
+    || receipt.installedFileCount > MAX_LIVE_PLUGIN_FILES) {
+    fail("Live receipt installedFileCount is invalid.");
+  }
+  if (config
+    && JSON.stringify(receipt.observedToolIds)
+      !== JSON.stringify(config.observedToolIds)) {
+    fail("Live receipt observedToolIds do not match the exact authority-specific operation manifest.");
+  }
+  for (const field of ["providerVersion", "providerRevision"]) {
+    if (typeof receipt[field] !== "string"
+      || !LIVE_RECEIPT_RUNTIME_ID.test(receipt[field])) {
+      fail(`Live receipt ${field} is invalid.`);
+    }
+  }
+  if (receipt.providerRevision
+    !== `binary-sha256-${receipt.providerBinaryDigest}`) {
+    fail("Live receipt providerRevision does not match its provider binary digest.");
+  }
+  if (receipt.mcpProtocolVersion !== LIVE_RECEIPT_MANIFEST.mcpProtocolVersion) {
+    fail("Live receipt mcpProtocolVersion does not match the code-owned manifest.");
+  }
+  if (config?.codexHostIdentity) {
+    if (!SHA256.test(receipt.codexBinaryDigest || "")) {
+      fail("Natural live receipt codexBinaryDigest must be sha256 hex.");
+    }
+    if (typeof receipt.codexVersion !== "string"
+      || !LIVE_RECEIPT_RUNTIME_ID.test(receipt.codexVersion)) {
+      fail("Natural live receipt codexVersion is invalid.");
+    }
+    if (receipt.codexModel !== null
+      && (typeof receipt.codexModel !== "string"
+        || !LIVE_RECEIPT_RUNTIME_ID.test(receipt.codexModel))) {
+      fail("Natural live receipt codexModel must be null or a bounded runtime identity.");
+    }
+    if (!SHA256.test(receipt.hostTaskDigest || "")) {
+      fail("Natural live receipt hostTaskDigest must be sha256 hex.");
+    }
+  } else if (receipt.codexBinaryDigest !== null
+    || receipt.codexVersion !== null
+    || receipt.codexModel !== null
+    || receipt.hostTaskDigest !== null) {
+    fail("Synthetic direct-MCP authority cannot contain or claim Codex host identity.");
+  }
+
+  if (!Array.isArray(receipt.scenarios)) {
+    fail("Live receipt scenarios must be an array.");
+  } else {
+    for (const [index, scenario] of receipt.scenarios.entries()) {
+      if (!exactFields(scenario, LIVE_RECEIPT_SCENARIO_FIELDS)) {
+        fail(`Live receipt scenarios[${index}] fields are invalid.`);
+        continue;
+      }
+      if (typeof scenario.id !== "string" || !scenario.id) {
+        fail(`Live receipt scenarios[${index}].id is invalid.`);
+      }
+      for (const field of LIVE_RECEIPT_SCENARIO_COUNT_FIELDS) {
+        if (!Number.isInteger(scenario[field])
+          || scenario[field] < 0
+          || scenario[field] > 8) {
+          fail(`Live receipt scenarios[${index}].${field} is invalid.`);
+        }
+      }
+      for (const field of LIVE_RECEIPT_SCENARIO_BOOLEAN_FIELDS) {
+        if (typeof scenario[field] !== "boolean") {
+          fail(`Live receipt scenarios[${index}].${field} must be boolean.`);
+        }
+      }
+      if (scenario.workerHostVerification !== "not_run") {
+        fail(`Live receipt scenarios[${index}].workerHostVerification must be not_run.`);
+      }
+    }
+    if (config && stableStringify(fixedLiveReceiptScenarioProjection(receipt.scenarios))
+      !== stableStringify(config.scenarios)) {
+      fail("Live receipt scenario order, lifecycle counts, or cleanup outcomes do not match the authority manifest.");
+    }
+  }
+  if (receipt.outcome !== "pass") fail("Live receipt outcome must be pass.");
+  for (const field of ["startedAt", "endedAt"]) {
+    if (!isCanonicalIsoDateTime(receipt[field])) {
+      fail(`Live receipt ${field} must be a canonical date-time.`);
+    }
+  }
+  if (isCanonicalIsoDateTime(receipt.startedAt)
+    && isCanonicalIsoDateTime(receipt.endedAt)
+    && Date.parse(receipt.endedAt) < Date.parse(receipt.startedAt)) {
+    fail("Live receipt endedAt precedes startedAt.");
+  }
+  if (!SHA256.test(receipt.receiptDigest || "")
+    || receipt.receiptDigest !== computeLiveQualificationReceiptDigest(receipt)) {
+    fail("Live receipt receiptDigest does not match its canonical body.");
+  }
+
+  if (options.strict && options.root) {
+    let sourceDigestMatches = false;
+    try {
+      const identity = gitIdentity(options.root);
+      const sourceDigest = computeInventoryDigest(options.root, { includeEvidence: false });
+      sourceDigestMatches = sourceDigest === receipt.sourceInventoryDigest;
+      if (!sourceDigestMatches) {
+        fail("Live receipt sourceInventoryDigest is stale.");
+      }
+      if (!isNonEvidenceTreeClean(options.root)) {
+        fail("Live receipt replay requires a clean non-evidence source tree.");
+      }
+      if (receipt.headCommit !== identity.headCommit && !sourceDigestMatches) {
+        fail("Live receipt headCommit does not match current source.");
+      }
+      if (receipt.headTree !== identity.headTree && !sourceDigestMatches) {
+        fail("Live receipt headTree does not match current source.");
+      }
+      if (config
+        && computePhaseScopeDigest(config.phase, options.root) !== receipt.phaseScopeDigest) {
+        fail("Live receipt phaseScopeDigest is stale.");
+      }
+      const sourcePlugin = captureLivePluginInventory(path.join(options.root, "plugins/grok"));
+      if (sourcePlugin.digest !== receipt.sourcePluginInventoryDigest
+        || sourcePlugin.fileCount !== receipt.installedFileCount) {
+        fail("Live receipt source plugin inventory no longer matches its installed-artifact binding.");
+      }
+      if (sourcePlugin.pluginVersion !== receipt.pluginVersion) {
+        fail("Live receipt pluginVersion is stale.");
+      }
+      if (sourcePlugin.installedEntrypointDigest !== receipt.installedEntrypointDigest) {
+        fail("Live receipt installed entrypoint does not match current source.");
+      }
+    } catch {
+      fail("Live receipt current source identity could not be verified.");
+    }
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
+function loadLiveReceiptReference(reference, authorityMode, root) {
+  if (!exactFields(reference, LIVE_RECEIPT_REFERENCE_FIELDS)
+    || typeof reference.path !== "string"
+    || !SHA256.test(reference.receiptDigest || "")) {
+    throw invalidLiveQualificationPublicationError();
+  }
+  const prefix = `${LIVE_RECEIPT_ROOT}/${authorityMode}/`;
+  if (!reference.path.startsWith(prefix)
+    || reference.path.includes("\\")
+    || reference.path.split("/").includes("..")) {
+    throw invalidLiveQualificationPublicationError();
+  }
+  let receipt;
+  try {
+    const absolute = path.join(root, ...reference.path.split("/"));
+    receipt = JSON.parse(readBoundedEvidenceFile(root, absolute));
+  } catch {
+    throw invalidLiveQualificationPublicationError();
+  }
+  const validation = validateLiveQualificationReceipt(receipt, { strict: true, root });
+  if (!validation.ok
+    || receipt.authorityMode !== authorityMode
+    || receipt.receiptDigest !== reference.receiptDigest
+    || liveReceiptRelativePath(receipt) !== reference.path) {
+    throw invalidLiveQualificationPublicationError();
+  }
+  return receipt;
+}
+
+function receiptMatchesRecordSource(receipt, record) {
+  return Boolean(receipt
+    && record?.source
+    && receipt.headCommit === record.source.headCommit
+    && receipt.headTree === record.source.headTree
+    && receipt.sourceInventoryDigest === record.source.sourceInventoryDigest);
+}
+
+function receiptsShareRuntimeIdentity(left, right) {
+  return [
+    "headCommit",
+    "headTree",
+    "sourceInventoryDigest",
+    "pluginVersion",
+    "sourcePluginInventoryDigest",
+    "installedPluginInventoryDigest",
+    "installedFileCount",
+    "installedEntrypointDigest",
+    "providerCapabilityDigest",
+    "providerBinaryDigest",
+    "providerVersion",
+    "providerRevision",
+    "mcpProtocolVersion"
+  ].every((field) => left?.[field] === right?.[field]);
 }
 
 /**
@@ -2847,6 +3691,31 @@ export function validateEvidenceRecord(record, options = {}) {
     for (const boundary of QUALIFICATION_BOUNDARIES) {
       if (!OUTCOME_SET.has(qualification[boundary])) {
         fail(`qualification.${boundary} must be pass, fail, skip, or not_run.`);
+      }
+    }
+  }
+
+  const hasLiveQualificationReceipts = Object.hasOwn(record, "liveQualificationReceipts");
+  const liveQualificationReceipts = record.liveQualificationReceipts;
+  if (hasLiveQualificationReceipts) {
+    if (!exactFields(liveQualificationReceipts, LIVE_QUALIFICATION_RECEIPTS_FIELDS)) {
+      fail("liveQualificationReceipts must contain the exact synthetic and natural receipt slots.");
+    } else {
+      for (const field of LIVE_QUALIFICATION_RECEIPTS_FIELDS) {
+        const reference = liveQualificationReceipts[field];
+        if (reference !== null
+          && !exactFields(reference, LIVE_RECEIPT_REFERENCE_FIELDS)) {
+          fail(`liveQualificationReceipts.${field} must be null or an exact receipt reference.`);
+          continue;
+        }
+        if (reference !== null) {
+          if (typeof reference.path !== "string" || !reference.path) {
+            fail(`liveQualificationReceipts.${field}.path is required.`);
+          }
+          if (!SHA256.test(reference.receiptDigest || "")) {
+            fail(`liveQualificationReceipts.${field}.receiptDigest must be sha256 hex.`);
+          }
+        }
       }
     }
   }
@@ -3351,6 +4220,164 @@ export function validateEvidenceRecord(record, options = {}) {
     }
   }
 
+  const providerPassRequested = qualification?.provider === "pass";
+  const installedHostPassRequested = qualification?.installedHost === "pass";
+  const hasSyntheticReference = Boolean(
+    exactFields(liveQualificationReceipts, LIVE_QUALIFICATION_RECEIPTS_FIELDS)
+    && liveQualificationReceipts.syntheticDirectMcp !== null
+  );
+  const hasNaturalReference = Boolean(
+    exactFields(liveQualificationReceipts, LIVE_QUALIFICATION_RECEIPTS_FIELDS)
+    && liveQualificationReceipts.naturalCodexHost !== null
+  );
+  const hasAnyLiveReference = hasSyntheticReference || hasNaturalReference;
+  let syntheticReceipt = null;
+  let naturalReceipt = null;
+
+  if (providerPassRequested || installedHostPassRequested || hasAnyLiveReference) {
+    if (record.status !== "implemented_unverified") {
+      fail("Live receipt/pass records must remain implemented_unverified.");
+    }
+    if (record.provisionalSupportingRecord !== true) {
+      fail("Live receipt/pass records must be provisionalSupportingRecord=true.");
+    }
+    if (record.releaseQualification !== false
+      || qualification?.release === "pass") {
+      fail("Live receipt/pass records cannot claim release qualification.");
+    }
+    if (record.authorities?.hostVerification !== "not_run") {
+      fail("Live receipt/pass records must preserve hostVerification=not_run.");
+    }
+    if (providerPassRequested && !hasSyntheticReference) {
+      fail("Provider qualification requires a synthetic-direct-mcp receipt reference.");
+    }
+    if (!providerPassRequested && hasSyntheticReference) {
+      fail("Synthetic live receipt linkage is forbidden without provider qualification pass.");
+    }
+    if (installedHostPassRequested && (!hasNaturalReference || !hasSyntheticReference)) {
+      fail("Installed-host qualification requires both natural-host and synthetic provider receipts.");
+    }
+    if (!installedHostPassRequested && hasNaturalReference) {
+      fail("Natural live receipt linkage is forbidden without installedHost qualification pass.");
+    }
+    if (providerPassRequested && !["1", "4"].includes(phase)) {
+      fail("Provider live qualification may link only to Phase 1 or Phase 4.");
+    }
+    if (installedHostPassRequested
+      && (phase !== "4" || !providerPassRequested)) {
+      fail("Natural installed-host qualification may link only to Phase 4 with provider pass.");
+    }
+    if (phase === "1" && installedHostPassRequested) {
+      fail("Synthetic Phase 1 evidence cannot claim natural installed-host authority.");
+    }
+    if (!(options.strict && options.root)) {
+      fail("Live qualification pass/linkage requires strict offline receipt replay.");
+    } else {
+      try {
+        if (hasSyntheticReference) {
+          syntheticReceipt = loadLiveReceiptReference(
+            liveQualificationReceipts.syntheticDirectMcp,
+            LIVE_RECEIPT_AUTHORITY_SYNTHETIC,
+            options.root
+          );
+        }
+        if (hasNaturalReference) {
+          naturalReceipt = loadLiveReceiptReference(
+            liveQualificationReceipts.naturalCodexHost,
+            LIVE_RECEIPT_AUTHORITY_NATURAL,
+            options.root
+          );
+        }
+      } catch {
+        fail("Live qualification receipt reference is missing, unsafe, stale, or invalid.");
+      }
+
+      for (const receipt of [syntheticReceipt, naturalReceipt].filter(Boolean)) {
+        if (!receiptMatchesRecordSource(receipt, record)) {
+          fail("Live qualification receipt does not match the exact record source identity.");
+        }
+      }
+      if (phase === "1"
+        && syntheticReceipt
+        && syntheticReceipt.phaseScopeDigest !== source?.phaseScopeDigest) {
+        fail("Phase 1 live receipt does not match the record phase scope.");
+      }
+      if (phase === "4"
+        && naturalReceipt
+        && naturalReceipt.phaseScopeDigest !== source?.phaseScopeDigest) {
+        fail("Phase 4 natural-host receipt does not match the record phase scope.");
+      }
+      if (syntheticReceipt
+        && naturalReceipt
+        && !receiptsShareRuntimeIdentity(syntheticReceipt, naturalReceipt)) {
+        fail("Synthetic and natural live receipts do not bind the same source, install, capability, and provider.");
+      }
+
+      const installationReceipt = naturalReceipt || syntheticReceipt;
+      if (installationReceipt) {
+        if (installation?.method !== installationReceipt.installationMethod
+          || installation?.sourcePluginInventoryDigest
+            !== installationReceipt.sourcePluginInventoryDigest
+          || installation?.installedPluginInventoryDigest
+            !== installationReceipt.installedPluginInventoryDigest
+          || installation?.installedFileCount !== installationReceipt.installedFileCount
+          || installation?.sourceAndInstalledInventoriesEqual !== true
+          || installation?.sourcePluginInventoryDigest
+            !== installation?.installedPluginInventoryDigest) {
+          fail("Evidence installation fields do not directly match the live receipt's equal inventories.");
+        }
+        if (record.runtime?.grokBuild !== installationReceipt.providerVersion
+          || record.runtime?.grokBuildRevision !== installationReceipt.providerRevision
+          || record.runtime?.mcpProtocolVersion
+            !== installationReceipt.mcpProtocolVersion) {
+          fail("Evidence provider runtime identity does not match the live receipt.");
+        }
+        if (naturalReceipt
+          && ![
+            record.runtime?.codexStandalone,
+            record.runtime?.codexDesktopBundled
+          ].includes(naturalReceipt.codexVersion)) {
+          fail("Evidence Codex host version does not match the natural-host receipt.");
+        }
+      }
+
+      const expectedLiveScenarios = [
+        ...(syntheticReceipt
+          ? LIVE_RECEIPT_SCENARIO_IDS[LIVE_RECEIPT_AUTHORITY_SYNTHETIC].map((id) => ({
+            id,
+            boundary: "provider-live",
+            outcome: "pass"
+          }))
+          : []),
+        ...(naturalReceipt
+          ? LIVE_RECEIPT_SCENARIO_IDS[LIVE_RECEIPT_AUTHORITY_NATURAL].map((id) => ({
+            id,
+            boundary: "installed-host",
+            outcome: "pass"
+          }))
+          : [])
+      ];
+      const actualLiveScenarios = Array.isArray(record.liveScenarios)
+        ? record.liveScenarios.map((scenario) => ({
+          id: scenario?.id,
+          boundary: scenario?.boundary,
+          outcome: scenario?.outcome,
+          boundedNarrativeOnly: ["runtime", "expected", "actual"].every((field) => (
+            scenario?.[field] == null
+          ))
+        }))
+        : [];
+      if (JSON.stringify(actualLiveScenarios.map((scenario) => ({
+        id: scenario.id,
+        boundary: scenario.boundary,
+        outcome: scenario.outcome
+      }))) !== JSON.stringify(expectedLiveScenarios)
+        || actualLiveScenarios.some((scenario) => !scenario.boundedNarrativeOnly)) {
+        fail("Evidence liveScenarios do not exactly match the linked bounded receipt scenarios.");
+      }
+    }
+  }
+
   if (record.status === "qualified") {
     if (qualification?.installedHost !== "pass" || qualification?.provider !== "pass") {
       fail("qualified requires installedHost and provider qualification to pass.");
@@ -3373,6 +4400,8 @@ export function validateEvidenceRecord(record, options = {}) {
     }
     if (!SHA256.test(installation?.sourcePluginInventoryDigest || "")
       || !SHA256.test(installation?.installedPluginInventoryDigest || "")
+      || installation?.sourcePluginInventoryDigest
+        !== installation?.installedPluginInventoryDigest
       || installation?.sourceAndInstalledInventoriesEqual !== true
       || !Number.isInteger(installation?.installedFileCount)
       || installation.installedFileCount < 1) {
@@ -3596,6 +4625,11 @@ function prepareEvidenceRecordForPublication(record, authority = null) {
     || Object.hasOwn(body, "proofProducer")
     || Object.hasOwn(body, "independentReviewReceipt"))
     && authority !== PROOF_PUBLICATION_AUTHORITY) {
+    throw invalidEvidencePublicationError();
+  }
+  const hasLivePass = body.qualification?.provider === "pass"
+    || body.qualification?.installedHost === "pass";
+  if (hasLivePass || Object.hasOwn(body, "liveQualificationReceipts")) {
     throw invalidEvidencePublicationError();
   }
   return body;
@@ -3841,6 +4875,20 @@ export function updateLedger(entry, root = REPO_ROOT) {
     if (!ledgerDocumentShapeIsValid(loaded.ledger)) throw invalidLedgerDocumentError();
     const entries = loaded.ledger.entries.map(cloneLedgerEntry);
     if (incoming.currency === "current") {
+      // Legacy/concurrency callers may reserve a ledger path before the record
+      // exists. Genuinely absent paths retain that compatibility, but existing
+      // bytes of any kind must parse and match the entry exactly; malformed,
+      // unsafe, mismatched, provisional, or live-supporting records fail closed.
+      const incomingRecord = loadCanonicalCutoverRecord(
+        incoming,
+        root,
+        { allowMissing: true }
+      );
+      if (incomingRecord
+        && (incomingRecord.provisionalSupportingRecord === true
+          || recordCarriesLiveQualification(incomingRecord))) {
+        throw invalidLedgerUpdateError();
+      }
       for (const existing of entries) {
         if (existing.phase === incoming.phase && existing.currency === "current") {
           existing.currency = "historical";
@@ -3866,15 +4914,23 @@ export function updateLedger(entry, root = REPO_ROOT) {
   });
 }
 
-function loadCanonicalCutoverRecord(entry, root) {
+function loadCanonicalCutoverRecord(entry, root, { allowMissing = false } = {}) {
   if (!ledgerEntryShapeIsValid(entry) || !normalizedLedgerEvidencePath(entry.path)) {
+    throw invalidLedgerDocumentError();
+  }
+  let absolute;
+  try {
+    absolute = path.resolve(root, entry.path);
+    const evidenceRoot = path.resolve(root, EVIDENCE_ROOT);
+    if (!absolute.startsWith(`${evidenceRoot}${path.sep}`)) {
+      throw invalidLedgerDocumentError();
+    }
+    if (allowMissing && evidencePathIsStablyAbsent(root, absolute)) return null;
+  } catch {
     throw invalidLedgerDocumentError();
   }
   let record;
   try {
-    const absolute = path.resolve(root, entry.path);
-    const evidenceRoot = path.resolve(root, EVIDENCE_ROOT);
-    if (!absolute.startsWith(`${evidenceRoot}${path.sep}`)) throw invalidLedgerDocumentError();
     record = JSON.parse(readBoundedEvidenceFile(root, absolute));
   } catch {
     throw invalidLedgerDocumentError();
@@ -4495,8 +5551,14 @@ export function verifyLedger(root = REPO_ROOT, {
       errors.push(...rawSafetyErrors.map((message) => `Ledger entry ${index}: ${message}`));
     }
     let currentRecordValidated = false;
+    const provisionalCurrent = entry.currency === "current"
+      && (record.provisionalSupportingRecord === true
+        || recordCarriesLiveQualification(record));
+    if (provisionalCurrent) {
+      errors.push(`Ledger entry ${index}: provisional/live supporting records cannot be current evidence.`);
+    }
     if (entry.currency === "current") {
-      if (rawSafetyErrors.length === 0) {
+      if (rawSafetyErrors.length === 0 && !provisionalCurrent) {
         const result = validateEvidenceRecord(record, {
           strict: effectiveStrict,
           root,
