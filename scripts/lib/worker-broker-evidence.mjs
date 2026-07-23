@@ -35,7 +35,7 @@ export const EVIDENCE_ONLY_PREFIXES = Object.freeze([
   "tests/e2e-results/qualification-"
 ]);
 export const PROOF_PRODUCER_ID = "worker-broker-gate-runner";
-export const PROOF_PRODUCER_VERSION = 2;
+export const PROOF_PRODUCER_VERSION = 3;
 export const INDEPENDENT_REVIEW_PRODUCER_ID = "codex-native-review-runner";
 export const INDEPENDENT_REVIEW_PRODUCER_VERSION = 1;
 export const INDEPENDENT_REVIEW_MANIFEST_DIGEST = "82792debed04937a264e759a1812ba1e33e0417aa555f87ce13e7f5417fd6f12";
@@ -717,6 +717,136 @@ export const PHASE_PROOF_GATE_MANIFEST = freezeGateManifest({
       boundary: "source",
       timeoutMs: 60_000
     }
+  ],
+  "2": [
+    {
+      gateId: "repository-check",
+      argv: ["node", "scripts/check-deterministic.mjs"],
+      boundary: "source-provider-neutral",
+      timeoutMs: 15 * 60_000
+    },
+    {
+      gateId: "phase-2-focused-tests",
+      argv: [
+        "node",
+        "--test",
+        "--test-reporter=./scripts/lib/zero-skip-test-reporter.mjs",
+        "tests/worker-context-roles.test.mjs",
+        "tests/worker-mailbox.test.mjs"
+      ],
+      boundary: "focused-source-provider-neutral",
+      timeoutMs: 5 * 60_000
+    },
+    {
+      gateId: "git-diff-check",
+      argv: ["git", "show", "--check", "--format=", "HEAD"],
+      boundary: "source",
+      timeoutMs: 60_000
+    }
+  ],
+  "3": [
+    {
+      gateId: "repository-check",
+      argv: ["node", "scripts/check-deterministic.mjs"],
+      boundary: "source-provider-neutral",
+      timeoutMs: 15 * 60_000
+    },
+    {
+      gateId: "phase-3-focused-tests",
+      argv: [
+        "node",
+        "--test",
+        "--test-reporter=./scripts/lib/zero-skip-test-reporter.mjs",
+        "tests/worker-worktree.test.mjs",
+        "tests/worker-safety-proofs.test.mjs"
+      ],
+      boundary: "focused-source-provider-neutral",
+      timeoutMs: 5 * 60_000
+    },
+    {
+      gateId: "git-diff-check",
+      argv: ["git", "show", "--check", "--format=", "HEAD"],
+      boundary: "source",
+      timeoutMs: 60_000
+    }
+  ],
+  "4": [
+    {
+      gateId: "repository-check",
+      argv: ["node", "scripts/check-deterministic.mjs"],
+      boundary: "source-provider-neutral",
+      timeoutMs: 15 * 60_000
+    },
+    {
+      gateId: "phase-4-focused-tests",
+      argv: [
+        "node",
+        "--test",
+        "--test-reporter=./scripts/lib/zero-skip-test-reporter.mjs",
+        "tests/worker-presentation.test.mjs",
+        "tests/mcp-worker-broker.test.mjs"
+      ],
+      boundary: "focused-source-provider-neutral",
+      timeoutMs: 5 * 60_000
+    },
+    {
+      gateId: "git-diff-check",
+      argv: ["git", "show", "--check", "--format=", "HEAD"],
+      boundary: "source",
+      timeoutMs: 60_000
+    }
+  ],
+  "5": [
+    {
+      gateId: "repository-check",
+      argv: ["node", "scripts/check-deterministic.mjs"],
+      boundary: "source-provider-neutral",
+      timeoutMs: 15 * 60_000
+    },
+    {
+      gateId: "phase-5-focused-tests",
+      argv: [
+        "node",
+        "--test",
+        "--test-reporter=./scripts/lib/zero-skip-test-reporter.mjs",
+        "tests/worker-safety-proofs.test.mjs",
+        "tests/worker-mutation.test.mjs"
+      ],
+      boundary: "focused-source-provider-neutral",
+      timeoutMs: 5 * 60_000
+    },
+    {
+      gateId: "git-diff-check",
+      argv: ["git", "show", "--check", "--format=", "HEAD"],
+      boundary: "source",
+      timeoutMs: 60_000
+    }
+  ],
+  aggregate: [
+    {
+      gateId: "repository-check",
+      argv: ["node", "scripts/check-deterministic.mjs"],
+      boundary: "source-provider-neutral",
+      timeoutMs: 15 * 60_000
+    },
+    {
+      gateId: "aggregate-qualification",
+      argv: [
+        "node",
+        "scripts/worker-broker-evidence.mjs",
+        "verify",
+        "--all",
+        "--strict"
+      ],
+      boundary: "release",
+      timeoutMs: 5 * 60_000
+    },
+    {
+      gateId: "git-diff-check",
+      argv: ["git", "show", "--check", "--format=", "HEAD"],
+      boundary: "source",
+      timeoutMs: 60_000
+    }
   ]
 });
 
@@ -1047,10 +1177,13 @@ const STATUS_SET = new Set([
 
 const OUTCOME_SET = new Set(["pass", "fail", "skip", "not_run"]);
 const VERIFIED_STATUS_SET = new Set(["verified_on_draft", "qualified"]);
+const NUMBERED_PHASES = Object.freeze(["0", "1", "2", "3", "4", "5"]);
+const NUMBERED_PHASE_SET = new Set(NUMBERED_PHASES);
 const SHA256 = /^[0-9a-f]{64}$/;
 const MAX_EVIDENCE_RECORD_BYTES = 256 * 1024;
 const MAX_EVIDENCE_STRING_CHARS = 4096;
 const MAX_EVIDENCE_ARRAY_ITEMS = 128;
+const MAX_PHASE_SCOPE_PATHS = 512;
 const MAX_EVIDENCE_DEPTH = 10;
 const LEDGER_LOCK_NAME = ".ledger.lock";
 const LEDGER_LOCK_OWNER_FILE = "owner.json";
@@ -1063,12 +1196,14 @@ const PRIVATE_EVIDENCE_PATH = /(?:^|[\s"'(=])(?:file:\/\/(?:localhost)?)?(?:\/(?
 const PRIVATE_EVIDENCE_FIELD = /(?:^|_)(?:raw|private|authorization|api_key|access_token|refresh_token|tokens?|password|passwd|pwd|secret|credential|cookie)(?:_|$)/;
 
 export function statusSatisfiesVerifiedPrerequisite(status, phase = null) {
-  if (!VERIFIED_STATUS_SET.has(status)) return false;
-  // Phase 1 promotion is deliberately unavailable until a separately
-  // protected issuer can sign a review attestation and the broker can verify
-  // that signature. The reserved structural receipt is caller-computable and
-  // therefore cannot satisfy a downstream prerequisite.
-  return String(phase ?? "") !== "1";
+  return status === "verified_on_draft"
+    && (phase == null || NUMBERED_PHASE_SET.has(String(phase)));
+}
+
+function statusSatisfiesPhaseReadiness(status, phase) {
+  return String(phase) === "aggregate"
+    ? status === "qualified"
+    : statusSatisfiesVerifiedPrerequisite(status, phase);
 }
 
 function fixedEvidenceError(code, message) {
@@ -1156,8 +1291,11 @@ function boundedEvidenceErrors(value, pathName = "$", depth = 0, errors = []) {
     return errors;
   }
   if (Array.isArray(value)) {
-    if (value.length > MAX_EVIDENCE_ARRAY_ITEMS) {
-      errors.push(`${pathName} exceeds ${MAX_EVIDENCE_ARRAY_ITEMS} items.`);
+    const limit = pathName.endsWith(".source.phaseScopePaths")
+      ? MAX_PHASE_SCOPE_PATHS
+      : MAX_EVIDENCE_ARRAY_ITEMS;
+    if (value.length > limit) {
+      errors.push(`${pathName} exceeds ${limit} items.`);
     }
     value.forEach((item, index) => boundedEvidenceErrors(item, `${pathName}[${index}]`, depth + 1, errors));
     return errors;
@@ -2831,6 +2969,20 @@ export function listSourceInventory(root = REPO_ROOT, { includeEvidence = false 
     .sort();
 }
 
+/**
+ * Return the exact source paths bound by one phase record. Numbered phases use
+ * their code-owned dependency closures. Aggregate evidence deliberately binds
+ * every current non-evidence source path, so no implementation surface can sit
+ * outside release qualification.
+ */
+export function phaseScopePaths(phase, root = REPO_ROOT) {
+  const phaseId = String(phase);
+  if (phaseId === "aggregate") {
+    return listSourceInventory(root, { includeEvidence: false });
+  }
+  return [...(PHASE_SCOPE[phaseId] || [])];
+}
+
 function listGitIndexIdentity(root) {
   const output = execTrustedGit(["ls-files", "-s", "-z"], {
     cwd: root,
@@ -3147,7 +3299,7 @@ function captureLivePluginInventory(pluginRoot) {
 }
 
 export function computePhaseScopeDigest(phase, root = REPO_ROOT) {
-  const scope = PHASE_SCOPE[String(phase)] || [];
+  const scope = phaseScopePaths(phase, root);
   const missing = scope.filter((relative) => !fs.existsSync(path.join(root, relative)));
   if (missing.length) {
     throw new Error(`Phase ${phase} scope contains missing paths: ${missing.join(", ")}`);
@@ -3706,6 +3858,9 @@ export function validateEvidenceRecord(record, options = {}) {
   if ((phase === "aggregate") !== (record.recordType === "worker-broker-aggregate")) {
     fail("recordType must be worker-broker-aggregate if and only if phase is aggregate.");
   }
+  if (record.status === "qualified" && phase !== "aggregate") {
+    fail("Only aggregate evidence may use status qualified.");
+  }
   if (typeof record.releaseQualification !== "boolean") {
     fail("releaseQualification must be boolean.");
   }
@@ -3836,9 +3991,20 @@ export function validateEvidenceRecord(record, options = {}) {
       || source.phaseScopePaths.some((relative) => typeof relative !== "string" || !relative)) {
       fail("source.phaseScopePaths must contain only nonempty strings.");
     } else {
-      const expectedScope = PHASE_SCOPE[phase] || [];
-      if (JSON.stringify(source.phaseScopePaths) !== JSON.stringify(expectedScope)) {
-        fail("source.phaseScopePaths does not match the derived phase scope.");
+      if (source.phaseScopePaths.length > MAX_PHASE_SCOPE_PATHS) {
+        fail(`source.phaseScopePaths exceeds ${MAX_PHASE_SCOPE_PATHS} items.`);
+      }
+      const normalizedScope = [...new Set(source.phaseScopePaths)].sort();
+      if (JSON.stringify(source.phaseScopePaths) !== JSON.stringify(normalizedScope)
+        || source.phaseScopePaths.some((relative) => isEvidenceOnlyPath(relative))) {
+        fail("source.phaseScopePaths must be sorted, unique, and exclude evidence-only paths.");
+      }
+      const scopeRoot = options.root || (phase === "aggregate" ? null : REPO_ROOT);
+      if (scopeRoot) {
+        const expectedScope = phaseScopePaths(phase, scopeRoot);
+        if (JSON.stringify(source.phaseScopePaths) !== JSON.stringify(expectedScope)) {
+          fail("source.phaseScopePaths does not match the derived phase scope.");
+        }
       }
     }
   }
@@ -4307,18 +4473,27 @@ export function validateEvidenceRecord(record, options = {}) {
   let naturalReceipt = null;
 
   if (providerPassRequested || installedHostPassRequested || hasAnyLiveReference) {
-    if (record.status !== "implemented_unverified") {
-      fail("Live receipt/pass records must remain implemented_unverified.");
-    }
-    if (record.provisionalSupportingRecord !== true) {
-      fail("Live receipt/pass records must be provisionalSupportingRecord=true.");
-    }
-    if (record.releaseQualification !== false
-      || qualification?.release === "pass") {
-      fail("Live receipt/pass records cannot claim release qualification.");
-    }
-    if (record.authorities?.hostVerification !== "not_run") {
-      fail("Live receipt/pass records must preserve hostVerification=not_run.");
+    const qualifiedAggregate = phase === "aggregate" && record.status === "qualified";
+    if (qualifiedAggregate) {
+      if (record.provisionalSupportingRecord !== false
+        || record.releaseQualification !== true
+        || qualification?.release !== "pass") {
+        fail("Qualified aggregate live evidence must be non-provisional release qualification.");
+      }
+    } else {
+      if (record.status !== "implemented_unverified") {
+        fail("Live receipt/pass supporting records must remain implemented_unverified.");
+      }
+      if (record.provisionalSupportingRecord !== true) {
+        fail("Live receipt/pass supporting records must be provisionalSupportingRecord=true.");
+      }
+      if (record.releaseQualification !== false
+        || qualification?.release === "pass") {
+        fail("Live receipt/pass supporting records cannot claim release qualification.");
+      }
+      if (record.authorities?.hostVerification !== "not_run") {
+        fail("Live receipt/pass supporting records must preserve hostVerification=not_run.");
+      }
     }
     if (providerPassRequested && !hasSyntheticReference) {
       fail("Provider qualification requires a synthetic-direct-mcp receipt reference.");
@@ -4332,12 +4507,12 @@ export function validateEvidenceRecord(record, options = {}) {
     if (!installedHostPassRequested && hasNaturalReference) {
       fail("Natural live receipt linkage is forbidden without installedHost qualification pass.");
     }
-    if (providerPassRequested && !["1", "4"].includes(phase)) {
-      fail("Provider live qualification may link only to Phase 1 or Phase 4.");
+    if (providerPassRequested && !["1", "4", "aggregate"].includes(phase)) {
+      fail("Provider live qualification may link only to Phase 1, Phase 4, or aggregate evidence.");
     }
     if (installedHostPassRequested
-      && (phase !== "4" || !providerPassRequested)) {
-      fail("Natural installed-host qualification may link only to Phase 4 with provider pass.");
+      && (!["4", "aggregate"].includes(phase) || !providerPassRequested)) {
+      fail("Natural installed-host qualification may link only to Phase 4 or aggregate evidence with provider pass.");
     }
     if (phase === "1" && installedHostPassRequested) {
       fail("Synthetic Phase 1 evidence cannot claim natural installed-host authority.");
@@ -4467,7 +4642,7 @@ export function validateEvidenceRecord(record, options = {}) {
   }
 
   if (qualification?.installedHost === "pass") {
-    if (!hasPassedBoundary(record, "installed-host")) {
+    if (phase !== "aggregate" && !hasPassedBoundary(record, "installed-host")) {
       fail("installedHost qualification requires a passing installed-host command gate.");
     }
     if (!SHA256.test(installation?.sourcePluginInventoryDigest || "")
@@ -4482,7 +4657,7 @@ export function validateEvidenceRecord(record, options = {}) {
   }
 
   if (qualification?.provider === "pass") {
-    if (!hasPassedBoundary(record, "provider-live")) {
+    if (phase !== "aggregate" && !hasPassedBoundary(record, "provider-live")) {
       fail("provider qualification requires a passing provider-live command gate.");
     }
     if (!record.runtime?.grokBuild || !record.runtime?.grokBuildRevision) {
@@ -4521,7 +4696,7 @@ export function validateEvidenceRecord(record, options = {}) {
     if (source?.sourceInventoryDigest && !sourceDigestMatches) {
       fail("sourceInventoryDigest is stale relative to current non-evidence source inventory.");
     }
-    if (source?.phaseScopeDigest && record.phase != null && record.phase !== "aggregate") {
+    if (source?.phaseScopeDigest && record.phase != null) {
       try {
         const currentPhase = computePhaseScopeDigest(record.phase, options.root);
         if (source.phaseScopeDigest !== currentPhase) {
@@ -4604,6 +4779,9 @@ export function buildEvidenceRecord({
   prerequisites = [],
   ci = null
 } = {}) {
+  if (status === "qualified") {
+    throw invalidEvidencePublicationError();
+  }
   const identity = gitIdentity(root);
   const packageJson = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
   const sourceInventoryDigest = computeInventoryDigest(root, { includeEvidence: false });
@@ -4631,7 +4809,7 @@ export function buildEvidenceRecord({
       sourceInventoryDigest,
       phaseScopeDigest,
       cleanTreeAtVerification: identity.cleanTreeAtVerification,
-      phaseScopePaths: PHASE_SCOPE[String(phase)] || []
+      phaseScopePaths: phaseScopePaths(phase, root)
     },
     installation: installation || {
       method: "source-tree",
@@ -4937,6 +5115,9 @@ export function updateLedger(entry, root = REPO_ROOT) {
   // evidence directory. The complete read/validate/mutate/replace transaction
   // is then serialized by the repository-local evidence lock.
   const incoming = prepareIncomingLedgerEntry(entry);
+  if (incoming.phase === "aggregate" && incoming.status === "qualified") {
+    throw invalidLedgerUpdateError();
+  }
   return withEvidenceLedgerLock(root, () => {
     let loaded;
     try {
@@ -5148,18 +5329,17 @@ function phaseIsSupersededByReplacement(candidatePhase, replacementPhase, visite
 
 function proofProducedStatusIsCurrent(record) {
   const phase = String(record?.phase ?? "");
-  if (phase === "0") return record?.status === "verified_on_draft";
-  if (phase === "1") {
+  if (NUMBERED_PHASE_SET.has(phase)) {
     return record?.status === "implemented_unverified"
-      || VERIFIED_STATUS_SET.has(record?.status);
+      || record?.status === "verified_on_draft";
   }
-  return false;
+  return phase === "aggregate" && record?.status === "qualified";
 }
 
-function priorProofProducedRecordIsSafelySupersedable(record) {
+function priorProofProducedRecordIsSafelySupersedable(record, root) {
   const producer = record?.proofProducer;
   const version = producer?.version;
-  return Boolean(
+  const shapeIsSupported = Boolean(
     producer
     && typeof producer === "object"
     && !Array.isArray(producer)
@@ -5168,13 +5348,27 @@ function priorProofProducedRecordIsSafelySupersedable(record) {
     && Number.isInteger(version)
     && version >= 1
     && version < PROOF_PRODUCER_VERSION
-    && SHA256.test(producer.manifestDigest || "")
+    && producer.manifestDigest === computeProofManifestDigest(record.phase)
     && ((record.phase === "0" && record.status === "verified_on_draft")
       || (record.phase === "1" && (
         record.status === "implemented_unverified"
         || VERIFIED_STATUS_SET.has(record.status)
       )))
   );
+  if (!shapeIsSupported) return false;
+  let normalized;
+  try {
+    normalized = structuredClone(record);
+    normalized.proofProducer.version = PROOF_PRODUCER_VERSION;
+    normalized = attachRecordDigest(normalized);
+  } catch {
+    return false;
+  }
+  return validateEvidenceRecord(normalized, {
+    strict: false,
+    root,
+    requireEvidenceSystem: true
+  }).ok;
 }
 
 function supersedeCurrentProofChainEntry(entry, replacementPhase) {
@@ -5237,12 +5431,12 @@ function publishPhaseZeroProofRecord(record, root, expectedSource, toolchain) {
     ));
     const priorRunnerCurrent = current.filter(({ record: existing }) => (
       Object.hasOwn(existing, "proofProducer")
-      && priorProofProducedRecordIsSafelySupersedable(existing)
+      && priorProofProducedRecordIsSafelySupersedable(existing, root)
     ));
     const malformedRunnerCurrent = current.filter(({ record: existing }) => (
       Object.hasOwn(existing, "proofProducer")
       && existing.proofProducer?.version !== PROOF_PRODUCER_VERSION
-      && !priorProofProducedRecordIsSafelySupersedable(existing)
+      && !priorProofProducedRecordIsSafelySupersedable(existing, root)
     ));
     const unsupportedCurrent = current.filter(({ record: existing }) => (
       !Object.hasOwn(existing, "proofProducer") && !VERIFIED_STATUS_SET.has(existing.status)
@@ -5486,6 +5680,85 @@ function publishDependentPhaseProofRecord(
   return relative;
 }
 
+/**
+ * Assess only the cross-record release-chain shape. Callers must first perform
+ * full record and ledger validation; verifyLedger does so before invoking this
+ * helper. Keeping the chain rule pure makes the six-draft/one-aggregate
+ * invariant independently testable while Phase 1 signed attestation remains a
+ * separate validation authority.
+ */
+export function assessCompleteEvidenceChain(records) {
+  const errors = [];
+  if (!Array.isArray(records)) {
+    return { ok: false, errors: ["Release readiness requires exactly seven current evidence records."] };
+  }
+  const byPhase = new Map();
+  for (const record of records) {
+    const phase = String(record?.phase ?? "");
+    if (!Object.hasOwn(PHASE_MANDATORY_GATE_IDS, phase) || byPhase.has(phase)) {
+      errors.push("Release readiness requires exactly one current record for each phase.");
+      continue;
+    }
+    byPhase.set(phase, record);
+  }
+  if (records.length !== NUMBERED_PHASES.length + 1
+    || byPhase.size !== NUMBERED_PHASES.length + 1) {
+    errors.push("Release readiness requires exactly seven current evidence records.");
+  }
+  for (const phase of NUMBERED_PHASES) {
+    const record = byPhase.get(phase);
+    if (!record) {
+      errors.push(`Release readiness requires one current evidence record for phase ${phase}.`);
+      continue;
+    }
+    if (record.status !== "verified_on_draft") {
+      errors.push(`Release readiness requires phase ${phase} status verified_on_draft.`);
+    }
+  }
+  const aggregate = byPhase.get("aggregate");
+  if (!aggregate) {
+    errors.push("Release readiness requires one current evidence record for phase aggregate.");
+  } else {
+    if (aggregate.status !== "qualified") {
+      errors.push("Release readiness requires phase aggregate status qualified.");
+    }
+    const prerequisites = Array.isArray(aggregate.prerequisites)
+      ? aggregate.prerequisites
+      : [];
+    const prerequisiteByPhase = new Map();
+    for (const prerequisite of prerequisites) {
+      const prerequisitePhase = String(prerequisite?.phase ?? "");
+      if (prerequisiteByPhase.has(prerequisitePhase)) {
+        errors.push("Release readiness aggregate prerequisites contain a duplicate phase.");
+      } else {
+        prerequisiteByPhase.set(prerequisitePhase, prerequisite);
+      }
+    }
+    if (prerequisites.length !== NUMBERED_PHASES.length
+      || prerequisiteByPhase.size !== NUMBERED_PHASES.length) {
+      errors.push("Release readiness requires aggregate prerequisites for exactly phases 0 through 5.");
+    }
+    for (const phase of NUMBERED_PHASES) {
+      const dependency = byPhase.get(phase);
+      const prerequisite = prerequisiteByPhase.get(phase);
+      if (!prerequisite) {
+        errors.push(`Release readiness aggregate is missing prerequisite phase ${phase}.`);
+      } else if (dependency && prerequisite.recordDigest !== dependency.recordDigest) {
+        errors.push(`Release readiness aggregate prerequisite phase ${phase} is stale or mismatched.`);
+      }
+    }
+    if (aggregate.qualification?.release !== "pass"
+      || aggregate.releaseQualification !== true) {
+      errors.push("Release readiness requires aggregate release qualification to pass.");
+    }
+    if (!aggregate.ci?.jobs?.length
+      || aggregate.ci.jobs.some((job) => job?.result !== "success")) {
+      errors.push("Release readiness requires a nonempty all-success aggregate CI matrix.");
+    }
+  }
+  return { ok: errors.length === 0, errors };
+}
+
 export function verifyLedger(root = REPO_ROOT, {
   strict = false,
   requireComplete = false
@@ -5693,9 +5966,6 @@ export function verifyLedger(root = REPO_ROOT, {
         )) {
           errors.push(`Ledger entry ${index}: prerequisite ${prerequisiteIndex} is not verified.`);
         }
-        if (record.status === "qualified" && dependency.record.status !== "qualified") {
-          errors.push(`Ledger entry ${index}: qualified evidence requires a qualified prerequisite.`);
-        }
         const dependencyPassGates = passedGateIds(dependency.record);
         const requiredDependencyGates = PHASE_MANDATORY_GATE_IDS[String(prerequisite.phase)] || [];
         for (const gateId of requiredDependencyGates) {
@@ -5712,26 +5982,10 @@ export function verifyLedger(root = REPO_ROOT, {
     }
   }
   if (requireComplete) {
-    const requiredPhases = ["0", "1", "2", "3", "4", "5", "aggregate"];
-    for (const phase of requiredPhases) {
-      const current = currentByPhase.get(phase);
-      if (!current?.record) {
-        errors.push(`Release readiness requires one current evidence record for phase ${phase}.`);
-        continue;
-      }
-      if (current.record.status !== "qualified") {
-        errors.push(`Release readiness requires phase ${phase} status qualified.`);
-      }
-    }
-    const aggregate = currentByPhase.get("aggregate")?.record;
-    if (aggregate) {
-      if (aggregate.qualification?.release !== "pass" || aggregate.releaseQualification !== true) {
-        errors.push("Release readiness requires aggregate release qualification to pass.");
-      }
-      if (!aggregate.ci?.jobs?.length || aggregate.ci.jobs.some((job) => job?.result !== "success")) {
-        errors.push("Release readiness requires a nonempty all-success aggregate CI matrix.");
-      }
-    }
+    const complete = assessCompleteEvidenceChain(
+      [...currentByPhase.values()].map((current) => current.record).filter(Boolean)
+    );
+    errors.push(...complete.errors);
   }
   return {
     ok: errors.length === 0,
@@ -5774,7 +6028,7 @@ export function verifyPhase(phase, root = REPO_ROOT, {
   const verified = Boolean(
     integrityOk
     && record
-    && statusSatisfiesVerifiedPrerequisite(record.status, record.phase)
+    && statusSatisfiesPhaseReadiness(record.status, record.phase)
   );
   const readinessErrors = [];
   if (requireVerified && !verified) {
@@ -5786,7 +6040,9 @@ export function verifyPhase(phase, root = REPO_ROOT, {
       );
     } else {
       readinessErrors.push(
-        `Verified readiness requires phase ${phaseId} current status verified_on_draft or qualified; found ${record.status}.`
+        `Verified readiness requires phase ${phaseId} current status ${
+          phaseId === "aggregate" ? "qualified" : "verified_on_draft"
+        }; found ${record.status}.`
       );
     }
   }

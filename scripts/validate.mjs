@@ -447,7 +447,7 @@ if (!versionsOnly) {
     const proofProducer = workerEvidenceSchema.properties?.proofProducer;
     if (proofProducer?.additionalProperties !== false
       || proofProducer?.properties?.id?.const !== "worker-broker-gate-runner"
-      || proofProducer?.properties?.version?.const !== 2
+      || proofProducer?.properties?.version?.const !== 3
       || !proofProducer?.required?.includes("manifestDigest")) {
       problem("Worker Broker evidence schema must bind exact gate-runner provenance.", file);
     }
@@ -480,11 +480,29 @@ if (!versionsOnly) {
       && rule?.then?.properties?.releaseQualification?.const === false
       && rule?.then?.properties?.authorities?.properties?.hostVerification?.const === "not_run"
     ));
+    const aggregateQualificationRule = (workerEvidenceSchema.allOf || []).find((rule) => (
+      rule?.if?.properties?.status?.const === "qualified"
+      && rule?.then?.properties?.phase?.const === "aggregate"
+      && rule?.then?.properties?.recordType?.const === "worker-broker-aggregate"
+      && rule?.then?.properties?.releaseQualification?.const === true
+      && rule?.then?.properties?.provisionalSupportingRecord?.const === false
+      && rule?.then?.properties?.qualification?.properties?.provider?.const === "pass"
+      && rule?.then?.properties?.qualification?.properties?.installedHost?.const === "pass"
+      && rule?.then?.properties?.qualification?.properties?.release?.const === "pass"
+      && rule?.then?.required?.includes("liveQualificationReceipts")
+      && rule?.then?.properties?.liveQualificationReceipts
+        ?.properties?.syntheticDirectMcp?.type === "object"
+      && rule?.then?.properties?.liveQualificationReceipts
+        ?.properties?.naturalCodexHost?.type === "object"
+    ));
     if (liveReferences?.additionalProperties !== false
       || !liveReferences?.required?.includes("syntheticDirectMcp")
       || !liveReferences?.required?.includes("naturalCodexHost")
       || !liveSemanticsRule) {
       problem("Worker Broker evidence schema must bind bidirectional provisional live-receipt semantics.", file);
+    }
+    if (!aggregateQualificationRule) {
+      problem("Worker Broker evidence schema must reserve qualification for a complete aggregate record.", file);
     }
   }
 

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/xliberty2008x/grok-plugin/schemas/worker-broker-evidence.schema.json",
   "title": "Worker Broker Evidence Record",
-  "description": "Immutable per-phase evidence for the Worker Broker roadmap (issue #25).",
+  "description": "Immutable numbered-phase and aggregate evidence for the Worker Broker roadmap (issue #25).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -49,11 +49,75 @@
       }
     },
     {
+      "if": {
+        "properties": {
+          "status": { "const": "qualified" }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "required": ["liveQualificationReceipts"],
+        "properties": {
+          "phase": { "const": "aggregate" },
+          "recordType": { "const": "worker-broker-aggregate" },
+          "releaseQualification": { "const": true },
+          "provisionalSupportingRecord": { "const": false },
+          "qualification": {
+            "properties": {
+              "installedHost": { "const": "pass" },
+              "provider": { "const": "pass" },
+              "release": { "const": "pass" }
+            }
+          },
+          "liveQualificationReceipts": {
+            "properties": {
+              "syntheticDirectMcp": { "type": "object" },
+              "naturalCodexHost": { "type": "object" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": { "enum": ["0", "1", "2", "3", "4", "5"] }
+        },
+        "required": ["phase"]
+      },
+      "then": {
+        "not": {
+          "properties": {
+            "status": { "const": "qualified" }
+          },
+          "required": ["status"]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": { "const": "aggregate" }
+        },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": {
+          "recordType": { "const": "worker-broker-aggregate" },
+          "source": {
+            "properties": {
+              "phaseScopePaths": { "minItems": 1 }
+            }
+          }
+        }
+      }
+    },
+    {
       "if": { "required": ["independentReviewReceipt"] },
       "then": {
         "properties": {
           "phase": { "const": "1" },
-          "status": { "enum": ["verified_on_draft", "qualified"] },
+          "status": { "const": "verified_on_draft" },
           "authorities": {
             "properties": {
               "independentValidation": { "const": "pass" }
@@ -97,7 +161,7 @@
       "then": {
         "required": ["liveQualificationReceipts"],
         "properties": {
-          "phase": { "enum": ["1", "4"] },
+          "phase": { "enum": ["1", "4", "aggregate"] },
           "liveQualificationReceipts": {
             "properties": {
               "syntheticDirectMcp": { "type": "object" }
@@ -119,7 +183,7 @@
       "then": {
         "required": ["liveQualificationReceipts"],
         "properties": {
-          "phase": { "const": "4" },
+          "phase": { "enum": ["4", "aggregate"] },
           "qualification": {
             "properties": { "provider": { "const": "pass" } }
           },
@@ -168,7 +232,7 @@
       },
       "then": {
         "properties": {
-          "phase": { "enum": ["1", "4"] },
+          "phase": { "enum": ["1", "4", "aggregate"] },
           "qualification": {
             "properties": { "provider": { "const": "pass" } }
           }
@@ -189,7 +253,7 @@
       },
       "then": {
         "properties": {
-          "phase": { "const": "4" },
+          "phase": { "enum": ["4", "aggregate"] },
           "qualification": {
             "properties": {
               "provider": { "const": "pass" },
@@ -247,7 +311,14 @@
             },
             "required": ["liveQualificationReceipts"]
           }
-        ]
+        ],
+        "not": {
+          "properties": {
+            "phase": { "const": "aggregate" },
+            "status": { "const": "qualified" }
+          },
+          "required": ["phase", "status"]
+        }
       },
       "then": {
         "properties": {
@@ -307,7 +378,7 @@
       "required": ["id", "version", "manifestDigest"],
       "properties": {
         "id": { "type": "string", "const": "worker-broker-gate-runner" },
-        "version": { "type": "integer", "const": 2 },
+        "version": { "type": "integer", "const": 3 },
         "manifestDigest": {
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"
@@ -393,7 +464,9 @@
         "cleanTreeAtVerification": { "type": "boolean" },
         "phaseScopePaths": {
           "type": "array",
+          "description": "Sorted unique source paths in the phase scope. Aggregate records must enumerate every current non-evidence source path.",
           "items": { "type": "string" },
+          "uniqueItems": true,
           "maxItems": 512
         }
       }

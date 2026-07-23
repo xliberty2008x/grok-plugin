@@ -25,6 +25,7 @@ import {
   LIVE_RECEIPT_PRODUCER_VERSION,
   LIVE_RECEIPT_ROOT,
   LIVE_RECEIPT_SCENARIO_IDS,
+  assessCompleteEvidenceChain,
   attachIndependentReviewReceiptDigest,
   attachRecordDigest,
   buildEvidenceRecord,
@@ -45,6 +46,7 @@ import {
   listSourceInventory,
   loadLedger,
   parsePorcelainV1ZChanges,
+  phaseScopePaths,
   provePhaseZero,
   proveWorkerBrokerPhase,
   runCommandCapture,
@@ -1655,7 +1657,13 @@ function seedPreRunnerCurrent(root, phase, slice = `legacy-${phase}`) {
   return { record: legacy, recordPath };
 }
 
-function seedPriorProofRunnerCurrent(root, phase = "0", slice = `runner-v1-${phase}`) {
+function seedPriorProofRunnerCurrent(
+  root,
+  phase = "0",
+  slice = `runner-v1-${phase}`,
+  version = 1,
+  prerequisites = []
+) {
   let record = buildEvidenceRecord({
     root,
     phase,
@@ -1663,13 +1671,14 @@ function seedPriorProofRunnerCurrent(root, phase = "0", slice = `runner-v1-${pha
     status: phase === "0" ? "verified_on_draft" : "implemented_unverified",
     verification: exactPhaseProof(phase),
     qualification: deterministicQualification(),
-    evidenceSystemQualification: true
+    evidenceSystemQualification: true,
+    prerequisites
   });
   record = attachRecordDigest({
     ...record,
     proofProducer: {
       id: PROOF_PRODUCER_ID,
-      version: 1,
+      version,
       manifestDigest: computeProofManifestDigest(phase)
     }
   });
@@ -1921,6 +1930,89 @@ test("phase scope digest changes when phase-scope source changes (structural)", 
   assert.notEqual(d0, d1);
   const source = computeInventoryDigest(REPO_ROOT, { includeEvidence: false });
   assert.match(source, /^[0-9a-f]{64}$/);
+});
+
+test("aggregate scope binds every non-evidence source path and generic APIs cannot mint qualification", () => {
+  const root = initRepo();
+  fs.writeFileSync(path.join(root, "package.json"), '{"name":"aggregate-scope","version":"1.0.0"}\n');
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.writeFileSync(path.join(root, "src/runtime.mjs"), "export const runtime = true;\n");
+  fs.mkdirSync(path.join(root, "tests/e2e-results/worker-broker"), { recursive: true });
+  fs.writeFileSync(path.join(root, "tests/e2e-results/worker-broker/.gitkeep"), "");
+  git(root, "add", ".");
+  git(root, "commit", "-m", "add aggregate scope fixture");
+
+  const record = buildEvidenceRecord({
+    root,
+    phase: "aggregate",
+    slice: "aggregate-structural",
+    status: "implemented_unverified",
+    verification: [passedCommand("aggregate-identity", "identity", "source")]
+  });
+  const expected = phaseScopePaths("aggregate", root);
+  assert.deepEqual(record.source.phaseScopePaths, expected);
+  assert.deepEqual(expected, ["package.json", "src/runtime.mjs", "tracked.txt"]);
+  assert.equal(
+    record.source.phaseScopeDigest,
+    computeInventoryDigest(root, { paths: expected })
+  );
+  const strict = validateEvidenceRecord(record, { strict: true, root });
+  assert.equal(strict.ok, true, strict.errors.join("; "));
+
+  const incompleteScope = structuredClone(record);
+  incompleteScope.source.phaseScopePaths = incompleteScope.source.phaseScopePaths.slice(1);
+  const incompleteValidation = validateEvidenceRecord(
+    attachRecordDigest(incompleteScope),
+    { strict: true, root }
+  );
+  assert.equal(incompleteValidation.ok, false);
+  assert.ok(incompleteValidation.errors.some((message) => /derived phase scope/i.test(message)));
+
+  assert.throws(
+    () => buildEvidenceRecord({
+      root,
+      phase: "aggregate",
+      slice: "generic-qualified-build",
+      status: "qualified",
+      verification: [passedCommand("aggregate-identity", "identity", "source")]
+    }),
+    (error) => error?.code === "E_EVIDENCE_RECORD_INVALID"
+  );
+  const callerQualified = attachRecordDigest({
+    ...record,
+    status: "qualified",
+    releaseQualification: true,
+    provisionalSupportingRecord: false
+  });
+  assert.throws(
+    () => writeEvidenceRecord(callerQualified, root),
+    (error) => error?.code === "E_EVIDENCE_RECORD_INVALID"
+  );
+  assert.throws(
+    () => updateLedger({
+      phase: "aggregate",
+      slice: "generic-qualified-link",
+      status: "qualified",
+      path: "tests/e2e-results/worker-broker/aggregate/missing.json",
+      recordDigest: "a".repeat(64),
+      sourceCommit: gitIdentity(root).headCommit,
+      recordedAt: STARTED_AT
+    }, root),
+    (error) => error?.code === "E_EVIDENCE_LEDGER_UPDATE_INVALID"
+  );
+  assert.deepEqual(
+    proveWorkerBrokerPhase({
+      phase: "aggregate",
+      slice: "generic-qualified-prove",
+      root,
+      write: true
+    }),
+    { ok: false, code: "E_PROOF_ARGUMENT" }
+  );
+  assert.equal(fs.existsSync(path.join(
+    root,
+    "tests/e2e-results/worker-broker/ledger.json"
+  )), false);
 });
 
 test("source inventory binds executable, symlink, and gitlink identity", () => {
@@ -3121,7 +3213,7 @@ test("live evidence runtime and JSON Schema enforce bidirectional provisional se
     const result = validateEvidenceRecord(attachRecordDigest(candidate));
     assert.equal(result.ok, false);
     assert.ok(result.errors.some((message) => (
-      /provider live qualification may link only to Phase 1 or Phase 4/i.test(message)
+      /provider live qualification may link only to Phase 1, Phase 4, or aggregate evidence/i.test(message)
     )));
   }
 
@@ -3154,7 +3246,11 @@ test("live evidence runtime and JSON Schema enforce bidirectional provisional se
     Array.isArray(rule?.if?.anyOf)
     && rule?.then?.properties?.provisionalSupportingRecord?.const === true
   ));
-  assert.deepEqual(providerPassRule.then.properties.phase.enum, ["1", "4"]);
+  const aggregateLiveSemantics = rules.find((rule) => (
+    rule?.if?.properties?.status?.const === "qualified"
+    && rule?.then?.properties?.phase?.const === "aggregate"
+  ));
+  assert.deepEqual(providerPassRule.then.properties.phase.enum, ["1", "4", "aggregate"]);
   assert.equal(
     providerPassRule.then.properties.liveQualificationReceipts
       .properties.syntheticDirectMcp.type,
@@ -3165,7 +3261,7 @@ test("live evidence runtime and JSON Schema enforce bidirectional provisional se
       .properties.syntheticDirectMcp.type,
     "null"
   );
-  assert.equal(installedPassRule.then.properties.phase.const, "4");
+  assert.deepEqual(installedPassRule.then.properties.phase.enum, ["4", "aggregate"]);
   assert.equal(
     installedPassRule.then.properties.qualification.properties.provider.const,
     "pass"
@@ -3179,7 +3275,7 @@ test("live evidence runtime and JSON Schema enforce bidirectional provisional se
     syntheticConverse.then.properties.qualification.properties.provider.const,
     "pass"
   );
-  assert.equal(naturalConverse.then.properties.phase.const, "4");
+  assert.deepEqual(naturalConverse.then.properties.phase.enum, ["4", "aggregate"]);
   assert.equal(
     naturalConverse.then.properties.qualification.properties.installedHost.const,
     "pass"
@@ -3193,6 +3289,11 @@ test("live evidence runtime and JSON Schema enforce bidirectional provisional se
   assert.equal(
     liveSemantics.then.properties.authorities.properties.hostVerification.const,
     "not_run"
+  );
+  assert.equal(aggregateLiveSemantics.then.properties.releaseQualification.const, true);
+  assert.equal(
+    aggregateLiveSemantics.then.properties.qualification.properties.release.const,
+    "pass"
   );
 
   const receiptSchema = JSON.parse(fs.readFileSync(
@@ -3249,6 +3350,90 @@ test("live evidence runtime and JSON Schema enforce bidirectional provisional se
   assert.deepEqual(
     naturalRule.then.properties.scenarios.const,
     LIVE_RECEIPT_AUTHORITY_CONFIG[LIVE_RECEIPT_AUTHORITY_NATURAL].scenarios
+  );
+});
+
+test("strict replay accepts a complete qualified aggregate without exposing a generic producer", () => {
+  const fixture = initLiveReceiptFixture("qualified-aggregate-structure");
+  const synthetic = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+  const syntheticReference = seedStructuralLiveReceipt(fixture.root, synthetic);
+  const natural = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_NATURAL);
+  const naturalReference = seedStructuralLiveReceipt(fixture.root, natural);
+  const phaseFour = liveQualificationRecord({
+    fixture,
+    phase: "4",
+    syntheticReceipt: synthetic,
+    syntheticReference,
+    naturalReceipt: natural,
+    naturalReference
+  });
+  const prerequisites = ["0", "1", "2", "3", "4", "5"].map((phase) => ({
+    phase,
+    recordDigest: sha256Text(`qualified-aggregate-prerequisite-${phase}`),
+    gateIds: [...PHASE_MANDATORY_GATE_IDS[phase]]
+  }));
+  const aggregate = attachRecordDigest({
+    ...phaseFour,
+    recordType: "worker-broker-aggregate",
+    phase: "aggregate",
+    slice: "release-qualification",
+    status: "qualified",
+    releaseQualification: true,
+    evidenceSystemQualification: true,
+    provisionalSupportingRecord: false,
+    proofProducer: proofProducer("aggregate"),
+    qualification: {
+      deterministic: "pass",
+      installedHost: "pass",
+      provider: "pass",
+      release: "pass"
+    },
+    source: {
+      ...phaseFour.source,
+      phaseScopeDigest: computePhaseScopeDigest("aggregate", fixture.root),
+      phaseScopePaths: phaseScopePaths("aggregate", fixture.root)
+    },
+    prerequisites,
+    verification: exactPhaseProof("aggregate"),
+    scenarios: [{
+      id: "aggregate-release-chain",
+      boundary: "release",
+      expected: "all current phase and live authority records are bound",
+      actual: "bounded aggregate inputs passed",
+      outcome: "pass"
+    }],
+    ci: {
+      workflowUrl: "https://github.com/xliberty2008x/grok-plugin/actions/runs/1",
+      runId: "1",
+      attempt: 1,
+      jobs: [{ name: "required", result: "success" }]
+    },
+    authorities: {
+      ...phaseFour.authorities,
+      hostVerification: "pass",
+      independentValidation: "pass"
+    }
+  });
+  const strict = validateEvidenceRecord(aggregate, {
+    strict: true,
+    root: fixture.root
+  });
+  assert.equal(strict.ok, true, strict.errors.join("; "));
+  assert.throws(
+    () => writeEvidenceRecord(aggregate, fixture.root),
+    (error) => error?.code === "E_EVIDENCE_RECORD_INVALID"
+  );
+  assert.throws(
+    () => updateLedger({
+      phase: aggregate.phase,
+      slice: aggregate.slice,
+      status: aggregate.status,
+      path: rawEvidenceFixturePath(fixture.root, aggregate),
+      recordDigest: aggregate.recordDigest,
+      sourceCommit: aggregate.source.headCommit,
+      recordedAt: aggregate.recordedAt
+    }, fixture.root),
+    (error) => error?.code === "E_EVIDENCE_LEDGER_UPDATE_INVALID"
   );
 });
 
@@ -4706,10 +4891,68 @@ test("Phase 1 proof rejects unsupported slices and caller-supplied execution aut
   assert.equal(injected.status, 2);
 });
 
+test("numbered phases are draft-only and producer v3 preserves the signed Phase 1 barrier", () => {
+  assert.equal(PROOF_PRODUCER_VERSION, 3);
+  for (const phase of ["0", "1", "2", "3", "4", "5"]) {
+    let unverified = buildEvidenceRecord({
+      phase,
+      slice: `phase-${phase}-state`,
+      status: "implemented_unverified",
+      verification: exactPhaseProof(phase),
+      qualification: deterministicQualification(),
+      evidenceSystemQualification: true
+    });
+    unverified = attachRecordDigest({
+      ...unverified,
+      source: { ...unverified.source, cleanTreeAtVerification: true },
+      proofProducer: proofProducer(phase)
+    });
+    const unverifiedResult = validateEvidenceRecord(unverified);
+    assert.equal(unverifiedResult.ok, true, `${phase}: ${unverifiedResult.errors.join("; ")}`);
+
+    const draft = attachRecordDigest({
+      ...unverified,
+      status: "verified_on_draft"
+    });
+    const draftResult = validateEvidenceRecord(draft);
+    if (phase === "1") {
+      assert.equal(draftResult.ok, false);
+      assert.ok(draftResult.errors.some((message) => /signed issuer-verified independent review/i.test(message)));
+    } else {
+      assert.equal(draftResult.ok, true, `${phase}: ${draftResult.errors.join("; ")}`);
+    }
+
+    const forbiddenQualified = attachRecordDigest({
+      ...draft,
+      status: "qualified"
+    });
+    const qualifiedResult = validateEvidenceRecord(forbiddenQualified);
+    assert.equal(qualifiedResult.ok, false);
+    assert.ok(qualifiedResult.errors.some((message) => /only aggregate evidence/i.test(message)));
+  }
+
+  const schema = JSON.parse(fs.readFileSync(
+    path.join(ROOT, "plugins/grok/schemas/worker-broker-evidence.schema.json"),
+    "utf8"
+  ));
+  assert.equal(schema.properties.proofProducer.properties.version.const, 3);
+  const qualifiedRule = schema.allOf.find((rule) => (
+    rule?.if?.properties?.status?.const === "qualified"
+  ));
+  assert.equal(qualifiedRule.then.properties.phase.const, "aggregate");
+  assert.equal(qualifiedRule.then.properties.recordType.const, "worker-broker-aggregate");
+  assert.equal(qualifiedRule.then.properties.releaseQualification.const, true);
+  const numberedQualifiedProhibition = schema.allOf.find((rule) => (
+    rule?.if?.properties?.phase?.enum?.length === 6
+    && rule?.then?.not?.properties?.status?.const === "qualified"
+  ));
+  assert.ok(numberedQualifiedProhibition);
+});
+
 test("Phase 1 rejects the reserved self-digested review receipt as unauthenticated", () => {
   assert.equal(statusSatisfiesVerifiedPrerequisite("implemented_unverified"), false);
   assert.equal(statusSatisfiesVerifiedPrerequisite("verified_on_draft"), true);
-  assert.equal(statusSatisfiesVerifiedPrerequisite("verified_on_draft", "1"), false);
+  assert.equal(statusSatisfiesVerifiedPrerequisite("verified_on_draft", "1"), true);
   assert.equal(statusSatisfiesVerifiedPrerequisite("qualified", "1"), false);
   const { root } = initPhaseOneProofRunnerFixture("phase-one-review-receipt");
   let base = buildEvidenceRecord({
@@ -4966,7 +5209,7 @@ test("Phase 1 proof separates strict integrity from verified readiness", () => {
   assert.equal(firstReadiness.integrityOk, true);
   assert.equal(firstReadiness.verified, false);
   assert.deepEqual(firstReadiness.readinessErrors, [
-    "Verified readiness requires phase 1 current status verified_on_draft or qualified; found implemented_unverified."
+    "Verified readiness requires phase 1 current status verified_on_draft; found implemented_unverified."
   ]);
   assert.deepEqual(firstReadiness.errors, firstReadiness.readinessErrors);
 
@@ -5079,7 +5322,7 @@ test("verify CLI exits independently for integrity and verified readiness", () =
   assert.equal(requiredPayload.status, "implemented_unverified");
   assert.equal(requiredPayload.verified, false);
   assert.deepEqual(requiredPayload.readinessErrors, [
-    "Verified readiness requires phase 1 current status verified_on_draft or qualified; found implemented_unverified."
+    "Verified readiness requires phase 1 current status verified_on_draft; found implemented_unverified."
   ]);
 
   const passingCli = run(process.execPath, [
@@ -5256,6 +5499,88 @@ test("strict validator rejects caller-authored promotion without exact producer 
   assert.ok(result.errors.some((message) => /proofProducer provenance/i.test(message)));
 });
 
+test("complete-chain assessment requires six verified drafts and one qualified aggregate", () => {
+  const phases = ["0", "1", "2", "3", "4", "5"].map((phase) => ({
+    phase,
+    status: "verified_on_draft",
+    recordDigest: sha256Text(`phase-${phase}`)
+  }));
+  const aggregate = {
+    phase: "aggregate",
+    status: "qualified",
+    recordDigest: sha256Text("aggregate"),
+    prerequisites: phases.map((record) => ({
+      phase: record.phase,
+      recordDigest: record.recordDigest,
+      gateIds: [...PHASE_MANDATORY_GATE_IDS[record.phase]]
+    })),
+    qualification: {
+      deterministic: "pass",
+      installedHost: "pass",
+      provider: "pass",
+      release: "pass"
+    },
+    releaseQualification: true,
+    ci: { jobs: [{ name: "required", result: "success" }] }
+  };
+  const complete = assessCompleteEvidenceChain([...phases, aggregate]);
+  assert.equal(complete.ok, true, complete.errors.join("; "));
+
+  const cases = [
+    {
+      label: "phase-qualified",
+      records: [...phases.map((record, index) => (
+        index === 2 ? { ...record, status: "qualified" } : record
+      )), aggregate],
+      expected: /phase 2 status verified_on_draft/i
+    },
+    {
+      label: "phase-implemented",
+      records: [...phases.map((record, index) => (
+        index === 3 ? { ...record, status: "implemented_unverified" } : record
+      )), aggregate],
+      expected: /phase 3 status verified_on_draft/i
+    },
+    {
+      label: "missing-phase",
+      records: [...phases.filter((record) => record.phase !== "4"), aggregate],
+      expected: /one current evidence record for phase 4/i
+    },
+    {
+      label: "stale-prerequisite",
+      records: [...phases, {
+        ...aggregate,
+        prerequisites: aggregate.prerequisites.map((prerequisite) => (
+          prerequisite.phase === "5"
+            ? { ...prerequisite, recordDigest: "f".repeat(64) }
+            : prerequisite
+        ))
+      }],
+      expected: /prerequisite phase 5 is stale or mismatched/i
+    },
+    {
+      label: "unqualified-aggregate",
+      records: [...phases, { ...aggregate, status: "verified_on_draft" }],
+      expected: /phase aggregate status qualified/i
+    },
+    {
+      label: "incomplete-aggregate",
+      records: [...phases, {
+        ...aggregate,
+        releaseQualification: false,
+        qualification: { ...aggregate.qualification, release: "not_run" },
+        ci: { jobs: [] }
+      }],
+      expected: /aggregate release qualification to pass/i
+    }
+  ];
+  for (const fixture of cases) {
+    const result = assessCompleteEvidenceChain(fixture.records);
+    assert.equal(result.ok, false, fixture.label);
+    assert.ok(result.errors.some((message) => fixture.expected.test(message)), fixture.label);
+  }
+});
+
 test("strict ledger validates incomplete integrity while readiness remains fail closed", () => {
   const root = initRepo();
   const scopedPaths = new Set([...PHASE_SCOPE["0"], ...PHASE_SCOPE["1"]]);
@@ -5318,7 +5643,7 @@ test("strict ledger validates incomplete integrity while readiness remains fail 
   const readiness = verifyLedger(root, { strict: true, requireComplete: true });
   assert.equal(readiness.ok, false);
   assert.equal(readiness.readinessRequired, true);
-  assert.ok(readiness.errors.some((message) => /phase 0 status qualified/i.test(message)));
+  assert.ok(readiness.errors.some((message) => /phase 0 status verified_on_draft/i.test(message)));
   assert.ok(readiness.errors.some((message) => /phase aggregate/i.test(message)));
 
   const ledgerPath = path.join(root, "tests/e2e-results/worker-broker/ledger.json");
@@ -5507,7 +5832,7 @@ test("Phase 0 proof safely supersedes a canonical current v1 proof runner record
 
   const result = provePhaseZero({
     phase: "0",
-    slice: "phase-zero-v2-baseline",
+    slice: "phase-zero-v3-baseline",
     root,
     write: true
   });
@@ -5525,12 +5850,17 @@ test("Phase 0 proof safely supersedes a canonical current v1 proof runner record
   assert.equal(strict.ok, true, strict.errors.join("; "));
 
   const malformedFixture = initProofRunnerFixture("proof-runner-v1-malformed");
-  const malformedPrior = seedPriorProofRunnerCurrent(malformedFixture.root);
+  const malformedPrior = seedPriorProofRunnerCurrent(
+    malformedFixture.root,
+    "0",
+    "runner-v2-malformed",
+    2
+  );
   const malformed = attachRecordDigest({
     ...malformedPrior.record,
     proofProducer: {
       ...malformedPrior.record.proofProducer,
-      callerVerdict: "pass"
+      manifestDigest: "9".repeat(64)
     }
   });
   fs.writeFileSync(
@@ -5553,6 +5883,75 @@ test("Phase 0 proof safely supersedes a canonical current v1 proof runner record
   assert.equal(rejected.ok, false);
   assert.equal(rejected.code, "E_PROOF_PUBLICATION");
   assert.equal(loadLedger(malformedFixture.root).entries[0].currency, "current");
+});
+
+test("producer v3 atomically supersedes an immutable current v2 Phase 0/1 chain", () => {
+  const { root } = initPhaseOneProofRunnerFixture("proof-runner-v2-chain-cutover");
+  const priorPhaseZero = seedPriorProofRunnerCurrent(
+    root,
+    "0",
+    "runner-v2-phase-0",
+    2
+  );
+  const priorPhaseOne = seedPriorProofRunnerCurrent(
+    root,
+    "1",
+    "runner-v2-phase-1",
+    2,
+    [{
+      phase: "0",
+      recordDigest: priorPhaseZero.record.recordDigest,
+      gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]]
+    }]
+  );
+  const phaseZeroBytes = fs.readFileSync(path.join(root, priorPhaseZero.recordPath));
+  const phaseOneBytes = fs.readFileSync(path.join(root, priorPhaseOne.recordPath));
+  fs.writeFileSync(path.join(root, "tracked.txt"), "source advanced after producer v2\n");
+  git(root, "add", "tracked.txt");
+  git(root, "commit", "-m", "advance source after producer v2");
+  assert.notEqual(
+    priorPhaseZero.record.source.sourceInventoryDigest,
+    computeInventoryDigest(root, { includeEvidence: false }),
+    "the v2 chain must be stale before cutover"
+  );
+
+  const replacement = provePhaseZero({
+    phase: "0",
+    slice: "producer-v3-baseline",
+    root,
+    write: true
+  });
+  assert.equal(replacement.ok, true, replacement.code);
+  assert.equal(replacement.record.proofProducer.version, 3);
+  const ledger = loadLedger(root);
+  assert.equal(
+    ledger.entries.find((entry) => (
+      entry.recordDigest === priorPhaseZero.record.recordDigest
+    ))?.currency,
+    "historical"
+  );
+  assert.equal(
+    ledger.entries.find((entry) => (
+      entry.recordDigest === priorPhaseOne.record.recordDigest
+    ))?.currency,
+    "historical"
+  );
+  assert.equal(
+    ledger.entries.find((entry) => entry.recordDigest === replacement.recordDigest)?.currency,
+    "current"
+  );
+  assert.deepEqual(
+    fs.readFileSync(path.join(root, priorPhaseZero.recordPath)),
+    phaseZeroBytes,
+    "Phase 0 v2 bytes remain immutable"
+  );
+  assert.deepEqual(
+    fs.readFileSync(path.join(root, priorPhaseOne.recordPath)),
+    phaseOneBytes,
+    "Phase 1 v2 bytes remain immutable"
+  );
+  const strict = verifyLedger(root, { strict: true });
+  assert.equal(strict.ok, true, strict.errors.join("; "));
 });
 
 test("baseline cutover refuses current captures, private history, and identity tampering", () => {
@@ -5739,6 +6138,7 @@ test("prove CLI rejects injection-shaped and duplicate arguments before executio
     ["--phase", "0", "--slice", "valid", "--command", "true"],
     ["--phase", "0", "--slice", "valid", "--argv", "true"],
     ["--phase", "1", "--slice", "wrong-phase"],
+    ["--phase", "aggregate", "--slice", "release-qualification"],
     ["--phase", "0", "--slice", "bad;touch-sentinel"],
     ["--phase", "0", "--slice", "valid", "--write", "--write"]
   ];
@@ -5773,12 +6173,16 @@ test("verify CLI keeps require-verified code-owned and rejects ambiguous or inje
 });
 
 test("capture CLI refuses fabricated verified or qualified status", () => {
-  for (const status of ["verified_on_draft", "qualified"]) {
+  for (const [phase, status] of [
+    ["5", "verified_on_draft"],
+    ["5", "qualified"],
+    ["aggregate", "qualified"]
+  ]) {
     const result = run(process.execPath, [
       path.join(ROOT, "scripts/worker-broker-evidence.mjs"),
       "capture",
       "--phase",
-      "5",
+      phase,
       "--slice",
       "fabricated",
       "--status",
