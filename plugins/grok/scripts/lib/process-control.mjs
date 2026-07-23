@@ -8,7 +8,7 @@ import { CompanionError } from "./errors.mjs";
 const MAX_PROCESS_START_TOKEN_LENGTH = 256;
 const SYSTEM_PS_CANDIDATES = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
 
-function assertCompleteDetachedOwnedIdentity(identity) {
+export function assertCompleteDetachedOwnedIdentity(identity) {
   const rawStartToken = typeof identity?.startToken === "string"
     ? identity.startToken
     : "";

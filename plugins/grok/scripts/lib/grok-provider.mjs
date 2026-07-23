@@ -1811,23 +1811,103 @@ export function assertTransferEffort(selected, effort = null) {
 }
 
 /**
- * True when the exact session ID appears in the non-isolated Grok session list.
- * Only provider metadata is retained; transcript contents are never requested.
+ * Observe whether one exact session ID appears in a successful non-isolated
+ * Grok session list. `ok:false` preserves list failure separately from a
+ * successful absence proof. Only provider metadata is requested or retained.
  */
-export function isImportedSessionReady(sessionId, binary = null, env = null, cwd = null) {
-  if (!sessionId) return false;
+export function inspectImportedSessionPresence(sessionId, binary = null, env = null, cwd = null) {
+  const canonicalSessionId = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const canonicalDate = (value) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value || "")) return false;
+    const parsed = Date.parse(`${value}T00:00:00.000Z`);
+    return Number.isFinite(parsed)
+      && new Date(parsed).toISOString().slice(0, 10) === value;
+  };
+  if (typeof sessionId !== "string"
+    || !canonicalSessionId.test(sessionId)) {
+    return Object.freeze({ ok: false, present: false });
+  }
   const resolved = binary || discoverGrok();
   const run = spawnSync(resolved, ["sessions", "list", "-n", "200"], {
     cwd: cwd || process.cwd(),
     encoding: "utf8",
     shell: false,
     timeout: 15000,
+    maxBuffer: 1024 * 1024,
     env: env || childEnvironment()
   });
-  if (run.status !== 0) return false;
-  const text = `${run.stdout || ""}\n${run.stderr || ""}`;
-  const escaped = String(sessionId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?:^|\\s)${escaped}(?:\\s|$)`, "i").test(text);
+  if (run.status !== 0 || run.error || String(run.stderr || "").trim() !== "") {
+    return Object.freeze({ ok: false, present: false });
+  }
+  const lines = String(run.stdout || "").split(/\r?\n/);
+  const observed = new Set();
+  let present = false;
+  let headers = 0;
+  let inTable = false;
+  let expectingHeader = false;
+  let tableHasSummary = false;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (line === "") continue;
+    const columns = line.split(/\s+/);
+    const header = (
+      (columns.length === 5 || columns.length === 6)
+      && columns[0] === "SESSION"
+      && columns[1] === "ID"
+      && columns[2] === "CREATED"
+      && columns[3] === "UPDATED"
+      && columns[4] === "STATUS"
+      && (columns.length === 5 || columns[5] === "SUMMARY")
+    );
+    if (header) {
+      if (inTable && !expectingHeader) {
+        return Object.freeze({ ok: false, present: false });
+      }
+      headers += 1;
+      inTable = true;
+      expectingHeader = false;
+      tableHasSummary = columns.length === 6;
+      continue;
+    }
+    if (/^\([^()\r\n]{1,256}\)$/.test(line)) {
+      if (expectingHeader) return Object.freeze({ ok: false, present: false });
+      inTable = false;
+      expectingHeader = true;
+      continue;
+    }
+    if (!inTable || expectingHeader) {
+      return Object.freeze({ ok: false, present: false });
+    }
+    const id = columns[0];
+    const normalizedId = typeof id === "string" ? id.toLowerCase() : "";
+    const minimumColumns = tableHasSummary ? 5 : 4;
+    if ((tableHasSummary ? columns.length < minimumColumns : columns.length !== minimumColumns)
+      || !canonicalSessionId.test(id || "")
+      || !canonicalDate(columns[1])
+      || !canonicalDate(columns[2])
+      || !/^[A-Za-z][A-Za-z0-9._:+-]{0,63}$/.test(columns[3] || "")
+      || observed.has(normalizedId)) {
+      return Object.freeze({ ok: false, present: false });
+    }
+    observed.add(normalizedId);
+    if (normalizedId === sessionId.toLowerCase()) present = true;
+  }
+  if (headers === 0 || expectingHeader) {
+    return Object.freeze({ ok: false, present: false });
+  }
+  if (!present && observed.size >= 200) {
+    return Object.freeze({ ok: false, present: false });
+  }
+  return Object.freeze({ ok: true, present });
+}
+
+/**
+ * Backward-compatible readiness predicate. Qualification code must use
+ * inspectImportedSessionPresence so list failure is not mistaken for absence.
+ */
+export function isImportedSessionReady(sessionId, binary = null, env = null, cwd = null) {
+  const observation = inspectImportedSessionPresence(sessionId, binary, env, cwd);
+  return observation.ok && observation.present;
 }
 
 /**

@@ -450,14 +450,29 @@ async function main() {
   }
 
   if (args[0] === "sessions" && args[1] === "list") {
+    if (Object.hasOwn(effective, "sessionsListOutput")) {
+      process.stdout.write(String(effective.sessionsListOutput));
+      if (effective.sessionsListStderr) process.stderr.write(String(effective.sessionsListStderr));
+      if (Number.isInteger(effective.sessionsListExitCode)) {
+        process.exitCode = effective.sessionsListExitCode;
+      }
+      return;
+    }
     const store = readJson(`${binary}.sessions.json`, { sessions: [] });
     const now = Date.now();
+    let pollStateChanged = false;
     const visible = (store.sessions || []).filter((entry) => {
       if (!entry?.id) return false;
       if (entry.neverReady) return false;
+      if (Number.isSafeInteger(entry.remainingListPolls) && entry.remainingListPolls > 0) {
+        entry.remainingListPolls -= 1;
+        pollStateChanged = true;
+        return false;
+      }
       if (typeof entry.readyAt === "number" && entry.readyAt > now) return false;
       return true;
     });
+    if (pollStateChanged) writeJson(`${binary}.sessions.json`, store);
     appendLog(effective, {
       event: "sessions-list",
       home: process.env.HOME || null,
@@ -531,10 +546,14 @@ async function main() {
     if (importedId && !effective.importExitCode) {
       const store = readJson(`${binary}.sessions.json`, { sessions: [] });
       const readyDelayMs = Number(effective.importReadyAfterMs);
+      const readyAfterPolls = Number(effective.importReadyAfterPolls);
       const entry = {
         id: importedId,
         readyAt: Number.isFinite(readyDelayMs) && readyDelayMs > 0 ? Date.now() + readyDelayMs : Date.now(),
-        neverReady: Boolean(effective.importNeverReady)
+        neverReady: Boolean(effective.importNeverReady),
+        ...(Number.isSafeInteger(readyAfterPolls) && readyAfterPolls > 0
+          ? { remainingListPolls: readyAfterPolls }
+          : {})
       };
       store.sessions = [...(store.sessions || []).filter((item) => item?.id !== importedId), entry];
       writeJson(`${binary}.sessions.json`, store);

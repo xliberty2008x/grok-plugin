@@ -129,6 +129,8 @@ test("transfer helpers format model-qualified resume and parse non-isolated mode
     parseAdvertisedModels,
     selectTransferModel,
     assertTransferEffort,
+    deleteSession,
+    inspectImportedSessionPresence,
     isImportedSessionReady,
     waitForImportedSession
   } = await import("../plugins/grok/scripts/lib/grok-provider.mjs");
@@ -176,6 +178,10 @@ Available models:
   fs.writeFileSync(storePath, JSON.stringify({
     sessions: [{ id: sessionId, readyAt: Date.now(), neverReady: true }]
   }), "utf8");
+  assert.deepEqual(inspectImportedSessionPresence(sessionId, fake.binary), {
+    ok: true,
+    present: false
+  });
   assert.equal(isImportedSessionReady(sessionId, fake.binary), false);
   const publish = setTimeout(() => fs.writeFileSync(storePath, JSON.stringify({
     sessions: [{ id: sessionId, readyAt: Date.now(), neverReady: false }]
@@ -189,7 +195,16 @@ Available models:
   } finally {
     clearTimeout(publish);
   }
+  assert.deepEqual(inspectImportedSessionPresence(sessionId, fake.binary), {
+    ok: true,
+    present: true
+  });
   assert.equal(isImportedSessionReady(sessionId, fake.binary), true);
+  assert.equal(deleteSession(sessionId, fake.binary).ok, true);
+  assert.deepEqual(inspectImportedSessionPresence(sessionId, fake.binary), {
+    ok: true,
+    present: false
+  });
   const listEvents = readFakeLog(fake.logFile).filter((entry) => entry.event === "sessions-list");
   assert.ok(listEvents.length >= 2);
 
@@ -200,6 +215,67 @@ Available models:
     () => waitForImportedSession(sessionId, { binary: fake.binary, timeoutMs: 120, intervalMs: 30 }),
     (error) => error?.code === "E_IMPORT_RESULT" && /not yet observable/i.test(error.message)
   );
+
+  const missingBinary = path.join(path.dirname(fake.binary), "missing-grok");
+  assert.deepEqual(inspectImportedSessionPresence(sessionId, missingBinary), {
+    ok: false,
+    present: false
+  });
+  assert.equal(isImportedSessionReady(sessionId, missingBinary), false);
+  assert.deepEqual(inspectImportedSessionPresence("", fake.binary), {
+    ok: false,
+    present: false
+  });
+
+  const header = "SESSION ID                            CREATED     UPDATED     STATUS      SUMMARY\n";
+  for (const [label, output, stderr, expected] of [
+    ["empty", "", "", { ok: false, present: false }],
+    ["malformed", "not a session table\n", "", { ok: false, present: false }],
+    [
+      "summary-only",
+      `${header}aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa  2026-07-14  2026-07-14  local  ${sessionId}\n`,
+      "",
+      { ok: true, present: false }
+    ],
+    ["stderr-only", header, `${sessionId}\n`, { ok: false, present: false }],
+    [
+      "warning-row",
+      `${header}WARNING partial output truncated now\n`,
+      "",
+      { ok: false, present: false }
+    ],
+    [
+      "impossible-date",
+      `${header}aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa  9999-99-99  2026-02-31  local  row\n`,
+      "",
+      { ok: false, present: false }
+    ]
+  ]) {
+    const special = installFakeGrok(tempDir(`fake-grok-ready-${label}-`), {
+      sessionsListOutput: output,
+      sessionsListStderr: stderr
+    });
+    assert.deepEqual(inspectImportedSessionPresence(sessionId, special.binary), expected, label);
+  }
+
+  const saturatedRows = Array.from({ length: 200 }, (_, index) => (
+    `${String(index + 1).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa  2026-07-14  2026-07-14  local  row-${index}`
+  ));
+  const saturated = installFakeGrok(tempDir("fake-grok-ready-saturated-"), {
+    sessionsListOutput: `${header}${saturatedRows.join("\n")}\n`
+  });
+  assert.deepEqual(inspectImportedSessionPresence(sessionId, saturated.binary), {
+    ok: false,
+    present: false
+  });
+
+  const grouped = installFakeGrok(tempDir("fake-grok-ready-grouped-"), {
+    sessionsListOutput: `(no label)\n${header}${sessionId}  2026-07-14  2026-07-14  local  imported\n`
+  });
+  assert.deepEqual(inspectImportedSessionPresence(sessionId, grouped.binary), {
+    ok: true,
+    present: true
+  });
 });
 
 function spawnCompanion(args, { cwd, env }) {
@@ -2457,7 +2533,7 @@ test("transfer waits for import readiness delay then succeeds", () => {
   const sessionId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   const { root, source, env, fake } = transferFixture({
     importSessionId: sessionId,
-    importReadyAfterMs: 150
+    importReadyAfterPolls: 2
   });
   const imported = parseJson(runCompanion(["transfer", "--source", source, "--json"], {
     cwd: root,
