@@ -1777,12 +1777,25 @@ function sha256File(absolute) {
 }
 
 const PROOF_TOOLCHAIN_ERROR = "E_PROOF_TOOLCHAIN";
+const PROOF_PLATFORM_ERROR = "E_PROOF_PLATFORM";
 let trustedGitBindingCache = null;
 
 function proofToolchainError() {
   const error = new Error("The proof toolchain could not be resolved or its identity changed.");
   error.code = PROOF_TOOLCHAIN_ERROR;
   return error;
+}
+
+function proofPlatformError() {
+  const error = new Error("The proof producer is unavailable on this platform.");
+  error.code = PROOF_PLATFORM_ERROR;
+  return error;
+}
+
+function assertProofProducerPlatform() {
+  if (process.platform !== "darwin" && process.platform !== "linux") {
+    throw proofPlatformError();
+  }
 }
 
 function uniqueAbsolutePaths(candidates) {
@@ -2103,15 +2116,252 @@ function proofTemporaryBase() {
   return "/tmp";
 }
 
+const PROOF_HOME_CLEANUP_ATTEMPTS = 5;
+const PROOF_HOME_CLEANUP_RETRY_MS = 10;
+const PROOF_HOME_DIRECTORY_HANDLES = new WeakMap();
+const PROOF_HOME_CLEANUP_RESULTS = new WeakMap();
+
+function processUidOrNull() {
+  return typeof process.getuid === "function" ? BigInt(process.getuid()) : null;
+}
+
+/**
+ * Capture immutable identity of a newly created proof temporary home.
+ * Callers must only cleanup the exact directory this identity describes.
+ */
+export function captureProofTemporaryHomeIdentity(proofHome) {
+  assertProofProducerPlatform();
+  const requested = path.resolve(proofHome);
+  let canonical;
+  try {
+    canonical = fs.realpathSync.native(requested);
+  } catch {
+    canonical = fs.realpathSync(requested);
+  }
+  const absolute = path.resolve(canonical);
+  const stat = fs.lstatSync(absolute, { bigint: true });
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error("Proof temporary home must be a real directory.");
+  }
+  const uid = processUidOrNull();
+  if (uid != null && stat.uid !== uid) {
+    throw new Error("Proof temporary home must be owned by the proof process.");
+  }
+  const identity = Object.freeze({
+    path: absolute,
+    realPath: absolute,
+    dev: stat.dev,
+    ino: stat.ino,
+    uid
+  });
+  const noFollow = fs.constants.O_NOFOLLOW;
+  const directory = fs.constants.O_DIRECTORY;
+  if (!Number.isInteger(noFollow) || !Number.isInteger(directory)) {
+    throw proofPlatformError();
+  }
+  const descriptor = fs.openSync(absolute, fs.constants.O_RDONLY | noFollow | directory);
+  try {
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    if (!proofHomeStatMatchesIdentity(opened, identity)) {
+      throw new Error("Proof temporary home identity changed while binding its directory handle.");
+    }
+    PROOF_HOME_DIRECTORY_HANDLES.set(identity, descriptor);
+  } catch (error) {
+    fs.closeSync(descriptor);
+    throw error;
+  }
+  return identity;
+}
+
+function proofHomeStatMatchesIdentity(stat, identity) {
+  return Boolean(stat
+    && !stat.isSymbolicLink()
+    && stat.isDirectory()
+    && stat.dev === identity.dev
+    && stat.ino === identity.ino
+    && (identity.uid == null || stat.uid === identity.uid));
+}
+
+/**
+ * Re-validate that `identity.path` still names the original owned directory.
+ * Returns "missing" when already gone (idempotent success), "match" when safe
+ * to remove, and "mismatch" for replacement/ownership/type failures.
+ */
+function inspectProofTemporaryHomeIdentity(identity) {
+  if (!identity
+    || typeof identity.path !== "string"
+    || identity.path !== path.resolve(identity.path)) {
+    return { status: "mismatch" };
+  }
+  let stat;
+  try {
+    stat = fs.lstatSync(identity.path, { bigint: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return { status: "missing" };
+    return { status: "mismatch" };
+  }
+  if (!proofHomeStatMatchesIdentity(stat, identity)) {
+    return { status: "mismatch" };
+  }
+  const uid = processUidOrNull();
+  if (uid != null && (identity.uid !== uid || stat.uid !== uid)) {
+    return { status: "mismatch" };
+  }
+  let realPath;
+  try {
+    realPath = path.resolve(fs.realpathSync.native(identity.path));
+  } catch {
+    try {
+      realPath = path.resolve(fs.realpathSync(identity.path));
+    } catch (error) {
+      if (error?.code === "ENOENT") return { status: "missing" };
+      return { status: "mismatch" };
+    }
+  }
+  if (realPath !== identity.realPath || realPath !== identity.path) {
+    return { status: "mismatch" };
+  }
+  return { status: "match", stat };
+}
+
+/**
+ * Fail-closed, idempotent removal of a quiescent proof temporary home.
+ *
+ * This is an integrity check for reviewed code-owned gates, not a same-user
+ * sandbox. Every gate and descendant must be quiescent before cleanup begins,
+ * and no other publisher-UID process may race the proof tree. Enforcing that
+ * stronger hostile-code boundary requires a separately privileged supervisor.
+ * Never throws: unproven cleanup returns `{ ok: false }` with no path/error.
+ */
+export function cleanupProofTemporaryHome(identity) {
+  if (identity && typeof identity === "object" && PROOF_HOME_CLEANUP_RESULTS.has(identity)) {
+    return { ok: PROOF_HOME_CLEANUP_RESULTS.get(identity) };
+  }
+  let ok = false;
+  const descriptor = identity && typeof identity === "object"
+    ? PROOF_HOME_DIRECTORY_HANDLES.get(identity)
+    : null;
+  let descriptorClosed = false;
+  let witnessDescriptor = null;
+  let witnessClosed = false;
+  let witnessIdentity = null;
+  try {
+    // The immutable fields are not an authority token. Only an identity object
+    // captured by this module has the no-follow root descriptor held in the
+    // private WeakMap; copied or caller-forged identities must never authorize
+    // pathname deletion.
+    if (descriptor == null) return { ok: false };
+    const initial = inspectProofTemporaryHomeIdentity(identity);
+    // A missing path before this cleanup starts is not proof of deletion: a
+    // gate may have renamed the original inode and left sensitive data behind.
+    if (initial.status !== "match") return { ok: false };
+    if (descriptor != null) {
+      const opened = fs.fstatSync(descriptor, { bigint: true });
+      if (!proofHomeStatMatchesIdentity(opened, identity) || opened.nlink === 0n) {
+        return { ok: false };
+      }
+      // Create the deletion witness only after every gate has exited and after
+      // the bound root was revalidated. Under the documented quiescent-gate
+      // boundary, its link transition distinguishes removal of this tree from
+      // a stale/mismatched pathname outcome.
+      const witnessPath = path.join(
+        identity.path,
+        `.proof-cleanup-witness-${crypto.randomBytes(16).toString("hex")}`
+      );
+      witnessDescriptor = fs.openSync(
+        witnessPath,
+        fs.constants.O_CREAT
+          | fs.constants.O_EXCL
+          | fs.constants.O_RDWR
+          | fs.constants.O_NOFOLLOW,
+        0o600
+      );
+      witnessIdentity = fs.fstatSync(witnessDescriptor, { bigint: true });
+      const witnessAtPath = fs.lstatSync(witnessPath, { bigint: true });
+      const rootAfterWitness = inspectProofTemporaryHomeIdentity(identity);
+      const rootHandleAfterWitness = fs.fstatSync(descriptor, { bigint: true });
+      if (!witnessIdentity.isFile()
+        || witnessIdentity.isSymbolicLink()
+        || witnessIdentity.dev !== identity.dev
+        || witnessIdentity.nlink !== 1n
+        || (identity.uid != null && witnessIdentity.uid !== identity.uid)
+        || !witnessAtPath.isFile()
+        || witnessAtPath.isSymbolicLink()
+        || witnessAtPath.dev !== witnessIdentity.dev
+        || witnessAtPath.ino !== witnessIdentity.ino
+        || rootAfterWitness.status !== "match"
+        || !proofHomeStatMatchesIdentity(rootHandleAfterWitness, identity)) {
+        return { ok: false };
+      }
+    }
+    // Delegate recursive unlink semantics to Node core. In particular, do not
+    // chmod or manually traverse gate-controlled descendants: static symlinks
+    // are unlinked as links, while inaccessible trees fail before publication.
+    fs.rmSync(identity.path, {
+      recursive: true,
+      force: false,
+      maxRetries: PROOF_HOME_CLEANUP_ATTEMPTS - 1,
+      retryDelay: PROOF_HOME_CLEANUP_RETRY_MS
+    });
+    const after = inspectProofTemporaryHomeIdentity(identity);
+    if (after.status !== "missing") return { ok: false };
+    if (descriptor != null) {
+      const removed = fs.fstatSync(descriptor, { bigint: true });
+      const removedWitness = fs.fstatSync(witnessDescriptor, { bigint: true });
+      if (!proofHomeStatMatchesIdentity(removed, identity)
+        || !removedWitness.isFile()
+        || removedWitness.dev !== witnessIdentity.dev
+        || removedWitness.ino !== witnessIdentity.ino
+        || removedWitness.nlink !== 0n) {
+        return { ok: false };
+      }
+      fs.closeSync(witnessDescriptor);
+      witnessClosed = true;
+      fs.closeSync(descriptor);
+      descriptorClosed = true;
+      PROOF_HOME_DIRECTORY_HANDLES.delete(identity);
+    }
+    ok = true;
+    return { ok: true };
+  } catch {
+    return { ok: false };
+  } finally {
+    if (witnessDescriptor != null && !witnessClosed) {
+      try { fs.closeSync(witnessDescriptor); } catch { ok = false; }
+    }
+    if (descriptor != null && !descriptorClosed) {
+      try { fs.closeSync(descriptor); } catch { ok = false; }
+      PROOF_HOME_DIRECTORY_HANDLES.delete(identity);
+    }
+    if (identity && typeof identity === "object") {
+      PROOF_HOME_CLEANUP_RESULTS.set(identity, ok);
+    }
+  }
+}
+
 function createProofExecutionContext() {
+  assertProofProducerPlatform();
   const node = resolveProofNodeBinding();
   const npm = resolveTrustedNpmBinding(node);
   const git = trustedGitBinding();
   const toolchain = Object.freeze({ node, npm, git });
   assertProofToolchainIdentity(toolchain);
+  const digest = proofToolchainDigest(toolchain);
   const temporaryBase = proofTemporaryBase();
-  const proofHome = fs.mkdtempSync(path.join(temporaryBase, "grok-worker-proof-"));
-  if (process.platform !== "win32") fs.chmodSync(proofHome, 0o700);
+  const createdProofHome = fs.mkdtempSync(path.join(temporaryBase, "grok-worker-proof-"));
+  if (process.platform !== "win32") fs.chmodSync(createdProofHome, 0o700);
+  let homeIdentity;
+  try {
+    homeIdentity = captureProofTemporaryHomeIdentity(createdProofHome);
+  } catch (error) {
+    try {
+      fs.rmSync(createdProofHome, { recursive: true, force: true, maxRetries: 2 });
+    } catch {
+      // The caller still receives only the bounded proof-toolchain failure.
+    }
+    throw error;
+  }
+  const proofHome = homeIdentity.path;
   const pathEntries = uniqueAbsolutePaths([
     path.dirname(node.pathEntry.entryPath),
     path.dirname(node.executable.canonicalPath),
@@ -2119,12 +2369,17 @@ function createProofExecutionContext() {
     path.dirname(git.canonicalPath)
   ]);
   const environment = Object.freeze(baseProofEnvironment(pathEntries, proofHome));
+  let cleaned = false;
   return {
     toolchain,
     environment,
-    digest: proofToolchainDigest(toolchain),
+    digest,
+    homeIdentity,
     cleanup() {
-      fs.rmSync(proofHome, { recursive: true, force: true });
+      if (cleaned) return { ok: true };
+      const result = cleanupProofTemporaryHome(homeIdentity);
+      if (result.ok) cleaned = true;
+      return result;
     }
   };
 }
@@ -4481,7 +4736,10 @@ function proofFailure(code, extras = {}) {
 }
 
 function proofFailureForError(error, fallback) {
-  return proofFailure(error?.code === PROOF_TOOLCHAIN_ERROR ? PROOF_TOOLCHAIN_ERROR : fallback);
+  if (error?.code === PROOF_TOOLCHAIN_ERROR || error?.code === PROOF_PLATFORM_ERROR) {
+    return proofFailure(error.code);
+  }
+  return proofFailure(fallback);
 }
 
 function proofRecordMatchesSnapshot(record, snapshot) {
@@ -4517,11 +4775,23 @@ export function proveWorkerBrokerPhase(options = {}) {
   } catch (error) {
     return proofFailureForError(error, PROOF_TOOLCHAIN_ERROR);
   }
+  let result;
   try {
-    return proveWorkerBrokerPhaseWithContext({ phase, slice, root, write }, proofContext);
-  } finally {
-    proofContext.cleanup();
+    result = proveWorkerBrokerPhaseWithContext({ phase, slice, root, write }, proofContext);
+  } catch (error) {
+    result = proofFailureForError(error, "E_PROOF_SOURCE");
   }
+  // Always finish temporary-home cleanup before returning. Cleanup is idempotent
+  // when the success path already cleaned before publication. Never let a raw
+  // cleanup exception escape or overwrite a structured result with a throw.
+  let cleaned;
+  try {
+    cleaned = proofContext.cleanup();
+  } catch {
+    cleaned = { ok: false };
+  }
+  if (!cleaned?.ok) return proofFailure("E_PROOF_CLEANUP");
+  return result;
 }
 
 function proveWorkerBrokerPhaseWithContext({ phase, slice, root, write }, proofContext) {
@@ -4629,8 +4899,15 @@ function proveWorkerBrokerPhaseWithContext({ phase, slice, root, write }, proofC
       independentValidation: "not_run"
     },
     limits: {
-      residualRisks: ["Installed-host and authenticated-provider qualification remain unproven."],
-      unsupportedPlatforms: ["windows-provider-execution", "linux-provider-unqualified"],
+      residualRisks: [
+        "Installed-host and authenticated-provider qualification remain unproven.",
+        "The local producer assumes reviewed gates and all descendants are quiescent; hostile same-UID races and data retained through open descriptors require a separately privileged supervisor."
+      ],
+      unsupportedPlatforms: [
+        "windows-proof-producer-cleanup",
+        "windows-provider-execution",
+        "linux-provider-unqualified"
+      ],
       invalidationTriggers: [
         "source inventory change outside evidence-only paths",
         "phase-scope path change",
@@ -4671,6 +4948,16 @@ function proveWorkerBrokerPhaseWithContext({ phase, slice, root, write }, proofC
   }
   const validated = validateEvidenceRecord(record, { strict: true, root, requireEvidenceSystem: true });
   if (!validated.ok) return proofFailure("E_PROOF_RECORD");
+
+  // Temporary-home cleanup must complete before any ledger/record publication so
+  // an unproven cleanup cannot leave ENOTEMPTY debris after a published claim.
+  let cleaned;
+  try {
+    cleaned = proofContext.cleanup();
+  } catch {
+    cleaned = { ok: false };
+  }
+  if (!cleaned?.ok) return proofFailure("E_PROOF_CLEANUP");
 
   if (!write) {
     return {

@@ -22,6 +22,8 @@ import {
   computePhaseScopeDigest,
   computeProofManifestDigest,
   computeRecordDigest,
+  captureProofTemporaryHomeIdentity,
+  cleanupProofTemporaryHome,
   expandLocalStaticImportClosure,
   findMissingLocalStaticImportDependencies,
   gitIdentity,
@@ -63,6 +65,7 @@ const DETERMINISTIC_CHECK_RUNNER = path.join(ROOT, "scripts/check-deterministic.
 const DETERMINISTIC_TEST_LIBRARY = path.join(ROOT, "scripts/lib/deterministic-test-runner.mjs");
 const STATIC_ESM_IMPORT_PARSER = path.join(ROOT, "scripts/lib/static-esm-import-parser.mjs");
 const PHASE_ONE_FOCUSED_RUNNER = path.join(ROOT, "scripts/test-phase1-focused.mjs");
+const POSIX_PROOF_PLATFORM = process.platform === "darwin" || process.platform === "linux";
 
 function installZeroSkipReporter(root) {
   const destination = path.join(root, "scripts/lib/zero-skip-test-reporter.mjs");
@@ -407,6 +410,21 @@ function proofProducer(phase = "0") {
     version: PROOF_PRODUCER_VERSION,
     manifestDigest: computeProofManifestDigest(phase)
   };
+}
+
+function assertQuiescentProofCleanupBoundary(record) {
+  assert.ok(
+    record.limits.residualRisks.some((risk) => (
+      /all descendants are quiescent/i.test(risk)
+      && /hostile same-UID races/i.test(risk)
+      && /separately privileged supervisor/i.test(risk)
+    )),
+    "proof-produced records must disclose the quiescent same-UID cleanup boundary"
+  );
+  assert.ok(
+    record.limits.unsupportedPlatforms.includes("windows-proof-producer-cleanup"),
+    "proof-produced records must disclose unsupported Windows cleanup"
+  );
 }
 
 function independentReviewReceipt(record, overrides = {}) {
@@ -2214,6 +2232,175 @@ process.exitCode = result.ok ? 0 : 1;
   assert.equal(strict.ok, true, strict.errors.join("; "));
 });
 
+test("proof temporary-home cleanup removes its bound root without following symlinks", {
+  skip: !POSIX_PROOF_PLATFORM
+}, () => {
+  const proofHome = tempDir("proof-home-cleanup-");
+  const external = tempDir("proof-home-external-");
+  const sentinel = path.join(external, "sentinel.txt");
+  fs.writeFileSync(sentinel, "outside\n", { mode: 0o640 });
+  const sentinelMode = fs.statSync(sentinel).mode & 0o777;
+  const identity = captureProofTemporaryHomeIdentity(proofHome);
+  const locked = path.join(proofHome, "nested", "ordinary");
+  fs.mkdirSync(locked, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(locked, "inside.txt"), "inside\n", { mode: 0o600 });
+
+  const externalLink = path.join(proofHome, "external-link");
+  let linkCreated = false;
+  try {
+    fs.symlinkSync(external, externalLink, process.platform === "win32" ? "junction" : "dir");
+    linkCreated = true;
+  } catch (error) {
+    if (process.platform !== "win32"
+      || !new Set(["EPERM", "EACCES", "ENOTSUP"]).has(error?.code)) throw error;
+  }
+
+  try {
+    assert.deepEqual(cleanupProofTemporaryHome(identity), { ok: true });
+    assert.equal(fs.existsSync(proofHome), false);
+    assert.deepEqual(cleanupProofTemporaryHome(identity), { ok: true }, "cleanup must be idempotent");
+    assert.equal(fs.readFileSync(sentinel, "utf8"), "outside\n");
+    assert.equal(fs.statSync(sentinel).mode & 0o777, sentinelMode);
+    if (linkCreated) assert.equal(fs.existsSync(externalLink), false);
+  } finally {
+    fs.rmSync(proofHome, { recursive: true, force: true, maxRetries: 3 });
+    fs.rmSync(external, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test("proof temporary-home cleanup rejects copied identity without its bound handle", {
+  skip: !POSIX_PROOF_PLATFORM
+}, () => {
+  const proofHome = tempDir("proof-home-forged-identity-");
+  const identity = captureProofTemporaryHomeIdentity(proofHome);
+  const copiedIdentity = Object.freeze({ ...identity });
+  fs.writeFileSync(path.join(proofHome, "retained.txt"), "retained\n", { mode: 0o600 });
+  try {
+    assert.deepEqual(cleanupProofTemporaryHome(copiedIdentity), { ok: false });
+    assert.equal(fs.readFileSync(path.join(proofHome, "retained.txt"), "utf8"), "retained\n");
+    assert.deepEqual(cleanupProofTemporaryHome(identity), { ok: true });
+    assert.equal(fs.existsSync(proofHome), false);
+  } finally {
+    fs.rmSync(proofHome, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test("proof temporary-home cleanup fails closed on inaccessible descendants", {
+  skip: !POSIX_PROOF_PLATFORM
+}, () => {
+  const proofHome = tempDir("proof-home-inaccessible-");
+  const identity = captureProofTemporaryHomeIdentity(proofHome);
+  const locked = path.join(proofHome, "mode-zero");
+  fs.mkdirSync(locked, { mode: 0o700 });
+  fs.writeFileSync(path.join(locked, "inside.txt"), "inside\n", { mode: 0o600 });
+  if (process.platform !== "win32") fs.chmodSync(locked, 0o000);
+  try {
+    const result = cleanupProofTemporaryHome(identity);
+    assert.deepEqual(result, { ok: false });
+    assert.equal(fs.existsSync(proofHome), true);
+  } finally {
+    if (process.platform !== "win32") {
+      try { fs.chmodSync(locked, 0o700); } catch {}
+    }
+    fs.rmSync(proofHome, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test("proof temporary-home cleanup does not accept a concurrent root rename", {
+  skip: !POSIX_PROOF_PLATFORM
+}, () => {
+  const proofHome = tempDir("proof-home-rename-race-");
+  const moved = `${proofHome}-moved`;
+  const identity = captureProofTemporaryHomeIdentity(proofHome);
+  const remove = fs.rmSync;
+  fs.writeFileSync(path.join(proofHome, "retained.txt"), "retained\n", { mode: 0o600 });
+  try {
+    fs.rmSync = (target, options) => {
+      if (path.resolve(target) === identity.path) {
+        fs.renameSync(identity.path, moved);
+        return;
+      }
+      return remove(target, options);
+    };
+    assert.deepEqual(cleanupProofTemporaryHome(identity), { ok: false });
+    assert.equal(fs.readFileSync(path.join(moved, "retained.txt"), "utf8"), "retained\n");
+  } finally {
+    fs.rmSync = remove;
+    fs.rmSync(proofHome, { recursive: true, force: true, maxRetries: 3 });
+    fs.rmSync(moved, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test("proof cleanup failure is structured and occurs before evidence publication", {
+  skip: !POSIX_PROOF_PLATFORM
+}, () => {
+  const markerRoot = tempDir("proof-home-replacement-marker-");
+  const marker = path.join(markerRoot, "paths.json");
+  const { root, evidenceDir } = initProofRunnerFixture(
+    "proof-cleanup-before-publication",
+    "node tests/replace-proof-home.mjs"
+  );
+  fs.writeFileSync(path.join(root, "tests/replace-proof-home.mjs"), [
+    'import fs from "node:fs";',
+    'import path from "node:path";',
+    'const home = fs.realpathSync(process.env.HOME);',
+    'const moved = `${home}-moved`;',
+    'fs.renameSync(home, moved);',
+    'fs.mkdirSync(home, { mode: 0o700 });',
+    `fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ home, moved }));`,
+    ''
+  ].join("\n"));
+  git(root, "add", ".");
+  git(root, "commit", "-m", "add proof-home replacement gate");
+
+  let paths = null;
+  try {
+    const result = provePhaseZero({
+      phase: "0",
+      slice: "cleanup-before-publication",
+      root,
+      write: true
+    });
+    paths = JSON.parse(fs.readFileSync(marker, "utf8"));
+    assert.deepEqual(result, { ok: false, code: "E_PROOF_CLEANUP" });
+    assert.equal(fs.existsSync(path.join(evidenceDir, "ledger.json")), false);
+    assert.equal(path.isAbsolute(paths.home), true);
+    assert.equal(path.isAbsolute(paths.moved), true);
+  } finally {
+    if (paths == null && fs.existsSync(marker)) {
+      try { paths = JSON.parse(fs.readFileSync(marker, "utf8")); } catch {}
+    }
+    for (const candidate of [paths?.home, paths?.moved]) {
+      if (typeof candidate === "string" && path.isAbsolute(candidate)) {
+        fs.rmSync(candidate, { recursive: true, force: true, maxRetries: 3 });
+      }
+    }
+    fs.rmSync(markerRoot, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test("proof producer rejects unsupported cleanup platforms before publication", () => {
+  const { root, evidenceDir } = initProofRunnerFixture("proof-platform-rejected");
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  try {
+    Object.defineProperty(process, "platform", {
+      configurable: true,
+      enumerable: originalPlatform?.enumerable ?? true,
+      value: "win32"
+    });
+    const result = proveWorkerBrokerPhase({
+      phase: "0",
+      slice: "unsupported-platform",
+      root,
+      write: true
+    });
+    assert.deepEqual(result, { ok: false, code: "E_PROOF_PLATFORM" });
+    assert.equal(fs.existsSync(path.join(evidenceDir, "ledger.json")), false);
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
+  }
+});
+
 test("Phase 0 proof fails without publication on dirty, drifting, failed, or secret-output gates", () => {
   const failed = initProofRunnerFixture("proof-failed", 'node -e "process.exit(7)"');
   const failedResult = provePhaseZero({ phase: "0", slice: "proof-failed", root: failed.root, write: true });
@@ -2633,6 +2820,7 @@ test("Phase 1 proof separates strict integrity from verified readiness", () => {
   assert.match(first.path, /^tests\/e2e-results\/worker-broker\/phase-1\//);
   const firstRecord = JSON.parse(fs.readFileSync(path.join(root, first.path), "utf8"));
   assert.equal(firstRecord.status, "implemented_unverified");
+  assertQuiescentProofCleanupBoundary(firstRecord);
   assert.equal(firstRecord.authorities.independentValidation, "not_run");
   assert.equal(Object.hasOwn(firstRecord, "independentReviewReceipt"), false);
   assert.deepEqual(firstRecord.prerequisites, [{
@@ -3174,6 +3362,9 @@ test("proof publication atomically invalidates canonical pre-runner current clai
   const result = provePhaseZero({ phase: "0", slice: "phase-zero-baseline", root, write: true });
   assert.equal(result.ok, true, result.code);
   assert.match(result.path, /^tests\/e2e-results\/worker-broker\/phase-0\//);
+  assertQuiescentProofCleanupBoundary(
+    JSON.parse(fs.readFileSync(path.join(root, result.path), "utf8"))
+  );
   const ledger = loadLedger(root);
   const current = ledger.entries.filter((entry) => entry.currency === "current");
   assert.equal(current.length, 1);

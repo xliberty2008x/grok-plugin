@@ -1143,7 +1143,7 @@ test("enabled stop gate emits Claude block JSON for BLOCK output", () => {
   assert.equal(log.some((entry) => entry.event === "rpc"), false);
 });
 
-test("enabled stop gate preserves primary BLOCK reason when isolated-home cleanup also fails", { skip: process.platform === "win32" }, () => {
+test("enabled stop gate preserves primary BLOCK reason when isolated-home cleanup also fails", { skip: process.platform === "win32" }, (t) => {
   const root = fs.realpathSync(initRepo());
   const fake = installFakeGrok(tempDir("fake-grok-stop-cleanup-"), {
     taskText: "BLOCK: add the missing regression test",
@@ -1151,6 +1151,21 @@ test("enabled stop gate preserves primary BLOCK reason when isolated-home cleanu
   });
   const pluginData = tempDir("grok-hook-data-");
   withPluginData(pluginData, () => setConfig(root, { stopReviewGate: true }));
+  t.after(() => withPluginData(pluginData, () => {
+    const homes = path.join(workspaceState(root), "review-homes");
+    if (fs.existsSync(homes)) {
+      for (const name of fs.readdirSync(homes)) {
+        const nest = path.join(homes, name, "undeletable-cleanup");
+        if (fs.existsSync(nest)) fs.chmodSync(nest, 0o700);
+      }
+      fs.rmSync(homes, { recursive: true, force: true });
+    }
+    assert.equal(
+      fs.existsSync(homes),
+      false,
+      "stop-gate teardown must remove retained review homes after unlocking mode-000 nests"
+    );
+  }));
   const result = hook(
     STOP_HOOK,
     null,
@@ -1165,15 +1180,6 @@ test("enabled stop gate preserves primary BLOCK reason when isolated-home cleanu
   // Primary BLOCK text must remain, not be replaced by cleanup-only wording.
   assert.doesNotMatch(payload.reason, /^Grok stop review could not remove its isolated credential environment/);
 
-  // Best-effort unlock of any retained review homes so the temp tree can be removed later.
-  const homes = path.join(workspaceState(root), "review-homes");
-  if (fs.existsSync(homes)) {
-    for (const name of fs.readdirSync(homes)) {
-      const nest = path.join(homes, name, "undeletable-cleanup");
-      try { fs.chmodSync(nest, 0o700); } catch {}
-    }
-    try { fs.rmSync(homes, { recursive: true, force: true }); } catch {}
-  }
 });
 
 test("Codex stop gate classifies PLUGIN_DATA host, preserves session id, and uses $grok remediation", async () => {
