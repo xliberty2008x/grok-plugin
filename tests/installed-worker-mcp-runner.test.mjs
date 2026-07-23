@@ -336,6 +336,14 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /commandObservationIdentity = Object\.freeze\(\{/);
   assert.match(source, /unownedSetupCommandGroupGone\(\{/);
   assert.match(source, /setup = validateInstalledSetup\(setupJson\);/);
+  assert.doesNotMatch(
+    source,
+    /publicWorker\.createdAt !== publicWorker\.updatedAt/
+  );
+  assert.match(
+    source,
+    /publicWorker\.createdAt !== publicWorker\.heartbeatAt/
+  );
   assert.match(source, /catch \{\s*fail\("E_SETUP"\);\s*\}/);
   assert.match(
     source,

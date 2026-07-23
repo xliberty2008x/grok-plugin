@@ -830,6 +830,22 @@ test("authoritative writes validate core state and preserve conservative schema-
   }
 });
 
+test("admission advances updatedAt without moving the creation heartbeat", () => {
+  const env = { ...process.env, CLAUDE_PLUGIN_DATA: tempDir("grok-state-data-") };
+  const root = initRepo();
+  const createdAt = "2026-01-01T00:00:00.000Z";
+  const admitted = admitJob(root, job(generateId("task"), {
+    status: "queued",
+    write: false,
+    createdAt,
+    updatedAt: createdAt,
+    heartbeatAt: createdAt
+  }), env);
+
+  assert.ok(Date.parse(admitted.updatedAt) > Date.parse(createdAt));
+  assert.equal(admitted.heartbeatAt, createdAt);
+});
+
 test("workspace admission gives write jobs an exclusive lease", () => {
   const previous = process.env.CLAUDE_PLUGIN_DATA;
   process.env.CLAUDE_PLUGIN_DATA = tempDir("grok-state-data-");

@@ -491,6 +491,11 @@ test("worker spawn returns a stable admission snapshot while dispatch advances p
   assert.equal(first.handle.status, "queued");
   assert.equal(first.handle.phase, "accepted");
   assert.equal(first.handle.eventCursor.sequence, 1);
+  assert.equal(first.handle.heartbeatAt, first.handle.createdAt);
+  assert.ok(
+    Date.parse(first.handle.updatedAt) >= Date.parse(first.handle.createdAt),
+    "admission persistence may advance updatedAt beyond the creation heartbeat"
+  );
   assert.equal(first.providerLaunchState, "pending");
   assert.equal(first.providerLaunched, false);
 

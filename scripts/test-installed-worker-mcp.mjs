@@ -2500,8 +2500,7 @@ function validateActiveSpawnHandle(
     }
     enterScenarioStage(tracker, "spawn-handle-time");
     if (
-      publicWorker.createdAt !== publicWorker.updatedAt
-      || publicWorker.createdAt !== publicWorker.heartbeatAt
+      publicWorker.createdAt !== publicWorker.heartbeatAt
     ) {
       fail("E_PRIVATE_STATE");
     }
