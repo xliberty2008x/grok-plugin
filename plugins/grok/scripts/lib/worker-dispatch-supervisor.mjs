@@ -255,7 +255,6 @@ export function startWorkerDispatchSupervisor({
           timer = null;
           void run();
         }, retryDelayMs);
-        timer?.unref?.();
       }
       finishIfDone();
     }
