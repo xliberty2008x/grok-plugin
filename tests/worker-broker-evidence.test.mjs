@@ -68,6 +68,10 @@ import {
   PHASE1_FOCUSED_TEST_FILES,
   runPhaseOneFocusedTests
 } from "../scripts/test-phase1-focused.mjs";
+import {
+  createPluginInventory,
+  digestInventory
+} from "../scripts/lib/plugin-inventory.mjs";
 import zeroSkipTestReporter, {
   ZERO_SKIP_MAX_SUMMARY_BYTES,
   ZERO_SKIP_MAX_VIOLATIONS,
@@ -929,7 +933,7 @@ test("zero-skip validator and deterministic parser reject raw short absolute pat
 });
 
 test("deterministic runner suppresses child stderr and globally caps structural violations", () => {
-  const secret = "xai-RUNNERSTDERR000000";
+  const stderrSentinel = "runner-stderr-sentinel";
   const childSummaries = [
     zeroSkipSummary({
       failed: 6,
@@ -955,14 +959,14 @@ test("deterministic runner suppresses child stderr and globally caps structural 
       status: 1,
       signal: null,
       stdout: childSummaries[call++],
-      stderr: `${secret}-must-not-be-forwarded`
+      stderr: `${stderrSentinel}-must-not-be-forwarded`
     }),
     stdout: { write(value) { output += value; } },
     stderr: { write(value) { diagnostic += value; } }
   });
   const aggregate = JSON.parse(output);
   assert.equal(status, 1);
-  assert.equal(`${output}${diagnostic}`.includes(secret), false);
+  assert.equal(`${output}${diagnostic}`.includes(stderrSentinel), false);
   assert.deepEqual(
     Object.fromEntries(["passed", "failed", "cancelled", "skipped", "todo"].map((field) => [field, aggregate[field]])),
     { passed: 2, failed: 6, cancelled: 0, skipped: 4, todo: 0 }
@@ -1403,45 +1407,26 @@ function initLiveReceiptFixture(name = "live-receipt-fixture") {
 }
 
 function structuralPluginInventory(pluginRoot) {
-  const entries = [];
-  let pluginVersion = null;
-  let installedEntrypointDigest = null;
-  const visit = (directory, prefix = "") => {
-    const children = fs.readdirSync(directory, { withFileTypes: true })
-      .sort((left, right) => left.name.localeCompare(right.name));
-    for (const child of children) {
-      const absolute = path.join(directory, child.name);
-      const relative = prefix ? `${prefix}/${child.name}` : child.name;
-      if (child.isDirectory()) {
-        visit(absolute, relative);
-        continue;
-      }
-      assert.equal(child.isFile(), true, `structural receipt fixture cannot include ${relative}`);
-      const stat = fs.statSync(absolute);
-      const bytes = fs.readFileSync(absolute);
-      const digest = sha256Text(bytes);
-      entries.push({
-        path: relative,
-        mode: stat.mode & 0o777,
-        size: bytes.byteLength,
-        sha256: digest
-      });
-      if (relative === ".codex-plugin/plugin.json") {
-        pluginVersion = JSON.parse(bytes.toString("utf8")).version;
-      }
-      if (relative === LIVE_RECEIPT_MANIFEST.installedEntrypoint) {
-        installedEntrypointDigest = digest;
-      }
-    }
-  };
-  visit(pluginRoot);
+  const entries = createPluginInventory(pluginRoot);
+  const manifestEntry = entries.find(
+    (entry) => entry.path === ".codex-plugin/plugin.json"
+  );
+  const installedEntrypoint = entries.find(
+    (entry) => entry.path === LIVE_RECEIPT_MANIFEST.installedEntrypoint
+  );
+  const pluginVersion = JSON.parse(
+    fs.readFileSync(path.join(pluginRoot, ".codex-plugin/plugin.json"), "utf8")
+  ).version;
   assert.equal(typeof pluginVersion, "string");
-  assert.match(installedEntrypointDigest, /^[0-9a-f]{64}$/);
+  assert.equal(manifestEntry?.sha256, sha256Text(
+    fs.readFileSync(path.join(pluginRoot, ".codex-plugin/plugin.json"))
+  ));
+  assert.match(installedEntrypoint?.sha256, /^[0-9a-f]{64}$/);
   return {
-    digest: sha256Text(JSON.stringify(entries)),
+    digest: digestInventory(entries),
     fileCount: entries.length,
     pluginVersion,
-    installedEntrypointDigest
+    installedEntrypointDigest: installedEntrypoint.sha256
   };
 }
 
@@ -2740,6 +2725,70 @@ test("live receipt v1 supports strict offline replay but exports no mint or publ
     schema.description,
     /cannot authenticate historical origin.*protected signature or external immutable anchor/i
   );
+});
+
+test("strict live receipt replay shares binary Unicode inventory ordering with the installer", () => {
+  const fixture = initLiveReceiptFixture("live-inventory-unicode-order");
+  const unicodeDirectory = path.join(fixture.root, "plugins/grok/unicode-order");
+  fs.mkdirSync(unicodeDirectory);
+  const names = ["zeta.txt", "äther.txt", "Ωmega.txt", "😀.txt"];
+  for (const name of [...names].reverse()) {
+    fs.writeFileSync(path.join(unicodeDirectory, name), `${name}\n`);
+  }
+  git(fixture.root, "add", ".");
+  git(fixture.root, "commit", "-m", "add unicode inventory fixture");
+
+  const pluginRoot = path.join(fixture.root, "plugins/grok");
+  const sharedInventory = createPluginInventory(pluginRoot);
+  const expectedOrder = [...names].sort(
+    (left, right) => Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"))
+  );
+  assert.deepEqual(
+    sharedInventory
+      .map((entry) => entry.path)
+      .filter((relative) => relative.startsWith("unicode-order/"))
+      .map((relative) => path.posix.basename(relative)),
+    expectedOrder
+  );
+
+  const receipt = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
+  assert.equal(
+    receipt.sourcePluginInventoryDigest,
+    digestInventory([...sharedInventory].reverse())
+  );
+
+  const localeCompareDescriptor = Object.getOwnPropertyDescriptor(
+    String.prototype,
+    "localeCompare"
+  );
+  const originalLocaleCompare = localeCompareDescriptor.value;
+  const targetNames = new Set(names);
+  Object.defineProperty(String.prototype, "localeCompare", {
+    ...localeCompareDescriptor,
+    value(other, ...args) {
+      const left = String(this);
+      const right = String(other);
+      if (targetNames.has(left) && targetNames.has(right)) {
+        return Buffer.compare(Buffer.from(right, "utf8"), Buffer.from(left, "utf8"));
+      }
+      return Reflect.apply(originalLocaleCompare, left, [other, ...args]);
+    }
+  });
+  try {
+    assert.deepEqual(
+      [...names].sort((left, right) => left.localeCompare(right)),
+      [...expectedOrder].reverse()
+    );
+    assert.equal(
+      validateLiveQualificationReceipt(
+        receipt,
+        { strict: true, root: fixture.root }
+      ).ok,
+      true
+    );
+  } finally {
+    Object.defineProperty(String.prototype, "localeCompare", localeCompareDescriptor);
+  }
 });
 
 test("manually seeded structural receipts replay offline while generic publication rejects linkage", () => {

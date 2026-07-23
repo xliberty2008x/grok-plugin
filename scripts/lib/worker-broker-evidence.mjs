@@ -9,6 +9,10 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { redactText } from "../../plugins/grok/scripts/lib/redact.mjs";
+import {
+  createPluginInventory,
+  digestInventory
+} from "./plugin-inventory.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const STATIC_ESM_IMPORT_PARSER = path.join(
@@ -2890,47 +2894,18 @@ const MAX_LIVE_PLUGIN_FILES = 4096;
 const MAX_LIVE_PLUGIN_DIRECTORIES = 512;
 const MAX_LIVE_PLUGIN_DEPTH = 32;
 const MAX_LIVE_PLUGIN_DIRECTORY_ENTRIES = 4096;
-const MAX_LIVE_PLUGIN_FILE_BYTES = 128 * 1024 * 1024;
-const MAX_LIVE_PLUGIN_TOTAL_BYTES = 512 * 1024 * 1024;
+const LIVE_PLUGIN_INVENTORY_LIMITS = Object.freeze({
+  maxDepth: MAX_LIVE_PLUGIN_DEPTH,
+  maxPathBytes: 4 * 1024,
+  maxFiles: MAX_LIVE_PLUGIN_FILES,
+  maxFileBytes: 16 * 1024 * 1024,
+  maxTotalBytes: 64 * 1024 * 1024
+});
 
-function readBoundedLiveDirectory(directory) {
-  const entries = [];
-  let handle;
-  let failure = null;
-  try {
-    handle = fs.opendirSync(directory);
-    while (true) {
-      const entry = handle.readSync();
-      if (entry === null) break;
-      if (entries.length >= MAX_LIVE_PLUGIN_DIRECTORY_ENTRIES) {
-        throw invalidLiveReceiptError();
-      }
-      entries.push(entry);
-    }
-  } catch {
-    failure = invalidLiveReceiptError();
-  } finally {
-    if (handle) {
-      try {
-        handle.closeSync();
-      } catch {
-        failure = invalidLiveReceiptError();
-      }
-    }
-  }
-  if (failure) throw failure;
-  return entries.sort((left, right) => left.name.localeCompare(right.name));
-}
-
-/**
- * Capture the portable plugin-tree inventory used by the installed-cache
- * updater. No absolute path, inode, device, timestamp, or file content leaves
- * this function; only the deterministic inventory digest/count are retained.
- */
-function captureLivePluginInventory(pluginRoot) {
+function assertLivePluginDirectoryBudgets(pluginRoot) {
   const lexicalRoot = path.resolve(pluginRoot);
-  let rootStat;
   let canonicalRoot;
+  let rootStat;
   try {
     rootStat = fs.lstatSync(lexicalRoot, { bigint: true });
     canonicalRoot = fs.realpathSync.native(lexicalRoot);
@@ -2943,11 +2918,7 @@ function captureLivePluginInventory(pluginRoot) {
     throw invalidLiveReceiptError();
   }
 
-  const entries = [];
-  let totalBytes = 0;
   let directoryCount = 0;
-  let pluginVersion = null;
-  let installedEntrypointDigest = null;
   const contained = (candidate) => {
     const relative = path.relative(canonicalRoot, candidate);
     return relative === ""
@@ -2955,96 +2926,86 @@ function captureLivePluginInventory(pluginRoot) {
         && !relative.startsWith(`..${path.sep}`)
         && !path.isAbsolute(relative));
   };
-  const visit = (directory, prefix = "", depth = 0) => {
+  const visit = (directory, depth) => {
     if (depth > MAX_LIVE_PLUGIN_DEPTH
       || directoryCount >= MAX_LIVE_PLUGIN_DIRECTORIES
       || !contained(directory)) {
       throw invalidLiveReceiptError();
     }
     directoryCount += 1;
+
     let directoryBefore;
     let canonicalDirectory;
-    let children;
     try {
       directoryBefore = fs.lstatSync(directory, { bigint: true });
       canonicalDirectory = fs.realpathSync.native(directory);
-      if (!directoryBefore.isDirectory()
-        || directoryBefore.isSymbolicLink()
-        || canonicalDirectory !== directory
-        || !contained(canonicalDirectory)) {
-        throw invalidLiveReceiptError();
-      }
-      children = readBoundedLiveDirectory(directory);
     } catch {
       throw invalidLiveReceiptError();
     }
+    if (!directoryBefore.isDirectory()
+      || directoryBefore.isSymbolicLink()
+      || canonicalDirectory !== directory
+      || !contained(canonicalDirectory)) {
+      throw invalidLiveReceiptError();
+    }
+
+    const children = [];
+    let handle;
+    let failure = null;
+    try {
+      handle = fs.opendirSync(directory);
+      while (true) {
+        const child = handle.readSync();
+        if (child === null) break;
+        if (children.length >= MAX_LIVE_PLUGIN_DIRECTORY_ENTRIES) {
+          throw invalidLiveReceiptError();
+        }
+        children.push(child);
+      }
+    } catch {
+      failure = invalidLiveReceiptError();
+    } finally {
+      if (handle) {
+        try {
+          handle.closeSync();
+        } catch {
+          failure = invalidLiveReceiptError();
+        }
+      }
+    }
+    if (failure) throw failure;
+
     for (const child of children) {
+      if (typeof child.name !== "string"
+        || child.name.length === 0
+        || child.name === "."
+        || child.name === ".."
+        || child.name.includes("/")
+        || child.name.includes("\\")
+        || child.name.includes("\0")) {
+        throw invalidLiveReceiptError();
+      }
       const absolute = path.join(directory, child.name);
-      const relative = prefix ? `${prefix}/${child.name}` : child.name;
-      let pathBefore;
-      let canonical;
+      let childStat;
+      let canonicalChild;
       try {
-        pathBefore = fs.lstatSync(absolute, { bigint: true });
-        canonical = fs.realpathSync.native(absolute);
+        childStat = fs.lstatSync(absolute, { bigint: true });
+        canonicalChild = fs.realpathSync.native(absolute);
       } catch {
         throw invalidLiveReceiptError();
       }
-      if (pathBefore.isSymbolicLink()
-        || canonical !== absolute
-        || !contained(canonical)) {
+      if (childStat.isSymbolicLink()
+        || canonicalChild !== absolute
+        || !contained(canonicalChild)) {
         throw invalidLiveReceiptError();
       }
-      if (pathBefore.isDirectory()) {
-        visit(absolute, relative, depth + 1);
-        continue;
-      }
-      if (!pathBefore.isFile() || entries.length >= MAX_LIVE_PLUGIN_FILES) {
+      if (childStat.isDirectory()) {
+        visit(absolute, depth + 1);
+      } else if (!childStat.isFile()) {
         throw invalidLiveReceiptError();
-      }
-      const noFollow = Number.isInteger(fs.constants.O_NOFOLLOW) ? fs.constants.O_NOFOLLOW : 0;
-      let descriptor;
-      try {
-        descriptor = fs.openSync(absolute, fs.constants.O_RDONLY | noFollow);
-        const before = fs.fstatSync(descriptor, { bigint: true });
-        if (!before.isFile()
-          || before.size < 0n
-          || before.size > BigInt(MAX_LIVE_PLUGIN_FILE_BYTES)
-          || !sameFileSnapshot(pathBefore, before)) {
-          throw invalidLiveReceiptError();
-        }
-        const bytes = fs.readFileSync(descriptor);
-        const after = fs.fstatSync(descriptor, { bigint: true });
-        const pathAfter = fs.lstatSync(absolute, { bigint: true });
-        if (BigInt(bytes.byteLength) !== before.size
-          || !sameFileSnapshot(before, after)
-          || !sameFileSnapshot(pathBefore, pathAfter)
-          || fs.realpathSync.native(absolute) !== absolute) {
-          throw invalidLiveReceiptError();
-        }
-        totalBytes += bytes.byteLength;
-        if (totalBytes > MAX_LIVE_PLUGIN_TOTAL_BYTES) throw invalidLiveReceiptError();
-        const digest = crypto.createHash("sha256").update(bytes).digest("hex");
-        entries.push({
-          path: relative,
-          mode: Number(before.mode & 0o777n),
-          size: bytes.byteLength,
-          sha256: digest
-        });
-        if (relative === ".codex-plugin/plugin.json") {
-          const manifest = JSON.parse(bytes.toString("utf8"));
-          if (typeof manifest?.version !== "string"
-            || !LIVE_RECEIPT_RUNTIME_ID.test(manifest.version)) {
-            throw invalidLiveReceiptError();
-          }
-          pluginVersion = manifest.version;
-        }
-        if (relative === LIVE_RECEIPT_MANIFEST.installedEntrypoint) {
-          installedEntrypointDigest = digest;
-        }
-      } finally {
-        if (descriptor !== undefined) fs.closeSync(descriptor);
       }
     }
+
     let directoryAfter;
     try {
       directoryAfter = fs.lstatSync(directory, { bigint: true });
@@ -3057,21 +3018,127 @@ function captureLivePluginInventory(pluginRoot) {
       throw invalidLiveReceiptError();
     }
   };
-  visit(canonicalRoot);
-  if (!entries.length || pluginVersion === null || installedEntrypointDigest === null) {
+
+  visit(canonicalRoot, 0);
+  let rootAfter;
+  try {
+    rootAfter = fs.lstatSync(lexicalRoot, { bigint: true });
+  } catch {
     throw invalidLiveReceiptError();
   }
-  const rootAfter = fs.lstatSync(lexicalRoot, { bigint: true });
   if (!sameFileSnapshot(rootStat, rootAfter)
     || fs.realpathSync.native(lexicalRoot) !== canonicalRoot) {
     throw invalidLiveReceiptError();
   }
-  return Object.freeze({
-    fileCount: entries.length,
-    digest: sha256Text(JSON.stringify(entries)),
-    pluginVersion,
-    installedEntrypointDigest
-  });
+}
+
+function readStableLiveInventoryFile(pluginRoot, expectedEntry) {
+  const absolute = path.join(pluginRoot, ...expectedEntry.path.split("/"));
+  const noFollow = Number.isInteger(fs.constants.O_NOFOLLOW) ? fs.constants.O_NOFOLLOW : 0;
+  const nonBlock = Number.isInteger(fs.constants.O_NONBLOCK) ? fs.constants.O_NONBLOCK : 0;
+  let descriptor;
+  let bytes;
+  let extra;
+  let failure = null;
+  try {
+    const pathBefore = fs.lstatSync(absolute, { bigint: true });
+    if (!pathBefore.isFile()
+      || pathBefore.isSymbolicLink()
+      || fs.realpathSync.native(absolute) !== absolute
+      || Number(pathBefore.size) !== expectedEntry.size
+      || Number(pathBefore.mode & 0o777n) !== expectedEntry.mode) {
+      throw invalidLiveReceiptError();
+    }
+    descriptor = fs.openSync(absolute, fs.constants.O_RDONLY | noFollow | nonBlock);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    if (!opened.isFile() || !sameFileSnapshot(pathBefore, opened)) {
+      throw invalidLiveReceiptError();
+    }
+    bytes = Buffer.alloc(expectedEntry.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (read === 0) break;
+      offset += read;
+    }
+    extra = Buffer.allocUnsafe(1);
+    const extraBytes = fs.readSync(descriptor, extra, 0, 1, null);
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    const pathAfter = fs.lstatSync(absolute, { bigint: true });
+    if (offset !== expectedEntry.size
+      || extraBytes !== 0
+      || !sameFileSnapshot(opened, after)
+      || !sameFileSnapshot(pathBefore, pathAfter)
+      || fs.realpathSync.native(absolute) !== absolute
+      || crypto.createHash("sha256").update(bytes).digest("hex") !== expectedEntry.sha256) {
+      throw invalidLiveReceiptError();
+    }
+  } catch {
+    failure = invalidLiveReceiptError();
+  } finally {
+    if (extra) extra.fill(0);
+    if (descriptor !== undefined) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        failure = invalidLiveReceiptError();
+      }
+    }
+  }
+  if (failure || !bytes) {
+    if (bytes) bytes.fill(0);
+    throw invalidLiveReceiptError();
+  }
+  return bytes;
+}
+
+/**
+ * Capture the portable plugin-tree inventory used by the installed-cache
+ * updater. No absolute path, inode, device, timestamp, or file content leaves
+ * this function; only the deterministic inventory digest/count are retained.
+ */
+function captureLivePluginInventory(pluginRoot) {
+  const lexicalRoot = path.resolve(pluginRoot);
+  let entries;
+  let pluginVersion;
+  try {
+    // Retain the live receipt's historical per-directory and directory-count
+    // ceilings around the shared helper's stricter portable file/path/byte
+    // limits. Running the structural guard on both sides closes the gap where
+    // a tree could grow after the first budget check.
+    assertLivePluginDirectoryBudgets(lexicalRoot);
+    entries = createPluginInventory(lexicalRoot, LIVE_PLUGIN_INVENTORY_LIMITS);
+    assertLivePluginDirectoryBudgets(lexicalRoot);
+
+    const manifestEntry = entries.find(
+      (entry) => entry.path === ".codex-plugin/plugin.json"
+    );
+    const installedEntrypoint = entries.find(
+      (entry) => entry.path === LIVE_RECEIPT_MANIFEST.installedEntrypoint
+    );
+    if (!entries.length || !manifestEntry || !installedEntrypoint) {
+      throw invalidLiveReceiptError();
+    }
+    const manifestBytes = readStableLiveInventoryFile(lexicalRoot, manifestEntry);
+    try {
+      const manifest = JSON.parse(manifestBytes.toString("utf8"));
+      if (typeof manifest?.version !== "string"
+        || !LIVE_RECEIPT_RUNTIME_ID.test(manifest.version)) {
+        throw invalidLiveReceiptError();
+      }
+      pluginVersion = manifest.version;
+    } finally {
+      manifestBytes.fill(0);
+    }
+    return Object.freeze({
+      fileCount: entries.length,
+      digest: digestInventory(entries),
+      pluginVersion,
+      installedEntrypointDigest: installedEntrypoint.sha256
+    });
+  } catch {
+    throw invalidLiveReceiptError();
+  }
 }
 
 export function computePhaseScopeDigest(phase, root = REPO_ROOT) {
