@@ -1785,6 +1785,17 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
   if (profile.transport === "headless") return runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker, resumeSessionId, cancelRequested, onEvent, ...(timeoutMs == null ? {} : { timeoutMs }) });
   const environment = /^rescue-(read|write|report)-v3$/.test(profile.id || "") ? taskEnvironment(stateDir, root, profile, providerHomeId || jobMarker) : null;
   const effectiveProfile = environment?.sandboxProfile ? { ...profile, sandbox: environment.sandboxProfile } : profile;
+  const boundProviderLaunch = providerLaunch
+    && typeof providerLaunch.prepare === "function"
+    && typeof providerLaunch.noChild === "function" ? {
+    prepare: () => providerLaunch.prepare(Object.freeze({
+      promptDigest: crypto.createHash("sha256").update(String(prompt || "")).digest("hex"),
+      profileId: effectiveProfile.id,
+      profileContractVersion: effectiveProfile.contractVersion,
+      agentProfileDigest: effectiveProfile.agentProfileDigest
+    })),
+    noChild: (details) => providerLaunch.noChild(details)
+  } : providerLaunch;
   try {
     if (environment) inspectIsolation(discoverGrok(), root, environment);
   } catch (error) {
@@ -1809,7 +1820,7 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
       cancelRequested,
       onEvent,
       guardBinding,
-      providerLaunch,
+      providerLaunch: boundProviderLaunch,
       testHooks
     });
   } catch (error) {

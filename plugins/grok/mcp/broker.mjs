@@ -234,6 +234,16 @@ function schemaAccepts(value, schema) {
   }
   if (schema.type === "string") {
     if (typeof value !== "string") return false;
+    for (let index = 0; index < value.length; index += 1) {
+      const code = value.charCodeAt(index);
+      if (code >= 0xD800 && code <= 0xDBFF) {
+        const next = value.charCodeAt(index + 1);
+        if (!(next >= 0xDC00 && next <= 0xDFFF)) return false;
+        index += 1;
+      } else if (code >= 0xDC00 && code <= 0xDFFF) {
+        return false;
+      }
+    }
     // JSON Schema measures string length in Unicode code points, not UTF-16
     // code units. Keep runtime admission identical to the advertised schema
     // for astral characters as well as ASCII.

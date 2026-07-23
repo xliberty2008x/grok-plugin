@@ -4,6 +4,14 @@ import path from "node:path";
 import { CompanionError } from "./errors.mjs";
 import { git } from "./workspace.mjs";
 import { redact, redactText, sanitizeDisplayText } from "./redact.mjs";
+import {
+  MAX_CONTEXT_CONSTRAINTS,
+  MAX_CONTEXT_CONSTRAINT_CHARS,
+  MAX_CONTEXT_FACTS,
+  MAX_CONTEXT_FACT_CHARS,
+  composeEffectiveProviderPrompt,
+  validateExplicitContextItems
+} from "./worker-context.mjs";
 
 const timestamp = () => new Date().toISOString();
 
@@ -213,6 +221,8 @@ export function buildTaskEnvelope({
   contextManifestId = null
 } = {}) {
   const request = boundedLiteral(userRequest, "userRequest");
+  const resolvedObjective = clip(String(objective ?? request).trim() || request);
+  const defaultObjective = objective == null ? resolvedObjective : null;
   const resolvedMode = mode === "write" ? "write" : "read";
   const criteria = normalizeAcceptance(
     acceptanceCriteria?.length
@@ -224,18 +234,48 @@ export function buildTaskEnvelope({
     if (acceptanceIds.has(criterion.id)) throw new CompanionError("E_USAGE", `Duplicate acceptance criterion ID ${criterion.id}.`);
     acceptanceIds.add(criterion.id);
   }
+  const explicitFacts = validateExplicitContextItems(
+    context?.facts ?? contextFacts,
+    {
+      name: "context.facts",
+      maxItems: MAX_CONTEXT_FACTS,
+      maxChars: MAX_CONTEXT_FACT_CHARS
+    }
+  );
+  const explicitConstraints = validateExplicitContextItems(
+    context?.constraints ?? constraints,
+    {
+      name: "context.constraints",
+      maxItems: MAX_CONTEXT_CONSTRAINTS,
+      maxChars: MAX_CONTEXT_CONSTRAINT_CHARS
+    }
+  );
+  for (const [name, items] of [
+    ["context.facts", explicitFacts],
+    ["context.constraints", explicitConstraints]
+  ]) {
+    const duplicate = items.findIndex((item) => (
+      item === request || (defaultObjective !== null && item === defaultObjective)
+    ));
+    if (duplicate >= 0) {
+      throw new CompanionError(
+        "E_POLICY",
+        `${name}[${duplicate}] duplicates the literal user request/default objective.`
+      );
+    }
+  }
   const envelope = {
     schemaVersion: TASK_ENVELOPE_VERSION,
     userRequest: request,
-    objective: clip(String(objective ?? request).trim() || request),
+    objective: resolvedObjective,
     mode: resolvedMode,
     scope: {
       include: asStringList(scope?.include),
       exclude: asStringList(scope?.exclude)
     },
     context: {
-      facts: asStringList(context?.facts ?? contextFacts),
-      constraints: asStringList(context?.constraints ?? constraints),
+      facts: explicitFacts,
+      constraints: explicitConstraints,
       expectedProjectMarkers: asStringList(context?.expectedProjectMarkers, { max: 32 }),
       requiredPaths: asRepositoryPathList(context?.requiredPaths, "context.requiredPaths"),
       workspaceState: ["complete", "task_scoped", "unknown"].includes(context?.workspaceState)
@@ -1326,7 +1366,28 @@ function observeIgnoredDrift(preGit, postGit, changed, { observer }) {
 /**
  * Compose the provider prompt from a TaskEnvelope without putting envelope JSON on argv.
  */
-export function composeProviderPrompt(envelope, { root, constraints = null, contextManifest = null } = {}) {
+export function composeProviderPrompt(envelope, {
+  root,
+  constraints = null,
+  contextManifest = null,
+  contextPacket = null,
+  runtimeRolePolicy = null
+} = {}) {
+  if (contextPacket !== null || runtimeRolePolicy !== null) {
+    if (constraints !== null || contextPacket === null || runtimeRolePolicy === null) {
+      throw new CompanionError(
+        "E_STATE",
+        "Receipt-backed provider prompt requires one packet/policy pair and no prompt override."
+      );
+    }
+    return composeEffectiveProviderPrompt({
+      envelope,
+      contextPacket,
+      rolePolicy: runtimeRolePolicy,
+      contextManifest,
+      root
+    });
+  }
   const context = envelope.context || { facts: [], constraints: [], expectedProjectMarkers: [], requiredPaths: [], workspaceState: "unknown", upstreamFreshness: "not_checked" };
   const facts = Array.isArray(context.facts) ? context.facts : [];
   const hostConstraints = Array.isArray(context.constraints) ? context.constraints : [];

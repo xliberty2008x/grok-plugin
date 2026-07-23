@@ -6,8 +6,20 @@ import {
   LIFECYCLE_EVENT_TYPES,
   MAX_LIFECYCLE_EVENTS,
   appendLifecycleEvent,
+  buildTaskEnvelope,
   normalizeLifecycleEventSequences
 } from "../plugins/grok/scripts/lib/task-contract.mjs";
+import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
+import {
+  CONTEXT_BINDING_MODE,
+  assertContextReceiptShape,
+  buildContextPacket,
+  buildContextReceipt
+} from "../plugins/grok/scripts/lib/worker-context.mjs";
+import {
+  buildRuntimeRolePolicy,
+  materializeRole
+} from "../plugins/grok/scripts/lib/worker-roles.mjs";
 import {
   WORKER_EVENT_CURSOR_SCHEMA_VERSION,
   WORKER_EVENT_SCHEMA_VERSION,
@@ -138,6 +150,46 @@ function job(overrides = {}) {
     error: null,
     ...overrides
   };
+}
+
+function receiptBackedSnapshot() {
+  const id = "task-1111111111111111";
+  const manifest = {
+    schemaVersion: 1,
+    manifestId: `ctx-${"b".repeat(24)}`,
+    digest: "c".repeat(64)
+  };
+  const envelope = buildTaskEnvelope({
+    userRequest: "Inspect the public receipt identity binding",
+    contextManifestId: manifest.manifestId
+  });
+  const role = materializeRole("explorer");
+  const profile = profileFor("task", false);
+  const contextPacket = buildContextPacket({ envelope });
+  const runtimeRolePolicy = buildRuntimeRolePolicy({ role, profile });
+  const providerPromptDigest = "d".repeat(64);
+  const contextReceipt = buildContextReceipt({
+    contextPacket,
+    rolePolicy: runtimeRolePolicy,
+    contextManifest: manifest,
+    lineageWorkerId: id,
+    effectivePromptDigest: providerPromptDigest
+  });
+  return projectWorkerSnapshot(job({
+    id,
+    role,
+    profile,
+    request: {
+      envelope,
+      contextManifest: manifest,
+      contextBindingMode: CONTEXT_BINDING_MODE,
+      contextPacket,
+      runtimeRolePolicy,
+      contextReceipt,
+      providerPromptDigest,
+      providerHomeId: id
+    }
+  }));
 }
 
 test("lifecycle append assigns durable monotonic sequences and normalizes legacy events", () => {
@@ -387,6 +439,74 @@ test("purported public snapshots are re-projected instead of trusted by version 
   assert.equal(normalized.context.upstreamFreshness, "not_checked");
   assert.equal(normalized.context.materialization.upstreamFreshness, "not_checked");
   assertConforms("WorkerSnapshot", normalized);
+});
+
+test("untrusted context receipts must cross-bind every public worker identity", () => {
+  const base = receiptBackedSnapshot();
+  assert.equal(base.contextBindingMode, CONTEXT_BINDING_MODE);
+  assert.equal(assertContextReceiptShape(base.contextReceipt), base.contextReceipt);
+  assert.doesNotThrow(() => normalizeWorkerSnapshot(base));
+
+  const mismatches = [
+    ["write capability", (snapshot) => {
+      snapshot.write = true;
+    }],
+    ["worker lineage", (snapshot) => {
+      snapshot.id = "task-2222222222222222";
+    }],
+    ["logical role", (snapshot) => {
+      snapshot.roleId = "reviewer";
+    }],
+    ["profile id", (snapshot) => {
+      snapshot.securityProfile.id = "rescue-other-v3";
+    }],
+    ["profile version", (snapshot) => {
+      snapshot.securityProfile.contractVersion += 1;
+    }],
+    ["agent bytes", (snapshot) => {
+      snapshot.securityProfile.agentProfileDigest = "e".repeat(64);
+    }],
+    ["envelope id", (snapshot) => {
+      snapshot.taskContract.envelopeId = `env-${"f".repeat(24)}`;
+    }],
+    ["envelope digest", (snapshot) => {
+      snapshot.taskContract.digest = "f".repeat(64);
+    }],
+    ["manifest id", (snapshot) => {
+      snapshot.context.manifestId = `ctx-${"f".repeat(24)}`;
+    }],
+    ["manifest digest", (snapshot) => {
+      snapshot.context.digest = "f".repeat(64);
+    }],
+    ["task-contract manifest", (snapshot) => {
+      snapshot.taskContract.contextManifestId = `ctx-${"f".repeat(24)}`;
+    }]
+  ];
+  for (const [label, mutate] of mismatches) {
+    const contradictory = structuredClone(base);
+    mutate(contradictory);
+    assert.equal(assertContextReceiptShape(contradictory.contextReceipt), contradictory.contextReceipt);
+    assert.throws(
+      () => normalizeWorkerSnapshot(contradictory),
+      (error) => error?.code === "E_SCHEMA",
+      label
+    );
+  }
+
+  for (const [label, mutate] of [
+    ["missing receipt", (snapshot) => { delete snapshot.contextReceipt; }],
+    ["missing discriminator", (snapshot) => { delete snapshot.contextBindingMode; }],
+    ["downgraded discriminator", (snapshot) => { snapshot.contextBindingMode = null; }],
+    ["unknown discriminator", (snapshot) => { snapshot.contextBindingMode = "legacy"; }]
+  ]) {
+    const downgraded = structuredClone(base);
+    mutate(downgraded);
+    assert.throws(
+      () => normalizeWorkerSnapshot(downgraded),
+      (error) => error?.code === "E_SCHEMA",
+      label
+    );
+  }
 });
 
 test("untrusted cursor projection suppresses host verification authority", () => {

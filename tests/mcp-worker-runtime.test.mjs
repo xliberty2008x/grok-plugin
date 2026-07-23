@@ -178,6 +178,30 @@ function emergencyStop(job) {
   }
 }
 
+function deleteAllContextBindingFields(job) {
+  const tampered = structuredClone(job);
+  for (const field of [
+    "contextBindingMode",
+    "contextPacket",
+    "runtimeRolePolicy",
+    "contextReceipt"
+  ]) {
+    delete tampered.request[field];
+  }
+  return tampered;
+}
+
+function assertProviderPreparationCountZero(job, fake) {
+  assert.equal(job.request?.spawn?.providerSpawnIntent, undefined);
+  assert.equal(job.providerProcess == null, true);
+  const providerLog = readFakeLog(fake.logFile);
+  assert.equal(
+    providerLog.filter((entry) => entry.event === "argv" && entry.args?.[0] === "agent").length,
+    0
+  );
+  assert.equal(providerLog.filter((entry) => entry.event === "prompt").length, 0);
+}
+
 function installProviderStartedFixture({
   root,
   workerId,
@@ -591,22 +615,25 @@ test("MCP spawn runs one fake provider, replays idempotently, waits, returns a p
   const { root, fake, pluginData, env } = fixture();
   const options = { env };
   let workerId = null;
+  const privateCanary = "PRIVATE_RUNTIME_REQUEST_CANARY_592e";
   t.after(() => workerId && emergencyStop(tryReadJob(root, workerId, env)));
 
   const first = await callTool(root, "worker_spawn", {
     idempotencyKey: "mcp-runtime-happy-0001",
-    userRequest: "Inspect the fixture and report success"
+    userRequest: `Inspect the fixture and report success. ${privateCanary}`
   }, options);
   workerId = first.worker.id;
   assert.equal(first.providerLaunchState, "pending");
   assert.equal(first.providerLaunched, false);
+  assert.equal(Object.hasOwn(first.worker, "contextReceipt"), false);
 
   const replay = await callTool(root, "worker_spawn", {
     idempotencyKey: "mcp-runtime-happy-0001",
-    userRequest: "Inspect the fixture and report success"
+    userRequest: `Inspect the fixture and report success. ${privateCanary}`
   }, options);
   assert.equal(replay.replayed, true);
   assert.equal(replay.worker.id, workerId);
+  assert.equal(Object.hasOwn(replay.worker, "contextReceipt"), false);
   assert.ok(["pending", "started"].includes(replay.providerLaunchState));
 
   await waitForTerminal(root, workerId, options);
@@ -615,13 +642,17 @@ test("MCP spawn runs one fake provider, replays idempotently, waits, returns a p
   assert.equal(result.worker.terminal, true);
   assert.equal(result.worker.result.workerReport.outcome, "complete");
   assert.equal(result.worker.result.hostVerification, "not_run");
+  assert.ok(result.worker.contextReceipt);
+  assert.deepEqual(result.worker.taskContract.context.facts, []);
+  assert.deepEqual(result.worker.taskContract.context.constraints, []);
 
   const terminalReplay = await callTool(root, "worker_spawn", {
     idempotencyKey: "mcp-runtime-happy-0001",
-    userRequest: "Inspect the fixture and report success"
+    userRequest: `Inspect the fixture and report success. ${privateCanary}`
   }, options);
   assert.equal(terminalReplay.replayed, true);
   assert.equal(terminalReplay.worker.id, workerId);
+  assert.equal(Object.hasOwn(terminalReplay.worker, "contextReceipt"), false);
 
   const prompts = readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt");
   assert.equal(prompts.length, 1);
@@ -645,10 +676,126 @@ test("MCP spawn runs one fake provider, replays idempotently, waits, returns a p
   assert.equal(providerLaunchState(privateJob), "started");
 
   const serialized = JSON.stringify([first, replay, result, terminalReplay]);
-  for (const secret of [root, pluginData, fake.authPath, privateJob.workerProcess.nonce]) {
+  for (const secret of [
+    root,
+    pluginData,
+    fake.authPath,
+    privateJob.workerProcess.nonce,
+    privateCanary
+  ]) {
     assert.equal(serialized.includes(secret), false, `public MCP payload leaked ${secret}`);
   }
   await assertAllProcessesGone(privateJob);
+});
+
+test("deleting every context-binding field before worker execution cannot downgrade to legacy or prepare a provider", { skip: process.platform === "win32" }, async (t) => {
+  const { root, fake, env } = fixture();
+  const shimRoot = tempDir("grok-mcp-context-preexecute-");
+  const shim = path.join(shimRoot, "delayed-exec.sh");
+  const release = path.join(shimRoot, "release");
+  fs.writeFileSync(
+    shim,
+    `#!/bin/sh\nwhile [ ! -f ${JSON.stringify(release)} ]; do sleep 0.05; done\nexec ${JSON.stringify(process.execPath)} \"$@\"\n`,
+    { mode: 0o755 }
+  );
+  const options = {
+    env,
+    serviceOptions: {
+      launchWorker: (args) => launchCommittedWorker({ ...args, executable: shim })
+    }
+  };
+  let workerId = null;
+  t.after(() => workerId && emergencyStop(tryReadJob(root, workerId, env)));
+
+  const spawned = await callTool(root, "worker_spawn", {
+    idempotencyKey: "mcp-runtime-context-preexecute-tamper-0001",
+    userRequest: "Never prepare a provider after pre-execute context tamper"
+  }, options);
+  workerId = spawned.worker.id;
+  const admitted = tryReadJob(root, workerId, env);
+  assert.equal(admitted.request.contextBindingMode, "context-receipt-v1");
+  assert.ok(admitted.request.spawn.contextBindingDigest);
+  assert.equal(admitted.request.spawn.providerSpawnIntent, undefined);
+
+  updateJob(root, workerId, (job) => deleteAllContextBindingFields(job), env);
+  const tampered = tryReadJob(root, workerId, env);
+  assert.ok(tampered.request.spawn.contextBindingDigest);
+  for (const field of [
+    "contextBindingMode",
+    "contextPacket",
+    "runtimeRolePolicy",
+    "contextReceipt"
+  ]) {
+    assert.equal(Object.hasOwn(tampered.request, field), false);
+  }
+
+  fs.writeFileSync(release, "continue\n", "utf8");
+  await waitFor(
+    () => {
+      const latest = tryReadJob(root, workerId, env);
+      return latest?.controllerProcess && processGroupGone(latest.controllerProcess);
+    },
+    { timeoutMs: 10_000, intervalMs: 50 }
+  );
+  const settled = tryReadJob(root, workerId, env);
+  assert.equal(settled.workerProcess, undefined);
+  assertProviderPreparationCountZero(settled, fake);
+});
+
+test("deleting every context-binding field after launch authorization consumption cannot prepare a provider", { skip: process.platform === "win32" }, async (t) => {
+  const { root, fake, env } = fixture({ inspectDelayMs: 1_500 });
+  const options = { env };
+  let workerId = null;
+  t.after(() => workerId && emergencyStop(tryReadJob(root, workerId, env)));
+
+  const spawned = await callTool(root, "worker_spawn", {
+    idempotencyKey: "mcp-runtime-context-post-auth-tamper-0001",
+    userRequest: "Never prepare a provider after post-authorization context tamper"
+  }, options);
+  workerId = spawned.worker.id;
+  await waitFor(
+    () => {
+      const latest = tryReadJob(root, workerId, env);
+      const inspectStarted = readFakeLog(fake.logFile)
+        .some((entry) => entry.event === "inspect-environment");
+      return inspectStarted
+        && /^[0-9a-f]{64}$/.test(latest?.request?.spawn?.consumedLaunchContractDigest || "")
+        && Boolean(latest?.request?.spawn?.launchContractConsumedAt)
+        && latest?.workerAuthorization === null;
+    },
+    { timeoutMs: 10_000, intervalMs: 25 }
+  );
+  const consumed = tryReadJob(root, workerId, env);
+  assert.equal(consumed.request.spawn.providerSpawnIntent, undefined);
+  assert.equal(consumed.request.contextBindingMode, "context-receipt-v1");
+
+  updateJob(root, workerId, (job) => deleteAllContextBindingFields(job), env);
+  const tampered = tryReadJob(root, workerId, env);
+  assert.ok(tampered.request.spawn.contextBindingDigest);
+  for (const field of [
+    "contextBindingMode",
+    "contextPacket",
+    "runtimeRolePolicy",
+    "contextReceipt"
+  ]) {
+    assert.equal(Object.hasOwn(tampered.request, field), false);
+  }
+
+  await waitFor(
+    () => {
+      const latest = tryReadJob(root, workerId, env);
+      return latest?.workerProcess
+        && processGroupGone(latest.workerProcess)
+        && latest?.controllerProcess
+        && processGroupGone(latest.controllerProcess);
+    },
+    { timeoutMs: 15_000, intervalMs: 50 }
+  );
+  const settled = tryReadJob(root, workerId, env);
+  assert.equal(settled.request.spawn.dispatch.state, "worker-started");
+  assert.ok(["E_STATE", "E_AUTH_REQUIRED"].includes(settled.error?.code));
+  assertProviderPreparationCountZero(settled, fake);
+  await assertAllProcessesGone(settled);
 });
 
 test("MCP cancellation in the commit-to-launch window starts no worker or provider", { skip: process.platform === "win32" }, async (t) => {

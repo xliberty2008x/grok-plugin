@@ -397,6 +397,9 @@ async function main() {
   if (args[0] === "inspect" && args[1] === "--json") {
     const authFile = process.env.GROK_HOME ? path.join(process.env.GROK_HOME, "auth.json") : null;
     appendLog(effective, { event: "inspect-environment", home: process.env.HOME, grokHome: process.env.GROK_HOME, config: process.env.GROK_HOME && fs.existsSync(path.join(process.env.GROK_HOME, "config.toml")) ? fs.readFileSync(path.join(process.env.GROK_HOME, "config.toml"), "utf8") : null, authExists: Boolean(authFile && fs.existsSync(authFile)), authMode: authFile && fs.existsSync(authFile) ? fs.statSync(authFile).mode & 0o777 : null });
+    if (Number.isSafeInteger(effective.inspectDelayMs) && effective.inspectDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, effective.inspectDelayMs));
+    }
     let inspectValue = effective.inspectValue;
     if (!inspectValue && effective.inspectBundledSkill && process.env.GROK_HOME) {
       const skills = [

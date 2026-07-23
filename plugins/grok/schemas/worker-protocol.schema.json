@@ -535,6 +535,177 @@
         "contextManifestId": { "type": ["string", "null"], "maxLength": 256 }
       }
     },
+    "contextReceiptProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "precedence", "envelopeId", "envelopeDigest"],
+      "properties": {
+        "source": { "type": "string", "enum": ["none", "explicit-envelope"] },
+        "precedence": {
+          "type": "array",
+          "maxItems": 2,
+          "items": {
+            "type": "string",
+            "enum": ["explicit-facts", "explicit-constraints"]
+          }
+        },
+        "envelopeId": {
+          "type": ["string", "null"],
+          "pattern": "^env-[a-f0-9]{24}$"
+        },
+        "envelopeDigest": {
+          "type": ["string", "null"],
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "contextReceiptBounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxFacts", "maxFactChars", "maxConstraints", "maxConstraintChars",
+        "effectiveMaxFacts", "effectiveMaxConstraints"
+      ],
+      "properties": {
+        "maxFacts": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "maxFactChars": { "type": "integer", "minimum": 0, "maximum": 2000 },
+        "maxConstraints": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "maxConstraintChars": { "type": "integer", "minimum": 0, "maximum": 2000 },
+        "effectiveMaxFacts": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "effectiveMaxConstraints": { "type": "integer", "minimum": 0, "maximum": 64 }
+      }
+    },
+    "ContextReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion", "packetId", "packetDigest", "mode", "provenance",
+        "factCount", "factsDigest", "constraintCount", "constraintsDigest",
+        "omissions", "bounds", "truncated", "hiddenRecordsExported",
+        "rolePolicyDigest", "logicalRoleId", "roleDigest", "providerProfileId",
+        "providerProfileVersion", "agentProfileDigest",
+        "allowedProviderToolIdsDigest", "deniedProviderToolIdsDigest",
+        "lineageWorkerId", "contextManifestId", "contextManifestDigest",
+        "effectivePromptDigest", "receiptDigest"
+      ],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "packetId": { "type": "string", "pattern": "^ctxpkt-[a-f0-9]{24}$" },
+        "packetDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "mode": { "type": "string", "enum": ["none", "explicit-envelope"] },
+        "provenance": { "$ref": "#/$defs/contextReceiptProvenance" },
+        "factCount": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "factsDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "constraintCount": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "constraintsDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "omissions": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "all-context-omitted", "hidden-system-instructions",
+              "developer-instructions", "raw-transcripts", "credentials",
+              "provider-session-ids", "user-request-body",
+              "default-objective-duplication", "secret-bearing-material",
+              "tool-records"
+            ]
+          }
+        },
+        "bounds": { "$ref": "#/$defs/contextReceiptBounds" },
+        "truncated": { "type": "boolean", "const": false },
+        "hiddenRecordsExported": { "type": "boolean", "const": false },
+        "rolePolicyDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "logicalRoleId": {
+          "type": "string",
+          "enum": ["explorer", "implementer", "reviewer", "security", "test"]
+        },
+        "roleDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "providerProfileId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+        "providerProfileVersion": { "type": "integer", "minimum": 1 },
+        "agentProfileDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "allowedProviderToolIdsDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "deniedProviderToolIdsDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "lineageWorkerId": { "$ref": "#/$defs/workerId" },
+        "contextManifestId": { "type": "string", "pattern": "^ctx-[a-f0-9]{24}$" },
+        "contextManifestDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "effectivePromptDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "receiptDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "none" } } },
+          "then": {
+            "properties": {
+              "provenance": {
+                "properties": {
+                  "source": { "const": "none" },
+                  "precedence": { "const": [] },
+                  "envelopeId": { "const": null },
+                  "envelopeDigest": { "const": null }
+                }
+              },
+              "factCount": { "const": 0 },
+              "factsDigest": {
+                "const": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+              },
+              "constraintCount": { "const": 0 },
+              "constraintsDigest": {
+                "const": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+              },
+              "omissions": { "const": ["all-context-omitted"] },
+              "bounds": {
+                "properties": {
+                  "maxFacts": { "const": 0 },
+                  "maxFactChars": { "const": 0 },
+                  "maxConstraints": { "const": 0 },
+                  "maxConstraintChars": { "const": 0 },
+                  "effectiveMaxFacts": { "const": 0 },
+                  "effectiveMaxConstraints": { "const": 0 }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "provenance": {
+                "properties": {
+                  "source": { "const": "explicit-envelope" },
+                  "precedence": {
+                    "const": ["explicit-facts", "explicit-constraints"]
+                  }
+                }
+              },
+              "omissions": {
+                "not": { "contains": { "const": "all-context-omitted" } },
+                "allOf": [
+                  { "contains": { "const": "hidden-system-instructions" } },
+                  { "contains": { "const": "developer-instructions" } },
+                  { "contains": { "const": "raw-transcripts" } },
+                  { "contains": { "const": "credentials" } },
+                  { "contains": { "const": "provider-session-ids" } },
+                  { "contains": { "const": "user-request-body" } },
+                  { "contains": { "const": "default-objective-duplication" } },
+                  { "contains": { "const": "secret-bearing-material" } },
+                  { "contains": { "const": "tool-records" } }
+                ]
+              },
+              "bounds": {
+                "properties": {
+                  "maxFacts": { "minimum": 1 },
+                  "maxFactChars": { "minimum": 1 },
+                  "maxConstraints": { "minimum": 1 },
+                  "maxConstraintChars": { "minimum": 1 },
+                  "effectiveMaxFacts": { "minimum": 1 },
+                  "effectiveMaxConstraints": { "minimum": 1 }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
     "materialization": {
       "type": "object",
       "additionalProperties": false,
@@ -588,6 +759,8 @@
         "snapshotSchemaVersion",
         "id",
         "status",
+        "contextBindingMode",
+        "contextReceipt",
         "terminal"
       ],
       "properties": {
@@ -631,6 +804,16 @@
           "items": { "$ref": "#/$defs/WorkerEvent" }
         },
         "taskContract": { "anyOf": [{ "$ref": "#/$defs/taskContract" }, { "type": "null" }] },
+        "contextBindingMode": {
+          "type": ["string", "null"],
+          "enum": ["context-receipt-v1", null]
+        },
+        "contextReceipt": {
+          "anyOf": [
+            { "$ref": "#/$defs/ContextReceipt" },
+            { "type": "null" }
+          ]
+        },
         "context": { "anyOf": [{ "$ref": "#/$defs/contextManifest" }, { "type": "null" }] },
         "resumeJobId": { "type": ["string", "null"], "maxLength": 256 },
         "result": {
@@ -651,7 +834,27 @@
         "roleId": { "type": ["string", "null"], "maxLength": 256 },
         "externalWorkerLabel": { "type": ["string", "null"], "maxLength": 64 },
         "awaitingHostAction": { "type": "null" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "contextBindingMode": { "const": "context-receipt-v1" }
+            },
+            "required": ["contextBindingMode"]
+          },
+          "then": {
+            "properties": {
+              "contextReceipt": { "$ref": "#/$defs/ContextReceipt" }
+            }
+          },
+          "else": {
+            "properties": {
+              "contextReceipt": { "type": "null" }
+            }
+          }
+        }
+      ]
     },
     "CancellationReceipt": {
       "type": "object",

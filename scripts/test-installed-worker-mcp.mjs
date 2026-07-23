@@ -245,6 +245,13 @@ function sameJson(left, right) {
   return JSON.stringify(canonicalJson(left)) === JSON.stringify(canonicalJson(right));
 }
 
+function canonicalDigest(value) {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(canonicalJson(value)))
+    .digest("hex");
+}
+
 function isPlainRecord(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
@@ -1560,6 +1567,49 @@ function hostTaskBindingFor(job) {
 }
 
 function immutablePrivateBinding(job) {
+  const request = job?.request;
+  const packet = request?.contextPacket;
+  const policy = request?.runtimeRolePolicy;
+  const receipt = request?.contextReceipt;
+  if (
+    request?.contextBindingMode !== "context-receipt-v1"
+    || request?.providerHomeId !== job?.id
+    || !isPlainRecord(packet)
+    || !isPlainRecord(policy)
+    || !isPlainRecord(receipt)
+    || packet.packetId !== receipt.packetId
+    || packet.digest !== receipt.packetDigest
+    || packet.truncated !== false
+    || packet.hiddenRecordsExported !== false
+    || !Array.isArray(packet.facts)
+    || !Array.isArray(packet.constraints)
+    || receipt.factCount !== packet.facts.length
+    || receipt.factsDigest !== canonicalDigest(packet.facts)
+    || receipt.constraintCount !== packet.constraints.length
+    || receipt.constraintsDigest !== canonicalDigest(packet.constraints)
+    || receipt.rolePolicyDigest !== policy.digest
+    || receipt.logicalRoleId !== policy.logicalRoleId
+    || receipt.roleDigest !== policy.roleDigest
+    || receipt.providerProfileId !== policy.providerProfileId
+    || receipt.providerProfileVersion !== policy.providerProfileVersion
+    || receipt.agentProfileDigest !== policy.agentProfileDigest
+    || receipt.allowedProviderToolIdsDigest
+      !== canonicalDigest(policy.allowedProviderToolIds)
+    || receipt.deniedProviderToolIdsDigest
+      !== canonicalDigest(policy.deniedProviderToolIds)
+    || receipt.lineageWorkerId !== job.id
+    || receipt.contextManifestId !== request.contextManifest?.manifestId
+    || receipt.contextManifestDigest !== request.contextManifest?.digest
+    || receipt.effectivePromptDigest !== request.providerPromptDigest
+    || receipt.provenance?.envelopeId !== request.envelope?.envelopeId
+    || receipt.provenance?.envelopeDigest !== request.envelope?.digest
+    || policy.logicalRoleId !== job.role?.id
+    || policy.providerProfileId !== job.profile?.id
+    || policy.providerProfileVersion !== job.profile?.contractVersion
+    || policy.agentProfileDigest !== job.profile?.agentProfileDigest
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
   return {
     workerId: job?.id,
     createdAt: job?.createdAt,
@@ -1575,7 +1625,7 @@ function immutablePrivateBinding(job) {
     contextManifestId: job?.request?.contextManifest?.manifestId,
     contextDigest: job?.request?.contextManifest?.digest,
     workspaceSnapshotDigest: job?.request?.contextManifest?.digest,
-    lineageWorkerId: job?.request?.providerHomeId || job?.id,
+    lineageWorkerId: job?.request?.providerHomeId,
     controlWorkspaceId: job?.controlWorkspaceId,
     hostTaskBinding: hostTaskBindingFor(job),
     ownerThreadId: job?.request?.spawn?.ownerThreadId,
@@ -1858,6 +1908,8 @@ const SNAPSHOT_KEYS = new Set([
   "latestPlan",
   "lifecycleEvents",
   "taskContract",
+  "contextBindingMode",
+  "contextReceipt",
   "context",
   "resumeJobId",
   "result",
@@ -2031,11 +2083,40 @@ function validateTaskContractProjection(worker, job) {
     || !hasExactKeys(contract.context, TASK_CONTEXT_KEYS)
     || !validStringList(contract.context.facts, { maximumItems: 64 })
     || !validStringList(contract.context.constraints, { maximumItems: 64 })
+    || contract.context.facts.length !== 0
+    || contract.context.constraints.length !== 0
     || !validStringList(contract.context.expectedProjectMarkers, { maximumItems: 32 })
     || !validStringList(contract.context.requiredPaths, { maximumItems: 64 })
     || !new Set(["complete", "task_scoped", "unknown"])
       .has(contract.context.workspaceState)
     || contract.context.upstreamFreshness !== "not_checked"
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+}
+
+function validateContextReceiptProjection(worker, job) {
+  const receipt = worker.contextReceipt;
+  const privateReceipt = job.request?.contextReceipt;
+  const packet = job.request?.contextPacket;
+  if (
+    !isPlainRecord(receipt)
+    || !sameJson(receipt, privateReceipt)
+    || receipt.packetId !== packet?.packetId
+    || receipt.packetDigest !== packet?.digest
+    || receipt.lineageWorkerId !== job.id
+    || receipt.contextManifestId !== job.request?.contextManifest?.manifestId
+    || receipt.contextManifestDigest !== job.request?.contextManifest?.digest
+    || receipt.effectivePromptDigest !== job.request?.providerPromptDigest
+    || receipt.rolePolicyDigest !== job.request?.runtimeRolePolicy?.digest
+    || receipt.truncated !== false
+    || receipt.hiddenRecordsExported !== false
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  const serialized = JSON.stringify(receipt);
+  if (
+    /"(?:facts|constraints|userRequest|objective|prompt|providerSessionId)"\s*:/.test(serialized)
   ) {
     fail("E_PRIVATE_STATE");
   }
@@ -2141,6 +2222,8 @@ function validateIntermediateWorkerSnapshot(worker, tracker, job) {
     worker.eventCursor
   );
   validateTaskContractProjection(worker, job);
+  if (worker.contextBindingMode !== "context-receipt-v1") fail("E_PRIVATE_STATE");
+  validateContextReceiptProjection(worker, job);
   validateContextProjection(worker, job);
 }
 
@@ -2367,6 +2450,8 @@ function validateTerminalWorkerSnapshot(worker, tracker, job, expectedStatus) {
     worker.eventCursor
   );
   validateTaskContractProjection(worker, job);
+  if (worker.contextBindingMode !== "context-receipt-v1") fail("E_PRIVATE_STATE");
+  validateContextReceiptProjection(worker, job);
   validateContextProjection(worker, job);
   validatePublicResultProjection(worker.result, tracker, job, expectedStatus);
   if (expectedStatus === "completed") {
@@ -2424,7 +2509,7 @@ function assertPublicPrivateBinding(worker, job) {
       agentProfileDigest: job.profile?.agentProfileDigest
     },
     parentWorkerId: job.request?.resumeJobId || null,
-    lineageWorkerId: job.request?.providerHomeId || job.id,
+    lineageWorkerId: job.request?.providerHomeId,
     taskEnvelopeId: job.request?.envelope?.envelopeId,
     taskEnvelopeDigest: job.request?.envelope?.digest,
     contextManifestId: job.request?.contextManifest?.manifestId,
@@ -2438,7 +2523,15 @@ function assertPublicPrivateBinding(worker, job) {
   const observed = Object.fromEntries(
     Object.keys(expected).map((key) => [key, worker[key]])
   );
-  if (!sameJson(observed, expected)) fail("E_PRIVATE_STATE");
+  if (
+    !sameJson(observed, expected)
+    || (
+      Object.hasOwn(worker, "snapshotSchemaVersion")
+      && !sameJson(worker.contextReceipt, job.request?.contextReceipt)
+    )
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
 }
 
 function publicWorkerDigest(worker) {
@@ -2815,7 +2908,8 @@ function bindSessionBoundary(context, tracker) {
   }
   if (!jobFile) fail("E_SESSION");
   const stateDirectory = path.dirname(path.dirname(jobFile));
-  const homeMarker = job.request?.providerHomeId || job.id;
+  const homeMarker = job.request?.providerHomeId;
+  if (homeMarker !== job.id) fail("E_SESSION");
   if (homeMarker !== tracker.privateBinding?.lineageWorkerId) {
     fail("E_SESSION");
   }
@@ -3296,7 +3390,8 @@ async function proveTerminalCleanup(context, tracker, expectedStatus) {
   if (!jobFile) fail("E_CLEANUP");
   const stateDirectory = path.dirname(path.dirname(jobFile));
   const jobsDirectory = path.dirname(jobFile);
-  const homeMarker = job.request?.providerHomeId || job.id;
+  const homeMarker = job.request?.providerHomeId;
+  if (homeMarker !== job.id) fail("E_CLEANUP");
   const transient = [
     path.join(stateDirectory, "task-homes", homeMarker, ".grok", "auth.json"),
     path.join(stateDirectory, "task-homes", homeMarker, ".grok", "agent-profiles")

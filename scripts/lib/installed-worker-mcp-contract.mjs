@@ -13,6 +13,7 @@ const WORKER_ID = /^(?:review|adversarial-review|task|stop-review)-[a-f0-9]{16,6
 const CANCELLATION_RECEIPT_ID = /^cancel-[a-f0-9]{24}$/;
 const SPAWN_RESPONSE_WITNESS_ID = /^spawnw-[a-f0-9]{24}$/;
 const TASK_ENVELOPE_ID = /^env-[a-f0-9]{24}$/;
+const CONTEXT_PACKET_ID = /^ctxpkt-[a-f0-9]{24}$/;
 const CONTEXT_MANIFEST_ID = /^ctx-[a-f0-9]{24}$/;
 const HOST_TASK_BINDING = /^host-task-[a-f0-9]{32}$/;
 const CONTROL_WORKSPACE_ID = /^cws-[a-f0-9]{32}$/;
@@ -282,6 +283,8 @@ const WORKER_SNAPSHOT_KEYS = new Set([
   "latestPlan",
   "lifecycleEvents",
   "taskContract",
+  "contextBindingMode",
+  "contextReceipt",
   "context",
   "resumeJobId",
   "result",
@@ -366,6 +369,59 @@ const TASK_CONTEXT_KEYS = new Set([
   "requiredPaths",
   "workspaceState",
   "upstreamFreshness"
+]);
+const CONTEXT_RECEIPT_KEYS = new Set([
+  "schemaVersion",
+  "packetId",
+  "packetDigest",
+  "mode",
+  "provenance",
+  "factCount",
+  "factsDigest",
+  "constraintCount",
+  "constraintsDigest",
+  "omissions",
+  "bounds",
+  "truncated",
+  "hiddenRecordsExported",
+  "rolePolicyDigest",
+  "logicalRoleId",
+  "roleDigest",
+  "providerProfileId",
+  "providerProfileVersion",
+  "agentProfileDigest",
+  "allowedProviderToolIdsDigest",
+  "deniedProviderToolIdsDigest",
+  "lineageWorkerId",
+  "contextManifestId",
+  "contextManifestDigest",
+  "effectivePromptDigest",
+  "receiptDigest"
+]);
+const CONTEXT_RECEIPT_PROVENANCE_KEYS = new Set([
+  "source",
+  "precedence",
+  "envelopeId",
+  "envelopeDigest"
+]);
+const CONTEXT_RECEIPT_BOUNDS_KEYS = new Set([
+  "maxFacts",
+  "maxFactChars",
+  "maxConstraints",
+  "maxConstraintChars",
+  "effectiveMaxFacts",
+  "effectiveMaxConstraints"
+]);
+const CONTEXT_RECEIPT_OMISSIONS = Object.freeze([
+  "hidden-system-instructions",
+  "developer-instructions",
+  "raw-transcripts",
+  "credentials",
+  "provider-session-ids",
+  "user-request-body",
+  "default-objective-duplication",
+  "secret-bearing-material",
+  "tool-records"
 ]);
 const CONTEXT_MANIFEST_KEYS = new Set([
   "schemaVersion",
@@ -528,6 +584,8 @@ const PRIVATE_PROJECTION_FIELDS = new Set([
   "commandMarker",
   "workspaceRoot",
   "prompt",
+  "contextPacket",
+  "runtimeRolePolicy",
   "userRequest",
   "rawProviderMessage",
   "rawProviderMessages"
@@ -1561,6 +1619,52 @@ function validTaskContext(value) {
   );
 }
 
+function validContextReceipt(value, worker) {
+  if (
+    !exactKeys(value, CONTEXT_RECEIPT_KEYS)
+    || value.schemaVersion !== 1
+    || !CONTEXT_PACKET_ID.test(value.packetId || "")
+    || !SHA256_HEX.test(value.packetDigest || "")
+    || value.mode !== "explicit-envelope"
+    || !exactKeys(value.provenance, CONTEXT_RECEIPT_PROVENANCE_KEYS)
+    || value.provenance.source !== "explicit-envelope"
+    || !sameJson(value.provenance.precedence, ["explicit-facts", "explicit-constraints"])
+    || value.provenance.envelopeId !== worker.taskEnvelopeId
+    || value.provenance.envelopeDigest !== worker.taskEnvelopeDigest
+    || value.factCount !== 0
+    || value.factsDigest !== stableDigest([])
+    || value.constraintCount !== 0
+    || value.constraintsDigest !== stableDigest([])
+    || !sameJson(value.omissions, CONTEXT_RECEIPT_OMISSIONS)
+    || !exactKeys(value.bounds, CONTEXT_RECEIPT_BOUNDS_KEYS)
+    || value.bounds.maxFacts !== 64
+    || value.bounds.maxFactChars !== 2_000
+    || value.bounds.maxConstraints !== 64
+    || value.bounds.maxConstraintChars !== 2_000
+    || value.bounds.effectiveMaxFacts !== 64
+    || value.bounds.effectiveMaxConstraints !== 64
+    || value.truncated !== false
+    || value.hiddenRecordsExported !== false
+    || !SHA256_HEX.test(value.rolePolicyDigest || "")
+    || value.logicalRoleId !== worker.roleId
+    || !SHA256_HEX.test(value.roleDigest || "")
+    || value.providerProfileId !== worker.profileId
+    || value.providerProfileVersion !== worker.securityProfile.contractVersion
+    || value.agentProfileDigest !== worker.securityProfile.agentProfileDigest
+    || !SHA256_HEX.test(value.allowedProviderToolIdsDigest || "")
+    || !SHA256_HEX.test(value.deniedProviderToolIdsDigest || "")
+    || value.lineageWorkerId !== worker.id
+    || value.contextManifestId !== worker.contextManifestId
+    || value.contextManifestDigest !== worker.contextDigest
+    || !SHA256_HEX.test(value.effectivePromptDigest || "")
+    || !SHA256_HEX.test(value.receiptDigest || "")
+  ) {
+    return false;
+  }
+  const { receiptDigest, ...body } = value;
+  return receiptDigest === stableDigest(body);
+}
+
 function validTaskContract(value, worker) {
   return (
     exactKeys(value, TASK_CONTRACT_KEYS)
@@ -1577,6 +1681,8 @@ function validTaskContract(value, worker) {
     && validPublicTextArray(value.requiredVerification)
     && validPublicText(value.expectedReturnFormat, 2_000, { nullable: true })
     && validTaskContext(value.context)
+    && value.context.facts.length === 0
+    && value.context.constraints.length === 0
     && value.contextManifestId === worker.contextManifestId
   );
 }
@@ -1829,6 +1935,8 @@ function validWorkerSnapshot(worker, status, code) {
     || !validPublicTextArray(worker.latestPlan, { maximumItems: 128 })
     || !validLifecycleEvents(worker.lifecycleEvents, worker, status)
     || !validTaskContract(worker.taskContract, worker)
+    || worker.contextBindingMode !== "context-receipt-v1"
+    || !validContextReceipt(worker.contextReceipt, worker)
     || !validContextManifest(worker.context, worker)
     || worker.resumeJobId !== null
     || !validPublicResult(worker.result, status, worker.taskContract)

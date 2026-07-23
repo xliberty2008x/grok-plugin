@@ -35,8 +35,22 @@ import {
   composeProviderPrompt,
   scrubStoredJob
 } from "./task-contract.mjs";
+import {
+  CONTEXT_BINDING_MODE,
+  assertContextPacket,
+  assertContextReceipt,
+  buildContextPacket,
+  buildContextReceipt,
+  resolveJobProviderPrompt,
+  verifyJobEffectivePrompt
+} from "./worker-context.mjs";
 import { projectWorkerHandle, projectWorkerSnapshot } from "./worker-protocol.mjs";
-import { materializeRole, assertRoleDigest } from "./worker-roles.mjs";
+import {
+  assertRuntimeRolePolicy,
+  buildRuntimeRolePolicy,
+  materializeRole,
+  assertRoleDigest
+} from "./worker-roles.mjs";
 import { profileFor, sameSecurityProfile } from "./profiles.mjs";
 import { processGroupGone, processStartToken } from "./process-control.mjs";
 import {
@@ -3774,6 +3788,12 @@ export function spawnReadOnlyWorker({
   }
 
   const role = materializeRole(roleId);
+  if (!write && role.id !== "explorer") {
+    throw new CompanionError(
+      "E_ROLE",
+      "Read-only broker admission supports only the immutable explorer runtime role."
+    );
+  }
   if (Boolean(role.write) !== Boolean(write)) {
     throw new CompanionError(
       "E_ROLE",
@@ -3802,6 +3822,32 @@ export function spawnReadOnlyWorker({
     validatedEnvelope,
     acceptedContextManifest.manifestId
   );
+  const profile = profileFor("task", Boolean(write));
+  const contextPacket = buildContextPacket({
+    mode: "explicit-envelope",
+    envelope: boundEnvelope,
+    facts: boundEnvelope.context.facts,
+    constraints: boundEnvelope.context.constraints
+  });
+  assertContextPacket(contextPacket, { envelope: boundEnvelope });
+  const runtimeRolePolicy = buildRuntimeRolePolicy({ role, profile });
+  assertRuntimeRolePolicy(runtimeRolePolicy, { role, profile });
+  const providerPrompt = composeProviderPrompt(boundEnvelope, {
+    root: executionRoot,
+    contextManifest: acceptedContextManifest,
+    contextPacket,
+    runtimeRolePolicy
+  });
+  const providerPromptDigest = crypto
+    .createHash("sha256")
+    .update(providerPrompt)
+    .digest("hex");
+  const contextBindingDigest = stableDigest({
+    mode: CONTEXT_BINDING_MODE,
+    packetDigest: contextPacket.digest,
+    runtimeRolePolicyDigest: runtimeRolePolicy.digest,
+    providerPromptDigest
+  });
 
   const keyDigest = digestKey(idempotencyKey);
   const requestOwner = spawnRequestOwner(principal);
@@ -3812,15 +3858,12 @@ export function spawnReadOnlyWorker({
     envelope: boundEnvelope,
     contextManifest: acceptedContextManifest,
     roleId,
-    write
+    write,
+    contextBinding: {
+      mode: CONTEXT_BINDING_MODE,
+      digest: contextBindingDigest
+    }
   });
-  const providerPromptDigest = crypto
-    .createHash("sha256")
-    .update(composeProviderPrompt(boundEnvelope, {
-      root: executionRoot,
-      contextManifest: acceptedContextManifest
-    }))
-    .digest("hex");
   const admitted = withWorkspaceStateTransaction(root, (transaction) => {
     const digestOwners = transaction.listJobs().filter((candidate) => (
       candidate.request?.spawn?.idempotencyKeyDigest === keyDigest
@@ -3908,6 +3951,13 @@ export function spawnReadOnlyWorker({
 
     const id = generateId("task");
     const createdAt = now();
+    const contextReceipt = buildContextReceipt({
+      contextPacket,
+      rolePolicy: runtimeRolePolicy,
+      contextManifest: acceptedContextManifest,
+      lineageWorkerId: id,
+      effectivePromptDigest: providerPromptDigest
+    });
     const job = {
       schemaVersion: 3,
       id,
@@ -3924,7 +3974,7 @@ export function spawnReadOnlyWorker({
       completedAt: null,
       heartbeatAt: createdAt,
       host: ownershipHost(principal),
-      profile: profileFor("task", Boolean(write)),
+      profile,
       role: {
         ...role,
         tools: [...role.tools]
@@ -3933,9 +3983,14 @@ export function spawnReadOnlyWorker({
       effort: null,
       controlWorkspaceId,
       request: {
+        contextBindingMode: CONTEXT_BINDING_MODE,
+        contextPacket,
+        runtimeRolePolicy,
+        contextReceipt,
         envelope: boundEnvelope,
         contextManifest: acceptedContextManifest,
         providerPromptDigest,
+        providerHomeId: id,
         publicObjective: boundEnvelope.objective !== boundEnvelope.userRequest
           ? boundEnvelope.objective
           : null,
@@ -3945,6 +4000,7 @@ export function spawnReadOnlyWorker({
           idempotencyKeyDigest: keyDigest,
           ownerThreadId: principal.threadId,
           requestDigest: spawnDigest,
+          contextBindingDigest,
           successDefinition: SPAWN_SUCCESS_DEFINITION,
           ownershipMode: SPAWN_OWNERSHIP_MODE,
           ...(providerCapabilityDigest !== null ? { providerCapabilityDigest } : {}),
@@ -4037,7 +4093,8 @@ function requestDigest({
   envelope,
   contextManifest,
   roleId,
-  write
+  write,
+  contextBinding = undefined
 }) {
   return stableDigest({
     owner: spawnRequestOwner(principal),
@@ -4046,7 +4103,8 @@ function requestDigest({
     envelope: stableEnvelopeDigestBinding(envelope),
     contextManifestDigest: contextManifest?.digest || null,
     roleId,
-    write: Boolean(write)
+    write: Boolean(write),
+    ...(contextBinding === undefined ? {} : { contextBinding })
   });
 }
 
@@ -4059,6 +4117,8 @@ export function assertDurableSpawnRequestBinding(job, env = process.env) {
     || !SHA256_HEX.test(spawn?.idempotencyKeyDigest || "")
     || (Object.hasOwn(spawn || {}, "providerCapabilityDigest")
       && !SHA256_HEX.test(spawn.providerCapabilityDigest || ""))
+    || (Object.hasOwn(spawn || {}, "contextBindingDigest")
+      && !SHA256_HEX.test(spawn.contextBindingDigest || ""))
     || spawn?.ownerThreadId !== job?.host?.sessionId) {
     spawnIdempotencyStateError("Durable worker spawn provenance is malformed.");
   }
@@ -4083,6 +4143,68 @@ export function assertDurableSpawnRequestBinding(job, env = process.env) {
     && job.request.envelope.contextManifestId !== acceptedContext?.manifestId) {
     spawnIdempotencyStateError("Durable worker spawn envelope no longer matches its context identity.");
   }
+  const bindingValues = [
+    job.request?.contextBindingMode,
+    job.request?.contextPacket,
+    job.request?.runtimeRolePolicy,
+    job.request?.contextReceipt,
+    spawn?.contextBindingDigest
+  ];
+  const hasAnyContextBinding = bindingValues.some((value) => value !== undefined);
+  const hasCompleteContextBinding = job.request?.contextBindingMode === CONTEXT_BINDING_MODE
+    && job.request?.contextPacket
+    && job.request?.runtimeRolePolicy
+    && job.request?.contextReceipt
+    && SHA256_HEX.test(spawn?.contextBindingDigest || "");
+  if (hasAnyContextBinding && !hasCompleteContextBinding) {
+    spawnIdempotencyStateError("Durable worker context binding is partial or downgraded.");
+  }
+  let contextBinding;
+  if (hasCompleteContextBinding) {
+    if (job.request?.providerHomeId !== job.id
+      || typeof job.request?.roleId !== "string"
+      || job.role?.id !== job.request.roleId
+      || (!job.write && job.request.roleId !== "explorer")) {
+      spawnIdempotencyStateError("Durable worker context lineage or logical role is malformed.");
+    }
+    const expectedRole = materializeRole(job.request.roleId);
+    const expectedProfile = profileFor("task", Boolean(job.write));
+    try {
+      assertRoleDigest(job.role);
+      if (!sameSecurityProfile(job.profile, expectedProfile)) {
+        throw new CompanionError("E_ROLE", "Durable provider profile drifted.");
+      }
+      assertContextPacket(job.request.contextPacket, {
+        envelope: job.request.envelope
+      });
+      assertRuntimeRolePolicy(job.request.runtimeRolePolicy, {
+        role: expectedRole,
+        profile: expectedProfile
+      });
+      assertContextReceipt(job.request.contextReceipt, {
+        contextPacket: job.request.contextPacket,
+        rolePolicy: job.request.runtimeRolePolicy,
+        contextManifest: acceptedContext,
+        lineageWorkerId: job.id,
+        effectivePromptDigest: job.request?.providerPromptDigest
+      });
+    } catch {
+      spawnIdempotencyStateError("Durable worker context packet, role policy, or receipt drifted.");
+    }
+    const expectedContextBindingDigest = stableDigest({
+      mode: CONTEXT_BINDING_MODE,
+      packetDigest: job.request.contextPacket.digest,
+      runtimeRolePolicyDigest: job.request.runtimeRolePolicy.digest,
+      providerPromptDigest: job.request.providerPromptDigest
+    });
+    if (spawn.contextBindingDigest !== expectedContextBindingDigest) {
+      spawnIdempotencyStateError("Durable worker context binding digest drifted.");
+    }
+    contextBinding = {
+      mode: CONTEXT_BINDING_MODE,
+      digest: expectedContextBindingDigest
+    };
+  }
   const recomputedRequestDigest = requestDigest({
     principal: {
       hostKind: job.host?.kind,
@@ -4093,7 +4215,8 @@ export function assertDurableSpawnRequestBinding(job, env = process.env) {
     envelope: job.request?.envelope,
     contextManifest: acceptedContext,
     roleId: job.request?.roleId,
-    write: job.write
+    write: job.write,
+    ...(contextBinding ? { contextBinding } : {})
   });
   if (spawn.requestDigest !== recomputedRequestDigest) {
     spawnIdempotencyStateError("Durable worker spawn request no longer matches its admitted binding.");
@@ -4102,10 +4225,21 @@ export function assertDurableSpawnRequestBinding(job, env = process.env) {
     spawnIdempotencyStateError("Durable worker provider-prompt digest is malformed.");
   }
   if (typeof job.request?.envelope?.userRequest === "string") {
-    const recomputedPromptDigest = digestKey(composeProviderPrompt(job.request.envelope, {
-      root: executionRoot,
-      contextManifest: acceptedContext
-    }));
+    let recomputedPromptDigest;
+    try {
+      recomputedPromptDigest = hasCompleteContextBinding
+        ? verifyJobEffectivePrompt(job, {
+          root: executionRoot,
+          contextManifest: acceptedContext,
+          composeLegacyProviderPrompt: composeProviderPrompt
+        }).digest
+        : digestKey(composeProviderPrompt(job.request.envelope, {
+          root: executionRoot,
+          contextManifest: acceptedContext
+        }));
+    } catch {
+      spawnIdempotencyStateError("Durable worker provider prompt reconstruction failed.");
+    }
     if (recomputedPromptDigest !== job.request.providerPromptDigest) {
       spawnIdempotencyStateError("Durable worker provider prompt no longer matches its admitted binding.");
     }

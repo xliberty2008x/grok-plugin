@@ -13,6 +13,13 @@ import crypto from "node:crypto";
 import { CompanionError } from "./errors.mjs";
 import { redact, sanitizeDisplayText } from "./redact.mjs";
 import {
+  CONTEXT_BINDING_MODE,
+  assertContextPacket,
+  assertContextReceipt,
+  assertContextReceiptShape
+} from "./worker-context.mjs";
+import { assertRuntimeRolePolicy } from "./worker-roles.mjs";
+import {
   LIFECYCLE_EVENT_TYPES,
   MAX_LIFECYCLE_EVENTS,
   normalizeLifecycleEventSequences
@@ -568,11 +575,14 @@ function projectLifecycleDetail(value, { trustHostAuthority = true } = {}) {
   return Object.keys(projected).length ? projected : null;
 }
 
-function projectTaskContext(value, { trustHostAuthority = true } = {}) {
+function projectTaskContext(value, {
+  trustHostAuthority = true,
+  hideBodies = false
+} = {}) {
   const context = isPlainObject(value) ? value : {};
   return {
-    facts: publicStringList(context.facts),
-    constraints: publicStringList(context.constraints),
+    facts: hideBodies ? [] : publicStringList(context.facts),
+    constraints: hideBodies ? [] : publicStringList(context.constraints),
     expectedProjectMarkers: publicPathList(context.expectedProjectMarkers, 32),
     requiredPaths: publicPathList(context.requiredPaths, MAX_PUBLIC_LIST_ITEMS),
     workspaceState: ["complete", "task_scoped", "unknown"].includes(context.workspaceState)
@@ -595,7 +605,10 @@ function projectAcceptanceCriteria(value) {
     }));
 }
 
-function projectTaskContract(envelope, publicObjective, { trustHostAuthority = true } = {}) {
+function projectTaskContract(envelope, publicObjective, {
+  trustHostAuthority = true,
+  hideContextBodies = false
+} = {}) {
   if (!isPlainObject(envelope)) return null;
   return {
     schemaVersion: nullableInteger(envelope.schemaVersion),
@@ -616,7 +629,10 @@ function projectTaskContract(envelope, publicObjective, { trustHostAuthority = t
     acceptanceCriteria: projectAcceptanceCriteria(envelope.acceptanceCriteria),
     requiredVerification: publicStringList(envelope.requiredVerification),
     expectedReturnFormat: nullableText(envelope.expectedReturnFormat),
-    context: projectTaskContext(envelope.context, { trustHostAuthority }),
+    context: projectTaskContext(envelope.context, {
+      trustHostAuthority,
+      hideBodies: hideContextBodies
+    }),
     contextManifestId: nullableText(envelope.contextManifestId, 256)
   };
 }
@@ -972,6 +988,37 @@ function projectPublicError(error) {
   });
 }
 
+function projectContextReceipt(job) {
+  const request = job?.request || {};
+  const fields = [
+    request.contextBindingMode,
+    request.contextPacket,
+    request.runtimeRolePolicy,
+    request.contextReceipt
+  ];
+  if (fields.every((value) => value === undefined)) return null;
+  if (request.contextBindingMode !== CONTEXT_BINDING_MODE
+    || !request.contextPacket
+    || !request.runtimeRolePolicy
+    || !request.contextReceipt
+    || request.providerHomeId !== job.id) {
+    throw new CompanionError("E_STATE", "Worker context binding is partial or downgraded.");
+  }
+  assertContextPacket(request.contextPacket, { envelope: request.envelope });
+  assertRuntimeRolePolicy(request.runtimeRolePolicy, {
+    role: job.role,
+    profile: job.profile
+  });
+  assertContextReceipt(request.contextReceipt, {
+    contextPacket: request.contextPacket,
+    rolePolicy: request.runtimeRolePolicy,
+    contextManifest: request.contextManifest,
+    lineageWorkerId: request.providerHomeId,
+    effectivePromptDigest: request.providerPromptDigest
+  });
+  return structuredClone(request.contextReceipt);
+}
+
 /**
  * Full public worker snapshot — the single contract for CLI public JSON and brokers.
  * Compatible with the historical publicJob shape; adds explicit protocol versioning
@@ -986,6 +1033,7 @@ export function projectWorkerSnapshot(job, { detail = true, trustHostAuthority =
   }
   const envelope = job.request?.envelope || null;
   const manifest = job.request?.contextManifest || null;
+  const contextReceipt = detail ? projectContextReceipt(job) : null;
   return sanitizePublicProjection({
     workerProtocolVersion: WORKER_PROTOCOL_VERSION,
     snapshotSchemaVersion: WORKER_SNAPSHOT_SCHEMA_VERSION,
@@ -1010,8 +1058,13 @@ export function projectWorkerSnapshot(job, { detail = true, trustHostAuthority =
     latestPlan: detail ? projectPublicPlan(job.latestPlan) : [],
     lifecycleEvents: detail ? projectLifecycleEvents(job.lifecycleEvents, { trustHostAuthority }) : [],
     taskContract: detail
-      ? projectTaskContract(envelope, job.request?.publicObjective, { trustHostAuthority })
+      ? projectTaskContract(envelope, job.request?.publicObjective, {
+        trustHostAuthority,
+        hideContextBodies: contextReceipt !== null
+      })
       : null,
+    contextBindingMode: contextReceipt === null ? null : CONTEXT_BINDING_MODE,
+    contextReceipt,
     context: detail ? projectContextManifest(manifest, { trustHostAuthority }) : null,
     resumeJobId: nullableText(job.request?.resumeJobId, 256),
     result: projectPublicResult(job, { detail, trustHostAuthority }),
@@ -1026,6 +1079,30 @@ export function projectWorkerSnapshot(job, { detail = true, trustHostAuthority =
   });
 }
 
+function assertPublicContextReceiptBinding(receipt, snapshot) {
+  const mismatches = [
+    receipt.lineageWorkerId !== snapshot.id,
+    snapshot.lineageWorkerId !== snapshot.id,
+    snapshot.write !== (receipt.logicalRoleId === "implementer"),
+    receipt.logicalRoleId !== snapshot.roleId,
+    receipt.providerProfileId !== snapshot.profileId,
+    receipt.providerProfileId !== snapshot.securityProfile?.id,
+    receipt.providerProfileVersion !== snapshot.securityProfile?.contractVersion,
+    receipt.agentProfileDigest !== snapshot.securityProfile?.agentProfileDigest,
+    receipt.provenance?.envelopeId !== snapshot.taskEnvelopeId,
+    receipt.provenance?.envelopeDigest !== snapshot.taskEnvelopeDigest,
+    receipt.contextManifestId !== snapshot.contextManifestId,
+    receipt.contextManifestDigest !== snapshot.contextDigest,
+    snapshot.taskContract?.contextManifestId !== receipt.contextManifestId
+  ];
+  if (mismatches.some(Boolean)) {
+    throw new CompanionError(
+      "E_SCHEMA",
+      "Context receipt contradicts the public worker, role, profile, envelope, or manifest identity."
+    );
+  }
+}
+
 /**
  * Re-project an untrusted, purportedly-public snapshot through the same
  * allowlist/redaction boundary as a private job. Version flags are descriptive,
@@ -1034,6 +1111,23 @@ export function projectWorkerSnapshot(job, { detail = true, trustHostAuthority =
 export function normalizeWorkerSnapshot(snapshot, { detail = true } = {}) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
     throw new CompanionError("E_SCHEMA", "Public worker snapshot must be an object.");
+  }
+  if (!Object.hasOwn(snapshot, "contextBindingMode")
+    || ![null, CONTEXT_BINDING_MODE].includes(snapshot.contextBindingMode)) {
+    throw new CompanionError(
+      "E_SCHEMA",
+      "Public worker snapshot is missing its exact context-binding discriminator."
+    );
+  }
+  const hasContextReceipt = snapshot.contextReceipt !== null
+    && snapshot.contextReceipt !== undefined;
+  if (detail && (
+    (snapshot.contextBindingMode === CONTEXT_BINDING_MODE) !== hasContextReceipt
+  )) {
+    throw new CompanionError(
+      "E_SCHEMA",
+      "Public worker snapshot context receipt was removed, added, or downgraded."
+    );
   }
   const context = isPlainObject(snapshot.context) ? snapshot.context : null;
   const taskContract = isPlainObject(snapshot.taskContract) ? snapshot.taskContract : null;
@@ -1079,6 +1173,16 @@ export function normalizeWorkerSnapshot(snapshot, { detail = true } = {}) {
   if (typeof snapshot.hostTaskBinding === "string"
     && /^host-task-[a-f0-9]{32}$/.test(snapshot.hostTaskBinding)) {
     normalized.hostTaskBinding = snapshot.hostTaskBinding;
+  }
+  normalized.contextBindingMode = detail ? snapshot.contextBindingMode : null;
+  if (detail && hasContextReceipt) {
+    assertContextReceiptShape(snapshot.contextReceipt);
+    assertPublicContextReceiptBinding(snapshot.contextReceipt, normalized);
+    normalized.contextReceipt = structuredClone(snapshot.contextReceipt);
+    if (normalized.taskContract?.context) {
+      normalized.taskContract.context.facts = [];
+      normalized.taskContract.context.constraints = [];
+    }
   }
   return sanitizePublicProjection(normalized);
 }

@@ -7,6 +7,30 @@ import crypto from "node:crypto";
 import { CompanionError } from "./errors.mjs";
 
 export const WORKER_ROLE_VERSION = 1;
+export const RUNTIME_ROLE_POLICY_VERSION = 1;
+const SHA256_HEX = /^[a-f0-9]{64}$/;
+const PROVIDER_PROFILE_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+const PROVIDER_TOOL_ID = /^[A-Za-z][A-Za-z0-9_.-]*:[A-Za-z0-9][A-Za-z0-9_.*-]{0,127}$/;
+const ROLE_KEYS = new Set([
+  "schemaVersion",
+  "id",
+  "write",
+  "tools",
+  "description",
+  "digest"
+]);
+const RUNTIME_ROLE_POLICY_KEYS = new Set([
+  "schemaVersion",
+  "logicalRoleId",
+  "roleDigest",
+  "write",
+  "providerProfileId",
+  "providerProfileVersion",
+  "agentProfileDigest",
+  "allowedProviderToolIds",
+  "deniedProviderToolIds",
+  "digest"
+]);
 
 const ROLE_SPECS = Object.freeze({
   explorer: Object.freeze({
@@ -77,7 +101,11 @@ export function materializeRole(roleId) {
 }
 
 export function assertRoleDigest(role) {
-  if (!role || typeof role !== "object") {
+  if (!role
+    || typeof role !== "object"
+    || Array.isArray(role)
+    || Object.keys(role).length !== ROLE_KEYS.size
+    || Object.keys(role).some((key) => !ROLE_KEYS.has(key))) {
     throw new CompanionError("E_ROLE", "Worker role is required.");
   }
   const expected = materializeRole(role.id);
@@ -88,11 +116,12 @@ export function assertRoleDigest(role) {
       actualDigest: role.digest || null
     });
   }
-  if (Boolean(role.write) !== expected.write) {
+  if (typeof role.write !== "boolean" || role.write !== expected.write) {
     throw new CompanionError("E_ROLE", "Worker role write capability mismatch.");
   }
   if (
     role.schemaVersion !== expected.schemaVersion
+    || role.description !== expected.description
     || !Array.isArray(role.tools)
     || role.tools.length !== expected.tools.length
     || role.tools.some((tool, index) => tool !== expected.tools[index])
@@ -156,6 +185,141 @@ export function assertWorkerCannotSelfEscalate(job, nextRoleId) {
       "Workers cannot self-escalate roles; host grant required."
     );
   }
+}
+
+function deepFreeze(value, seen = new WeakSet()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return value;
+  seen.add(value);
+  for (const child of Object.values(value)) deepFreeze(child, seen);
+  return Object.freeze(value);
+}
+
+function policyDigest(body) {
+  return crypto.createHash("sha256").update(stableStringify(body)).digest("hex");
+}
+
+function exactProviderToolList(value) {
+  if (!Array.isArray(value)
+    || value.length > 64
+    || value.some((item) => typeof item !== "string" || !PROVIDER_TOOL_ID.test(item))
+    || new Set(value).size !== value.length) return null;
+  return value.slice();
+}
+
+/**
+ * Build an immutable RuntimeRolePolicy binding a logical role to the exact
+ * provider profile id/version/agent digest and allowed/denied provider tool ids.
+ * Root public spawn only advertises explorer; other roles remain internal.
+ */
+export function buildRuntimeRolePolicy({
+  role,
+  profile,
+  logicalRoleId = role?.id
+} = {}) {
+  const expectedRole = assertRoleDigest(role || materializeRole(logicalRoleId));
+  if (logicalRoleId && logicalRoleId !== expectedRole.id) {
+    throw new CompanionError("E_ROLE", "RuntimeRolePolicy logical role does not match the materialised role.");
+  }
+  if (!profile || typeof profile !== "object") {
+    throw new CompanionError("E_ROLE", "RuntimeRolePolicy requires a provider security profile.");
+  }
+  if (typeof profile.id !== "string" || !PROVIDER_PROFILE_ID.test(profile.id)) {
+    throw new CompanionError("E_ROLE", "RuntimeRolePolicy requires a provider profile id.");
+  }
+  if (!Number.isSafeInteger(profile.contractVersion) || profile.contractVersion < 1) {
+    throw new CompanionError("E_ROLE", "RuntimeRolePolicy requires a provider profile contract version.");
+  }
+  if (!SHA256_HEX.test(profile.agentProfileDigest || "")) {
+    throw new CompanionError("E_ROLE", "RuntimeRolePolicy requires an exact agent profile digest.");
+  }
+  const allowed = exactProviderToolList(profile.providerToolIds);
+  const denied = exactProviderToolList(profile.deniedProviderToolIds);
+  if (!allowed || !denied) {
+    throw new CompanionError("E_ROLE", "RuntimeRolePolicy requires exact allowed and denied provider tool ids.");
+  }
+  const body = {
+    schemaVersion: RUNTIME_ROLE_POLICY_VERSION,
+    logicalRoleId: expectedRole.id,
+    roleDigest: expectedRole.digest,
+    write: expectedRole.write,
+    providerProfileId: profile.id,
+    providerProfileVersion: profile.contractVersion,
+    agentProfileDigest: profile.agentProfileDigest,
+    allowedProviderToolIds: allowed,
+    deniedProviderToolIds: denied
+  };
+  return deepFreeze({
+    ...body,
+    digest: policyDigest(body)
+  });
+}
+
+export function assertRuntimeRolePolicy(policy, { role = null, profile = null } = {}) {
+  if (!policy || typeof policy !== "object" || Array.isArray(policy)) {
+    throw new CompanionError("E_ROLE", "RuntimeRolePolicy is missing or malformed.");
+  }
+  if (Object.keys(policy).length !== RUNTIME_ROLE_POLICY_KEYS.size
+    || Object.keys(policy).some((key) => !RUNTIME_ROLE_POLICY_KEYS.has(key))
+    || policy.schemaVersion !== RUNTIME_ROLE_POLICY_VERSION) {
+    throw new CompanionError("E_ROLE", "Unsupported RuntimeRolePolicy schema version.");
+  }
+  if (!SHA256_HEX.test(policy.digest || "")
+    || !SHA256_HEX.test(policy.roleDigest || "")
+    || !SHA256_HEX.test(policy.agentProfileDigest || "")) {
+    throw new CompanionError("E_ROLE", "RuntimeRolePolicy digests are malformed.");
+  }
+  const allowedPolicyTools = exactProviderToolList(policy.allowedProviderToolIds);
+  const deniedPolicyTools = exactProviderToolList(policy.deniedProviderToolIds);
+  if (!allowedPolicyTools
+    || !deniedPolicyTools
+    || typeof policy.logicalRoleId !== "string"
+    || !ROLE_SPECS[policy.logicalRoleId]
+    || typeof policy.write !== "boolean"
+    || typeof policy.providerProfileId !== "string"
+    || !PROVIDER_PROFILE_ID.test(policy.providerProfileId)
+    || !Number.isSafeInteger(policy.providerProfileVersion)
+    || policy.providerProfileVersion < 1) {
+    throw new CompanionError("E_ROLE", "RuntimeRolePolicy tool ids are malformed.");
+  }
+  const body = {
+    schemaVersion: policy.schemaVersion,
+    logicalRoleId: policy.logicalRoleId,
+    roleDigest: policy.roleDigest,
+    write: policy.write,
+    providerProfileId: policy.providerProfileId,
+    providerProfileVersion: policy.providerProfileVersion,
+    agentProfileDigest: policy.agentProfileDigest,
+    allowedProviderToolIds: allowedPolicyTools,
+    deniedProviderToolIds: deniedPolicyTools
+  };
+  if (policy.digest !== policyDigest(body)) {
+    throw new CompanionError("E_ROLE", "RuntimeRolePolicy digest mismatch.");
+  }
+  if (role) {
+    const expectedRole = assertRoleDigest(role);
+    if (expectedRole.id !== policy.logicalRoleId
+      || expectedRole.digest !== policy.roleDigest
+      || expectedRole.write !== policy.write) {
+      throw new CompanionError("E_ROLE", "RuntimeRolePolicy does not match the durable worker role.");
+    }
+  }
+  if (profile) {
+    const allowed = exactProviderToolList(profile.providerToolIds) || [];
+    const denied = exactProviderToolList(profile.deniedProviderToolIds) || [];
+    if (profile.id !== policy.providerProfileId
+      || profile.contractVersion !== policy.providerProfileVersion
+      || profile.agentProfileDigest !== policy.agentProfileDigest
+      || allowed.length !== policy.allowedProviderToolIds.length
+      || denied.length !== policy.deniedProviderToolIds.length
+      || allowed.some((tool, index) => tool !== policy.allowedProviderToolIds[index])
+      || denied.some((tool, index) => tool !== policy.deniedProviderToolIds[index])) {
+      throw new CompanionError(
+        "E_ROLE",
+        "RuntimeRolePolicy does not match the durable provider profile or tool ids."
+      );
+    }
+  }
+  return policy;
 }
 
 export { ROLE_SPECS };

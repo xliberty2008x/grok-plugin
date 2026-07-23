@@ -227,8 +227,15 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /sessions: new Map\(\)/);
   assert.match(
     source,
-    /lineageWorkerId: job\?\.request\?\.providerHomeId \|\| job\?\.id/
+    /lineageWorkerId: job\?\.request\?\.providerHomeId,/
   );
+  assert.doesNotMatch(source, /providerHomeId \|\| job(?:\?\.)?\.id/);
+  assert.match(
+    source,
+    /request\?\.contextBindingMode !== "context-receipt-v1"/
+  );
+  assert.match(source, /request\?\.providerHomeId !== job\?\.id/);
+  assert.match(source, /validateContextReceiptProjection\(worker, job\)/);
   assert.match(
     source,
     /bindInstalledWorkerSessionBoundary\(\{[\s\S]*?childEnvironment: context\.provider\.childEnvironment[\s\S]*?\}\)/

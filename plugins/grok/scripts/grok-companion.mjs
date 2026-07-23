@@ -66,7 +66,9 @@ import {
   scrubStoredJob
 } from "./lib/task-contract.mjs";
 import { projectWorkerSnapshot } from "./lib/worker-protocol.mjs";
+import { CONTEXT_BINDING_MODE, verifyJobEffectivePrompt } from "./lib/worker-context.mjs";
 import {
+  assertDurableSpawnRequestBinding,
   assertDispatchContract,
   authorizeWorkerProviderRotation,
   cancelWorker,
@@ -838,7 +840,7 @@ function eventUpdater(root, id, dispatchAttemptId = null, providerGeneration = n
             job.request?.spawn?.dispatch?.attemptId !== dispatchAttemptId
             || job.request?.spawn?.dispatch?.state !== "provider-started"
           ))) return job;
-        return touchJob(job, {
+        const promoted = touchJob(job, {
           providerProcess,
           profile: { ...job.profile, grokVersion: safeEvent.version },
           phase: "creating-session",
@@ -847,6 +849,9 @@ function eventUpdater(root, id, dispatchAttemptId = null, providerGeneration = n
             version: safeEvent.version || null
           })
         });
+        return promoted.request?.contextBindingMode === CONTEXT_BINDING_MODE
+          ? scrubStoredJob(promoted)
+          : promoted;
       });
     } else if (safeEvent.type === "session") {
       updateJob(root, id, (job) => {
@@ -906,6 +911,52 @@ function eventUpdater(root, id, dispatchAttemptId = null, providerGeneration = n
   };
 }
 
+function providerLaunchBinding(profile, prompt) {
+  return Object.freeze({
+    promptDigest: crypto.createHash("sha256").update(String(prompt || "")).digest("hex"),
+    profileId: profile?.id || null,
+    profileContractVersion: profile?.contractVersion ?? null,
+    agentProfileDigest: profile?.agentProfileDigest || null
+  });
+}
+
+function assertProviderLaunchBinding(observed, expected) {
+  const keys = [
+    "promptDigest",
+    "profileId",
+    "profileContractVersion",
+    "agentProfileDigest"
+  ];
+  if (!observed
+    || typeof observed !== "object"
+    || Array.isArray(observed)
+    || Object.keys(observed).length !== keys.length
+    || Object.keys(observed).some((key) => !keys.includes(key))
+    || keys.some((key) => observed[key] !== expected?.[key])) {
+    throw new CompanionError(
+      "E_AUTH_REQUIRED",
+      "Provider launch prompt or security profile changed before process preparation."
+    );
+  }
+  return observed;
+}
+
+function assertExecutableWorkerBinding(job, { dispatchAttemptId = null } = {}) {
+  const spawn = job?.request?.spawn;
+  const hasBrokerBindingWitness = (
+    job?.request?.contextBindingMode === CONTEXT_BINDING_MODE
+    || Object.prototype.hasOwnProperty.call(spawn || {}, "contextBindingDigest")
+    || Object.prototype.hasOwnProperty.call(spawn || {}, "idempotencyKeyDigest")
+  );
+  if (hasBrokerBindingWitness) {
+    return assertDurableSpawnRequestBinding(job);
+  }
+  if (dispatchAttemptId) {
+    return assertDispatchContract(job);
+  }
+  return job;
+}
+
 async function execute(root, id, { dispatchAttemptId = null, dispatchFence = null } = {}) {
   const exactBrokerWorkerIdentity = (identity) => Boolean(
     identity?.pid === process.pid
@@ -936,7 +987,18 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
       throw new CompanionError("E_RECURSION", "Unauthenticated or stale broker worker invocation refused.");
     }
   }
-  let prompt = job.request?.prompt;
+  const receiptBacked = job.request?.contextBindingMode === CONTEXT_BINDING_MODE;
+  // Broker jobs carry a durable admission witness. Exact legacy CLI dispatches
+  // do not; keep their existing dispatch contract while refusing any partial
+  // or deleted broker context binding as a legacy downgrade.
+  assertExecutableWorkerBinding(job, { dispatchAttemptId });
+  let prompt = receiptBacked
+    ? verifyJobEffectivePrompt(job, {
+      root,
+      contextManifest: job.request?.contextManifest || null,
+      composeLegacyProviderPrompt: composeProviderPrompt
+    }).prompt
+    : job.request?.prompt;
   if (!prompt && job.request?.envelope) {
     prompt = composeProviderPrompt(job.request.envelope, {
       root,
@@ -986,22 +1048,30 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
     current.summary = "Starting Grok";
     current.progress = "Starting Grok";
     current.heartbeatAt = now();
-    // Retain structured envelope fields; only clear the assembled provider prompt text.
-    Object.assign(current, scrubStoredJob({
-      ...current,
-      request: {
-        ...current.request,
-        promptDigest,
-        contextManifest: current.request?.contextManifest || preContext,
-        ...(consumedLaunchContractDigest ? {
-          spawn: {
-            ...current.request?.spawn,
-            consumedLaunchContractDigest,
-            launchContractConsumedAt: now()
-          }
-        } : {})
-      }
-    }));
+    const startingRequest = {
+      ...current.request,
+      prompt: null,
+      promptDigest,
+      contextManifest: current.request?.contextManifest || preContext,
+      ...(consumedLaunchContractDigest ? {
+        spawn: {
+          ...current.request?.spawn,
+          consumedLaunchContractDigest,
+          launchContractConsumedAt: now()
+        }
+      } : {})
+    };
+    // Receipt-backed jobs must retain the literal TaskEnvelope request through
+    // the second, immediately-pre-spawn reconstruction check. Scrub it as soon
+    // as the exact provider process is durably promoted below.
+    if (receiptBacked) {
+      current.request = startingRequest;
+    } else {
+      Object.assign(current, scrubStoredJob({
+        ...current,
+        request: startingRequest
+      }));
+    }
     if (consumedLaunchContractDigest) current.workerAuthorization = null;
     if (!dispatchAttemptId) {
       current.workerProcess = {
@@ -1077,6 +1147,7 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
     // Keep the corresponding handoff process-local and single-use so an
     // unrelated pre-existing pending intent can never admit another bootstrap.
     let providerLaunchAuthorization = null;
+    let expectedProviderLaunchBinding = providerLaunchBinding(job.profile, prompt);
     const common = {
       root,
       profile: job.profile,
@@ -1097,7 +1168,28 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
           providerGeneration
         },
         providerLaunch: {
-          prepare: () => {
+          prepare: (observedLaunchBinding) => {
+            const latest = readJob(root, id);
+            assertExecutableWorkerBinding(latest, { dispatchAttemptId });
+            assertProviderLaunchBinding(
+              observedLaunchBinding,
+              expectedProviderLaunchBinding
+            );
+            if (providerGeneration === 1
+              && latest.request?.contextBindingMode === CONTEXT_BINDING_MODE) {
+              const verified = verifyJobEffectivePrompt(latest, {
+                root,
+                contextManifest: latest.request?.contextManifest || null,
+                composeLegacyProviderPrompt: composeProviderPrompt
+              });
+              if (verified.digest !== observedLaunchBinding.promptDigest
+                || verified.prompt !== prompt) {
+                throw new CompanionError(
+                  "E_AUTH_REQUIRED",
+                  "Provider prompt changed before provider launch preparation."
+                );
+              }
+            }
             const authorization = providerLaunchAuthorization;
             providerLaunchAuthorization = null;
             const candidate = prepareWorkerProviderSpawn({
@@ -1168,10 +1260,16 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
               providerGeneration: rotationAuthorization.providerGeneration
             });
           }
+          const repairProfile = profileFor("report-repair");
+          const repairPrompt = composeWorkerReportRepairPrompt(envelope, workerReport);
+          expectedProviderLaunchBinding = providerLaunchBinding(
+            repairProfile,
+            repairPrompt
+          );
           const repaired = await runProvider({
             ...common,
-            profile: profileFor("report-repair"),
-            prompt: composeWorkerReportRepairPrompt(envelope, workerReport),
+            profile: repairProfile,
+            prompt: repairPrompt,
             resumeSessionId: result.sessionId,
             ...(dispatchAttemptId ? {
               guardBinding: {

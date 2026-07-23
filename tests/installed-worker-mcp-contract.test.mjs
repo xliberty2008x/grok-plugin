@@ -14,6 +14,17 @@ import {
   projectWorkerHandle,
   projectWorkerSnapshot
 } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
+import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
+import {
+  buildContextPacket,
+  buildContextReceipt,
+  composeEffectiveProviderPrompt,
+  effectivePromptDigest
+} from "../plugins/grok/scripts/lib/worker-context.mjs";
+import {
+  buildRuntimeRolePolicy,
+  materializeRole
+} from "../plugins/grok/scripts/lib/worker-roles.mjs";
 import {
   INSTALLED_WORKER_SCENARIO_IDS,
   INSTALLED_WORKER_TOOL_NAMES,
@@ -30,9 +41,11 @@ import {
   validateProviderCapabilityAgreement
 } from "../scripts/lib/installed-worker-mcp-contract.mjs";
 
+const ROOT_READ_PROFILE = Object.freeze(profileFor("task", false));
+const EXPLORER_ROLE = materializeRole("explorer");
 const DIGESTS = Object.freeze({
   setup: "a".repeat(64),
-  rootRead: "b".repeat(64),
+  rootRead: ROOT_READ_PROFILE.agentProfileDigest,
   provider: "c".repeat(64)
 });
 const WORKER_ID = "task-0123456789abcdef";
@@ -392,6 +405,28 @@ function privateJob(status, { cancellation = false } = {}) {
         ? "done"
         : "cancelled";
   const terminal = ["completed", "cancelled"].includes(status);
+  const envelope = taskEnvelopeFixture();
+  const contextManifest = contextManifestFixture();
+  const contextPacket = buildContextPacket({ envelope });
+  const runtimeRolePolicy = buildRuntimeRolePolicy({
+    role: EXPLORER_ROLE,
+    profile: ROOT_READ_PROFILE
+  });
+  const providerPrompt = composeEffectiveProviderPrompt({
+    envelope,
+    contextPacket,
+    rolePolicy: runtimeRolePolicy,
+    contextManifest,
+    root: "/tmp/grok-installed-worker-fixture"
+  });
+  const providerPromptDigest = effectivePromptDigest(providerPrompt);
+  const contextReceipt = buildContextReceipt({
+    contextPacket,
+    rolePolicy: runtimeRolePolicy,
+    contextManifest,
+    lineageWorkerId: WORKER_ID,
+    effectivePromptDigest: providerPromptDigest
+  });
   return {
     schemaVersion: 3,
     id: WORKER_ID,
@@ -423,20 +458,22 @@ function privateJob(status, { cancellation = false } = {}) {
       kind: "codex",
       sessionId: HOST_SESSION_ID
     },
-    profile: {
-      id: "rescue-read-v3",
-      contractVersion: 3,
-      agentProfileDigest: DIGESTS.rootRead
-    },
-    role: { id: "explorer" },
+    profile: clone(ROOT_READ_PROFILE),
+    role: clone(EXPLORER_ROLE),
     model: null,
     effort: null,
     controlWorkspaceId: CONTROL_WORKSPACE_ID,
     status,
     phase,
     request: {
-      envelope: taskEnvelopeFixture(),
-      contextManifest: contextManifestFixture(),
+      contextBindingMode: "context-receipt-v1",
+      contextPacket,
+      runtimeRolePolicy,
+      contextReceipt,
+      envelope,
+      contextManifest,
+      providerPromptDigest,
+      providerHomeId: WORKER_ID,
       publicObjective: "Inspect repository",
       resumeJobId: null
     },
@@ -2225,6 +2262,19 @@ test("integrated validator rejects consistently forged public binding fields", (
       }
       if (publicWorker.context) {
         publicWorker.context.digest = publicWorker.contextDigest;
+      }
+      if (publicWorker.contextReceipt) {
+        publicWorker.contextReceipt.agentProfileDigest =
+          publicWorker.securityProfile.agentProfileDigest;
+        publicWorker.contextReceipt.provenance.envelopeDigest =
+          publicWorker.taskEnvelopeDigest;
+        publicWorker.contextReceipt.contextManifestDigest =
+          publicWorker.contextDigest;
+        const {
+          receiptDigest: ignoredReceiptDigest,
+          ...receiptBody
+        } = publicWorker.contextReceipt;
+        publicWorker.contextReceipt.receiptDigest = digest(receiptBody);
       }
     }
     assert.doesNotThrow(() => entry.validatePublic(entry.publicEvidence));
