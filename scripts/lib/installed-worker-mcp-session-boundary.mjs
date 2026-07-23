@@ -123,3 +123,98 @@ export function bindInstalledWorkerSessionBoundary({
     env: Object.freeze(env)
   });
 }
+
+export class InstalledWorkerSessionTransactionError extends Error {
+  constructor(kind) {
+    super(kind === "cleanup"
+      ? "Installed worker session credential cleanup failed."
+      : "Installed worker session proof failed.");
+    this.name = "InstalledWorkerSessionTransactionError";
+    this.kind = kind === "cleanup" ? "cleanup" : "session";
+    this.stack = `${this.name}: ${this.message}`;
+  }
+}
+
+/**
+ * Execute one bounded credential window for an exact provider session.
+ * Callers own the concrete provider commands and boundary checks; this helper
+ * owns their security-sensitive order and guarantees a final credential revoke.
+ */
+export async function runInstalledWorkerSessionCredentialTransaction({
+  mode,
+  deleteAcknowledged = false,
+  stageCredential,
+  authenticate,
+  provePresent,
+  deleteExact,
+  onDeleteAcknowledged,
+  proveAbsent,
+  beforeCredentialRevocation = null,
+  revokeCredential,
+  assertCredentialAbsent
+}) {
+  const required = [
+    stageCredential,
+    authenticate,
+    provePresent,
+    revokeCredential,
+    assertCredentialAbsent
+  ];
+  if (
+    !["observe", "delete"].includes(mode)
+    || typeof deleteAcknowledged !== "boolean"
+    || required.some((callback) => typeof callback !== "function")
+    || (beforeCredentialRevocation != null
+      && typeof beforeCredentialRevocation !== "function")
+    || (mode === "delete" && [deleteExact, onDeleteAcknowledged, proveAbsent]
+      .some((callback) => typeof callback !== "function"))
+  ) {
+    throw new TypeError("Invalid installed worker session transaction.");
+  }
+
+  let credential = null;
+  let acknowledged = deleteAcknowledged;
+  let primaryError = null;
+  let cleanupOk = true;
+  try {
+    credential = await stageCredential();
+    await authenticate(credential);
+    if (mode === "observe") {
+      await provePresent(credential);
+    } else {
+      if (!acknowledged) {
+        await provePresent(credential);
+        if (await deleteExact(credential) !== true) {
+          throw new InstalledWorkerSessionTransactionError("session");
+        }
+        acknowledged = true;
+        await onDeleteAcknowledged();
+      }
+      await proveAbsent(credential);
+    }
+  } catch (error) {
+    primaryError = error;
+  } finally {
+    try {
+      await beforeCredentialRevocation?.();
+    } catch {
+      cleanupOk = false;
+    }
+    try {
+      await revokeCredential(credential);
+    } catch {
+      cleanupOk = false;
+    }
+    try {
+      await assertCredentialAbsent();
+    } catch {
+      cleanupOk = false;
+    }
+  }
+
+  if (!cleanupOk) {
+    throw new InstalledWorkerSessionTransactionError("cleanup");
+  }
+  if (primaryError) throw primaryError;
+  return Object.freeze({ deleteAcknowledged: acknowledged });
+}

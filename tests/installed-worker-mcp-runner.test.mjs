@@ -235,7 +235,83 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   );
   assert.match(
     source,
-    /context\.provider\.taskEnvironment\([\s\S]*?\["models"\][\s\S]*?context\.provider\.parseAdvertisedModels\([\s\S]*?context\.provider\.deleteSession\([\s\S]*?environment\.env/
+    /context\.provider\.taskCredentialEnvironment\([\s\S]*?\["models"\][\s\S]*?context\.provider\.parseAdvertisedModels\(/
+  );
+  assert.match(
+    source,
+    /try \{\s*authenticatedModels = runBounded\([\s\S]*?\["models"\][\s\S]*?\} finally \{\s*refreshSessionCredentialHandle\(environment\);\s*\}/
+  );
+  assert.match(source, /runInstalledWorkerSessionCredentialTransaction\(\{/);
+  assert.match(
+    source,
+    /context\.provider\.taskCredentialEnvironment\([\s\S]*?catch \(error\) \{[\s\S]*?if \(environment\) \{[\s\S]*?environment\.revokeCredential\(\)[\s\S]*?if \(error instanceof QualificationError\) throw error;\s*fail\("E_SESSION"\);/
+  );
+  assert.match(source, /deleteAcknowledged: tracker\.sessionDeleteAcknowledged === true/);
+  assert.match(
+    source,
+    /if \(deleted\?\.ok !== true \|\| deleted\.removed !== true\) fail\("E_SESSION"\);/
+  );
+  assert.match(source, /tracker\.sessionDeleteAcknowledged = true/);
+  assert.match(
+    source,
+    /finally \{\s*if \(deleted\?\.ok === true && deleted\.removed === true\) \{\s*tracker\.sessionDeleteAcknowledged = true;\s*\}\s*refreshSessionCredentialHandle\(environment\);\s*\}/
+  );
+  assert.match(source, /"session-cleanup-credential-revoked"/);
+  const credentialRevocation = source.slice(
+    source.indexOf("function revokeSessionCredential("),
+    source.indexOf("function assertSessionCredentialAbsent(")
+  );
+  assert.match(credentialRevocation, /environment\?\.revokeCredential\(\)/);
+  assert.doesNotMatch(credentialRevocation, /revokeTaskCredential/);
+  assert.match(
+    source,
+    /deleteAndProveSessionAbsent\(context, tracker, \{\s*updateStage: false,\s*timeoutMs: 30_000\s*\}\)/
+  );
+  const presenceTransaction = source.slice(
+    source.indexOf("async function waitForSessionPresence("),
+    source.indexOf("async function deleteAndProveSessionAbsent(")
+  );
+  assert.match(presenceTransaction, /mode: "observe"/);
+  assert.match(
+    presenceTransaction,
+    /"session-presence"[\s\S]*?runSessionCredentialTransaction[\s\S]*?"session-cleanup-credential-revoked"/
+  );
+  const deletionTransaction = source.slice(
+    source.indexOf("async function deleteAndProveSessionAbsent("),
+    source.indexOf("function proveTerminalCleanup(")
+  );
+  assert.ok(
+    deletionTransaction.indexOf("tracker.sessionDeleteAcknowledged = true")
+      < deletionTransaction.indexOf("proveAbsent:"),
+    "delete acknowledgement must be durable in memory before absence proof"
+  );
+  const cancellationScenario = source.slice(
+    source.indexOf("async function runCancellationScenario("),
+    source.indexOf("function privateObservationFor(")
+  );
+  assert.equal(
+    cancellationScenario.match(/waitForSessionPresence\(context, tracker\)/g)?.length,
+    1
+  );
+  assert.equal(
+    cancellationScenario.match(/deleteAndProveSessionAbsent\(context, tracker\)/g)?.length,
+    1
+  );
+  assert.ok(
+    cancellationScenario.indexOf("waitForSessionPresence(context, tracker)")
+      < cancellationScenario.indexOf('enterQualificationStage("cancellation-reconnect")')
+  );
+  assert.ok(
+    cancellationScenario.indexOf('enterQualificationStage("cancellation-cleanup-report")')
+      < cancellationScenario.indexOf("deleteAndProveSessionAbsent(context, tracker)")
+  );
+  assert.match(
+    source,
+    /sameJson\(sessionBoundaryIdentity\(tracker\.sessionBoundary\), identity\)/
+  );
+  assert.match(
+    source,
+    /sameJson\(sessionBoundaryIdentity\(registered\.binding\), identity\)/
   );
   assert.doesNotMatch(
     source,

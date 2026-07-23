@@ -180,16 +180,7 @@ function ensureFreshCachedCredential(source, minimumValidityMs = 45 * 60 * 1000)
   }
 }
 
-function writeReviewCredential(source, destination, { refresh = false } = {}) {
-  if (!refresh && fs.existsSync(destination)) {
-    if (!fs.lstatSync(destination).isFile()) throw new CompanionError("E_STATE", "The isolated Grok credential path is not a regular file.");
-    try {
-      const existing = JSON.parse(fs.readFileSync(destination, "utf8"));
-      const key = Object.values(existing || {}).find((entry) => entry && typeof entry === "object" && typeof entry.key === "string" && entry.key.length >= 16)?.key;
-      if (key) return key;
-    } catch {}
-    throw new CompanionError("E_AUTH_REQUIRED", `The isolated Grok credential is unreadable. Run \`grok login\`, then ${hostCommand("setup")}.`);
-  }
+function isolatedCredentialPayload(source) {
   const stat = fs.statSync(source);
   if (!stat.isFile() || stat.size <= 0 || stat.size > 2 * 1024 * 1024) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication is unavailable. Run \`grok login\`, then ${hostCommand("setup")}.`);
   let parsed;
@@ -200,15 +191,266 @@ function writeReviewCredential(source, destination, { refresh = false } = {}) {
   if (!selected) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication contains no usable session. Run \`grok login\`, then ${hostCommand("setup")}.`);
   const [account, entry] = selected;
   const isolated = { key: entry.key, auth_mode: entry.auth_mode || "oauth", create_time: entry.create_time || new Date().toISOString(), user_id: "", email: "", first_name: "", last_name: "", profile_image_asset_id: "", principal_type: entry.principal_type || "", principal_id: entry.principal_id || "", team_id: entry.team_id || "", coding_data_retention_opt_out: Boolean(entry.coding_data_retention_opt_out), refresh_token: "", expires_at: entry.expires_at || "", oidc_issuer: entry.oidc_issuer || "", oidc_client_id: entry.oidc_client_id || "" };
+  return {
+    key: entry.key,
+    contents: `${JSON.stringify({ [account]: isolated })}\n`
+  };
+}
+
+function writeReviewCredential(source, destination, { refresh = false } = {}) {
+  if (!refresh && fs.existsSync(destination)) {
+    if (!fs.lstatSync(destination).isFile()) throw new CompanionError("E_STATE", "The isolated Grok credential path is not a regular file.");
+    try {
+      const existing = JSON.parse(fs.readFileSync(destination, "utf8"));
+      const key = Object.values(existing || {}).find((entry) => entry && typeof entry === "object" && typeof entry.key === "string" && entry.key.length >= 16)?.key;
+      if (key) return key;
+    } catch {}
+    throw new CompanionError("E_AUTH_REQUIRED", `The isolated Grok credential is unreadable. Run \`grok login\`, then ${hostCommand("setup")}.`);
+  }
+  const payload = isolatedCredentialPayload(source);
   const temporary = `${destination}.tmp-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
   try {
-    fs.writeFileSync(temporary, `${JSON.stringify({ [account]: isolated })}\n`, { mode: 0o600, flag: "wx" });
+    fs.writeFileSync(temporary, payload.contents, { mode: 0o600, flag: "wx" });
     fs.renameSync(temporary, destination);
     fs.chmodSync(destination, 0o600);
   } finally {
     try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== "ENOENT") throw error; }
   }
-  return entry.key;
+  return payload.key;
+}
+
+function existingPrivateDirectoryIdentity(directory) {
+  const resolved = path.resolve(directory);
+  const stat = fs.lstatSync(resolved);
+  if (
+    !stat.isDirectory()
+    || stat.isSymbolicLink()
+    || (stat.mode & 0o077) !== 0
+    || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    || fs.realpathSync(resolved) !== resolved
+  ) {
+    throw new CompanionError("E_STATE", "The isolated task home is unsafe.");
+  }
+  return Object.freeze({
+    path: resolved,
+    device: String(stat.dev),
+    inode: String(stat.ino)
+  });
+}
+
+function directoryIdentityMatches(identity) {
+  try {
+    const current = existingPrivateDirectoryIdentity(identity.path);
+    return current.device === identity.device && current.inode === identity.inode;
+  } catch {
+    return false;
+  }
+}
+
+function sameFileIdentity(left, right) {
+  return left?.device === right?.device && left?.inode === right?.inode;
+}
+
+function privateCredentialIdentity(stat) {
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink?.()
+    || stat.size <= 0
+    || stat.size > 2 * 1024 * 1024
+    || stat.nlink !== 1
+    || (stat.mode & 0o077) !== 0
+    || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+  ) {
+    throw new CompanionError("E_STATE", "The isolated task credential is unsafe.");
+  }
+  return Object.freeze({
+    device: String(stat.dev),
+    inode: String(stat.ino)
+  });
+}
+
+function openPrivateCredentialHandle(authFile) {
+  let descriptor = null;
+  try {
+    const before = fs.lstatSync(authFile);
+    const identity = privateCredentialIdentity(before);
+    descriptor = fs.openSync(
+      authFile,
+      fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0)
+    );
+    const opened = fs.fstatSync(descriptor);
+    const openedIdentity = privateCredentialIdentity(opened);
+    const afterIdentity = privateCredentialIdentity(fs.lstatSync(authFile));
+    if (
+      !sameFileIdentity(identity, openedIdentity)
+      || !sameFileIdentity(identity, afterIdentity)
+    ) {
+      throw new CompanionError("E_STATE", "The isolated task credential changed during binding.");
+    }
+    return { descriptor, identity };
+  } catch (error) {
+    if (descriptor != null) {
+      try { fs.closeSync(descriptor); } catch { /* best-effort */ }
+    }
+    throw error;
+  }
+}
+
+function neutralizeCredentialHandle(handle) {
+  if (!handle || handle.descriptor == null) return;
+  let failure = null;
+  try { fs.ftruncateSync(handle.descriptor, 0); }
+  catch (error) { failure = error; }
+  try { fs.fsyncSync(handle.descriptor); }
+  catch (error) { failure ||= error; }
+  try { fs.closeSync(handle.descriptor); }
+  catch (error) { failure ||= error; }
+  handle.descriptor = null;
+  if (failure) throw failure;
+}
+
+function unlinkIdentityBoundCredential(authFile, directoryIdentities, identity) {
+  if (!directoryIdentities.every(directoryIdentityMatches)) {
+    throw new CompanionError("E_STATE", "The isolated task credential parent changed during cleanup.");
+  }
+  let current;
+  try {
+    current = fs.lstatSync(authFile);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  const currentIdentity = Object.freeze({
+    device: String(current.dev),
+    inode: String(current.ino)
+  });
+  if (
+    !current.isFile()
+    || current.isSymbolicLink()
+    || current.nlink !== 1
+    || (current.mode & 0o077) !== 0
+    || (typeof process.getuid === "function" && current.uid !== process.getuid())
+    || !sameFileIdentity(currentIdentity, identity)
+  ) {
+    throw new CompanionError("E_STATE", "The isolated task credential changed during cleanup.");
+  }
+  const rebound = fs.lstatSync(authFile);
+  if (
+    String(rebound.dev) !== identity.device
+    || String(rebound.ino) !== identity.inode
+  ) {
+    throw new CompanionError("E_STATE", "The isolated task credential changed during cleanup.");
+  }
+  fs.unlinkSync(authFile);
+  try {
+    fs.lstatSync(authFile);
+    throw new CompanionError("E_STATE", "The isolated task credential remained after cleanup.");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+function stageRevocableTaskCredential(source, authFile, directoryIdentities) {
+  const payload = isolatedCredentialPayload(source);
+  const temporary = `${authFile}.tmp-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
+  let handle = null;
+  let published = false;
+  try {
+    const descriptor = fs.openSync(
+      temporary,
+      fs.constants.O_CREAT
+        | fs.constants.O_EXCL
+        | fs.constants.O_RDWR
+        | (fs.constants.O_NOFOLLOW || 0),
+      0o600
+    );
+    handle = { descriptor, identity: null };
+    fs.writeFileSync(descriptor, payload.contents, "utf8");
+    fs.fchmodSync(descriptor, 0o600);
+    fs.fsyncSync(descriptor);
+    handle.identity = privateCredentialIdentity(fs.fstatSync(descriptor));
+    fs.linkSync(temporary, authFile);
+    published = true;
+    fs.unlinkSync(temporary);
+    if (!directoryIdentities.every(directoryIdentityMatches)) {
+      throw new CompanionError("E_STATE", "The isolated task credential parent changed during staging.");
+    }
+    const publishedIdentity = privateCredentialIdentity(fs.lstatSync(authFile));
+    if (!sameFileIdentity(publishedIdentity, handle.identity)) {
+      throw new CompanionError("E_STATE", "The isolated task credential changed during staging.");
+    }
+  } catch (error) {
+    let cleanupFailure = null;
+    try { neutralizeCredentialHandle(handle); }
+    catch (cleanupError) { cleanupFailure = cleanupError; }
+    if (published && handle?.identity) {
+      try { fs.unlinkSync(temporary); }
+      catch (cleanupError) {
+        if (cleanupError?.code !== "ENOENT") cleanupFailure ||= cleanupError;
+      }
+      try {
+        unlinkIdentityBoundCredential(
+          authFile,
+          directoryIdentities,
+          handle.identity
+        );
+      } catch (cleanupError) {
+        cleanupFailure ||= cleanupError;
+      }
+    } else {
+      try { fs.unlinkSync(temporary); }
+      catch (cleanupError) {
+        if (cleanupError?.code !== "ENOENT") cleanupFailure ||= cleanupError;
+      }
+    }
+    if (cleanupFailure) {
+      throw new CompanionError("E_STATE", "The isolated task credential could not be neutralized.");
+    }
+    throw error;
+  }
+
+  let activeHandle = handle;
+  let activeIdentity = handle.identity;
+  let revoked = false;
+  return {
+    key: payload.key,
+    refresh() {
+      if (revoked) {
+        throw new CompanionError("E_STATE", "The isolated task credential was already revoked.");
+      }
+      if (!directoryIdentities.every(directoryIdentityMatches)) {
+        throw new CompanionError("E_STATE", "The isolated task credential parent changed during use.");
+      }
+      const next = openPrivateCredentialHandle(authFile);
+      if (sameFileIdentity(next.identity, activeIdentity)) {
+        fs.closeSync(next.descriptor);
+        return;
+      }
+      const previous = activeHandle;
+      activeHandle = next;
+      activeIdentity = next.identity;
+      neutralizeCredentialHandle(previous);
+    },
+    revoke() {
+      if (revoked) return;
+      let failure = null;
+      const current = activeHandle;
+      activeHandle = null;
+      try { neutralizeCredentialHandle(current); }
+      catch (error) { failure = error; }
+      try {
+        unlinkIdentityBoundCredential(
+          authFile,
+          directoryIdentities,
+          activeIdentity
+        );
+      } catch (error) {
+        failure ||= error;
+      }
+      if (failure) throw failure;
+      revoked = true;
+    }
+  };
 }
 
 export function reviewEnvironment(stateDir, jobMarker, { includeCredential = true } = {}) {
@@ -300,6 +542,70 @@ export function taskEnvironment(stateDir, root, profile, homeMarker = "task") {
     sandboxProfile,
     revokeCredential() {
       try { fs.unlinkSync(authFile); } catch (error) { if (error.code !== "ENOENT") throw error; }
+    }
+  };
+}
+
+/**
+ * Stage only a short-lived credential in an existing isolated task home.
+ * Qualification cleanup uses this after the provider runtime has already
+ * removed its execution credential; it must not rewrite task configuration or
+ * sandbox policy while proving provider-session deletion.
+ */
+export function taskCredentialEnvironment(stateDir, homeMarker = "task") {
+  const lineage = safeMarker(homeMarker);
+  if (!lineage || lineage !== homeMarker) {
+    throw new CompanionError("E_STATE", "A qualified isolated task home is required.");
+  }
+  const home = path.join(stateDir, "task-homes", lineage);
+  const grokHome = path.join(home, ".grok");
+  const directoryIdentities = [home, grokHome]
+    .map(existingPrivateDirectoryIdentity);
+  const authPath = process.env.GROK_AUTH_PATH
+    || path.join(os.homedir(), ".grok", "auth.json");
+  if (!fs.existsSync(authPath)) {
+    throw new CompanionError(
+      "E_AUTH_REQUIRED",
+      `Grok cached authentication is unavailable. Run \`grok login\`, then ${hostCommand("setup")}.`
+    );
+  }
+  ensureFreshCachedCredential(authPath);
+  const authFile = path.join(grokHome, "auth.json");
+  try {
+    fs.lstatSync(authFile);
+    throw new CompanionError("E_STATE", "The isolated task credential was not revoked before staging.");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const credential = stageRevocableTaskCredential(
+    authPath,
+    authFile,
+    directoryIdentities
+  );
+  const knownSecrets = [credential.key];
+  const env = childEnvironment({
+    HOME: home,
+    USERPROFILE: home,
+    GROK_HOME: grokHome,
+    GROK_FOLDER_TRUST: "1",
+    GROK_SUBAGENTS: "0",
+    GROK_MEMORY: "0",
+    GROK_WEB_FETCH: "0",
+    GROK_LSP_TOOLS: "0"
+  });
+  delete env.HOMEDRIVE;
+  delete env.HOMEPATH;
+  delete env.GROK_AUTH_PATH;
+  return {
+    env,
+    home,
+    grokHome,
+    knownSecrets,
+    refreshCredentialHandle() {
+      credential.refresh();
+    },
+    revokeCredential() {
+      credential.revoke();
     }
   };
 }
@@ -1696,9 +2002,33 @@ export async function runStructuredReview(options) {
 }
 
 export function deleteSession(sessionId, binary = null, env = null) {
-  if (!sessionId) return { ok: true };
-  const run = spawnSync(binary || discoverGrok(), ["sessions", "delete", sessionId], { encoding: "utf8", timeout: 10000, shell: false, env: env || childEnvironment() });
-  return { ok: run.status === 0, warning: run.status === 0 ? null : redactText(run.stderr || run.stdout) };
+  if (!sessionId) return { ok: true, removed: false, warning: null };
+  const run = spawnSync(
+    binary || discoverGrok(),
+    ["sessions", "delete", sessionId],
+    {
+      encoding: "utf8",
+      timeout: 10000,
+      maxBuffer: 1024 * 1024,
+      shell: false,
+      env: env || childEnvironment()
+    }
+  );
+  const stdout = String(run.stdout || "");
+  const stderr = String(run.stderr || "");
+  const acknowledged = (
+    run.status === 0
+    && !run.error
+    && !run.signal
+    && stderr === ""
+    && (stdout === `Deleted session ${sessionId}\n`
+      || stdout === `Deleted session ${sessionId}\r\n`)
+  );
+  return {
+    ok: acknowledged,
+    removed: acknowledged,
+    warning: acknowledged ? null : redactText(stderr || stdout)
+  };
 }
 
 function shellWord(value) {

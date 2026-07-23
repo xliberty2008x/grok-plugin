@@ -414,11 +414,15 @@ async function main() {
   }
 
   if (args[0] === "models") {
+    const authFile = process.env.GROK_HOME
+      ? path.join(process.env.GROK_HOME, "auth.json")
+      : null;
     appendLog(effective, {
       event: "models",
       home: process.env.HOME || null,
       userProfile: process.env.USERPROFILE || null,
-      grokHome: process.env.GROK_HOME || null
+      grokHome: process.env.GROK_HOME || null,
+      authExists: Boolean(authFile && fs.existsSync(authFile))
     });
     if (effective.authError) {
       process.stderr.write(effective.authError);
@@ -485,6 +489,10 @@ async function main() {
       event: "sessions-list",
       home: process.env.HOME || null,
       grokHome: process.env.GROK_HOME || null,
+      authExists: Boolean(
+        process.env.GROK_HOME
+        && fs.existsSync(path.join(process.env.GROK_HOME, "auth.json"))
+      ),
       count: visible.length,
       sessionIds: visible.map((entry) => entry.id)
     });
@@ -500,20 +508,34 @@ async function main() {
   }
 
   if (args[0] === "sessions" && args[1] === "delete") {
+    const storeFile = sessionsStoreFile(binary, effective);
+    const store = readJson(storeFile, { sessions: [] });
+    const removed = (store.sessions || []).some(
+      (entry) => entry?.id === args[2]
+    );
     appendLog(effective, {
       event: "delete-session",
       sessionId: args[2] ?? null,
       home: process.env.HOME || null,
-      grokHome: process.env.GROK_HOME || null
+      grokHome: process.env.GROK_HOME || null,
+      authExists: Boolean(
+        process.env.GROK_HOME
+        && fs.existsSync(path.join(process.env.GROK_HOME, "auth.json"))
+      ),
+      removed
     });
-    const storeFile = sessionsStoreFile(binary, effective);
-    const store = readJson(storeFile, { sessions: [] });
-    store.sessions = (store.sessions || []).filter((entry) => entry?.id !== args[2]);
-    writeJson(storeFile, store);
     if (effective.deleteSessionFails) {
       process.stderr.write("delete failed with xai-FAKESECRET000000\n");
       process.exitCode = 1;
+      return;
     }
+    store.sessions = (store.sessions || []).filter((entry) => entry?.id !== args[2]);
+    writeJson(storeFile, store);
+    process.stdout.write(
+      removed
+        ? `Deleted session ${args[2]}\n`
+        : `No session found with id ${args[2]}.\n`
+    );
     return;
   }
 

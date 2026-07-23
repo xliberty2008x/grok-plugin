@@ -30,7 +30,9 @@ import {
   unownedSetupCommandGroupGone
 } from "./lib/installed-worker-mcp-setup-boundary.mjs";
 import {
-  bindInstalledWorkerSessionBoundary
+  InstalledWorkerSessionTransactionError,
+  bindInstalledWorkerSessionBoundary,
+  runInstalledWorkerSessionCredentialTransaction
 } from "./lib/installed-worker-mcp-session-boundary.mjs";
 import { spawnMcpStdioClient } from "./lib/mcp-stdio-client.mjs";
 import {
@@ -149,6 +151,7 @@ const QUALIFICATION_STAGES = new Set([
   "completion-session-presence",
   "completion-session-delete",
   "completion-session-absence",
+  "completion-session-cleanup-credential-revoked",
   "completion-contract",
   "cancellation-mcp-surface",
   "cancellation-spawn",
@@ -195,6 +198,7 @@ const QUALIFICATION_STAGES = new Set([
   "cancellation-session-presence",
   "cancellation-session-delete",
   "cancellation-session-absence",
+  "cancellation-session-cleanup-credential-revoked",
   "cancellation-contract",
   "global-cleanup",
   "installed-recheck",
@@ -2745,6 +2749,7 @@ function createTracker(scenarioId, fixtureStatus) {
       cancelReplay: 0
     },
     sessionPresent: false,
+    sessionDeleteAcknowledged: false,
     sessionDeleted: false,
     providerGuardAbsent: false
   };
@@ -2867,7 +2872,13 @@ function exactPrivateAuthFile(binding) {
     const stat = fs.lstatSync(binding.authFile);
     return stat.isFile()
       && !stat.isSymbolicLink()
-      && (stat.mode & 0o077) === 0;
+      && stat.size > 0
+      && stat.size <= 2 * 1024 * 1024
+      && (stat.mode & 0o077) === 0
+      && (
+        typeof process.getuid !== "function"
+        || stat.uid === process.getuid()
+      );
   } catch {
     return false;
   }
@@ -2884,43 +2895,12 @@ async function waitForSessionCredentialRevocation(context, tracker) {
   fail("E_CLEANUP");
 }
 
-async function waitForSessionPresence(context, tracker) {
-  enterScenarioStage(tracker, "session-binding");
-  bindSessionBoundary(context, tracker);
-  enterScenarioStage(tracker, "session-credential-revoked");
-  await waitForSessionCredentialRevocation(context, tracker);
-  enterScenarioStage(tracker, "session-presence");
-  const deadline = Date.now() + 60_000;
-  while (Date.now() <= deadline) {
-    checkInterrupted(context.runner);
-    const binding = bindSessionBoundary(context, tracker);
-    const observed = context.provider.inspectImportedSessionPresence(
-      tracker.sessionId,
-      context.providerBinary,
-      binding.env,
-      context.fixtureRoot
-    );
-    if (observed?.ok === true && observed.present === true) {
-      tracker.sessionPresent = true;
-      return;
-    }
-    if (observed?.ok !== true) fail("E_SESSION");
-    await new Promise((resolve) => setTimeout(resolve, STATE_POLL_MS));
-  }
-  fail("E_SESSION");
-}
-
-function runAuthenticatedSessionDelete(context, tracker) {
+function stageAuthenticatedSessionCredential(context, tracker) {
   const binding = bindSessionBoundary(context, tracker);
-  const job = tracker.latestJob;
   let environment = null;
-  let deleteOk = false;
-  let cleanupOk = true;
   try {
-    environment = context.provider.taskEnvironment(
+    environment = context.provider.taskCredentialEnvironment(
       binding.stateDirectory,
-      context.fixtureRoot,
-      job.profile,
       binding.homeMarker
     );
     if (
@@ -2929,105 +2909,259 @@ function runAuthenticatedSessionDelete(context, tracker) {
       || environment?.env?.HOME !== binding.home
       || environment?.env?.GROK_HOME !== binding.grokHome
     ) {
-      cleanupOk = false;
-    } else {
-      const rebound = bindSessionBoundary(context, tracker);
-      if (!exactPrivateAuthFile(rebound)) {
-        cleanupOk = false;
-      } else {
-        const authenticatedModels = runBounded(
-          context.providerBinary,
-          ["models"],
-          {
-            cwd: context.fixtureRoot,
-            env: environment.env,
-            timeoutMs: 30_000,
-            code: "E_SESSION"
-          }
-        );
-        const advertised = context.provider.parseAdvertisedModels(
-          authenticatedModels.stdout
-        );
-        if (!Array.isArray(advertised) || advertised.length === 0) {
-          fail("E_SESSION");
-        }
-        const authenticatedBinding = bindSessionBoundary(context, tracker);
-        if (!exactPrivateAuthFile(authenticatedBinding)) {
-          fail("E_CLEANUP");
-        }
-        const deleted = context.provider.deleteSession(
-          tracker.sessionId,
-          context.providerBinary,
-          environment.env
-        );
-        deleteOk = deleted?.ok === true;
+      fail("E_CLEANUP");
+    }
+    const rebound = bindSessionBoundary(context, tracker);
+    if (!exactPrivateAuthFile(rebound)) fail("E_CLEANUP");
+    return environment;
+  } catch (error) {
+    if (environment) {
+      try {
+        environment.revokeCredential();
+      } catch {
+        fail("E_CLEANUP");
       }
     }
-  } catch (error) {
-    deleteOk = false;
-    if (error instanceof QualificationError && error.code === "E_CLEANUP") {
-      cleanupOk = false;
-    }
-  } finally {
-    try {
-      environment?.revokeCredential();
-    } catch {
-      cleanupOk = false;
-    }
-    try {
-      context.provider.revokeTaskCredential(
-        binding.stateDirectory,
-        binding.homeMarker
-      );
-    } catch {
-      cleanupOk = false;
-    }
-    try {
-      const rebound = bindSessionBoundary(context, tracker);
-      if (!exactAuthFileAbsent(rebound)) cleanupOk = false;
-    } catch {
-      cleanupOk = false;
-    }
-  }
-  return Object.freeze({ deleteOk, cleanupOk });
-}
-
-async function deleteAndProveSessionAbsent(context, tracker) {
-  if (!tracker.sessionPresent || !CANONICAL_UUID.test(tracker.sessionId || "")) {
+    if (error instanceof QualificationError) throw error;
     fail("E_SESSION");
   }
-  enterScenarioStage(tracker, "session-binding");
-  bindSessionBoundary(context, tracker);
-  enterScenarioStage(tracker, "session-delete");
-  const deleted = runAuthenticatedSessionDelete(context, tracker);
-  if (deleted.cleanupOk !== true) fail("E_CLEANUP");
-  if (deleted.deleteOk !== true) fail("E_SESSION");
-  enterScenarioStage(tracker, "session-absence");
-  const deadline = Date.now() + 60_000;
+}
+
+function refreshSessionCredentialHandle(environment) {
+  try {
+    environment?.refreshCredentialHandle();
+  } catch (error) {
+    if (error instanceof QualificationError) throw error;
+    fail("E_CLEANUP");
+  }
+}
+
+function authenticateSessionCredential(context, tracker, environment) {
+  const binding = bindSessionBoundary(context, tracker);
+  if (!exactPrivateAuthFile(binding)) fail("E_CLEANUP");
+  let authenticatedModels;
+  try {
+    authenticatedModels = runBounded(
+      context.providerBinary,
+      ["models"],
+      {
+        cwd: context.fixtureRoot,
+        env: binding.env,
+        timeoutMs: 30_000,
+        code: "E_SESSION"
+      }
+    );
+  } finally {
+    refreshSessionCredentialHandle(environment);
+  }
+  const advertised = context.provider.parseAdvertisedModels(
+    authenticatedModels.stdout
+  );
+  if (!Array.isArray(advertised) || advertised.length === 0) fail("E_SESSION");
+  const rebound = bindSessionBoundary(context, tracker);
+  if (!exactPrivateAuthFile(rebound)) fail("E_CLEANUP");
+}
+
+function revokeSessionCredential(context, tracker, environment) {
+  try {
+    environment?.revokeCredential();
+  } catch {
+    throw new Error("credential-revocation-failed");
+  }
+}
+
+function assertSessionCredentialAbsent(context, tracker) {
+  const binding = bindSessionBoundary(context, tracker);
+  if (!exactAuthFileAbsent(binding)) {
+    throw new Error("credential-remained");
+  }
+}
+
+async function runSessionCredentialTransaction(context, tracker, options) {
+  try {
+    return await runInstalledWorkerSessionCredentialTransaction({
+      ...options,
+      stageCredential: () => stageAuthenticatedSessionCredential(
+        context,
+        tracker
+      ),
+      authenticate: (environment) => authenticateSessionCredential(
+        context,
+        tracker,
+        environment
+      ),
+      revokeCredential: (environment) => revokeSessionCredential(
+        context,
+        tracker,
+        environment
+      ),
+      assertCredentialAbsent: () => assertSessionCredentialAbsent(
+        context,
+        tracker
+      )
+    });
+  } catch (error) {
+    if (error instanceof QualificationError) throw error;
+    if (
+      error instanceof InstalledWorkerSessionTransactionError
+      && error.kind === "cleanup"
+    ) {
+      fail("E_CLEANUP");
+    }
+    fail("E_SESSION");
+  }
+}
+
+async function observeSessionPresentWithCredential(
+  context,
+  tracker,
+  environment,
+  timeoutMs
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    checkInterrupted(context.runner);
+    const binding = bindSessionBoundary(context, tracker);
+    if (!exactPrivateAuthFile(binding)) fail("E_CLEANUP");
+    let observed;
+    try {
+      observed = context.provider.inspectImportedSessionPresence(
+        tracker.sessionId,
+        context.providerBinary,
+        binding.env,
+        context.fixtureRoot
+      );
+    } finally {
+      refreshSessionCredentialHandle(environment);
+    }
+    if (observed?.ok === true && observed.present === true) return true;
+    if (observed?.ok !== true) fail("E_SESSION");
+    await new Promise((resolve) => setTimeout(resolve, STATE_POLL_MS));
+  }
+  fail("E_SESSION");
+}
+
+async function proveSessionAbsentWithCredential(
+  context,
+  tracker,
+  environment,
+  timeoutMs
+) {
+  const deadline = Date.now() + timeoutMs;
   let consecutiveAbsenceProofs = 0;
   while (Date.now() <= deadline) {
     checkInterrupted(context.runner);
     const binding = bindSessionBoundary(context, tracker);
-    const observed = context.provider.inspectImportedSessionPresence(
-      tracker.sessionId,
-      context.providerBinary,
-      binding.env,
-      context.fixtureRoot
-    );
+    if (!exactPrivateAuthFile(binding)) fail("E_CLEANUP");
+    let observed;
+    try {
+      observed = context.provider.inspectImportedSessionPresence(
+        tracker.sessionId,
+        context.providerBinary,
+        binding.env,
+        context.fixtureRoot
+      );
+    } finally {
+      refreshSessionCredentialHandle(environment);
+    }
     if (observed?.ok !== true) fail("E_SESSION");
-    if (observed.present === false) {
-      consecutiveAbsenceProofs += 1;
-    } else {
-      consecutiveAbsenceProofs = 0;
-    }
-    if (consecutiveAbsenceProofs >= 2) {
-      tracker.sessionDeleted = true;
-      context.runner.sessions.delete(tracker.sessionId);
-      return;
-    }
+    consecutiveAbsenceProofs = observed.present === false
+      ? consecutiveAbsenceProofs + 1
+      : 0;
+    if (consecutiveAbsenceProofs >= 2) return;
     await new Promise((resolve) => setTimeout(resolve, STATE_POLL_MS));
   }
   fail("E_SESSION");
+}
+
+async function waitForSessionPresence(context, tracker) {
+  enterScenarioStage(tracker, "session-binding");
+  bindSessionBoundary(context, tracker);
+  enterScenarioStage(tracker, "session-credential-revoked");
+  await waitForSessionCredentialRevocation(context, tracker);
+  enterScenarioStage(tracker, "session-presence");
+  await runSessionCredentialTransaction(context, tracker, {
+    mode: "observe",
+    provePresent: (environment) => observeSessionPresentWithCredential(
+      context,
+      tracker,
+      environment,
+      60_000
+    ),
+    beforeCredentialRevocation: () => enterScenarioStage(
+      tracker,
+      "session-cleanup-credential-revoked"
+    )
+  });
+  tracker.sessionPresent = true;
+}
+
+async function deleteAndProveSessionAbsent(context, tracker, {
+  updateStage = true,
+  timeoutMs = 60_000
+} = {}) {
+  if (!CANONICAL_UUID.test(tracker.sessionId || "")) fail("E_SESSION");
+  const enterStage = (stage) => {
+    if (updateStage) enterScenarioStage(tracker, stage);
+  };
+  enterStage("session-binding");
+  bindSessionBoundary(context, tracker);
+  enterStage("session-credential-revoked");
+  await waitForSessionCredentialRevocation(context, tracker);
+  enterStage(tracker.sessionDeleteAcknowledged === true
+    ? "session-absence"
+    : "session-presence");
+  await runSessionCredentialTransaction(context, tracker, {
+    mode: "delete",
+    deleteAcknowledged: tracker.sessionDeleteAcknowledged === true,
+    provePresent: async (environment) => {
+      enterStage("session-presence");
+      await observeSessionPresentWithCredential(
+        context,
+        tracker,
+        environment,
+        timeoutMs
+      );
+      tracker.sessionPresent = true;
+    },
+    deleteExact: (environment) => {
+      enterStage("session-delete");
+      const binding = bindSessionBoundary(context, tracker);
+      if (!exactPrivateAuthFile(binding)) fail("E_CLEANUP");
+      let deleted;
+      try {
+        deleted = context.provider.deleteSession(
+          tracker.sessionId,
+          context.providerBinary,
+          binding.env
+        );
+      } finally {
+        if (deleted?.ok === true && deleted.removed === true) {
+          tracker.sessionDeleteAcknowledged = true;
+        }
+        refreshSessionCredentialHandle(environment);
+      }
+      if (deleted?.ok !== true || deleted.removed !== true) fail("E_SESSION");
+      return true;
+    },
+    onDeleteAcknowledged: () => {
+      tracker.sessionDeleteAcknowledged = true;
+    },
+    proveAbsent: (environment) => {
+      enterStage("session-absence");
+      return proveSessionAbsentWithCredential(
+        context,
+        tracker,
+        environment,
+        timeoutMs
+      );
+    },
+    beforeCredentialRevocation: () => enterStage(
+      "session-cleanup-credential-revoked"
+    )
+  });
+  tracker.sessionDeleted = true;
+  context.runner.sessions.delete(tracker.sessionId);
 }
 
 function proveTerminalCleanup(context, tracker, expectedStatus) {
@@ -3277,7 +3411,6 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   }
   enterQualificationStage("completion-session-id");
   if (!tracker.sessionId) fail("E_SESSION");
-  await waitForSessionPresence(context, tracker);
   await deleteAndProveSessionAbsent(context, tracker);
 
   const publicEvidence = {
@@ -3891,56 +4024,10 @@ async function emergencyCleanup(runner) {
       }
       const { context, tracker } = entry;
       try {
-        const binding = bindSessionBoundary(context, tracker);
-        let observed = runner.provider.inspectImportedSessionPresence(
-          sessionId,
-          runner.providerBinary,
-          binding.env,
-          context.fixtureRoot
-        );
-        if (observed?.ok !== true) {
-          clean = false;
-          continue;
-        }
-        if (observed.present !== true) {
-          clean = false;
-          continue;
-        }
-        tracker.sessionPresent = true;
-        const deletion = runAuthenticatedSessionDelete(context, tracker);
-        if (deletion.cleanupOk !== true || deletion.deleteOk !== true) {
-          clean = false;
-          continue;
-        }
-        const deadline = Date.now() + 30_000;
-        let consecutiveAbsenceProofs = 0;
-        while (Date.now() <= deadline && consecutiveAbsenceProofs < 2) {
-          await new Promise((resolve) => setTimeout(resolve, STATE_POLL_MS));
-          const rebound = bindSessionBoundary(context, tracker);
-          observed = runner.provider.inspectImportedSessionPresence(
-            sessionId,
-            runner.providerBinary,
-            rebound.env,
-            context.fixtureRoot
-          );
-          if (observed?.ok !== true) {
-            clean = false;
-            break;
-          }
-          consecutiveAbsenceProofs = observed.present === false
-            ? consecutiveAbsenceProofs + 1
-            : 0;
-        }
-        if (
-          observed?.ok === true
-          && observed.present === false
-          && consecutiveAbsenceProofs >= 2
-        ) {
-          tracker.sessionDeleted = true;
-          runner.sessions.delete(sessionId);
-        } else {
-          clean = false;
-        }
+        await deleteAndProveSessionAbsent(context, tracker, {
+          updateStage: false,
+          timeoutMs: 30_000
+        });
       } catch {
         clean = false;
       }
