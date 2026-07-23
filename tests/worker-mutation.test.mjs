@@ -116,6 +116,36 @@ function spawnIdempotencyFile(root, key, env) {
   return path.join(workspaceState(root, env), "idempotency", "spawn", `${keyDigest}.json`);
 }
 
+function canonicalize(value) {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => canonicalize(item));
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .filter((key) => value[key] !== undefined)
+      .map((key) => [key, canonicalize(value[key])])
+  );
+}
+
+function stableDigest(value) {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(canonicalize(value)))
+    .digest("hex");
+}
+
+function spawnResponseWitnessBody(witness) {
+  const { witnessId: _witnessId, ...body } = witness;
+  return body;
+}
+
+function refreshSpawnWitnessId(record) {
+  record.responseWitness.witnessId = `spawnw-${
+    stableDigest(spawnResponseWitnessBody(record.responseWitness)).slice(0, 24)
+  }`;
+  return record;
+}
+
 function providerGuardFile(root, marker) {
   const scopeDigest = crypto.createHash("sha256").update(gitCommonDir(root)).digest("hex");
   const guardRoot = path.join(
@@ -128,12 +158,13 @@ function providerGuardFile(root, marker) {
 test("spawn commits durable job without provider launch; retry is idempotent", () => {
   const root = initRepo();
   const { env } = envFor(root);
+  const idempotencyKey = "spawn-key-0001";
   const envelope = buildTaskEnvelope({ userRequest: "Inspect package.json", mode: "read" });
   const first = spawnReadOnlyWorker({
     root,
     principal: principal(root),
     envelope,
-    idempotencyKey: "spawn-key-0001",
+    idempotencyKey,
     env
   });
   assert.equal(first.replayed, false);
@@ -142,20 +173,136 @@ test("spawn commits durable job without provider launch; retry is idempotent", (
   assert.equal(first.handle.externalWorkerLabel, "external-grok-worker");
   assert.equal(first.providerLaunched, false);
 
+  const firstRecord = JSON.parse(
+    fs.readFileSync(spawnIdempotencyFile(root, idempotencyKey, env), "utf8")
+  );
+  assert.deepEqual(Object.keys(firstRecord).sort(), [
+    "committedAt",
+    "controlWorkspaceId",
+    "executionRoot",
+    "idempotencyKeyDigest",
+    "launchContractDigest",
+    "owner",
+    "requestDigest",
+    "responseWitness",
+    "schemaVersion",
+    "workerId"
+  ]);
+  assert.equal(firstRecord.schemaVersion, 4);
+  assert.deepEqual(Object.keys(firstRecord.responseWitness).sort(), [
+    "eventCursorSequence",
+    "handleDigest",
+    "idempotencyKeyDigest",
+    "projection",
+    "recordedAt",
+    "replayed",
+    "requestDigest",
+    "responseSequence",
+    "schemaVersion",
+    "witnessId",
+    "workerId"
+  ]);
+  assert.equal(firstRecord.responseWitness.schemaVersion, 1);
+  assert.equal(firstRecord.responseWitness.projection, "worker-handle-v1-untrusted-host");
+  assert.equal(firstRecord.responseWitness.responseSequence, 1);
+  assert.equal(firstRecord.responseWitness.workerId, first.handle.id);
+  assert.equal(firstRecord.responseWitness.requestDigest, firstRecord.requestDigest);
+  assert.equal(
+    firstRecord.responseWitness.idempotencyKeyDigest,
+    crypto.createHash("sha256").update(idempotencyKey).digest("hex")
+  );
+  assert.equal(firstRecord.responseWitness.replayed, false);
+  assert.equal(firstRecord.responseWitness.handleDigest, stableDigest(first.handle));
+  assert.equal(
+    firstRecord.responseWitness.eventCursorSequence,
+    first.handle.eventCursor.sequence
+  );
+  assert.equal(
+    new Date(firstRecord.responseWitness.recordedAt).toISOString(),
+    firstRecord.responseWitness.recordedAt
+  );
+  assert.equal(
+    firstRecord.responseWitness.witnessId,
+    `spawnw-${stableDigest(spawnResponseWitnessBody(firstRecord.responseWitness)).slice(0, 24)}`
+  );
+
   const second = spawnReadOnlyWorker({
     root,
     principal: principal(root),
     envelope,
-    idempotencyKey: "spawn-key-0001",
+    idempotencyKey,
     env
   });
   assert.equal(second.replayed, true);
   assert.equal(second.handle.id, first.handle.id);
   assert.equal(second.providerLaunched, false);
 
+  const secondRecord = JSON.parse(
+    fs.readFileSync(spawnIdempotencyFile(root, idempotencyKey, env), "utf8")
+  );
+  assert.equal(secondRecord.schemaVersion, 4);
+  assert.equal(secondRecord.responseWitness.responseSequence, 2);
+  assert.equal(secondRecord.responseWitness.replayed, true);
+  assert.equal(secondRecord.responseWitness.handleDigest, stableDigest(second.handle));
+  assert.equal(
+    secondRecord.responseWitness.eventCursorSequence,
+    second.handle.eventCursor.sequence
+  );
+  assert.equal(
+    secondRecord.responseWitness.witnessId,
+    `spawnw-${stableDigest(spawnResponseWitnessBody(secondRecord.responseWitness)).slice(0, 24)}`
+  );
+
   const job = tryReadJob(root, first.handle.id, env);
   assert.ok(job);
   assert.equal(job.host.sessionId, THREAD);
+});
+
+test("spawn replay projects the transaction-time job without host verification claims", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const envelope = buildTaskEnvelope({
+    userRequest: "Inspect replay projection authority",
+    mode: "read"
+  });
+  const first = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey: "spawn-replay-projection-0001",
+    env
+  });
+
+  updateJob(root, first.handle.id, (job) => ({
+    ...job,
+    summary: "Host verification passed",
+    progress: "Host verification passed after durable admission"
+  }), env);
+
+  const replay = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey: "spawn-replay-projection-0001",
+    env
+  });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.handle.id, first.handle.id);
+  assert.equal(replay.handle.eventCursor.sequence, 1);
+  assert.equal(replay.handle.summary, null);
+  assert.equal(replay.handle.progress, null);
+  assert.equal(JSON.stringify(replay.handle).includes("Host verification passed"), false);
+  const record = JSON.parse(
+    fs.readFileSync(
+      spawnIdempotencyFile(root, "spawn-replay-projection-0001", env),
+      "utf8"
+    )
+  );
+  assert.equal(record.responseWitness.handleDigest, stableDigest(replay.handle));
+  assert.equal(
+    JSON.stringify(record.responseWitness).includes("Host verification passed"),
+    false
+  );
 });
 
 test("spawn validates and canonically rebinds TaskEnvelope identity to trusted context", () => {
@@ -293,6 +440,43 @@ test("spawn idempotency binds the exact owner and complete request without leaki
   );
 });
 
+test("spawn orphan recovery writes an authentic replay response witness without duplicating the job", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const envelope = buildTaskEnvelope({ userRequest: "Recover orphaned spawn response", mode: "read" });
+  const idempotencyKey = "spawn-orphan-witness-0001";
+  const first = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey,
+    env
+  });
+  fs.rmSync(spawnIdempotencyFile(root, idempotencyKey, env));
+
+  const recovered = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey,
+    env
+  });
+  assert.equal(recovered.replayed, true);
+  assert.equal(recovered.handle.id, first.handle.id);
+  const record = JSON.parse(
+    fs.readFileSync(spawnIdempotencyFile(root, idempotencyKey, env), "utf8")
+  );
+  assert.equal(record.schemaVersion, 4);
+  assert.equal(record.responseWitness.responseSequence, 1);
+  assert.equal(record.responseWitness.replayed, true);
+  assert.equal(record.responseWitness.handleDigest, stableDigest(recovered.handle));
+  assert.equal(
+    record.responseWitness.witnessId,
+    `spawnw-${stableDigest(spawnResponseWitnessBody(record.responseWitness)).slice(0, 24)}`
+  );
+  assert.equal(listJobs(root, env).length, 1);
+});
+
 test("spawn idempotency requires one unique durable digest owner with and without its adjacent record", () => {
   const root = initRepo();
   const { env } = envFor(root);
@@ -360,7 +544,7 @@ test("spawn idempotency replay cross-checks its durable job binding", () => {
   });
   const file = spawnIdempotencyFile(root, idempotencyKey, env);
   const record = JSON.parse(fs.readFileSync(file, "utf8"));
-  assert.equal(record.schemaVersion, 3);
+  assert.equal(record.schemaVersion, 4);
   record.committedAt = new Date(Date.parse(record.committedAt) + 1000).toISOString();
   fs.writeFileSync(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
 
@@ -376,6 +560,144 @@ test("spawn idempotency replay cross-checks its durable job binding", () => {
       && !String(error.message).includes(first.handle.id)
   );
   assert.equal(listJobs(root, env).length, 1);
+});
+
+test("spawn idempotency migrates an exact legacy schema 3 record on replay", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const envelope = buildTaskEnvelope({ userRequest: "Migrate legacy spawn witness", mode: "read" });
+  const idempotencyKey = "spawn-legacy-witness-0001";
+  const first = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey,
+    env
+  });
+  const file = spawnIdempotencyFile(root, idempotencyKey, env);
+  const current = JSON.parse(fs.readFileSync(file, "utf8"));
+  const { responseWitness: _responseWitness, ...legacy } = current;
+  legacy.schemaVersion = 3;
+  fs.writeFileSync(file, `${JSON.stringify(legacy)}\n`, { mode: 0o600 });
+
+  const replay = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey,
+    env
+  });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.handle.id, first.handle.id);
+  const migrated = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(migrated.schemaVersion, 4);
+  assert.equal(migrated.responseWitness.responseSequence, 1);
+  assert.equal(migrated.responseWitness.replayed, true);
+  assert.equal(migrated.responseWitness.handleDigest, stableDigest(replay.handle));
+  assert.equal(
+    migrated.responseWitness.eventCursorSequence,
+    replay.handle.eventCursor.sequence
+  );
+  assert.equal(listJobs(root, env).length, 1);
+});
+
+test("spawn idempotency fails closed on corrupt response-witness fields, identity, and digest", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const envelope = buildTaskEnvelope({ userRequest: "Reject corrupt spawn witness", mode: "read" });
+  const idempotencyKey = "spawn-corrupt-witness-0001";
+  const first = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey,
+    env
+  });
+  const file = spawnIdempotencyFile(root, idempotencyKey, env);
+  const original = JSON.parse(fs.readFileSync(file, "utf8"));
+  const corruptions = [
+    (record) => { record.responseWitness.unsupportedAuthority = true; },
+    (record) => { record.responseWitness.projection = "worker-handle-v1-host-trusted"; },
+    (record) => { record.responseWitness.responseSequence = 0; },
+    (record) => { record.responseWitness.workerId = `task-${"0".repeat(16)}`; },
+    (record) => { record.responseWitness.requestDigest = "0".repeat(64); },
+    (record) => { record.responseWitness.idempotencyKeyDigest = "0".repeat(64); },
+    (record) => { record.responseWitness.replayed = "false"; },
+    (record) => { record.responseWitness.handleDigest = "0".repeat(64); },
+    (record) => { record.responseWitness.eventCursorSequence = -1; },
+    (record) => { record.responseWitness.recordedAt = "2026-07-23T00:00:00Z"; },
+    (record) => { record.responseWitness.witnessId = `spawnw-${"0".repeat(24)}`; }
+  ];
+
+  for (const corrupt of corruptions) {
+    const record = structuredClone(original);
+    corrupt(record);
+    fs.writeFileSync(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    assert.throws(
+      () => spawnReadOnlyWorker({
+        root,
+        principal: principal(root),
+        envelope,
+        idempotencyKey,
+        env
+      }),
+      (error) => error?.code === "E_STATE"
+        && !String(error.message).includes(first.handle.id)
+    );
+    assert.equal(listJobs(root, env).length, 1);
+  }
+});
+
+test("spawn response witness rejects noncausal time and sequence overflow before rewriting", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const envelope = buildTaskEnvelope({ userRequest: "Bound spawn witness chronology", mode: "read" });
+  const idempotencyKey = "spawn-witness-chronology-0001";
+  const first = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey,
+    env
+  });
+  const file = spawnIdempotencyFile(root, idempotencyKey, env);
+  const original = JSON.parse(fs.readFileSync(file, "utf8"));
+  const cases = [
+    (record) => {
+      record.responseWitness.recordedAt = new Date(
+        Date.parse(record.committedAt) - 1
+      ).toISOString();
+      refreshSpawnWitnessId(record);
+    },
+    (record) => {
+      record.responseWitness.recordedAt = new Date(Date.now() + 86_400_000).toISOString();
+      refreshSpawnWitnessId(record);
+    },
+    (record) => {
+      record.responseWitness.responseSequence = Number.MAX_SAFE_INTEGER;
+      record.responseWitness.replayed = true;
+      refreshSpawnWitnessId(record);
+    }
+  ];
+
+  for (const mutate of cases) {
+    const corrupt = structuredClone(original);
+    mutate(corrupt);
+    fs.writeFileSync(file, `${JSON.stringify(corrupt)}\n`, { mode: 0o600 });
+    assert.throws(
+      () => spawnReadOnlyWorker({
+        root,
+        principal: principal(root),
+        envelope,
+        idempotencyKey,
+        env
+      }),
+      (error) => error?.code === "E_STATE"
+        && !String(error.message).includes(first.handle.id)
+    );
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), corrupt);
+    assert.equal(listJobs(root, env).length, 1);
+  }
 });
 
 test("spawn idempotency replay rejects a launch-contract-corrupted durable job without a handle", () => {

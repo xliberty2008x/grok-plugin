@@ -212,6 +212,9 @@ export function createWorkerService({
       // once more at that exact boundary: if readiness changed while the job
       // was being committed, preserve the pending outbox for a later valid
       // worker_wait/supervisor pass and report that no provider was started.
+      // Keep admitted.handle as the stable transaction-time snapshot even when
+      // dispatch advances the private job synchronously; launch observation is
+      // reported only via providerLaunchState / providerLaunched.
       const mayLaunch = typeof providerCapabilityDigest !== "string"
         || currentCapabilityDigest() === providerCapabilityDigest;
       const launch = mayLaunch
@@ -222,14 +225,12 @@ export function createWorkerService({
           env
         })
         : null;
-      const latest = readJob(root, admitted.handle.id, env);
+      const launchState = launch?.providerLaunchState
+        || providerLaunchState(readJob(root, admitted.handle.id, env));
       return {
         ...admitted,
-        handle: latest
-          ? projectWorkerHandle(latest, { trustHostAuthority: false })
-          : admitted.handle,
-        providerLaunchState: launch?.providerLaunchState
-          || providerLaunchState(latest),
+        handle: admitted.handle,
+        providerLaunchState: launchState,
         providerLaunched: launch?.providerLaunched === true
       };
     },

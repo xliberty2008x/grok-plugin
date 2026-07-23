@@ -22,7 +22,6 @@ import {
   now,
   readPrivateJsonFile,
   requestCancel,
-  tryReadJob,
   writePrivateJsonFile,
   ensurePrivateStateDirectory,
   withWorkspaceStateTransaction
@@ -533,8 +532,12 @@ function assertDispatchLifecycleContract(job, dispatch) {
 const MAX_CANCELLATION_RECOVERY_RECORDS = 32;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const CONTROL_WORKSPACE_ID = /^cws-[0-9a-f]{32}$/;
-const SPAWN_IDEMPOTENCY_SCHEMA_VERSION = 3;
-const SPAWN_IDEMPOTENCY_KEYS = new Set([
+const LEGACY_SPAWN_IDEMPOTENCY_SCHEMA_VERSION = 3;
+const SPAWN_IDEMPOTENCY_SCHEMA_VERSION = 4;
+const SPAWN_RESPONSE_WITNESS_SCHEMA_VERSION = 1;
+const SPAWN_RESPONSE_WITNESS_PROJECTION = "worker-handle-v1-untrusted-host";
+const SPAWN_RESPONSE_WITNESS_ID = /^spawnw-[0-9a-f]{24}$/;
+const LEGACY_SPAWN_IDEMPOTENCY_KEYS = new Set([
   "schemaVersion",
   "workerId",
   "owner",
@@ -545,7 +548,24 @@ const SPAWN_IDEMPOTENCY_KEYS = new Set([
   "idempotencyKeyDigest",
   "committedAt"
 ]);
+const SPAWN_IDEMPOTENCY_KEYS = new Set([
+  ...LEGACY_SPAWN_IDEMPOTENCY_KEYS,
+  "responseWitness"
+]);
 const SPAWN_IDEMPOTENCY_OWNER_KEYS = new Set(["hostKind", "sessionId"]);
+const SPAWN_RESPONSE_WITNESS_KEYS = new Set([
+  "schemaVersion",
+  "witnessId",
+  "projection",
+  "responseSequence",
+  "workerId",
+  "requestDigest",
+  "idempotencyKeyDigest",
+  "replayed",
+  "handleDigest",
+  "eventCursorSequence",
+  "recordedAt"
+]);
 const CANCELLATION_RECEIPT_STATUSES = new Set([
   "accepted",
   "already_cancelled",
@@ -829,10 +849,67 @@ function spawnIdempotencyStateError(message) {
   throw new CompanionError("E_STATE", message);
 }
 
+function spawnResponseWitnessBody(witness) {
+  return {
+    schemaVersion: witness.schemaVersion,
+    projection: witness.projection,
+    responseSequence: witness.responseSequence,
+    workerId: witness.workerId,
+    requestDigest: witness.requestDigest,
+    idempotencyKeyDigest: witness.idempotencyKeyDigest,
+    replayed: witness.replayed,
+    handleDigest: witness.handleDigest,
+    eventCursorSequence: witness.eventCursorSequence,
+    recordedAt: witness.recordedAt
+  };
+}
+
+function normalizeSpawnResponseWitness(witness, { record, keyDigest }) {
+  if (!isPlainRecord(witness)
+    || Object.keys(witness).length !== SPAWN_RESPONSE_WITNESS_KEYS.size
+    || Object.keys(witness).some((key) => !SPAWN_RESPONSE_WITNESS_KEYS.has(key))) {
+    spawnIdempotencyStateError("Spawn response witness is malformed.");
+  }
+  if (witness.schemaVersion !== SPAWN_RESPONSE_WITNESS_SCHEMA_VERSION
+    || !SPAWN_RESPONSE_WITNESS_ID.test(witness.witnessId || "")
+    || witness.projection !== SPAWN_RESPONSE_WITNESS_PROJECTION
+    || !Number.isSafeInteger(witness.responseSequence)
+    || witness.responseSequence < 1
+    || witness.workerId !== record.workerId
+    || witness.requestDigest !== record.requestDigest
+    || witness.idempotencyKeyDigest !== record.idempotencyKeyDigest
+    || witness.idempotencyKeyDigest !== keyDigest
+    || typeof witness.replayed !== "boolean"
+    || !SHA256_HEX.test(witness.handleDigest || "")
+    || !Number.isSafeInteger(witness.eventCursorSequence)
+    || witness.eventCursorSequence < 0
+    || !validIsoTimestamp(witness.recordedAt)
+    || Date.parse(witness.recordedAt) < Date.parse(record.committedAt)
+    || (witness.responseSequence > 1 && witness.replayed !== true)) {
+    spawnIdempotencyStateError("Spawn response witness binding is malformed.");
+  }
+  const expectedWitnessId = `spawnw-${stableDigest(spawnResponseWitnessBody(witness)).slice(0, 24)}`;
+  if (witness.witnessId !== expectedWitnessId) {
+    spawnIdempotencyStateError("Spawn response witness identity is malformed.");
+  }
+  return Object.freeze({
+    witnessId: witness.witnessId,
+    ...spawnResponseWitnessBody(witness)
+  });
+}
+
 function normalizeSpawnIdempotencyRecord(record, { keyDigest }) {
-  if (!isPlainRecord(record)
-    || Object.keys(record).length !== SPAWN_IDEMPOTENCY_KEYS.size
-    || Object.keys(record).some((key) => !SPAWN_IDEMPOTENCY_KEYS.has(key))) {
+  if (!isPlainRecord(record)) {
+    spawnIdempotencyStateError("Spawn idempotency record is malformed.");
+  }
+  const expectedKeys = record.schemaVersion === LEGACY_SPAWN_IDEMPOTENCY_SCHEMA_VERSION
+    ? LEGACY_SPAWN_IDEMPOTENCY_KEYS
+    : record.schemaVersion === SPAWN_IDEMPOTENCY_SCHEMA_VERSION
+      ? SPAWN_IDEMPOTENCY_KEYS
+      : null;
+  if (!expectedKeys
+    || Object.keys(record).length !== expectedKeys.size
+    || Object.keys(record).some((key) => !expectedKeys.has(key))) {
     spawnIdempotencyStateError("Spawn idempotency record is malformed.");
   }
   if (!isPlainRecord(record.owner)
@@ -840,8 +917,7 @@ function normalizeSpawnIdempotencyRecord(record, { keyDigest }) {
     || Object.keys(record.owner).some((key) => !SPAWN_IDEMPOTENCY_OWNER_KEYS.has(key))) {
     spawnIdempotencyStateError("Spawn idempotency owner binding is malformed.");
   }
-  if (record.schemaVersion !== SPAWN_IDEMPOTENCY_SCHEMA_VERSION
-    || typeof record.workerId !== "string"
+  if (typeof record.workerId !== "string"
     || !record.workerId
     || record.workerId.length > 256
     || typeof record.owner.hostKind !== "string"
@@ -861,7 +937,20 @@ function normalizeSpawnIdempotencyRecord(record, { keyDigest }) {
     || !validIsoTimestamp(record.committedAt)) {
     spawnIdempotencyStateError("Spawn idempotency binding is malformed.");
   }
-  return record;
+  if (record.schemaVersion === SPAWN_IDEMPOTENCY_SCHEMA_VERSION) {
+    return Object.freeze({
+      ...record,
+      owner: Object.freeze({ ...record.owner }),
+      responseWitness: normalizeSpawnResponseWitness(record.responseWitness, {
+        record,
+        keyDigest
+      })
+    });
+  }
+  return Object.freeze({
+    ...record,
+    owner: Object.freeze({ ...record.owner })
+  });
 }
 
 function spawnRequestOwner(principal) {
@@ -871,7 +960,49 @@ function spawnRequestOwner(principal) {
   };
 }
 
-function buildSpawnIdempotencyRecord({ job, keyDigest }) {
+function buildSpawnResponseWitness({
+  job,
+  keyDigest,
+  replayed,
+  responseSequence,
+  recordedAt = now()
+}) {
+  const handle = projectWorkerHandle(job, { trustHostAuthority: false });
+  const eventCursorSequence = handle?.eventCursor?.sequence;
+  if (!Number.isSafeInteger(eventCursorSequence) || eventCursorSequence < 0) {
+    spawnIdempotencyStateError("Spawn response handle cursor is malformed.");
+  }
+  const body = {
+    schemaVersion: SPAWN_RESPONSE_WITNESS_SCHEMA_VERSION,
+    projection: SPAWN_RESPONSE_WITNESS_PROJECTION,
+    responseSequence,
+    workerId: job.id,
+    requestDigest: job.request?.spawn?.requestDigest,
+    idempotencyKeyDigest: keyDigest,
+    replayed,
+    handleDigest: stableDigest(handle),
+    eventCursorSequence,
+    recordedAt
+  };
+  return {
+    handle,
+    responseWitness: {
+      schemaVersion: body.schemaVersion,
+      witnessId: `spawnw-${stableDigest(body).slice(0, 24)}`,
+      projection: body.projection,
+      responseSequence: body.responseSequence,
+      workerId: body.workerId,
+      requestDigest: body.requestDigest,
+      idempotencyKeyDigest: body.idempotencyKeyDigest,
+      replayed: body.replayed,
+      handleDigest: body.handleDigest,
+      eventCursorSequence: body.eventCursorSequence,
+      recordedAt: body.recordedAt
+    }
+  };
+}
+
+function buildSpawnIdempotencyRecord({ job, keyDigest, responseWitness }) {
   return {
     schemaVersion: SPAWN_IDEMPOTENCY_SCHEMA_VERSION,
     workerId: job.id,
@@ -884,11 +1015,12 @@ function buildSpawnIdempotencyRecord({ job, keyDigest }) {
     requestDigest: job.request.spawn.requestDigest,
     launchContractDigest: launchContractDigest(job),
     idempotencyKeyDigest: keyDigest,
-    committedAt: job.createdAt
+    committedAt: job.createdAt,
+    responseWitness
   };
 }
 
-function assertSpawnIdempotencyJobBinding(record, job, { keyDigest }) {
+function assertSpawnIdempotencyJobBinding(record, job, { keyDigest, responseHandle = null }) {
   if (!job
     || record.workerId !== job.id
     || record.owner.hostKind !== job.host?.kind
@@ -902,7 +1034,48 @@ function assertSpawnIdempotencyJobBinding(record, job, { keyDigest }) {
     || record.committedAt !== job.createdAt) {
     spawnIdempotencyStateError("Spawn idempotency record disagrees with its durable job.");
   }
+  if (record.schemaVersion === SPAWN_IDEMPOTENCY_SCHEMA_VERSION) {
+    const witness = normalizeSpawnResponseWitness(record.responseWitness, { record, keyDigest });
+    const currentHandle = projectWorkerHandle(job, { trustHostAuthority: false });
+    const currentCursorSequence = currentHandle?.eventCursor?.sequence;
+    if (!Number.isSafeInteger(currentCursorSequence)
+      || currentCursorSequence < witness.eventCursorSequence) {
+      spawnIdempotencyStateError("Spawn response witness cursor disagrees with its durable job.");
+    }
+    if (responseHandle !== null
+      && (stableDigest(responseHandle) !== witness.handleDigest
+        || responseHandle?.id !== job.id
+        || responseHandle?.eventCursor?.sequence !== witness.eventCursorSequence
+        || stableDigest(currentHandle) !== witness.handleDigest)) {
+      spawnIdempotencyStateError("Spawn response witness digest disagrees with its captured handle.");
+    }
+  }
   return job;
+}
+
+function captureSpawnResponse({
+  job,
+  keyDigest,
+  replayed,
+  responseSequence,
+  recordedAt = now()
+}) {
+  if (!Number.isSafeInteger(responseSequence) || responseSequence < 1) {
+    spawnIdempotencyStateError("Spawn response sequence is malformed.");
+  }
+  const { handle, responseWitness } = buildSpawnResponseWitness({
+    job,
+    keyDigest,
+    replayed,
+    responseSequence,
+    recordedAt
+  });
+  const record = normalizeSpawnIdempotencyRecord(
+    buildSpawnIdempotencyRecord({ job, keyDigest, responseWitness }),
+    { keyDigest }
+  );
+  assertSpawnIdempotencyJobBinding(record, job, { keyDigest, responseHandle: handle });
+  return Object.freeze({ handle, record });
 }
 
 /**
@@ -3677,7 +3850,27 @@ export function spawnReadOnlyWorker({
         && committed.request?.spawn?.providerCapabilityDigest !== providerCapabilityDigest) {
         throw new CompanionError("E_CONTEXT_DRIFT", "Provider capability changed since durable worker admission.");
       }
-      return { committed, replayed: true };
+      if (record.schemaVersion === SPAWN_IDEMPOTENCY_SCHEMA_VERSION
+        && record.responseWitness.responseSequence === Number.MAX_SAFE_INTEGER) {
+        spawnIdempotencyStateError("Spawn response sequence cannot be incremented safely.");
+      }
+      const responseSequence = record.schemaVersion === SPAWN_IDEMPOTENCY_SCHEMA_VERSION
+        ? record.responseWitness.responseSequence + 1
+        : 1;
+      const recordedAt = now();
+      if (record.schemaVersion === SPAWN_IDEMPOTENCY_SCHEMA_VERSION
+        && Date.parse(recordedAt) < Date.parse(record.responseWitness.recordedAt)) {
+        spawnIdempotencyStateError("Spawn response witness time moved backwards.");
+      }
+      const captured = captureSpawnResponse({
+        job: committed,
+        keyDigest,
+        replayed: true,
+        responseSequence,
+        recordedAt
+      });
+      writeIdempotency(root, "spawn", idempotencyKey, captured.record, env);
+      return { committed, handle: captured.handle, replayed: true };
     }
 
     // Recover a commit whose adjacent idempotency publication was interrupted.
@@ -3703,11 +3896,14 @@ export function spawnReadOnlyWorker({
         && orphan.request?.spawn?.providerCapabilityDigest !== providerCapabilityDigest) {
         throw new CompanionError("E_CONTEXT_DRIFT", "Provider capability changed since durable worker admission.");
       }
-      const record = buildSpawnIdempotencyRecord({ job: orphan, keyDigest });
-      normalizeSpawnIdempotencyRecord(record, { keyDigest });
-      assertSpawnIdempotencyJobBinding(record, orphan, { keyDigest });
-      writeIdempotency(root, "spawn", idempotencyKey, record, env);
-      return { committed: orphan, replayed: true };
+      const captured = captureSpawnResponse({
+        job: orphan,
+        keyDigest,
+        replayed: true,
+        responseSequence: 1
+      });
+      writeIdempotency(root, "spawn", idempotencyKey, captured.record, env);
+      return { committed: orphan, handle: captured.handle, replayed: true };
     }
 
     const id = generateId("task");
@@ -3779,16 +3975,21 @@ export function spawnReadOnlyWorker({
     });
 
     const committed = transaction.admitJob(job);
-    const record = buildSpawnIdempotencyRecord({ job: committed, keyDigest });
-    normalizeSpawnIdempotencyRecord(record, { keyDigest });
-    assertSpawnIdempotencyJobBinding(record, committed, { keyDigest });
-    writeIdempotency(root, "spawn", idempotencyKey, record, env);
-    return { committed, replayed: false };
+    const captured = captureSpawnResponse({
+      job: committed,
+      keyDigest,
+      replayed: false,
+      responseSequence: 1
+    });
+    writeIdempotency(root, "spawn", idempotencyKey, captured.record, env);
+    return { committed, handle: captured.handle, replayed: false };
   }, env);
 
-  const finalCommitted = tryReadJob(root, admitted.committed.id, env) || admitted.committed;
+  // Return the exact handle captured and witnessed inside the transaction. A
+  // later reread would observe moving active state (dispatch claim, provider
+  // launch) and replace this durable response boundary with a TOCTOU race.
   return {
-    handle: projectWorkerHandle(finalCommitted),
+    handle: admitted.handle,
     replayed: admitted.replayed,
     spawnSuccessDefinition: SPAWN_SUCCESS_DEFINITION,
     providerLaunched: false

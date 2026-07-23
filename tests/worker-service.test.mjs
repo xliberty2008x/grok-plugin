@@ -12,6 +12,10 @@ import {
 } from "../plugins/grok/scripts/lib/task-contract.mjs";
 import { tryReadJob } from "../plugins/grok/scripts/lib/state.mjs";
 import { createWorkerService } from "../plugins/grok/scripts/lib/worker-service.mjs";
+import {
+  claimWorkerDispatch,
+  providerLaunchState
+} from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import { materializeRole } from "../plugins/grok/scripts/lib/worker-roles.mjs";
 import { workspaceStateSegment } from "../plugins/grok/scripts/lib/workspace.mjs";
 import { initRepo, tempDir } from "./helpers.mjs";
@@ -451,6 +455,68 @@ test("receipt drift after durable admission leaves a recoverable pending launch 
   });
   await recovered.wait(admitted.handle.id, { timeoutMs: 0 });
   assert.ok(recoveredLaunches > 0);
+});
+
+test("worker spawn returns a stable admission snapshot while dispatch advances private state", () => {
+  const root = initRepo();
+  const fixture = stateFixture(root);
+  const capabilityDigest = "a".repeat(64);
+  let dispatchCalls = 0;
+  let successfulClaims = 0;
+  const dispatchWorker = ({ workerId, principal, env }) => {
+    dispatchCalls += 1;
+    const claim = claimWorkerDispatch({ root, workerId, principal, env });
+    if (claim.claimed) successfulClaims += 1;
+    const launchState = providerLaunchState(claim.job);
+    return {
+      providerLaunchState: launchState,
+      providerLaunched: launchState === "started"
+    };
+  };
+  const service = createWorkerService({
+    root,
+    principal: { hostKind: "codex", threadId: THREAD_A },
+    env: fixture.env,
+    providerCapabilityDigest: capabilityDigest,
+    validateProviderCapability: () => capabilityDigest,
+    allowUnboundDispatch: false,
+    dispatchWorker
+  });
+
+  const first = service.spawn({
+    userRequest: "Capture admission before synchronous dispatch",
+    idempotencyKey: "service-stable-admission-0001"
+  });
+  assert.equal(first.replayed, false);
+  assert.equal(first.handle.status, "queued");
+  assert.equal(first.handle.phase, "accepted");
+  assert.equal(first.handle.eventCursor.sequence, 1);
+  assert.equal(first.providerLaunchState, "pending");
+  assert.equal(first.providerLaunched, false);
+
+  const afterDispatch = tryReadJob(root, first.handle.id, fixture.env);
+  assert.equal(afterDispatch.status, "queued");
+  assert.equal(afterDispatch.phase, "provider-launching");
+  assert.equal(afterDispatch.lifecycleEvents.at(-1).sequence, 2);
+  assert.equal(afterDispatch.request.spawn.dispatch.state, "claimed");
+
+  const replay = service.spawn({
+    userRequest: "Capture admission before synchronous dispatch",
+    idempotencyKey: "service-stable-admission-0001"
+  });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.handle.id, first.handle.id);
+  assert.equal(replay.handle.phase, "provider-launching");
+  assert.equal(replay.handle.eventCursor.sequence, 2);
+  assert.equal(replay.providerLaunchState, "pending");
+  assert.equal(replay.providerLaunched, false);
+  assert.equal(dispatchCalls, 2);
+  assert.equal(successfulClaims, 1, "idempotent replay created a duplicate dispatch claim");
+  assert.equal(
+    tryReadJob(root, first.handle.id, fixture.env).lifecycleEvents.at(-1).sequence,
+    2,
+    "idempotent replay appended a duplicate dispatch event"
+  );
 });
 
 test("MCP advertises only the generic explorer role until runtime role policy exists", () => {

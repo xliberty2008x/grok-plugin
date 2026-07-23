@@ -874,8 +874,13 @@ test("MCP launch fails durably and terminates the controller when its birth toke
     userRequest: "Fail before controller identity publication"
   }, options);
   assert.equal(spawned.providerLaunchState, "failed");
-  assert.equal(spawned.worker.status, "failed");
+  assert.equal(spawned.providerLaunched, false);
+  assert.equal(spawned.worker.status, "queued");
+  assert.equal(spawned.worker.phase, "accepted");
+  assert.equal(spawned.worker.eventCursor.sequence, 1);
   const privateJob = tryReadJob(root, spawned.worker.id, env);
+  assert.equal(privateJob.status, "failed");
+  assert.equal(privateJob.phase, "failed");
   assert.equal(privateJob.error.code, "E_PROCESS_IDENTITY");
   assert.equal(privateJob.request.spawn.dispatch.state, "failed");
   assert.equal(privateJob.controllerProcess, undefined);
