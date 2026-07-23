@@ -19,6 +19,7 @@ import {
   validateInstalledToolResult,
   validateProviderCapabilityAgreement
 } from "./lib/installed-worker-mcp-contract.mjs";
+import { selectInstalledWorkerMcpFailure } from "./lib/installed-worker-mcp-failure.mjs";
 import { spawnMcpStdioClient } from "./lib/mcp-stdio-client.mjs";
 import {
   canonicalPath,
@@ -85,13 +86,51 @@ const FIXED_ERRORS = Object.freeze({
   E_RECEIPT: "The provisional live receipt could not be validated or published.",
   E_INTERRUPTED: "Installed Worker MCP qualification was interrupted."
 });
+const QUALIFICATION_STAGES = new Set([
+  "startup",
+  "source-boundary",
+  "private-install",
+  "installed-imports",
+  "provider-setup",
+  "provider-capability",
+  "completion-mcp-surface",
+  "completion-spawn",
+  "completion-wait",
+  "completion-result",
+  "completion-cleanup",
+  "completion-session-cleanup",
+  "completion-contract",
+  "cancellation-mcp-surface",
+  "cancellation-spawn",
+  "cancellation-live-provider",
+  "cancellation-reconnect",
+  "cancellation-replay",
+  "cancellation-request",
+  "cancellation-wait",
+  "cancellation-result",
+  "cancellation-cleanup",
+  "cancellation-session-cleanup",
+  "cancellation-contract",
+  "global-cleanup",
+  "installed-recheck",
+  "evidence-binding",
+  "receipt-publication",
+  "emergency-cleanup"
+]);
+let qualificationStage = "startup";
+
+function enterQualificationStage(stage) {
+  if (!QUALIFICATION_STAGES.has(stage)) throw new Error("Unknown qualification stage.");
+  qualificationStage = stage;
+}
 
 class QualificationError extends Error {
-  constructor(code) {
+  constructor(code, stage = qualificationStage) {
     const normalized = Object.hasOwn(FIXED_ERRORS, code) ? code : "E_SCENARIO";
     super(FIXED_ERRORS[normalized]);
     this.name = "QualificationError";
     this.code = normalized;
+    this.stage = QUALIFICATION_STAGES.has(stage) ? stage : "startup";
     this.stack = `${this.name}: ${this.message}`;
   }
 }
@@ -2715,8 +2754,10 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   const fixtureStatus = initializeFixtureRepository(fixtureRoot, context.env);
   const tracker = createTracker("authenticated-completion", fixtureStatus);
   context.runner.trackers.push({ context, tracker });
+  enterQualificationStage("completion-mcp-surface");
   let client = await startInstalledMcp(context);
   await verifyMcpSurface(context, client, { negative: true });
+  enterQualificationStage("completion-spawn");
   const started = await beginScenario(
     context,
     tracker,
@@ -2724,7 +2765,9 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
     `installed-completion-${crypto.randomUUID()}`,
     "authenticated completion"
   );
+  enterQualificationStage("completion-wait");
   await waitForTerminal(context, client, tracker, started.cursor);
+  enterQualificationStage("completion-result");
   const result = await callTool(
     context,
     client,
@@ -2740,6 +2783,7 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   await closeMcp(context, client);
   client = null;
 
+  enterQualificationStage("completion-cleanup");
   const terminalJob = proveTerminalCleanup(context, tracker, "completed");
   validateTerminalWorkerSnapshot(
     result.worker,
@@ -2767,6 +2811,7 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   ) {
     fail("E_SCENARIO");
   }
+  enterQualificationStage("completion-session-cleanup");
   if (!tracker.sessionId) fail("E_SESSION");
   await waitForSessionPresence(context, tracker);
   await deleteAndProveSessionAbsent(context, tracker);
@@ -2775,6 +2820,7 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
     spawn: started.spawn,
     terminalResult: result
   };
+  enterQualificationStage("completion-contract");
   validateInstalledCompletionScenario(publicEvidence);
   return { context, tracker, publicEvidence };
 }
@@ -2788,8 +2834,10 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
   );
   const tracker = createTracker("mcp-restart-reconnect-cancellation", fixtureStatus);
   context.runner.trackers.push({ context, tracker });
+  enterQualificationStage("cancellation-mcp-surface");
   let client = await startInstalledMcp(context);
   await verifyMcpSurface(context, client);
+  enterQualificationStage("cancellation-spawn");
   const started = await beginScenario(
     context,
     tracker,
@@ -2798,6 +2846,7 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
     "restart and cancellation",
     { activeWindow: true }
   );
+  enterQualificationStage("cancellation-live-provider");
   await pollPrivateJob(
     context,
     tracker,
@@ -2815,10 +2864,12 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
   );
   await waitForSessionPresence(context, tracker);
 
+  enterQualificationStage("cancellation-reconnect");
   await closeMcp(context, client);
   tracker.calls.reconnect += 1;
   client = await startInstalledMcp(context);
   await verifyMcpSurface(context, client);
+  enterQualificationStage("cancellation-replay");
   const replay = await callTool(
     context,
     client,
@@ -2856,6 +2907,7 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
     fail("E_SCENARIO");
   }
 
+  enterQualificationStage("cancellation-request");
   const cancelKey = `installed-cancel-request-${crypto.randomUUID()}`;
   tracker.cancelIdempotencyKey = cancelKey;
   const cancel = await callTool(
@@ -2886,7 +2938,9 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
     fail("E_SCENARIO");
   }
 
+  enterQualificationStage("cancellation-wait");
   await waitForTerminal(context, client, tracker, started.cursor);
+  enterQualificationStage("cancellation-result");
   const result = await callTool(
     context,
     client,
@@ -2902,6 +2956,7 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
   await closeMcp(context, client);
   client = null;
 
+  enterQualificationStage("cancellation-cleanup");
   const terminalJob = proveTerminalCleanup(context, tracker, "cancelled");
   validateTerminalWorkerSnapshot(
     result.worker,
@@ -2931,6 +2986,7 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
   ) {
     fail("E_SCENARIO");
   }
+  enterQualificationStage("cancellation-session-cleanup");
   await deleteAndProveSessionAbsent(context, tracker);
 
   const publicEvidence = {
@@ -2940,6 +2996,7 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
     cancelReplay,
     terminalResult: result
   };
+  enterQualificationStage("cancellation-contract");
   validateInstalledCancellationReplayScenario(publicEvidence);
   return { context, tracker, publicEvidence };
 }
@@ -3628,6 +3685,7 @@ function buildReceipt({
 }
 
 async function qualify(runner) {
+  enterQualificationStage("source-boundary");
   const startedAt = new Date().toISOString();
   if (!isNonEvidenceTreeClean(ROOT)) fail("E_SOURCE");
   const sourceIdentity = gitIdentity(ROOT);
@@ -3668,6 +3726,7 @@ async function qualify(runner) {
   runner.baseEnvironment = env;
   initializeFixtureRepository(setupFixture, env);
 
+  enterQualificationStage("private-install");
   const codexBinary = process.env.CODEX_BIN || "codex";
   runJson(codexBinary, ["plugin", "marketplace", "add", ROOT, "--json"], {
     cwd: ROOT,
@@ -3739,6 +3798,7 @@ async function qualify(runner) {
     fail("E_INSTALL");
   }
 
+  enterQualificationStage("installed-imports");
   const providerCapability = await importInstalled(
     installedRoot,
     "scripts/lib/provider-capability.mjs"
@@ -3778,6 +3838,7 @@ async function qualify(runner) {
   );
   const broker = await importInstalled(installedRoot, "mcp/broker.mjs");
 
+  enterQualificationStage("provider-setup");
   runner.setupBoundary = createSetupBoundary({
     fixtureRoot: setupFixture,
     pluginData,
@@ -3814,6 +3875,7 @@ async function qualify(runner) {
   }).stdout;
   if (setupFixtureStatus !== "") fail("E_SETUP");
   const providerIdentity = captureProviderFileIdentity(setup.grok.binary);
+  enterQualificationStage("provider-capability");
   const capability = providerCapability.readValidProviderCapabilityReceipt({ env });
   if (!capability) fail("E_CAPABILITY");
   validateProviderCapabilityAgreement(capability, {
@@ -3874,6 +3936,7 @@ async function qualify(runner) {
     cancellationFixture
   );
 
+  enterQualificationStage("global-cleanup");
   if (!(await terminateTrackedClients(runner))) fail("E_CLEANUP");
   for (const { tracker } of [completion, cancellation]) {
     if (
@@ -3884,6 +3947,7 @@ async function qualify(runner) {
       fail("E_CLEANUP");
     }
   }
+  enterQualificationStage("installed-recheck");
   const finalInstalledEntries = createPluginInventory(installedRoot);
   const finalInstalledDigest = digestInventory(finalInstalledEntries);
   const finalInstalledEntrypointDigest = digestRegularFile(
@@ -3909,6 +3973,7 @@ async function qualify(runner) {
   if (fs.existsSync(runner.temporaryRoot)) fail("E_CLEANUP");
   runner.temporaryRemoved = true;
 
+  enterQualificationStage("evidence-binding");
   for (const completed of [completion, cancellation]) {
     completed.tracker.context = completed.context;
     const observation = privateObservationFor(completed.tracker, true);
@@ -3943,6 +4008,7 @@ async function qualify(runner) {
     providerBinaryDigest: providerIdentity.contentDigest,
     providerVersion: capability.providerVersion
   });
+  enterQualificationStage("receipt-publication");
   publishReceipt(receipt);
 }
 
@@ -3978,10 +4044,23 @@ async function main() {
       "Installed Worker MCP E2E passed; one provisional synthetic direct-MCP receipt was published.\n"
     );
   } catch (error) {
-    const cleanupProven = await emergencyCleanup(runner);
-    if (!cleanupProven) fail("E_CLEANUP");
-    if (error instanceof QualificationError) throw error;
-    fail("E_SCENARIO");
+    const originalCode = error instanceof QualificationError
+      ? error.code
+      : "E_SCENARIO";
+    const originalStage = error instanceof QualificationError
+      ? error.stage
+      : qualificationStage;
+    enterQualificationStage("emergency-cleanup");
+    let cleanupProven = false;
+    try {
+      cleanupProven = await emergencyCleanup(runner);
+    } catch {}
+    const selected = selectInstalledWorkerMcpFailure({
+      originalCode,
+      originalStage,
+      cleanupProven
+    }, QUALIFICATION_STAGES);
+    throw new QualificationError(selected.code, selected.stage);
   } finally {
     process.removeListener("SIGINT", interrupt);
     process.removeListener("SIGTERM", interrupt);
@@ -3994,8 +4073,13 @@ const IS_MAIN = process.argv[1]
 if (IS_MAIN) {
   main().catch((error) => {
     const code = error instanceof QualificationError ? error.code : "E_SCENARIO";
+    const stage = error instanceof QualificationError
+      && error.stage !== "startup"
+      && QUALIFICATION_STAGES.has(error.stage)
+        ? `; stage=${error.stage}`
+        : "";
     process.stderr.write(
-      `Installed Worker MCP E2E failed [${code}]: ${FIXED_ERRORS[code] || FIXED_ERRORS.E_SCENARIO}\n`
+      `Installed Worker MCP E2E failed [${code}${stage}]: ${FIXED_ERRORS[code] || FIXED_ERRORS.E_SCENARIO}\n`
     );
     process.exitCode = 1;
   });

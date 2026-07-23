@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
+import { selectInstalledWorkerMcpFailure } from "../scripts/lib/installed-worker-mcp-failure.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RUNNER = path.join(ROOT, "scripts", "test-installed-worker-mcp.mjs");
@@ -344,6 +345,49 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /reopened\.dev !== publishedIdentity\.dev/);
   assert.match(source, /fs\.readFileSync\(descriptor, "utf8"\)/);
   assert.match(source, /\{ workloadFiles: 32 \}/);
+});
+
+test("installed Worker MCP runner preserves original stages and lets cleanup failure override", () => {
+  const allowedStages = new Set([
+    "completion-spawn",
+    "completion-wait",
+    "emergency-cleanup"
+  ]);
+  assert.deepEqual(
+    selectInstalledWorkerMcpFailure({
+      originalCode: "E_PRIVATE_STATE",
+      originalStage: "completion-spawn",
+      cleanupProven: true
+    }, allowedStages),
+    { code: "E_PRIVATE_STATE", stage: "completion-spawn" }
+  );
+  assert.deepEqual(
+    selectInstalledWorkerMcpFailure({
+      originalCode: "E_SCENARIO",
+      originalStage: "completion-wait",
+      cleanupProven: false
+    }, allowedStages),
+    { code: "E_CLEANUP", stage: "emergency-cleanup" }
+  );
+  assert.throws(
+    () => selectInstalledWorkerMcpFailure({
+      originalCode: "E_PRIVATE_STATE",
+      originalStage: "unbounded-secret-stage",
+      cleanupProven: true
+    }, allowedStages),
+    TypeError
+  );
+
+  const source = fs.readFileSync(RUNNER, "utf8");
+  assert.match(source, /const QUALIFICATION_STAGES = new Set\(\[/);
+  assert.match(source, /this\.stage = QUALIFICATION_STAGES\.has\(stage\) \? stage : "startup";/);
+  assert.match(source, /QUALIFICATION_STAGES\.has\(error\.stage\)/);
+  assert.match(source, /stage=\$\{error\.stage\}/);
+  assert.doesNotMatch(source, /error\.(?:message|stack|details).*stage=/);
+  assert.ok(
+    source.indexOf("const originalStage =")
+      < source.indexOf('enterQualificationStage("emergency-cleanup")')
+  );
 });
 
 test("package and repository validator pin the installed Worker MCP runner wiring", () => {

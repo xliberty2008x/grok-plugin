@@ -237,6 +237,7 @@ if (!versionsOnly) {
     "scripts/update-local-codex.mjs",
     "scripts/test-natural-codex.mjs",
     "scripts/test-installed-worker-mcp.mjs",
+    "scripts/lib/installed-worker-mcp-failure.mjs",
     "tests/live-grok.test.mjs",
     "tests/installed-codex.test.mjs",
     "tests/installed-worker-mcp-runner.test.mjs",
