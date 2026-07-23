@@ -110,6 +110,11 @@ const QUALIFICATION_STAGES = new Set([
   "completion-spawn-call",
   "completion-spawn-private",
   "completion-spawn-witness",
+  "completion-spawn-witness-record",
+  "completion-spawn-witness-binding",
+  "completion-spawn-witness-handle",
+  "completion-spawn-witness-time",
+  "completion-spawn-witness-id",
   "completion-get",
   "completion-events",
   "completion-wait",
@@ -123,6 +128,11 @@ const QUALIFICATION_STAGES = new Set([
   "cancellation-spawn-call",
   "cancellation-spawn-private",
   "cancellation-spawn-witness",
+  "cancellation-spawn-witness-record",
+  "cancellation-spawn-witness-binding",
+  "cancellation-spawn-witness-handle",
+  "cancellation-spawn-witness-time",
+  "cancellation-spawn-witness-id",
   "cancellation-get",
   "cancellation-events",
   "cancellation-live-provider",
@@ -2481,11 +2491,17 @@ function validateSpawnResponseWitness(
   }
   const witness = record?.responseWitness;
   const handleDigest = publicWorkerDigest(publicWorker);
+  enterScenarioStage(tracker, "spawn-witness-record");
   if (
     !hasExactKeys(record, SPAWN_IDEMPOTENCY_RECORD_KEYS)
     || record.schemaVersion !== 4
-    || record.workerId !== job.id
     || !hasExactKeys(record.owner, new Set(["hostKind", "sessionId"]))
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  enterScenarioStage(tracker, "spawn-witness-binding");
+  if (
+    record.workerId !== job.id
     || record.owner.hostKind !== job.host?.kind
     || record.owner.sessionId !== job.host?.sessionId
     || record.controlWorkspaceId !== job.controlWorkspaceId
@@ -2506,13 +2522,24 @@ function validateSpawnResponseWitness(
     || witness.requestDigest !== record.requestDigest
     || witness.idempotencyKeyDigest !== keyDigest
     || witness.replayed !== replayed
-    || witness.handleDigest !== handleDigest
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  enterScenarioStage(tracker, "spawn-witness-handle");
+  if (
+    witness.handleDigest !== handleDigest
     || witness.eventCursorSequence !== publicWorker.eventCursor.sequence
-    || !canonicalTimestamp(witness.recordedAt)
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  enterScenarioStage(tracker, "spawn-witness-time");
+  if (
+    !canonicalTimestamp(witness.recordedAt)
     || Date.parse(witness.recordedAt) < Date.parse(publicWorker.updatedAt)
   ) {
     fail("E_PRIVATE_STATE");
   }
+  enterScenarioStage(tracker, "spawn-witness-id");
   const { witnessId: ignoredWitnessId, ...witnessBody } = witness;
   const expectedWitnessId = `spawnw-${crypto
     .createHash("sha256")
