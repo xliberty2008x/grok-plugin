@@ -11,6 +11,10 @@ import {
   codexMetadataCapabilityMatrix
 } from "../plugins/grok/scripts/lib/worker-presentation.mjs";
 import {
+  projectWorkerHandle,
+  projectWorkerSnapshot
+} from "../plugins/grok/scripts/lib/worker-protocol.mjs";
+import {
   INSTALLED_WORKER_SCENARIO_IDS,
   INSTALLED_WORKER_TOOL_NAMES,
   InstalledWorkerMcpContractError,
@@ -34,8 +38,15 @@ const WORKER_ID = "task-0123456789abcdef";
 const ENVELOPE_ID = "env-0123456789abcdef01234567";
 const MANIFEST_ID = "ctx-0123456789abcdef01234567";
 const RECEIPT_ID = "cancel-0123456789abcdef01234567";
+const SPAWN_REQUEST_DIGEST = "7".repeat(64);
+const SPAWN_IDEMPOTENCY_KEY_DIGEST = "8".repeat(64);
 const OBSERVED_AT = Date.parse("2026-07-23T10:01:00.000Z");
-const HOST_TASK_BINDING = `host-task-${"f".repeat(32)}`;
+const HOST_SESSION_ID = "019f666a-6469-7cc1-9a8d-8c1adf61e103";
+const HOST_TASK_BINDING = `host-task-${crypto
+  .createHash("sha256")
+  .update(`codex\0${HOST_SESSION_ID}`)
+  .digest("hex")
+  .slice(0, 32)}`;
 const CONTROL_WORKSPACE_ID = `cws-${"1".repeat(32)}`;
 const INITIALIZE_CLIENT_META = Object.freeze({
   threadId: "019f666a-6469-7cc1-9a8d-8c1adf61e103",
@@ -93,6 +104,7 @@ function setupFixture() {
         sandbox: "read-only",
         permissionMode: "dontAsk",
         injectDefaultTools: false,
+        allowedTools: ["todo_write"],
         agentProfileDigest: DIGESTS.setup,
         unattendedPrivilegeExpansion: false
       },
@@ -183,11 +195,194 @@ function initializeExpectations() {
   };
 }
 
-function worker(status, {
-  terminal = false,
-  cancellation = false,
-  hostVerification = "not_run"
-} = {}) {
+function contextManifestFixture() {
+  return {
+    schemaVersion: 1,
+    manifestId: MANIFEST_ID,
+    digest: "e".repeat(64),
+    capturedAt: "2026-07-23T10:00:00.000Z",
+    projectMarkers: ["package.json"],
+    materialization: {
+      state: "local_complete",
+      reasons: [],
+      submodules: [],
+      upstreamFreshness: "not_checked"
+    },
+    git: {
+      branch: "main",
+      head: "a".repeat(40),
+      dirtyDigest: "2".repeat(64),
+      dirtyEntryCount: 0,
+      ignoredDigest: "3".repeat(64),
+      ignoredEntryCount: 0,
+      trackedTreeIdentity: "4".repeat(64),
+      metadataIdentity: "5".repeat(64),
+      insideWorktree: true,
+      linkedWorktree: false,
+      sparse: false,
+      shallow: false,
+      upstreamRef: null,
+      upstreamCommit: null,
+      upstreamFreshness: "not_checked"
+    }
+  };
+}
+
+function taskEnvelopeFixture() {
+  return {
+    schemaVersion: 1,
+    envelopeId: ENVELOPE_ID,
+    digest: "d".repeat(64),
+    userRequest: "Private provider request which the public projector must omit.",
+    objective: "Inspect repository",
+    mode: "read",
+    scope: { include: [], exclude: [] },
+    nonGoals: [],
+    acceptanceCriteria: [{ id: "AC-01", text: "Complete the inspection." }],
+    requiredVerification: ["node --test"],
+    expectedReturnFormat: "Return a structured report.",
+    context: {
+      facts: [],
+      constraints: [],
+      expectedProjectMarkers: ["package.json"],
+      requiredPaths: [],
+      workspaceState: "task_scoped",
+      upstreamFreshness: "not_checked"
+    },
+    contextManifestId: MANIFEST_ID
+  };
+}
+
+function lifecycleEvents(status, cancellation) {
+  const events = [{
+    type: "task.accepted",
+    at: "2026-07-23T10:00:00.000Z",
+    summary: "Accepted",
+    sequence: 1,
+    detail: {
+      spawnSuccessDefinition: "durable-job-commit",
+      write: false
+    }
+  }];
+  if (status === "running") {
+    events.push({
+      type: "activity.started",
+      at: "2026-07-23T10:01:30.000Z",
+      summary: "Provider started",
+      sequence: 2,
+      detail: { mode: "read" }
+    });
+  } else if (status === "completed") {
+    events.push({
+      type: "activity.started",
+      at: "2026-07-23T10:01:30.000Z",
+      summary: "Provider started",
+      sequence: 2,
+      detail: { mode: "read" }
+    }, {
+      type: "final.report",
+      at: "2026-07-23T10:02:20.000Z",
+      summary: "Done",
+      sequence: 3,
+      detail: { outcome: "complete", structured: true }
+    }, {
+      type: "checkpoint",
+      at: "2026-07-23T10:03:00.000Z",
+      summary: "Task runtime cleanup completed",
+      sequence: 4
+    });
+  } else if (cancellation) {
+    events.push(
+      {
+        type: "activity.started",
+        at: "2026-07-23T10:01:30.000Z",
+        summary: "Provider started",
+        sequence: 2,
+        detail: { mode: "read" }
+      },
+      {
+        type: "checkpoint",
+        at: "2026-07-23T10:01:35.000Z",
+        summary: "Session created",
+        sequence: 3,
+        detail: { state: "accepted" }
+      },
+      {
+        type: "activity.started",
+        at: "2026-07-23T10:01:40.000Z",
+        summary: "Prompt delivered",
+        sequence: 4,
+        detail: { eventType: "message" }
+      },
+      {
+        type: "plan.updated",
+        at: "2026-07-23T10:01:45.000Z",
+        summary: "Plan received",
+        sequence: 5,
+        detail: { plan: ["Inspect"] }
+      },
+      {
+        type: "checkpoint",
+        at: "2026-07-23T10:01:50.000Z",
+        summary: "Provider active",
+        sequence: 6,
+        detail: { status: "running" }
+      },
+      {
+        type: "cancellation.requested",
+        at: "2026-07-23T10:02:00.000Z",
+        summary: "Cancellation requested",
+        sequence: 7,
+        detail: { requestAcceptedAt: "2026-07-23T10:02:00.000Z" }
+      },
+      {
+        type: "blocked",
+        at: "2026-07-23T10:03:00.000Z",
+        summary: "Task runtime cleanup completed",
+        sequence: 8
+      }
+    );
+  }
+  return events;
+}
+
+function completionResult() {
+  return {
+    hostVerification: "not_run",
+    taskRuntimeCleaned: true,
+    stopReason: "EndTurn",
+    textBytes: 10,
+    textDigest: "6".repeat(64),
+    textTruncated: false,
+    interim: {
+      bytes: 0,
+      digest: crypto.createHash("sha256").update("").digest("hex")
+    },
+    workerReport: {
+      schemaVersion: 1,
+      structured: true,
+      valid: true,
+      outcome: "complete",
+      summary: "Done",
+      changedFiles: [],
+      checksClaimed: ["node --test"],
+      acceptanceResults: [{ id: "AC-01", status: "met" }],
+      risks: [],
+      questions: [],
+      validationIssues: []
+    },
+    providerClaims: {
+      success: true,
+      outcome: "complete",
+      summary: "Done",
+      changedFiles: [],
+      checksClaimed: ["node --test"],
+      observedFileAgreement: true
+    }
+  };
+}
+
+function privateJob(status, { cancellation = false } = {}) {
   const phase = status === "queued"
     ? "accepted"
     : status === "running"
@@ -195,44 +390,85 @@ function worker(status, {
       : status === "completed"
         ? "done"
         : "cancelled";
+  const terminal = ["completed", "cancelled"].includes(status);
   return {
+    schemaVersion: 3,
     id: WORKER_ID,
     kind: "task",
     jobClass: "task",
     write: false,
-    parentWorkerId: null,
-    lineageWorkerId: WORKER_ID,
-    taskEnvelopeId: ENVELOPE_ID,
-    taskEnvelopeDigest: "d".repeat(64),
-    contextManifestId: MANIFEST_ID,
-    contextDigest: "e".repeat(64),
-    workspaceSnapshotDigest: "e".repeat(64),
-    hostTaskBinding: HOST_TASK_BINDING,
+    summary: terminal ? (cancellation ? "Cancelled" : "Done") : "Spawn committed",
+    progress: terminal
+      ? "Terminal record committed."
+      : "Durable job record committed; provider not started by broker spawn.",
+    createdAt: "2026-07-23T10:00:00.000Z",
+    updatedAt: terminal
+      ? "2026-07-23T10:03:00.000Z"
+      : status === "running"
+        ? "2026-07-23T10:01:30.000Z"
+        : "2026-07-23T10:00:00.000Z",
+    startedAt: status === "queued" ? null : "2026-07-23T10:01:30.000Z",
+    completedAt: terminal
+      ? cancellation
+        ? "2026-07-23T10:02:30.000Z"
+        : "2026-07-23T10:02:15.000Z"
+      : null,
+    heartbeatAt: terminal
+      ? "2026-07-23T10:03:00.000Z"
+      : status === "running"
+        ? "2026-07-23T10:01:30.000Z"
+        : "2026-07-23T10:00:00.000Z",
+    host: {
+      kind: "codex",
+      sessionId: HOST_SESSION_ID
+    },
+    profile: {
+      id: "rescue-read-v3",
+      contractVersion: 3,
+      agentProfileDigest: DIGESTS.rootRead
+    },
+    role: { id: "explorer" },
+    model: null,
+    effort: null,
     controlWorkspaceId: CONTROL_WORKSPACE_ID,
-    roleId: "explorer",
-    externalWorkerLabel: "external-grok-worker",
     status,
     phase,
-    terminal,
-    startedAt: status === "queued" ? null : "2026-07-23T10:01:30.000Z",
-    completedAt: terminal ? "2026-07-23T10:03:00.000Z" : null,
-    lifecycleEvents: cancellation
-      ? [{ sequence: 7, type: "cancellation.requested" }]
-      : [{ sequence: 7, type: "completed" }],
-    result: terminal ? {
-      hostVerification,
-      taskRuntimeCleaned: true,
-      ...(cancellation ? {
-        stopReason: "cancelled",
-        cancellation: {
-          requestAcceptedAt: "2026-07-23T10:02:00.000Z",
-          processGroupGoneAt: null,
-          terminalRecordCommittedAt: null,
-          receiptId: RECEIPT_ID
-        }
-      } : {})
-    } : null
+    request: {
+      envelope: taskEnvelopeFixture(),
+      contextManifest: contextManifestFixture(),
+      publicObjective: "Inspect repository",
+      resumeJobId: null
+    },
+    latestPlan: ["Inspect"],
+    lifecycleEvents: lifecycleEvents(status, cancellation),
+    result: status === "completed"
+      ? completionResult()
+      : cancellation
+        ? {
+            hostVerification: "not_run",
+            taskRuntimeCleaned: true,
+            stopReason: "cancelled",
+            cancellation: {
+              requestAcceptedAt: "2026-07-23T10:02:00.000Z",
+              processGroupGoneAt: null,
+              terminalRecordCommittedAt: null,
+              receiptId: RECEIPT_ID,
+              ownerThreadId: "private",
+              requestDigest: "private"
+            }
+          }
+        : null,
+    error: cancellation
+      ? { code: "E_CANCELLED", message: "Cancelled." }
+      : null
   };
+}
+
+function worker(status, { cancellation = false } = {}) {
+  const job = privateJob(status, { cancellation });
+  return ["queued", "running"].includes(status)
+    ? projectWorkerHandle(job, { trustHostAuthority: false })
+    : projectWorkerSnapshot(job, { trustHostAuthority: false });
 }
 
 function spawnFixture({ replayed = false } = {}) {
@@ -244,6 +480,35 @@ function spawnFixture({ replayed = false } = {}) {
     providerLaunchState: replayed ? "started" : "pending",
     providerLaunched: replayed
   };
+}
+
+function spawnResponseWitness(workerValue, {
+  responseSequence,
+  replayed,
+  recordedAt
+}) {
+  const body = {
+    schemaVersion: 1,
+    projection: "worker-handle-v1-untrusted-host",
+    responseSequence,
+    workerId: workerValue.id,
+    requestDigest: SPAWN_REQUEST_DIGEST,
+    idempotencyKeyDigest: SPAWN_IDEMPOTENCY_KEY_DIGEST,
+    replayed,
+    handleDigest: digest(workerValue),
+    eventCursorSequence: workerValue.eventCursor.sequence,
+    recordedAt
+  };
+  return {
+    ...body,
+    witnessId: `spawnw-${digest(body).slice(0, 24)}`
+  };
+}
+
+function refreshSpawnResponseWitnessId(witness) {
+  const { witnessId: ignoredWitnessId, ...body } = witness;
+  witness.witnessId = `spawnw-${digest(body).slice(0, 24)}`;
+  return witness;
 }
 
 function cancelFixture({ replayed = false } = {}) {
@@ -294,8 +559,47 @@ function cancellationBundle() {
 function privateObservation(scenarioId) {
   const cancellation = scenarioId === "mcp-restart-reconnect-cancellation";
   const count = cancellation ? 3 : 2;
+  const publicEvidence = cancellation ? cancellationBundle() : completionBundle();
+  const publicWorkers = cancellation
+    ? [
+        publicEvidence.spawn.worker,
+        publicEvidence.spawnReplay.worker,
+        publicEvidence.terminalResult.worker
+      ]
+    : [publicEvidence.spawn.worker, publicEvidence.terminalResult.worker];
+  const activeWorkers = publicWorkers.slice(0, -1);
   return {
     scenarioId,
+    installedWorkerBinding: {
+      workerId: WORKER_ID,
+      createdAt: "2026-07-23T10:00:00.000Z",
+      model: null,
+      effort: null,
+      securityProfile: {
+        id: "rescue-read-v3",
+        contractVersion: 3,
+        agentProfileDigest: DIGESTS.rootRead
+      },
+      taskEnvelopeId: ENVELOPE_ID,
+      taskEnvelopeDigest: "d".repeat(64),
+      contextManifestId: MANIFEST_ID,
+      contextDigest: "e".repeat(64),
+      workspaceSnapshotDigest: "e".repeat(64),
+      controlWorkspaceId: CONTROL_WORKSPACE_ID,
+      hostTaskBinding: HOST_TASK_BINDING
+    },
+    observedPublicWorkerDigests: publicWorkers.map((workerValue) => (
+      digest(workerValue)
+    )),
+    observedSpawnResponseWitnesses: activeWorkers.map(
+      (workerValue, index) => spawnResponseWitness(workerValue, {
+        responseSequence: index + 1,
+        replayed: index === 1,
+        recordedAt: index === 0
+          ? "2026-07-23T10:00:00.100Z"
+          : "2026-07-23T10:01:30.100Z"
+      })
+    ),
     observedWorkerIds: Array(count).fill(WORKER_ID),
     observedTaskEnvelopeIds: Array(count).fill(ENVELOPE_ID),
     observedContextManifestIds: Array(count).fill(MANIFEST_ID),
@@ -351,6 +655,8 @@ test("installed setup requires semantic readiness, not a successful process exit
     (value) => { value.grok.acpIsolation.sandbox = "workspace-write"; },
     (value) => { value.grok.acpIsolation.permissionMode = "ask"; },
     (value) => { value.grok.acpIsolation.injectDefaultTools = true; },
+    (value) => { value.grok.acpIsolation.allowedTools = []; },
+    (value) => { value.grok.acpIsolation.allowedTools = ["todo_write", "read_file"]; },
     (value) => { value.grok.acpIsolation.unattendedPrivilegeExpansion = true; },
     (value) => { value.grok.binary = "relative/grok"; },
     (value) => { value.grok.version = "unbounded-version"; }
@@ -608,6 +914,19 @@ test("completion scenario binds the terminal public worker and suppresses host c
       value.terminalResult.worker.parentWorkerId = "task-ffffffffffffffff";
     },
     (value) => {
+      value.terminalResult.worker.securityProfile.agentProfileDigest =
+        "f".repeat(64);
+    },
+    (value) => {
+      value.terminalResult.worker.model = "grok-code-fast-1";
+    },
+    (value) => {
+      value.terminalResult.worker.effort = "high";
+    },
+    (value) => {
+      value.terminalResult.worker.createdAt = "2026-07-23T09:59:59.000Z";
+    },
+    (value) => {
       value.spawn.worker.status = "cancelled";
       value.spawn.worker.phase = "cancelled";
     }
@@ -636,39 +955,419 @@ test("completion scenario binds the terminal public worker and suppresses host c
   );
 });
 
-test("non-replayed spawn accepts only the exact production race matrix", () => {
-  const allowed = [
+test("spawn accepts the actual public handle and rejects every shape or identity escape", () => {
+  const actual = completionBundle();
+  assert.equal(actual.spawn.worker.workerProtocolVersion, 1);
+  assert.equal(actual.spawn.worker.handleSchemaVersion, 1);
+  assert.deepEqual(actual.spawn.worker.eventCursor, {
+    schemaVersion: 1,
+    workerId: WORKER_ID,
+    sequence: 1
+  });
+  assert.deepEqual(actual.spawn.worker.securityProfile, {
+    id: "rescue-read-v3",
+    contractVersion: 3,
+    agentProfileDigest: DIGESTS.rootRead
+  });
+  assert.doesNotThrow(() => validateInstalledCompletionScenario(actual));
+
+  const mutations = [
+    (value) => { value.spawn.worker.providerProcess = { pid: 42 }; },
+    (value) => { value.spawn.worker.nonce = "private"; },
     (value) => {
-      value.spawn.worker.status = "queued";
-      value.spawn.worker.phase = "accepted";
-      value.spawn.worker.startedAt = null;
+      value.spawn.worker.host = { kind: "codex", sessionId: HOST_SESSION_ID };
     },
+    (value) => { value.spawn.worker.futurePublicField = true; },
     (value) => {
-      value.spawn.worker.status = "queued";
+      value.spawn.worker.summary = "Read /private/tmp/provider-session.json";
+    },
+    (value) => { value.spawn.worker.workerProtocolVersion = 2; },
+    (value) => { value.spawn.worker.handleSchemaVersion = 2; },
+    (value) => { value.spawn.worker.eventCursor.schemaVersion = 2; },
+    (value) => {
+      value.spawn.worker.eventCursor.workerId = "task-ffffffffffffffff";
+    },
+    (value) => { value.spawn.worker.eventCursor.sequence = -1; },
+    (value) => { value.spawn.worker.eventCursor.sequence = 0; },
+    (value) => { value.spawn.worker.eventCursor.sequence = 1.5; },
+    (value) => { value.spawn.worker.eventCursor.sequence = 999; },
+    (value) => {
       value.spawn.worker.phase = "provider-launching";
-      value.spawn.worker.startedAt = null;
+      value.spawn.worker.eventCursor.sequence = 2;
     },
+    (value) => { value.spawn.worker.eventCursor.nonce = "private"; },
+    (value) => { value.spawn.worker.securityProfile.id = "rescue-write-v3"; },
+    (value) => { value.spawn.worker.securityProfile.contractVersion = 2; },
     (value) => {
-      value.spawn.worker.status = "running";
-      value.spawn.worker.phase = "starting";
-      value.spawn.worker.startedAt = "2026-07-23T10:01:30.000Z";
-    }
+      value.spawn.worker.securityProfile.agentProfileDigest = "not-a-digest";
+    },
+    (value) => { value.spawn.worker.securityProfile.host = "private"; },
+    (value) => { value.spawn.worker.profileId = null; },
+    (value) => { value.spawn.worker.externalWorkerLabel = "native-worker"; }
   ];
-  for (const configure of allowed) {
+  for (const mutate of mutations) {
     const evidence = completionBundle();
-    configure(evidence);
-    assert.doesNotThrow(() => validateInstalledCompletionScenario(evidence));
+    mutate(evidence);
+    assert.throws(
+      () => validateInstalledCompletionScenario(evidence),
+      assertContractError("E_LIVE_COMPLETION")
+    );
   }
 
+  const equalTerminalCursor = completionBundle();
+  equalTerminalCursor.spawn.worker = worker("running");
+  equalTerminalCursor.spawn.worker.phase = "starting";
+  equalTerminalCursor.spawn.worker.eventCursor.sequence =
+    equalTerminalCursor.terminalResult.worker.eventCursor.sequence;
+  assert.throws(
+    () => validateInstalledCompletionScenario(equalTerminalCursor),
+    assertContractError("E_LIVE_COMPLETION")
+  );
+});
+
+test("public evidence rejects local paths after every punctuation and in nested values", () => {
+  const pathEscapes = [
+    "secret=/private/tmp/provider.json",
+    "secret:/Users/alice/provider.json",
+    "secret,/home/alice/provider.json",
+    "secret;/root/provider.json",
+    "{\"path\":\"/opt/grok/private.json\"}",
+    "source=~/provider.json",
+    "source=file:///etc/passwd",
+    "source=C:\\Users\\alice\\provider.json",
+    "source=\\\\server\\share\\provider.json",
+    "source=//server/share/provider.json"
+  ];
+  for (const escaped of pathEscapes) {
+    const handleEvidence = completionBundle();
+    handleEvidence.spawn.worker.summary = escaped;
+    assert.throws(
+      () => validateInstalledCompletionScenario(handleEvidence),
+      assertContractError("E_LIVE_COMPLETION")
+    );
+
+    const nestedEvidence = completionBundle();
+    nestedEvidence.terminalResult.worker.result.workerReport.risks = [escaped];
+    assert.throws(
+      () => validateInstalledCompletionScenario(nestedEvidence),
+      assertContractError("E_LIVE_COMPLETION")
+    );
+  }
+});
+
+test("terminal worker_result accepts the production snapshot and rejects private data recursively", () => {
+  const actual = completionBundle();
+  const snapshot = actual.terminalResult.worker;
+  assert.equal(snapshot.workerProtocolVersion, 1);
+  assert.equal(snapshot.snapshotSchemaVersion, 1);
+  assert.equal(snapshot.schemaVersion, 3);
+  assert.equal(snapshot.result.workerReport.outcome, "complete");
+  assert.equal(snapshot.result.providerClaims.observedFileAgreement, true);
+  assert.equal(snapshot.result.hostVerification, "not_run");
+  assert.doesNotThrow(() => validateInstalledCompletionScenario(actual));
+
+  const mutations = [
+    (value) => {
+      value.terminalResult.worker.providerProcess = { pid: 42 };
+    },
+    (value) => { value.terminalResult.worker.host = { sessionId: "private" }; },
+    (value) => { value.terminalResult.worker.nonce = "private"; },
+    (value) => { value.terminalResult.worker.snapshotSchemaVersion = 2; },
+    (value) => { value.terminalResult.worker.schemaVersion = 4; },
+    (value) => {
+      value.terminalResult.worker.eventCursor.sequence = -1;
+    },
+    (value) => {
+      value.terminalResult.worker.securityProfile.agentProfileDigest = "0";
+    },
+    (value) => {
+      value.terminalResult.worker.result.providerProcess = { pid: 42 };
+    },
+    (value) => {
+      value.terminalResult.worker.result.workerReport.rawProviderMessage = "private";
+    },
+    (value) => {
+      value.terminalResult.worker.result.workerReport.changedFiles = [
+        "/private/tmp/secret.txt"
+      ];
+    },
+    (value) => {
+      value.terminalResult.worker.result.workerReport.summary =
+        "Provider output at /Users/alice/private.txt";
+    },
+    (value) => {
+      value.terminalResult.worker.taskContract.context.prompt = "raw prompt";
+    },
+    (value) => {
+      value.terminalResult.worker.context.materialization.workspaceRoot =
+        "/private/tmp/workspace";
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[0].detail.rawProviderMessages = [];
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[0].detail.futureField = true;
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[0].detail.write = true;
+    },
+    (value) => {
+      value.terminalResult.worker.result.hostVerification = "passed";
+    },
+    (value) => {
+      value.terminalResult.worker.result.runtimeEvidence = {
+        hostVerification: "passed"
+      };
+    },
+    (value) => {
+      value.terminalResult.worker.result.workerReport.changedFiles = [
+        "../outside.txt"
+      ];
+    }
+  ];
+  for (const mutate of mutations) {
+    const evidence = completionBundle();
+    mutate(evidence);
+    assert.throws(
+      () => validateInstalledCompletionScenario(evidence),
+      assertContractError("E_LIVE_COMPLETION")
+    );
+  }
+});
+
+test("worker and lifecycle chronology is state-aware and keeps later cleanup checkpoints", () => {
+  const positive = completionBundle();
+  const completed = positive.terminalResult.worker;
+  const cleanup = completed.lifecycleEvents.at(-1);
+  assert.equal(cleanup.type, "checkpoint");
+  assert.ok(Date.parse(cleanup.at) > Date.parse(completed.completedAt));
+  assert.ok(Date.parse(cleanup.at) <= Date.parse(completed.updatedAt));
+  assert.doesNotThrow(() => validateInstalledCompletionScenario(positive));
+
+  const finalReportAtIntent = completionBundle();
+  finalReportAtIntent.terminalResult.worker.lifecycleEvents
+    .find((event) => event.type === "final.report")
+    .at = finalReportAtIntent.terminalResult.worker.completedAt;
+  assert.doesNotThrow(
+    () => validateInstalledCompletionScenario(finalReportAtIntent)
+  );
+
+  const mutations = [
+    (value) => {
+      value.spawn.worker.createdAt = "2026-07-23T10:00:01.000Z";
+    },
+    (value) => {
+      value.spawn.worker.heartbeatAt = "2026-07-23T10:00:01.000Z";
+    },
+    (value) => {
+      value.spawn.worker.heartbeatAt = "2030-01-01T00:00:00.000Z";
+      value.spawn.worker.updatedAt = "2030-01-01T00:00:00.000Z";
+    },
+    (value) => {
+      value.spawn.worker = worker("running");
+      value.spawn.worker.startedAt = "2026-07-23T09:59:59.000Z";
+    },
+    (value) => {
+      value.spawn.worker = worker("running");
+      value.spawn.worker.phase = "starting";
+      value.spawn.worker.startedAt = "2026-07-23T10:01:20.000Z";
+    },
+    (value) => {
+      value.terminalResult.worker.startedAt = "2026-07-23T09:59:59.000Z";
+    },
+    (value) => {
+      value.terminalResult.worker.completedAt = "2026-07-23T10:01:00.000Z";
+    },
+    (value) => {
+      value.terminalResult.worker.heartbeatAt = "2026-07-23T10:02:00.000Z";
+    },
+    (value) => {
+      value.terminalResult.worker.updatedAt = "2026-07-23T10:02:59.000Z";
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[0].sequence = 2;
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[0].type = "checkpoint";
+    },
+    (value) => {
+      const events = value.terminalResult.worker.lifecycleEvents;
+      const duplicate = clone(events[0]);
+      duplicate.at = "2026-07-23T10:00:30.000Z";
+      value.terminalResult.worker.lifecycleEvents = [
+        events[0],
+        duplicate,
+        ...events.slice(1)
+      ].map((event, index) => ({ ...event, sequence: index + 1 }));
+      value.terminalResult.worker.eventCursor.sequence =
+        value.terminalResult.worker.lifecycleEvents.length;
+    },
+    (value) => {
+      delete value.terminalResult.worker.lifecycleEvents[0].detail;
+    },
+    (value) => {
+      delete value.terminalResult.worker.lifecycleEvents[0].detail.write;
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[0].detail
+        .spawnSuccessDefinition = "provider-start";
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[0].detail.mode = "read";
+    },
+    (value) => {
+      const event = value.terminalResult.worker.lifecycleEvents[1];
+      event.type = "cancellation.requested";
+      event.detail = { requestAcceptedAt: event.at };
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[0].at =
+        "2026-07-23T09:59:59.000Z";
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[0].at =
+        "2026-07-23T10:01:31.000Z";
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[2].at =
+        "2026-07-23T10:01:20.000Z";
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents
+        .find((event) => event.type === "final.report")
+        .at = "2026-07-23T10:02:10.000Z";
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents.at(-1).at =
+        "2026-07-23T10:03:01.000Z";
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents.at(-1).type =
+        "activity.started";
+    },
+    (value) => {
+      const event = value.terminalResult.worker.lifecycleEvents.at(-1);
+      event.at = "2026-07-23T10:02:25.000Z";
+      event.type = "activity.started";
+    },
+    (value) => {
+      const event = value.terminalResult.worker.lifecycleEvents.at(-1);
+      event.at = "2026-07-23T10:02:25.000Z";
+      event.type = "plan.updated";
+      event.detail = { plan: ["Late plan"] };
+    },
+    (value) => {
+      const event = value.terminalResult.worker.lifecycleEvents.at(-1);
+      event.at = "2026-07-23T10:02:25.000Z";
+      event.type = "final.report";
+      event.detail = { outcome: "complete", structured: true };
+    },
+    (value) => {
+      const event = value.terminalResult.worker.lifecycleEvents.at(-1);
+      event.at = "2026-07-23T10:02:25.000Z";
+      event.type = "cancellation.requested";
+      event.detail = { requestAcceptedAt: event.at };
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[1].at =
+        "2026-07-23T10:01:00.000Z";
+      value.terminalResult.worker.lifecycleEvents[2].at =
+        "2026-07-23T10:01:10.000Z";
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[2].at =
+        "2026-07-23T10:03:01.000Z";
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[2].detail.outcome = "partial";
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[2].detail.structured = false;
+    }
+  ];
+  for (const mutate of mutations) {
+    const evidence = completionBundle();
+    mutate(evidence);
+    assert.throws(
+      () => validateInstalledCompletionScenario(evidence),
+      assertContractError("E_LIVE_COMPLETION")
+    );
+  }
+});
+
+test("completion binds every acceptance criterion and provider claim to the report", () => {
+  const mutations = [
+    (value) => {
+      value.terminalResult.worker.taskContract.acceptanceCriteria = [];
+      value.terminalResult.worker.result.workerReport.acceptanceResults = [];
+    },
+    (value) => {
+      value.terminalResult.worker.result.workerReport.acceptanceResults = [];
+    },
+    (value) => {
+      value.terminalResult.worker.result.workerReport.acceptanceResults = [
+        { id: "AC-01", status: "met" },
+        { id: "AC-01", status: "met" }
+      ];
+    },
+    (value) => {
+      value.terminalResult.worker.result.workerReport.acceptanceResults[0].id =
+        "AC-02";
+    },
+    (value) => {
+      value.terminalResult.worker.result.workerReport.acceptanceResults[0].status =
+        "unmet";
+    },
+    (value) => {
+      value.terminalResult.worker.taskContract.acceptanceCriteria.push({
+        id: "AC-01",
+        text: "Duplicate criterion."
+      });
+    },
+    (value) => {
+      value.terminalResult.worker.result.providerClaims.summary = "Drift";
+    },
+    (value) => {
+      value.terminalResult.worker.result.workerReport.checksClaimed = [
+        "node --test",
+        "npm test"
+      ];
+      value.terminalResult.worker.result.providerClaims.checksClaimed = [
+        "npm test",
+        "node --test"
+      ];
+    },
+    (value) => {
+      value.terminalResult.worker.result.providerClaims.changedFiles = [
+        "tracked.txt"
+      ];
+    }
+  ];
+  for (const mutate of mutations) {
+    const evidence = completionBundle();
+    mutate(evidence);
+    assert.throws(
+      () => validateInstalledCompletionScenario(evidence),
+      assertContractError("E_LIVE_COMPLETION")
+    );
+  }
+});
+
+test("non-replayed spawn accepts only the committed initial handle", () => {
+  assert.doesNotThrow(
+    () => validateInstalledCompletionScenario(completionBundle())
+  );
   const rejected = [
     (value) => {
       value.spawn.worker.status = "failed";
       value.spawn.worker.phase = "failed";
     },
     (value) => {
-      value.spawn.worker.status = "running";
-      value.spawn.worker.phase = "cleanup-blocked";
-      value.spawn.worker.startedAt = "2026-07-23T10:01:30.000Z";
+      value.spawn.worker.phase = "provider-launching";
+    },
+    (value) => {
+      value.spawn.worker = worker("running");
+      value.spawn.worker.phase = "starting";
     },
     (value) => { value.spawn.worker.terminal = true; },
     (value) => {
@@ -693,6 +1392,25 @@ test("non-replayed spawn accepts only the exact production race matrix", () => {
       value.spawn.worker.status = "running";
       value.spawn.worker.phase = "accepted";
       value.spawn.worker.startedAt = "2026-07-23T10:01:30.000Z";
+    },
+    (value) => {
+      value.spawn.worker.summary = "Provider launch started";
+    },
+    (value) => {
+      value.spawn.worker.progress = "Provider is starting.";
+    },
+    (value) => {
+      value.spawn.worker.eventCursor.sequence = 2;
+    },
+    (value) => {
+      value.spawn.worker.updatedAt = "2026-07-23T10:00:01.000Z";
+      value.spawn.worker.heartbeatAt = "2026-07-23T10:00:01.000Z";
+    },
+    (value) => {
+      value.spawn.worker.model = "grok-code-fast-1";
+    },
+    (value) => {
+      value.spawn.worker.effort = "high";
     }
   ];
   for (const mutate of rejected) {
@@ -710,6 +1428,16 @@ test("cancellation replay preserves immutable admission receipt and one public e
   assert.equal(valid.cancel.replayed, false);
   assert.equal(valid.cancelReplay.replayed, true);
   assert.equal(valid.cancel.receipt.processGroupGoneAt, null);
+  assert.ok(
+    Date.parse(valid.terminalResult.worker.lifecycleEvents.at(-1).at)
+      > Date.parse(valid.terminalResult.worker.completedAt)
+  );
+  assert.deepEqual(clone(valid.terminalResult.worker.error), {
+    workerProtocolVersion: 1,
+    errorSchemaVersion: 1,
+    code: "E_CANCELLED",
+    message: "Cancelled."
+  });
 
   const receiptDrift = cancellationBundle();
   receiptDrift.cancelReplay.receipt.receiptId = "cancel-ffffffffffffffffffffffff";
@@ -755,6 +1483,128 @@ test("cancellation replay preserves immutable admission receipt and one public e
     () => validateInstalledCancellationReplayScenario(replayReview),
     assertContractError("E_LIVE_CANCELLATION")
   );
+
+  const replayCursorInversion = cancellationBundle();
+  replayCursorInversion.spawnReplay.worker.eventCursor.sequence = 0;
+  assert.throws(
+    () => validateInstalledCancellationReplayScenario(replayCursorInversion),
+    assertContractError("E_LIVE_CANCELLATION")
+  );
+
+  const replayAtCancellationCursor = cancellationBundle();
+  replayAtCancellationCursor.spawnReplay.worker.eventCursor.sequence =
+    replayAtCancellationCursor.cancel.receipt.cancellationRequestSequence;
+  assert.throws(
+    () => validateInstalledCancellationReplayScenario(
+      replayAtCancellationCursor
+    ),
+    assertContractError("E_LIVE_CANCELLATION")
+  );
+
+  const replayAtTerminalCursor = cancellationBundle();
+  replayAtTerminalCursor.spawnReplay.worker.eventCursor.sequence =
+    replayAtTerminalCursor.terminalResult.worker.eventCursor.sequence;
+  assert.throws(
+    () => validateInstalledCancellationReplayScenario(replayAtTerminalCursor),
+    assertContractError("E_LIVE_CANCELLATION")
+  );
+
+  const replayAfterTerminalTime = cancellationBundle();
+  replayAfterTerminalTime.spawnReplay.worker.heartbeatAt =
+    "2030-01-01T00:00:00.000Z";
+  replayAfterTerminalTime.spawnReplay.worker.updatedAt =
+    "2030-01-01T00:00:00.000Z";
+  assert.throws(
+    () => validateInstalledCancellationReplayScenario(replayAfterTerminalTime),
+    assertContractError("E_LIVE_CANCELLATION")
+  );
+
+  const replayStartedAtDrift = cancellationBundle();
+  replayStartedAtDrift.spawnReplay.worker.startedAt =
+    "2026-07-23T10:01:20.000Z";
+  assert.throws(
+    () => validateInstalledCancellationReplayScenario(replayStartedAtDrift),
+    assertContractError("E_LIVE_CANCELLATION")
+  );
+
+  for (const mutate of [
+    (value) => { value.terminalResult.worker.error = null; },
+    (value) => { value.terminalResult.worker.error.code = "E_TIMEOUT"; },
+    (value) => {
+      value.terminalResult.worker.error.details = { nonce: "private" };
+    },
+    (value) => {
+      value.terminalResult.worker.result.cancellation.providerProcess = {
+        pid: 42
+      };
+    },
+    (value) => {
+      value.terminalResult.worker.result.workerReport = {
+        rawProviderMessage: "private"
+      };
+    },
+    (value) => {
+      const event = value.terminalResult.worker.lifecycleEvents[2];
+      event.type = "final.report";
+      event.detail = { outcome: "complete", structured: true };
+    },
+    (value) => {
+      const event = value.terminalResult.worker.lifecycleEvents.at(-1);
+      event.at = "2026-07-23T10:02:15.000Z";
+      event.type = "activity.started";
+    },
+    (value) => {
+      const event = value.terminalResult.worker.lifecycleEvents.at(-1);
+      event.at = "2026-07-23T10:02:15.000Z";
+      event.type = "plan.updated";
+      event.detail = { plan: ["Late plan"] };
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[2].sequence += 1;
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents
+        .find((event) => event.type === "cancellation.requested")
+        .detail.requestAcceptedAt = "2026-07-23T10:02:01.000Z";
+    },
+    (value) => {
+      const acceptedAt = "2026-07-23T10:02:31.000Z";
+      value.cancel.receipt.requestAcceptedAt = acceptedAt;
+      value.cancelReplay.receipt.requestAcceptedAt = acceptedAt;
+      value.terminalResult.worker.result.cancellation.requestAcceptedAt =
+        acceptedAt;
+      const event = value.terminalResult.worker.lifecycleEvents
+        .find((entry) => entry.type === "cancellation.requested");
+      event.at = acceptedAt;
+      event.detail.requestAcceptedAt = acceptedAt;
+    },
+    (value) => {
+      const acceptedAt = "2026-07-23T10:01:00.000Z";
+      const events = value.terminalResult.worker.lifecycleEvents;
+      const cancellationEvent = events[6];
+      cancellationEvent.at = acceptedAt;
+      cancellationEvent.detail.requestAcceptedAt = acceptedAt;
+      value.terminalResult.worker.lifecycleEvents = [
+        events[0],
+        cancellationEvent,
+        ...events.slice(1, 6),
+        events[7]
+      ].map((event, index) => ({ ...event, sequence: index + 1 }));
+      value.cancel.receipt.requestAcceptedAt = acceptedAt;
+      value.cancelReplay.receipt.requestAcceptedAt = acceptedAt;
+      value.cancel.receipt.cancellationRequestSequence = 2;
+      value.cancelReplay.receipt.cancellationRequestSequence = 2;
+      value.terminalResult.worker.result.cancellation.requestAcceptedAt =
+        acceptedAt;
+    }
+  ]) {
+    const drift = cancellationBundle();
+    mutate(drift);
+    assert.throws(
+      () => validateInstalledCancellationReplayScenario(drift),
+      assertContractError("E_LIVE_CANCELLATION")
+    );
+  }
 });
 
 test("private completion observation requires exact counts, immutable ids, and cleanup proof", () => {
@@ -765,9 +1615,37 @@ test("private completion observation requires exact counts, immutable ids, and c
 
   for (const mutate of [
     (value) => { value.providerLaunchCount = 2; },
+    (value) => { value.observedPublicWorkerDigests[0] = "not-a-digest"; },
+    (value) => { value.observedPublicWorkerDigests.pop(); },
     (value) => { value.observedProviderGenerations = [1, 2]; },
     (value) => { value.observedWorkerIds[1] = "task-ffffffffffffffff"; },
     (value) => { value.observedContextManifestIds[1] = "ctx-drift"; },
+    (value) => { delete value.installedWorkerBinding.createdAt; },
+    (value) => { value.installedWorkerBinding.createdAt = "not-a-time"; },
+    (value) => { value.installedWorkerBinding.model = 42; },
+    (value) => {
+      value.installedWorkerBinding.effort = "path=/private/tmp/effort";
+    },
+    (value) => {
+      value.installedWorkerBinding.securityProfile.id = "rescue-write-v3";
+    },
+    (value) => {
+      value.installedWorkerBinding.securityProfile.contractVersion = 2;
+    },
+    (value) => {
+      value.installedWorkerBinding.securityProfile.agentProfileDigest = "0";
+    },
+    (value) => {
+      value.installedWorkerBinding.securityProfile.nonce = "private";
+    },
+    (value) => { delete value.installedWorkerBinding.hostTaskBinding; },
+    (value) => { value.installedWorkerBinding.extra = true; },
+    (value) => {
+      value.installedWorkerBinding.workspaceSnapshotDigest = "f".repeat(64);
+    },
+    (value) => {
+      value.installedWorkerBinding.taskEnvelopeDigest = "not-a-digest";
+    },
     (value) => { value.workerHostVerification = "passed"; },
     (value) => { value.processGroupGone = false; },
     (value) => { value.taskRuntimeCleaned = false; },
@@ -775,6 +1653,112 @@ test("private completion observation requires exact counts, immutable ids, and c
     (value) => { value.qualificationSessionDeleted = false; }
   ]) {
     const drift = privateObservation("authenticated-completion");
+    mutate(drift);
+    assert.throws(
+      () => validateInstalledPrivateObservation(drift),
+      assertContractError("E_LIVE_PRIVATE_STATE")
+    );
+  }
+});
+
+test("spawn response witnesses fail closed on shape, identity, and digest drift", () => {
+  const completionMutations = [
+    (value) => {
+      value.observedSpawnResponseWitnesses.pop();
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses.push(
+        clone(value.observedSpawnResponseWitnesses[0])
+      );
+    },
+    (value) => {
+      delete value.observedSpawnResponseWitnesses[0].witnessId;
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[0].extra = true;
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[0].schemaVersion = 2;
+      refreshSpawnResponseWitnessId(value.observedSpawnResponseWitnesses[0]);
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[0].witnessId =
+        `spawnw-${"f".repeat(24)}`;
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[0].projection =
+        "worker-snapshot-v1";
+      refreshSpawnResponseWitnessId(value.observedSpawnResponseWitnesses[0]);
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[0].responseSequence = 2;
+      refreshSpawnResponseWitnessId(value.observedSpawnResponseWitnesses[0]);
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[0].workerId =
+        "task-ffffffffffffffff";
+      refreshSpawnResponseWitnessId(value.observedSpawnResponseWitnesses[0]);
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[0].requestDigest = "not-a-digest";
+      refreshSpawnResponseWitnessId(value.observedSpawnResponseWitnesses[0]);
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[0].idempotencyKeyDigest =
+        "not-a-digest";
+      refreshSpawnResponseWitnessId(value.observedSpawnResponseWitnesses[0]);
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[0].replayed = true;
+      refreshSpawnResponseWitnessId(value.observedSpawnResponseWitnesses[0]);
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[0].handleDigest = "f".repeat(64);
+      refreshSpawnResponseWitnessId(value.observedSpawnResponseWitnesses[0]);
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[0].eventCursorSequence = 2;
+      refreshSpawnResponseWitnessId(value.observedSpawnResponseWitnesses[0]);
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[0].recordedAt = "not-a-time";
+      refreshSpawnResponseWitnessId(value.observedSpawnResponseWitnesses[0]);
+    }
+  ];
+  for (const mutate of completionMutations) {
+    const drift = privateObservation("authenticated-completion");
+    mutate(drift);
+    assert.throws(
+      () => validateInstalledPrivateObservation(drift),
+      assertContractError("E_LIVE_PRIVATE_STATE")
+    );
+  }
+
+  const cancellationMutations = [
+    (value) => {
+      value.observedSpawnResponseWitnesses[1].requestDigest = "f".repeat(64);
+      refreshSpawnResponseWitnessId(value.observedSpawnResponseWitnesses[1]);
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[1].idempotencyKeyDigest =
+        "f".repeat(64);
+      refreshSpawnResponseWitnessId(value.observedSpawnResponseWitnesses[1]);
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[1].eventCursorSequence = 1;
+      refreshSpawnResponseWitnessId(value.observedSpawnResponseWitnesses[1]);
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses[1].recordedAt =
+        "2026-07-23T09:59:59.000Z";
+      refreshSpawnResponseWitnessId(value.observedSpawnResponseWitnesses[1]);
+    },
+    (value) => {
+      value.observedSpawnResponseWitnesses.reverse();
+    }
+  ];
+  for (const mutate of cancellationMutations) {
+    const drift = privateObservation("mcp-restart-reconnect-cancellation");
     mutate(drift);
     assert.throws(
       () => validateInstalledPrivateObservation(drift),
@@ -803,6 +1787,34 @@ test("private reconnect/cancel observation requires one generation and one repla
     () => validateInstalledPrivateObservation(replayDrift),
     assertContractError("E_LIVE_PRIVATE_STATE")
   );
+
+  const publicDigestCountDrift = privateObservation(
+    "mcp-restart-reconnect-cancellation"
+  );
+  publicDigestCountDrift.observedPublicWorkerDigests.pop();
+  assert.throws(
+    () => validateInstalledPrivateObservation(publicDigestCountDrift),
+    assertContractError("E_LIVE_PRIVATE_STATE")
+  );
+});
+
+test("integrated witness binding rejects forged replay response fields", () => {
+  const publicEvidence = cancellationBundle();
+  const privateEvidence = privateObservation(
+    "mcp-restart-reconnect-cancellation"
+  );
+  publicEvidence.spawnReplay.worker.summary = "Forged replay response";
+  publicEvidence.spawnReplay.worker.progress = "Forged active progress.";
+  assert.doesNotThrow(
+    () => validateInstalledCancellationReplayScenario(publicEvidence)
+  );
+  assert.doesNotThrow(
+    () => validateInstalledPrivateObservation(privateEvidence)
+  );
+  assert.throws(
+    () => validateInstalledScenarioEvidence(publicEvidence, privateEvidence),
+    assertContractError("E_LIVE_PRIVATE_STATE")
+  );
 });
 
 test("integrated validator cross-binds every private identity to public scenario evidence", () => {
@@ -816,6 +1828,9 @@ test("integrated validator cross-binds every private identity to public scenario
   ), true);
 
   const unrelated = privateObservation("authenticated-completion");
+  unrelated.installedWorkerBinding.workerId = "task-ffffffffffffffff";
+  unrelated.installedWorkerBinding.taskEnvelopeId = `env-${"f".repeat(24)}`;
+  unrelated.installedWorkerBinding.contextManifestId = `ctx-${"f".repeat(24)}`;
   unrelated.observedWorkerIds = Array(2).fill("task-ffffffffffffffff");
   unrelated.observedProviderWorkerIds = ["task-ffffffffffffffff"];
   unrelated.observedTaskEnvelopeIds = Array(2).fill(
@@ -824,6 +1839,10 @@ test("integrated validator cross-binds every private identity to public scenario
   unrelated.observedContextManifestIds = Array(2).fill(
     `ctx-${"f".repeat(24)}`
   );
+  for (const witness of unrelated.observedSpawnResponseWitnesses) {
+    witness.workerId = "task-ffffffffffffffff";
+    refreshSpawnResponseWitnessId(witness);
+  }
   assert.doesNotThrow(() => validateInstalledPrivateObservation(unrelated));
   assert.throws(
     () => validateInstalledScenarioEvidence(completionBundle(), unrelated),
@@ -836,14 +1855,8 @@ test("integrated validator cross-binds every private identity to public scenario
   providerBindingDrift.observedProviderWorkerIds = Array(2).fill(
     "task-ffffffffffffffff"
   );
-  assert.doesNotThrow(
-    () => validateInstalledPrivateObservation(providerBindingDrift)
-  );
   assert.throws(
-    () => validateInstalledScenarioEvidence(
-      cancellationBundle(),
-      providerBindingDrift
-    ),
+    () => validateInstalledPrivateObservation(providerBindingDrift),
     assertContractError("E_LIVE_PRIVATE_STATE")
   );
 
@@ -871,6 +1884,111 @@ test("integrated validator cross-binds every private identity to public scenario
     ),
     assertContractError("E_LIVE_COMPLETION")
   );
+
+  for (const scenarioId of INSTALLED_WORKER_SCENARIO_IDS) {
+    const publicEvidence = scenarioId === "authenticated-completion"
+      ? completionBundle()
+      : cancellationBundle();
+    const reorderedDigests = privateObservation(scenarioId);
+    reorderedDigests.observedPublicWorkerDigests.reverse();
+    for (
+      const [index, witness] of
+        reorderedDigests.observedSpawnResponseWitnesses.entries()
+    ) {
+      witness.handleDigest = reorderedDigests.observedPublicWorkerDigests[index];
+      refreshSpawnResponseWitnessId(witness);
+    }
+    assert.doesNotThrow(
+      () => validateInstalledPrivateObservation(reorderedDigests)
+    );
+    assert.throws(
+      () => validateInstalledScenarioEvidence(
+        publicEvidence,
+        reorderedDigests
+      ),
+      assertContractError("E_LIVE_PRIVATE_STATE")
+    );
+  }
+});
+
+test("integrated validator binds terminal task and context content to private digests", () => {
+  for (const mutate of [
+    (value) => {
+      value.terminalResult.worker.taskContract.objective =
+        "Forged public objective.";
+    },
+    (value) => {
+      value.terminalResult.worker.context.branch = "forged-branch";
+    }
+  ]) {
+    const publicEvidence = completionBundle();
+    const privateEvidence = privateObservation("authenticated-completion");
+    mutate(publicEvidence);
+    assert.doesNotThrow(
+      () => validateInstalledCompletionScenario(publicEvidence)
+    );
+    assert.throws(
+      () => validateInstalledScenarioEvidence(
+        publicEvidence,
+        privateEvidence
+      ),
+      assertContractError("E_LIVE_PRIVATE_STATE")
+    );
+  }
+});
+
+test("integrated validator rejects consistently forged public binding fields", () => {
+  const cases = [
+    {
+      publicEvidence: completionBundle(),
+      privateEvidence: privateObservation("authenticated-completion"),
+      validatePublic: validateInstalledCompletionScenario,
+      workers(value) {
+        return [value.spawn.worker, value.terminalResult.worker];
+      }
+    },
+    {
+      publicEvidence: cancellationBundle(),
+      privateEvidence: privateObservation(
+        "mcp-restart-reconnect-cancellation"
+      ),
+      validatePublic: validateInstalledCancellationReplayScenario,
+      workers(value) {
+        return [
+          value.spawn.worker,
+          value.spawnReplay.worker,
+          value.terminalResult.worker
+        ];
+      }
+    }
+    ];
+  for (const entry of cases) {
+    for (const publicWorker of entry.workers(entry.publicEvidence)) {
+      publicWorker.securityProfile.agentProfileDigest = "a".repeat(64);
+      publicWorker.taskEnvelopeDigest = "a".repeat(64);
+      publicWorker.contextDigest = "b".repeat(64);
+      publicWorker.workspaceSnapshotDigest = "b".repeat(64);
+      publicWorker.controlWorkspaceId = `cws-${"f".repeat(32)}`;
+      publicWorker.hostTaskBinding = `host-task-${"f".repeat(32)}`;
+      if (publicWorker.taskContract) {
+        publicWorker.taskContract.digest = publicWorker.taskEnvelopeDigest;
+      }
+      if (publicWorker.context) {
+        publicWorker.context.digest = publicWorker.contextDigest;
+      }
+    }
+    assert.doesNotThrow(() => entry.validatePublic(entry.publicEvidence));
+    assert.doesNotThrow(
+      () => validateInstalledPrivateObservation(entry.privateEvidence)
+    );
+    assert.throws(
+      () => validateInstalledScenarioEvidence(
+        entry.publicEvidence,
+        entry.privateEvidence
+      ),
+      assertContractError("E_LIVE_PRIVATE_STATE")
+    );
+  }
 });
 
 test("contract exposes validation only and no live receipt authority", async () => {

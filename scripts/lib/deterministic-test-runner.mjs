@@ -98,6 +98,10 @@ export function runDeterministicTestFiles({
     const file = files[index];
     const child = index + 1;
     let result;
+    // Emit only a fixed ordinal before the blocking child call. This keeps
+    // paths, environment values, and child output private while allowing a
+    // bounded CI timeout to identify the last child that actually started.
+    stderr.write(`Deterministic test child ${child} started.\n`);
     try {
       result = run(node, [
         "--test",

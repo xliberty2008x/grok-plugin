@@ -24,7 +24,7 @@ export function profileFor(kind, write = false) {
     sandbox: "strict",
     permissionMode: "dontAsk",
     agentProfileDigest: agentProfileDigest("report-repair.md"),
-    allowedTools: [],
+    allowedTools: ["todo_write"],
     deniedTools: [...denied, "Bash", "Edit", "Write"]
   };
   return {

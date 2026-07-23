@@ -236,8 +236,10 @@ if (!versionsOnly) {
     "scripts/bump-version.mjs",
     "scripts/update-local-codex.mjs",
     "scripts/test-natural-codex.mjs",
+    "scripts/test-installed-worker-mcp.mjs",
     "tests/live-grok.test.mjs",
     "tests/installed-codex.test.mjs",
+    "tests/installed-worker-mcp-runner.test.mjs",
     "tests/natural-codex-output.schema.json",
     "tests/worker-broker-evidence.test.mjs",
     "tests/worker-protocol.test.mjs",
@@ -295,7 +297,7 @@ if (!versionsOnly) {
     if (packageJson.type !== "module") problem("The package must use ESM (`type: module`).", "package.json");
     if (packageJson.license !== "Apache-2.0") problem("Package license must be Apache-2.0.", "package.json");
     if (packageJson.engines?.node !== ">=18.18") problem("Node engine must remain >=18.18.", "package.json");
-    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "codex:update-local", "validate", "version:check", "version:bump", "check"]) {
+    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "test:installed-worker-mcp", "codex:update-local", "validate", "version:check", "version:bump", "check"]) {
       if (!packageJson.scripts?.[script]) problem(`Missing npm script: ${script}.`, "package.json");
     }
     if (packageJson.scripts?.["test:pty-ingress"] !== "node --test tests/pty-ingress.test.mjs") {
@@ -303,6 +305,9 @@ if (!versionsOnly) {
     }
     if (packageJson.scripts?.["test:installed-codex"] !== "node --test tests/installed-codex.test.mjs") {
       problem("test:installed-codex must execute the installed Codex gate directly.", "package.json");
+    }
+    if (packageJson.scripts?.["test:installed-worker-mcp"] !== "node scripts/test-installed-worker-mcp.mjs") {
+      problem("test:installed-worker-mcp must execute the opt-in installed Worker MCP gate directly.", "package.json");
     }
     if (packageJson.scripts?.["test:deterministic"] !== "node scripts/test-deterministic.mjs") {
       problem("test:deterministic must execute the zero-skip deterministic runner directly.", "package.json");
@@ -625,15 +630,47 @@ if (!versionsOnly) {
     if (!/modified|adapted/i.test(agent) || !/openai\/codex-plugin-cc/i.test(agent)) problem("Adapted agent must carry a prominent upstream modification notice.", "plugins/grok/agents/grok-rescue.md");
   }
 
-  const reportRepairFile = "plugins/grok/provider-agents/report-repair.md";
-  const reportRepair = readText(reportRepairFile, { required: false });
-  if (reportRepair != null) {
-    const frontmatter = reportRepair.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] || "";
-    if (!frontmatter) problem("Report-repair profile must start with YAML frontmatter.", reportRepairFile);
-    if (!/^permission_mode:\s*dontAsk\s*$/m.test(frontmatter)) problem("Report-repair profile must deny interactive permission escalation.", reportRepairFile);
-    if (!/^injectDefaultTools:\s*false\s*$/m.test(frontmatter)) problem("Report-repair profile must disable default tools.", reportRepairFile);
-    if (!/^toolConfig:\s*\r?\n\s+tools:\s*\[\s*\]\s*$/m.test(frontmatter)) problem("Report-repair profile must declare an empty tool list.", reportRepairFile);
-    if (/GrokBuild:[A-Za-z_]/.test(frontmatter)) problem("Report-repair profile must not name any Grok tool.", reportRepairFile);
+  for (const [label, profileFile, expectedName, expectedDescription] of [
+    [
+      "Report-repair",
+      "plugins/grok/provider-agents/report-repair.md",
+      "grok-companion-report-repair",
+      "No-workspace formatter for a completed Grok Companion task report."
+    ],
+    [
+      "Setup-probe",
+      "plugins/grok/provider-agents/setup-probe.md",
+      "grok-companion-setup-probe",
+      "Restricted no-workspace ACP setup probe agent for Grok Companion."
+    ]
+  ]) {
+    const profile = readText(profileFile, { required: false });
+    if (profile == null) continue;
+    const frontmatter = profile.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] || "";
+    if (!frontmatter) problem(`${label} profile must start with YAML frontmatter.`, profileFile);
+    const canonicalFrontmatter = [
+      `name: ${expectedName}`,
+      `description: ${expectedDescription}`,
+      "prompt_mode: full",
+      "permission_mode: dontAsk",
+      "agents_md: false",
+      "injectDefaultTools: false",
+      "toolConfig:",
+      "  tools:",
+      "    - id: GrokBuild:todo_write"
+    ].join("\n");
+    if (frontmatter.replace(/\r\n/g, "\n") !== canonicalFrontmatter) {
+      problem(`${label} profile frontmatter must use the exact canonical compatibility-only shape.`, profileFile);
+    }
+    if (!/^permission_mode:\s*dontAsk\s*$/m.test(frontmatter)) problem(`${label} profile must deny interactive permission escalation.`, profileFile);
+    if (!/^injectDefaultTools:\s*false\s*$/m.test(frontmatter)) problem(`${label} profile must disable default tools.`, profileFile);
+    if (!/^toolConfig:\s*\r?\n\s+tools:\s*\r?\n\s+- id:\s*GrokBuild:todo_write\s*$/m.test(frontmatter)) {
+      problem(`${label} profile must expose only the compatibility plan-state tool.`, profileFile);
+    }
+    const toolIds = [...frontmatter.matchAll(/^\s+- id:\s*(\S+)\s*$/gm)].map((match) => match[1]);
+    if (toolIds.length !== 1 || toolIds[0] !== "GrokBuild:todo_write") {
+      problem(`${label} profile must not expose workspace, execution, network, or orchestration tools.`, profileFile);
+    }
   }
 
   const rootLicense = readText("LICENSE");

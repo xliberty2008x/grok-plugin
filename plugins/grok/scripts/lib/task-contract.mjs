@@ -971,7 +971,7 @@ export function buildWorkerReport({
   };
 }
 
-/** Build one same-session, no-tool repair turn for a malformed final worker report. */
+/** Build one same-session, no-tool-use repair turn for a malformed final worker report. */
 export function composeWorkerReportRepairPrompt(envelope, report) {
   const criteria = Array.isArray(envelope?.acceptanceCriteria) ? envelope.acceptanceCriteria : [];
   const acceptanceTemplate = criteria.map((criterion) => ({

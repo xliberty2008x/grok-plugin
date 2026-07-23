@@ -517,7 +517,7 @@ test("worker reports require the final marker and exact acceptance IDs", () => {
   assert.ok(invalid.validationIssues.some((item) => /Missing acceptance result AC-02/.test(item)));
 });
 
-test("report repair prompt is no-tool, marker-bound, and acceptance-complete", () => {
+test("report repair prompt forbids tool use and is marker-bound and acceptance-complete", () => {
   const envelope = buildTaskEnvelope({
     userRequest: "repair fixture",
     acceptanceCriteria: [
@@ -532,6 +532,49 @@ test("report repair prompt is no-tool, marker-bound, and acceptance-complete", (
   assert.match(prompt, /GROK_WORKER_REPORT:/);
   assert.match(prompt, /AC-01/);
   assert.match(prompt, /AC-02/);
+});
+
+test("provider formatter and setup profiles expose only compatibility plan state", () => {
+  for (const [file, name, description] of [
+    [
+      "report-repair.md",
+      "grok-companion-report-repair",
+      "No-workspace formatter for a completed Grok Companion task report."
+    ],
+    [
+      "setup-probe.md",
+      "grok-companion-setup-probe",
+      "Restricted no-workspace ACP setup probe agent for Grok Companion."
+    ]
+  ]) {
+    const text = fs.readFileSync(
+      path.join(ROOT, "plugins/grok/provider-agents", file),
+      "utf8"
+    );
+    const frontmatter = text.match(/^---\n([\s\S]*?)\n---/)?.[1] || "";
+    assert.equal(frontmatter, [
+      `name: ${name}`,
+      `description: ${description}`,
+      "prompt_mode: full",
+      "permission_mode: dontAsk",
+      "agents_md: false",
+      "injectDefaultTools: false",
+      "toolConfig:",
+      "  tools:",
+      "    - id: GrokBuild:todo_write"
+    ].join("\n"));
+    assert.match(frontmatter, /^permission_mode:\s*dontAsk$/m);
+    assert.match(frontmatter, /^injectDefaultTools:\s*false$/m);
+    assert.deepEqual(
+      [...frontmatter.matchAll(/^\s+- id:\s*(\S+)\s*$/gm)].map((match) => match[1]),
+      ["GrokBuild:todo_write"]
+    );
+    assert.doesNotMatch(
+      frontmatter,
+      /GrokBuild:(?:read_file|list_dir|grep|search_replace|run_terminal_cmd|web_search|web_fetch|task|ask_user_question)/
+    );
+    assert.match(text, /never invoke it/i);
+  }
 });
 
 test("provider success claims leave hostVerification not_run in runtime evidence", () => {
@@ -845,7 +888,8 @@ test("integration: malformed task report gets one same-session format repair", {
   assert.equal(fs.existsSync(stagedRepairProfile), false, "repair profile remained after verified provider exit");
   const repairProfile = fs.readFileSync(path.join(ROOT, "plugins/grok/provider-agents/report-repair.md"), "utf8");
   assert.match(repairProfile, /name: grok-companion-report-repair/);
-  assert.match(repairProfile, /tools:\s*\[\]/);
+  assert.match(repairProfile, /tools:\s*\n\s+- id: GrokBuild:todo_write/);
+  assert.equal((repairProfile.match(/^\s+- id:/gm) || []).length, 1);
   assert.equal(repairProfile.includes("GrokBuild:search_replace"), false);
 });
 
@@ -874,7 +918,10 @@ test("integration: two invalid task reports fail with E_SCHEMA and retain bounde
   assert.equal(invocations.length, 2);
   const repairProfileIndex = invocations[1].args.indexOf("--agent-profile");
   assert.equal(fs.existsSync(invocations[1].args[repairProfileIndex + 1]), false, "failed repair retained its staged profile");
-  assert.match(fs.readFileSync(path.join(ROOT, "plugins/grok/provider-agents/report-repair.md"), "utf8"), /tools:\s*\[\]/);
+  assert.match(
+    fs.readFileSync(path.join(ROOT, "plugins/grok/provider-agents/report-repair.md"), "utf8"),
+    /tools:\s*\n\s+- id: GrokBuild:todo_write/
+  );
 });
 
 test("integration: report-repair transport failures preserve their operational error code", {

@@ -197,6 +197,7 @@ async function collectZeroSkipReport(events, options = {}) {
 
 test("deterministic runner executes files sequentially and aggregates exact zero-skip summaries", () => {
   const calls = [];
+  const timeline = [];
   let output = "";
   let diagnostic = "";
   const files = ["tests/first.test.mjs", "tests/second.test.mjs"];
@@ -207,6 +208,7 @@ test("deterministic runner executes files sequentially and aggregates exact zero
     node: "/exact/node",
     env: { PROOF_ENV: "fixed" },
     run(binary, args, options) {
+      timeline.push(`run-${calls.length + 1}`);
       calls.push({ binary, args, options });
       return {
         status: 0,
@@ -216,10 +218,22 @@ test("deterministic runner executes files sequentially and aggregates exact zero
       };
     },
     stdout: { write(value) { output += value; } },
-    stderr: { write(value) { diagnostic += value; } }
+    stderr: { write(value) {
+      diagnostic += value;
+      timeline.push(value);
+    } }
   });
   assert.equal(status, 0);
-  assert.equal(diagnostic, "");
+  assert.equal(
+    diagnostic,
+    "Deterministic test child 1 started.\nDeterministic test child 2 started.\n"
+  );
+  assert.deepEqual(timeline, [
+    "Deterministic test child 1 started.\n",
+    "run-1",
+    "Deterministic test child 2 started.\n",
+    "run-2"
+  ]);
   assert.deepEqual(calls.map((call) => call.args), files.map((file) => [
     "--test",
     "--test-reporter=/exact/reporter.mjs",
@@ -4595,8 +4609,14 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
     "scripts/lib/static-esm-import-parser.mjs",
     "scripts/lib/zero-skip-test-reporter.mjs",
     "scripts/lib/deterministic-test-runner.mjs",
+    "scripts/lib/installed-worker-mcp-contract.mjs",
+    "scripts/test-installed-worker-mcp.mjs",
     "scripts/test-phase1-focused.mjs",
+    "scripts/validate.mjs",
+    "package.json",
     "tests/control-plane.test.mjs",
+    "tests/installed-worker-mcp-contract.test.mjs",
+    "tests/installed-worker-mcp-runner.test.mjs",
     "tests/mcp-worker-runtime.test.mjs",
     "tests/process-control.test.mjs",
     "tests/provider.test.mjs",
@@ -4630,6 +4650,8 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
     "the Phase 1 focused gate must use only the fixed serial runner"
   );
   for (const relative of [
+    "tests/installed-worker-mcp-contract.test.mjs",
+    "tests/installed-worker-mcp-runner.test.mjs",
     "tests/worker-launch-outbox.test.mjs",
     "tests/provider-bootstrap-crash-window.test.mjs",
     "tests/provider-capability.test.mjs",
@@ -4641,7 +4663,7 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
       `the Phase 1 focused gate must execute ${relative} exactly once`
     );
   }
-  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 25);
+  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 27);
 });
 
 test("Phase 1 proof rejects unsupported slices and caller-supplied execution authority", () => {

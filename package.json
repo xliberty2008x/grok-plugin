@@ -13,6 +13,7 @@
     "test:e2e": "node --test tests/live-grok.test.mjs",
     "test:pty-ingress": "node --test tests/pty-ingress.test.mjs",
     "test:installed-codex": "node --test tests/installed-codex.test.mjs",
+    "test:installed-worker-mcp": "node scripts/test-installed-worker-mcp.mjs",
     "test:natural-codex": "node scripts/test-natural-codex.mjs",
     "codex:update-local": "node scripts/update-local-codex.mjs",
     "validate": "node scripts/validate.mjs",

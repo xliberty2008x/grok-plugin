@@ -11,6 +11,7 @@ const MAX_STRING_BYTES = 256 * 1024;
 const SHA256_HEX = /^[a-f0-9]{64}$/;
 const WORKER_ID = /^(?:review|adversarial-review|task|stop-review)-[a-f0-9]{16,64}$/;
 const CANCELLATION_RECEIPT_ID = /^cancel-[a-f0-9]{24}$/;
+const SPAWN_RESPONSE_WITNESS_ID = /^spawnw-[a-f0-9]{24}$/;
 const TASK_ENVELOPE_ID = /^env-[a-f0-9]{24}$/;
 const CONTEXT_MANIFEST_ID = /^ctx-[a-f0-9]{24}$/;
 const HOST_TASK_BINDING = /^host-task-[a-f0-9]{32}$/;
@@ -70,6 +71,7 @@ const ACP_ISOLATION_KEYS = new Set([
   "sandbox",
   "permissionMode",
   "injectDefaultTools",
+  "allowedTools",
   "agentProfileDigest",
   "unattendedPrivilegeExpansion"
 ]);
@@ -171,6 +173,9 @@ const CANCELLATION_BUNDLE_KEYS = new Set([
 ]);
 const PRIVATE_OBSERVATION_KEYS = new Set([
   "scenarioId",
+  "installedWorkerBinding",
+  "observedPublicWorkerDigests",
+  "observedSpawnResponseWitnesses",
   "observedWorkerIds",
   "observedTaskEnvelopeIds",
   "observedContextManifestIds",
@@ -195,6 +200,337 @@ const PRIVATE_OBSERVATION_KEYS = new Set([
   "providerGuardAbsent",
   "runnerTemporaryArtifactsRemoved",
   "qualificationSessionDeleted"
+]);
+const INSTALLED_WORKER_BINDING_KEYS = new Set([
+  "workerId",
+  "createdAt",
+  "model",
+  "effort",
+  "securityProfile",
+  "taskEnvelopeId",
+  "taskEnvelopeDigest",
+  "contextManifestId",
+  "contextDigest",
+  "workspaceSnapshotDigest",
+  "controlWorkspaceId",
+  "hostTaskBinding"
+]);
+const WORKER_HANDLE_KEYS = new Set([
+  "workerProtocolVersion",
+  "handleSchemaVersion",
+  "id",
+  "kind",
+  "jobClass",
+  "write",
+  "status",
+  "phase",
+  "summary",
+  "progress",
+  "createdAt",
+  "startedAt",
+  "updatedAt",
+  "completedAt",
+  "heartbeatAt",
+  "profileId",
+  "model",
+  "effort",
+  "parentWorkerId",
+  "lineageWorkerId",
+  "eventCursor",
+  "taskEnvelopeId",
+  "taskEnvelopeDigest",
+  "contextManifestId",
+  "contextDigest",
+  "workspaceSnapshotDigest",
+  "hostTaskBinding",
+  "securityProfile",
+  "controlWorkspaceId",
+  "roleId",
+  "externalWorkerLabel",
+  "terminal"
+]);
+const WORKER_SNAPSHOT_KEYS = new Set([
+  "workerProtocolVersion",
+  "snapshotSchemaVersion",
+  "schemaVersion",
+  "id",
+  "kind",
+  "jobClass",
+  "write",
+  "status",
+  "phase",
+  "summary",
+  "progress",
+  "createdAt",
+  "startedAt",
+  "updatedAt",
+  "completedAt",
+  "heartbeatAt",
+  "profileId",
+  "model",
+  "effort",
+  "parentWorkerId",
+  "lineageWorkerId",
+  "eventCursor",
+  "taskEnvelopeId",
+  "taskEnvelopeDigest",
+  "contextManifestId",
+  "contextDigest",
+  "workspaceSnapshotDigest",
+  "hostTaskBinding",
+  "securityProfile",
+  "latestPlan",
+  "lifecycleEvents",
+  "taskContract",
+  "context",
+  "resumeJobId",
+  "result",
+  "error",
+  "controlWorkspaceId",
+  "roleId",
+  "externalWorkerLabel",
+  "awaitingHostAction",
+  "terminal"
+]);
+const EVENT_CURSOR_KEYS = new Set(["schemaVersion", "workerId", "sequence"]);
+const SECURITY_PROFILE_KEYS = new Set(["id", "contractVersion", "agentProfileDigest"]);
+const SPAWN_RESPONSE_WITNESS_KEYS = new Set([
+  "schemaVersion",
+  "witnessId",
+  "projection",
+  "responseSequence",
+  "workerId",
+  "requestDigest",
+  "idempotencyKeyDigest",
+  "replayed",
+  "handleDigest",
+  "eventCursorSequence",
+  "recordedAt"
+]);
+const SPAWN_RESPONSE_WITNESS_PROJECTION =
+  "worker-handle-v1-untrusted-host";
+const LIFECYCLE_EVENT_KEYS = new Set([
+  "workerProtocolVersion",
+  "eventSchemaVersion",
+  "type",
+  "at",
+  "summary",
+  "sequence"
+]);
+const LIFECYCLE_DETAIL_KEYS = new Set([
+  "envelopeId",
+  "resumeJobId",
+  "spawnSuccessDefinition",
+  "requestAcceptedAt",
+  "reconciler",
+  "messageId",
+  "contentDigest",
+  "parentWorkerId",
+  "version",
+  "name",
+  "status",
+  "mode",
+  "state",
+  "eventType",
+  "verdict",
+  "outcome",
+  "write",
+  "replayedPrompt",
+  "structured",
+  "exitCode",
+  "findings",
+  "commands",
+  "plan",
+  "questions",
+  "validationIssues",
+  "observedChangedPaths"
+]);
+const TASK_CONTRACT_KEYS = new Set([
+  "schemaVersion",
+  "envelopeId",
+  "digest",
+  "objective",
+  "mode",
+  "scope",
+  "nonGoals",
+  "acceptanceCriteria",
+  "requiredVerification",
+  "expectedReturnFormat",
+  "context",
+  "contextManifestId"
+]);
+const TASK_CONTEXT_KEYS = new Set([
+  "facts",
+  "constraints",
+  "expectedProjectMarkers",
+  "requiredPaths",
+  "workspaceState",
+  "upstreamFreshness"
+]);
+const CONTEXT_MANIFEST_KEYS = new Set([
+  "schemaVersion",
+  "manifestId",
+  "digest",
+  "capturedAt",
+  "branch",
+  "head",
+  "dirtyDigest",
+  "dirtyEntryCount",
+  "ignoredDigest",
+  "ignoredEntryCount",
+  "trackedTreeIdentity",
+  "metadataIdentity",
+  "insideWorktree",
+  "linkedWorktree",
+  "sparse",
+  "shallow",
+  "upstreamRef",
+  "upstreamCommit",
+  "upstreamFreshness",
+  "projectMarkers",
+  "materialization"
+]);
+const MATERIALIZATION_KEYS = new Set([
+  "state",
+  "reasons",
+  "submodules",
+  "upstreamFreshness"
+]);
+const RESULT_REQUIRED_KEYS = new Set([
+  "workerProtocolVersion",
+  "resultSchemaVersion",
+  "hostVerification",
+  "taskRuntimeCleaned"
+]);
+const RESULT_ALLOWED_KEYS = new Set([
+  ...RESULT_REQUIRED_KEYS,
+  "workerReport",
+  "reportRepair",
+  "providerClaims",
+  "textBytes",
+  "textDigest",
+  "textTruncated",
+  "interim",
+  "stopReason",
+  "cancellation",
+  "providerSessionDeleted",
+  "privacyWarning"
+]);
+const WORKER_REPORT_KEYS = new Set([
+  "schemaVersion",
+  "structured",
+  "valid",
+  "outcome",
+  "summary",
+  "changedFiles",
+  "checksClaimed",
+  "acceptanceResults",
+  "risks",
+  "questions",
+  "validationIssues"
+]);
+const PROVIDER_CLAIMS_KEYS = new Set([
+  "success",
+  "outcome",
+  "summary",
+  "changedFiles",
+  "checksClaimed",
+  "observedFileAgreement"
+]);
+const REPORT_REPAIR_REQUIRED_KEYS = new Set([
+  "attempted",
+  "valid",
+  "validationIssues"
+]);
+const REPORT_REPAIR_ALLOWED_KEYS = new Set([
+  ...REPORT_REPAIR_REQUIRED_KEYS,
+  "initialResponse",
+  "error"
+]);
+const CANCELLATION_RESULT_KEYS = new Set([
+  "requestAcceptedAt",
+  "processGroupGoneAt",
+  "terminalRecordCommittedAt",
+  "receiptId"
+]);
+const PUBLIC_ERROR_REQUIRED_KEYS = new Set([
+  "workerProtocolVersion",
+  "errorSchemaVersion",
+  "code",
+  "message"
+]);
+const PUBLIC_WORKER_ERROR_CODES = new Set([
+  "E_AUTH_REQUIRED",
+  "E_CANCELLED",
+  "E_CAPABILITY",
+  "E_CONTEXT_DRIFT",
+  "E_DELIVERY",
+  "E_GIT_REQUIRED",
+  "E_GROK_NOT_FOUND",
+  "E_GROK_VERSION",
+  "E_IDEMPOTENCY_CONFLICT",
+  "E_IMPORT_RESULT",
+  "E_IMPORT_SOURCE",
+  "E_INTEGRATION",
+  "E_JOB_ACTIVE",
+  "E_JOB_NOT_FOUND",
+  "E_NO_RESUME_CANDIDATE",
+  "E_OUTPUT_LIMIT",
+  "E_POLICY",
+  "E_PROCESS_IDENTITY",
+  "E_PROTOCOL",
+  "E_PROVIDER_EXIT",
+  "E_RECURSION",
+  "E_REVIEW_MUTATED_WORKSPACE",
+  "E_REVIEW_TOO_LARGE",
+  "E_ROLE",
+  "E_SCHEMA",
+  "E_SCOPE_VIOLATION",
+  "E_SECURITY_PROFILE",
+  "E_STATE",
+  "E_TIMEOUT",
+  "E_USAGE",
+  "E_WORKER_LOST",
+  "E_WORKTREE",
+  "E_BROKER"
+]);
+const PUBLIC_LIFECYCLE_EVENT_TYPES = new Set([
+  "task.accepted",
+  "plan.updated",
+  "activity.started",
+  "activity.completed",
+  "checkpoint",
+  "blocked",
+  "final.report",
+  "cancellation.requested"
+]);
+const TERMINAL_OPERATIONAL_EVENT_TYPES = new Set([
+  "plan.updated",
+  "activity.started",
+  "activity.completed",
+  "final.report",
+  "cancellation.requested"
+]);
+const POST_COMPLETION_EVENT_TYPES = new Set(["checkpoint", "blocked"]);
+const PRIVATE_PROJECTION_FIELDS = new Set([
+  "host",
+  "sessionId",
+  "grokSessionId",
+  "claudeSessionId",
+  "workerProcess",
+  "providerProcess",
+  "controllerProcess",
+  "workerAuthorization",
+  "pid",
+  "processGroupId",
+  "startToken",
+  "nonce",
+  "commandMarker",
+  "workspaceRoot",
+  "prompt",
+  "userRequest",
+  "rawProviderMessage",
+  "rawProviderMessages"
 ]);
 
 const SCENARIO_COUNTS = Object.freeze({
@@ -234,6 +570,9 @@ const IMMUTABLE_WORKER_FIELDS = Object.freeze([
   "kind",
   "jobClass",
   "write",
+  "createdAt",
+  "profileId",
+  "securityProfile",
   "lineageWorkerId",
   "taskEnvelopeId",
   "taskEnvelopeDigest",
@@ -245,7 +584,11 @@ const IMMUTABLE_WORKER_FIELDS = Object.freeze([
   "roleId",
   "externalWorkerLabel"
 ]);
-const NULLABLE_STABLE_WORKER_FIELDS = Object.freeze(["parentWorkerId"]);
+const NULLABLE_IMMUTABLE_WORKER_FIELDS = Object.freeze([
+  "parentWorkerId",
+  "model",
+  "effort"
+]);
 const ACTIVE_REPLAY_PHASES = new Set([
   "starting",
   "creating-session",
@@ -370,6 +713,15 @@ function exactKeys(value, expected) {
   return keys.length === expected.size && keys.every((key) => expected.has(key));
 }
 
+function allowedKeys(value, required, allowed) {
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value);
+  return (
+    [...required].every((key) => Object.hasOwn(value, key))
+    && keys.every((key) => allowed.has(key))
+  );
+}
+
 function sameJson(left, right) {
   if (left === right) return true;
   if (typeof left !== typeof right || left === null || right === null) return false;
@@ -411,6 +763,80 @@ function canonicalIsoTimestamp(value) {
   if (typeof value !== "string") return false;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+function containsPrivatePath(value) {
+  if (typeof value !== "string") return false;
+  return (
+    value.includes("[PRIVATE_PATH]")
+    || /file:\/\//i.test(value)
+    || /(?:^|[^A-Za-z0-9._~\/-])\/(?!\/)[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._@%+=~-]+)*/.test(value)
+    || /(?:^|[^:])\/\/[^/\s]+\/[^/\s]+/.test(value)
+    || /~\//.test(value)
+    || /[A-Za-z]:[\\/]/.test(value)
+    || /\\\\[^\\\s]+\\[^\\\s]+/.test(value)
+  );
+}
+
+function validPublicText(value, maximumBytes = 2_000, { nullable = false } = {}) {
+  if (nullable && value === null) return true;
+  return boundedString(value, maximumBytes) && !containsPrivatePath(value);
+}
+
+function validPublicTextArray(
+  value,
+  {
+    maximumItems = 64,
+    maximumBytes = 2_000,
+    nonempty = false
+  } = {}
+) {
+  return (
+    Array.isArray(value)
+    && value.length <= maximumItems
+    && (!nonempty || value.length > 0)
+    && value.every((entry) => validPublicText(entry, maximumBytes))
+  );
+}
+
+function validRepositoryRelativePath(value) {
+  if (
+    !validPublicText(value, 1_024)
+    || value.length === 0
+    || value.startsWith("/")
+    || value.startsWith("\\")
+    || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value)
+    || /^[A-Za-z]:/.test(value)
+    || value.split(/[\\/]/).includes("..")
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function validPathArray(value, maximumItems = 200) {
+  return (
+    Array.isArray(value)
+    && value.length <= maximumItems
+    && value.every(validRepositoryRelativePath)
+    && new Set(value).size === value.length
+  );
+}
+
+function assertNoPrivateProjectionData(value, code) {
+  if (typeof value === "string") {
+    if (containsPrivatePath(value)) fail(code);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  if (isRecord(value)) {
+    for (const key of Object.keys(value)) {
+      if (PRIVATE_PROJECTION_FIELDS.has(key)) fail(code);
+    }
+  }
+  for (const entry of Object.values(value)) {
+    assertNoPrivateProjectionData(entry, code);
+  }
 }
 
 function validRuntimeId(value) {
@@ -493,6 +919,7 @@ function validSetupRuntime(runtime) {
     || runtime.acpIsolation.sandbox !== "read-only"
     || runtime.acpIsolation.permissionMode !== "dontAsk"
     || runtime.acpIsolation.injectDefaultTools !== false
+    || !validTextArray(runtime.acpIsolation.allowedTools, ["todo_write"])
     || !SHA256_HEX.test(runtime.acpIsolation.agentProfileDigest || "")
     || runtime.acpIsolation.unattendedPrivilegeExpansion !== false
     || !Array.isArray(runtime.authMethods)
@@ -804,8 +1231,609 @@ export function validateInstalledToolResult(value, valueExpectations) {
   return result.structuredContent;
 }
 
+function validWorkerIdentity(worker) {
+  return (
+    WORKER_ID.test(worker.id || "")
+    && worker.kind === "task"
+    && worker.jobClass === "task"
+    && worker.write === false
+    && worker.parentWorkerId === null
+    && worker.lineageWorkerId === worker.id
+    && TASK_ENVELOPE_ID.test(worker.taskEnvelopeId || "")
+    && SHA256_HEX.test(worker.taskEnvelopeDigest || "")
+    && CONTEXT_MANIFEST_ID.test(worker.contextManifestId || "")
+    && SHA256_HEX.test(worker.contextDigest || "")
+    && SHA256_HEX.test(worker.workspaceSnapshotDigest || "")
+    && worker.workspaceSnapshotDigest === worker.contextDigest
+    && HOST_TASK_BINDING.test(worker.hostTaskBinding || "")
+    && CONTROL_WORKSPACE_ID.test(worker.controlWorkspaceId || "")
+    && worker.roleId === "explorer"
+    && worker.externalWorkerLabel === "external-grok-worker"
+    && exactKeys(worker.eventCursor, EVENT_CURSOR_KEYS)
+    && worker.eventCursor.schemaVersion === 1
+    && worker.eventCursor.workerId === worker.id
+    && Number.isSafeInteger(worker.eventCursor.sequence)
+    && worker.eventCursor.sequence >= 0
+    && exactKeys(worker.securityProfile, SECURITY_PROFILE_KEYS)
+    && worker.securityProfile.id === "rescue-read-v3"
+    && worker.securityProfile.contractVersion === 3
+    && SHA256_HEX.test(worker.securityProfile.agentProfileDigest || "")
+    && worker.profileId === worker.securityProfile.id
+  );
+}
+
+function validWorkerDisplayAndTime(worker) {
+  return (
+    validPublicText(worker.status, 128)
+    && validPublicText(worker.phase, 128, { nullable: true })
+    && validPublicText(worker.summary, 2_000, { nullable: true })
+    && validPublicText(worker.progress, 2_000, { nullable: true })
+    && canonicalIsoTimestamp(worker.createdAt)
+    && canonicalIsoTimestamp(worker.updatedAt)
+    && canonicalIsoTimestamp(worker.heartbeatAt)
+    && Date.parse(worker.heartbeatAt) >= Date.parse(worker.createdAt)
+    && Date.parse(worker.updatedAt) >= Date.parse(worker.heartbeatAt)
+    && validPublicText(worker.model, 256, { nullable: true })
+    && validPublicText(worker.effort, 128, { nullable: true })
+  );
+}
+
+function validWorkerHandle(worker, code) {
+  assertNoPrivateProjectionData(worker, code);
+  if (
+    !exactKeys(worker, WORKER_HANDLE_KEYS)
+    || worker.workerProtocolVersion !== 1
+    || worker.handleSchemaVersion !== 1
+    || !validWorkerIdentity(worker)
+    || !validWorkerDisplayAndTime(worker)
+  ) {
+    fail(code);
+  }
+}
+
+function validLifecycleDetail(detail) {
+  if (
+    !allowedKeys(detail, new Set(), LIFECYCLE_DETAIL_KEYS)
+    || Object.keys(detail).length === 0
+  ) {
+    return false;
+  }
+  const textFields = [
+    ["envelopeId", 256],
+    ["resumeJobId", 256],
+    ["spawnSuccessDefinition", 1_000],
+    ["reconciler", 128],
+    ["messageId", 256],
+    ["version", 128],
+    ["name", 300],
+    ["status", 80]
+  ];
+  for (const [key, maximumBytes] of textFields) {
+    if (Object.hasOwn(detail, key) && !validPublicText(detail[key], maximumBytes)) return false;
+  }
+  if (
+    Object.hasOwn(detail, "envelopeId")
+    && !TASK_ENVELOPE_ID.test(detail.envelopeId || "")
+  ) {
+    return false;
+  }
+  if (
+    Object.hasOwn(detail, "resumeJobId")
+    && !WORKER_ID.test(detail.resumeJobId || "")
+  ) {
+    return false;
+  }
+  if (
+    Object.hasOwn(detail, "spawnSuccessDefinition")
+    && detail.spawnSuccessDefinition !== "durable-job-commit"
+  ) {
+    return false;
+  }
+  if (
+    Object.hasOwn(detail, "requestAcceptedAt")
+    && !canonicalIsoTimestamp(detail.requestAcceptedAt)
+  ) {
+    return false;
+  }
+  if (
+    Object.hasOwn(detail, "contentDigest")
+    && !SHA256_HEX.test(detail.contentDigest || "")
+  ) {
+    return false;
+  }
+  if (
+    Object.hasOwn(detail, "parentWorkerId")
+    && !WORKER_ID.test(detail.parentWorkerId || "")
+  ) {
+    return false;
+  }
+  const enums = [
+    ["mode", new Set(["read"])],
+    ["state", new Set(["accepted", "pending", "delivered", "delivery_unknown", "rejected"])],
+    ["eventType", new Set(["tool", "plan", "message"])],
+    ["verdict", new Set(["pass", "needs_changes"])],
+    ["outcome", new Set(["complete", "partial", "blocked"])]
+  ];
+  for (const [key, allowed] of enums) {
+    if (Object.hasOwn(detail, key) && !allowed.has(detail[key])) return false;
+  }
+  for (const key of ["write", "replayedPrompt", "structured"]) {
+    if (Object.hasOwn(detail, key) && typeof detail[key] !== "boolean") return false;
+  }
+  if (detail.write === true) return false;
+  for (const key of ["exitCode", "findings", "commands"]) {
+    if (
+      Object.hasOwn(detail, key)
+      && (
+        !Number.isSafeInteger(detail[key])
+        || (key !== "exitCode" && detail[key] < 0)
+      )
+    ) {
+      return false;
+    }
+  }
+  if (
+    Object.hasOwn(detail, "plan")
+    && !validPublicTextArray(detail.plan, { maximumItems: 20, maximumBytes: 500 })
+  ) {
+    return false;
+  }
+  if (
+    Object.hasOwn(detail, "questions")
+    && !validPublicTextArray(detail.questions)
+  ) {
+    return false;
+  }
+  if (
+    Object.hasOwn(detail, "validationIssues")
+    && !validPublicTextArray(detail.validationIssues, { maximumItems: 200 })
+  ) {
+    return false;
+  }
+  return (
+    !Object.hasOwn(detail, "observedChangedPaths")
+    || (
+      validPathArray(detail.observedChangedPaths)
+      && detail.observedChangedPaths.length === 0
+    )
+  );
+}
+
+function validLifecycleEvents(events, worker, status) {
+  if (
+    !Array.isArray(events)
+    || events.length < 1
+    || events.length > 128
+    || events.filter((event) => event?.type === "task.accepted").length !== 1
+    || events[0]?.sequence !== 1
+    || events[0]?.type !== "task.accepted"
+    || !exactKeys(
+      events[0]?.detail,
+      new Set(["spawnSuccessDefinition", "write"])
+    )
+    || events[0].detail.spawnSuccessDefinition !== "durable-job-commit"
+    || events[0].detail.write !== false
+  ) {
+    return false;
+  }
+  const createdAt = Date.parse(worker.createdAt);
+  const updatedAt = Date.parse(worker.updatedAt);
+  const startedAt = Date.parse(worker.startedAt);
+  const completedAt = Date.parse(worker.completedAt);
+  let previousSequence = null;
+  let previousAt = null;
+  for (const event of events) {
+    const eventAt = Date.parse(event?.at);
+    const completionFinalReport = (
+      status === "completed"
+      && event?.type === "final.report"
+    );
+    if (
+      !allowedKeys(
+        event,
+        LIFECYCLE_EVENT_KEYS,
+        new Set([...LIFECYCLE_EVENT_KEYS, "detail"])
+      )
+      || event.workerProtocolVersion !== 1
+      || event.eventSchemaVersion !== 1
+      || !PUBLIC_LIFECYCLE_EVENT_TYPES.has(event.type)
+      || !canonicalIsoTimestamp(event.at)
+      || !validPublicText(event.summary, 2_000, { nullable: true })
+      || !Number.isSafeInteger(event.sequence)
+      || event.sequence < 1
+      || eventAt < createdAt
+      || eventAt > updatedAt
+      || (
+        event.type === "task.accepted"
+        && eventAt > startedAt
+      )
+      || (
+        TERMINAL_OPERATIONAL_EVENT_TYPES.has(event.type)
+        && (
+          eventAt < startedAt
+          || (!completionFinalReport && eventAt > completedAt)
+        )
+      )
+      || (
+        eventAt > completedAt
+        && !POST_COMPLETION_EVENT_TYPES.has(event.type)
+        && !completionFinalReport
+      )
+      || (previousAt !== null && eventAt < previousAt)
+      || (
+        previousSequence !== null
+        && event.sequence !== previousSequence + 1
+      )
+      || (
+        Object.hasOwn(event, "detail")
+        && !validLifecycleDetail(event.detail)
+      )
+    ) {
+      return false;
+    }
+    previousSequence = event.sequence;
+    previousAt = eventAt;
+  }
+  if (
+    worker.eventCursor.sequence !== previousSequence
+    || Date.parse(events[0].at) > startedAt
+  ) {
+    return false;
+  }
+  const finalReports = events.filter((event) => event.type === "final.report");
+  const cancellationEvents = events.filter(
+    (event) => event.type === "cancellation.requested"
+  );
+  if (
+    status === "completed"
+    && (
+      finalReports.length !== 1
+      || events.some((event) => event.type === "cancellation.requested")
+      || finalReports[0].detail?.outcome !== "complete"
+      || finalReports[0].detail?.structured !== true
+      || Date.parse(finalReports[0].at) < completedAt
+    )
+  ) {
+    return false;
+  }
+  if (status === "cancelled") {
+    if (
+      cancellationEvents.length !== 1
+      || finalReports.length !== 0
+      || cancellationEvents[0].detail?.requestAcceptedAt !== cancellationEvents[0].at
+      || Date.parse(cancellationEvents[0].at) > completedAt
+    ) {
+      return false;
+    }
+  }
+  const terminalMarker = status === "completed"
+    ? finalReports[0]
+    : cancellationEvents[0];
+  const terminalMarkerIndex = events.indexOf(terminalMarker);
+  if (
+    terminalMarkerIndex < 0
+    || events.slice(terminalMarkerIndex + 1).some(
+      (event) => !POST_COMPLETION_EVENT_TYPES.has(event.type)
+    )
+  ) {
+    return false;
+  }
+  return Number.isFinite(startedAt) && Number.isFinite(completedAt);
+}
+
+function validAcceptanceCriteria(value) {
+  return (
+    Array.isArray(value)
+    && value.length <= 64
+    && new Set(value.map((entry) => entry?.id)).size === value.length
+    && value.every((entry) => (
+      exactKeys(entry, new Set(["id", "text"]))
+      && validPublicText(entry.id, 80)
+      && entry.id.length > 0
+      && validPublicText(entry.text)
+      && entry.text.length > 0
+    ))
+  );
+}
+
+function validTaskContext(value) {
+  return (
+    exactKeys(value, TASK_CONTEXT_KEYS)
+    && validPublicTextArray(value.facts)
+    && validPublicTextArray(value.constraints)
+    && validPathArray(value.expectedProjectMarkers, 32)
+    && validPathArray(value.requiredPaths, 64)
+    && ["complete", "task_scoped", "unknown"].includes(value.workspaceState)
+    && value.upstreamFreshness === "not_checked"
+  );
+}
+
+function validTaskContract(value, worker) {
+  return (
+    exactKeys(value, TASK_CONTRACT_KEYS)
+    && value.schemaVersion === 1
+    && value.envelopeId === worker.taskEnvelopeId
+    && value.digest === worker.taskEnvelopeDigest
+    && validPublicText(value.objective, 2_000, { nullable: true })
+    && value.mode === "read"
+    && exactKeys(value.scope, new Set(["include", "exclude"]))
+    && validPathArray(value.scope.include, 64)
+    && validPathArray(value.scope.exclude, 64)
+    && validPublicTextArray(value.nonGoals)
+    && validAcceptanceCriteria(value.acceptanceCriteria)
+    && validPublicTextArray(value.requiredVerification)
+    && validPublicText(value.expectedReturnFormat, 2_000, { nullable: true })
+    && validTaskContext(value.context)
+    && value.contextManifestId === worker.contextManifestId
+  );
+}
+
+function validNullableDigest(value) {
+  return value === null || SHA256_HEX.test(value || "");
+}
+
+function validNullableCommit(value) {
+  return value === null || /^[a-f0-9]{40,64}$/.test(value || "");
+}
+
+function validContextManifest(value, worker) {
+  return (
+    exactKeys(value, CONTEXT_MANIFEST_KEYS)
+    && value.schemaVersion === 1
+    && value.manifestId === worker.contextManifestId
+    && value.digest === worker.contextDigest
+    && canonicalIsoTimestamp(value.capturedAt)
+    && validPublicText(value.branch, 256, { nullable: true })
+    && validNullableCommit(value.head)
+    && validNullableDigest(value.dirtyDigest)
+    && Number.isSafeInteger(value.dirtyEntryCount)
+    && value.dirtyEntryCount >= 0
+    && validNullableDigest(value.ignoredDigest)
+    && Number.isSafeInteger(value.ignoredEntryCount)
+    && value.ignoredEntryCount >= 0
+    && validNullableDigest(value.trackedTreeIdentity)
+    && validNullableDigest(value.metadataIdentity)
+    && value.insideWorktree === true
+    && typeof value.linkedWorktree === "boolean"
+    && typeof value.sparse === "boolean"
+    && typeof value.shallow === "boolean"
+    && validPublicText(value.upstreamRef, 256, { nullable: true })
+    && validNullableCommit(value.upstreamCommit)
+    && value.upstreamFreshness === "not_checked"
+    && validPathArray(value.projectMarkers, 32)
+    && exactKeys(value.materialization, MATERIALIZATION_KEYS)
+    && value.materialization.state === "local_complete"
+    && validPublicTextArray(value.materialization.reasons)
+    && validPublicTextArray(value.materialization.submodules, { maximumItems: 100 })
+    && value.materialization.upstreamFreshness === "not_checked"
+  );
+}
+
+function validAcceptanceResults(value) {
+  return (
+    Array.isArray(value)
+    && value.length <= 64
+    && value.every((entry) => (
+      allowedKeys(
+        entry,
+        new Set(["id", "status"]),
+        new Set(["id", "status", "note"])
+      )
+      && validPublicText(entry.id, 80)
+      && entry.id.length > 0
+      && ["met", "unmet", "unknown"].includes(entry.status)
+      && (
+        !Object.hasOwn(entry, "note")
+        || validPublicText(entry.note)
+      )
+    ))
+  );
+}
+
+function validWorkerReport(value, status) {
+  return (
+    exactKeys(value, WORKER_REPORT_KEYS)
+    && value.schemaVersion === 1
+    && value.structured === true
+    && value.valid === true
+    && (status !== "completed" || value.outcome === "complete")
+    && ["complete", "partial", "blocked"].includes(value.outcome)
+    && validPublicText(value.summary)
+    && value.summary.length > 0
+    && validPathArray(value.changedFiles)
+    && value.changedFiles.length === 0
+    && validPublicTextArray(value.checksClaimed)
+    && validAcceptanceResults(value.acceptanceResults)
+    && validPublicTextArray(value.risks)
+    && validPublicTextArray(value.questions)
+    && validPublicTextArray(value.validationIssues, { maximumItems: 200 })
+  );
+}
+
+function validProviderClaims(value, status) {
+  return (
+    exactKeys(value, PROVIDER_CLAIMS_KEYS)
+    && typeof value.success === "boolean"
+    && (status !== "completed" || value.success === true)
+    && (status !== "completed" || value.outcome === "complete")
+    && ["complete", "partial", "blocked"].includes(value.outcome)
+    && validPublicText(value.summary, 2_000, { nullable: true })
+    && validPathArray(value.changedFiles)
+    && value.changedFiles.length === 0
+    && validPublicTextArray(value.checksClaimed)
+    && value.observedFileAgreement === true
+  );
+}
+
+function validCompletedReportBinding(result, taskContract) {
+  const report = result.workerReport;
+  const claims = result.providerClaims;
+  const criterionIds = taskContract.acceptanceCriteria.map((entry) => entry.id);
+  const resultIds = report.acceptanceResults.map((entry) => entry.id);
+  return (
+    criterionIds.length > 0
+    && report.acceptanceResults.length === criterionIds.length
+    && new Set(resultIds).size === resultIds.length
+    && report.acceptanceResults.every((entry) => entry.status === "met")
+    && criterionIds.every((id) => resultIds.includes(id))
+    && claims.summary === report.summary
+    && sameJson(claims.changedFiles, report.changedFiles)
+    && sameJson(claims.checksClaimed, report.checksClaimed)
+  );
+}
+
+function validTextEvidence(value) {
+  return (
+    exactKeys(value, new Set(["bytes", "digest"]))
+    && Number.isSafeInteger(value.bytes)
+    && value.bytes >= 0
+    && SHA256_HEX.test(value.digest || "")
+  );
+}
+
+function validNestedError(value) {
+  return (
+    exactKeys(value, new Set(["code", "message"]))
+    && PUBLIC_WORKER_ERROR_CODES.has(value.code)
+    && validPublicText(value.message)
+    && value.message.length > 0
+  );
+}
+
+function validReportRepair(value) {
+  return (
+    allowedKeys(value, REPORT_REPAIR_REQUIRED_KEYS, REPORT_REPAIR_ALLOWED_KEYS)
+    && typeof value.attempted === "boolean"
+    && typeof value.valid === "boolean"
+    && validPublicTextArray(value.validationIssues, { maximumItems: 200 })
+    && (
+      !Object.hasOwn(value, "initialResponse")
+      || validTextEvidence(value.initialResponse)
+    )
+    && (
+      !Object.hasOwn(value, "error")
+      || validNestedError(value.error)
+    )
+  );
+}
+
+function validCancellationResult(value) {
+  return (
+    exactKeys(value, CANCELLATION_RESULT_KEYS)
+    && canonicalIsoTimestamp(value.requestAcceptedAt)
+    && value.processGroupGoneAt === null
+    && value.terminalRecordCommittedAt === null
+    && CANCELLATION_RECEIPT_ID.test(value.receiptId || "")
+  );
+}
+
+function validPublicError(value, status) {
+  if (status === "completed") return value === null;
+  return (
+    exactKeys(value, PUBLIC_ERROR_REQUIRED_KEYS)
+    && value.workerProtocolVersion === 1
+    && value.errorSchemaVersion === 1
+    && value.code === "E_CANCELLED"
+    && validPublicText(value.message)
+    && value.message.length > 0
+  );
+}
+
+function validPublicResult(value, status, taskContract) {
+  if (
+    !allowedKeys(value, RESULT_REQUIRED_KEYS, RESULT_ALLOWED_KEYS)
+    || value.workerProtocolVersion !== 1
+    || value.resultSchemaVersion !== 1
+    || value.hostVerification !== "not_run"
+    || value.taskRuntimeCleaned !== true
+    || Object.hasOwn(value, "privacyWarning")
+    || Object.hasOwn(value, "providerSessionDeleted")
+    || (
+      Object.hasOwn(value, "workerReport")
+      && !validWorkerReport(value.workerReport, status)
+    )
+    || (
+      Object.hasOwn(value, "reportRepair")
+      && !validReportRepair(value.reportRepair)
+    )
+    || (
+      Object.hasOwn(value, "providerClaims")
+      && !validProviderClaims(value.providerClaims, status)
+    )
+    || (
+      Object.hasOwn(value, "interim")
+      && !validTextEvidence(value.interim)
+    )
+  ) {
+    return false;
+  }
+  const textFields = ["textBytes", "textDigest", "textTruncated"];
+  const textFieldCount = textFields.filter((key) => Object.hasOwn(value, key)).length;
+  if (
+    ![0, 3].includes(textFieldCount)
+    || (
+      textFieldCount === 3
+      && (
+        !Number.isSafeInteger(value.textBytes)
+        || value.textBytes < 0
+        || !SHA256_HEX.test(value.textDigest || "")
+        || typeof value.textTruncated !== "boolean"
+      )
+    )
+  ) {
+    return false;
+  }
+  if (status === "completed") {
+    return (
+      Object.hasOwn(value, "workerReport")
+      && Object.hasOwn(value, "providerClaims")
+      && !Object.hasOwn(value, "reportRepair")
+      && textFieldCount === 3
+      && Object.hasOwn(value, "interim")
+      && ["EndTurn", "end_turn"].includes(value.stopReason)
+      && !Object.hasOwn(value, "cancellation")
+      && validCompletedReportBinding(value, taskContract)
+    );
+  }
+  return (
+    value.stopReason === "cancelled"
+    && validCancellationResult(value.cancellation)
+    && !Object.hasOwn(value, "workerReport")
+    && !Object.hasOwn(value, "providerClaims")
+    && !Object.hasOwn(value, "reportRepair")
+  );
+}
+
+function validWorkerSnapshot(worker, status, code) {
+  assertNoPrivateProjectionData(worker, code);
+  if (
+    !exactKeys(worker, WORKER_SNAPSHOT_KEYS)
+    || worker.workerProtocolVersion !== 1
+    || worker.snapshotSchemaVersion !== 1
+    || worker.schemaVersion !== 3
+    || !validWorkerIdentity(worker)
+    || !validWorkerDisplayAndTime(worker)
+    || !validPublicTextArray(worker.latestPlan, { maximumItems: 128 })
+    || !validLifecycleEvents(worker.lifecycleEvents, worker, status)
+    || !validTaskContract(worker.taskContract, worker)
+    || !validContextManifest(worker.context, worker)
+    || worker.resumeJobId !== null
+    || !validPublicResult(worker.result, status, worker.taskContract)
+    || !validPublicError(worker.error, status)
+    || worker.awaitingHostAction !== null
+  ) {
+    fail(code);
+  }
+}
+
 function validSpawnPayload(value, { replayed, state, launched }, code) {
   const worker = value?.worker;
+  validWorkerHandle(worker, code);
+  const validStartedChronology = worker?.startedAt === null || (
+    canonicalIsoTimestamp(worker?.startedAt)
+    && Date.parse(worker.startedAt) >= Date.parse(worker.createdAt)
+    && Date.parse(worker.startedAt) <= Date.parse(worker.heartbeatAt)
+  );
   const validLifecycle = replayed
     ? (
         worker?.status === "running"
@@ -813,22 +1841,22 @@ function validSpawnPayload(value, { replayed, state, launched }, code) {
         && worker?.terminal === false
         && canonicalIsoTimestamp(worker?.startedAt)
         && worker?.completedAt === null
+        && validStartedChronology
       )
     : (
-        worker?.terminal === false
+        worker?.status === "queued"
+        && worker?.phase === "accepted"
+        && worker?.terminal === false
+        && worker?.summary === "Spawn committed"
+        && worker?.progress
+          === "Durable job record committed; provider not started by broker spawn."
+        && worker?.createdAt === worker?.updatedAt
+        && worker?.createdAt === worker?.heartbeatAt
+        && worker?.model === null
+        && worker?.effort === null
+        && worker?.startedAt === null
         && worker?.completedAt === null
-        && (
-          (
-            worker?.status === "queued"
-            && ["accepted", "provider-launching"].includes(worker?.phase)
-            && worker?.startedAt === null
-          )
-          || (
-            worker?.status === "running"
-            && ACTIVE_REPLAY_PHASES.has(worker?.phase)
-            && canonicalIsoTimestamp(worker?.startedAt)
-          )
-        )
+        && worker?.eventCursor?.sequence === 1
       );
   if (
     !exactKeys(value, SPAWN_PAYLOAD_KEYS)
@@ -837,13 +1865,36 @@ function validSpawnPayload(value, { replayed, state, launched }, code) {
     || value.spawnSuccessDefinition !== "durable-job-commit"
     || value.providerLaunchState !== state
     || value.providerLaunched !== launched
-    || !isRecord(value.worker)
-    || !WORKER_ID.test(value.worker.id || "")
-    || value.worker.externalWorkerLabel !== "external-grok-worker"
     || !validLifecycle
   ) {
     fail(code);
   }
+}
+
+function validSpawnResponseWitness(value, {
+  responseSequence,
+  replayed
+} = {}) {
+  if (
+    !exactKeys(value, SPAWN_RESPONSE_WITNESS_KEYS)
+    || value.schemaVersion !== 1
+    || !SPAWN_RESPONSE_WITNESS_ID.test(value.witnessId || "")
+    || value.projection !== SPAWN_RESPONSE_WITNESS_PROJECTION
+    || value.responseSequence !== responseSequence
+    || value.workerId == null
+    || !WORKER_ID.test(value.workerId)
+    || !SHA256_HEX.test(value.requestDigest || "")
+    || !SHA256_HEX.test(value.idempotencyKeyDigest || "")
+    || value.replayed !== replayed
+    || !SHA256_HEX.test(value.handleDigest || "")
+    || !Number.isSafeInteger(value.eventCursorSequence)
+    || value.eventCursorSequence < 1
+    || !canonicalIsoTimestamp(value.recordedAt)
+  ) {
+    return false;
+  }
+  const { witnessId: ignoredWitnessId, ...body } = value;
+  return value.witnessId === `spawnw-${stableDigest(body).slice(0, 24)}`;
 }
 
 function validImmutableWorkerIdentity(worker) {
@@ -851,7 +1902,7 @@ function validImmutableWorkerIdentity(worker) {
   for (const field of IMMUTABLE_WORKER_FIELDS) {
     if (!Object.hasOwn(worker, field) || worker[field] == null) return false;
   }
-  for (const field of NULLABLE_STABLE_WORKER_FIELDS) {
+  for (const field of NULLABLE_IMMUTABLE_WORKER_FIELDS) {
     if (!Object.hasOwn(worker, field)) return false;
   }
   return (
@@ -884,25 +1935,57 @@ function assertImmutableWorkerIdentity(workers, code) {
     for (const field of IMMUTABLE_WORKER_FIELDS) {
       if (!sameJson(first[field], worker[field])) fail(code);
     }
-    for (const field of NULLABLE_STABLE_WORKER_FIELDS) {
+    for (const field of NULLABLE_IMMUTABLE_WORKER_FIELDS) {
       if (!sameJson(first[field], worker[field])) fail(code);
+    }
+  }
+}
+
+function assertMonotonicWorkerCursors(workers, code) {
+  for (let index = 1; index < workers.length; index += 1) {
+    if (
+      workers[index - 1].eventCursor.sequence
+      > workers[index].eventCursor.sequence
+    ) {
+      fail(code);
+    }
+  }
+}
+
+function assertCrossSnapshotChronology(workers, code) {
+  if (!Array.isArray(workers) || workers.length < 2) fail(code);
+  const terminal = workers.at(-1);
+  const terminalUpdatedAt = Date.parse(terminal.updatedAt);
+  const terminalHeartbeatAt = Date.parse(terminal.heartbeatAt);
+  for (const worker of workers.slice(0, -1)) {
+    if (
+      Date.parse(worker.updatedAt) > terminalUpdatedAt
+      || Date.parse(worker.heartbeatAt) > terminalHeartbeatAt
+      || (
+        worker.startedAt !== null
+        && worker.startedAt !== terminal.startedAt
+      )
+    ) {
+      fail(code);
     }
   }
 }
 
 function validTerminalResult(value, status, code) {
   const expectedPhase = status === "completed" ? "done" : "cancelled";
+  validWorkerSnapshot(value?.worker, status, code);
   if (
     !exactKeys(value, new Set(["ok", "worker"]))
     || value.ok !== true
-    || !isRecord(value.worker)
-    || !WORKER_ID.test(value.worker.id || "")
     || value.worker.status !== status
     || value.worker.phase !== expectedPhase
     || value.worker.terminal !== true
     || !canonicalIsoTimestamp(value.worker.startedAt)
     || !canonicalIsoTimestamp(value.worker.completedAt)
+    || Date.parse(value.worker.startedAt) < Date.parse(value.worker.createdAt)
     || Date.parse(value.worker.completedAt) < Date.parse(value.worker.startedAt)
+    || Date.parse(value.worker.heartbeatAt) < Date.parse(value.worker.completedAt)
+    || Date.parse(value.worker.updatedAt) < Date.parse(value.worker.heartbeatAt)
     || !isRecord(value.worker.result)
     || value.worker.result.hostVerification !== "not_run"
     || value.worker.result.taskRuntimeCleaned !== true
@@ -928,6 +2011,20 @@ export function validateInstalledCompletionScenario(value) {
     evidence.spawn.worker,
     evidence.terminalResult.worker
   ], "E_LIVE_COMPLETION");
+  assertCrossSnapshotChronology([
+    evidence.spawn.worker,
+    evidence.terminalResult.worker
+  ], "E_LIVE_COMPLETION");
+  assertMonotonicWorkerCursors([
+    evidence.spawn.worker,
+    evidence.terminalResult.worker
+  ], "E_LIVE_COMPLETION");
+  if (
+    evidence.spawn.worker.eventCursor.sequence
+    >= evidence.terminalResult.worker.eventCursor.sequence
+  ) {
+    fail("E_LIVE_COMPLETION");
+  }
   return evidence;
 }
 
@@ -992,6 +2089,8 @@ export function validateInstalledCancellationReplayScenario(value) {
     cancellationEvents.length !== 1
     || cancellationEvents[0].sequence
       !== evidence.cancel.receipt.cancellationRequestSequence
+    || cancellationEvents[0].detail?.requestAcceptedAt
+      !== evidence.cancel.receipt.requestAcceptedAt
   ) {
     fail("E_LIVE_CANCELLATION");
   }
@@ -1000,6 +2099,28 @@ export function validateInstalledCancellationReplayScenario(value) {
     evidence.spawnReplay.worker,
     evidence.terminalResult.worker
   ], "E_LIVE_CANCELLATION");
+  assertCrossSnapshotChronology([
+    evidence.spawn.worker,
+    evidence.spawnReplay.worker,
+    evidence.terminalResult.worker
+  ], "E_LIVE_CANCELLATION");
+  assertMonotonicWorkerCursors([
+    evidence.spawn.worker,
+    evidence.spawnReplay.worker,
+    evidence.terminalResult.worker
+  ], "E_LIVE_CANCELLATION");
+  const spawnCursor = evidence.spawn.worker.eventCursor.sequence;
+  const replayCursor = evidence.spawnReplay.worker.eventCursor.sequence;
+  const cancellationSequence = evidence.cancel.receipt.cancellationRequestSequence;
+  const terminalCursor = evidence.terminalResult.worker.eventCursor.sequence;
+  if (
+    spawnCursor >= replayCursor
+    || spawnCursor >= cancellationSequence
+    || replayCursor >= cancellationSequence
+    || cancellationSequence > terminalCursor
+  ) {
+    fail("E_LIVE_CANCELLATION");
+  }
   return evidence;
 }
 
@@ -1017,6 +2138,28 @@ function sameNonemptyValues(values, pattern = null) {
   );
 }
 
+function validInstalledWorkerBinding(binding) {
+  return (
+    exactKeys(binding, INSTALLED_WORKER_BINDING_KEYS)
+    && WORKER_ID.test(binding.workerId || "")
+    && canonicalIsoTimestamp(binding.createdAt)
+    && validPublicText(binding.model, 256, { nullable: true })
+    && validPublicText(binding.effort, 128, { nullable: true })
+    && exactKeys(binding.securityProfile, SECURITY_PROFILE_KEYS)
+    && binding.securityProfile.id === "rescue-read-v3"
+    && binding.securityProfile.contractVersion === 3
+    && SHA256_HEX.test(binding.securityProfile.agentProfileDigest || "")
+    && TASK_ENVELOPE_ID.test(binding.taskEnvelopeId || "")
+    && SHA256_HEX.test(binding.taskEnvelopeDigest || "")
+    && CONTEXT_MANIFEST_ID.test(binding.contextManifestId || "")
+    && SHA256_HEX.test(binding.contextDigest || "")
+    && SHA256_HEX.test(binding.workspaceSnapshotDigest || "")
+    && binding.workspaceSnapshotDigest === binding.contextDigest
+    && CONTROL_WORKSPACE_ID.test(binding.controlWorkspaceId || "")
+    && HOST_TASK_BINDING.test(binding.hostTaskBinding || "")
+  );
+}
+
 /**
  * Validate the pure observation summary derived from private installed state.
  * It has no filesystem, process, provider, or receipt-publication authority.
@@ -1026,6 +2169,7 @@ export function validateInstalledPrivateObservation(value) {
   if (
     !exactKeys(observation, PRIVATE_OBSERVATION_KEYS)
     || !INSTALLED_WORKER_SCENARIO_IDS.includes(observation.scenarioId)
+    || !validInstalledWorkerBinding(observation.installedWorkerBinding)
   ) {
     fail("E_LIVE_PRIVATE_STATE");
   }
@@ -1039,8 +2183,42 @@ export function validateInstalledPrivateObservation(value) {
     }
   }
   const minimumObservations = observation.scenarioId === "authenticated-completion" ? 2 : 3;
+  const expectedWitnesses = observation.scenarioId === "authenticated-completion"
+    ? [{ responseSequence: 1, replayed: false }]
+    : [
+        { responseSequence: 1, replayed: false },
+        { responseSequence: 2, replayed: true }
+      ];
+  const witnesses = observation.observedSpawnResponseWitnesses;
+  const sameWitnessBinding = (
+    Array.isArray(witnesses)
+    && witnesses.length === expectedWitnesses.length
+    && witnesses.every((witness, index) => (
+      validSpawnResponseWitness(witness, expectedWitnesses[index])
+      && witness.workerId === observation.installedWorkerBinding.workerId
+      && witness.handleDigest === observation.observedPublicWorkerDigests[index]
+      && (
+        index === 0
+        || (
+          witness.requestDigest === witnesses[0].requestDigest
+          && witness.idempotencyKeyDigest === witnesses[0].idempotencyKeyDigest
+          && witness.eventCursorSequence
+            > witnesses[index - 1].eventCursorSequence
+          && Date.parse(witness.recordedAt)
+            >= Date.parse(witnesses[index - 1].recordedAt)
+        )
+      )
+    ))
+    && witnesses[0]?.eventCursorSequence === 1
+  );
   if (
-    !sameNonemptyValues(observation.observedWorkerIds, WORKER_ID)
+    !Array.isArray(observation.observedPublicWorkerDigests)
+    || observation.observedPublicWorkerDigests.length !== minimumObservations
+    || !observation.observedPublicWorkerDigests.every(
+      (value) => SHA256_HEX.test(value || "")
+    )
+    || !sameWitnessBinding
+    || !sameNonemptyValues(observation.observedWorkerIds, WORKER_ID)
     || observation.observedWorkerIds.length < minimumObservations
     || !sameNonemptyValues(observation.observedTaskEnvelopeIds, TASK_ENVELOPE_ID)
     || observation.observedTaskEnvelopeIds.length !== observation.observedWorkerIds.length
@@ -1053,6 +2231,18 @@ export function validateInstalledPrivateObservation(value) {
     || !sameNonemptyValues(observation.observedProviderWorkerIds, WORKER_ID)
     || observation.observedProviderWorkerIds.length
       !== observation.observedProviderGenerations.length
+    || !observation.observedWorkerIds.every(
+      (id) => id === observation.installedWorkerBinding.workerId
+    )
+    || !observation.observedProviderWorkerIds.every(
+      (id) => id === observation.installedWorkerBinding.workerId
+    )
+    || !observation.observedTaskEnvelopeIds.every(
+      (id) => id === observation.installedWorkerBinding.taskEnvelopeId
+    )
+    || !observation.observedContextManifestIds.every(
+      (id) => id === observation.installedWorkerBinding.contextManifestId
+    )
     || observation.workerHostVerification !== "not_run"
     || observation.processGroupGone !== true
     || observation.taskRuntimeCleaned !== true
@@ -1097,6 +2287,27 @@ export function validateInstalledScenarioEvidence(
         publicEvidence.spawnReplay.worker,
         publicEvidence.terminalResult.worker
       ];
+  const activePublicWorkers = publicWorkers.slice(0, -1);
+  const terminalPublicWorker = publicWorkers.at(-1);
+  const samePublicWorkerDigests = sameJson(
+    observation.observedPublicWorkerDigests,
+    publicWorkers.map((worker) => stableDigest(worker))
+  );
+  const sameSpawnResponseWitnesses = (
+    observation.observedSpawnResponseWitnesses.length
+      === activePublicWorkers.length
+    && observation.observedSpawnResponseWitnesses.every((witness, index) => {
+      const worker = activePublicWorkers[index];
+      return (
+        witness.workerId === worker.id
+        && witness.handleDigest === stableDigest(worker)
+        && witness.eventCursorSequence === worker.eventCursor.sequence
+        && Date.parse(witness.recordedAt) >= Date.parse(worker.updatedAt)
+        && Date.parse(witness.recordedAt)
+          <= Date.parse(terminalPublicWorker.updatedAt)
+      );
+    })
+  );
   const identity = publicWorkers[0];
   const sameWorker = observation.observedWorkerIds.every((id) => id === identity.id)
     && observation.observedProviderWorkerIds.every((id) => id === identity.id);
@@ -1104,6 +2315,21 @@ export function validateInstalledScenarioEvidence(
     .every((id) => id === identity.taskEnvelopeId);
   const sameContext = observation.observedContextManifestIds
     .every((id) => id === identity.contextManifestId);
+  const binding = observation.installedWorkerBinding;
+  const sameInstalledBinding = publicWorkers.every((worker) => (
+    binding.workerId === worker.id
+    && binding.createdAt === worker.createdAt
+    && binding.model === worker.model
+    && binding.effort === worker.effort
+    && sameJson(binding.securityProfile, worker.securityProfile)
+    && binding.taskEnvelopeId === worker.taskEnvelopeId
+    && binding.taskEnvelopeDigest === worker.taskEnvelopeDigest
+    && binding.contextManifestId === worker.contextManifestId
+    && binding.contextDigest === worker.contextDigest
+    && binding.workspaceSnapshotDigest === worker.workspaceSnapshotDigest
+    && binding.controlWorkspaceId === worker.controlWorkspaceId
+    && binding.hostTaskBinding === worker.hostTaskBinding
+  ));
   const oneBoundProviderGeneration = (
     observation.providerLaunchCount === 1
     && new Set(observation.observedProviderGenerations).size === 1
@@ -1119,9 +2345,12 @@ export function validateInstalledScenarioEvidence(
       .every((id) => id === publicEvidence.cancel.receipt.receiptId);
   }
   if (
-    !sameWorker
+    !samePublicWorkerDigests
+    || !sameSpawnResponseWitnesses
+    || !sameWorker
     || !sameEnvelope
     || !sameContext
+    || !sameInstalledBinding
     || !oneBoundProviderGeneration
     || !sameCancellationReceipt
   ) {

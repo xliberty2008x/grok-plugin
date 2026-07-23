@@ -214,6 +214,7 @@ test("probe negotiates ACP v1, session loading, auth methods, models, and effort
     assert.equal(result.acpIsolation.sandbox, "read-only");
     assert.equal(result.acpIsolation.permissionMode, "dontAsk");
     assert.equal(result.acpIsolation.injectDefaultTools, false);
+    assert.deepEqual(result.acpIsolation.allowedTools, ["todo_write"]);
     assert.equal(result.acpIsolation.unattendedPrivilegeExpansion, false);
     assert.match(result.acpIsolation.agentProfileDigest, /^[a-f0-9]{64}$/);
 

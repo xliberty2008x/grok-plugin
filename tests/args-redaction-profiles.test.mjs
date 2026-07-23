@@ -126,7 +126,7 @@ test("execution profiles keep reviews immutable and grant writes only to write r
   assert.equal(reportRepair.id, "rescue-report-v3");
   assert.equal(reportRepair.permissionMode, "dontAsk");
   assert.match(reportRepair.agentProfileDigest, /^[a-f0-9]{64}$/);
-  assert.deepEqual(reportRepair.allowedTools, []);
+  assert.deepEqual(reportRepair.allowedTools, ["todo_write"]);
   for (const denied of ["Bash", "Edit", "Write"]) assert.ok(reportRepair.deniedTools.includes(denied));
 });
 

@@ -18,6 +18,8 @@ export const PHASE1_FOCUSED_TEST_FILES = Object.freeze([
   "tests/worker-mailbox.test.mjs",
   "tests/mcp-worker-broker.test.mjs",
   "tests/mcp-worker-runtime.test.mjs",
+  "tests/installed-worker-mcp-contract.test.mjs",
+  "tests/installed-worker-mcp-runner.test.mjs",
   "tests/provider-bootstrap-crash-window.test.mjs",
   "tests/provider-capability.test.mjs",
   "tests/provider-startup-cancel.test.mjs",

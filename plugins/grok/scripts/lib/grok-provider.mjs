@@ -1987,7 +1987,7 @@ export async function probe(root, stateDir) {
       subagents: false,
       isolatedLeader: true,
       agentProfileDigest,
-      allowedTools: [],
+      allowedTools: ["todo_write"],
       deniedTools: ["WebSearch", "WebFetch", "Agent", "mcp__*", "Bash", "Edit", "Write"]
     };
     provider = await openProvider({ root, profile, stateDir, jobMarker: marker, environment: isolation });
@@ -2002,6 +2002,7 @@ export async function probe(root, stateDir) {
         sandbox: profile.sandbox,
         permissionMode: profile.permissionMode,
         injectDefaultTools: false,
+        allowedTools: [...profile.allowedTools],
         agentProfileDigest,
         unattendedPrivilegeExpansion: false
       },
