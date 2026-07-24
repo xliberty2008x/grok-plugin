@@ -38,6 +38,10 @@ const WORKSPACE = "/workspace";
 const LEDGER_RELATIVE = "tests/e2e-results/worker-broker/ledger.json";
 const STARTED_AT = "2026-07-23T10:00:00.000Z";
 const ENDED_AT = "2026-07-23T10:00:01.000Z";
+const VALIDATION_SUPPORT_FILES = Object.freeze([
+  "tests/e2e-results/macos-0.2.99-2026-07-13.json",
+  "tests/e2e-results/worker-broker/phase-1-readonly-dcb78b8.json"
+]);
 const REQUIRED = process.env.GROK_PROTECTED_REVIEW_E2E === "1"
   || process.env.npm_lifecycle_event === "test:protected-review";
 let hostGitAuthority = null;
@@ -66,6 +70,19 @@ function copySourceInventory(destination) {
       fs.copyFileSync(source, target);
       fs.chmodSync(target, stat.mode);
     }
+  }
+}
+
+function copyValidationSupportFiles(destination) {
+  for (const relative of VALIDATION_SUPPORT_FILES) {
+    const source = path.join(ROOT, ...relative.split("/"));
+    const target = path.join(destination, ...relative.split("/"));
+    const stat = fs.lstatSync(source);
+    assert.equal(stat.isFile(), true, `${relative} must be a regular file.`);
+    assert.equal(stat.isSymbolicLink(), false, `${relative} must not be a symlink.`);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(source, target);
+    fs.chmodSync(target, stat.mode);
   }
 }
 
@@ -231,6 +248,7 @@ function initializeFixture() {
   fixtureGit(root, "config", "user.email", "protected-review@example.com");
   fixtureGit(root, "config", "user.name", "Protected Review E2E");
   copySourceInventory(root);
+  copyValidationSupportFiles(root);
   const evidenceRoot = path.join(root, "tests/e2e-results/worker-broker");
   fs.mkdirSync(evidenceRoot, { recursive: true });
   fs.writeFileSync(path.join(evidenceRoot, ".gitkeep"), "");
