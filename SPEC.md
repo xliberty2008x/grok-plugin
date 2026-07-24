@@ -64,7 +64,7 @@ Behavioral parity does not require identical provider internals. Headless Grok r
 - Native Grok review behavior unless xAI publishes and supports such an API.
 - A shared long-lived Grok broker in v0.3.
 - Provider-enforced macOS child-network isolation (Grok does not enforce it; the plugin documents the gap).
-- Pre-mutation prevention of every write-scope violation (writes are native-like in-place; scope is detected after mutation).
+- Pre-mutation prevention of every write-scope violation inside a broker-created execution worktree; scope is detected after mutation, while the control checkout remains unchanged until explicit host integration.
 - Claiming the July 13, 2026 macOS matrix qualifies this hardened worktree.
 - Authenticated installed-Codex natural-flow E2E for this hardening slice until it is rerun.
 - Windows provider process execution or process-control support in v0.3. Windows remains provider-unverified until authenticated lifecycle and PID-ownership evidence exists.
@@ -176,9 +176,17 @@ A requested write job MUST fail with an actionable policy error if the installed
 
 Review processes MAY write only their isolated review home and other locations allowed by Grok's effective sandbox. The plugin MUST remove the isolated review home after completion on a best-effort basis, and the review MUST NOT change the reviewed repository.
 
-Write processes perform native-like in-place workspace edits through `search_replace`. Scope violations are detected after mutation from runtime-observed dirty-state diffs and recorded as `E_SCOPE_VIOLATION`; the runtime MUST NOT claim rollback. Arbitrary sibling, parent, or home-directory writes remain forbidden by sandbox and isolation policy.
+Write processes perform native-like edits through `search_replace` only inside a broker-created detached execution worktree. The control checkout MUST remain unchanged until a separate explicit host integration operation succeeds. Scope violations are detected after mutation from runtime-observed execution-root diffs and recorded as `E_SCOPE_VIOLATION`; the runtime MUST NOT claim rollback of the worker tree and MUST NOT make the violating artifact integration-ready. Arbitrary sibling, parent, control-checkout, or home-directory writes remain forbidden by sandbox and isolation policy.
 
-At most one active write job may occupy a workspace at a time. Read-only jobs may overlap each other, but a writer requires an otherwise idle workspace so observed diffs can be attributed to one worker. Admission of any job while a writer is active, or admission of a writer while any non-terminal job is active, MUST fail with `E_JOB_ACTIVE`.
+Before write provisioning, the broker MUST hold control-workspace admission, capture a complete parent fingerprint, and reject a dirty or unsafe control checkout, including tracked, staged, untracked, ignored, unresolved-index, hidden-index, mode, symlink, and content drift. Dirty-source materialization is unsupported until a separately approved contract exists. The exact clean `HEAD` is the only worktree base.
+
+Every accepted write job MUST have one private durable `ExecutionBinding` created before any filesystem effect or provider dispatch. Its immutable body MUST cover the worker and control-workspace identities, exact base commit/tree, trusted clean-parent fingerprint, canonical control root and deterministic expected execution root, Git common-directory identity, TaskEnvelope scope, role/profile/context identities, creation time, and an immutable digest. The mutable provisioning journal MUST be separately digest-bound to that body. The binding digest MUST also enter the spawn request, launch contract, worker authorization, controller/worker identities, provider bootstrap, and provider guard. The provider controller MUST launch with `cwd` equal to that exact execution root and MUST fail closed if any bound identity is missing, partial, stale, or inconsistent. Only digests and non-sensitive lifecycle state may enter public projections.
+
+Provisioning MUST use a job-first, effect-second state machine. Under control-workspace admission the broker atomically commits the job, idempotency witness, immutable binding body, and `planned` journal state without a dispatch outbox or launch authorization. A fenced provisioning attempt then advances `planned → provisioning`, creates the deterministic detached worktree, verifies its exact registered-worktree/common-directory/base/cleanliness/symlink/index identity plus the unchanged parent, captures its ContextManifest, and atomically advances to `ready` while creating the prompt, request digest, dispatch outbox, and worker authorization. Terminal journal states are `cleanup_pending`, `cleaned`, or `failed`.
+
+Recovery MAY retry `planned`. It MAY adopt a `provisioning` worktree only when the deterministic path is registered with the exact binding worker/control/common-directory/base identity and is clean; otherwise it MUST fail closed and retain ambiguous state for inspection. Cancellation during provisioning disables dispatch and requests exact-identity cleanup. Cleanup MUST remove only the exact registered deterministic worker path after worker/binding/common-directory verification. A crash MUST NOT create a launchable unbound worker or permit cleanup of an arbitrary path.
+
+Until managed-root leases are implemented in Phase 3.2, at most one active write job may occupy a control workspace. Read-only jobs may overlap each other, but a writer requires an otherwise idle control workspace. Admission of any job while a writer is active, or admission of a writer while any non-terminal job is active, MUST fail with `E_JOB_ACTIVE`. This is a conservative transitional fence, not the final concurrency model; Phase 3.2 replaces it with same-root exclusion and distinct-root concurrency.
 
 ## 8. Provider transport contracts
 
@@ -863,7 +871,7 @@ The implementation MUST:
 - Reject unsafe state paths and malformed job IDs.
 - Honor Grok enterprise and managed restrictions.
 - Document that Grok receives a restricted environment allowlist and that model-invoked commands inherit that restricted child environment when any such command path exists.
-- Document residual limitations honestly: macOS child-process network isolation is not enforced by Grok; write mutations are native-like in-place and scope violations are detected after the fact; authenticated installed-Codex natural-flow E2E has not yet been rerun for this hardening slice; July 13 evidence does not qualify the changed worktree.
+- Document residual limitations honestly: macOS child-process network isolation is not enforced by Grok; write-scope violations inside isolated execution worktrees are detected after the fact and violating artifacts are not integration-ready; dirty-source materialization and managed-root writer concurrency remain unavailable until their explicit phases pass; authenticated installed-Codex natural-flow E2E has not yet been rerun for this hardening slice; July 13 evidence does not qualify the changed worktree.
 
 A review/task integrity snapshot SHALL capture, before and after the provider run:
 

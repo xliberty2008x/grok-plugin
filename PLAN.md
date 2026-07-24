@@ -61,7 +61,7 @@ Parity means:
 ### Residual limitations (document honestly)
 
 1. **macOS child-network isolation** is not enforced by Grok; the plugin does not claim otherwise.
-2. **Writes are native-like in-place** via `search_replace`. Scope violations are detected **after** mutation (`E_SCOPE_VIOLATION`) and are not rolled back by the runtime.
+2. **Writes are native-like inside broker-created detached execution worktrees** via `search_replace`. Scope violations are detected **after** mutation (`E_SCOPE_VIOLATION`), are not claimed as rolled back inside the worker tree, and can never make the artifact integration-ready. The control checkout remains unchanged until explicit host integration.
 3. **Authenticated installed-Codex natural host-orchestration E2E** for this hardening slice remains outstanding; direct installed-wrapper execution has passed but is a different evidence boundary.
 4. Cross-platform authenticated provider qualification beyond historical macOS evidence remains open.
 
@@ -361,7 +361,8 @@ Using the fake provider and an opt-in real CLI test against this worktree:
 - Use atomic writes and a bounded lock with stale-lock recovery.
 - Use `0700` directories and `0600` sensitive files where supported.
 - Retain at most 50 jobs without evicting active jobs.
-- Enforce one workspace writer via atomic admission.
+- For the P3.1 cutover, reject dirty/unsafe control checkouts; atomically commit each write job, idempotency witness, immutable private `ExecutionBinding`, and `planned` journal before any filesystem effect; then use one fenced `planned → provisioning → ready` attempt to create and verify the exact detached worktree. Construct launch authorization/outbox only at `ready`, and require provider `cwd` plus every controller/provider authority digest to equal that binding before dispatch.
+- Retain one control-workspace writer as a conservative transitional fence; P3.2 replaces it with durable managed-root leases so distinct execution roots may overlap while the same root/lineage remains exclusive.
 - Implement `queued`, `running`, `completed`, `failed`, and `cancelled` transitions with progress and heartbeat.
 - Persist workspace, host kind/session, Grok session, the complete effective security profile, model, effort, verified process identities, timestamps, TaskEnvelope/context manifests, completion manifests, lifecycle events, result (worker report, provider claims, runtime evidence, hostVerification), and stable error; read legacy schema-1/2 records compatibly.
 - Convert stale active records to `E_WORKER_LOST` only after provider cleanup is absent or verified; record `E_PROCESS_IDENTITY` and retain the guard/state when a leader is gone with a live group or ownership cannot be verified.
@@ -564,7 +565,7 @@ Before release, run the protected `GROK_E2E=1` headless review, sandbox, cancell
 - Document Grok's independent `~/.grok/sessions` store and the `grok sessions list` / `grok sessions delete <session-id>` cleanup flow for imported sessions; document both host forms of the rescue resume command.
 - Disclose that prompts, plugin-collected review context, repository content selected by task tools, command output, imported Claude context, and filtered user-visible Codex context may be processed through Grok/xAI services despite the local CLI transport.
 - Explain read-only versus write profiles, no-terminal write tools, host-owned verification, and managed-policy limitations.
-- Document residual limitations: macOS child-network caveat; native-like in-place writes with post-mutation scope detection; outstanding authenticated installed-Codex natural-flow E2E for this slice.
+- Document residual limitations: macOS child-network caveat; post-mutation scope detection inside isolated execution worktrees; dirty-source materialization and managed-root concurrency remain unavailable until their explicit P3 slices pass; outstanding authenticated installed-Codex natural-flow E2E for this slice.
 - Document stable error codes and troubleshooting.
 - Publish the 0.2.99 compatibility floor separately from exact authenticated test evidence; do not imply historical July 13 evidence qualifies the current worktree.
 - Classify this branch as an unqualified hardening candidate until re-qualification completes.
