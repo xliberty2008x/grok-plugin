@@ -836,6 +836,7 @@ function protectedCommand(name, mode, args, {
 function parseProtectedResult(result, {
   status,
   code = null,
+  operationFailure = false,
   label
 }) {
   assert.equal(result.status, status, `${label}:\n${result.stdout}\n${result.stderr}`);
@@ -844,7 +845,15 @@ function parseProtectedResult(result, {
   const payload = JSON.parse(result.stdout);
   if (code == null) assert.equal(payload.ok, true, label);
   else {
-    assert.deepEqual(payload, { ok: false, code }, label);
+    assert.deepEqual(payload, operationFailure
+      ? {
+          ok: false,
+          code,
+          gateId: null,
+          failureKind: null,
+          outputDigest: null
+        }
+      : { ok: false, code }, label);
   }
   return payload;
 }
@@ -1363,7 +1372,8 @@ test("root-owned protected review runtime promotes and replays exact signed evid
         ]);
         assert.equal(result.status, 0, "Workspace fsmonitor canary executed.");
       },
-      code: "E_REVIEW_TRUST_UNAVAILABLE"
+      code: "E_REVIEW_TRUST_UNAVAILABLE",
+      operationFailure: true
     },
     {
       id: "textconv-config",
@@ -1394,7 +1404,8 @@ test("root-owned protected review runtime promotes and replays exact signed evid
         ]);
         assert.equal(result.status, 0, "Workspace textconv canary executed.");
       },
-      code: "E_REVIEW_TRUST_UNAVAILABLE"
+      code: "E_REVIEW_TRUST_UNAVAILABLE",
+      operationFailure: true
     },
     {
       id: "clean-filter-config",
@@ -1425,7 +1436,8 @@ test("root-owned protected review runtime promotes and replays exact signed evid
         ]);
         assert.equal(result.status, 0, "Workspace clean-filter canary executed.");
       },
-      code: "E_REVIEW_TRUST_UNAVAILABLE"
+      code: "E_REVIEW_TRUST_UNAVAILABLE",
+      operationFailure: true
     },
     {
       id: "hostile-path",
@@ -1505,7 +1517,8 @@ test("root-owned protected review runtime promotes and replays exact signed evid
           }
         );
       },
-      code: "E_REVIEW_ATTESTATION_INVALID"
+      code: "E_REVIEW_ATTESTATION_INVALID",
+      operationFailure: true
     },
     {
       id: "caller-key",
@@ -1558,6 +1571,7 @@ test("root-owned protected review runtime promotes and replays exact signed evid
     parseProtectedResult(result, {
       status: scenario.status ?? 1,
       code: scenario.code,
+      operationFailure: scenario.operationFailure === true,
       label: scenario.id
     });
     if (scenario.assertNoExecution) {
