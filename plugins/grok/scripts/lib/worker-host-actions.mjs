@@ -69,6 +69,8 @@ const SOURCE_BINDING_KEYS = new Set([
   "workerProcessDigest",
   "providerProcessDigest",
   "providerSessionDigest",
+  "communicationChainDigest",
+  "finalReportDigest",
   "consumedLaunchContractDigest",
   "launchContractConsumedAt"
 ]);
@@ -358,6 +360,12 @@ function normalizeSourceBinding(binding) {
     || !SHA256_HEX.test(binding.workerProcessDigest || "")
     || !SHA256_HEX.test(binding.providerProcessDigest || "")
     || !SHA256_HEX.test(binding.providerSessionDigest || "")
+    || !(binding.communicationChainDigest === null
+      || SHA256_HEX.test(binding.communicationChainDigest || ""))
+    || !(binding.finalReportDigest === null
+      || SHA256_HEX.test(binding.finalReportDigest || ""))
+    || ((binding.communicationChainDigest === null)
+      !== (binding.finalReportDigest === null))
     || !SHA256_HEX.test(binding.consumedLaunchContractDigest || "")
     || !validIsoTimestamp(binding.launchContractConsumedAt)) {
     stateError("Host-action source binding is malformed.");
@@ -388,7 +396,9 @@ function assertDispatchSource(job, {
   attemptId,
   dispatchFence,
   providerGeneration,
-  providerSessionId
+  providerSessionId,
+  communicationChainDigest = null,
+  finalReportDigest = null
 }) {
   const dispatch = job?.request?.spawn?.dispatch;
   assertDispatchV2Structure(dispatch);
@@ -420,6 +430,15 @@ function assertDispatchSource(job, {
   if (job.grokSessionId != null && job.grokSessionId !== providerSessionId) {
     throw new CompanionError("E_PROCESS_IDENTITY", "Provider session identity changed before host-action persistence.");
   }
+  if (!(communicationChainDigest === null
+      || SHA256_HEX.test(communicationChainDigest || ""))
+    || !(finalReportDigest === null || SHA256_HEX.test(finalReportDigest || ""))
+    || ((communicationChainDigest === null) !== (finalReportDigest === null))) {
+    throw new CompanionError(
+      "E_CONTEXT_DRIFT",
+      "Host-action mailbox completion binding is incomplete."
+    );
+  }
   return Object.freeze({
     workerId: job.id,
     attemptId,
@@ -428,6 +447,8 @@ function assertDispatchSource(job, {
     workerProcessDigest: stableDigest(workerProcess),
     providerProcessDigest: stableDigest(providerProcess),
     providerSessionDigest: providerSessionDigest(providerSessionId),
+    communicationChainDigest,
+    finalReportDigest,
     consumedLaunchContractDigest: job.request.spawn.consumedLaunchContractDigest,
     launchContractConsumedAt: job.request.spawn.launchContractConsumedAt
   });
@@ -688,11 +709,22 @@ export function assertHostActionRequestStillBound(
   if (job?.id !== request.sourceBinding.workerId) {
     throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
   }
+  const mailboxEvidence = job?.result?.mailboxEvidence || null;
+  if (mailboxEvidence
+    && mailboxEvidence.finalReportDigest !== job?.result?.textDigest) {
+    throw new CompanionError(
+      "E_CONTEXT_DRIFT",
+      "Host-action final report no longer matches mailbox evidence."
+    );
+  }
   const source = assertDispatchSource(job, {
     attemptId: request.sourceBinding.attemptId,
     dispatchFence: request.sourceBinding.dispatchFence,
     providerGeneration: request.sourceBinding.providerGeneration,
-    providerSessionId
+    providerSessionId,
+    communicationChainDigest:
+      job?.result?.mailboxEvidence?.communicationChainDigest ?? null,
+    finalReportDigest: mailboxEvidence?.finalReportDigest ?? null
   });
   if (stableDigest(source) !== stableDigest(request.sourceBinding)) {
     throw new CompanionError("E_PROCESS_IDENTITY", "Host-action process or session binding drifted.");
@@ -712,7 +744,9 @@ export function mintHostActionRequest(job, {
   dispatchAttemptId,
   dispatchFence,
   providerGeneration,
-  providerSessionId
+  providerSessionId,
+  communicationChainDigest = null,
+  finalReportDigest = null
 } = {}) {
   const validated = validateProviderHostActionRequest(providerRequest, { present: true });
   if (!validated.ok || !validated.value) {
@@ -732,7 +766,9 @@ export function mintHostActionRequest(job, {
     attemptId: dispatchAttemptId,
     dispatchFence,
     providerGeneration,
-    providerSessionId
+    providerSessionId,
+    communicationChainDigest,
+    finalReportDigest
   });
   const parentBinding = buildParentBinding(job);
   const requestedAt = now();

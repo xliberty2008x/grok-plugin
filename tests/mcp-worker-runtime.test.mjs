@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn as spawnProcess } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -11,12 +12,14 @@ import {
   handleMcpRequest
 } from "../plugins/grok/mcp/broker.mjs";
 import {
+  ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY,
   ROOT_READ_PROVIDER_CAPABILITY,
   SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
 } from "../plugins/grok/scripts/lib/provider-capability.mjs";
 import {
   assertDispatchContract,
   authorizeWorkerProviderRotation,
+  cancellationNonce,
   claimWorkerDispatch,
   prepareDispatchProcessSpawn,
   providerLaunchState,
@@ -40,12 +43,19 @@ import {
   registerProviderGuard,
   unregisterProviderGuard
 } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
+import {
+  assertNoRetainedBodies,
+  listAttemptMessages,
+  readAttemptMailbox,
+  resolveOpenMailbox
+} from "../plugins/grok/scripts/lib/worker-mailbox.mjs";
 import { materializeRole } from "../plugins/grok/scripts/lib/worker-roles.mjs";
 import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
 import {
   cancelFile,
   tryReadJob,
-  updateJob
+  updateJob,
+  withWorkspaceStateTransaction
 } from "../plugins/grok/scripts/lib/state.mjs";
 import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 
@@ -59,7 +69,8 @@ const TEST_PROVIDER_RECEIPT = Object.freeze({
   capabilityDigest: "c".repeat(64),
   capabilities: [
     ROOT_READ_PROVIDER_CAPABILITY,
-    SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+    SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
+    ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
   ]
 });
 const TEST_BROKER_RUNTIME = createMcpBrokerRuntime({
@@ -120,6 +131,19 @@ function fixture(config = {}) {
   delete env.GROK_AGENT;
   delete env.GROK_LEADER_SOCKET;
   return { root, fake, pluginData, env };
+}
+
+function launchWithPrimaryTurnBarrier(args, barrierDirectory) {
+  return launchCommittedWorker({
+    ...args,
+    spawnProcess: (command, argv, options) => spawnProcess(command, argv, {
+      ...options,
+      env: {
+        ...options.env,
+        GROK_COMPANION_TEST_PRIMARY_TURN_BARRIER_DIR: barrierDirectory
+      }
+    })
+  });
 }
 
 async function rawTool(root, name, args, options) {
@@ -671,6 +695,22 @@ test("MCP spawn runs one fake provider, replays idempotently, waits, returns a p
   assert.equal(dispatch.providerGeneration, 1);
   assert.notEqual(privateJob.providerProcess.startToken, "[REDACTED]");
   assert.ok(privateJob.providerProcess.startToken);
+  const primaryAdmission = privateJob.request.spawn.primaryTurnAdmissions?.["1"];
+  assert.equal(primaryAdmission?.schemaVersion, 1);
+  assert.equal(primaryAdmission?.status, "consumed");
+  assert.match(primaryAdmission?.admissionId || "", /^[a-f0-9]{32}$/);
+  assert.equal(primaryAdmission?.dispatchAttemptId, dispatch.attemptId);
+  assert.equal(primaryAdmission?.dispatchFence, dispatch.fence);
+  assert.equal(primaryAdmission?.providerGeneration, 1);
+  assert.equal(primaryAdmission?.providerSessionId, privateJob.grokSessionId);
+  assert.equal(primaryAdmission?.promptDigest, privateJob.request.providerPromptDigest);
+  assert.equal(primaryAdmission?.workerProcess.pid, privateJob.workerProcess.pid);
+  assert.equal(primaryAdmission?.workerProcess.startToken, privateJob.workerProcess.startToken);
+  assert.equal(primaryAdmission?.providerProcess.pid, privateJob.providerProcess.pid);
+  assert.equal(primaryAdmission?.providerProcess.startToken, privateJob.providerProcess.startToken);
+  assert.ok(primaryAdmission?.admittedAt);
+  assert.ok(primaryAdmission?.consumedAt);
+  assert.ok(primaryAdmission.consumedAt >= primaryAdmission.admittedAt);
   assert.ok(dispatch.controllerStartedAt);
   assert.ok(dispatch.workerStartedAt);
   assert.ok(dispatch.providerStartedAt);
@@ -692,6 +732,161 @@ test("MCP spawn runs one fake provider, replays idempotently, waits, returns a p
   ]) {
     assert.equal(serialized.includes(secret), false, `public MCP payload leaked ${secret}`);
   }
+  await assertAllProcessesGone(privateJob);
+});
+
+test("MCP mailbox vertical uses one provider session for two ordered sends and selects only the third report", { skip: process.platform === "win32" }, async (t) => {
+  const { root, fake, env } = fixture({
+    taskTexts: [
+      taskReport("Primary report must not be selected"),
+      taskReport("First mailbox report must not be selected"),
+      taskReport("Second mailbox report is final", {
+        hostActionRequest: {
+          schemaVersion: 1,
+          kind: "role_admission",
+          requestedRoleId: "reviewer"
+        }
+      })
+    ],
+    delayMsByPrompt: [5_000, 0, 0]
+  });
+  const options = { env };
+  let workerId = null;
+  t.after(() => workerId && emergencyStop(tryReadJob(root, workerId, env)));
+
+  const spawned = await callTool(root, "worker_spawn", {
+    idempotencyKey: "mcp-runtime-mailbox-root-0001",
+    userRequest: "Inspect once, accept two ordered messages, and return only the last report."
+  }, options);
+  workerId = spawned.worker.id;
+
+  const openAttempt = await waitFor(() => {
+    const promptCount = readFakeLog(fake.logFile)
+      .filter((entry) => entry.event === "prompt").length;
+    if (promptCount !== 1) return null;
+    try {
+      return resolveOpenMailbox(root, workerId, env);
+    } catch {
+      return null;
+    }
+  }, { timeoutMs: 30_000, intervalMs: 25 });
+  assert.equal(openAttempt.providerGeneration, 1);
+
+  const first = await callTool(root, "worker_send", {
+    id: workerId,
+    message: "Check the first mailbox condition.",
+    idempotencyKey: "mcp-runtime-mailbox-send-0001"
+  }, options);
+  const second = await callTool(root, "worker_send", {
+    id: workerId,
+    message: "Check the second mailbox condition and produce the final report.",
+    idempotencyKey: "mcp-runtime-mailbox-send-0002"
+  }, options);
+  assert.equal(first.message.state, "accepted");
+  assert.equal(first.message.sequence, 1);
+  assert.equal(second.message.state, "accepted");
+  assert.equal(second.message.sequence, 2);
+  const publicMailboxPayload = JSON.stringify([first, second]);
+  const publicDigestCanaries = [
+    "mcp-runtime-mailbox-send-0001",
+    "mcp-runtime-mailbox-send-0002",
+    "Check the first mailbox condition.",
+    "Check the second mailbox condition and produce the final report."
+  ].map((value) => crypto.createHash("sha256").update(value).digest("hex"));
+  assert.equal(publicMailboxPayload.includes("mailbox condition"), false);
+  assert.equal(publicMailboxPayload.includes("idempotencyKeyDigest"), false);
+  assert.equal(publicMailboxPayload.includes("contentDigest"), false);
+  for (const canary of publicDigestCanaries) {
+    assert.equal(publicMailboxPayload.includes(canary), false);
+  }
+  assert.match(first.message.messageId, /^msg-[a-f0-9]{24}$/);
+  assert.match(second.message.messageId, /^msg-[a-f0-9]{24}$/);
+  assert.notEqual(first.message.messageId, second.message.messageId);
+
+  await waitForTerminal(root, workerId, options);
+  const result = await callTool(root, "worker_result", { id: workerId }, options);
+  assert.equal(result.worker.status, "completed");
+  assert.equal(result.worker.result.workerReport.summary, "Second mailbox report is final");
+
+  const terminalReplay = await callTool(root, "worker_send", {
+    id: workerId,
+    message: "Check the first mailbox condition.",
+    idempotencyKey: "mcp-runtime-mailbox-send-0001"
+  }, options);
+  assert.equal(terminalReplay.replayed, true);
+  assert.equal(terminalReplay.message.state, "delivered");
+
+  const privateJob = tryReadJob(root, workerId, env);
+  assert.equal(privateJob.result.mailboxEvidence.selectedSequence, 2);
+  assert.equal(privateJob.result.mailboxEvidence.finalReportSequence, 2);
+  assert.equal(privateJob.result.mailboxEvidence.deliveryUnknown, false);
+  assert.equal(privateJob.result.mailboxEvidence.closed, true);
+  assert.equal(privateJob.result.mailboxEvidence.bodiesRetained, false);
+  const attemptId = privateJob.request.spawn.dispatch.attemptId;
+  const attempt = readAttemptMailbox(root, workerId, attemptId, env);
+  const messages = listAttemptMessages(root, workerId, attemptId, env);
+  assert.equal(attempt.state, "closed");
+  assert.equal(attempt.providerGeneration, 1);
+  assert.equal(attempt.lastCompletedSequence, 2);
+  assert.equal(attempt.finalReportSequence, 2);
+  assert.equal(attempt.finalReportDigest, privateJob.result.mailboxEvidence.finalReportDigest);
+  assert.equal(attempt.finalReportDigest, privateJob.result.textDigest);
+  assert.deepEqual(messages.map((record) => record.state), ["delivered", "delivered"]);
+  assert.equal(messages[0].idempotencyKeyDigest, publicDigestCanaries[0]);
+  assert.equal(messages[1].idempotencyKeyDigest, publicDigestCanaries[1]);
+  assert.equal(messages[0].contentDigest, publicDigestCanaries[2]);
+  assert.equal(messages[1].contentDigest, publicDigestCanaries[3]);
+  assert.equal(assertNoRetainedBodies(root, workerId, attemptId, env), true);
+  assert.equal(
+    privateJob.hostAction.request.sourceBinding.communicationChainDigest,
+    attempt.communicationChainDigest
+  );
+  assert.equal(
+    privateJob.hostAction.request.sourceBinding.finalReportDigest,
+    attempt.finalReportDigest
+  );
+
+  const log = readFakeLog(fake.logFile);
+  const providerProcesses = log.filter((entry) => (
+    entry.event === "argv" && entry.args?.includes("agent")
+  ));
+  const sessionNew = log.filter((entry) => (
+    entry.event === "rpc" && entry.message?.method === "session/new"
+  ));
+  const sessionLoad = log.filter((entry) => (
+    entry.event === "rpc" && entry.message?.method === "session/load"
+  ));
+  const prompts = log.filter((entry) => entry.event === "prompt");
+  assert.equal(providerProcesses.length, 1);
+  assert.equal(sessionNew.length, 1);
+  assert.equal(sessionLoad.length, 0);
+  assert.equal(prompts.length, 3);
+  assert.equal(new Set(prompts.map((entry) => entry.sessionId)).size, 1);
+  assert.equal(prompts[1].prompt.includes("Check the first mailbox condition."), true);
+  assert.equal(
+    prompts[2].prompt.includes("Check the second mailbox condition and produce the final report."),
+    true
+  );
+  const requestId = result.worker.awaitingHostAction.requestId;
+  updateJob(root, workerId, (current) => ({
+    ...current,
+    result: {
+      ...current.result,
+      mailboxEvidence: {
+        ...current.result.mailboxEvidence,
+        finalReportDigest: "9".repeat(64)
+      }
+    }
+  }), env);
+  const driftedDecision = await rawTool(root, "worker_decide_host_action", {
+    id: workerId,
+    requestId,
+    decision: "grant",
+    idempotencyKey: "mcp-runtime-mailbox-drifted-decision-0001"
+  }, options);
+  assert.equal(driftedDecision.isError, true);
+  assert.equal(driftedDecision.structuredContent.error.code, "E_CONTEXT_DRIFT");
+  assert.equal(privateJob.result.taskRuntimeCleaned, true);
   await assertAllProcessesGone(privateJob);
 });
 
@@ -771,7 +966,7 @@ test("MCP grant-bound follow-up loads the exact provider session once and replay
     userRequest: "Inspect the fixture, then request one independent reviewer."
   }, options);
   workerIds.push(spawned.worker.id);
-  await waitForTerminal(root, spawned.worker.id, options);
+  await waitForTerminal(root, spawned.worker.id, options, 45_000);
   const rootResult = await callTool(root, "worker_result", {
     id: spawned.worker.id
   }, options);
@@ -806,7 +1001,7 @@ test("MCP grant-bound follow-up loads the exact provider session once and replay
   assert.equal(replay.replayed, true);
   assert.equal(replay.worker.id, followed.worker.id);
 
-  await waitForTerminal(root, followed.worker.id, options);
+  await waitForTerminal(root, followed.worker.id, options, 45_000);
   const childResult = await callTool(root, "worker_result", {
     id: followed.worker.id
   }, options);
@@ -1032,6 +1227,169 @@ test("MCP cancellation in the commit-to-launch window starts no worker or provid
   assert.equal(privateJob.providerProcess, undefined);
   assert.equal(readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length, 0);
   await assertAllProcessesGone(privateJob);
+});
+
+test("MCP primary-turn admission serializes session-boundary cancellation before prompt bytes", { skip: process.platform === "win32" }, async (t) => {
+  const { root, fake, env } = fixture({ sessionResponseDelayMs: 750 });
+  const options = { env };
+  let workerId = null;
+  t.after(() => workerId && emergencyStop(tryReadJob(root, workerId, env)));
+
+  const spawned = await callTool(root, "worker_spawn", {
+    idempotencyKey: "mcp-runtime-primary-admission-cancel-0001",
+    userRequest: "Cancellation must win at the exact primary session boundary."
+  }, options);
+  workerId = spawned.worker.id;
+  await waitFor(
+    () => readFakeLog(fake.logFile).some((entry) => (
+      entry.event === "rpc" && entry.message?.method === "session/new"
+    )),
+    { timeoutMs: 10_000, intervalMs: 20 }
+  );
+
+  // Acquire the exact state lock before session/new resolves. The worker may
+  // still publish its session event (per-job lock), but primary admission and
+  // cancellation are both ordered behind this transaction.
+  withWorkspaceStateTransaction(root, (transaction) => {
+    const deadline = Date.now() + 5_000;
+    let atBoundary = null;
+    while (Date.now() < deadline) {
+      atBoundary = transaction.tryReadJob(workerId);
+      if (atBoundary?.grokSessionId) break;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+    assert.ok(atBoundary?.grokSessionId, "provider session boundary was not published");
+    const nonce = cancellationNonce(atBoundary);
+    assert.ok(nonce);
+    transaction.requestCancel(workerId, nonce);
+    assert.equal(transaction.isCancelRequested(workerId, nonce), true);
+  }, env);
+
+  await waitForTerminal(root, workerId, options);
+  const terminal = tryReadJob(root, workerId, env);
+  assert.equal(terminal.status, "cancelled");
+  assert.equal(terminal.error.code, "E_CANCELLED");
+  assert.equal(
+    terminal.request.spawn.primaryTurnAdmissions?.["1"],
+    undefined
+  );
+  assert.equal(
+    readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length,
+    0
+  );
+  await assertAllProcessesGone(terminal);
+});
+
+test("MCP cancellation after generation-1 admission wins before prompt consumption", { skip: process.platform === "win32" }, async (t) => {
+  const { root, fake, env } = fixture();
+  const barrierDirectory = tempDir("grok-primary-admission-gen1-");
+  const options = {
+    env,
+    serviceOptions: {
+      launchWorker: (args) => launchWithPrimaryTurnBarrier(args, barrierDirectory)
+    }
+  };
+  let workerId = null;
+  t.after(() => workerId && emergencyStop(tryReadJob(root, workerId, env)));
+
+  const spawned = await callTool(root, "worker_spawn", {
+    idempotencyKey: "mcp-runtime-primary-consume-cancel-gen1-0001",
+    userRequest: "Cancel after primary admission but before prompt consumption."
+  }, options);
+  workerId = spawned.worker.id;
+  const admittedPath = path.join(barrierDirectory, "generation-1.admitted");
+  const releasePath = path.join(barrierDirectory, "generation-1.release");
+  await waitFor(() => fs.existsSync(admittedPath), {
+    timeoutMs: 15_000,
+    intervalMs: 20
+  });
+
+  const admitted = tryReadJob(root, workerId, env);
+  assert.equal(admitted.request.spawn.primaryTurnAdmissions?.["1"]?.status, "admitted");
+  assert.equal(
+    readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length,
+    0
+  );
+  const cancelled = await callTool(root, "worker_cancel", {
+    id: workerId,
+    idempotencyKey: "mcp-runtime-primary-consume-cancel-gen1-receipt-0001"
+  }, options);
+  assert.equal(cancelled.receipt.status, "accepted");
+  fs.writeFileSync(releasePath, "continue\n", { encoding: "utf8", mode: 0o600 });
+
+  await waitForTerminal(root, workerId, options);
+  const terminal = tryReadJob(root, workerId, env);
+  assert.equal(terminal.status, "cancelled");
+  assert.equal(terminal.error.code, "E_CANCELLED");
+  assert.equal(terminal.request.spawn.primaryTurnAdmissions?.["1"]?.status, "admitted");
+  assert.equal(terminal.request.spawn.primaryTurnAdmissions?.["1"]?.consumedAt, null);
+  assert.equal(
+    readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length,
+    0
+  );
+  await assertAllProcessesGone(terminal);
+});
+
+test("MCP cancellation after report-repair generation-2 admission wins before prompt consumption", { skip: process.platform === "win32" }, async (t) => {
+  const { root, fake, env } = fixture({
+    taskTexts: ["invalid first worker response", taskReport("Repair must not run")]
+  });
+  const barrierDirectory = tempDir("grok-primary-admission-gen2-");
+  const options = {
+    env,
+    serviceOptions: {
+      launchWorker: (args) => launchWithPrimaryTurnBarrier(args, barrierDirectory)
+    }
+  };
+  let workerId = null;
+  t.after(() => workerId && emergencyStop(tryReadJob(root, workerId, env)));
+
+  const spawned = await callTool(root, "worker_spawn", {
+    idempotencyKey: "mcp-runtime-primary-consume-cancel-gen2-0001",
+    userRequest: "Cancel the report repair after admission but before prompt consumption."
+  }, options);
+  workerId = spawned.worker.id;
+  const admittedOnePath = path.join(barrierDirectory, "generation-1.admitted");
+  const releaseOnePath = path.join(barrierDirectory, "generation-1.release");
+  await waitFor(() => fs.existsSync(admittedOnePath), {
+    timeoutMs: 15_000,
+    intervalMs: 20
+  });
+  fs.writeFileSync(releaseOnePath, "continue\n", { encoding: "utf8", mode: 0o600 });
+
+  const admittedTwoPath = path.join(barrierDirectory, "generation-2.admitted");
+  const releaseTwoPath = path.join(barrierDirectory, "generation-2.release");
+  await waitFor(() => fs.existsSync(admittedTwoPath), {
+    timeoutMs: 20_000,
+    intervalMs: 20
+  });
+  const admitted = tryReadJob(root, workerId, env);
+  assert.equal(admitted.request.spawn.primaryTurnAdmissions?.["1"]?.status, "consumed");
+  assert.equal(admitted.request.spawn.primaryTurnAdmissions?.["2"]?.status, "admitted");
+  assert.equal(
+    readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length,
+    1
+  );
+
+  const cancelled = await callTool(root, "worker_cancel", {
+    id: workerId,
+    idempotencyKey: "mcp-runtime-primary-consume-cancel-gen2-receipt-0001"
+  }, options);
+  assert.equal(cancelled.receipt.status, "accepted");
+  fs.writeFileSync(releaseTwoPath, "continue\n", { encoding: "utf8", mode: 0o600 });
+
+  await waitForTerminal(root, workerId, options);
+  const terminal = tryReadJob(root, workerId, env);
+  assert.equal(terminal.status, "cancelled");
+  assert.equal(terminal.error.code, "E_CANCELLED");
+  assert.equal(terminal.request.spawn.primaryTurnAdmissions?.["1"]?.status, "consumed");
+  assert.equal(terminal.request.spawn.primaryTurnAdmissions?.["2"]?.status, "admitted");
+  assert.equal(terminal.request.spawn.primaryTurnAdmissions?.["2"]?.consumedAt, null);
+  assert.equal(
+    readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length,
+    1
+  );
+  await assertAllProcessesGone(terminal);
 });
 
 test("MCP cancellation before dispatch claim starts no controller, worker, or provider", { skip: process.platform === "win32" }, async () => {
@@ -1459,6 +1817,27 @@ test("broker report repair rotates provider identity once after the previous gro
   assert.equal(dispatch.providerRotationCount, 1);
   assert.ok(dispatch.providerRotatedAt);
   assert.equal(privateJob.providerProcess.providerGeneration, 2);
+  const primaryAdmissions = privateJob.request.spawn.primaryTurnAdmissions;
+  assert.deepEqual(Object.keys(primaryAdmissions || {}).sort(), ["1", "2"]);
+  assert.equal(primaryAdmissions["1"].status, "consumed");
+  assert.equal(primaryAdmissions["1"].providerGeneration, 1);
+  assert.equal(primaryAdmissions["1"].promptDigest, privateJob.request.providerPromptDigest);
+  assert.equal(primaryAdmissions["2"].status, "consumed");
+  assert.equal(primaryAdmissions["2"].providerGeneration, 2);
+  assert.notEqual(primaryAdmissions["2"].promptDigest, primaryAdmissions["1"].promptDigest);
+  assert.equal(primaryAdmissions["2"].providerSessionId, privateJob.grokSessionId);
+  assert.equal(primaryAdmissions["2"].providerProcess.pid, privateJob.providerProcess.pid);
+  assert.equal(
+    primaryAdmissions["2"].providerProcess.startToken,
+    privateJob.providerProcess.startToken
+  );
+  const mailbox = readAttemptMailbox(root, workerId, dispatch.attemptId, env);
+  assert.equal(mailbox.finalReportSequence, mailbox.lastCompletedSequence);
+  assert.equal(mailbox.finalReportDigest, privateJob.result.textDigest);
+  assert.equal(
+    mailbox.finalReportDigest,
+    privateJob.result.mailboxEvidence.finalReportDigest
+  );
   await assertAllProcessesGone(privateJob);
 });
 
@@ -2281,6 +2660,115 @@ test("controller watchdog settles a provider-started worker crash and cleans eve
   assert.ok(lost.request.spawn.dispatch.runtimeLostAt);
   assert.equal(lost.result.hostVerification, "not_run");
   assert.equal(lost.result.taskRuntimeCleaned, true);
+  const mailbox = readAttemptMailbox(
+    root,
+    workerId,
+    lost.request.spawn.dispatch.attemptId,
+    env
+  );
+  assert.equal(mailbox.state, "closed");
+  assert.equal(mailbox.primaryTurnEvidence, null);
+  assert.equal(assertNoRetainedBodies(
+    root,
+    workerId,
+    lost.request.spawn.dispatch.attemptId,
+    env
+  ), true);
+  await assertAllProcessesGone(lost);
+});
+
+test("worker restart recovery settles an inflight mailbox turn as unknown without replay or retained body", { skip: process.platform === "win32" }, async (t) => {
+  const { root, fake, env } = fixture({
+    taskTexts: [
+      taskReport("Primary report before crash"),
+      taskReport("This inflight report must never be trusted")
+    ],
+    delayMsByPrompt: [5_000, 0],
+    cancelMode: "wait",
+    cancelModeOnPrompt: 2
+  });
+  const options = {
+    env,
+    reconcileWorkers: (args) => reconcileBrokerWorkers(args)
+  };
+  let workerId = null;
+  t.after(() => workerId && emergencyStop(tryReadJob(root, workerId, env)));
+
+  const spawned = await callTool(root, "worker_spawn", {
+    idempotencyKey: "mcp-runtime-mailbox-restart-0001",
+    userRequest: "Accept one message, then prove restart recovery is ambiguity-safe."
+  }, options);
+  workerId = spawned.worker.id;
+  const openAttempt = await waitFor(() => {
+    if (readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length !== 1) {
+      return null;
+    }
+    try { return resolveOpenMailbox(root, workerId, env); }
+    catch { return null; }
+  }, { timeoutMs: 15_000, intervalMs: 25 });
+
+  const sent = await callTool(root, "worker_send", {
+    id: workerId,
+    message: "Enter the provider boundary exactly once.",
+    idempotencyKey: "mcp-runtime-mailbox-restart-send-0001"
+  }, options);
+  assert.equal(sent.message.state, "accepted");
+  await waitFor(() => {
+    const messages = listAttemptMessages(
+      root,
+      workerId,
+      openAttempt.dispatchAttemptId,
+      env
+    );
+    return messages[0]?.state === "inflight" ? messages[0] : null;
+  }, { timeoutMs: 15_000, intervalMs: 25 });
+  const active = tryReadJob(root, workerId, env);
+  process.kill(-active.workerProcess.processGroupId, "SIGKILL");
+
+  await waitForTerminal(root, workerId, options);
+  const lost = tryReadJob(root, workerId, env);
+  assert.equal(lost.status, "failed");
+  assert.equal(lost.error.code, "E_WORKER_LOST");
+  const attempt = readAttemptMailbox(
+    root,
+    workerId,
+    openAttempt.dispatchAttemptId,
+    env
+  );
+  const messages = listAttemptMessages(
+    root,
+    workerId,
+    openAttempt.dispatchAttemptId,
+    env
+  );
+  assert.equal(attempt.state, "closed");
+  assert.equal(attempt.deliveryUnknownSequence, 1);
+  assert.deepEqual(messages.map((record) => record.state), ["delivery_unknown"]);
+  assert.equal(assertNoRetainedBodies(
+    root,
+    workerId,
+    openAttempt.dispatchAttemptId,
+    env
+  ), true);
+
+  const replay = await callTool(root, "worker_send", {
+    id: workerId,
+    message: "Enter the provider boundary exactly once.",
+    idempotencyKey: "mcp-runtime-mailbox-restart-send-0001"
+  }, options);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.message.state, "delivery_unknown");
+  const rejected = await rawTool(root, "worker_send", {
+    id: workerId,
+    message: "Must not enter the terminal mailbox.",
+    idempotencyKey: "mcp-runtime-mailbox-restart-send-0002"
+  }, options);
+  assert.equal(rejected.isError, true);
+  assert.equal(rejected.structuredContent.error.code, "E_JOB_NOT_FOUND");
+  assert.equal(
+    readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length,
+    2
+  );
   await assertAllProcessesGone(lost);
 });
 

@@ -559,6 +559,9 @@ if (!versionsOnly) {
       problem("Worker Broker scenario measurements must be a bounded allowlist.", file);
     }
     const liveReferences = workerEvidenceSchema.properties?.liveQualificationReceipts;
+    const liveReferencePattern = (name) => liveReferences?.properties?.[name]
+      ?.anyOf?.find((candidate) => candidate?.type === "object")
+      ?.properties?.path?.pattern;
     const liveSemanticsRule = (workerEvidenceSchema.allOf || []).find((rule) => (
       Array.isArray(rule?.if?.anyOf)
       && rule?.then?.properties?.status?.const === "implemented_unverified"
@@ -584,6 +587,10 @@ if (!versionsOnly) {
     if (liveReferences?.additionalProperties !== false
       || !liveReferences?.required?.includes("syntheticDirectMcp")
       || !liveReferences?.required?.includes("naturalCodexHost")
+      || liveReferencePattern("syntheticDirectMcp")
+        !== "^tests/e2e-results/worker-broker/live-receipts/v2/synthetic-direct-mcp/[0-9a-f]{16}-[0-9a-f]{16}\\.json$"
+      || liveReferencePattern("naturalCodexHost")
+        !== "^tests/e2e-results/worker-broker/live-receipts/v2/natural-codex-host/[0-9a-f]{16}-[0-9a-f]{16}\\.json$"
       || !liveSemanticsRule) {
       problem("Worker Broker evidence schema must bind bidirectional provisional live-receipt semantics.", file);
     }
@@ -839,6 +846,7 @@ if (!versionsOnly) {
       "installedPluginInventoryDigest",
       "installedEntrypointDigest",
       "providerCapabilityDigest",
+      "observedProviderCapabilities",
       "observedToolIds",
       "providerBinaryDigest",
       "mcpProtocolVersion",
@@ -853,10 +861,10 @@ if (!versionsOnly) {
         problem(`Worker Broker live receipt schema is missing required field ${field}.`, file);
       }
     }
-    const expectedManifestDigest = "aee11910fb0ff30ac4d7475fbd29c79cc07fed679e037b602d383a94e7694833";
-    if (liveReceiptSchema.properties?.schemaVersion?.const !== 1
+    const expectedManifestDigest = "179f210223b5bc963fa94295217fa7ed9710c5f7620ac6e2eb4883f28b943b73";
+    if (liveReceiptSchema.properties?.schemaVersion?.const !== 2
       || liveReceiptSchema.properties?.producerId?.const !== "worker-broker-live-receipt-runner"
-      || liveReceiptSchema.properties?.producerVersion?.const !== 1
+      || liveReceiptSchema.properties?.producerVersion?.const !== 2
       || liveReceiptSchema.properties?.manifestDigest?.const !== expectedManifestDigest
       || liveReceiptSchema.properties?.mcpProtocolVersion?.const !== "2025-11-25"
       || liveReceiptSchema.properties?.providerRevision?.pattern
@@ -873,6 +881,7 @@ if (!versionsOnly) {
       "cancelInvocationCount",
       "cancelReplayCount",
       "uniqueCancelRequestCount",
+      "mailbox",
       "runnerTemporaryArtifactsRemoved",
       "qualificationSessionDeleted"
     ];
@@ -893,13 +902,38 @@ if (!versionsOnly) {
     const naturalRule = (liveReceiptSchema.allOf || []).find((rule) => (
       rule?.if?.properties?.authorityMode?.const === "natural-codex-host"
     ));
+    const providerCapabilities = [
+      "root-read-spawn-v1",
+      "same-session-read-followup-v1",
+      "ordered-turn-boundary-mailbox-v1"
+    ];
+    const mailboxSummary = syntheticRule?.then?.properties?.scenarios?.const?.[0]?.mailbox;
     if (syntheticRule?.then?.properties?.phase?.const !== "1"
-      || syntheticRule?.then?.properties?.observedToolIds?.const?.length !== 9
+      || JSON.stringify(
+        liveReceiptSchema.properties?.observedProviderCapabilities?.const
+      ) !== JSON.stringify(providerCapabilities)
+      || syntheticRule?.then?.properties?.observedToolIds?.const?.length !== 10
+      || syntheticRule?.then?.properties?.observedToolIds?.const?.[8] !== "worker_send"
       || syntheticRule?.then?.properties?.scenarios?.const?.length !== 2
+      || mailboxSummary?.providerGenerationCount !== 1
+      || mailboxSummary?.providerSessionCount !== 1
+      || mailboxSummary?.promptCount !== 3
+      || mailboxSummary?.sendInvocationCount !== 3
+      || mailboxSummary?.sendReplayCount !== 1
+      || mailboxSummary?.acceptedCount !== 2
+      || mailboxSummary?.deliveredCount !== 2
+      || mailboxSummary?.deliveryUnknownCount !== 0
+      || mailboxSummary?.rejectedCount !== 0
+      || mailboxSummary?.finalReportSequence !== 2
+      || mailboxSummary?.replayPromptDelta !== 0
+      || mailboxSummary?.retainedBodyCount !== 0
+      || mailboxSummary?.closed !== true
+      || syntheticRule?.then?.properties?.scenarios?.const?.[1]?.mailbox !== null
       || naturalRule?.then?.properties?.phase?.const !== "4"
       || naturalRule?.then?.properties?.installationMethod?.const !== "codex-local-plugin-cache"
       || naturalRule?.then?.properties?.observedToolIds?.const?.length !== 4
-      || naturalRule?.then?.properties?.scenarios?.const?.length !== 1) {
+      || naturalRule?.then?.properties?.scenarios?.const?.length !== 1
+      || naturalRule?.then?.properties?.scenarios?.const?.[0]?.mailbox !== null) {
       problem("Worker Broker live receipt schema must bind exact authority scenarios and tool inventories.", file);
     }
   }

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/xliberty2008x/grok-plugin/schemas/worker-broker-live-receipt.schema.json",
   "title": "Worker Broker Live Qualification Receipt",
-  "description": "Immutable bounded live-qualification receipt v1 for strict offline structural and source-bound integrity replay. Offline validation cannot authenticate historical origin against manual JSON authorship without a protected signature or external immutable anchor. No supported receipt mint or publication API exists until a future fixed runner derives the cache root from verified installation output, capabilities from the setup receipt and tools/list, binary digests from launched files, natural identity from trusted host events, and invocation/replay counts from code-observed private installed state rather than public provider-start or session-created events.",
+  "description": "Immutable bounded live-qualification receipt v2 for strict offline structural and source-bound integrity replay. Offline validation cannot authenticate historical origin against manual JSON authorship without a protected signature or external immutable anchor. The fixed installed runner owns receipt construction and private publication after deriving the cache root from verified installation output, capabilities from the setup receipt and tools/list, binary digests from launched files, natural identity from trusted host events, and invocation/replay/mailbox counts from code-observed private installed state rather than public provider-start or session-created events. Generic evidence code exposes validation only and has no mint, link, or publication authority.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -24,6 +24,7 @@
     "installedFileCount",
     "installedEntrypointDigest",
     "providerCapabilityDigest",
+    "observedProviderCapabilities",
     "observedToolIds",
     "providerBinaryDigest",
     "providerVersion",
@@ -41,15 +42,15 @@
     "receiptDigest"
   ],
   "properties": {
-    "schemaVersion": { "type": "integer", "const": 1 },
+    "schemaVersion": { "type": "integer", "const": 2 },
     "producerId": {
       "type": "string",
       "const": "worker-broker-live-receipt-runner"
     },
-    "producerVersion": { "type": "integer", "const": 1 },
+    "producerVersion": { "type": "integer", "const": 2 },
     "manifestDigest": {
       "type": "string",
-      "const": "aee11910fb0ff30ac4d7475fbd29c79cc07fed679e037b602d383a94e7694833"
+      "const": "179f210223b5bc963fa94295217fa7ed9710c5f7620ac6e2eb4883f28b943b73"
     },
     "authorityMode": {
       "type": "string",
@@ -99,10 +100,18 @@
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
+    "observedProviderCapabilities": {
+      "type": "array",
+      "const": [
+        "root-read-spawn-v1",
+        "same-session-read-followup-v1",
+        "ordered-turn-boundary-mailbox-v1"
+      ]
+    },
     "observedToolIds": {
       "type": "array",
       "minItems": 4,
-      "maxItems": 9,
+      "maxItems": 10,
       "uniqueItems": true,
       "items": {
         "type": "string",
@@ -115,6 +124,7 @@
           "worker_spawn",
           "worker_decide_host_action",
           "worker_followup",
+          "worker_send",
           "worker_cancel"
         ]
       }
@@ -178,6 +188,7 @@
           "uniqueCancelRequestCount",
           "cancellationEventCount",
           "duplicateLaunchCount",
+          "mailbox",
           "workerHostVerification",
           "processGroupGone",
           "taskRuntimeCleaned",
@@ -240,6 +251,45 @@
           },
           "cancellationEventCount": { "type": "integer", "minimum": 0, "maximum": 8 },
           "duplicateLaunchCount": { "type": "integer", "minimum": 0, "maximum": 8 },
+          "mailbox": {
+            "oneOf": [
+              { "type": "null" },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "providerGenerationCount",
+                  "providerSessionCount",
+                  "promptCount",
+                  "sendInvocationCount",
+                  "sendReplayCount",
+                  "acceptedCount",
+                  "deliveredCount",
+                  "deliveryUnknownCount",
+                  "rejectedCount",
+                  "finalReportSequence",
+                  "replayPromptDelta",
+                  "retainedBodyCount",
+                  "closed"
+                ],
+                "properties": {
+                  "providerGenerationCount": { "type": "integer", "minimum": 0, "maximum": 8 },
+                  "providerSessionCount": { "type": "integer", "minimum": 0, "maximum": 8 },
+                  "promptCount": { "type": "integer", "minimum": 0, "maximum": 32 },
+                  "sendInvocationCount": { "type": "integer", "minimum": 0, "maximum": 32 },
+                  "sendReplayCount": { "type": "integer", "minimum": 0, "maximum": 32 },
+                  "acceptedCount": { "type": "integer", "minimum": 0, "maximum": 32 },
+                  "deliveredCount": { "type": "integer", "minimum": 0, "maximum": 32 },
+                  "deliveryUnknownCount": { "type": "integer", "minimum": 0, "maximum": 32 },
+                  "rejectedCount": { "type": "integer", "minimum": 0, "maximum": 32 },
+                  "finalReportSequence": { "type": "integer", "minimum": 0, "maximum": 32 },
+                  "replayPromptDelta": { "type": "integer", "const": 0 },
+                  "retainedBodyCount": { "type": "integer", "const": 0 },
+                  "closed": { "type": "boolean", "const": true }
+                }
+              }
+            ]
+          },
           "workerHostVerification": { "type": "string", "const": "not_run" },
           "processGroupGone": { "type": "boolean" },
           "taskRuntimeCleaned": { "type": "boolean" },
@@ -280,6 +330,7 @@
               "worker_spawn",
               "worker_decide_host_action",
               "worker_followup",
+              "worker_send",
               "worker_cancel"
             ]
           },
@@ -302,6 +353,21 @@
                 "uniqueCancelRequestCount": 0,
                 "cancellationEventCount": 0,
                 "duplicateLaunchCount": 0,
+                "mailbox": {
+                  "providerGenerationCount": 1,
+                  "providerSessionCount": 1,
+                  "promptCount": 3,
+                  "sendInvocationCount": 3,
+                  "sendReplayCount": 1,
+                  "acceptedCount": 2,
+                  "deliveredCount": 2,
+                  "deliveryUnknownCount": 0,
+                  "rejectedCount": 0,
+                  "finalReportSequence": 2,
+                  "replayPromptDelta": 0,
+                  "retainedBodyCount": 0,
+                  "closed": true
+                },
                 "workerHostVerification": "not_run",
                 "processGroupGone": true,
                 "taskRuntimeCleaned": true,
@@ -322,6 +388,7 @@
                 "uniqueCancelRequestCount": 1,
                 "cancellationEventCount": 1,
                 "duplicateLaunchCount": 0,
+                "mailbox": null,
                 "workerHostVerification": "not_run",
                 "processGroupGone": true,
                 "taskRuntimeCleaned": true,
@@ -378,6 +445,7 @@
                 "uniqueCancelRequestCount": 0,
                 "cancellationEventCount": 0,
                 "duplicateLaunchCount": 0,
+                "mailbox": null,
                 "workerHostVerification": "not_run",
                 "processGroupGone": true,
                 "taskRuntimeCleaned": true,

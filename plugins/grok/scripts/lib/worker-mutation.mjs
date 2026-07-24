@@ -21,7 +21,6 @@ import {
   isCancelRequested,
   now,
   readPrivateJsonFile,
-  requestCancel,
   tryReadJob,
   writePrivateJsonFile,
   ensurePrivateStateDirectory,
@@ -5186,7 +5185,7 @@ export function cancelWorker({
       const brokerOnlyQueued = brokerOnlyQueuedCandidate && providerGuardAbsent;
       // Fail closed for every active state, including the commit-before-launch
       // window. The provider launch hook observes this same nonce-bound marker.
-      requestCancel(root, workerId, cancellationNonce(current), env);
+      transaction.requestCancel(workerId, cancellationNonce(current));
       // A broker-only queued job has no process to stop, but stale credentials
       // or profiles may still exist after a prior interrupted cleanup. Verify
       // their removal inside this workspace/job transaction before claiming a

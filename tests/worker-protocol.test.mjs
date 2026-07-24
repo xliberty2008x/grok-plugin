@@ -388,6 +388,34 @@ test("public projections bound text and map unknown errors fail closed", () => {
   assertConforms("WorkerError", providerExit.error);
 });
 
+test("public mailbox lifecycle projection exposes no replay or content equality digests", () => {
+  const contentCanary = "c".repeat(64);
+  const idempotencyCanary = "d".repeat(64);
+  const projected = projectLifecycleEvent({
+    type: "checkpoint",
+    at: "2026-07-24T00:00:00.000Z",
+    summary: "Mailbox message accepted.",
+    sequence: 7,
+    detail: {
+      messageId: "msg-0123456789abcdef01234567",
+      state: "accepted",
+      sequence: 1,
+      contentDigest: contentCanary,
+      idempotencyKeyDigest: idempotencyCanary
+    }
+  });
+  assert.deepEqual(projected.detail, {
+    messageId: "msg-0123456789abcdef01234567",
+    state: "accepted"
+  });
+  const serialized = JSON.stringify(projected);
+  assert.equal(serialized.includes(contentCanary), false);
+  assert.equal(serialized.includes(idempotencyCanary), false);
+  assert.equal(serialized.includes("contentDigest"), false);
+  assert.equal(serialized.includes("idempotencyKeyDigest"), false);
+  assertConforms("WorkerEvent", projected);
+});
+
 test("purported public snapshots are re-projected instead of trusted by version flags", () => {
   const canary = ["gh", "p_", "abcdefghijklmnopqrstuvwxyz", "1234567890"].join("");
   const base = projectWorkerSnapshot(job());

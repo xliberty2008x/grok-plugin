@@ -547,6 +547,9 @@ function projectLifecycleDetail(value, { trustHostAuthority = true } = {}) {
     status: 80
   };
   for (const [key, max] of Object.entries(textFields)) {
+    // Mailbox lifecycle events expose only an opaque message handle and state.
+    // Content and idempotency equality remain private durability evidence.
+    if (key === "contentDigest" && typeof value.messageId === "string") continue;
     if (typeof value[key] === "string") projected[key] = boundedText(value[key], { max });
   }
   if (["read", "write"].includes(value.mode)) projected.mode = value.mode;

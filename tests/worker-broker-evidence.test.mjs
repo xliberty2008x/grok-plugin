@@ -29,9 +29,11 @@ import {
   LIVE_RECEIPT_CAPABILITY_TOOL_IDS,
   LIVE_RECEIPT_MANIFEST,
   LIVE_RECEIPT_NATURAL_TOOL_IDS,
+  LIVE_RECEIPT_PROVIDER_CAPABILITIES,
   LIVE_RECEIPT_PRODUCER_ID,
   LIVE_RECEIPT_PRODUCER_VERSION,
   LIVE_RECEIPT_ROOT,
+  LIVE_RECEIPT_SCHEMA_VERSION,
   LIVE_RECEIPT_SCENARIO_IDS,
   assessCompleteEvidenceChain,
   attachIndependentReviewReceiptDigest,
@@ -1087,7 +1089,7 @@ function seedLedgerFixtureEntry(root, entry) {
   const ledgerPath = path.join(root, "tests/e2e-results/worker-broker/ledger.json");
   fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
   let ledger = {
-    schemaVersion: 1,
+    schemaVersion: LIVE_RECEIPT_SCHEMA_VERSION,
     roadmapVersion: "1.0",
     issue: "https://github.com/xliberty2008x/grok-plugin/issues/25",
     updatedAt: null,
@@ -1529,7 +1531,7 @@ function structuralLiveReceipt(fixture, authorityMode, overrides = {}) {
     `${fixture.name}:structural-provider-binary`
   );
   const receipt = {
-    schemaVersion: 1,
+    schemaVersion: LIVE_RECEIPT_SCHEMA_VERSION,
     producerId: LIVE_RECEIPT_PRODUCER_ID,
     producerVersion: LIVE_RECEIPT_PRODUCER_VERSION,
     manifestDigest: computeLiveReceiptManifestDigest(),
@@ -1547,6 +1549,7 @@ function structuralLiveReceipt(fixture, authorityMode, overrides = {}) {
     installedFileCount: pluginInventory.fileCount,
     installedEntrypointDigest: pluginInventory.installedEntrypointDigest,
     providerCapabilityDigest: fixture.providerCapabilityDigest,
+    observedProviderCapabilities: [...config.observedProviderCapabilities],
     observedToolIds: [...config.observedToolIds],
     providerBinaryDigest,
     providerVersion: "0.2.106-fixture",
@@ -3038,7 +3041,7 @@ test("evidence publication validates privacy, bounds, structure, and supplied di
   assert.equal(published.recordDigest, computeRecordDigest(published));
 });
 
-test("live receipt v1 supports strict offline replay but exports no mint or publication authority", async () => {
+test("live receipt v2 supports strict offline replay but exports no generic mint or publication authority", async () => {
   const evidenceModule = await import(EVIDENCE_MODULE_URL);
   for (const unsupported of [
     "attachLiveQualificationReceiptDigest",
@@ -3055,6 +3058,23 @@ test("live receipt v1 supports strict offline replay but exports no mint or publ
     )),
     []
   );
+  assert.equal(
+    LIVE_RECEIPT_ROOT,
+    "tests/e2e-results/worker-broker/live-receipts/v2"
+  );
+  const historicalV1 = path.join(
+    ROOT,
+    "tests/e2e-results/worker-broker/live-receipts/v1/synthetic-direct-mcp",
+    "9e109ac49369cb53-2babb2f1362e0b7e.json"
+  );
+  assert.equal(fs.existsSync(historicalV1), true);
+  assert.equal(
+    crypto.createHash("sha256").update(fs.readFileSync(historicalV1)).digest("hex"),
+    "d8347082d42c1f6ad931350b82d6ed0efee0e1a5c031e71d56cfeec38d3137ef"
+  );
+  const staleV1 = JSON.parse(fs.readFileSync(historicalV1, "utf8"));
+  assert.equal(staleV1.schemaVersion, 1);
+  assert.equal(validateLiveQualificationReceipt(staleV1).ok, false);
 
   const fixture = initLiveReceiptFixture("live-receipt-positive");
   const ignoredLinkInput = buildEvidenceRecord({
@@ -3076,6 +3096,10 @@ test("live receipt v1 supports strict offline replay but exports no mint or publ
   assert.equal(synthetic.manifestDigest, computeLiveReceiptManifestDigest());
   assert.equal(synthetic.phase, "1");
   assert.deepEqual(synthetic.observedToolIds, LIVE_RECEIPT_CAPABILITY_TOOL_IDS);
+  assert.deepEqual(
+    synthetic.observedProviderCapabilities,
+    LIVE_RECEIPT_PROVIDER_CAPABILITIES
+  );
   assert.equal(
     synthetic.sourcePluginInventoryDigest,
     synthetic.installedPluginInventoryDigest
@@ -3095,6 +3119,22 @@ test("live receipt v1 supports strict offline replay but exports no mint or publ
     synthetic.scenarios,
     LIVE_RECEIPT_AUTHORITY_CONFIG[LIVE_RECEIPT_AUTHORITY_SYNTHETIC].scenarios
   );
+  assert.deepEqual(synthetic.scenarios[0].mailbox, {
+    providerGenerationCount: 1,
+    providerSessionCount: 1,
+    promptCount: 3,
+    sendInvocationCount: 3,
+    sendReplayCount: 1,
+    acceptedCount: 2,
+    deliveredCount: 2,
+    deliveryUnknownCount: 0,
+    rejectedCount: 0,
+    finalReportSequence: 2,
+    replayPromptDelta: 0,
+    retainedBodyCount: 0,
+    closed: true
+  });
+  assert.equal(synthetic.scenarios[1].mailbox, null);
   assert.deepEqual(
     {
       spawnInvocationCount: synthetic.scenarios[1].spawnInvocationCount,
@@ -3139,6 +3179,7 @@ test("live receipt v1 supports strict offline replay but exports no mint or publ
     natural.scenarios,
     LIVE_RECEIPT_AUTHORITY_CONFIG[LIVE_RECEIPT_AUTHORITY_NATURAL].scenarios
   );
+  assert.equal(natural.scenarios[0].mailbox, null);
   assert.ok(natural.scenarios.every((scenario) => (
     scenario.workerHostVerification === "not_run"
   )));
@@ -3170,6 +3211,10 @@ test("live receipt v1 supports strict offline replay but exports no mint or publ
   assert.deepEqual(
     syntheticRule.then.properties.observedToolIds.const,
     LIVE_RECEIPT_CAPABILITY_TOOL_IDS
+  );
+  assert.deepEqual(
+    schema.properties.observedProviderCapabilities.const,
+    LIVE_RECEIPT_PROVIDER_CAPABILITIES
   );
   assert.deepEqual(
     naturalRule.then.properties.observedToolIds.const,
@@ -3358,6 +3403,12 @@ test("live receipt validation rejects digest, method, authority, scenario, clean
     ["tool-inventory-substitution", (receipt) => {
       receipt.observedToolIds = receipt.observedToolIds.slice(0, -1);
     }],
+    ["provider-capability-substitution", (receipt) => {
+      receipt.observedProviderCapabilities = receipt.observedProviderCapabilities.slice(0, -1);
+    }],
+    ["provider-capability-order", (receipt) => {
+      receipt.observedProviderCapabilities.reverse();
+    }],
     ["provider-revision-substitution", (receipt) => {
       receipt.providerRevision = `binary-sha256-${"f".repeat(64)}`;
     }],
@@ -3381,6 +3432,36 @@ test("live receipt validation rejects digest, method, authority, scenario, clean
     }],
     ["launch-count", (receipt) => {
       receipt.scenarios[0].providerLaunchCount = 2;
+    }],
+    ["mailbox-prompt-count", (receipt) => {
+      receipt.scenarios[0].mailbox.promptCount = 4;
+    }],
+    ["mailbox-send-replay-count", (receipt) => {
+      receipt.scenarios[0].mailbox.sendReplayCount = 0;
+    }],
+    ["mailbox-delivered-count", (receipt) => {
+      receipt.scenarios[0].mailbox.deliveredCount = 1;
+    }],
+    ["mailbox-delivery-unknown", (receipt) => {
+      receipt.scenarios[0].mailbox.deliveryUnknownCount = 1;
+    }],
+    ["mailbox-final-report", (receipt) => {
+      receipt.scenarios[0].mailbox.finalReportSequence = 1;
+    }],
+    ["mailbox-replay-prompt-delta", (receipt) => {
+      receipt.scenarios[0].mailbox.replayPromptDelta = 1;
+    }],
+    ["mailbox-retained-body", (receipt) => {
+      receipt.scenarios[0].mailbox.retainedBodyCount = 1;
+    }],
+    ["mailbox-not-closed", (receipt) => {
+      receipt.scenarios[0].mailbox.closed = false;
+    }],
+    ["mailbox-private-field", (receipt) => {
+      receipt.scenarios[0].mailbox.contentDigest = "PRIVATE_MAILBOX_CANARY";
+    }],
+    ["mailbox-on-cancellation", (receipt) => {
+      receipt.scenarios[1].mailbox = structuredClone(receipt.scenarios[0].mailbox);
     }],
     ["spawn-replay-count", (receipt) => {
       receipt.scenarios[1].spawnReplayCount = 0;
@@ -3653,7 +3734,10 @@ test("live evidence runtime and JSON Schema enforce bidirectional provisional se
     "utf8"
   ));
   assert.equal(receiptSchema.$schema, "https://json-schema.org/draft/2020-12/schema");
-  assert.equal(receiptSchema.properties.schemaVersion.const, 1);
+  assert.equal(
+    receiptSchema.properties.schemaVersion.const,
+    LIVE_RECEIPT_SCHEMA_VERSION
+  );
   assert.equal(receiptSchema.properties.producerId.const, LIVE_RECEIPT_PRODUCER_ID);
   assert.equal(receiptSchema.properties.producerVersion.const, LIVE_RECEIPT_PRODUCER_VERSION);
   assert.equal(receiptSchema.properties.manifestDigest.const, computeLiveReceiptManifestDigest());

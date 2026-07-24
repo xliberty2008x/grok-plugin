@@ -642,6 +642,12 @@ export function withWorkspaceStateTransaction(root, action, env = process.env) {
     },
     updateJob(id, mutator) {
       return updateJob(root, id, mutator, env);
+    },
+    requestCancel(id, nonce) {
+      return requestCancelUnlocked(root, id, nonce, env);
+    },
+    isCancelRequested(id, expectedNonce) {
+      return isCancelRequested(root, id, expectedNonce, env);
     }
   })), env);
 }
@@ -1094,7 +1100,7 @@ export function selectJob(root, { id, host, claudeSessionId, active, finished, a
   return match[0];
 }
 
-export function requestCancel(root, id, nonce, env = process.env) {
+function requestCancelUnlocked(root, id, nonce, env = process.env) {
   if (typeof nonce !== "string" || nonce.length < 1 || nonce.length > 256 || /[\r\n]/.test(nonce)) {
     throw new CompanionError("E_PROCESS_IDENTITY", "Refusing to create a cancellation marker without the active worker nonce.");
   }
@@ -1103,6 +1109,19 @@ export function requestCancel(root, id, nonce, env = process.env) {
   // first lets another process observe an empty nonce between open and write,
   // which can lose a launch-window cancellation on slower runtimes.
   atomicPrivateFile(file, `${nonce}\n`);
+}
+
+/**
+ * Commit durable cancellation under the workspace state transaction. Provider
+ * turn admission uses the same lock, giving cancellation and prompt dispatch a
+ * single authoritative order.
+ */
+export function requestCancel(root, id, nonce, env = process.env) {
+  return withWorkspaceStateTransaction(
+    root,
+    (transaction) => transaction.requestCancel(id, nonce),
+    env
+  );
 }
 
 export function isCancelRequested(root, id, expectedNonce, env = process.env) {

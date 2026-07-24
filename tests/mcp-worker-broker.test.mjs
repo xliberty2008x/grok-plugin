@@ -12,6 +12,7 @@ import {
   handleMcpRequest
 } from "../plugins/grok/mcp/broker.mjs";
 import {
+  ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY,
   ROOT_READ_PROVIDER_CAPABILITY,
   SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
 } from "../plugins/grok/scripts/lib/provider-capability.mjs";
@@ -30,7 +31,8 @@ const SPAWN_RECEIPT = Object.freeze({
   capabilityDigest: "a".repeat(64),
   capabilities: [
     ROOT_READ_PROVIDER_CAPABILITY,
-    SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+    SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
+    ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
   ]
 });
 const SPAWN_RUNTIME = createMcpBrokerRuntime({
@@ -41,7 +43,7 @@ const LIVE_SPAWN_OPTIONS = Object.freeze({
   readProviderCapabilityReceipt: () => SPAWN_RECEIPT
 });
 
-test("decision and follow-up tools are advertised only by the exact combined capability receipt", () => {
+test("decision, follow-up, and send tools are advertised only by the exact combined capability receipt", () => {
   const receipts = [
     {
       label: "root-only",
@@ -54,10 +56,16 @@ test("decision and follow-up tools are advertised only by the exact combined cap
       expected: BASE_WORKER_TOOLS
     },
     {
+      label: "mailbox-only",
+      capabilities: [ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY],
+      expected: BASE_WORKER_TOOLS
+    },
+    {
       label: "reordered",
       capabilities: [
         SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
-        ROOT_READ_PROVIDER_CAPABILITY
+        ROOT_READ_PROVIDER_CAPABILITY,
+        ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
       ],
       expected: BASE_WORKER_TOOLS
     },
@@ -66,7 +74,8 @@ test("decision and follow-up tools are advertised only by the exact combined cap
       capabilities: [
         ROOT_READ_PROVIDER_CAPABILITY,
         SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
-        SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+        ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY,
+        ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
       ],
       expected: BASE_WORKER_TOOLS
     },
@@ -75,6 +84,7 @@ test("decision and follow-up tools are advertised only by the exact combined cap
       capabilities: [
         ROOT_READ_PROVIDER_CAPABILITY,
         SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
+        ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY,
         "unexpected-provider-capability"
       ],
       expected: BASE_WORKER_TOOLS
@@ -83,7 +93,8 @@ test("decision and follow-up tools are advertised only by the exact combined cap
       label: "exact",
       capabilities: [
         ROOT_READ_PROVIDER_CAPABILITY,
-        SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+        SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
+        ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
       ],
       expected: WORKER_TOOLS
     }
@@ -146,10 +157,11 @@ test("MCP broker advertises sandbox metadata, pins protocol versions, and lists 
     "worker_spawn",
     "worker_decide_host_action",
     "worker_followup",
+    "worker_send",
     "worker_cancel"
   ]);
   assert.deepEqual(full.result.tools, WORKER_TOOLS);
-  assert.equal(full.result.tools.some((tool) => tool.name === "worker_send"), false);
+  assert.equal(full.result.tools.some((tool) => tool.name === "worker_send"), true);
   assert.equal(Object.hasOwn(full.result.tools.find((tool) => tool.name === "worker_spawn").inputSchema.properties, "write"), false);
   for (const tool of listed.result.tools) {
     assert.equal(tool.annotations.idempotentHint, true);
@@ -206,7 +218,7 @@ test("frozen broker runtime cannot be widened and hidden operations never reach 
   }, TypeError);
 
   for (const [name, runtime, expectedCode] of [
-    ["worker_send", SPAWN_RUNTIME, "E_USAGE"],
+    ["worker_send", BASE_RUNTIME, "E_CAPABILITY"],
     ["worker_spawn", BASE_RUNTIME, "E_CAPABILITY"],
     ["worker_decide_host_action", BASE_RUNTIME, "E_CAPABILITY"],
     ["worker_followup", BASE_RUNTIME, "E_CAPABILITY"]
@@ -251,6 +263,11 @@ test("every admission tool revalidates the live receipt before authority or serv
       grantId: "hag-aaaaaaaaaaaaaaaaaaaaaaaa",
       message: "Must not be admitted",
       idempotencyKey: "live-receipt-followup-0001"
+    }],
+    ["worker_send", {
+      id: "task-aaaaaaaaaaaaaaaa",
+      message: "Must not be admitted",
+      idempotencyKey: "live-receipt-send-0001"
     }]
   ];
   for (const [label, currentReceipt] of unavailable) {
@@ -505,6 +522,7 @@ test("MCP exposes only bounded host-action decisions and grant-bound follow-up h
   const privateDigest = "d".repeat(64);
   let decisionArgs = null;
   let followupArgs = null;
+  let sendArgs = null;
   const options = {
     ...LIVE_SPAWN_OPTIONS,
     resolveAuthority: () => PRINCIPAL,
@@ -541,6 +559,18 @@ test("MCP exposes only bounded host-action decisions and grant-bound follow-up h
           spawnSuccessDefinition: "durable-job-commit",
           providerLaunchState: "pending",
           providerLaunched: false
+        };
+      },
+      send(args) {
+        sendArgs = args;
+        return {
+          receipt: {
+            workerId: args.id,
+            sequence: 1,
+            state: "accepted",
+            acceptedAt: "2026-07-23T00:00:00.000Z"
+          },
+          replayed: false
         };
       }
     })
@@ -580,6 +610,27 @@ test("MCP exposes only bounded host-action decisions and grant-bound follow-up h
   });
   assert.equal(followed.structuredContent.worker.id, "task-bbbbbbbbbbbbbbbb");
   assert.equal(followed.structuredContent.providerLaunched, false);
+
+  const sent = await callWorkerTool({
+    name: "worker_send",
+    arguments: {
+      id: "task-aaaaaaaaaaaaaaaa",
+      message: "Check the second condition",
+      idempotencyKey: "mcp-send-0001"
+    }
+  }, options);
+  assert.deepEqual(sendArgs, {
+    id: "task-aaaaaaaaaaaaaaaa",
+    message: "Check the second condition",
+    idempotencyKey: "mcp-send-0001"
+  });
+  assert.deepEqual(sent.structuredContent.message, {
+    workerId: "task-aaaaaaaaaaaaaaaa",
+    sequence: 1,
+    state: "accepted",
+    acceptedAt: "2026-07-23T00:00:00.000Z"
+  });
+  assert.equal(JSON.stringify(sent).includes("Check the second condition"), false);
 });
 
 test("MCP broker routes owned reads and allowlists errors without private details", async () => {

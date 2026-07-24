@@ -35,7 +35,7 @@ import {
   clearProviderCapabilityReceipt,
   writeProviderCapabilityReceipt
 } from "./lib/provider-capability.mjs";
-import { admitJob, appendJobLog, config, setConfig, generateId, writeJob, updateJob, listJobs, readJob, selectJob, requestCancel, isCancelRequested, terminal, now, retain, logFile, withWorkspaceAdmission } from "./lib/state.mjs";
+import { admitJob, appendJobLog, config, setConfig, generateId, writeJob, updateJob, listJobs, readJob, selectJob, requestCancel, isCancelRequested, terminal, now, retain, logFile, withWorkspaceAdmission, withWorkspaceStateTransaction } from "./lib/state.mjs";
 import { resolveControlWorkspace, workspaceRoot, workspaceState } from "./lib/workspace.mjs";
 import { redact, redactText, sanitizeDisplayText } from "./lib/redact.mjs";
 import { readBoundedStdin, STDIN_READY_MARKER } from "./lib/stdin.mjs";
@@ -97,6 +97,18 @@ import {
 import { launchCommittedWorker } from "./lib/worker-runtime.mjs";
 import { materializeRole } from "./lib/worker-roles.mjs";
 import { attachHostActionRequestToJob } from "./lib/worker-host-actions.mjs";
+import {
+  assertNoRetainedBodies,
+  composeMailboxTurnPrompt,
+  contentDigestOf as mailboxContentDigest,
+  drainWorkerMailbox,
+  openAttemptMailbox,
+  readAttemptMailbox,
+  recordPrimaryTurn,
+  selectFinalReportSequence,
+  settleInterruptedAttempt,
+  stableDigest as mailboxStableDigest
+} from "./lib/worker-mailbox.mjs";
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = path.resolve(path.dirname(SCRIPT), "..");
@@ -164,6 +176,46 @@ function out(value, json = false) { process.stdout.write(`${json ? JSON.stringif
 function currentHost() { return hostContext(); }
 function sessionId() { return currentHost().sessionId; }
 function stateDir(root) { return workspaceState(root); }
+
+function primaryTurnAdmissionTestHooks() {
+  const directory = process.env.GROK_COMPANION_TEST_PRIMARY_TURN_BARRIER_DIR;
+  if (!directory) return null;
+  if (!path.isAbsolute(directory)) {
+    throw new CompanionError(
+      "E_USAGE",
+      "The primary-turn test barrier directory must be absolute."
+    );
+  }
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  return Object.freeze({
+    afterPrimaryTurnAdmitted: async ({ admission }) => {
+      const generation = admission?.providerGeneration;
+      if (![1, 2].includes(generation)) {
+        throw new CompanionError(
+          "E_STATE",
+          "The primary-turn test barrier observed an invalid provider generation."
+        );
+      }
+      const ready = path.join(directory, `generation-${generation}.admitted`);
+      const release = path.join(directory, `generation-${generation}.release`);
+      fs.writeFileSync(ready, `${admission.admissionId}\n`, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600
+      });
+      const deadline = Date.now() + 30_000;
+      while (!fs.existsSync(release)) {
+        if (Date.now() >= deadline) {
+          throw new CompanionError(
+            "E_TIMEOUT",
+            "Timed out waiting for the primary-turn test barrier release."
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+  });
+}
 /** Public job JSON shares Worker Protocol v1 snapshot projection with future brokers. */
 function publicJob(job, options = {}) {
   return projectWorkerSnapshot(job, options);
@@ -354,6 +406,13 @@ function workerEnvironment(nonce, dispatchAttemptId = null, dispatchFence = null
   if (process.env.GROK_HEADLESS_PROMPT_ON_DISK) env.GROK_HEADLESS_PROMPT_ON_DISK = process.env.GROK_HEADLESS_PROMPT_ON_DISK;
   if (process.env.CI) env.CI = process.env.CI;
   if (process.env.GITHUB_ACTIONS) env.GITHUB_ACTIONS = process.env.GITHUB_ACTIONS;
+  // This barrier is deliberately absent from trustedWorkerEnvironment's
+  // allowlist. Tests can inject it only into the already-authorized controller
+  // spawn wrapper to exercise the admit/consume cancellation boundary.
+  if (process.env.GROK_COMPANION_TEST_PRIMARY_TURN_BARRIER_DIR) {
+    env.GROK_COMPANION_TEST_PRIMARY_TURN_BARRIER_DIR =
+      process.env.GROK_COMPANION_TEST_PRIMARY_TURN_BARRIER_DIR;
+  }
   env.GROK_COMPANION_WORKER_NONCE = nonce;
   if (dispatchAttemptId) env.GROK_COMPANION_DISPATCH_ATTEMPT = dispatchAttemptId;
   if (Number.isSafeInteger(dispatchFence) && dispatchFence > 0) {
@@ -1149,6 +1208,489 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
     // unrelated pre-existing pending intent can never admit another bootstrap.
     let providerLaunchAuthorization = null;
     let expectedProviderLaunchBinding = providerLaunchBinding(job.profile, prompt);
+    const mailboxCapabilityDigest = job.request?.spawn?.providerCapabilityDigest;
+    const mailboxEligible = Boolean(
+      job.jobClass === "task"
+      && receiptBacked
+      && dispatchAttemptId
+      && providerGeneration === 1
+      && /^[a-f0-9]{64}$/.test(mailboxCapabilityDigest || "")
+    );
+    const primaryTurnEligible = Boolean(
+      job.jobClass === "task"
+      && receiptBacked
+      && dispatchAttemptId
+      && isDispatchV2(job.request?.spawn?.dispatch)
+      && [1, 2].includes(providerGeneration)
+    );
+    const primaryTurnProcessBinding = (identity, { provider = false } = {}) => ({
+      pid: identity?.pid ?? null,
+      startToken: identity?.startToken ?? null,
+      processGroupId: identity?.processGroupId ?? null,
+      commandMarker: identity?.commandMarker ?? null,
+      dispatchAttemptId: identity?.dispatchAttemptId ?? null,
+      dispatchFence: identity?.dispatchFence ?? null,
+      ...(provider
+        ? { providerGeneration: identity?.providerGeneration ?? null }
+        : { nonce: identity?.nonce ?? null })
+    });
+    const assertPrimaryTurnAuthority = (current, {
+      sessionId: expectedSessionId,
+      providerProcess: expectedProviderProcess,
+      prompt: effectivePrompt
+    }) => {
+      if (!current || terminal(current)) {
+        throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+      }
+      assertDispatchContract(current);
+      const dispatch = current.request?.spawn?.dispatch;
+      const effectivePromptDigest = mailboxContentDigest(effectivePrompt);
+      if (!isDispatchV2(dispatch)
+        || dispatch.state !== "provider-started"
+        || dispatch.attemptId !== dispatchAttemptId
+        || dispatch.fence !== dispatchFence
+        || dispatch.providerGeneration !== providerGeneration
+        || !exactBrokerWorkerIdentity(current.workerProcess)
+        || !expectedProviderLaunchBinding
+        || effectivePromptDigest !== expectedProviderLaunchBinding.promptDigest
+        || typeof expectedSessionId !== "string"
+        || !expectedSessionId
+        || current.grokSessionId !== expectedSessionId) {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "Primary turn authority changed before provider dispatch."
+        );
+      }
+      const durableProvider = current.providerProcess;
+      if (!durableProvider
+        || durableProvider.commandMarker !== id
+        || durableProvider.dispatchAttemptId !== dispatchAttemptId
+        || durableProvider.dispatchFence !== dispatchFence
+        || durableProvider.providerGeneration !== providerGeneration
+        || !Number.isInteger(durableProvider.pid)
+        || typeof durableProvider.startToken !== "string"
+        || !durableProvider.startToken
+        || durableProvider.pid !== expectedProviderProcess?.pid
+        || durableProvider.startToken !== expectedProviderProcess?.startToken
+        || durableProvider.processGroupId !== expectedProviderProcess?.processGroupId) {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "Primary turn provider identity changed before dispatch."
+        );
+      }
+      return {
+        current,
+        effectivePromptDigest,
+        workerProcess: primaryTurnProcessBinding(current.workerProcess),
+        providerProcess: primaryTurnProcessBinding(durableProvider, { provider: true })
+      };
+    };
+    const primaryTurnController = primaryTurnEligible
+      ? Object.freeze({
+          admit: ({
+            sessionId: providerSessionId,
+            providerProcess,
+            prompt: effectivePrompt
+          }) => withWorkspaceStateTransaction(root, (transaction) => {
+            if (transaction.isCancelRequested(id, workerNonce)) {
+              throw new CompanionError(
+                "E_CANCELLED",
+                "Grok job was cancelled before primary turn admission."
+              );
+            }
+            const generationKey = String(providerGeneration);
+            const updated = transaction.updateJob(id, (current) => {
+              const authority = assertPrimaryTurnAuthority(current, {
+                sessionId: providerSessionId,
+                providerProcess,
+                prompt: effectivePrompt
+              });
+              const existing = current.request?.spawn?.primaryTurnAdmissions;
+              if (existing != null && (
+                typeof existing !== "object"
+                || Array.isArray(existing)
+                || Object.keys(existing).some((key) => !["1", "2"].includes(key))
+              )) {
+                throw new CompanionError(
+                  "E_STATE",
+                  "Primary turn admission state is malformed."
+                );
+              }
+              if (existing?.[generationKey]) {
+                throw new CompanionError(
+                  "E_STATE",
+                  "Primary provider turn was already admitted and cannot be replayed."
+                );
+              }
+              const admittedAt = now();
+              const admission = {
+                schemaVersion: 1,
+                status: "admitted",
+                admissionId: crypto.randomBytes(16).toString("hex"),
+                dispatchAttemptId,
+                dispatchFence,
+                providerGeneration,
+                workerProcess: authority.workerProcess,
+                providerProcess: authority.providerProcess,
+                providerSessionId,
+                promptDigest: authority.effectivePromptDigest,
+                admittedAt,
+                consumedAt: null
+              };
+              return {
+                ...current,
+                request: {
+                  ...current.request,
+                  spawn: {
+                    ...current.request?.spawn,
+                    primaryTurnAdmissions: {
+                      ...(existing || {}),
+                      [generationKey]: admission
+                    }
+                  }
+                },
+                updatedAt: admittedAt
+              };
+            });
+            return Object.freeze({
+              ...updated.request.spawn.primaryTurnAdmissions[generationKey]
+            });
+          }),
+          consume: ({
+            admission,
+            sessionId: providerSessionId,
+            providerProcess,
+            prompt: effectivePrompt
+          }) => withWorkspaceStateTransaction(root, (transaction) => {
+            if (transaction.isCancelRequested(id, workerNonce)) {
+              throw new CompanionError(
+                "E_CANCELLED",
+                "Grok job was cancelled before primary turn consumption."
+              );
+            }
+            const generationKey = String(providerGeneration);
+            const updated = transaction.updateJob(id, (current) => {
+              assertPrimaryTurnAuthority(current, {
+                sessionId: providerSessionId,
+                providerProcess,
+                prompt: effectivePrompt
+              });
+              const stored = current.request?.spawn?.primaryTurnAdmissions?.[generationKey];
+              if (!stored
+                || stored.schemaVersion !== 1
+                || stored.status !== "admitted"
+                || stored.providerGeneration !== providerGeneration
+                || stored.dispatchAttemptId !== dispatchAttemptId
+                || stored.dispatchFence !== dispatchFence
+                || mailboxStableDigest(stored) !== mailboxStableDigest(admission)) {
+                throw new CompanionError(
+                  "E_PROCESS_IDENTITY",
+                  "Primary turn admission changed before exact consumption."
+                );
+              }
+              const consumedAt = now();
+              return {
+                ...current,
+                request: {
+                  ...current.request,
+                  spawn: {
+                    ...current.request?.spawn,
+                    primaryTurnAdmissions: {
+                      ...current.request.spawn.primaryTurnAdmissions,
+                      [generationKey]: {
+                        ...stored,
+                        status: "consumed",
+                        consumedAt
+                      }
+                    }
+                  }
+                },
+                updatedAt: consumedAt
+              };
+            });
+            return Object.freeze({
+              ...updated.request.spawn.primaryTurnAdmissions[generationKey]
+            });
+          })
+        })
+      : null;
+    const mailboxAuthority = (transaction, {
+      sessionId: expectedSessionId = null,
+      providerProcess: expectedProviderProcess = null
+    } = {}) => {
+      const current = transaction.tryReadJob(id);
+      if (!current || terminal(current)) {
+        throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+      }
+      assertDispatchContract(current);
+      const dispatch = current.request?.spawn?.dispatch;
+      if (!isDispatchV2(dispatch)
+        || dispatch.state !== "provider-started"
+        || dispatch.attemptId !== dispatchAttemptId
+        || dispatch.fence !== dispatchFence
+        || dispatch.providerGeneration !== 1
+        || !exactBrokerWorkerIdentity(current.workerProcess)
+        || current.request?.spawn?.providerCapabilityDigest !== mailboxCapabilityDigest) {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "Mailbox authority changed from the exact primary provider attempt."
+        );
+      }
+      const durableProvider = current.providerProcess;
+      if (!durableProvider
+        || durableProvider.commandMarker !== id
+        || durableProvider.dispatchAttemptId !== dispatchAttemptId
+        || durableProvider.dispatchFence !== dispatchFence
+        || durableProvider.providerGeneration !== 1
+        || !Number.isInteger(durableProvider.pid)
+        || typeof durableProvider.startToken !== "string"
+        || !durableProvider.startToken) {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "Mailbox provider identity is incomplete."
+        );
+      }
+      if (expectedProviderProcess && (
+        durableProvider.pid !== expectedProviderProcess.pid
+        || durableProvider.startToken !== expectedProviderProcess.startToken
+        || durableProvider.processGroupId !== expectedProviderProcess.processGroupId
+      )) {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "Mailbox provider identity changed before opening."
+        );
+      }
+      if (expectedSessionId !== null && current.grokSessionId !== expectedSessionId) {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "Mailbox provider session changed before opening."
+        );
+      }
+      if (!current.request?.contextReceipt
+        || !/^[a-f0-9]{64}$/.test(current.request?.runtimeRolePolicy?.digest || "")) {
+        throw new CompanionError(
+          "E_CONTEXT_DRIFT",
+          "Mailbox context receipt or role policy is unavailable."
+        );
+      }
+      return current;
+    };
+    const reportRepairMailboxAuthority = (transaction, {
+      sessionId: expectedSessionId
+    }) => {
+      const current = transaction.tryReadJob(id);
+      if (!current || terminal(current)) {
+        throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+      }
+      assertDispatchContract(current);
+      const dispatch = current.request?.spawn?.dispatch;
+      if (!isDispatchV2(dispatch)
+        || dispatch.state !== "provider-started"
+        || dispatch.attemptId !== dispatchAttemptId
+        || dispatch.fence !== dispatchFence
+        || providerGeneration !== 2
+        || dispatch.providerGeneration !== 2
+        || dispatch.nextProviderGeneration !== null
+        || dispatch.providerRotationCount !== 1
+        || !dispatch.providerRotatedAt
+        || !exactBrokerWorkerIdentity(current.workerProcess)
+        || current.request?.spawn?.providerCapabilityDigest !== mailboxCapabilityDigest) {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "Report-repair authority changed from the exact provider rotation."
+        );
+      }
+      const durableProvider = current.providerProcess;
+      if (!durableProvider
+        || durableProvider.commandMarker !== id
+        || durableProvider.dispatchAttemptId !== dispatchAttemptId
+        || durableProvider.dispatchFence !== dispatchFence
+        || durableProvider.providerGeneration !== 2
+        || !Number.isInteger(durableProvider.pid)
+        || typeof durableProvider.startToken !== "string"
+        || !durableProvider.startToken
+        || typeof expectedSessionId !== "string"
+        || !expectedSessionId
+        || current.grokSessionId !== expectedSessionId) {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "Report-repair provider identity or session is incomplete."
+        );
+      }
+      const attempt = readAttemptMailbox(root, id, dispatchAttemptId);
+      if (!attempt
+        || attempt.state !== "closed"
+        || attempt.dispatchFence !== dispatchFence
+        || attempt.providerGeneration !== 1
+        || attempt.workerProcessDigest !== mailboxStableDigest(current.workerProcess)
+        || attempt.providerSessionDigest !== mailboxStableDigest({
+          providerSessionId: expectedSessionId
+        })
+        || attempt.providerCapabilityDigest !== mailboxCapabilityDigest
+        || attempt.contextReceiptDigest
+          !== mailboxStableDigest(current.request?.contextReceipt)
+        || attempt.rolePolicyDigest
+          !== current.request?.runtimeRolePolicy?.digest) {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "Closed mailbox binding changed before report-repair selection."
+        );
+      }
+      assertNoRetainedBodies(root, id, dispatchAttemptId);
+      return current;
+    };
+    const mailboxController = mailboxEligible
+      ? Object.freeze({
+          open: ({ sessionId: providerSessionId, providerProcess, providerCapabilities }) => (
+            withWorkspaceStateTransaction(root, (transaction) => {
+              if (providerCapabilities?.protocolVersion !== 1
+                || providerCapabilities?.agentCapabilities?.loadSession !== true) {
+                throw new CompanionError(
+                  "E_CAPABILITY",
+                  "Provider did not retain the required ACP mailbox capability."
+                );
+              }
+              const current = mailboxAuthority(transaction, {
+                sessionId: providerSessionId,
+                providerProcess
+              });
+              return openAttemptMailbox(root, {
+                workerId: id,
+                dispatchAttemptId,
+                dispatchFence,
+                workerProcessDigest: mailboxStableDigest(current.workerProcess),
+                providerProcessDigest: mailboxStableDigest(current.providerProcess),
+                providerGeneration: 1,
+                providerSessionDigest: mailboxStableDigest({
+                  providerSessionId
+                }),
+                providerCapabilityDigest: mailboxCapabilityDigest,
+                contextReceiptDigest: mailboxStableDigest(current.request.contextReceipt),
+                rolePolicyDigest: current.request.runtimeRolePolicy.digest
+              });
+            })
+          ),
+          recordPrimary: ({ attempt, prompt: effectivePrompt }) => (
+            withWorkspaceStateTransaction(root, (transaction) => {
+              const current = mailboxAuthority(transaction);
+              const promptDigest = mailboxContentDigest(effectivePrompt);
+              if (current.request?.providerPromptDigest !== promptDigest
+                || attempt?.dispatchAttemptId !== dispatchAttemptId) {
+                throw new CompanionError(
+                  "E_AUTH_REQUIRED",
+                  "Primary mailbox turn no longer matches the authorized prompt."
+                );
+              }
+              return recordPrimaryTurn(root, id, dispatchAttemptId, {
+                contentDigest: promptDigest,
+                composedPromptDigest: promptDigest,
+                pumpOwnerDigest: attempt.pumpOwnerDigest
+              });
+            })
+          ),
+          drain: async ({
+            attempt,
+            client,
+            sessionId: providerSessionId,
+            collectTurnText,
+            timeoutMs,
+            cancelRequested
+          }) => {
+            const drained = await drainWorkerMailbox({
+              root,
+              workerId: id,
+              attemptId: dispatchAttemptId,
+              client,
+              sessionId: providerSessionId,
+              composePrompt: ({ message, sequence }) => composeMailboxTurnPrompt(message, {
+                sequence,
+                workerId: id
+              }),
+              collectTurnText,
+              timeoutMs,
+              cancelRequested,
+              validateAuthority: (transaction) => {
+                const current = mailboxAuthority(transaction, {
+                  sessionId: providerSessionId
+                });
+                const currentAttempt = readAttemptMailbox(
+                  root,
+                  id,
+                  dispatchAttemptId
+                );
+                if (!currentAttempt
+                  || currentAttempt.pumpOwnerDigest !== attempt.pumpOwnerDigest
+                  || currentAttempt.workerProcessDigest
+                    !== mailboxStableDigest(current.workerProcess)
+                  || currentAttempt.providerProcessDigest
+                    !== mailboxStableDigest(current.providerProcess)) {
+                  throw new CompanionError(
+                    "E_PROCESS_IDENTITY",
+                    "Mailbox attempt binding changed while pumping."
+                  );
+                }
+              }
+            });
+            return {
+              ...drained,
+              bodiesRetained: !assertNoRetainedBodies(
+                root,
+                id,
+                dispatchAttemptId
+              )
+            };
+          },
+          interrupt: ({ attempt, reason }) => withWorkspaceStateTransaction(
+            root,
+            (transaction) => {
+              mailboxAuthority(transaction);
+              const currentAttempt = readAttemptMailbox(root, id, dispatchAttemptId);
+              if (!currentAttempt
+                || currentAttempt.pumpOwnerDigest !== attempt.pumpOwnerDigest) {
+                throw new CompanionError(
+                  "E_PROCESS_IDENTITY",
+                  "Mailbox attempt changed before interruption settlement."
+                );
+              }
+              return settleInterruptedAttempt(
+                root,
+                id,
+                dispatchAttemptId,
+                { reason }
+              );
+            }
+          ),
+          selectReport: ({ sequence, valid, reportDigest }) => (
+            withWorkspaceStateTransaction(root, (transaction) => {
+              mailboxAuthority(transaction);
+              return selectFinalReportSequence(root, id, dispatchAttemptId, {
+                sequence,
+                valid,
+                reportDigest
+              });
+            })
+          ),
+          selectRepairedReport: ({
+            sequence,
+            reportDigest,
+            sessionId: providerSessionId
+          }) => (
+            withWorkspaceStateTransaction(root, (transaction) => {
+              reportRepairMailboxAuthority(transaction, {
+                sessionId: providerSessionId
+              });
+              return selectFinalReportSequence(root, id, dispatchAttemptId, {
+                sequence,
+                valid: true,
+                reportDigest
+              });
+            })
+          )
+        })
+      : null;
+    const primaryTurnTestHooks = primaryTurnEligible
+      ? primaryTurnAdmissionTestHooks()
+      : null;
     const common = {
       root,
       profile: job.profile,
@@ -1225,6 +1767,9 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
           })
         }
       } : {}),
+      ...(primaryTurnController ? { primaryTurnController } : {}),
+      ...(mailboxController ? { mailboxController } : {}),
+      ...(primaryTurnTestHooks ? { testHooks: primaryTurnTestHooks } : {}),
       onEvent: eventUpdater(root, id, dispatchAttemptId, providerGeneration, dispatchFence)
     };
     let result = job.jobClass === "review" && job.kind !== "stop-review"
@@ -1240,6 +1785,25 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
         providerText: result.text || "",
         acceptanceCriteria: envelope?.acceptanceCriteria || []
       });
+      if (result.mailboxEvidence) {
+        const reportDigest = workerReport.valid
+          ? boundedProviderText(result.text || "").textDigest
+          : null;
+        const selected = mailboxController.selectReport({
+          sequence: result.mailboxEvidence.selectedSequence,
+          valid: workerReport.valid,
+          reportDigest
+        });
+        result = {
+          ...result,
+          mailboxEvidence: {
+            ...result.mailboxEvidence,
+            finalReportSequence: selected.finalReportSequence,
+            finalReportDigest: selected.finalReportDigest,
+            communicationChainDigest: selected.communicationChainDigest
+          }
+        };
+      }
       if (!workerReport.valid && result.sessionId) {
         const initialResponse = textEvidence(result.text || "");
         recordLifecycle(root, id, "checkpoint", "Requesting one same-session report-format repair", {
@@ -1272,6 +1836,7 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
             profile: repairProfile,
             prompt: repairPrompt,
             resumeSessionId: result.sessionId,
+            mailboxController: null,
             ...(dispatchAttemptId ? {
               guardBinding: {
                 ...common.guardBinding,
@@ -1291,7 +1856,28 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
             validationIssues: repairedReport.validationIssues
           };
           if (repairedReport.valid) {
-            result = repaired;
+            const priorMailboxEvidence = result.mailboxEvidence || null;
+            const repairedMailboxSelection = priorMailboxEvidence
+              ? mailboxController.selectRepairedReport({
+                sequence: priorMailboxEvidence.selectedSequence,
+                reportDigest: boundedProviderText(repaired.text || "").textDigest,
+                sessionId: repaired.sessionId
+              })
+              : null;
+            result = {
+              ...repaired,
+              ...(priorMailboxEvidence
+                ? {
+                    mailboxEvidence: {
+                      ...priorMailboxEvidence,
+                      finalReportSequence: repairedMailboxSelection.finalReportSequence,
+                      finalReportDigest: repairedMailboxSelection.finalReportDigest,
+                      communicationChainDigest:
+                        repairedMailboxSelection.communicationChainDigest
+                    }
+                  }
+                : {})
+            };
             workerReport = repairedReport;
           }
         } catch (repairError) {
@@ -1364,10 +1950,26 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
       const observedFileAgreement = claimedPaths.size === observedPaths.size
         && [...claimedPaths].every((item) => observedPaths.has(item));
       const storedText = boundedProviderText(result.text || "");
+      const mailboxLifecycleValid = !result.mailboxEvidence || (
+        result.mailboxEvidence.deliveryUnknown === false
+        && result.mailboxEvidence.closed === true
+        && result.mailboxEvidence.bodiesRetained === false
+      );
+      const mailboxFinalReportBound = !result.mailboxEvidence || (
+        Number.isSafeInteger(result.mailboxEvidence.selectedSequence)
+        && result.mailboxEvidence.selectedSequence
+          === result.mailboxEvidence.lastCompletedSequence
+        && result.mailboxEvidence.finalReportSequence
+          === result.mailboxEvidence.lastCompletedSequence
+        && result.mailboxEvidence.finalReportDigest === storedText.textDigest
+      );
       // Provider success is a claim only; hostVerification stays not_run.
       const safeResult = redact({
         ...storedText,
         interim: textEvidence(result.interimText || ""),
+        ...(result.mailboxEvidence
+          ? { mailboxEvidence: result.mailboxEvidence }
+          : {}),
         ...(reportRepair ? { reportRepair } : {}),
         stopReason: result.stopReason,
         workerReport,
@@ -1375,7 +1977,9 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
           success: workerReport.valid
             && workerReport.outcome === "complete"
             && workerReport.acceptanceResults.every((entry) => entry.status === "met")
-            && observedFileAgreement,
+            && observedFileAgreement
+            && mailboxLifecycleValid
+            && mailboxFinalReportBound,
           outcome: workerReport.outcome,
           summary: workerReport.summary,
           changedFiles: workerReport.changedFiles,
@@ -1392,6 +1996,11 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
           `Grok changed paths outside the delegated scope: ${scopeViolationEvidence.join(", ")}. Host review is required; changes were not rolled back.`,
           { paths: scopeViolationEvidence }
         );
+      } else if (!mailboxLifecycleValid) {
+        finalTaskError = new CompanionError(
+          "E_DELIVERY",
+          "Ordered mailbox delivery could not be proven complete without ambiguity."
+        );
       } else if (reportRepairError) {
         finalTaskError = reportRepairError;
       } else if (!workerReport.valid) {
@@ -1403,6 +2012,18 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
             attempts: reportRepair?.attempted ? 2 : 1,
             validationIssues: workerReport.validationIssues
           }
+        );
+      } else if (!mailboxFinalReportBound) {
+        finalTaskError = new CompanionError(
+          "E_STATE",
+          "The final worker report is not bound to the last completed mailbox turn."
+        );
+      } else if (reportRepair?.valid
+        && result.mailboxEvidence
+        && workerReport.hostActionRequest) {
+        finalTaskError = new CompanionError(
+          "E_CAPABILITY",
+          "Host actions cannot be requested by a report-format repair generation."
         );
       } else if (workerReport.hostActionRequest?.requestedRoleId === "implementer") {
         finalTaskError = new CompanionError(
@@ -1420,7 +2041,11 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
               dispatchAttemptId,
               dispatchFence,
               providerGeneration,
-              providerSessionId: result.sessionId
+              providerSessionId: result.sessionId,
+              communicationChainDigest:
+                safeResult.mailboxEvidence?.communicationChainDigest ?? null,
+              finalReportDigest:
+                safeResult.mailboxEvidence?.finalReportDigest ?? null
             })
             : current;
           return touchJob(withHostAction, {
@@ -1455,6 +2080,35 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
     terminalError = error;
     const intendedTerminal = terminalIntentFor(error, redactText(error.message));
     const failedProviderProcess = providerCleanupIdentity(error);
+    const mailboxFailureEvidence = (() => {
+      if (!dispatchAttemptId) return null;
+      try {
+        const attempt = readAttemptMailbox(root, id, dispatchAttemptId);
+        if (!attempt) return null;
+        return {
+          schemaVersion: 1,
+          attemptId: dispatchAttemptId,
+          communicationChainDigest: attempt.communicationChainDigest,
+          lastCompletedSequence: attempt.lastCompletedSequence,
+          finalReportSequence: attempt.finalReportSequence,
+          finalReportDigest: attempt.finalReportDigest,
+          acceptedCount: attempt.acceptedCount,
+          acceptedBytes: attempt.acceptedBytes,
+          deliveryUnknown: attempt.deliveryUnknownSequence !== null,
+          closed: attempt.state === "closed",
+          bodiesRetained: (() => {
+            try {
+              assertNoRetainedBodies(root, id, dispatchAttemptId);
+              return false;
+            } catch {
+              return true;
+            }
+          })()
+        };
+      } catch {
+        return null;
+      }
+    })();
     const postContext = (() => {
       try { return captureContextManifest(root); } catch { return null; }
     })();
@@ -1474,6 +2128,9 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
         ...terminalIntentPatch(current, intendedTerminal),
         result: {
           ...(current.result || {}),
+          ...(mailboxFailureEvidence
+            ? { mailboxEvidence: mailboxFailureEvidence }
+            : {}),
           hostVerification: current.result?.hostVerification || "not_run",
           runtimeEvidence: buildRuntimeEvidence({
             preContext,

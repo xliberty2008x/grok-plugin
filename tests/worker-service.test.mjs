@@ -821,3 +821,25 @@ test("WorkerService does not persist a role decision after provider capability e
   assert.equal(stored.hostAction.decision, null);
   assert.equal(stored.hostAction.grant, null);
 });
+
+test("WorkerService rejects mailbox admission when provider capability expires at the service boundary", () => {
+  const root = initRepo();
+  const fixture = stateFixture(root);
+  const capabilityDigest = "c".repeat(64);
+  const service = createWorkerService({
+    root,
+    principal: { hostKind: "codex", threadId: THREAD_A },
+    env: fixture.env,
+    providerCapabilityDigest: capabilityDigest,
+    validateProviderCapability: () => null,
+    allowUnboundDispatch: false
+  });
+  assert.throws(
+    () => service.send({
+      id: "task-aaaaaaaaaaaaaaaa",
+      message: "Must not be accepted",
+      idempotencyKey: "service-expired-mailbox-0001"
+    }),
+    (error) => error?.code === "E_CAPABILITY"
+  );
+});

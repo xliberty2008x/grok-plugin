@@ -212,6 +212,7 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
     "scripts/lib/worker-launch-contract.mjs",
     "scripts/lib/grok-provider.mjs",
     "scripts/lib/worker-protocol.mjs",
+    "scripts/lib/worker-mailbox-state.mjs",
     "mcp/broker.mjs"
   ]) {
     assert.ok(source.includes(`"${relative}"`), relative);
@@ -221,6 +222,22 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.equal(
     source.includes("../plugins/grok/scripts/lib/worker-protocol.mjs"),
     false
+  );
+  assert.equal(
+    source.includes("../plugins/grok/scripts/lib/worker-mailbox-state.mjs"),
+    false
+  );
+  assert.match(
+    source,
+    /message\.messageId\s*!==\s*tracker\.mailboxPublicReceipts\[index\]\?\.messageId/
+  );
+  assert.match(
+    source,
+    /attempt\.finalReportDigest !== terminalJob\.result\?\.textDigest/
+  );
+  assert.match(
+    source,
+    /terminalJob\.result\?\.mailboxEvidence\?\.selectedSequence !== 2/
   );
   assert.equal(source.includes("fake-grok"), false);
   assert.equal(source.includes("baseEnvironment"), false);
@@ -347,6 +364,65 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
     "receipt must be strictly validated before and after publication"
   );
   assert.match(source, /validateInstalledScenarioEvidence\(/);
+  assert.match(
+    source,
+    /mailboxState = await importInstalled\(\s*installedRoot,\s*"scripts\/lib\/worker-mailbox-state\.mjs"\s*\)/
+  );
+  assert.match(source, /async function waitForInstalledMailboxOpen\(/);
+  assert.match(source, /function snapshotInstalledMailboxProof\(/);
+  assert.match(
+    source,
+    /context\.mailboxState\.assertNoRetainedBodies\([\s\S]*?context\.env\s*\)/
+  );
+  assert.match(
+    source,
+    /context\.mailboxState\.verifyChainExtension\(/,
+    "runner must validate the installed helper's private body-free chain"
+  );
+  const completionScenario = source.slice(
+    source.indexOf("async function runCompletionScenario("),
+    source.indexOf("async function runCancellationScenario(")
+  );
+  assert.equal(
+    completionScenario.match(/"worker_send"/g)?.length,
+    3,
+    "completion must call worker_send twice and replay one exact send"
+  );
+  assert.ok(
+    completionScenario.indexOf('"completion-mailbox-open"')
+      < completionScenario.indexOf('"completion-send-first"')
+  );
+  assert.ok(
+    completionScenario.indexOf('"completion-send-first"')
+      < completionScenario.indexOf('"completion-send-second"')
+  );
+  assert.ok(
+    completionScenario.indexOf('"completion-send-second"')
+      < completionScenario.indexOf('"completion-send-replay"')
+  );
+  assert.ok(
+    completionScenario.indexOf('"completion-send-replay"')
+      < completionScenario.indexOf('"completion-wait"')
+  );
+  assert.ok(
+    completionScenario.indexOf("snapshotInstalledMailboxProof(")
+      < completionScenario.indexOf("deleteAndProveSessionAbsent(context, tracker)")
+  );
+  assert.match(source, /mailboxMessageCountAfterReplay = afterReplayMessages\.length/);
+  assert.match(source, /providerGenerationCount: 1/);
+  assert.match(source, /providerSessionCount: 1/);
+  assert.match(source, /promptCount: 3/);
+  assert.match(source, /deliveredCount: 2/);
+  assert.match(source, /deliveryUnknownCount: 0/);
+  assert.match(source, /rejectedCount: 0/);
+  assert.match(source, /finalReportSequence: 2/);
+  assert.match(source, /replayPromptDelta: 0/);
+  assert.match(source, /retainedBodyCount: 0/);
+  assert.match(source, /closed: true/);
+  assert.match(source, /observedProviderCapabilities: capability\.capabilities/);
+  assert.match(source, /schemaVersion: LIVE_RECEIPT_SCHEMA_VERSION/);
+  assert.match(source, /producerVersion: LIVE_RECEIPT_PRODUCER_VERSION/);
+  assert.match(source, /LIVE_RECEIPT_ROOT/);
   assert.match(source, /installedWorkerBinding: \{/);
   assert.match(source, /observedPublicWorkerDigests: \[/);
   assert.match(

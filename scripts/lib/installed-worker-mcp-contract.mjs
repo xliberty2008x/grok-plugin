@@ -11,6 +11,7 @@ const MAX_STRING_BYTES = 256 * 1024;
 const SHA256_HEX = /^[a-f0-9]{64}$/;
 const WORKER_ID = /^(?:review|adversarial-review|task|stop-review)-[a-f0-9]{16,64}$/;
 const CANCELLATION_RECEIPT_ID = /^cancel-[a-f0-9]{24}$/;
+const MAILBOX_MESSAGE_ID = /^msg-[a-f0-9]{24}$/;
 const SPAWN_RESPONSE_WITNESS_ID = /^spawnw-[a-f0-9]{24}$/;
 const TASK_ENVELOPE_ID = /^env-[a-f0-9]{24}$/;
 const CONTEXT_PACKET_ID = /^ctxpkt-[a-f0-9]{24}$/;
@@ -40,6 +41,7 @@ export const INSTALLED_WORKER_TOOL_NAMES = Object.freeze([
   "worker_spawn",
   "worker_decide_host_action",
   "worker_followup",
+  "worker_send",
   "worker_cancel"
 ]);
 
@@ -156,6 +158,16 @@ const SPAWN_PAYLOAD_KEYS = new Set([
   "providerLaunched"
 ]);
 const CANCEL_PAYLOAD_KEYS = new Set(["ok", "receipt", "replayed"]);
+const SEND_PAYLOAD_KEYS = new Set(["ok", "message", "replayed"]);
+const MESSAGE_RECEIPT_KEYS = new Set([
+  "messageId",
+  "workerId",
+  "state",
+  "sequence",
+  "acceptedAt",
+  "outcomeAt",
+  "reason"
+]);
 const CANCELLATION_RECEIPT_KEYS = new Set([
   "receiptId",
   "workerId",
@@ -166,7 +178,13 @@ const CANCELLATION_RECEIPT_KEYS = new Set([
   "idempotencyKeyDigest",
   "cancellationRequestSequence"
 ]);
-const COMPLETION_BUNDLE_KEYS = new Set(["spawn", "terminalResult"]);
+const COMPLETION_BUNDLE_KEYS = new Set([
+  "spawn",
+  "firstSend",
+  "secondSend",
+  "sendReplay",
+  "terminalResult"
+]);
 const CANCELLATION_BUNDLE_KEYS = new Set([
   "spawn",
   "spawnReplay",
@@ -197,12 +215,34 @@ const PRIVATE_OBSERVATION_KEYS = new Set([
   "uniqueCancelRequestCount",
   "cancellationEventCount",
   "duplicateLaunchCount",
+  "mailboxMessageBindings",
+  "mailbox",
   "workerHostVerification",
   "processGroupGone",
   "taskRuntimeCleaned",
   "providerGuardAbsent",
   "runnerTemporaryArtifactsRemoved",
   "qualificationSessionDeleted"
+]);
+const MAILBOX_OBSERVATION_KEYS = new Set([
+  "providerGenerationCount",
+  "providerSessionCount",
+  "promptCount",
+  "sendInvocationCount",
+  "sendReplayCount",
+  "acceptedCount",
+  "deliveredCount",
+  "deliveryUnknownCount",
+  "rejectedCount",
+  "finalReportSequence",
+  "replayPromptDelta",
+  "retainedBodyCount",
+  "closed"
+]);
+const MAILBOX_MESSAGE_BINDING_KEYS = new Set([
+  "messageId",
+  "sequence",
+  "acceptedAt"
 ]);
 const INSTALLED_WORKER_BINDING_KEYS = new Set([
   "workerId",
@@ -329,7 +369,6 @@ const LIFECYCLE_DETAIL_KEYS = new Set([
   "requestAcceptedAt",
   "reconciler",
   "messageId",
-  "contentDigest",
   "parentWorkerId",
   "version",
   "name",
@@ -1057,7 +1096,8 @@ export function validateProviderCapabilityAgreement(value, valueExpectations) {
     || !SHA256_HEX.test(receipt.rootReadProfileDigest || "")
     || !validTextArray(receipt.capabilities, [
       "root-read-spawn-v1",
-      "same-session-read-followup-v1"
+      "same-session-read-followup-v1",
+      "ordered-turn-boundary-mailbox-v1"
     ])
     || !canonicalIsoTimestamp(receipt.issuedAt)
     || !canonicalIsoTimestamp(receipt.expiresAt)
@@ -1188,7 +1228,7 @@ function validTool(tool, expectedName) {
 }
 
 /**
- * Require both the fixed nine-tool order and exact structural equality with
+ * Require both the fixed ten-tool order and exact structural equality with
  * the WORKER_TOOLS projection loaded from the same installed artifact.
  */
 export function validateInstalledToolInventory(value, valueExpectedTools) {
@@ -1207,9 +1247,10 @@ export function validateInstalledToolInventory(value, valueExpectedTools) {
     fail("E_LIVE_TOOLS");
   }
   const spawn = result.tools[5];
+  const send = result.tools[8];
   if (
     Object.hasOwn(spawn.inputSchema.properties || {}, "write")
-    || result.tools.some((tool) => tool.name === "worker_send")
+    || send?.name !== "worker_send"
   ) {
     fail("E_LIVE_TOOLS");
   }
@@ -1398,12 +1439,6 @@ function validLifecycleDetail(detail) {
   if (
     Object.hasOwn(detail, "requestAcceptedAt")
     && !canonicalIsoTimestamp(detail.requestAcceptedAt)
-  ) {
-    return false;
-  }
-  if (
-    Object.hasOwn(detail, "contentDigest")
-    && !SHA256_HEX.test(detail.contentDigest || "")
   ) {
     return false;
   }
@@ -2120,6 +2155,28 @@ function validTerminalResult(value, status, code) {
   assertNoHostVerificationPromotion(value.worker, code);
 }
 
+function validSendPayload(value, {
+  replayed,
+  workerId,
+  sequence
+}) {
+  if (
+    !exactKeys(value, SEND_PAYLOAD_KEYS)
+    || value.ok !== true
+    || value.replayed !== replayed
+    || !exactKeys(value.message, MESSAGE_RECEIPT_KEYS)
+    || !MAILBOX_MESSAGE_ID.test(value.message.messageId || "")
+    || value.message.workerId !== workerId
+    || value.message.state !== "accepted"
+    || value.message.sequence !== sequence
+    || !canonicalIsoTimestamp(value.message.acceptedAt)
+    || value.message.outcomeAt !== null
+    || value.message.reason !== null
+  ) {
+    fail("E_LIVE_COMPLETION");
+  }
+}
+
 /**
  * Validate the public half of the authenticated-completion scenario.
  */
@@ -2131,6 +2188,21 @@ export function validateInstalledCompletionScenario(value) {
     state: "pending",
     launched: false
   }, "E_LIVE_COMPLETION");
+  validSendPayload(evidence.firstSend, {
+    replayed: false,
+    workerId: evidence.spawn.worker.id,
+    sequence: 1
+  });
+  validSendPayload(evidence.secondSend, {
+    replayed: false,
+    workerId: evidence.spawn.worker.id,
+    sequence: 2
+  });
+  validSendPayload(evidence.sendReplay, {
+    replayed: true,
+    workerId: evidence.spawn.worker.id,
+    sequence: 1
+  });
   validTerminalResult(evidence.terminalResult, "completed", "E_LIVE_COMPLETION");
   assertImmutableWorkerIdentity([
     evidence.spawn.worker,
@@ -2145,8 +2217,12 @@ export function validateInstalledCompletionScenario(value) {
     evidence.terminalResult.worker
   ], "E_LIVE_COMPLETION");
   if (
-    evidence.spawn.worker.eventCursor.sequence
-    >= evidence.terminalResult.worker.eventCursor.sequence
+    !sameJson(evidence.firstSend.message, evidence.sendReplay.message)
+    || evidence.firstSend.message.messageId === evidence.secondSend.message.messageId
+    || Date.parse(evidence.secondSend.message.acceptedAt)
+      < Date.parse(evidence.firstSend.message.acceptedAt)
+    || evidence.spawn.worker.eventCursor.sequence
+      >= evidence.terminalResult.worker.eventCursor.sequence
   ) {
     fail("E_LIVE_COMPLETION");
   }
@@ -2364,6 +2440,35 @@ function validInstalledWorkerBinding(binding) {
   );
 }
 
+function validMailboxObservation(mailbox) {
+  return Boolean(
+    exactKeys(mailbox, MAILBOX_OBSERVATION_KEYS)
+    && mailbox.providerGenerationCount === 1
+    && mailbox.providerSessionCount === 1
+    && mailbox.promptCount === 3
+    && mailbox.sendInvocationCount === 3
+    && mailbox.sendReplayCount === 1
+    && mailbox.acceptedCount === 2
+    && mailbox.deliveredCount === 2
+    && mailbox.deliveryUnknownCount === 0
+    && mailbox.rejectedCount === 0
+    && mailbox.finalReportSequence === 2
+    && mailbox.replayPromptDelta === 0
+    && mailbox.retainedBodyCount === 0
+    && mailbox.closed === true
+    && mailbox.providerGenerationCount === 1
+    && mailbox.promptCount
+      === 1 + mailbox.deliveredCount + mailbox.deliveryUnknownCount
+    && mailbox.acceptedCount
+      === mailbox.deliveredCount
+        + mailbox.deliveryUnknownCount
+        + mailbox.rejectedCount
+    && mailbox.sendInvocationCount
+      === mailbox.acceptedCount + mailbox.sendReplayCount
+    && mailbox.finalReportSequence === mailbox.deliveredCount
+  );
+}
+
 /**
  * Validate the pure observation summary derived from private installed state.
  * It has no filesystem, process, provider, or receipt-publication authority.
@@ -2374,6 +2479,22 @@ export function validateInstalledPrivateObservation(value) {
     !exactKeys(observation, PRIVATE_OBSERVATION_KEYS)
     || !INSTALLED_WORKER_SCENARIO_IDS.includes(observation.scenarioId)
     || !validInstalledWorkerBinding(observation.installedWorkerBinding)
+    || (
+      observation.scenarioId === "authenticated-completion"
+        ? (
+            !validMailboxObservation(observation.mailbox)
+            || !Array.isArray(observation.mailboxMessageBindings)
+            || observation.mailboxMessageBindings.length !== 2
+            || observation.mailboxMessageBindings.some((binding, index) => (
+              !exactKeys(binding, MAILBOX_MESSAGE_BINDING_KEYS)
+              || !MAILBOX_MESSAGE_ID.test(binding.messageId || "")
+              || binding.sequence !== index + 1
+              || !canonicalIsoTimestamp(binding.acceptedAt)
+            ))
+          )
+        : observation.mailbox !== null
+          || observation.mailboxMessageBindings !== null
+    )
   ) {
     fail("E_LIVE_PRIVATE_STATE");
   }
@@ -2548,6 +2669,28 @@ export function validateInstalledScenarioEvidence(
     sameCancellationReceipt = observation.observedCancellationReceiptIds
       .every((id) => id === publicEvidence.cancel.receipt.receiptId);
   }
+  const sameMailboxEvidence = observation.scenarioId
+    === "mcp-restart-reconnect-cancellation"
+    ? observation.mailbox === null
+    : (
+        validMailboxObservation(observation.mailbox)
+        && publicEvidence.firstSend.message.sequence === 1
+        && publicEvidence.secondSend.message.sequence === 2
+        && publicEvidence.sendReplay.replayed === true
+        && sameJson(publicEvidence.firstSend.message, publicEvidence.sendReplay.message)
+        && sameJson(observation.mailboxMessageBindings, [
+          {
+            messageId: publicEvidence.firstSend.message.messageId,
+            sequence: publicEvidence.firstSend.message.sequence,
+            acceptedAt: publicEvidence.firstSend.message.acceptedAt
+          },
+          {
+            messageId: publicEvidence.secondSend.message.messageId,
+            sequence: publicEvidence.secondSend.message.sequence,
+            acceptedAt: publicEvidence.secondSend.message.acceptedAt
+          }
+        ])
+      );
   if (
     !samePublicWorkerDigests
     || !sameSpawnResponseWitnesses
@@ -2557,6 +2700,7 @@ export function validateInstalledScenarioEvidence(
     || !sameInstalledBinding
     || !oneBoundProviderGeneration
     || !sameCancellationReceipt
+    || !sameMailboxEvidence
   ) {
     fail("E_LIVE_PRIVATE_STATE");
   }

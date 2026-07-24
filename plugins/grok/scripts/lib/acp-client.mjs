@@ -2,44 +2,467 @@ import { EventEmitter } from "node:events";
 import { CompanionError } from "./errors.mjs";
 import { redact } from "./redact.mjs";
 
+const PROMPT_STOP_REASON_CLASSES = new Map([
+  ["end_turn", "success"],
+  ["max_tokens", "success"],
+  ["max_turn_requests", "success"],
+  ["cancelled", "cancelled"],
+  ["refusal", "refusal"],
+  // Older Grok builds used the ACP enum member names instead of their v1
+  // wire values. Keep that compatibility explicit and classify it identically.
+  ["EndTurn", "success"],
+  ["MaxTokens", "success"],
+  ["MaxTurnRequests", "success"],
+  ["Cancelled", "cancelled"],
+  ["Refusal", "refusal"]
+]);
+
+/**
+ * JSON-RPC ACP client with reserve-then-dispatch correlation.
+ *
+ * Delivered PromptResponse requires:
+ * - jsonrpc === "2.0"
+ * - exact numeric id matching the reserved request id (no string coercion)
+ * - no method field
+ * - exactly one valid result XOR error branch
+ * - successful PromptResponse shape for session/prompt
+ */
 export class AcpClient extends EventEmitter {
-  constructor(child, { timeoutMs = 30000, knownSecrets = [], permissionPolicy = () => ({ outcome: { outcome: "cancelled" } }) } = {}) {
-    super(); this.child = child; this.timeoutMs = timeoutMs; this.knownSecrets = knownSecrets; this.permissionPolicy = permissionPolicy; this.nextId = 1; this.pending = new Map(); this.buffer = ""; this.stderr = ""; this.closed = false;
-    child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+  constructor(child, {
+    timeoutMs = 30000,
+    knownSecrets = [],
+    permissionPolicy = () => ({ outcome: { outcome: "cancelled" } })
+  } = {}) {
+    super();
+    this.child = child;
+    this.timeoutMs = timeoutMs;
+    this.knownSecrets = knownSecrets;
+    this.permissionPolicy = permissionPolicy;
+    this.nextId = 1;
+    this.reserved = new Set();
+    this.used = new Set();
+    this.pending = new Map();
+    this.buffer = "";
+    this.stderr = "";
+    this.closed = false;
+    this.transportError = null;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => this.#data(chunk));
-    child.stderr.on("data", (chunk) => { this.stderr = `${this.stderr}${chunk}`.slice(-32768); this.emit("stderr", redact(chunk, knownSecrets)); });
-    child.on("exit", (code, signal) => this.#close(new CompanionError("E_PROVIDER_EXIT", `Grok ACP exited (${code ?? signal}).`, { code, signal, stderr: redact(this.stderr, knownSecrets) })));
-    child.on("error", (error) => this.#close(new CompanionError("E_PROVIDER_EXIT", `Could not start Grok: ${error.message}`)));
+    child.stderr.on("data", (chunk) => {
+      this.stderr = `${this.stderr}${chunk}`.slice(-32768);
+      this.emit("stderr", redact(chunk, knownSecrets));
+    });
+    child.stdin.on("error", (error) => this.#close(new CompanionError(
+      "E_PROTOCOL",
+      `ACP stdin failed: ${error?.message || String(error)}.`,
+      { code: error?.code || null }
+    )));
+    child.on("exit", (code, signal) => this.#close(new CompanionError(
+      "E_PROVIDER_EXIT",
+      `Grok ACP exited (${code ?? signal}).`,
+      { code, signal, stderr: redact(this.stderr, knownSecrets) }
+    )));
+    child.on("error", (error) => this.#close(new CompanionError(
+      "E_PROVIDER_EXIT",
+      `Could not start Grok: ${error.message}`
+    )));
   }
-  #data(chunk) { this.buffer += chunk; if (Buffer.byteLength(this.buffer) > 8 * 1024 * 1024 && !this.buffer.includes("\n")) { this.#close(new CompanionError("E_PROTOCOL", "Grok ACP frame exceeded 8 MiB.")); try { this.child.kill("SIGTERM"); } catch {} return; } for (;;) { const end = this.buffer.indexOf("\n"); if (end < 0) break; const line = this.buffer.slice(0, end).trim(); this.buffer = this.buffer.slice(end + 1); if (!line) continue; let message; try { message = JSON.parse(line); } catch { this.#close(new CompanionError("E_PROTOCOL", "Grok emitted malformed ACP JSON.")); try { this.child.kill("SIGTERM"); } catch {} return; } this.#message(message); } }
-  #message(message) {
-    if (message.id != null && this.pending.has(String(message.id))) {
-      const pending = this.pending.get(String(message.id));
-      this.pending.delete(String(message.id));
-      clearTimeout(pending.timer);
-      if (message.error) pending.reject(new CompanionError("E_PROTOCOL", message.error.message || "ACP request failed.", redact(message.error, this.knownSecrets)));
-      else pending.resolve(message.result);
+
+  /**
+   * Reserve an exact numeric JSON-RPC request id without writing any bytes.
+   * Callers must persist body-free inflight state before dispatchReserved.
+   */
+  reserveRequestId() {
+    if (this.closed) {
+      throw new CompanionError("E_PROTOCOL", "ACP transport is closed.");
+    }
+    const id = this.nextId;
+    this.nextId += 1;
+    if (!Number.isSafeInteger(id) || id < 1) {
+      throw new CompanionError("E_PROTOCOL", "ACP request id space exhausted.");
+    }
+    this.reserved.add(id);
+    return id;
+  }
+
+  /**
+   * Dispatch one previously reserved request id. The id must not already be pending.
+   */
+  dispatchReserved(id, method, params = {}, timeoutMs = this.timeoutMs, {
+    validateResult = null
+  } = {}) {
+    if (this.closed) {
+      return Promise.reject(new CompanionError("E_PROTOCOL", "ACP transport is closed."));
+    }
+    if (!Number.isSafeInteger(id) || id < 1 || !this.reserved.has(id) || this.used.has(id)) {
+      return Promise.reject(new CompanionError("E_PROTOCOL", "Reserved ACP request id is invalid."));
+    }
+    if (this.pending.has(id)) {
+      return Promise.reject(new CompanionError("E_PROTOCOL", "Reserved ACP request id is already pending."));
+    }
+    this.reserved.delete(id);
+    this.used.add(id);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        this.pending.delete(id);
+        reject(new CompanionError("E_TIMEOUT", `${method} timed out.`));
+      }, timeoutMs);
+      this.pending.set(id, {
+        method,
+        resolve,
+        reject,
+        timer,
+        validateResult: typeof validateResult === "function" ? validateResult : null,
+        settled: false,
+        responsePending: false
+      });
+      try {
+        this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      } catch (error) {
+        this.#close(new CompanionError(
+          "E_PROTOCOL",
+          `Failed to write ACP request: ${error?.message || String(error)}`
+        ));
+      }
+    });
+  }
+
+  request(method, params = {}, timeoutMs = this.timeoutMs) {
+    const id = this.reserveRequestId();
+    return this.dispatchReserved(id, method, params, timeoutMs);
+  }
+
+  /**
+   * Reserve then dispatch session/prompt with strict PromptResponse validation.
+   * Returns { id, result } on success. Failures never report delivered.
+   */
+  async promptTurn({ sessionId, prompt, timeoutMs = this.timeoutMs, reserveHook = null } = {}) {
+    if (typeof sessionId !== "string" || !sessionId) {
+      throw new CompanionError("E_PROTOCOL", "session/prompt requires a session id.");
+    }
+    if (!Array.isArray(prompt)) {
+      throw new CompanionError("E_PROTOCOL", "session/prompt requires a prompt array.");
+    }
+    const id = this.reserveRequestId();
+    if (typeof reserveHook === "function") {
+      await reserveHook(id);
+    }
+    const result = await this.dispatchReserved(
+      id,
+      "session/prompt",
+      { sessionId, prompt },
+      timeoutMs,
+      { validateResult: validatePromptResponse }
+    );
+    return { id, result };
+  }
+
+  notify(method, params = {}) {
+    if (!this.closed) {
+      try {
+        this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
+      } catch (error) {
+        this.#close(new CompanionError(
+          "E_PROTOCOL",
+          `Failed to write ACP notification: ${error?.message || String(error)}`
+        ));
+      }
+    }
+  }
+
+  close() {
+    if (!this.closed) {
+      try {
+        this.child.stdin.end();
+      } catch (error) {
+        this.#close(new CompanionError(
+          "E_PROTOCOL",
+          `Failed to close ACP stdin: ${error?.message || String(error)}`
+        ));
+        return;
+      }
+      setTimeout(() => {
+        if (!this.closed) this.child.kill("SIGTERM");
+      }, 500).unref();
+    }
+  }
+
+  #data(chunk) {
+    this.buffer += chunk;
+    if (Buffer.byteLength(this.buffer) > 8 * 1024 * 1024 && !this.buffer.includes("\n")) {
+      this.#close(new CompanionError("E_PROTOCOL", "Grok ACP frame exceeded 8 MiB."));
+      try { this.child.kill("SIGTERM"); } catch { /* best-effort */ }
       return;
     }
-    if (message.id != null && message.method) {
+    for (;;) {
+      const end = this.buffer.indexOf("\n");
+      if (end < 0) break;
+      const line = this.buffer.slice(0, end).trim();
+      this.buffer = this.buffer.slice(end + 1);
+      if (!line) continue;
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        this.#close(new CompanionError("E_PROTOCOL", "Grok emitted malformed ACP JSON."));
+        try { this.child.kill("SIGTERM"); } catch { /* best-effort */ }
+        return;
+      }
+      this.#message(message);
+    }
+  }
+
+  #message(message) {
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      this.#close(new CompanionError("E_PROTOCOL", "Grok emitted a non-object ACP frame."));
+      return;
+    }
+
+    // Server requests (have method + id): never correlate as client responses.
+    if (message.id != null && typeof message.method === "string") {
+      if (message.jsonrpc !== "2.0") {
+        this.#close(new CompanionError("E_PROTOCOL", "ACP server request jsonrpc version is invalid."));
+        return;
+      }
       if (message.method === "session/request_permission") {
         let result;
-        try { result = this.permissionPolicy(redact(message.params, this.knownSecrets)); }
-        catch { result = { outcome: { outcome: "cancelled" } }; }
-        this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: message.id, result })}\n`);
-        this.emit("permission", redact({ method: message.method, params: message.params, result }, this.knownSecrets));
+        try {
+          result = this.permissionPolicy(redact(message.params, this.knownSecrets));
+        } catch {
+          result = { outcome: { outcome: "cancelled" } };
+        }
+        try {
+          this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: message.id, result })}\n`);
+        } catch (error) {
+          this.#close(new CompanionError(
+            "E_PROTOCOL",
+            `Failed to write ACP permission response: ${error?.message || String(error)}`
+          ));
+          return;
+        }
+        this.emit("permission", redact({
+          method: message.method,
+          params: message.params,
+          result
+        }, this.knownSecrets));
       } else {
-        this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Client method not supported." } })}\n`);
+        try {
+          this.child.stdin.write(`${JSON.stringify({
+            jsonrpc: "2.0",
+            id: message.id,
+            error: { code: -32601, message: "Client method not supported." }
+          })}\n`);
+        } catch (error) {
+          this.#close(new CompanionError(
+            "E_PROTOCOL",
+            `Failed to write ACP method response: ${error?.message || String(error)}`
+          ));
+        }
       }
       return;
     }
-    if (message.method === "session/update") this.emit("update", normalizeUpdate(redact(message.params?.update, this.knownSecrets)));
-    else this.emit("unknown", redact(message, this.knownSecrets));
+
+    // Notifications
+    if (message.method === "session/update") {
+      if (message.jsonrpc !== "2.0" || Object.hasOwn(message, "id")) {
+        this.#close(new CompanionError("E_PROTOCOL", "ACP session update envelope is invalid."));
+        return;
+      }
+      this.emit("update", normalizeUpdate(redact(message.params?.update, this.knownSecrets)));
+      return;
+    }
+    if (typeof message.method === "string") {
+      this.emit("unknown", redact(message, this.knownSecrets));
+      return;
+    }
+
+    // Client response correlation: exact numeric id only (no string coercion).
+    if (!Object.hasOwn(message, "id") || !Number.isSafeInteger(message.id)) {
+      if (typeof message.id === "string") {
+        const colliding = Number(message.id);
+        if (Number.isSafeInteger(colliding) && this.pending.has(colliding)) {
+          this.#close(new CompanionError(
+            "E_PROTOCOL",
+            "ACP response used a string id that collides with a numeric request id."
+          ));
+        } else {
+          // Servers must not answer client responses, but an unrelated
+          // server-owned string-id response cannot settle a numeric request.
+          this.emit("unknown", redact(message, this.knownSecrets));
+        }
+        return;
+      }
+      this.#close(new CompanionError("E_PROTOCOL", "ACP response id must be an exact numeric request id."));
+      return;
+    }
+
+    const pending = this.pending.get(message.id);
+    if (!pending || pending.settled || pending.responsePending) {
+      this.#close(new CompanionError("E_PROTOCOL", "ACP response id is duplicate or unmatched."));
+      return;
+    }
+
+    if (message.jsonrpc !== "2.0") {
+      this.#rejectPending(message.id, new CompanionError(
+        "E_PROTOCOL",
+        "ACP response jsonrpc version is invalid."
+      ));
+      return;
+    }
+    if (Object.hasOwn(message, "method")) {
+      this.#rejectPending(message.id, new CompanionError(
+        "E_PROTOCOL",
+        "ACP response must not include a method field."
+      ));
+      return;
+    }
+
+    const hasResult = Object.hasOwn(message, "result");
+    const hasError = Object.hasOwn(message, "error");
+    if (hasResult === hasError) {
+      this.#rejectPending(message.id, new CompanionError(
+        "E_PROTOCOL",
+        "ACP response must include exactly one of result or error."
+      ));
+      return;
+    }
+    const expectedKeys = hasResult
+      ? new Set(["jsonrpc", "id", "result"])
+      : new Set(["jsonrpc", "id", "error"]);
+    if (Object.keys(message).length !== expectedKeys.size
+      || Object.keys(message).some((key) => !expectedKeys.has(key))) {
+      this.#rejectPending(message.id, new CompanionError(
+        "E_PROTOCOL",
+        "ACP response envelope contains unsupported fields."
+      ));
+      return;
+    }
+
+    if (hasError) {
+      if (!message.error
+        || typeof message.error !== "object"
+        || Array.isArray(message.error)
+        || !Number.isInteger(message.error.code)
+        || typeof message.error.message !== "string"
+        || !message.error.message) {
+        this.#rejectPending(message.id, new CompanionError(
+          "E_PROTOCOL",
+          "ACP error response is malformed."
+        ));
+        return;
+      }
+      this.#rejectPending(message.id, new CompanionError(
+        "E_PROTOCOL",
+        message.error?.message || "ACP request failed.",
+        redact(message.error, this.knownSecrets)
+      ));
+      return;
+    }
+
+    if (pending.validateResult) {
+      try {
+        pending.validateResult(message.result);
+      } catch (error) {
+        this.#rejectPending(
+          message.id,
+          error instanceof CompanionError
+            ? error
+            : new CompanionError("E_PROTOCOL", error?.message || "ACP result validation failed.")
+        );
+        return;
+      }
+    }
+
+    // Do not publish a successful response until the complete stdout batch has
+    // been parsed. A duplicate, colliding, or unmatched response later in the
+    // same batch poisons the transport and must reject this request instead of
+    // letting a mailbox persist a false delivered settlement.
+    pending.responsePending = true;
+    queueMicrotask(() => {
+      const current = this.pending.get(message.id);
+      if (!current || current.settled) return;
+      if (this.closed || this.transportError) {
+        this.#rejectPending(
+          message.id,
+          this.transportError || new CompanionError("E_PROTOCOL", "ACP transport closed before response settlement.")
+        );
+        return;
+      }
+      this.#resolvePending(message.id, message.result);
+    });
   }
-  #close(error) { if (this.closed) return; this.closed = true; for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(error); } this.pending.clear(); this.emit("closed", error); }
-  request(method, params = {}, timeoutMs = this.timeoutMs) { if (this.closed) return Promise.reject(new CompanionError("E_PROTOCOL", "ACP transport is closed.")); const id = this.nextId++; return new Promise((resolve, reject) => { const timer = setTimeout(() => { this.pending.delete(String(id)); reject(new CompanionError("E_TIMEOUT", `${method} timed out.`)); }, timeoutMs); this.pending.set(String(id), { resolve, reject, timer }); this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`); }); }
-  notify(method, params = {}) { if (!this.closed) this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`); }
-  close() { if (!this.closed) { this.child.stdin.end(); setTimeout(() => { if (!this.closed) this.child.kill("SIGTERM"); }, 500).unref(); } }
+
+  #resolvePending(id, result) {
+    const pending = this.pending.get(id);
+    if (!pending || pending.settled) return;
+    pending.settled = true;
+    this.pending.delete(id);
+    clearTimeout(pending.timer);
+    pending.resolve(result);
+  }
+
+  #rejectPending(id, error) {
+    const pending = this.pending.get(id);
+    if (!pending || pending.settled) return;
+    pending.settled = true;
+    this.pending.delete(id);
+    clearTimeout(pending.timer);
+    pending.reject(error);
+  }
+
+  #close(error) {
+    if (this.closed) return;
+    this.closed = true;
+    this.transportError = error;
+    for (const [id, pending] of this.pending.entries()) {
+      if (pending.settled) continue;
+      pending.settled = true;
+      clearTimeout(pending.timer);
+      pending.reject(error);
+      this.pending.delete(id);
+    }
+    this.emit("closed", error);
+  }
+}
+
+export function validatePromptResponse(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new CompanionError("E_PROTOCOL", "PromptResponse must be an object.");
+  }
+  if (typeof result.stopReason !== "string" || !result.stopReason) {
+    throw new CompanionError("E_PROTOCOL", "PromptResponse.stopReason is required.");
+  }
+  if (!classifyPromptStopReason(result.stopReason).valid) {
+    throw new CompanionError("E_PROTOCOL", "PromptResponse.stopReason is invalid.");
+  }
+  // Disallow embedding request-shaped fields.
+  if (Object.hasOwn(result, "method") || Object.hasOwn(result, "jsonrpc")) {
+    throw new CompanionError("E_PROTOCOL", "PromptResponse must not embed JSON-RPC envelope fields.");
+  }
+  return result;
+}
+
+export function isSuccessfulPromptStopReason(stopReason) {
+  return classifyPromptStopReason(stopReason).successful;
+}
+
+export function isCancelledPromptStopReason(stopReason) {
+  return classifyPromptStopReason(stopReason).cancelled;
+}
+
+export function classifyPromptStopReason(stopReason) {
+  const classification = typeof stopReason === "string"
+    ? PROMPT_STOP_REASON_CLASSES.get(stopReason) || null
+    : null;
+  return Object.freeze({
+    valid: classification !== null,
+    successful: classification === "success",
+    cancelled: classification === "cancelled",
+    refusal: classification === "refusal"
+  });
 }
 
 export function normalizeUpdate(update) {

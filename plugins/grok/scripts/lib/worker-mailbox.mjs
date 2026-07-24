@@ -1,8 +1,9 @@
 /**
- * Phase 2 mailbox: durable send + lineage-preserving follow-up.
+ * P2.4 ordered turn-boundary ACP mailbox: durable accept + provider-owned pump.
  *
- * Delivery states: accepted → pending → delivered | delivery_unknown | rejected
- * delivery_unknown is NEVER automatically retried.
+ * Production settlement is exclusively the worker/provider pump:
+ * accepted(body) -> claimed(body) -> inflight(body-free, numeric RPC id)
+ * -> delivered | delivery_unknown. delivery_unknown is never retried.
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -10,20 +11,53 @@ import path from "node:path";
 
 import { CompanionError } from "./errors.mjs";
 import {
-  ensurePrivateStateDirectory,
-  now,
-  readPrivateJsonFile,
-  writePrivateJsonFile,
+  isCancelledPromptStopReason,
+  isSuccessfulPromptStopReason,
+  validatePromptResponse
+} from "./acp-client.mjs";
+import {
+  isCancelRequested,
+  terminal,
   withWorkspaceStateTransaction
 } from "./state.mjs";
 import { appendLifecycleEvent } from "./task-contract.mjs";
+import { workspaceState } from "./workspace.mjs";
+import { isDispatchV2 } from "./worker-launch-contract.mjs";
 import {
   assertMutationOwnership,
+  cancellationNonce,
   spawnGrantedFollowupWorker
 } from "./worker-mutation.mjs";
+import {
+  MAILBOX_MESSAGE_SCHEMA_VERSION,
+  MAX_MAILBOX_MESSAGE_LENGTH,
+  acceptAttemptMessage,
+  assertNoRetainedBodies,
+  claimNextAcceptedMessage,
+  communicationChainEntry,
+  contentDigestOf,
+  findWorkerMessage,
+  listAttemptMessages,
+  mailboxHasRetainedBodies,
+  markMessageInflight,
+  openAttemptMailbox,
+  publicMessageReceipt,
+  readAttemptMailbox,
+  readMailboxMessage,
+  recordPrimaryTurn,
+  recoverAttemptConsistency,
+  resolveOpenMailbox,
+  settleMessageDelivered,
+  settleMessageRejected,
+  settleMessageUnknown,
+  settleInterruptedAttempt,
+  stableDigest,
+  tryCloseAttemptMailbox,
+  utf8ByteLength
+} from "./worker-mailbox-state.mjs";
 
-export const MAILBOX_SCHEMA_VERSION = 1;
-export const MAX_MAILBOX_MESSAGE_LENGTH = 16000;
+export const MAILBOX_SCHEMA_VERSION = MAILBOX_MESSAGE_SCHEMA_VERSION;
+export { MAX_MAILBOX_MESSAGE_LENGTH };
 export const DELIVERY_STATES = Object.freeze([
   "accepted",
   "pending",
@@ -31,6 +65,30 @@ export const DELIVERY_STATES = Object.freeze([
   "delivery_unknown",
   "rejected"
 ]);
+
+export {
+  MAX_MAILBOX_ACCEPTED_MESSAGES,
+  MAX_MAILBOX_ACCEPTED_BYTES,
+  MAILBOX_CAPABILITY,
+  openAttemptMailbox,
+  resolveOpenMailbox,
+  readAttemptMailbox,
+  listAttemptMessages,
+  tryCloseAttemptMailbox,
+  recordPrimaryTurn,
+  recoverAttemptConsistency,
+  mailboxHasRetainedBodies,
+  assertNoRetainedBodies,
+  settleMessageUnknown,
+  settleInterruptedAttempt,
+  settleMessageRejected,
+  selectFinalReportSequence,
+  communicationChainEntry,
+  stableDigest,
+  contentDigestOf,
+  utf8ByteLength,
+  publicMessageReceipt as publicReceipt
+} from "./worker-mailbox-state.mjs";
 
 function digest(value) {
   return crypto.createHash("sha256").update(String(value)).digest("hex");
@@ -55,12 +113,8 @@ function canonicalize(value, stack = new Set()) {
   return result;
 }
 
-function stableDigest(value) {
+function requestStableDigest(value) {
   return digest(JSON.stringify(canonicalize(value)));
-}
-
-function idempotencyConflict(message) {
-  throw new CompanionError("E_IDEMPOTENCY_CONFLICT", message);
 }
 
 function assertIdempotencyKey(key) {
@@ -83,52 +137,40 @@ function assertMessage(message) {
   return message;
 }
 
-function mailboxDir(root, env = process.env) {
-  return ensurePrivateStateDirectory(root, "mailbox", env);
-}
-
-function messagePath(root, messageId, env = process.env) {
-  return path.join(mailboxDir(root, env), `${messageId}.json`);
-}
-
-function writeMessage(root, record, env = process.env) {
-  const file = messagePath(root, record.messageId, env);
-  return writePrivateJsonFile(file, record);
-}
-
-function readMessage(root, messageId, env = process.env) {
-  return readPrivateJsonFile(messagePath(root, messageId, env), {
-    missing: null,
-    label: "mailbox message"
-  });
-}
-
-function findByIdempotency(root, keyDigest, env = process.env) {
-  const dir = mailboxDir(root, env);
-  for (const name of fs.readdirSync(dir)) {
-    if (!name.startsWith("msg-") || !name.endsWith(".json")) continue;
-    const record = readPrivateJsonFile(path.join(dir, name), {
-      missing: null,
-      label: "mailbox idempotency record"
-    });
-    if (record?.idempotencyKeyDigest === keyDigest) {
-      return record;
-    }
+function assertLiveMailboxAuthority(job, attempt) {
+  if (!attempt || attempt.state !== "open" || terminal(job)) {
+    throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
   }
-  return null;
-}
-
-function publicReceipt(record) {
-  return Object.freeze({
-    messageId: record.messageId,
-    workerId: record.workerId,
-    state: record.state,
-    acceptedAt: record.acceptedAt,
-    outcomeAt: record.outcomeAt || null,
-    idempotencyKeyDigest: record.idempotencyKeyDigest,
-    contentDigest: record.contentDigest,
-    reason: record.reason || null
-  });
+  const dispatch = job.request?.spawn?.dispatch;
+  const exact = (
+    attempt.workerId === job.id
+    && isDispatchV2(dispatch)
+    && dispatch.state === "provider-started"
+    && dispatch.attemptId === attempt.dispatchAttemptId
+    && dispatch.fence === attempt.dispatchFence
+    && dispatch.providerGeneration === 1
+    && job.workerProcess
+    && stableDigest(job.workerProcess) === attempt.workerProcessDigest
+    && job.providerProcess
+    && stableDigest(job.providerProcess) === attempt.providerProcessDigest
+    && job.providerProcess.providerGeneration === 1
+    && typeof job.grokSessionId === "string"
+    && job.grokSessionId.length > 0
+    && stableDigest({ providerSessionId: job.grokSessionId })
+      === attempt.providerSessionDigest
+    && (job.request?.spawn?.providerCapabilityDigest ?? null)
+      === attempt.providerCapabilityDigest
+    && job.request?.contextReceipt
+    && stableDigest(job.request?.contextReceipt) === attempt.contextReceiptDigest
+    && job.request?.runtimeRolePolicy?.digest === attempt.rolePolicyDigest
+  );
+  if (!exact) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Mailbox authority changed from the exact primary provider attempt."
+    );
+  }
+  return attempt;
 }
 
 function appendMailboxOutcome(transaction, workerId, record) {
@@ -150,7 +192,8 @@ function appendMailboxOutcome(transaction, workerId, record) {
         {
           messageId: record.messageId,
           state: record.state,
-          contentDigest: record.contentDigest
+          sequence: record.sequence,
+          ...(record.turnDigest ? { turnDigest: record.turnDigest } : {})
         }
       )
     };
@@ -159,7 +202,7 @@ function appendMailboxOutcome(transaction, workerId, record) {
 
 /**
  * ACP acknowledgement/dedup feasibility result (spike record).
- * Without proven provider ack/dedup, exactly-once is not claimed.
+ * PromptResponse proves a completed turn boundary, not exactly-once execution.
  */
 export function acpDeliveryCapability({
   acknowledgement = false,
@@ -171,15 +214,17 @@ export function acpDeliveryCapability({
     acknowledgement: Boolean(acknowledgement),
     dedupKey: Boolean(dedupKey),
     safeBoundaryInjection: Boolean(safeBoundaryInjection),
-    exactlyOnceClaimable: Boolean(acknowledgement && dedupKey),
-    note: acknowledgement && dedupKey
-      ? "Exactly-once delivery may be claimed when both ack and dedup are proven."
+    // Turn-boundary acknowledgement is not exactly-once execution.
+    exactlyOnceClaimable: false,
+    note: acknowledgement
+      ? "ACP PromptResponse proves a completed turn boundary only; crash after response before durable outcome remains delivery_unknown."
       : "Durable acceptance plus explicit ambiguity only; delivery_unknown is never auto-retried."
   });
 }
 
 /**
- * Accept a message for an active worker. Delivery is separate and may end as delivery_unknown.
+ * Accept a message for an open attempt-bound mailbox. Delivery is settled only
+ * by the provider-owned pump — never by a caller-defined deliver hook.
  */
 export function sendWorkerMessage({
   root,
@@ -187,7 +232,6 @@ export function sendWorkerMessage({
   workerId,
   message,
   idempotencyKey,
-  deliver = null,
   env = process.env
 } = {}) {
   assertIdempotencyKey(idempotencyKey);
@@ -195,154 +239,105 @@ export function sendWorkerMessage({
     throw new CompanionError("E_AUTH_REQUIRED", "Trusted Codex task identity is unavailable.");
   }
   assertMessage(message);
-  if (typeof deliver === "function" && deliver.constructor?.name === "AsyncFunction") {
+  if (Object.hasOwn(arguments[0] || {}, "deliver")) {
     throw new CompanionError(
       "E_CAPABILITY",
-      "Asynchronous mailbox delivery adapters are unsupported by the synchronous broker API."
+      "Caller-defined mailbox delivery adapters are unsupported; only the provider pump settles delivery."
     );
   }
-  // Privacy: reject obvious secret patterns in exported receipts (body stored privately).
-  const contentDigest = digest(message);
+
+  const contentDigest = contentDigestOf(message);
   const keyDigest = digest(idempotencyKey);
-  const mutationDigest = stableDigest({
+  const mutationDigest = requestStableDigest({
     ownerThreadId: principal.threadId,
     workerId,
     message
   });
-  // The public message id is workspace-key scoped, so a key cannot reserve two
-  // different workers in separate processes.
-  const messageId = `msg-${keyDigest.slice(0, 24)}`;
+  // The public correlation handle must reveal neither idempotency-key equality
+  // nor message-content equality. Exact replay identity remains private.
+  const messageId = `msg-${crypto.randomBytes(12).toString("hex")}`;
 
   return withWorkspaceStateTransaction(root, (transaction) => {
-    const prior = readMessage(root, messageId, env) || findByIdempotency(root, keyDigest, env);
-    if (prior) {
-      if (
-        prior.ownerThreadId !== principal.threadId
-        || prior.workerId !== workerId
-        || prior.requestDigest !== mutationDigest
-        || prior.contentDigest !== contentDigest
-      ) {
-        idempotencyConflict("idempotencyKey was reused with a different mailbox owner or request.");
-      }
-
-      let replay = prior;
-      if (prior.state === "accepted" || prior.state === "pending") {
-        // A previous lock owner disappeared after durable reservation. Never
-        // invoke delivery again because the provider outcome is unknowable.
-        replay = writeMessage(root, {
-          ...prior,
-          state: "delivery_unknown",
-          outcomeAt: now(),
-          reason: "interrupted-delivery",
-          _privateBody: undefined
-        }, env);
-      }
-      // The mailbox record is the durable delivery authority. A crash may occur
-      // after its terminal write but before the adjacent lifecycle append. Every
-      // replay repairs that derived, deduplicated event without re-delivering.
-      appendMailboxOutcome(transaction, workerId, replay);
-      return { receipt: publicReceipt(replay), replayed: true };
-    }
-
     const job = transaction.tryReadJob(workerId);
     if (!job) throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
     assertMutationOwnership(job, principal);
 
-    const acceptedAt = now();
-    const baseRecord = {
-      schemaVersion: MAILBOX_SCHEMA_VERSION,
+    const prior = findWorkerMessage(root, workerId, {
       messageId,
+      idempotencyKeyDigest: keyDigest
+    }, env);
+    if (prior) {
+      if (prior.ownerThreadId !== principal.threadId
+        || prior.workerId !== workerId
+        || prior.requestDigest !== mutationDigest
+        || prior.contentDigest !== contentDigest
+        || prior.idempotencyKeyDigest !== keyDigest) {
+        throw new CompanionError(
+          "E_IDEMPOTENCY_CONFLICT",
+          "idempotencyKey was reused with a different mailbox owner or request."
+        );
+      }
+    }
+
+    const cancelled = isCancelRequested(
+      root,
+      workerId,
+      cancellationNonce(job),
+      env
+    );
+    if (cancelled) {
+      const openAttempt = resolveOpenMailbox(root, workerId, env);
+      if (openAttempt) {
+        settleInterruptedAttempt(root, workerId, openAttempt.dispatchAttemptId, {
+          reason: "provider-cancelled"
+        }, env);
+        for (const record of listAttemptMessages(
+          root,
+          workerId,
+          openAttempt.dispatchAttemptId,
+          env
+        )) {
+          appendMailboxOutcome(transaction, workerId, record);
+        }
+      }
+      if (!prior) {
+        throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+      }
+      const settledPrior = findWorkerMessage(root, workerId, {
+        messageId: prior.messageId,
+        idempotencyKeyDigest: keyDigest
+      }, env);
+      return {
+        receipt: publicMessageReceipt(settledPrior || prior),
+        replayed: true
+      };
+    }
+
+    if (prior) {
+      if (!terminal(job)) appendMailboxOutcome(transaction, workerId, prior);
+      return {
+        receipt: publicMessageReceipt(prior),
+        replayed: true
+      };
+    }
+
+    assertLiveMailboxAuthority(job, resolveOpenMailbox(root, workerId, env));
+    const accepted = acceptAttemptMessage(root, {
       workerId,
       ownerThreadId: principal.threadId,
+      message,
+      idempotencyKey,
       requestDigest: mutationDigest,
-      state: "accepted",
-      acceptedAt,
-      outcomeAt: null,
-      idempotencyKeyDigest: keyDigest,
       contentDigest,
-      reason: null,
-      senderAuthority: { threadId: principal.threadId, source: principal.source || null }
-    };
-
-    if (job.status !== "queued" && job.status !== "running") {
-      const rejected = writeMessage(root, {
-        ...baseRecord,
-        state: "rejected",
-        outcomeAt: now(),
-        reason: "worker-not-active"
-      }, env);
-      appendMailboxOutcome(transaction, workerId, rejected);
-      return { receipt: publicReceipt(rejected), replayed: false };
-    }
-
-    let record = writeMessage(root, {
-      ...baseRecord,
-      // Private body retained for the single delivery attempt only — never
-      // exported on receipts.
-      _privateBody: message
+      idempotencyKeyDigest: keyDigest,
+      messageId
     }, env);
-    record = writeMessage(root, { ...record, state: "pending" }, env);
 
-    if (typeof deliver === "function") {
-      try {
-        const outcome = deliver({ message, job, messageId });
-        if (outcome === "delivered") {
-          record = writeMessage(root, {
-            ...record,
-            state: "delivered",
-            outcomeAt: now(),
-            _privateBody: undefined
-          }, env);
-        } else if (outcome === "rejected") {
-          record = writeMessage(root, {
-            ...record,
-            state: "rejected",
-            outcomeAt: now(),
-            reason: "provider-rejected",
-            _privateBody: undefined
-          }, env);
-        } else if (outcome && typeof outcome.then === "function") {
-          // A non-async function can still return a thenable. The attempt has
-          // already crossed the provider boundary, so record explicit
-          // ambiguity, consume rejection, and never retry it automatically.
-          Promise.resolve(outcome).catch(() => {});
-          record = writeMessage(root, {
-            ...record,
-            state: "delivery_unknown",
-            outcomeAt: now(),
-            reason: "async-delivery-unsupported",
-            _privateBody: undefined
-          }, env);
-        } else {
-          record = writeMessage(root, {
-            ...record,
-            state: "delivery_unknown",
-            outcomeAt: now(),
-            reason: "provider-delivery-ambiguous",
-            _privateBody: undefined
-          }, env);
-        }
-      } catch {
-        record = writeMessage(root, {
-          ...record,
-          state: "delivery_unknown",
-          outcomeAt: now(),
-          reason: "delivery-threw",
-          _privateBody: undefined
-        }, env);
-      }
-    } else {
-      record = writeMessage(root, {
-        ...record,
-        state: "delivery_unknown",
-        outcomeAt: now(),
-        reason: "no-delivery-adapter",
-        _privateBody: undefined
-      }, env);
-    }
-
-    appendMailboxOutcome(transaction, workerId, record);
-    return { receipt: publicReceipt(record), replayed: false };
+    appendMailboxOutcome(transaction, workerId, accepted.record);
+    return {
+      receipt: publicMessageReceipt(accepted.record),
+      replayed: accepted.replayed === true
+    };
   }, env);
 }
 
@@ -350,18 +345,38 @@ export function sendWorkerMessage({
  * delivery_unknown must never be automatically retried.
  */
 export function retryDelivery(root, messageId, env = process.env) {
-  const record = readMessage(root, messageId, env);
-  if (!record) throw new CompanionError("E_JOB_NOT_FOUND", "Message was not found.");
-  if (record.state === "delivery_unknown") {
-    throw new CompanionError(
-      "E_DELIVERY",
-      "delivery_unknown messages must not be automatically retried."
-    );
+  if (typeof messageId !== "string" || !/^msg-[a-f0-9]{24}$/.test(messageId)) {
+    throw new CompanionError("E_JOB_NOT_FOUND", "Message was not found.");
   }
-  if (record.state === "delivered" || record.state === "rejected") {
-    throw new CompanionError("E_DELIVERY", `Message already terminal as ${record.state}.`);
+  try {
+    const stateRoot = workspaceState(root, env);
+    const attemptsRoot = path.join(stateRoot, "mailbox", "attempts");
+    if (!fs.existsSync(attemptsRoot)) {
+      throw new CompanionError("E_JOB_NOT_FOUND", "Message was not found.");
+    }
+    for (const dirName of fs.readdirSync(attemptsRoot)) {
+      const file = path.join(attemptsRoot, dirName, `${messageId}.json`);
+      if (!fs.existsSync(file)) continue;
+      const attemptId = dirName.slice(-32);
+      const workerId = dirName.slice(0, -(32 + 1));
+      if (!/^[a-f0-9]{32}$/.test(attemptId)) continue;
+      const record = readMailboxMessage(root, workerId, attemptId, messageId, env);
+      if (!record) continue;
+      if (record.state === "delivery_unknown") {
+        throw new CompanionError(
+          "E_DELIVERY",
+          "delivery_unknown messages must not be automatically retried."
+        );
+      }
+      if (record.state === "delivered" || record.state === "rejected") {
+        throw new CompanionError("E_DELIVERY", `Message already terminal as ${record.state}.`);
+      }
+      return publicMessageReceipt(record);
+    }
+  } catch (error) {
+    if (error instanceof CompanionError) throw error;
   }
-  return publicReceipt(record);
+  throw new CompanionError("E_JOB_NOT_FOUND", "Message was not found.");
 }
 
 /**
@@ -390,18 +405,482 @@ export function followupWorker(options = {}) {
 }
 
 export function listMailboxMessages(root, workerId, env = process.env) {
-  const dir = mailboxDir(root, env);
-  return fs.readdirSync(dir)
-    .filter((name) => name.startsWith("msg-") && name.endsWith(".json"))
-    .map((name) => {
-      try {
-        return JSON.parse(fs.readFileSync(path.join(dir, name), "utf8"));
-      } catch {
-        return null;
-      }
-    })
-    .filter((record) => record && record.workerId === workerId)
-    .map((record) => publicReceipt(record));
+  const open = resolveOpenMailbox(root, workerId, env);
+  if (open) {
+    return listAttemptMessages(root, workerId, open.dispatchAttemptId, env)
+      .map((record) => publicMessageReceipt(record));
+  }
+  const stateRoot = workspaceState(root, env);
+  const attemptsRoot = path.join(stateRoot, "mailbox", "attempts");
+  if (!fs.existsSync(attemptsRoot)) return [];
+  const receipts = [];
+  for (const dirName of fs.readdirSync(attemptsRoot)) {
+    if (!dirName.startsWith(`${workerId}-`)) continue;
+    const attemptId = dirName.slice(workerId.length + 1);
+    for (const record of listAttemptMessages(root, workerId, attemptId, env)) {
+      receipts.push(publicMessageReceipt(record));
+    }
+  }
+  return receipts;
 }
 
-export { readMessage, publicReceipt };
+/**
+ * Open the attempt-bound mailbox for the primary provider generation after
+ * session establishment. Report-repair generations must not call this.
+ */
+export function openWorkerMailboxForProvider({
+  root,
+  workerId,
+  dispatchAttemptId,
+  dispatchFence,
+  workerProcessDigest,
+  providerProcessDigest,
+  providerGeneration,
+  providerSessionDigest,
+  providerCapabilityDigest = null,
+  contextReceiptDigest,
+  rolePolicyDigest,
+  env = process.env
+}) {
+  return withWorkspaceStateTransaction(root, () => openAttemptMailbox(root, {
+    workerId,
+    dispatchAttemptId,
+    dispatchFence,
+    workerProcessDigest,
+    providerProcessDigest,
+    providerGeneration,
+    providerSessionDigest,
+    providerCapabilityDigest,
+    contextReceiptDigest,
+    rolePolicyDigest
+  }, env), env);
+}
+
+/**
+ * Drain accepted messages sequentially through one ACP client/session.
+ * Never holds a filesystem lock while awaiting ACP.
+ */
+export async function drainWorkerMailbox({
+  root,
+  workerId,
+  attemptId,
+  client,
+  sessionId,
+  composePrompt,
+  collectTurnText,
+  timeoutMs = 30 * 60 * 1000,
+  env = process.env,
+  onTurn = null,
+  validateAuthority = null,
+  cancelRequested = () => false
+} = {}) {
+  if (!client || typeof client.reserveRequestId !== "function"
+    || typeof client.dispatchReserved !== "function") {
+    throw new CompanionError("E_CAPABILITY", "Mailbox pump requires a reserve-then-dispatch ACP client.");
+  }
+  if (typeof composePrompt !== "function") {
+    throw new CompanionError("E_USAGE", "Mailbox pump requires composePrompt.");
+  }
+
+  const turns = [];
+  let deliveryUnknown = false;
+  const initialAttempt = readAttemptMailbox(root, workerId, attemptId, env);
+  if (!initialAttempt) {
+    throw new CompanionError("E_JOB_NOT_FOUND", "Worker mailbox attempt was not found.");
+  }
+  const pumpOwnerDigest = initialAttempt.pumpOwnerDigest;
+  const inTransaction = (callback) => withWorkspaceStateTransaction(root, (transaction) => {
+    if (typeof validateAuthority === "function") validateAuthority(transaction);
+    return callback(transaction);
+  }, env);
+  const cancellationRequested = () => {
+    try {
+      return cancelRequested() === true;
+    } catch (error) {
+      throw error instanceof CompanionError
+        ? error
+        : new CompanionError("E_STATE", "Could not read durable cancellation state.");
+    }
+  };
+  const settleCancellation = (transaction) => {
+    const settledAttempt = settleInterruptedAttempt(root, workerId, attemptId, {
+      reason: "provider-cancelled"
+    }, env);
+    for (const settledRecord of listAttemptMessages(root, workerId, attemptId, env)) {
+      appendMailboxOutcome(transaction, workerId, settledRecord);
+    }
+    return settledAttempt;
+  };
+
+  for (;;) {
+    const claimed = inTransaction((transaction) => {
+      const current = readAttemptMailbox(root, workerId, attemptId, env);
+      if (!current || current.state !== "open") {
+        return { done: true, attempt: current, record: null };
+      }
+      if (cancellationRequested()) {
+        return {
+          done: true,
+          cancelled: true,
+          attempt: settleCancellation(transaction),
+          record: null
+        };
+      }
+      if (current.deliveryUnknownSequence != null) {
+        return { done: true, attempt: current, record: null, unknown: true };
+      }
+      const next = claimNextAcceptedMessage(
+        root,
+        workerId,
+        attemptId,
+        pumpOwnerDigest,
+        env
+      );
+      if (!next.record) {
+        const closed = tryCloseAttemptMailbox(root, workerId, attemptId, {
+          reason: "empty-drain",
+          pumpOwnerDigest
+        }, env);
+        return {
+          done: true,
+          attempt: closed || next.attempt,
+          record: null,
+          closed: Boolean(closed)
+        };
+      }
+      return { done: false, attempt: next.attempt, record: next.record };
+    });
+
+    if (claimed.done) {
+      if (claimed.cancelled) {
+        throw new CompanionError(
+          "E_CANCELLED",
+          "Grok job was cancelled before the next mailbox turn."
+        );
+      }
+      return {
+        attempt: claimed.attempt,
+        turns,
+        finalReportSequence: claimed.attempt?.finalReportSequence ?? null,
+        deliveryUnknown: claimed.unknown === true || deliveryUnknown,
+        closed: claimed.attempt?.state === "closed"
+      };
+    }
+
+    const record = claimed.record;
+    const body = record._privateBody;
+    if (typeof body !== "string" || !body) {
+      throw new CompanionError("E_STATE", "Claimed mailbox message body is unavailable.");
+    }
+
+    let composed;
+    try {
+      composed = composePrompt({ message: body, sequence: record.sequence, record });
+    } catch (error) {
+      inTransaction((transaction) => {
+        const rejected = settleMessageRejected(root, {
+          workerId,
+          attemptId,
+          messageId: record.messageId,
+          reason: "compose-failed"
+        }, env);
+        appendMailboxOutcome(transaction, workerId, rejected);
+        return rejected;
+      });
+      continue;
+    }
+
+    const promptText = typeof composed === "string" ? composed : composed?.prompt;
+    const composedPromptDigest = typeof composed === "object" && composed?.digest
+      ? composed.digest
+      : contentDigestOf(promptText);
+    if (typeof promptText !== "string" || !promptText) {
+      inTransaction((transaction) => {
+        const rejected = settleMessageRejected(root, {
+          workerId,
+          attemptId,
+          messageId: record.messageId,
+          reason: "compose-empty"
+        }, env);
+        appendMailboxOutcome(transaction, workerId, rejected);
+        return rejected;
+      });
+      continue;
+    }
+
+    let rpcRequestId;
+    try {
+      rpcRequestId = client.reserveRequestId();
+      const transition = inTransaction((transaction) => {
+        if (cancellationRequested()) {
+          return {
+            cancelled: true,
+            attempt: settleCancellation(transaction)
+          };
+        }
+        return {
+          cancelled: false,
+          record: markMessageInflight(root, {
+            workerId,
+            attemptId,
+            messageId: record.messageId,
+            rpcRequestId,
+            composedPromptDigest,
+            pumpOwnerDigest
+          }, env)
+        };
+      });
+      if (transition.cancelled) {
+        throw new CompanionError(
+          "E_CANCELLED",
+          "Grok job was cancelled before mailbox dispatch."
+        );
+      }
+    } catch (error) {
+      if (error?.code === "E_CANCELLED") throw error;
+      const latest = readMailboxMessage(root, workerId, attemptId, record.messageId, env);
+      if (latest?.state === "inflight") {
+        const settled = inTransaction((transaction) => {
+          const unknown = settleMessageUnknown(root, {
+            workerId,
+            attemptId,
+            messageId: record.messageId,
+            reason: "inflight-persist-ambiguous",
+            pumpOwnerDigest
+          }, env);
+          appendMailboxOutcome(transaction, workerId, unknown.record);
+          return unknown;
+        });
+        const closed = inTransaction(() => tryCloseAttemptMailbox(
+          root,
+          workerId,
+          attemptId,
+          { reason: "delivery-unknown", pumpOwnerDigest },
+          env
+        ));
+        return {
+          attempt: closed || settled.attempt,
+          turns: [...turns, settled.turn],
+          finalReportSequence: null,
+          deliveryUnknown: true,
+          closed: (closed || settled.attempt)?.state === "closed",
+          error
+        };
+      }
+      inTransaction((transaction) => {
+        const rejected = settleMessageRejected(root, {
+          workerId,
+          attemptId,
+          messageId: record.messageId,
+          reason: "inflight-persist-failed"
+        }, env);
+        appendMailboxOutcome(transaction, workerId, rejected);
+        return rejected;
+      });
+      continue;
+    }
+
+    let promptResult;
+    let promptError = null;
+    const textCollector = typeof collectTurnText === "function"
+      ? collectTurnText()
+      : { text: () => "" };
+    try {
+      promptResult = await client.dispatchReserved(
+        rpcRequestId,
+        "session/prompt",
+        {
+          sessionId,
+          prompt: [{ type: "text", text: promptText }]
+        },
+        timeoutMs,
+        {
+          validateResult: validatePromptResponse
+        }
+      );
+    } catch (error) {
+      promptError = error;
+    }
+    if (!promptError && (client.transportError || client.closed === true)) {
+      promptError = client.transportError
+        || new CompanionError("E_PROTOCOL", "ACP transport closed before durable mailbox settlement.");
+    }
+
+    if (promptError
+      || !promptResult
+      || !isSuccessfulPromptStopReason(promptResult.stopReason)) {
+      const reason = promptError?.code === "E_TIMEOUT"
+        ? "prompt-timeout"
+        : promptError?.code === "E_PROVIDER_EXIT"
+          ? "provider-closed"
+          : isCancelledPromptStopReason(promptResult?.stopReason)
+            ? "prompt-cancelled"
+            : promptResult?.stopReason === "refusal" || promptResult?.stopReason === "Refusal"
+              ? "prompt-refused"
+            : "prompt-error-or-malformed";
+      const settled = inTransaction((transaction) => {
+        const unknown = settleMessageUnknown(root, {
+          workerId,
+          attemptId,
+          messageId: record.messageId,
+          reason,
+          pumpOwnerDigest
+        }, env);
+        appendMailboxOutcome(transaction, workerId, unknown.record);
+        return unknown;
+      });
+      deliveryUnknown = true;
+      turns.push(settled.turn);
+      if (typeof onTurn === "function") {
+        try {
+          onTurn({ outcome: "delivery_unknown", record: settled.record, turn: settled.turn });
+        } catch { /* non-fatal */ }
+      }
+      const closed = inTransaction(() => tryCloseAttemptMailbox(
+        root,
+        workerId,
+        attemptId,
+        { reason: "delivery-unknown", pumpOwnerDigest },
+        env
+      ));
+      return {
+        attempt: closed || settled.attempt,
+        turns,
+        finalReportSequence: (closed || settled.attempt)?.finalReportSequence ?? null,
+        deliveryUnknown: true,
+        closed: (closed || settled.attempt)?.state === "closed",
+        error: promptError
+      };
+    }
+
+    const attemptSnapshot = readAttemptMailbox(root, workerId, attemptId, env);
+    const turnEntry = communicationChainEntry({
+      previousDigest: attemptSnapshot.communicationChainDigest,
+      contextReceiptDigest: attemptSnapshot.contextReceiptDigest,
+      rolePolicyDigest: attemptSnapshot.rolePolicyDigest,
+      dispatchAttemptId: attemptSnapshot.dispatchAttemptId,
+      dispatchFence: attemptSnapshot.dispatchFence,
+      workerProcessDigest: attemptSnapshot.workerProcessDigest,
+      providerGeneration: attemptSnapshot.providerGeneration,
+      providerProcessDigest: attemptSnapshot.providerProcessDigest,
+      providerSessionDigest: attemptSnapshot.providerSessionDigest,
+      providerCapabilityDigest: attemptSnapshot.providerCapabilityDigest,
+      sequence: record.sequence,
+      contentDigest: record.contentDigest,
+      composedPromptDigest,
+      outcome: "delivered",
+      messageId: record.messageId,
+      rpcRequestId
+    });
+
+    const turnText = typeof textCollector.text === "function" ? textCollector.text() : "";
+    let settled;
+    try {
+      settled = inTransaction((transaction) => {
+        const delivered = settleMessageDelivered(root, {
+          workerId,
+          attemptId,
+          messageId: record.messageId,
+          turnEntry,
+          pumpOwnerDigest
+        }, env);
+        appendMailboxOutcome(transaction, workerId, delivered.record);
+        return delivered;
+      });
+    } catch (error) {
+      const durableRecord = readMailboxMessage(
+        root,
+        workerId,
+        attemptId,
+        record.messageId,
+        env
+      );
+      const durableAttempt = readAttemptMailbox(root, workerId, attemptId, env);
+      if (durableRecord?.state === "delivered"
+        && durableRecord.turnDigest === turnEntry.turnDigest
+        && durableAttempt?.communicationChainDigest === turnEntry.turnDigest
+        && durableAttempt.lastCompletedSequence === record.sequence) {
+        settled = {
+          attempt: durableAttempt,
+          record: durableRecord,
+          turn: turnEntry
+        };
+      } else if (durableRecord?.state !== "inflight") {
+        throw error;
+      }
+      if (settled) {
+        turns.push({
+          ...settled.turn,
+          text: turnText,
+          stopReason: promptResult.stopReason
+        });
+        continue;
+      }
+      const unknown = inTransaction((transaction) => {
+        const settledUnknown = settleMessageUnknown(root, {
+          workerId,
+          attemptId,
+          messageId: record.messageId,
+          reason: "delivered-persist-failed",
+          pumpOwnerDigest
+        }, env);
+        appendMailboxOutcome(transaction, workerId, settledUnknown.record);
+        return settledUnknown;
+      });
+      deliveryUnknown = true;
+      turns.push(unknown.turn);
+      const closed = inTransaction(() => tryCloseAttemptMailbox(
+        root,
+        workerId,
+        attemptId,
+        { reason: "delivery-unknown", pumpOwnerDigest },
+        env
+      ));
+      return {
+        attempt: closed || unknown.attempt,
+        turns,
+        finalReportSequence: (closed || unknown.attempt)?.finalReportSequence ?? null,
+        deliveryUnknown: true,
+        closed: (closed || unknown.attempt)?.state === "closed",
+        error
+      };
+    }
+
+    turns.push({
+      ...settled.turn,
+      text: turnText,
+      stopReason: promptResult.stopReason
+    });
+    if (typeof onTurn === "function") {
+      try {
+        onTurn({
+          outcome: "delivered",
+          record: settled.record,
+          turn: settled.turn,
+          text: turnText,
+          stopReason: promptResult.stopReason
+        });
+      } catch { /* non-fatal */ }
+    }
+  }
+}
+
+/**
+ * Compose a bounded follow-up prompt for one mailbox turn.
+ */
+export function composeMailboxTurnPrompt(message, {
+  sequence,
+  workerId = null
+} = {}) {
+  const header = [
+    "MAILBOX_TURN_BOUNDARY",
+    `sequence=${sequence}`,
+    workerId ? `worker=${workerId}` : null,
+    "Continue from the previous completed turn using only this message body."
+  ].filter(Boolean).join("\n");
+  const prompt = `${header}\n\n${message}`;
+  return {
+    prompt,
+    digest: contentDigestOf(prompt)
+  };
+}

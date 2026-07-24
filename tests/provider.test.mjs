@@ -304,6 +304,42 @@ test("runProvider creates a session, streams normalized events, and preserves li
   );
 });
 
+test("runProvider accepts max-turn completion and rejects refusal or legacy cancellation as success", async () => {
+  await withFake({ stopReason: "max_turn_requests" }, async () => {
+    const result = await runProvider({
+      root: initRepo(),
+      profile: profileFor("task", false),
+      prompt: "bounded turn",
+      stateDir: tempDir("provider-stop-reason-state-")
+    });
+    assert.equal(result.stopReason, "max_turn_requests");
+  });
+
+  await withFake({ stopReason: "refusal" }, async () => {
+    await assert.rejects(
+      () => runProvider({
+        root: initRepo(),
+        profile: profileFor("task", false),
+        prompt: "refused turn",
+        stateDir: tempDir("provider-stop-reason-state-")
+      }),
+      (error) => error?.code === "E_PROTOCOL"
+    );
+  });
+
+  await withFake({ stopReason: "Cancelled" }, async () => {
+    await assert.rejects(
+      () => runProvider({
+        root: initRepo(),
+        profile: profileFor("task", false),
+        prompt: "cancelled turn",
+        stateDir: tempDir("provider-stop-reason-state-")
+      }),
+      (error) => error?.code === "E_CANCELLED"
+    );
+  });
+});
+
 test("runProvider loads an existing session and rejects unadvertised models", async () => {
   await withFake({}, async (fake) => {
     const root = initRepo();

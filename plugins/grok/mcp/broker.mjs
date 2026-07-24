@@ -6,6 +6,7 @@ import {
 import { MAX_WORKER_WAIT_MS, createWorkerService } from "../scripts/lib/worker-service.mjs";
 import {
   MCP_CAPABILITY_CONTRACT_VERSION,
+  ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY,
   ROOT_READ_PROVIDER_CAPABILITY,
   SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
   readValidProviderCapabilityReceipt
@@ -198,12 +199,30 @@ export const WORKER_FOLLOWUP_TOOL = deepFreeze({
   annotations: MUTATION_ANNOTATIONS
 });
 
-/** Complete root-read continuation inventory; runtime advertisement is atomic. */
+export const WORKER_SEND_TOOL = deepFreeze({
+  name: "worker_send",
+  title: "Send a Grok worker message",
+  description: "Idempotently accept one ordered message for the active provider attempt. Acceptance is not delivery; terminal outcome is recorded by the provider-owned mailbox pump.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["id", "message", "idempotencyKey"],
+    properties: {
+      id: WORKER_ID_SCHEMA,
+      message: { type: "string", minLength: 1, maxLength: 16000 },
+      idempotencyKey: { type: "string", minLength: 8, maxLength: 256 }
+    }
+  },
+  annotations: MUTATION_ANNOTATIONS
+});
+
+/** Complete root-read continuation + ordered mailbox inventory; advertised atomically. */
 export const WORKER_TOOLS = deepFreeze([
   ...BASE_WORKER_TOOLS.slice(0, -1),
   WORKER_SPAWN_TOOL,
   WORKER_DECIDE_HOST_ACTION_TOOL,
   WORKER_FOLLOWUP_TOOL,
+  WORKER_SEND_TOOL,
   BASE_WORKER_TOOLS.at(-1)
 ]);
 
@@ -212,6 +231,7 @@ const MUTATION_AUTHORITY_TOOLS = new Set([
   "worker_spawn",
   "worker_decide_host_action",
   "worker_followup",
+  "worker_send",
   "worker_cancel"
 ]);
 
@@ -221,9 +241,10 @@ function validProviderCapabilityReceipt(receipt) {
   return Boolean(
     SHA256_HEX.test(receipt?.capabilityDigest || "")
     && Array.isArray(receipt?.capabilities)
-    && receipt.capabilities.length === 2
+    && receipt.capabilities.length === 3
     && receipt.capabilities[0] === ROOT_READ_PROVIDER_CAPABILITY
     && receipt.capabilities[1] === SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+    && receipt.capabilities[2] === ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
   );
 }
 
@@ -388,14 +409,14 @@ export async function callWorkerTool(params, options = {}) {
   const name = params?.name;
   const runtime = brokerRuntime(options);
   if (!runtime.tools.some((tool) => tool.name === name)) {
-    return ["worker_spawn", "worker_decide_host_action", "worker_followup"].includes(name)
+    return ["worker_spawn", "worker_decide_host_action", "worker_followup", "worker_send"].includes(name)
       ? toolResult({ code: "E_CAPABILITY", message: "Required worker broker capability is unavailable." }, true)
       : toolResult({ code: "E_USAGE", message: "Invalid worker broker request." }, true);
   }
   // tools/list is frozen for the MCP process lifetime, but provider readiness
   // is not. Revalidate immediately before any new admission and again inside
   // the service so expiry, setup revocation, or binary/profile drift fail closed.
-  if (["worker_spawn", "worker_decide_host_action", "worker_followup"].includes(name)
+  if (["worker_spawn", "worker_decide_host_action", "worker_followup", "worker_send"].includes(name)
     && currentProviderCapabilityDigest(runtime, options) === null) {
     return toolResult({
       code: "E_CAPABILITY",
@@ -495,6 +516,17 @@ export async function callWorkerTool(params, options = {}) {
         providerLaunched: followed.providerLaunched
       });
     }
+    if (name === "worker_send") {
+      const sent = service.send({
+        id: args.id,
+        message: args.message,
+        idempotencyKey: args.idempotencyKey
+      });
+      return toolResult({
+        message: sent.receipt,
+        replayed: sent.replayed
+      });
+    }
     if (name === "worker_cancel") {
       const cancelled = service.cancel({
         id: args.id,
@@ -525,7 +557,7 @@ export async function handleMcpRequest(message, options = {}) {
             experimental: CODEX_MCP_EXPERIMENTAL_CAPABILITIES
           },
           serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
-          instructions: "Task-owned Grok worker broker (structured list/get/events/wait/result/cancel, plus read-only spawn and exact grant-bound same-session follow-up only when advertised). Grok workers are external, not native host subagents. Host verification is not trusted or promoted by this MCP surface.",
+          instructions: "Task-owned Grok worker broker (structured list/get/events/wait/result/cancel, plus read-only spawn, exact grant-bound same-session follow-up, and ordered active-worker send only when advertised). Grok workers are external, not native host subagents. Accepted mailbox messages are not reported as delivered until the provider-owned pump records a terminal outcome. Host verification is not trusted or promoted by this MCP surface.",
           _meta: {
             "grok/capability-matrix": capability,
             "grok/capabilityDigest": runtime.providerCapabilityDigest,

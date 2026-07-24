@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { AcpClient } from "./acp-client.mjs";
+import {
+  AcpClient,
+  isCancelledPromptStopReason,
+  isSuccessfulPromptStopReason
+} from "./acp-client.mjs";
 import { CompanionError } from "./errors.mjs";
 import { redact, redactText } from "./redact.mjs";
 import { processGroupAlive, processGroupGone, processStartToken } from "./process-control.mjs";
@@ -1781,7 +1785,7 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
   return { sessionId, text: redactText(String(payload.text ?? "").trim(), isolation.knownSecrets), structuredOutput: redact(payload.structuredOutput, isolation.knownSecrets), stopReason: payload.stopReason || "EndTurn", provider: { version, process: identity, isolatedHome: isolation.home }, capabilities: { transport: "headless", agent: "explore", sandbox: isolation.sandboxProfile } };
 }
 
-export async function runProvider({ root, profile, prompt, model, effort, stateDir, jobMarker = "job", providerHomeId = null, resumeSessionId = null, cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, testHooks = null, timeoutMs = undefined }) {
+export async function runProvider({ root, profile, prompt, model, effort, stateDir, jobMarker = "job", providerHomeId = null, resumeSessionId = null, cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, primaryTurnController = null, mailboxController = null, testHooks = null, timeoutMs = undefined }) {
   if (profile.transport === "headless") return runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker, resumeSessionId, cancelRequested, onEvent, ...(timeoutMs == null ? {} : { timeoutMs }) });
   const environment = /^rescue-(read|write|report)-v3$/.test(profile.id || "") ? taskEnvironment(stateDir, root, profile, providerHomeId || jobMarker) : null;
   const effectiveProfile = environment?.sandboxProfile ? { ...profile, sandbox: environment.sandboxProfile } : profile;
@@ -1846,7 +1850,15 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
     }
     throw error;
   }
-  let sessionId = null, interimText = "", finalText = "", allMessageText = "", poll, killTimer, cancelled = false, outputError = null, outputBytes = 0;
+  let sessionId = null;
+  let poll;
+  let killTimer;
+  let cancelled = false;
+  let outputError = null;
+  let outputBytes = 0;
+  let primaryTurnAdmission = null;
+  let mailboxAttempt = null;
+  let mailboxClosed = false;
   try {
     if ((provider.initialized.authMethods || []).some((method) => method?.id === "cached_token")) {
       await requestDuringProviderStartup(
@@ -1880,7 +1892,70 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
     // Session creation is authenticated before any model tool can run. Remove the
     // reusable bearer credential before session/prompt exposes workspace tools.
     environment?.revokeCredential();
+    if (mailboxController) {
+      if (typeof mailboxController.open !== "function") {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "Attempt-bound mailbox pumping is available only on the primary provider generation."
+        );
+      }
+      mailboxAttempt = await mailboxController.open({
+        sessionId,
+        providerProcess: provider.process,
+        providerCapabilities: provider.initialized
+      });
+    }
+    if (primaryTurnController) {
+      if (typeof primaryTurnController.admit !== "function"
+        || typeof primaryTurnController.consume !== "function") {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "Primary provider turns require an exact durable admission controller."
+        );
+      }
+      primaryTurnAdmission = primaryTurnController.admit({
+        sessionId,
+        providerProcess: provider.process,
+        prompt
+      });
+      if (!primaryTurnAdmission
+        || typeof primaryTurnAdmission !== "object"
+        || typeof primaryTurnAdmission.then === "function") {
+        throw new CompanionError(
+          "E_STATE",
+          "Primary provider turn admission must be committed synchronously."
+        );
+      }
+      await testHooks?.afterPrimaryTurnAdmitted?.({
+        admission: primaryTurnAdmission,
+        sessionId,
+        providerProcess: provider.process
+      });
+    }
     // Separate interim chatter (messages before/between tool/plan activity) from the final answer.
+    let currentTurn = null;
+    const beginTurn = () => {
+      const turn = {
+        allMessageText: "",
+        finalText: "",
+        interimText: ""
+      };
+      currentTurn = turn;
+      return {
+        text: () => {
+          const marker = turn.allMessageText.lastIndexOf("GROK_WORKER_REPORT:");
+          return (marker >= 0
+            ? turn.allMessageText.slice(marker)
+            : turn.finalText).trim();
+        },
+        interimText: () => {
+          const marker = turn.allMessageText.lastIndexOf("GROK_WORKER_REPORT:");
+          return (marker >= 0
+            ? turn.allMessageText.slice(0, marker)
+            : turn.interimText).trim();
+        }
+      };
+    };
     const listener = (event) => {
       if (event.type === "message") {
         const chunk = event.text || "";
@@ -1895,42 +1970,142 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
           }
           return;
         }
-        allMessageText += chunk;
-        finalText += chunk;
+        if (currentTurn) {
+          currentTurn.allMessageText += chunk;
+          currentTurn.finalText += chunk;
+        }
         return;
       }
       if (event.type === "tool" || event.type === "plan") {
-        if (finalText) {
-          interimText += finalText;
-          finalText = "";
+        if (currentTurn?.finalText) {
+          currentTurn.interimText += currentTurn.finalText;
+          currentTurn.finalText = "";
         }
       }
     };
     provider.client.on("update", listener);
     poll = setInterval(() => { if (!cancelled && cancelRequested()) { cancelled = true; provider.client.notify("session/cancel", { sessionId }); killTimer = setTimeout(() => { try { process.kill(provider.process.processGroupId ? -provider.process.processGroupId : provider.child.pid, "SIGTERM"); } catch {} }, 5000); } }, 100);
     let result;
-    try { result = await provider.client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: prompt }] }, timeoutMs ?? 30 * 60 * 1000); }
+    const primaryCollector = beginTurn();
+    try {
+      if (primaryTurnController) {
+        const consumed = primaryTurnController.consume({
+          admission: primaryTurnAdmission,
+          sessionId,
+          providerProcess: provider.process,
+          prompt
+        });
+        if (!consumed
+          || typeof consumed !== "object"
+          || typeof consumed.then === "function") {
+          throw new CompanionError(
+            "E_STATE",
+            "Primary provider turn admission must be consumed synchronously."
+          );
+        }
+      }
+      ({ result } = await provider.client.promptTurn({
+        sessionId,
+        prompt: [{ type: "text", text: prompt }],
+        timeoutMs: timeoutMs ?? 30 * 60 * 1000
+      }));
+    }
     catch (error) { if (outputError) throw outputError; if (cancelled) throw new CompanionError("E_CANCELLED", "Grok job was cancelled."); throw provider.eventError() || error; }
     if (provider.eventError()) throw provider.eventError();
-    clearInterval(poll); poll = null; provider.client.off("update", listener);
     if (outputError) throw outputError;
-    if (cancelled || result?.stopReason === "cancelled") throw new CompanionError("E_CANCELLED", "Grok job was cancelled.");
+    if (cancelled
+      || cancelRequested()
+      || isCancelledPromptStopReason(result?.stopReason)) {
+      throw new CompanionError("E_CANCELLED", "Grok job was cancelled.");
+    }
+    if (!isSuccessfulPromptStopReason(result?.stopReason)) {
+      throw new CompanionError(
+        "E_PROTOCOL",
+        "Grok prompt did not end at a successful ACP turn boundary."
+      );
+    }
     const secrets = environment?.knownSecrets || [];
-    // Tool/plan notifications can arrive after the assistant has already emitted its final
-    // report. Bind task finality to the explicit last report marker across the ordered message
-    // stream instead of trusting notification order. Non-task/setup turns retain segmentation.
-    const reportMarker = allMessageText.lastIndexOf("GROK_WORKER_REPORT:");
-    const resolvedFinal = (reportMarker >= 0 ? allMessageText.slice(reportMarker) : finalText).trim();
-    const resolvedInterim = (reportMarker >= 0 ? allMessageText.slice(0, reportMarker) : interimText).trim();
+    let resolvedFinal = primaryCollector.text();
+    let resolvedInterim = primaryCollector.interimText();
+    let selectedSequence = 0;
+    let mailboxEvidence = null;
+    if (mailboxController) {
+      await mailboxController.recordPrimary({
+        attempt: mailboxAttempt,
+        prompt,
+        stopReason: result?.stopReason || "end_turn"
+      });
+      const drained = await mailboxController.drain({
+        attempt: mailboxAttempt,
+        client: provider.client,
+        sessionId,
+        collectTurnText: beginTurn,
+        timeoutMs: timeoutMs ?? 30 * 60 * 1000,
+        cancelRequested
+      });
+      if (cancelled || cancelRequested()) {
+        throw new CompanionError(
+          "E_CANCELLED",
+          "Grok job was cancelled after mailbox drain."
+        );
+      }
+      mailboxClosed = drained?.closed === true;
+      const deliveredTurns = Array.isArray(drained?.turns)
+        ? drained.turns.filter((turn) => turn?.outcome === "delivered")
+        : [];
+      if (drained?.deliveryUnknown === true) {
+        // Never reuse an earlier report when the last attempted turn is
+        // ambiguous. The controller will fail the provider-success claim.
+        resolvedFinal = "";
+        resolvedInterim = "";
+        selectedSequence = drained?.attempt?.lastCompletedSequence ?? selectedSequence;
+      } else if (deliveredTurns.length) {
+        const selected = deliveredTurns.at(-1);
+        selectedSequence = selected.sequence;
+        resolvedFinal = String(selected.text || "").trim();
+        resolvedInterim = "";
+      }
+      mailboxEvidence = {
+        schemaVersion: 1,
+        attemptId: mailboxAttempt.dispatchAttemptId,
+        communicationChainDigest: drained?.attempt?.communicationChainDigest || null,
+        lastCompletedSequence: drained?.attempt?.lastCompletedSequence ?? null,
+        selectedSequence,
+        acceptedCount: drained?.attempt?.acceptedCount ?? 0,
+        acceptedBytes: drained?.attempt?.acceptedBytes ?? 0,
+        deliveryUnknown: drained?.deliveryUnknown === true,
+        closed: mailboxClosed,
+        bodiesRetained: Boolean(drained?.bodiesRetained)
+      };
+    }
+    clearInterval(poll); poll = null; provider.client.off("update", listener);
     return {
       sessionId,
       text: redactText(resolvedFinal, secrets),
       interimText: redactText(resolvedInterim, secrets),
       stopReason: result?.stopReason || "end_turn",
       provider: { version: provider.version, process: provider.process },
-      capabilities: provider.initialized
+      capabilities: provider.initialized,
+      ...(mailboxEvidence ? { mailboxEvidence } : {})
     };
   } catch (error) {
+    if (mailboxController && mailboxAttempt && !mailboxClosed) {
+      try {
+        await mailboxController.interrupt({
+          attempt: mailboxAttempt,
+          reason: error?.code === "E_CANCELLED"
+            ? "provider-cancelled"
+            : "provider-interrupted"
+        });
+      } catch (mailboxError) {
+        const details = error?.details && typeof error.details === "object"
+          && !Array.isArray(error.details)
+          ? { ...error.details }
+          : {};
+        details.mailboxWarning = redactText(mailboxError?.message || String(mailboxError)).slice(0, 500);
+        if (error && typeof error === "object") error.details = details;
+      }
+    }
     if (/auth|login|unauthori[sz]ed|no auth method/i.test(`${error?.message || ""} ${error?.details?.data || ""}`)) throw new CompanionError("E_AUTH_REQUIRED", `Grok authentication is unavailable or expired. Run \`grok login\`, then ${hostCommand("setup")}.`);
     throw provider.eventError() || error;
   } finally {

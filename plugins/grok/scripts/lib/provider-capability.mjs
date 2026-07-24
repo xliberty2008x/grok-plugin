@@ -12,9 +12,11 @@ import { readPrivateJsonFile, writePrivateJsonFile } from "./state.mjs";
 export const ROOT_READ_PROVIDER_CAPABILITY = "root-read-spawn-v1";
 export const SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY =
   "same-session-read-followup-v1";
+export const ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY =
+  "ordered-turn-boundary-mailbox-v1";
 export const PROVIDER_CAPABILITY_SCHEMA_VERSION = 1;
 export const PROVIDER_CAPABILITY_TTL_MS = 12 * 60 * 60 * 1000;
-export const MCP_CAPABILITY_CONTRACT_VERSION = "1.2.0";
+export const MCP_CAPABILITY_CONTRACT_VERSION = "1.3.0";
 
 const MAX_RECEIPT_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_PROVIDER_BINARY_BYTES = 128 * 1024 * 1024;
@@ -205,7 +207,8 @@ function stableCapabilityBody({
     rootReadProfileDigest,
     capabilities: [
       ROOT_READ_PROVIDER_CAPABILITY,
-      SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+      SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
+      ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
     ]
   };
 }
@@ -236,9 +239,10 @@ function validateReceiptShape(receipt) {
     || !SHA256_HEX.test(receipt.setupProfileDigest || "")
     || !SHA256_HEX.test(receipt.rootReadProfileDigest || "")
     || !Array.isArray(receipt.capabilities)
-    || receipt.capabilities.length !== 2
+    || receipt.capabilities.length !== 3
     || receipt.capabilities[0] !== ROOT_READ_PROVIDER_CAPABILITY
     || receipt.capabilities[1] !== SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+    || receipt.capabilities[2] !== ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
     || !validIsoTimestamp(receipt.issuedAt)
     || !validIsoTimestamp(receipt.expiresAt)
     || !SHA256_HEX.test(receipt.capabilityDigest || "")

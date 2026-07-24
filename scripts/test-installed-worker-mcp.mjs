@@ -48,6 +48,7 @@ import {
   LIVE_RECEIPT_AUTHORITY_SYNTHETIC,
   LIVE_RECEIPT_CAPABILITY_TOOL_IDS,
   LIVE_RECEIPT_MANIFEST,
+  LIVE_RECEIPT_PROVIDER_CAPABILITIES,
   LIVE_RECEIPT_PRODUCER_ID,
   LIVE_RECEIPT_PRODUCER_VERSION,
   LIVE_RECEIPT_ROOT,
@@ -138,6 +139,10 @@ const QUALIFICATION_STAGES = new Set([
   "completion-spawn-witness-id",
   "completion-get",
   "completion-events",
+  "completion-mailbox-open",
+  "completion-send-first",
+  "completion-send-second",
+  "completion-send-replay",
   "completion-wait",
   "completion-result",
   "completion-cleanup-private",
@@ -146,6 +151,7 @@ const QUALIFICATION_STAGES = new Set([
   "completion-cleanup-binding",
   "completion-cleanup-identity",
   "completion-cleanup-report",
+  "completion-mailbox-proof",
   "completion-session-id",
   "completion-session-binding",
   "completion-session-credential-revoked",
@@ -2832,6 +2838,11 @@ function createTracker(scenarioId, fixtureStatus) {
     observedProviderGenerations: [],
     observedProviderWorkerIds: [],
     observedCancellationReceiptIds: [],
+    mailboxAttemptId: null,
+    mailboxMessageCountAfterReplay: null,
+    mailboxObservation: null,
+    mailboxPublicReceipts: null,
+    mailboxMessageBindings: null,
     publicWorkers: [],
     events: orderedEventObserver(),
     calls: {
@@ -2840,7 +2851,9 @@ function createTracker(scenarioId, fixtureStatus) {
       result: 0,
       reconnect: 0,
       cancel: 0,
-      cancelReplay: 0
+      cancelReplay: 0,
+      send: 0,
+      sendReplay: 0
     },
     sessionPresent: false,
     sessionDeleteAcknowledged: false,
@@ -3538,9 +3551,239 @@ async function beginScenario(
   return { spawnArguments, spawn, cursor };
 }
 
+function mailboxTurnMessage(label) {
+  return [
+    `Re-check tracked.txt for mailbox turn ${label}.`,
+    "Do not edit files and do not invoke another agent.",
+    "End this response with this exact final line:",
+    "GROK_WORKER_REPORT: {\"outcome\":\"complete\",\"summary\":\"Installed Worker MCP fixture inspected.\",\"changedFiles\":[],\"checksClaimed\":[],\"acceptanceResults\":[{\"id\":\"AC-01\",\"status\":\"met\"},{\"id\":\"AC-02\",\"status\":\"met\"}],\"risks\":[],\"questions\":[]}"
+  ].join(" ");
+}
+
+async function waitForInstalledMailboxOpen(context, tracker) {
+  const deadline = Date.now() + 120_000;
+  while (Date.now() <= deadline) {
+    checkInterrupted(context.runner);
+    const job = readPrivateJob(context, tracker, {
+      requireLiveProvider: true,
+      recordProviderObservation: false
+    });
+    let attempt = null;
+    try {
+      attempt = context.mailboxState.resolveOpenMailbox(
+        context.fixtureRoot,
+        tracker.workerId,
+        context.env
+      );
+    } catch {
+      attempt = null;
+    }
+    if (attempt?.state === "open") {
+      const dispatch = job.request?.spawn?.dispatch;
+      if (
+        attempt.workerId !== tracker.workerId
+        || attempt.dispatchAttemptId !== dispatch?.attemptId
+        || attempt.dispatchFence !== dispatch?.fence
+        || attempt.providerGeneration !== 1
+        || attempt.workerProcessDigest
+          !== context.mailboxState.stableDigest(job.workerProcess)
+        || attempt.providerProcessDigest
+          !== context.mailboxState.stableDigest(job.providerProcess)
+        || attempt.providerSessionDigest
+          !== context.mailboxState.stableDigest({
+            providerSessionId: job.grokSessionId
+          })
+        || attempt.providerCapabilityDigest
+          !== context.providerCapability.capabilityDigest
+        || attempt.contextReceiptDigest
+          !== context.mailboxState.stableDigest(job.request?.contextReceipt)
+        || attempt.rolePolicyDigest !== job.request?.runtimeRolePolicy?.digest
+      ) {
+        fail("E_PRIVATE_STATE");
+      }
+      observePrivateJob(context, tracker, job, {
+        requireLiveProvider: true,
+        recordProviderObservation: true
+      });
+      tracker.mailboxAttemptId = attempt.dispatchAttemptId;
+      return attempt;
+    }
+    await new Promise((resolve) => setTimeout(resolve, STATE_POLL_MS));
+  }
+  fail("E_PRIVATE_STATE");
+}
+
+function snapshotInstalledMailboxProof(context, tracker, terminalJob) {
+  const attemptId = tracker.mailboxAttemptId;
+  if (typeof attemptId !== "string") fail("E_PRIVATE_STATE");
+  let attempt;
+  let messages;
+  try {
+    attempt = context.mailboxState.readAttemptMailbox(
+      context.fixtureRoot,
+      tracker.workerId,
+      attemptId,
+      context.env
+    );
+    messages = context.mailboxState.listAttemptMessages(
+      context.fixtureRoot,
+      tracker.workerId,
+      attemptId,
+      context.env
+    );
+    context.mailboxState.assertNoRetainedBodies(
+      context.fixtureRoot,
+      tracker.workerId,
+      attemptId,
+      context.env
+    );
+  } catch {
+    fail("E_PRIVATE_STATE");
+  }
+  if (
+    !attempt
+    || attempt.state !== "closed"
+    || attempt.workerId !== tracker.workerId
+    || attempt.providerGeneration !== 1
+    || attempt.workerProcessDigest
+      !== context.mailboxState.stableDigest(terminalJob.workerProcess)
+    || attempt.providerProcessDigest
+      !== context.mailboxState.stableDigest(terminalJob.providerProcess)
+    || attempt.providerSessionDigest
+      !== context.mailboxState.stableDigest({
+        providerSessionId: tracker.sessionId
+      })
+    || attempt.providerCapabilityDigest
+      !== context.providerCapability.capabilityDigest
+    || attempt.acceptedCount !== 2
+    || attempt.lastCompletedSequence !== 2
+    || attempt.finalReportSequence !== 2
+    || attempt.deliveryUnknownSequence !== null
+    || attempt.activeSequence !== null
+    || !Array.isArray(messages)
+    || messages.length !== 2
+    || !Array.isArray(tracker.mailboxPublicReceipts)
+    || tracker.mailboxPublicReceipts.length !== 2
+    || tracker.mailboxMessageCountAfterReplay !== 2
+    || messages.some((message, index) => (
+      message.sequence !== index + 1
+      || message.state !== "delivered"
+      || Object.hasOwn(message, "_privateBody")
+      || message.turnEvidence?.outcome !== "delivered"
+      || message.turnEvidence?.sequence !== index + 1
+      || message.messageId
+        !== tracker.mailboxPublicReceipts[index]?.messageId
+      || message.sequence
+        !== tracker.mailboxPublicReceipts[index]?.sequence
+      || message.acceptedAt
+        !== tracker.mailboxPublicReceipts[index]?.acceptedAt
+    ))
+    || terminalJob.result?.mailboxEvidence?.communicationChainDigest
+      !== attempt.communicationChainDigest
+    || terminalJob.result?.mailboxEvidence?.deliveryUnknown !== false
+    || terminalJob.result?.mailboxEvidence?.closed !== true
+    || terminalJob.result?.mailboxEvidence?.bodiesRetained !== false
+    || terminalJob.result?.mailboxEvidence?.selectedSequence !== 2
+    || terminalJob.result?.mailboxEvidence?.lastCompletedSequence !== 2
+    || terminalJob.result?.mailboxEvidence?.finalReportSequence !== 2
+    || terminalJob.result?.mailboxEvidence?.finalReportDigest
+      !== attempt.finalReportDigest
+    || attempt.finalReportDigest !== terminalJob.result?.textDigest
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  tracker.mailboxMessageBindings = messages.map((message) => Object.freeze({
+    messageId: message.messageId,
+    sequence: message.sequence,
+    acceptedAt: message.acceptedAt
+  }));
+
+  let previousDigest;
+  try {
+    previousDigest = context.mailboxState.genesisCommunicationChainDigest(attempt);
+    const primary = context.mailboxState.verifyChainExtension({
+      ...attempt,
+      communicationChainDigest: previousDigest
+    }, attempt.primaryTurnEvidence);
+    previousDigest = primary.turnDigest;
+    for (const message of messages) {
+      const turn = context.mailboxState.verifyChainExtension({
+        ...attempt,
+        communicationChainDigest: previousDigest
+      }, message.turnEvidence);
+      previousDigest = turn.turnDigest;
+    }
+  } catch {
+    fail("E_PRIVATE_STATE");
+  }
+  if (previousDigest !== attempt.communicationChainDigest) {
+    fail("E_PRIVATE_STATE");
+  }
+
+  const allTurns = [attempt.primaryTurnEvidence, ...messages.map(
+    (message) => message.turnEvidence
+  )];
+  const providerGenerationCount = new Set(
+    allTurns.map((turn) => turn.providerGeneration)
+  ).size;
+  const providerSessionCount = new Set(
+    allTurns.map((turn) => turn.providerSessionDigest)
+  ).size;
+  const deliveredCount = messages.filter(
+    (message) => message.state === "delivered"
+  ).length;
+  const deliveryUnknownCount = messages.filter(
+    (message) => message.state === "delivery_unknown"
+  ).length;
+  const rejectedCount = messages.filter(
+    (message) => message.state === "rejected"
+  ).length;
+  const retainedBodyCount = messages.filter(
+    (message) => Object.hasOwn(message, "_privateBody")
+  ).length;
+  const observation = Object.freeze({
+    providerGenerationCount,
+    providerSessionCount,
+    promptCount: allTurns.length,
+    sendInvocationCount: tracker.calls.send + tracker.calls.sendReplay,
+    sendReplayCount: tracker.calls.sendReplay,
+    acceptedCount: attempt.acceptedCount,
+    deliveredCount,
+    deliveryUnknownCount,
+    rejectedCount,
+    finalReportSequence: attempt.finalReportSequence,
+    replayPromptDelta: messages.length - tracker.mailboxMessageCountAfterReplay,
+    retainedBodyCount,
+    closed: attempt.state === "closed"
+  });
+  if (!sameJson(observation, {
+    providerGenerationCount: 1,
+    providerSessionCount: 1,
+    promptCount: 3,
+    sendInvocationCount: 3,
+    sendReplayCount: 1,
+    acceptedCount: 2,
+    deliveredCount: 2,
+    deliveryUnknownCount: 0,
+    rejectedCount: 0,
+    finalReportSequence: 2,
+    replayPromptDelta: 0,
+    retainedBodyCount: 0,
+    closed: true
+  })) {
+    fail("E_PRIVATE_STATE");
+  }
+  tracker.mailboxObservation = observation;
+  return observation;
+}
+
 async function runCompletionScenario(baseContext, fixtureRoot) {
   const context = { ...baseContext, fixtureRoot };
-  const fixtureStatus = initializeFixtureRepository(fixtureRoot, context.env);
+  const fixtureStatus = initializeFixtureRepository(
+    fixtureRoot,
+    context.env,
+    { workloadFiles: 32 }
+  );
   const tracker = createTracker("authenticated-completion", fixtureStatus);
   context.runner.trackers.push({ context, tracker });
   enterQualificationStage("completion-mcp-surface");
@@ -3552,8 +3795,63 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
     tracker,
     client,
     `installed-completion-${crypto.randomUUID()}`,
-    "authenticated completion"
+    "authenticated completion",
+    { activeWindow: true }
   );
+  enterQualificationStage("completion-mailbox-open");
+  await waitForInstalledMailboxOpen(context, tracker);
+  const firstSendArguments = {
+    id: tracker.workerId,
+    message: mailboxTurnMessage("one"),
+    idempotencyKey: `installed-mailbox-one-${crypto.randomUUID()}`
+  };
+  enterQualificationStage("completion-send-first");
+  const firstSend = await callTool(
+    context,
+    client,
+    "worker_send",
+    firstSendArguments,
+    ["message", "replayed"]
+  );
+  tracker.calls.send += 1;
+  enterQualificationStage("completion-send-second");
+  const secondSend = await callTool(
+    context,
+    client,
+    "worker_send",
+    {
+      id: tracker.workerId,
+      message: mailboxTurnMessage("two"),
+      idempotencyKey: `installed-mailbox-two-${crypto.randomUUID()}`
+    },
+    ["message", "replayed"]
+  );
+  tracker.calls.send += 1;
+  enterQualificationStage("completion-send-replay");
+  const sendReplay = await callTool(
+    context,
+    client,
+    "worker_send",
+    firstSendArguments,
+    ["message", "replayed"]
+  );
+  tracker.calls.sendReplay += 1;
+  tracker.mailboxPublicReceipts = [
+    structuredClone(firstSend.message),
+    structuredClone(secondSend.message)
+  ];
+  let afterReplayMessages;
+  try {
+    afterReplayMessages = context.mailboxState.listAttemptMessages(
+      context.fixtureRoot,
+      tracker.workerId,
+      tracker.mailboxAttemptId,
+      context.env
+    );
+  } catch {
+    fail("E_PRIVATE_STATE");
+  }
+  tracker.mailboxMessageCountAfterReplay = afterReplayMessages.length;
   enterQualificationStage("completion-wait");
   await waitForTerminal(context, client, tracker, started.cursor);
   enterQualificationStage("completion-result");
@@ -3606,12 +3904,17 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   ) {
     fail("E_SCENARIO");
   }
+  enterQualificationStage("completion-mailbox-proof");
+  snapshotInstalledMailboxProof(context, tracker, terminalJob);
   enterQualificationStage("completion-session-id");
   if (!tracker.sessionId) fail("E_SESSION");
   await deleteAndProveSessionAbsent(context, tracker);
 
   const publicEvidence = {
     spawn: started.spawn,
+    firstSend,
+    secondSend,
+    sendReplay,
     terminalResult: result
   };
   enterQualificationStage("completion-contract");
@@ -3815,6 +4118,13 @@ function privateObservationFor(tracker, temporaryRemoved) {
       (digest) => !/^[0-9a-f]{64}$/.test(digest)
     )
     || tracker.observedSpawnResponseWitnesses.length !== witnessCount
+    || (
+      tracker.scenarioId === "authenticated-completion"
+      && (
+        !Array.isArray(tracker.mailboxMessageBindings)
+        || tracker.mailboxMessageBindings.length !== 2
+      )
+    )
   ) {
     fail("E_PRIVATE_STATE");
   }
@@ -3865,6 +4175,12 @@ function privateObservationFor(tracker, temporaryRemoved) {
     cancellationEventCount: (tracker.latestJob?.lifecycleEvents || [])
       .filter((event) => event?.type === "cancellation.requested").length,
     duplicateLaunchCount: Math.max(0, providerLaunchCount - 1),
+    mailboxMessageBindings: tracker.scenarioId === "authenticated-completion"
+      ? tracker.mailboxMessageBindings.map((binding) => structuredClone(binding))
+      : null,
+    mailbox: tracker.scenarioId === "authenticated-completion"
+      ? structuredClone(tracker.mailboxObservation)
+      : null,
     workerHostVerification: "not_run",
     processGroupGone: Boolean(tracker.context)
       && [...tracker.processIdentities.values()]
@@ -4426,6 +4742,7 @@ function buildReceipt({
   installedFileCount,
   installedEntrypointDigest,
   providerCapabilityDigest,
+  observedProviderCapabilities,
   providerBinaryDigest,
   providerVersion
 }) {
@@ -4449,6 +4766,7 @@ function buildReceipt({
     installedFileCount,
     installedEntrypointDigest,
     providerCapabilityDigest,
+    observedProviderCapabilities: [...observedProviderCapabilities],
     observedToolIds: [...LIVE_RECEIPT_CAPABILITY_TOOL_IDS],
     providerBinaryDigest,
     providerVersion,
@@ -4619,6 +4937,10 @@ async function qualify(runner) {
     installedRoot,
     "scripts/lib/worker-protocol.mjs"
   );
+  const mailboxState = await importInstalled(
+    installedRoot,
+    "scripts/lib/worker-mailbox-state.mjs"
+  );
   const broker = await importInstalled(installedRoot, "mcp/broker.mjs");
 
   enterQualificationStage("provider-setup");
@@ -4689,11 +5011,14 @@ async function qualify(runner) {
     observedAt: Date.now()
   });
   if (
-    capability.capabilities?.length !== 2
+    capability.capabilities?.length !== 3
+    || !sameJson(capability.capabilities, LIVE_RECEIPT_PROVIDER_CAPABILITIES)
     || capability.capabilities[0]
       !== providerCapability.ROOT_READ_PROVIDER_CAPABILITY
     || capability.capabilities[1]
       !== providerCapability.SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+    || capability.capabilities[2]
+      !== providerCapability.ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
     || broker.DEFAULT_MCP_PROTOCOL_VERSION !== PROTOCOL_VERSION
     || broker.MCP_SERVER_NAME !== "grok-worker-broker"
     || broker.MCP_SERVER_VERSION
@@ -4722,6 +5047,7 @@ async function qualify(runner) {
     launchContract,
     provider,
     workerProtocol,
+    mailboxState,
     workerTools: broker.WORKER_TOOLS,
     serverVersion: broker.MCP_SERVER_VERSION,
     experimentalCapabilities: EXPECTED_EXPERIMENTAL_CAPABILITIES
@@ -4801,6 +5127,7 @@ async function qualify(runner) {
     installedFileCount: installedEntries.length,
     installedEntrypointDigest,
     providerCapabilityDigest: capability.capabilityDigest,
+    observedProviderCapabilities: capability.capabilities,
     providerBinaryDigest: providerIdentity.contentDigest,
     providerVersion: capability.providerVersion
   });

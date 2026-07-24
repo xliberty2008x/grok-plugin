@@ -52,6 +52,8 @@ const WORKER_ID = "task-0123456789abcdef";
 const ENVELOPE_ID = "env-0123456789abcdef01234567";
 const MANIFEST_ID = "ctx-0123456789abcdef01234567";
 const RECEIPT_ID = "cancel-0123456789abcdef01234567";
+const FIRST_MESSAGE_ID = "msg-0123456789abcdef01234567";
+const SECOND_MESSAGE_ID = "msg-89abcdef0123456701234567";
 const SPAWN_REQUEST_DIGEST = "7".repeat(64);
 const SPAWN_IDEMPOTENCY_KEY_DIGEST = "8".repeat(64);
 const OBSERVED_AT = Date.parse("2026-07-23T10:01:00.000Z");
@@ -148,7 +150,7 @@ function capabilityFixture() {
     schemaVersion: 1,
     receiptType: "grok-provider-capability",
     pluginVersion: "0.3.0-dev.1",
-    mcpCapabilityContractVersion: "1.2.0",
+    mcpCapabilityContractVersion: "1.3.0",
     platform: "darwin",
     architecture: "arm64",
     providerVersion: "0.2.99",
@@ -159,7 +161,8 @@ function capabilityFixture() {
     rootReadProfileDigest: DIGESTS.rootRead,
     capabilities: [
       "root-read-spawn-v1",
-      "same-session-read-followup-v1"
+      "same-session-read-followup-v1",
+      "ordered-turn-boundary-mailbox-v1"
     ]
   };
   const body = {
@@ -175,7 +178,7 @@ function capabilityExpectations() {
   return {
     setup: setupFixture(),
     pluginVersion: "0.3.0-dev.1",
-    mcpCapabilityContractVersion: "1.2.0",
+    mcpCapabilityContractVersion: "1.3.0",
     platform: "darwin",
     architecture: "arm64",
     providerFileIdentity: providerIdentity(),
@@ -191,7 +194,7 @@ function initializeFixture() {
       tools: { listChanged: false },
       experimental: clone(CODEX_MCP_EXPERIMENTAL_CAPABILITIES)
     },
-    serverInfo: { name: "grok-worker-broker", version: "1.2.0" },
+    serverInfo: { name: "grok-worker-broker", version: "1.3.0" },
     instructions: "External worker broker; host verification is not promoted.",
     _meta: {
       "grok/capability-matrix": clone(EXPECTED_CAPABILITY_MATRIX),
@@ -205,7 +208,7 @@ function initializeFixture() {
 
 function initializeExpectations() {
   return {
-    serverVersion: "1.2.0",
+    serverVersion: "1.3.0",
     capabilityDigest: capabilityFixture().capabilityDigest,
     experimentalCapabilities: clone(CODEX_MCP_EXPERIMENTAL_CAPABILITIES),
     capabilityMatrix: clone(EXPECTED_CAPABILITY_MATRIX)
@@ -569,6 +572,27 @@ function cancelFixture({ replayed = false } = {}) {
   };
 }
 
+function sendFixture({
+  replayed = false,
+  messageId = FIRST_MESSAGE_ID,
+  sequence = 1,
+  acceptedAt = "2026-07-23T10:00:30.000Z"
+} = {}) {
+  return {
+    ok: true,
+    message: {
+      messageId,
+      workerId: WORKER_ID,
+      state: "accepted",
+      sequence,
+      acceptedAt,
+      outcomeAt: null,
+      reason: null
+    },
+    replayed
+  };
+}
+
 function toolResult(structuredContent, isError = false) {
   return {
     content: [{ type: "text", text: JSON.stringify(structuredContent) }],
@@ -580,6 +604,13 @@ function toolResult(structuredContent, isError = false) {
 function completionBundle() {
   return {
     spawn: spawnFixture(),
+    firstSend: sendFixture(),
+    secondSend: sendFixture({
+      messageId: SECOND_MESSAGE_ID,
+      sequence: 2,
+      acceptedAt: "2026-07-23T10:00:31.000Z"
+    }),
+    sendReplay: sendFixture({ replayed: true }),
     terminalResult: { ok: true, worker: worker("completed", { terminal: true }) }
   };
 }
@@ -659,6 +690,33 @@ function privateObservation(scenarioId) {
     uniqueCancelRequestCount: cancellation ? 1 : 0,
     cancellationEventCount: cancellation ? 1 : 0,
     duplicateLaunchCount: 0,
+    mailboxMessageBindings: cancellation ? null : [
+      {
+        messageId: FIRST_MESSAGE_ID,
+        sequence: 1,
+        acceptedAt: "2026-07-23T10:00:30.000Z"
+      },
+      {
+        messageId: SECOND_MESSAGE_ID,
+        sequence: 2,
+        acceptedAt: "2026-07-23T10:00:31.000Z"
+      }
+    ],
+    mailbox: cancellation ? null : {
+      providerGenerationCount: 1,
+      providerSessionCount: 1,
+      promptCount: 3,
+      sendInvocationCount: 3,
+      sendReplayCount: 1,
+      acceptedCount: 2,
+      deliveredCount: 2,
+      deliveryUnknownCount: 0,
+      rejectedCount: 0,
+      finalReportSequence: 2,
+      replayPromptDelta: 0,
+      retainedBodyCount: 0,
+      closed: true
+    },
     workerHostVerification: "not_run",
     processGroupGone: true,
     taskRuntimeCleaned: true,
@@ -756,6 +814,7 @@ test("capability receipt is cryptographically bound to setup and installed ident
   );
   assert.equal(receipt.capabilities[0], "root-read-spawn-v1");
   assert.equal(receipt.capabilities[1], "same-session-read-followup-v1");
+  assert.equal(receipt.capabilities[2], "ordered-turn-boundary-mailbox-v1");
   assert.equal(receipt.providerVersion, setupFixture().grok.version);
 });
 
@@ -910,6 +969,33 @@ test("tool result rejects provider attempts to promote host verification", () =>
 test("completion scenario binds the terminal public worker and suppresses host claims", () => {
   const valid = validateInstalledCompletionScenario(completionBundle());
   assert.equal(valid.terminalResult.worker.status, "completed");
+  assert.equal(valid.firstSend.message.sequence, 1);
+  assert.equal(valid.secondSend.message.sequence, 2);
+  assert.equal(valid.sendReplay.replayed, true);
+
+  for (const privateField of ["contentDigest", "idempotencyKeyDigest"]) {
+    const leaked = completionBundle();
+    leaked.firstSend.message[privateField] = `PUBLIC_${privateField}_CANARY`;
+    assert.throws(
+      () => validateInstalledCompletionScenario(leaked),
+      assertContractError("E_LIVE_COMPLETION")
+    );
+  }
+  for (const mutate of [
+    (value) => { value.firstSend.message.state = "pending"; },
+    (value) => { value.secondSend.message.sequence = 1; },
+    (value) => { value.sendReplay.replayed = false; },
+    (value) => { value.sendReplay.message.messageId = SECOND_MESSAGE_ID; },
+    (value) => { value.firstSend.message.outcomeAt = value.firstSend.message.acceptedAt; },
+    (value) => { delete value.secondSend.message.reason; }
+  ]) {
+    const drift = completionBundle();
+    mutate(drift);
+    assert.throws(
+      () => validateInstalledCompletionScenario(drift),
+      assertContractError("E_LIVE_COMPLETION")
+    );
+  }
 
   const identityDrift = completionBundle();
   identityDrift.terminalResult.worker.contextManifestId = "ctx-drift";
@@ -1173,6 +1259,13 @@ test("terminal worker_result accepts the production snapshot and rejects private
     },
     (value) => {
       value.terminalResult.worker.lifecycleEvents[0].detail.futureField = true;
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[1].detail = {
+        messageId: FIRST_MESSAGE_ID,
+        state: "delivered",
+        contentDigest: "f".repeat(64)
+      };
     },
     (value) => {
       value.terminalResult.worker.lifecycleEvents[0].detail.write = true;
@@ -1903,12 +1996,29 @@ test("private completion observation requires exact counts, immutable ids, and c
     privateObservation("authenticated-completion")
   );
   assert.equal(valid.providerLaunchCount, 1);
+  assert.deepEqual(clone(valid.mailbox), {
+    providerGenerationCount: 1,
+    providerSessionCount: 1,
+    promptCount: 3,
+    sendInvocationCount: 3,
+    sendReplayCount: 1,
+    acceptedCount: 2,
+    deliveredCount: 2,
+    deliveryUnknownCount: 0,
+    rejectedCount: 0,
+    finalReportSequence: 2,
+    replayPromptDelta: 0,
+    retainedBodyCount: 0,
+    closed: true
+  });
 
   for (const mutate of [
     (value) => { value.providerLaunchCount = 2; },
     (value) => { value.observedPublicWorkerDigests[0] = "not-a-digest"; },
     (value) => { value.observedPublicWorkerDigests.pop(); },
     (value) => { value.observedProviderGenerations = [1, 2]; },
+    (value) => { value.mailboxMessageBindings[0].messageId = "not-a-message-id"; },
+    (value) => { value.mailboxMessageBindings[1].acceptedAt = "not-a-time"; },
     (value) => { value.observedWorkerIds[1] = "task-ffffffffffffffff"; },
     (value) => { value.observedContextManifestIds[1] = "ctx-drift"; },
     (value) => { delete value.installedWorkerBinding.createdAt; },
@@ -1941,7 +2051,16 @@ test("private completion observation requires exact counts, immutable ids, and c
     (value) => { value.processGroupGone = false; },
     (value) => { value.taskRuntimeCleaned = false; },
     (value) => { value.providerGuardAbsent = false; },
-    (value) => { value.qualificationSessionDeleted = false; }
+    (value) => { value.qualificationSessionDeleted = false; },
+    (value) => { value.mailbox.promptCount = 4; },
+    (value) => { value.mailbox.deliveredCount = 1; },
+    (value) => { value.mailbox.deliveryUnknownCount = 1; },
+    (value) => { value.mailbox.rejectedCount = 1; },
+    (value) => { value.mailbox.finalReportSequence = 1; },
+    (value) => { value.mailbox.replayPromptDelta = 1; },
+    (value) => { value.mailbox.retainedBodyCount = 1; },
+    (value) => { value.mailbox.closed = false; },
+    (value) => { value.mailbox.contentDigest = "PRIVATE_MAILBOX_CANARY"; }
   ]) {
     const drift = privateObservation("authenticated-completion");
     mutate(drift);
@@ -2137,6 +2256,25 @@ test("integrated validator cross-binds every private identity to public scenario
   assert.doesNotThrow(() => validateInstalledPrivateObservation(unrelated));
   assert.throws(
     () => validateInstalledScenarioEvidence(completionBundle(), unrelated),
+    assertContractError("E_LIVE_PRIVATE_STATE")
+  );
+
+  const mailboxBindingDrift = privateObservation("authenticated-completion");
+  [
+    mailboxBindingDrift.mailboxMessageBindings[0].messageId,
+    mailboxBindingDrift.mailboxMessageBindings[1].messageId
+  ] = [
+    mailboxBindingDrift.mailboxMessageBindings[1].messageId,
+    mailboxBindingDrift.mailboxMessageBindings[0].messageId
+  ];
+  assert.doesNotThrow(
+    () => validateInstalledPrivateObservation(mailboxBindingDrift)
+  );
+  assert.throws(
+    () => validateInstalledScenarioEvidence(
+      completionBundle(),
+      mailboxBindingDrift
+    ),
     assertContractError("E_LIVE_PRIVATE_STATE")
   );
 

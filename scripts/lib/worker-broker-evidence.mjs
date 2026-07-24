@@ -72,12 +72,12 @@ export const SIGNED_REVIEW_MANIFEST = Object.freeze({
   ])
 });
 export const SIGNED_REVIEW_MANIFEST_DIGEST = sha256Text(stableStringify(SIGNED_REVIEW_MANIFEST));
-export const LIVE_RECEIPT_SCHEMA_VERSION = 1;
+export const LIVE_RECEIPT_SCHEMA_VERSION = 2;
 export const LIVE_RECEIPT_PRODUCER_ID = "worker-broker-live-receipt-runner";
-export const LIVE_RECEIPT_PRODUCER_VERSION = 1;
+export const LIVE_RECEIPT_PRODUCER_VERSION = 2;
 export const LIVE_RECEIPT_AUTHORITY_SYNTHETIC = "synthetic-direct-mcp";
 export const LIVE_RECEIPT_AUTHORITY_NATURAL = "natural-codex-host";
-export const LIVE_RECEIPT_ROOT = `${EVIDENCE_ROOT}/live-receipts/v1`;
+export const LIVE_RECEIPT_ROOT = `${EVIDENCE_ROOT}/live-receipts/v2`;
 export const LIVE_RECEIPT_AUTHORITY_MODES = Object.freeze([
   LIVE_RECEIPT_AUTHORITY_SYNTHETIC,
   LIVE_RECEIPT_AUTHORITY_NATURAL
@@ -95,7 +95,13 @@ export const LIVE_RECEIPT_CAPABILITY_TOOL_IDS = Object.freeze([
   "worker_spawn",
   "worker_decide_host_action",
   "worker_followup",
+  "worker_send",
   "worker_cancel"
+]);
+export const LIVE_RECEIPT_PROVIDER_CAPABILITIES = Object.freeze([
+  "root-read-spawn-v1",
+  "same-session-read-followup-v1",
+  "ordered-turn-boundary-mailbox-v1"
 ]);
 export const LIVE_RECEIPT_NATURAL_TOOL_IDS = Object.freeze([
   "worker_list_owned",
@@ -128,6 +134,21 @@ const LIVE_RECEIPT_SCENARIOS = Object.freeze({
       uniqueCancelRequestCount: 0,
       cancellationEventCount: 0,
       duplicateLaunchCount: 0,
+      mailbox: Object.freeze({
+        providerGenerationCount: 1,
+        providerSessionCount: 1,
+        promptCount: 3,
+        sendInvocationCount: 3,
+        sendReplayCount: 1,
+        acceptedCount: 2,
+        deliveredCount: 2,
+        deliveryUnknownCount: 0,
+        rejectedCount: 0,
+        finalReportSequence: 2,
+        replayPromptDelta: 0,
+        retainedBodyCount: 0,
+        closed: true
+      }),
       workerHostVerification: "not_run",
       processGroupGone: true,
       taskRuntimeCleaned: true,
@@ -148,6 +169,7 @@ const LIVE_RECEIPT_SCENARIOS = Object.freeze({
       uniqueCancelRequestCount: 1,
       cancellationEventCount: 1,
       duplicateLaunchCount: 0,
+      mailbox: null,
       workerHostVerification: "not_run",
       processGroupGone: true,
       taskRuntimeCleaned: true,
@@ -170,6 +192,7 @@ const LIVE_RECEIPT_SCENARIOS = Object.freeze({
       uniqueCancelRequestCount: 0,
       cancellationEventCount: 0,
       duplicateLaunchCount: 0,
+      mailbox: null,
       workerHostVerification: "not_run",
       processGroupGone: true,
       taskRuntimeCleaned: true,
@@ -189,6 +212,7 @@ export const LIVE_RECEIPT_AUTHORITY_CONFIG = Object.freeze({
     phase: "1",
     qualifies: Object.freeze(["provider"]),
     codexHostIdentity: false,
+    observedProviderCapabilities: LIVE_RECEIPT_PROVIDER_CAPABILITIES,
     observedToolIds: LIVE_RECEIPT_CAPABILITY_TOOL_IDS,
     installationMethods: LIVE_INSTALLATION_METHODS,
     scenarios: LIVE_RECEIPT_SCENARIOS[LIVE_RECEIPT_AUTHORITY_SYNTHETIC]
@@ -197,6 +221,7 @@ export const LIVE_RECEIPT_AUTHORITY_CONFIG = Object.freeze({
     phase: "4",
     qualifies: Object.freeze(["installedHost"]),
     codexHostIdentity: true,
+    observedProviderCapabilities: LIVE_RECEIPT_PROVIDER_CAPABILITIES,
     observedToolIds: LIVE_RECEIPT_NATURAL_TOOL_IDS,
     installationMethods: Object.freeze(["codex-local-plugin-cache"]),
     scenarios: LIVE_RECEIPT_SCENARIOS[LIVE_RECEIPT_AUTHORITY_NATURAL]
@@ -1175,6 +1200,7 @@ const LIVE_RECEIPT_FIELDS = new Set([
   "installedFileCount",
   "installedEntrypointDigest",
   "providerCapabilityDigest",
+  "observedProviderCapabilities",
   "observedToolIds",
   "providerBinaryDigest",
   "providerVersion",
@@ -1205,6 +1231,7 @@ const LIVE_RECEIPT_SCENARIO_FIELDS = new Set([
   "uniqueCancelRequestCount",
   "cancellationEventCount",
   "duplicateLaunchCount",
+  "mailbox",
   "workerHostVerification",
   "processGroupGone",
   "taskRuntimeCleaned",
@@ -1224,6 +1251,21 @@ const LIVE_RECEIPT_SCENARIO_COUNT_FIELDS = new Set([
   "uniqueCancelRequestCount",
   "cancellationEventCount",
   "duplicateLaunchCount"
+]);
+const LIVE_RECEIPT_MAILBOX_FIELDS = new Set([
+  "providerGenerationCount",
+  "providerSessionCount",
+  "promptCount",
+  "sendInvocationCount",
+  "sendReplayCount",
+  "acceptedCount",
+  "deliveredCount",
+  "deliveryUnknownCount",
+  "rejectedCount",
+  "finalReportSequence",
+  "replayPromptDelta",
+  "retainedBodyCount",
+  "closed"
 ]);
 const LIVE_RECEIPT_SCENARIO_BOOLEAN_FIELDS = new Set([
   "processGroupGone",
@@ -4533,6 +4575,7 @@ function fixedLiveReceiptScenarioProjection(scenarios) {
     uniqueCancelRequestCount: scenario.uniqueCancelRequestCount,
     cancellationEventCount: scenario.cancellationEventCount,
     duplicateLaunchCount: scenario.duplicateLaunchCount,
+    mailbox: scenario.mailbox == null ? null : { ...scenario.mailbox },
     workerHostVerification: scenario.workerHostVerification,
     processGroupGone: scenario.processGroupGone,
     taskRuntimeCleaned: scenario.taskRuntimeCleaned,
@@ -4547,13 +4590,13 @@ function fixedLiveReceiptScenarioProjection(scenarios) {
  * signature or external anchor it cannot distinguish manually authored JSON
  * from runner output. No supported mint/publication API exists in this module.
  *
- * A future fixed runner must derive the cache root from verified Codex install
+ * The fixed installed runner derives the cache root from verified Codex install
  * output, the stable provider capability from the setup receipt and tools/list,
  * binary identities from the files it actually launches, and natural task
- * identity from trusted Codex host events. Invocation/replay counts must come
+ * identity from trusted Codex host events. Invocation/replay/mailbox counts come
  * from the runner and private installed state, not public provider-start or
- * session-created events. It must keep observation and private publication end
- * to end.
+ * session-created events. It keeps observation and private publication end to
+ * end; this generic module still exposes validation only.
  */
 export function validateLiveQualificationReceipt(receipt, options = {}) {
   const errors = [];
@@ -4573,7 +4616,7 @@ export function validateLiveQualificationReceipt(receipt, options = {}) {
   }
   for (const message of boundedEvidenceErrors(receipt, "$receipt")) fail(message);
   if (!exactFields(receipt, LIVE_RECEIPT_FIELDS)) {
-    fail("Live receipt fields do not match the fixed v1 manifest.");
+    fail("Live receipt fields do not match the fixed v2 manifest.");
   }
 
   if (receipt.schemaVersion !== LIVE_RECEIPT_SCHEMA_VERSION) {
@@ -4634,6 +4677,11 @@ export function validateLiveQualificationReceipt(receipt, options = {}) {
     || receipt.installedFileCount < 1
     || receipt.installedFileCount > MAX_LIVE_PLUGIN_FILES) {
     fail("Live receipt installedFileCount is invalid.");
+  }
+  if (config
+    && JSON.stringify(receipt.observedProviderCapabilities)
+      !== JSON.stringify(config.observedProviderCapabilities)) {
+    fail("Live receipt observedProviderCapabilities do not match the exact provider capability manifest.");
   }
   if (config
     && JSON.stringify(receipt.observedToolIds)
@@ -4701,6 +4749,41 @@ export function validateLiveQualificationReceipt(receipt, options = {}) {
       }
       if (scenario.workerHostVerification !== "not_run") {
         fail(`Live receipt scenarios[${index}].workerHostVerification must be not_run.`);
+      }
+      if (scenario.id === "authenticated-completion") {
+        const mailbox = scenario.mailbox;
+        if (!exactFields(mailbox, LIVE_RECEIPT_MAILBOX_FIELDS)) {
+          fail(`Live receipt scenarios[${index}].mailbox fields are invalid.`);
+        } else {
+          for (const field of [...LIVE_RECEIPT_MAILBOX_FIELDS].filter(
+            (candidate) => candidate !== "closed"
+          )) {
+            if (!Number.isInteger(mailbox[field])
+              || mailbox[field] < 0
+              || mailbox[field] > 32) {
+              fail(`Live receipt scenarios[${index}].mailbox.${field} is invalid.`);
+            }
+          }
+          if (mailbox.closed !== true) {
+            fail(`Live receipt scenarios[${index}].mailbox.closed must be true.`);
+          }
+          if (mailbox.providerGenerationCount !== scenario.providerLaunchCount
+            || mailbox.promptCount
+              !== 1 + mailbox.deliveredCount + mailbox.deliveryUnknownCount
+            || mailbox.acceptedCount
+              !== mailbox.deliveredCount
+                + mailbox.deliveryUnknownCount
+                + mailbox.rejectedCount
+            || mailbox.sendInvocationCount
+              !== mailbox.acceptedCount + mailbox.sendReplayCount
+            || mailbox.finalReportSequence !== mailbox.deliveredCount
+            || mailbox.replayPromptDelta !== 0
+            || mailbox.retainedBodyCount !== 0) {
+            fail(`Live receipt scenarios[${index}].mailbox cross-bindings are invalid.`);
+          }
+        }
+      } else if (scenario.mailbox !== null) {
+        fail(`Live receipt scenarios[${index}].mailbox must be null.`);
       }
     }
     if (config && stableStringify(fixedLiveReceiptScenarioProjection(receipt.scenarios))
@@ -4803,7 +4886,9 @@ function receiptMatchesRecordSource(receipt, record) {
 }
 
 function receiptsShareRuntimeIdentity(left, right) {
-  return [
+  return JSON.stringify(left?.observedProviderCapabilities)
+    === JSON.stringify(right?.observedProviderCapabilities)
+    && [
     "headCommit",
     "headTree",
     "sourceInventoryDigest",
@@ -4817,7 +4902,7 @@ function receiptsShareRuntimeIdentity(left, right) {
     "providerVersion",
     "providerRevision",
     "mcpProtocolVersion"
-  ].every((field) => left?.[field] === right?.[field]);
+    ].every((field) => left?.[field] === right?.[field]);
 }
 
 function promotedPhaseOneMatchesOriginal(record, original, attestation) {

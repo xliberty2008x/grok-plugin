@@ -39,6 +39,7 @@ import {
   handleMcpRequest
 } from "../plugins/grok/mcp/broker.mjs";
 import {
+  ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY,
   ROOT_READ_PROVIDER_CAPABILITY,
   SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
 } from "../plugins/grok/scripts/lib/provider-capability.mjs";
@@ -1911,7 +1912,8 @@ test("MCP worker_spawn and worker_cancel drive real service functions", async ()
     capabilityDigest: "d".repeat(64),
     capabilities: [
       ROOT_READ_PROVIDER_CAPABILITY,
-      SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+      SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
+      ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
     ]
   };
   const runtime = createMcpBrokerRuntime({

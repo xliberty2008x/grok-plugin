@@ -701,7 +701,7 @@
     },
     "liveQualificationReceipts": {
       "type": "object",
-      "description": "Digest references for strict offline integrity replay only. The generic writer rejects this field, no supported publication API currently exists, and historical origin cannot be authenticated without a protected signature or external immutable anchor.",
+      "description": "Digest references for strict offline integrity replay only. The generic writer rejects this field; only the fixed installed live runner owns private receipt publication. Historical origin cannot be authenticated without a protected signature or external immutable anchor.",
       "additionalProperties": false,
       "required": ["syntheticDirectMcp", "naturalCodexHost"],
       "properties": {
@@ -715,7 +715,7 @@
               "properties": {
                 "path": {
                   "type": "string",
-                  "pattern": "^tests/e2e-results/worker-broker/live-receipts/v1/synthetic-direct-mcp/[0-9a-f]{16}-[0-9a-f]{16}\\.json$"
+                  "pattern": "^tests/e2e-results/worker-broker/live-receipts/v2/synthetic-direct-mcp/[0-9a-f]{16}-[0-9a-f]{16}\\.json$"
                 },
                 "receiptDigest": {
                   "type": "string",
@@ -735,7 +735,7 @@
               "properties": {
                 "path": {
                   "type": "string",
-                  "pattern": "^tests/e2e-results/worker-broker/live-receipts/v1/natural-codex-host/[0-9a-f]{16}-[0-9a-f]{16}\\.json$"
+                  "pattern": "^tests/e2e-results/worker-broker/live-receipts/v2/natural-codex-host/[0-9a-f]{16}-[0-9a-f]{16}\\.json$"
                 },
                 "receiptDigest": {
                   "type": "string",

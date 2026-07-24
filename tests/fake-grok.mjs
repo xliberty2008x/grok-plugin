@@ -140,13 +140,33 @@ async function serveAcp(binary, config) {
 
     if (message.method === "session/new") {
       currentSession = config.sessionId ?? "fake-session-00000001";
-      send({ jsonrpc: "2.0", id: message.id, result: { sessionId: currentSession, models: {} } });
+      const response = {
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { sessionId: currentSession, models: {} }
+      };
+      if (Number.isSafeInteger(config.sessionResponseDelayMs)
+        && config.sessionResponseDelayMs > 0) {
+        setTimeout(() => send(response), config.sessionResponseDelayMs);
+      } else {
+        send(response);
+      }
       return;
     }
 
     if (message.method === "session/load") {
       currentSession = message.params?.sessionId;
-      send({ jsonrpc: "2.0", id: message.id, result: { sessionId: currentSession, models: {} } });
+      const response = {
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { sessionId: currentSession, models: {} }
+      };
+      if (Number.isSafeInteger(config.sessionResponseDelayMs)
+        && config.sessionResponseDelayMs > 0) {
+        setTimeout(() => send(response), config.sessionResponseDelayMs);
+      } else {
+        send(response);
+      }
       return;
     }
 
@@ -163,7 +183,9 @@ async function serveAcp(binary, config) {
         return;
       }
 
-      if (config.cancelMode === "wait") {
+      if (config.cancelMode === "wait"
+        && (!Number.isSafeInteger(config.cancelModeOnPrompt)
+          || config.cancelModeOnPrompt === promptNumber)) {
         heldPrompt = { id: message.id, sessionId: currentSession };
         update(currentSession, {
           sessionUpdate: "agent_message_chunk",
@@ -229,7 +251,10 @@ async function serveAcp(binary, config) {
         id: message.id,
         result: { stopReason: config.stopReason ?? "end_turn" }
       });
-      if (config.delayMs) setTimeout(finish, config.delayMs);
+      const delayMs = Array.isArray(config.delayMsByPrompt)
+        ? config.delayMsByPrompt[promptNumber - 1]
+        : config.delayMs;
+      if (Number.isSafeInteger(delayMs) && delayMs > 0) setTimeout(finish, delayMs);
       else finish();
       return;
     }

@@ -14,7 +14,14 @@ import {
   sameGuardProcessIdentity,
   unregisterProviderGuardInWorkspaceTransaction
 } from "./recursion-guard.mjs";
-import { isCancelRequested, listJobs, terminal, tryReadJob, updateJob } from "./state.mjs";
+import {
+  isCancelRequested,
+  listJobs,
+  terminal,
+  tryReadJob,
+  updateJob,
+  withWorkspaceStateTransaction
+} from "./state.mjs";
 import { appendLifecycleEvent } from "./task-contract.mjs";
 import {
   assertDispatchContract,
@@ -33,6 +40,11 @@ import {
   isDispatchV2,
   isSupportedWorkerDispatch
 } from "./worker-launch-contract.mjs";
+import {
+  readAttemptMailbox,
+  settleInterruptedAttempt,
+  stableDigest
+} from "./worker-mailbox-state.mjs";
 
 export const BROKER_RECOVERY_PRIVILEGE = "host-trusted-reconciler";
 export const BROKER_DISPATCH_RECOVERY_GRACE_MS = 5_000;
@@ -134,6 +146,50 @@ function sameBoundProviderIdentity(left, right) {
     && left.dispatchAttemptId === right.dispatchAttemptId
     && left.dispatchFence === right.dispatchFence
     && left.providerGeneration === right.providerGeneration;
+}
+
+function settleMailboxAfterProviderLoss({
+  root,
+  workerId,
+  attemptId,
+  workerProcess,
+  providerProcess,
+  env
+}) {
+  return withWorkspaceStateTransaction(root, (transaction) => {
+    const latest = transaction.tryReadJob(workerId);
+    if (!latest || terminal(latest)) {
+      throw new CompanionError("E_PROCESS_IDENTITY", "Mailbox recovery authority disappeared.");
+    }
+    const dispatch = latest.request?.spawn?.dispatch;
+    const attempt = readAttemptMailbox(root, workerId, attemptId, env);
+    if (!attempt) return null;
+    if (attempt.state === "closed") return attempt;
+    if (!isDispatchV2(dispatch)
+      || dispatch.state !== "provider-started"
+      || dispatch.attemptId !== attemptId
+      || dispatch.fence !== attempt.dispatchFence
+      || dispatch.providerGeneration !== 1
+      || !sameBoundWorkerIdentity(latest.workerProcess, workerProcess)
+      || !sameBoundProviderIdentity(latest.providerProcess, providerProcess)
+      || stableDigest(latest.workerProcess) !== attempt.workerProcessDigest
+      || stableDigest(latest.providerProcess) !== attempt.providerProcessDigest
+      || stableDigest({ providerSessionId: latest.grokSessionId })
+        !== attempt.providerSessionDigest
+      || (latest.request?.spawn?.providerCapabilityDigest ?? null)
+        !== attempt.providerCapabilityDigest
+      || !latest.request?.contextReceipt
+      || stableDigest(latest.request.contextReceipt) !== attempt.contextReceiptDigest
+      || latest.request?.runtimeRolePolicy?.digest !== attempt.rolePolicyDigest) {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "Mailbox recovery no longer matches the exact lost provider attempt."
+      );
+    }
+    return settleInterruptedAttempt(root, workerId, attemptId, {
+      reason: "provider-process-lost"
+    }, env);
+  }, env);
 }
 
 async function terminateWithRecoveryFence({
@@ -509,6 +565,20 @@ export async function recoverLostProviderStartedWorker({
   } catch {
     cleanupBlocked(root, workerId, "Provider process-group cleanup could not be verified.", env);
     return { action: "cleanup-blocked", reason: "provider-cleanup-unverified" };
+  }
+
+  try {
+    settleMailboxAfterProviderLoss({
+      root,
+      workerId,
+      attemptId,
+      workerProcess,
+      providerProcess: providerIdentity,
+      env
+    });
+  } catch {
+    cleanupBlocked(root, workerId, "Attempt-bound mailbox settlement could not be verified.", env);
+    return { action: "cleanup-blocked", reason: "mailbox-settlement-unverified" };
   }
 
   let settled;

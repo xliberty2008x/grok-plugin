@@ -18,13 +18,25 @@ import { resolveWorkerAuthority } from "../plugins/grok/scripts/lib/worker-autho
 import {
   assertDispatchContract,
   cancelWorker,
+  cancellationNonce,
   spawnReadOnlyWorker
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import {
   acpDeliveryCapability,
+  assertNoRetainedBodies,
+  composeMailboxTurnPrompt,
+  contentDigestOf,
+  drainWorkerMailbox,
   followupWorker,
+  listAttemptMessages,
+  openWorkerMailboxForProvider,
+  readAttemptMailbox,
+  recordPrimaryTurn,
+  recoverAttemptConsistency,
   retryDelivery,
-  sendWorkerMessage
+  sendWorkerMessage,
+  settleInterruptedAttempt,
+  stableDigest
 } from "../plugins/grok/scripts/lib/worker-mailbox.mjs";
 import {
   buildContextPacket,
@@ -37,8 +49,14 @@ import {
   requestHostAction,
   assertWorkerCannotSelfEscalate
 } from "../plugins/grok/scripts/lib/worker-roles.mjs";
-import { listJobs, tryReadJob, updateJob } from "../plugins/grok/scripts/lib/state.mjs";
+import {
+  isCancelRequested,
+  listJobs,
+  tryReadJob,
+  updateJob
+} from "../plugins/grok/scripts/lib/state.mjs";
 import { reconcileOwnedWorkers } from "../plugins/grok/scripts/lib/worker-reconcile.mjs";
+import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 import { initRepo, tempDir } from "./helpers.mjs";
 
 const THREAD = "019f666a-6469-7cc1-9a8d-8c1adf61e103";
@@ -102,6 +120,140 @@ function envFor() {
     GROK_COMPANION_HOST: "codex",
     GROK_COMPANION_PLUGIN_DATA: pluginData
   };
+}
+
+function openMailboxFixture({
+  root = initRepo(),
+  env = envFor(),
+  attemptId = ATTEMPT,
+  idempotencyKey = `mb-open-${attemptId}`
+} = {}) {
+  const spawned = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope: buildTaskEnvelope({ userRequest: "Active mailbox worker", mode: "read" }),
+    contextManifest: captureContextManifest(root),
+    idempotencyKey,
+    providerCapabilityDigest: "4".repeat(64),
+    env
+  });
+  const workerProcess = {
+    pid: 998_981,
+    startToken: "mailbox-worker-start",
+    processGroupId: process.platform === "win32" ? null : 998_981,
+    commandMarker: spawned.handle.id,
+    dispatchAttemptId: attemptId,
+    dispatchFence: 1,
+    nonce: "mailbox-worker-nonce"
+  };
+  const providerProcess = {
+    pid: 998_982,
+    startToken: "mailbox-provider-start",
+    processGroupId: process.platform === "win32" ? null : 998_982,
+    commandMarker: spawned.handle.id,
+    dispatchAttemptId: attemptId,
+    dispatchFence: 1,
+    providerGeneration: 1
+  };
+  updateJob(root, spawned.handle.id, (job) => {
+    const at = new Date().toISOString();
+    return {
+      ...job,
+      status: "running",
+      phase: "executing",
+      workerProcess,
+      providerProcess,
+      grokSessionId: SESSION,
+      request: {
+        ...job.request,
+        spawn: {
+          ...job.request.spawn,
+          providerCapabilityDigest: "4".repeat(64),
+          dispatch: {
+            ...job.request.spawn.dispatch,
+            state: "provider-started",
+            attemptId,
+            fence: 1,
+            providerGeneration: 1,
+            nextProviderGeneration: null,
+            lease: null,
+            claimedAt: at,
+            controllerStartedAt: at,
+            workerStartedAt: at,
+            providerStartedAt: at,
+            updatedAt: at
+          }
+        }
+      }
+    };
+  }, env);
+  const active = tryReadJob(root, spawned.handle.id, env);
+  const attempt = openWorkerMailboxForProvider({
+    root,
+    workerId: spawned.handle.id,
+    dispatchAttemptId: attemptId,
+    dispatchFence: 1,
+    workerProcessDigest: stableDigest(active.workerProcess),
+    providerProcessDigest: stableDigest(active.providerProcess),
+    providerGeneration: 1,
+    providerSessionDigest: stableDigest({ providerSessionId: active.grokSessionId }),
+    providerCapabilityDigest: "4".repeat(64),
+    contextReceiptDigest: stableDigest(active.request.contextReceipt),
+    rolePolicyDigest: active.request.runtimeRolePolicy.digest,
+    env
+  });
+  const primary = recordPrimaryTurn(root, spawned.handle.id, attemptId, {
+    contentDigest: contentDigestOf("primary provider report"),
+    composedPromptDigest: contentDigestOf("primary provider prompt"),
+    pumpOwnerDigest: attempt.pumpOwnerDigest
+  }, env);
+  return {
+    root,
+    env,
+    workerId: spawned.handle.id,
+    attemptId,
+    attempt: primary.attempt
+  };
+}
+
+function mailboxClient({ reject = false } = {}) {
+  let nextRequestId = 0;
+  const calls = [];
+  return {
+    calls,
+    reserveRequestId() {
+      nextRequestId += 1;
+      return nextRequestId;
+    },
+    async dispatchReserved(rpcRequestId, method, params, _timeoutMs, options = {}) {
+      calls.push({ rpcRequestId, method, params });
+      if (reject) throw Object.assign(new Error("provider response unavailable"), {
+        code: "E_PROVIDER_EXIT"
+      });
+      const response = { stopReason: "end_turn" };
+      return typeof options.validateResult === "function"
+        ? options.validateResult(response)
+        : response;
+    }
+  };
+}
+
+function mailboxAttemptDirectory(fixture) {
+  return path.join(
+    workspaceState(fixture.root, fixture.env),
+    "mailbox",
+    "attempts",
+    `${fixture.workerId}-${fixture.attemptId}`
+  );
+}
+
+function mutateAndResealPrivateRecord(file, digestField, mutate) {
+  const record = JSON.parse(fs.readFileSync(file, "utf8"));
+  mutate(record);
+  delete record[digestField];
+  record[digestField] = stableDigest(record);
+  fs.writeFileSync(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  return record;
 }
 
 function terminalGrantedParent({
@@ -207,134 +359,673 @@ test("ACP spike record does not claim exactly-once without ack+dedup", () => {
   const weak = acpDeliveryCapability();
   assert.equal(weak.exactlyOnceClaimable, false);
   const strong = acpDeliveryCapability({ acknowledgement: true, dedupKey: true });
-  assert.equal(strong.exactlyOnceClaimable, true);
+  assert.equal(strong.exactlyOnceClaimable, false);
+  assert.match(strong.note, /completed turn boundary/);
 });
 
-test("send ends as delivered, rejected, or delivery_unknown; unknown never auto-retried", () => {
-  const root = initRepo();
-  const env = envFor();
-  const envelope = buildTaskEnvelope({ userRequest: "Active worker", mode: "read" });
-  const spawned = spawnReadOnlyWorker({
-    root,
-    principal: principal(root),
-    envelope,
-    idempotencyKey: "mb-spawn-0001",
-    env
-  });
-  // Mark running so send is allowed.
-  updateJob(root, spawned.handle.id, (job) => ({ ...job, status: "running", phase: "executing" }), env);
-
-  const delivered = sendWorkerMessage({
-    root,
-    principal: principal(root),
-    workerId: spawned.handle.id,
+test("provider-owned pump delivers ordered messages, closes body-free, and replays terminal receipts", async () => {
+  const fixture = openMailboxFixture({ idempotencyKey: "mb-spawn-delivery-0001" });
+  const first = sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
     message: "Please continue with step 2",
-    idempotencyKey: "mb-send-delivered",
-    env,
-    deliver: () => "delivered"
+    idempotencyKey: "mb-send-delivered-0001",
+    env: fixture.env
   });
-  assert.equal(delivered.receipt.state, "delivered");
-  assert.equal(delivered.receipt.contentDigest != null, true);
-  assert.equal(JSON.stringify(delivered.receipt).includes("Please continue"), false);
-
-  const unknown = sendWorkerMessage({
-    root,
-    principal: principal(root),
-    workerId: spawned.handle.id,
-    message: "Ambiguous delivery",
-    idempotencyKey: "mb-send-unknown",
-    env,
-    deliver: () => "maybe"
+  const second = sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "Then verify step 3",
+    idempotencyKey: "mb-send-delivered-0002",
+    env: fixture.env
   });
-  assert.equal(unknown.receipt.state, "delivery_unknown");
-  assert.throws(
-    () => retryDelivery(root, unknown.receipt.messageId, env),
-    (error) => error?.code === "E_DELIVERY"
+  assert.equal(first.receipt.state, "accepted");
+  assert.equal(second.receipt.sequence, 2);
+  assert.equal(JSON.stringify(first.receipt).includes("Please continue"), false);
+  assert.match(first.receipt.messageId, /^msg-[a-f0-9]{24}$/);
+  assert.notEqual(
+    first.receipt.messageId,
+    `msg-${contentDigestOf("mb-send-delivered-0001").slice(0, 24)}`
   );
+  assert.equal(Object.hasOwn(first.receipt, "idempotencyKeyDigest"), false);
+  assert.equal(Object.hasOwn(first.receipt, "contentDigest"), false);
+  assert.notEqual(first.receipt.messageId, second.receipt.messageId);
 
-  const rejected = sendWorkerMessage({
-    root,
-    principal: principal(root),
-    workerId: spawned.handle.id,
-    message: "Nope",
-    idempotencyKey: "mb-send-reject",
-    env,
-    deliver: () => "rejected"
+  const client = mailboxClient();
+  const drained = await drainWorkerMailbox({
+    root: fixture.root,
+    workerId: fixture.workerId,
+    attemptId: fixture.attemptId,
+    client,
+    sessionId: SESSION,
+    composePrompt: ({ message, sequence }) => composeMailboxTurnPrompt(message, {
+      sequence,
+      workerId: fixture.workerId
+    }),
+    collectTurnText: () => ({ text: () => "mailbox turn report" }),
+    env: fixture.env
   });
-  assert.equal(rejected.receipt.state, "rejected");
+  assert.equal(drained.closed, true);
+  assert.equal(drained.deliveryUnknown, false);
+  assert.deepEqual(client.calls.map((call) => call.rpcRequestId), [1, 2]);
+  assert.equal(client.calls.every((call) => (
+    call.method === "session/prompt" && call.params.sessionId === SESSION
+  )), true);
+  assert.deepEqual(
+    listAttemptMessages(
+      fixture.root,
+      fixture.workerId,
+      fixture.attemptId,
+      fixture.env
+    ).map((record) => record.state),
+    ["delivered", "delivered"]
+  );
+  assert.equal(assertNoRetainedBodies(
+    fixture.root,
+    fixture.workerId,
+    fixture.attemptId,
+    fixture.env
+  ), true);
+  assert.equal(readAttemptMailbox(
+    fixture.root,
+    fixture.workerId,
+    fixture.attemptId,
+    fixture.env
+  ).lastCompletedSequence, 2);
 
-  // Idempotent resend
-  const again = sendWorkerMessage({
-    root,
-    principal: principal(root),
-    workerId: spawned.handle.id,
+  const replay = sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
     message: "Please continue with step 2",
-    idempotencyKey: "mb-send-delivered",
-    env,
-    deliver: () => "delivered"
+    idempotencyKey: "mb-send-delivered-0001",
+    env: fixture.env
   });
-  assert.equal(again.replayed, true);
-
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.receipt.state, "delivered");
   assert.throws(
     () => sendWorkerMessage({
-      root,
-      principal: principal(root),
-      workerId: spawned.handle.id,
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
       message: "Different content",
-      idempotencyKey: "mb-send-delivered",
-      env,
-      deliver: () => "delivered"
+      idempotencyKey: "mb-send-delivered-0001",
+      env: fixture.env
     }),
     (error) => error?.code === "E_IDEMPOTENCY_CONFLICT"
   );
   assert.throws(
     () => sendWorkerMessage({
-      root,
-      principal: principal(root, THREAD_B),
-      workerId: spawned.handle.id,
+      root: fixture.root,
+      principal: principal(fixture.root, THREAD_B),
+      workerId: fixture.workerId,
       message: "Please continue with step 2",
-      idempotencyKey: "mb-send-delivered",
-      env,
+      idempotencyKey: "mb-send-delivered-0001",
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_JOB_NOT_FOUND"
+      && !String(error.message).includes(first.receipt.messageId)
+  );
+  assert.throws(
+    () => sendWorkerMessage({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      message: "Caller adapter",
+      idempotencyKey: "mb-send-adapter-0001",
+      env: fixture.env,
       deliver: () => "delivered"
-    }),
-    (error) => error?.code === "E_IDEMPOTENCY_CONFLICT"
-      && !String(error.message).includes(delivered.receipt.messageId)
-  );
-
-  assert.throws(
-    () => sendWorkerMessage({
-      root,
-      principal: principal(root),
-      workerId: spawned.handle.id,
-      message: "x".repeat(16001),
-      idempotencyKey: "mb-send-too-large",
-      env
-    }),
-    (error) => error?.code === "E_USAGE"
-  );
-  assert.throws(
-    () => sendWorkerMessage({
-      root,
-      principal: principal(root),
-      workerId: spawned.handle.id,
-      message: "Async adapter",
-      idempotencyKey: "mb-send-async-function",
-      env,
-      deliver: async () => "delivered"
     }),
     (error) => error?.code === "E_CAPABILITY"
   );
-  const thenable = sendWorkerMessage({
-    root,
-    principal: principal(root),
-    workerId: spawned.handle.id,
-    message: "Thenable adapter",
-    idempotencyKey: "mb-send-thenable",
-    env,
-    deliver: () => Promise.resolve("delivered")
+});
+
+test("durable cancellation rejects queued turns and prevents another provider prompt between turns", async () => {
+  const fixture = openMailboxFixture({
+    attemptId: "2".repeat(32),
+    idempotencyKey: "mb-spawn-cancel-barrier-0001"
   });
-  assert.equal(thenable.receipt.state, "delivery_unknown");
-  assert.equal(thenable.receipt.reason, "async-delivery-unsupported");
+  const first = sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "Complete the current mailbox turn",
+    idempotencyKey: "mb-send-cancel-barrier-0001",
+    env: fixture.env
+  });
+  const second = sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "This queued turn must never cross ACP",
+    idempotencyKey: "mb-send-cancel-barrier-0002",
+    env: fixture.env
+  });
+  const client = mailboxClient();
+  const originalDispatch = client.dispatchReserved.bind(client);
+  client.dispatchReserved = async (...args) => {
+    const response = await originalDispatch(...args);
+    cancelWorker({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      idempotencyKey: "mb-cancel-between-turns-0001",
+      env: fixture.env
+    });
+    return response;
+  };
+  const cancelRequested = () => {
+    const current = tryReadJob(fixture.root, fixture.workerId, fixture.env);
+    return isCancelRequested(
+      fixture.root,
+      fixture.workerId,
+      cancellationNonce(current),
+      fixture.env
+    );
+  };
+
+  await assert.rejects(
+    () => drainWorkerMailbox({
+      root: fixture.root,
+      workerId: fixture.workerId,
+      attemptId: fixture.attemptId,
+      client,
+      sessionId: SESSION,
+      composePrompt: ({ message, sequence }) => composeMailboxTurnPrompt(message, {
+        sequence,
+        workerId: fixture.workerId
+      }),
+      collectTurnText: () => ({ text: () => "first turn completed" }),
+      cancelRequested,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_CANCELLED"
+  );
+  assert.equal(client.calls.length, 1);
+  assert.deepEqual(
+    listAttemptMessages(
+      fixture.root,
+      fixture.workerId,
+      fixture.attemptId,
+      fixture.env
+    ).map((record) => record.state),
+    ["delivered", "rejected"]
+  );
+  assert.equal(readAttemptMailbox(
+    fixture.root,
+    fixture.workerId,
+    fixture.attemptId,
+    fixture.env
+  ).state, "closed");
+  assert.equal(assertNoRetainedBodies(
+    fixture.root,
+    fixture.workerId,
+    fixture.attemptId,
+    fixture.env
+  ), true);
+
+  assert.throws(
+    () => sendWorkerMessage({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      message: "Must be rejected after the durable cancellation marker",
+      idempotencyKey: "mb-send-after-cancel-barrier-0001",
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_JOB_NOT_FOUND"
+  );
+  const firstReplay = sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "Complete the current mailbox turn",
+    idempotencyKey: "mb-send-cancel-barrier-0001",
+    env: fixture.env
+  });
+  const secondReplay = sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "This queued turn must never cross ACP",
+    idempotencyKey: "mb-send-cancel-barrier-0002",
+    env: fixture.env
+  });
+  assert.equal(firstReplay.receipt.messageId, first.receipt.messageId);
+  assert.equal(firstReplay.receipt.state, "delivered");
+  assert.equal(secondReplay.receipt.messageId, second.receipt.messageId);
+  assert.equal(secondReplay.receipt.state, "rejected");
+});
+
+test("cancellation between claim and dispatch rejects claimed and queued messages without ACP bytes", async () => {
+  const fixture = openMailboxFixture({
+    attemptId: "3".repeat(32),
+    idempotencyKey: "mb-spawn-cancel-before-dispatch-0001"
+  });
+  sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "Claimed but never dispatched",
+    idempotencyKey: "mb-send-cancel-before-dispatch-0001",
+    env: fixture.env
+  });
+  sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "Queued and never dispatched",
+    idempotencyKey: "mb-send-cancel-before-dispatch-0002",
+    env: fixture.env
+  });
+  const client = mailboxClient();
+  let cancellationCommitted = false;
+  const cancelRequested = () => {
+    const current = tryReadJob(fixture.root, fixture.workerId, fixture.env);
+    return isCancelRequested(
+      fixture.root,
+      fixture.workerId,
+      cancellationNonce(current),
+      fixture.env
+    );
+  };
+
+  await assert.rejects(
+    () => drainWorkerMailbox({
+      root: fixture.root,
+      workerId: fixture.workerId,
+      attemptId: fixture.attemptId,
+      client,
+      sessionId: SESSION,
+      composePrompt: ({ message, sequence }) => {
+        if (!cancellationCommitted) {
+          cancellationCommitted = true;
+          cancelWorker({
+            root: fixture.root,
+            principal: principal(fixture.root),
+            workerId: fixture.workerId,
+            idempotencyKey: "mb-cancel-before-dispatch-0001",
+            env: fixture.env
+          });
+        }
+        return composeMailboxTurnPrompt(message, {
+          sequence,
+          workerId: fixture.workerId
+        });
+      },
+      cancelRequested,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_CANCELLED"
+  );
+  assert.equal(client.calls.length, 0);
+  assert.deepEqual(
+    listAttemptMessages(
+      fixture.root,
+      fixture.workerId,
+      fixture.attemptId,
+      fixture.env
+    ).map((record) => record.state),
+    ["rejected", "rejected"]
+  );
+  assert.equal(assertNoRetainedBodies(
+    fixture.root,
+    fixture.workerId,
+    fixture.attemptId,
+    fixture.env
+  ), true);
+});
+
+test("an inflight provider failure is delivery_unknown, blocks later messages, and never retries", async () => {
+  const fixture = openMailboxFixture({
+    attemptId: "b".repeat(32),
+    idempotencyKey: "mb-spawn-unknown-0001"
+  });
+  const ambiguous = sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "Ambiguous delivery",
+    idempotencyKey: "mb-send-unknown-0001",
+    env: fixture.env
+  });
+  sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "Must not be dispatched after ambiguity",
+    idempotencyKey: "mb-send-blocked-0001",
+    env: fixture.env
+  });
+
+  const client = mailboxClient({ reject: true });
+  const drained = await drainWorkerMailbox({
+    root: fixture.root,
+    workerId: fixture.workerId,
+    attemptId: fixture.attemptId,
+    client,
+    sessionId: SESSION,
+    composePrompt: ({ message, sequence }) => composeMailboxTurnPrompt(message, {
+      sequence,
+      workerId: fixture.workerId
+    }),
+    env: fixture.env
+  });
+  assert.equal(drained.deliveryUnknown, true);
+  assert.equal(drained.closed, true);
+  assert.equal(client.calls.length, 1);
+  const records = listAttemptMessages(
+    fixture.root,
+    fixture.workerId,
+    fixture.attemptId,
+    fixture.env
+  );
+  assert.deepEqual(records.map((record) => record.state), [
+    "delivery_unknown",
+    "rejected"
+  ]);
+  assert.equal(records[1].reason, "blocked-by-prior-unknown");
+  assert.equal(assertNoRetainedBodies(
+    fixture.root,
+    fixture.workerId,
+    fixture.attemptId,
+    fixture.env
+  ), true);
+  assert.throws(
+    () => retryDelivery(fixture.root, ambiguous.receipt.messageId, fixture.env),
+    (error) => error?.code === "E_DELIVERY"
+  );
+  const replay = sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "Ambiguous delivery",
+    idempotencyKey: "mb-send-unknown-0001",
+    env: fixture.env
+  });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.receipt.state, "delivery_unknown");
+});
+
+test("a transport poisoned before durable settlement cannot become delivered", async () => {
+  const fixture = openMailboxFixture({
+    attemptId: "4".repeat(32),
+    idempotencyKey: "mb-spawn-transport-poison-0001"
+  });
+  sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "A valid-looking response on a poisoned transport",
+    idempotencyKey: "mb-send-transport-poison-0001",
+    env: fixture.env
+  });
+  const client = mailboxClient();
+  const dispatch = client.dispatchReserved.bind(client);
+  client.dispatchReserved = async (...args) => {
+    const response = await dispatch(...args);
+    client.closed = true;
+    client.transportError = Object.assign(new Error("duplicate response poisoned transport"), {
+      code: "E_PROTOCOL"
+    });
+    return response;
+  };
+
+  const drained = await drainWorkerMailbox({
+    root: fixture.root,
+    workerId: fixture.workerId,
+    attemptId: fixture.attemptId,
+    client,
+    sessionId: SESSION,
+    composePrompt: ({ message, sequence }) => composeMailboxTurnPrompt(message, {
+      sequence,
+      workerId: fixture.workerId
+    }),
+    env: fixture.env
+  });
+  assert.equal(drained.deliveryUnknown, true);
+  assert.equal(drained.closed, true);
+  assert.equal(client.calls.length, 1);
+  const [record] = listAttemptMessages(
+    fixture.root,
+    fixture.workerId,
+    fixture.attemptId,
+    fixture.env
+  );
+  assert.equal(record.state, "delivery_unknown");
+  assert.equal(record.reason, "prompt-error-or-malformed");
+  assert.equal(assertNoRetainedBodies(
+    fixture.root,
+    fixture.workerId,
+    fixture.attemptId,
+    fixture.env
+  ), true);
+});
+
+test("new send admission fails closed on durable attempt drift while terminal replay stays immutable", () => {
+  const fixture = openMailboxFixture({
+    attemptId: "d".repeat(32),
+    idempotencyKey: "mb-spawn-authority-0001"
+  });
+  const first = sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "Durably accepted before drift",
+    idempotencyKey: "mb-send-before-drift-0001",
+    env: fixture.env
+  });
+  const original = tryReadJob(fixture.root, fixture.workerId, fixture.env);
+  const cases = [
+    ["dispatch-fence", (job) => {
+      job.request.spawn.dispatch.fence += 1;
+    }],
+    ["worker-process", (job) => {
+      job.workerProcess.startToken = "changed-worker-start";
+    }],
+    ["provider-process", (job) => {
+      job.providerProcess.startToken = "changed-provider-start";
+    }],
+    ["provider-session", (job) => {
+      job.grokSessionId = "changed-provider-session";
+    }],
+    ["provider-capability", (job) => {
+      job.request.spawn.providerCapabilityDigest = "9".repeat(64);
+    }],
+    ["role-policy", (job) => {
+      job.request.runtimeRolePolicy.digest = "8".repeat(64);
+    }]
+  ];
+  for (const [label, mutate] of cases) {
+    updateJob(fixture.root, fixture.workerId, () => {
+      const changed = structuredClone(original);
+      mutate(changed);
+      return changed;
+    }, fixture.env);
+    assert.throws(
+      () => sendWorkerMessage({
+        root: fixture.root,
+        principal: principal(fixture.root),
+        workerId: fixture.workerId,
+        message: `Must fail after ${label}`,
+        idempotencyKey: `mb-send-drift-${label}-0001`,
+        env: fixture.env
+      }),
+      (error) => error?.code === "E_PROCESS_IDENTITY",
+      label
+    );
+    assert.equal(readAttemptMailbox(
+      fixture.root,
+      fixture.workerId,
+      fixture.attemptId,
+      fixture.env
+    ).acceptedCount, 1);
+  }
+
+  updateJob(fixture.root, fixture.workerId, () => ({
+    ...structuredClone(original),
+    status: "failed",
+    phase: "failed",
+    error: { code: "E_WORKER_LOST", message: "Worker stopped." }
+  }), fixture.env);
+  assert.throws(
+    () => sendWorkerMessage({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      message: "Must not enter a stale terminal mailbox",
+      idempotencyKey: "mb-send-after-terminal-0001",
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_JOB_NOT_FOUND"
+  );
+  const beforeReplay = tryReadJob(fixture.root, fixture.workerId, fixture.env);
+  const replay = sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "Durably accepted before drift",
+    idempotencyKey: "mb-send-before-drift-0001",
+    env: fixture.env
+  });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.receipt.messageId, first.receipt.messageId);
+  assert.deepEqual(
+    tryReadJob(fixture.root, fixture.workerId, fixture.env),
+    beforeReplay
+  );
+  settleInterruptedAttempt(
+    fixture.root,
+    fixture.workerId,
+    fixture.attemptId,
+    { reason: "test-cleanup" },
+    fixture.env
+  );
+  assert.equal(assertNoRetainedBodies(
+    fixture.root,
+    fixture.workerId,
+    fixture.attemptId,
+    fixture.env
+  ), true);
+});
+
+test("mailbox recovery recomputes the full primary-to-terminal chain and rejects missing or resealed turns", async () => {
+  async function deliveredFixture(attemptId, idempotencyKey) {
+    const fixture = openMailboxFixture({ attemptId, idempotencyKey });
+    sendWorkerMessage({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      message: "One delivered recovery turn",
+      idempotencyKey: `${idempotencyKey}-send`,
+      env: fixture.env
+    });
+    await drainWorkerMailbox({
+      root: fixture.root,
+      workerId: fixture.workerId,
+      attemptId: fixture.attemptId,
+      client: mailboxClient(),
+      sessionId: SESSION,
+      composePrompt: ({ message, sequence }) => composeMailboxTurnPrompt(message, {
+        sequence,
+        workerId: fixture.workerId
+      }),
+      env: fixture.env
+    });
+    return fixture;
+  }
+
+  const forward = await deliveredFixture(
+    "e".repeat(32),
+    "mb-recovery-forward-0001"
+  );
+  const forwardAttemptFile = path.join(mailboxAttemptDirectory(forward), "attempt.json");
+  mutateAndResealPrivateRecord(forwardAttemptFile, "attemptDigest", (attempt) => {
+    attempt.state = "open";
+    attempt.closedAt = null;
+    attempt.closeReason = null;
+    attempt.communicationChainDigest = attempt.primaryTurnEvidence.turnDigest;
+    attempt.lastCompletedSequence = 0;
+    attempt.lastCompletedTurnDigest = attempt.primaryTurnEvidence.turnDigest;
+    attempt.finalReportSequence = null;
+    attempt.finalReportDigest = null;
+  });
+  const repaired = recoverAttemptConsistency(
+    forward.root,
+    forward.workerId,
+    forward.attemptId,
+    forward.env
+  );
+  assert.equal(repaired.lastCompletedSequence, 1);
+  assert.equal(
+    repaired.communicationChainDigest,
+    listAttemptMessages(
+      forward.root,
+      forward.workerId,
+      forward.attemptId,
+      forward.env
+    )[0].turnDigest
+  );
+
+  const missing = await deliveredFixture(
+    "f".repeat(32),
+    "mb-recovery-missing-0001"
+  );
+  const [missingRecord] = listAttemptMessages(
+    missing.root,
+    missing.workerId,
+    missing.attemptId,
+    missing.env
+  );
+  fs.unlinkSync(path.join(
+    mailboxAttemptDirectory(missing),
+    `${missingRecord.messageId}.json`
+  ));
+  assert.throws(
+    () => recoverAttemptConsistency(
+      missing.root,
+      missing.workerId,
+      missing.attemptId,
+      missing.env
+    ),
+    (error) => error?.code === "E_STATE"
+  );
+
+  const tampered = await deliveredFixture(
+    "1".repeat(32),
+    "mb-recovery-tampered-0001"
+  );
+  const [tamperedRecord] = listAttemptMessages(
+    tampered.root,
+    tampered.workerId,
+    tampered.attemptId,
+    tampered.env
+  );
+  const tamperedFile = path.join(
+    mailboxAttemptDirectory(tampered),
+    `${tamperedRecord.messageId}.json`
+  );
+  mutateAndResealPrivateRecord(tamperedFile, "messageDigest", (record) => {
+    const turn = {
+      ...record.turnEvidence,
+      previousDigest: "7".repeat(64)
+    };
+    delete turn.turnDigest;
+    turn.turnDigest = stableDigest(turn);
+    record.turnEvidence = turn;
+    record.turnDigest = turn.turnDigest;
+  });
+  assert.throws(
+    () => recoverAttemptConsistency(
+      tampered.root,
+      tampered.workerId,
+      tampered.attemptId,
+      tampered.env
+    ),
+    (error) => error?.code === "E_STATE"
+  );
 });
 
 test("followup preserves root lineage through an exact grant and rejects caller authority fields", () => {
@@ -465,33 +1156,20 @@ test("followup requires the broker-branded exact root owner", () => {
   );
 });
 
-test("mailbox send stays idempotent across process boundaries and crash ambiguity", async () => {
-  const root = initRepo();
-  const env = envFor();
-  const spawned = spawnReadOnlyWorker({
-    root,
-    principal: principal(root),
-    envelope: buildTaskEnvelope({ userRequest: "Concurrent mailbox", mode: "read" }),
-    idempotencyKey: "mb-cross-process-parent",
-    env
+test("mailbox acceptance stays idempotent across process boundaries and the provider pump dispatches once", async () => {
+  const fixture = openMailboxFixture({
+    attemptId: "c".repeat(32),
+    idempotencyKey: "mb-cross-process-parent"
   });
-  updateJob(root, spawned.handle.id, (job) => ({ ...job, status: "running", phase: "executing" }), env);
-  const deliveryDir = tempDir("grok-mailbox-delivery-marker-");
-  const deliveryMarker = path.join(deliveryDir, "deliveries.log");
   const sendSource = `
-    import fs from "node:fs";
     import { sendWorkerMessage } from ${JSON.stringify(MAILBOX_MODULE)};
     const result = sendWorkerMessage({
-      root: ${JSON.stringify(root)},
-      env: ${JSON.stringify(env)},
-      principal: ${JSON.stringify(principal(root))},
-      workerId: ${JSON.stringify(spawned.handle.id)},
+      root: ${JSON.stringify(fixture.root)},
+      env: ${JSON.stringify(fixture.env)},
+      principal: ${JSON.stringify(principal(fixture.root))},
+      workerId: ${JSON.stringify(fixture.workerId)},
       message: "One provider delivery",
-      idempotencyKey: "mb-cross-process-send",
-      deliver: () => {
-        fs.appendFileSync(${JSON.stringify(deliveryMarker)}, "delivery\\n");
-        return "delivered";
-      }
+      idempotencyKey: "mb-cross-process-send"
     });
     console.log(JSON.stringify(result));
   `;
@@ -500,96 +1178,37 @@ test("mailbox send stays idempotent across process boundaries and crash ambiguit
   const sendResults = sendRuns.map((run) => lastJson(run.stdout));
   assert.equal(sendResults[0].receipt.messageId, sendResults[1].receipt.messageId);
   assert.deepEqual(sendResults.map((result) => result.replayed).sort(), [false, true]);
-  assert.equal(fs.readFileSync(deliveryMarker, "utf8").trim().split(/\r?\n/).length, 1);
+  assert.equal(listAttemptMessages(
+    fixture.root,
+    fixture.workerId,
+    fixture.attemptId,
+    fixture.env
+  ).length, 1);
 
-  const terminalBeforeEventSource = `
-    import fs from "node:fs";
-    const rename = fs.renameSync.bind(fs);
-    fs.renameSync = (source, target) => {
-      let terminalMailboxWrite = false;
-      try {
-        const record = JSON.parse(fs.readFileSync(source, "utf8"));
-        terminalMailboxWrite = String(target).includes("/mailbox/") && record.state === "delivered";
-      } catch {}
-      const result = rename(source, target);
-      if (terminalMailboxWrite) process.exit(24);
-      return result;
-    };
-    const { sendWorkerMessage } = await import(${JSON.stringify(MAILBOX_MODULE)});
-    sendWorkerMessage({
-      root: ${JSON.stringify(root)},
-      env: ${JSON.stringify(env)},
-      principal: ${JSON.stringify(principal(root))},
-      workerId: ${JSON.stringify(spawned.handle.id)},
-      message: "Terminal record before lifecycle event",
-      idempotencyKey: "mb-terminal-before-event",
-      deliver: () => "delivered"
-    });
-  `;
-  const terminalBeforeEvent = await runIsolatedModule(terminalBeforeEventSource);
-  assert.equal(terminalBeforeEvent.code, 24, terminalBeforeEvent.stderr);
-  let terminalRedeliveries = 0;
-  const repairedTerminal = sendWorkerMessage({
-    root,
-    env,
-    principal: principal(root),
-    workerId: spawned.handle.id,
-    message: "Terminal record before lifecycle event",
-    idempotencyKey: "mb-terminal-before-event",
-    deliver: () => { terminalRedeliveries += 1; return "delivered"; }
+  const client = mailboxClient();
+  await drainWorkerMailbox({
+    root: fixture.root,
+    workerId: fixture.workerId,
+    attemptId: fixture.attemptId,
+    client,
+    sessionId: SESSION,
+    composePrompt: ({ message, sequence }) => composeMailboxTurnPrompt(message, {
+      sequence,
+      workerId: fixture.workerId
+    }),
+    env: fixture.env
   });
-  assert.equal(repairedTerminal.replayed, true);
-  assert.equal(repairedTerminal.receipt.state, "delivered");
-  assert.equal(terminalRedeliveries, 0);
-  const repairedEvents = (tryReadJob(root, spawned.handle.id, env).lifecycleEvents || []).filter((event) => (
-    event.detail?.messageId === repairedTerminal.receipt.messageId
-    && event.detail?.state === "delivered"
-  ));
-  assert.equal(repairedEvents.length, 1);
-  sendWorkerMessage({
-    root,
-    env,
-    principal: principal(root),
-    workerId: spawned.handle.id,
-    message: "Terminal record before lifecycle event",
-    idempotencyKey: "mb-terminal-before-event",
-    deliver: () => { terminalRedeliveries += 1; return "delivered"; }
+  assert.equal(client.calls.length, 1);
+  const terminal = sendWorkerMessage({
+    root: fixture.root,
+    env: fixture.env,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "One provider delivery",
+    idempotencyKey: "mb-cross-process-send"
   });
-  assert.equal((tryReadJob(root, spawned.handle.id, env).lifecycleEvents || []).filter((event) => (
-    event.detail?.messageId === repairedTerminal.receipt.messageId
-    && event.detail?.state === "delivered"
-  )).length, 1);
-  assert.equal(terminalRedeliveries, 0);
-
-  const interruptedSource = `
-    import { sendWorkerMessage } from ${JSON.stringify(MAILBOX_MODULE)};
-    sendWorkerMessage({
-      root: ${JSON.stringify(root)},
-      env: ${JSON.stringify(env)},
-      principal: ${JSON.stringify(principal(root))},
-      workerId: ${JSON.stringify(spawned.handle.id)},
-      message: "Crash during provider delivery",
-      idempotencyKey: "mb-cross-process-crash",
-      deliver: () => process.exit(23)
-    });
-  `;
-  const interrupted = await runIsolatedModule(interruptedSource);
-  assert.equal(interrupted.code, 23, interrupted.stderr);
-  let redeliveries = 0;
-  const recovered = sendWorkerMessage({
-    root,
-    env,
-    principal: principal(root),
-    workerId: spawned.handle.id,
-    message: "Crash during provider delivery",
-    idempotencyKey: "mb-cross-process-crash",
-    deliver: () => { redeliveries += 1; return "delivered"; }
-  });
-  assert.equal(recovered.replayed, true);
-  assert.equal(recovered.receipt.state, "delivery_unknown");
-  assert.equal(recovered.receipt.reason, "interrupted-delivery");
-  assert.equal(redeliveries, 0);
-
+  assert.equal(terminal.replayed, true);
+  assert.equal(terminal.receipt.state, "delivered");
 });
 
 test("one grant has one cross-process child reservation and cancellation never refunds it", async () => {

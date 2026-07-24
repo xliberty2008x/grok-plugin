@@ -257,15 +257,21 @@ export function createWorkerService({
       return { receipt: projectCancellationReceipt(receipt), replayed };
     },
 
-    send({ id, message, idempotencyKey, deliver = null } = {}) {
+    send({ id, message, idempotencyKey } = {}) {
       if (!id) throw new CompanionError("E_USAGE", "id is required for send.");
+      if (typeof providerCapabilityDigest === "string"
+        && currentCapabilityDigest() !== providerCapabilityDigest) {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "The installed provider capability changed before mailbox admission."
+        );
+      }
       return sendWorkerMessage({
         root,
         principal,
         workerId: id,
         message,
         idempotencyKey,
-        deliver,
         env
       });
     },
