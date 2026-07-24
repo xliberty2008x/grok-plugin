@@ -12,7 +12,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const REVIEW_DOMAIN = "grok-plugin/worker-broker/phase-1-review-attestation/v1";
 const REVIEW_ALGORITHM = "Ed25519";
@@ -21,14 +22,18 @@ const MAX_DESCRIPTOR_BYTES = 64 * 1024;
 const MAX_RUNTIME_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_ATTESTATION_BYTES = 256 * 1024;
 const MAX_EXECUTABLE_BYTES = 128 * 1024 * 1024;
+const MAX_OPERATION_OUTPUT_BYTES = 1024 * 1024;
 const PROTECTED_GIT_PATH = "/usr/bin/git";
 const EMPTY_HOOKS_RELATIVE_PATH = ".worker-broker-host-state/empty-hooks";
+const OPERATION_RELATIVE_PATH =
+  "scripts/trusted/worker-broker-review-operation.cjs";
 const SHA256 = /^[0-9a-f]{64}$/;
 const RUNTIME_BUNDLE_PATHS = Object.freeze([
   "plugins/grok/scripts/lib/redact.mjs",
   "scripts/lib/plugin-inventory.mjs",
   "scripts/lib/static-esm-import-parser.mjs",
   "scripts/lib/worker-broker-evidence.mjs",
+  OPERATION_RELATIVE_PATH,
   "scripts/trusted/worker-broker-review.mjs"
 ]);
 const DESCRIPTOR_FIELDS = Object.freeze([
@@ -65,6 +70,7 @@ const POLICY = Object.freeze({
   gitPath: PROTECTED_GIT_PATH,
   emptyHooksPath: EMPTY_HOOKS_RELATIVE_PATH,
   runtimeBundlePaths: RUNTIME_BUNDLE_PATHS,
+  operationPath: OPERATION_RELATIVE_PATH,
   workspaceRole: "data-only",
   privateKeyLocation: "external-issuer-only"
 });
@@ -367,6 +373,9 @@ function boundedResult(result) {
       ok: result.ok === true,
       converged: result.converged === true,
       path: result.path || null,
+      phase: result.phase || null,
+      slice: result.slice || null,
+      status: result.status || null,
       recordDigest: result.recordDigest
     };
   }
@@ -399,6 +408,52 @@ function boundedFailure(error) {
     if (SHA256.test(error?.recordDigest || "")) result.recordDigest = error.recordDigest;
   }
   return result;
+}
+
+function invokeProtectedOperation(runtimeRoot, parsed, attestation) {
+  const operationPath = path.join(runtimeRoot, OPERATION_RELATIVE_PATH);
+  const result = spawnSync(
+    process.execPath,
+    [operationPath, ...process.argv.slice(2)],
+    {
+      cwd: runtimeRoot,
+      env: {
+        PATH: CLEAN_PATH,
+        LANG: "C",
+        LC_ALL: "C",
+        TZ: "UTC"
+      },
+      input: parsed.mode === "promote"
+        ? `${stableStringify(attestation)}\n`
+        : "",
+      encoding: "utf8",
+      shell: false,
+      timeout: 35 * 60_000,
+      maxBuffer: MAX_OPERATION_OUTPUT_BYTES
+    }
+  );
+  const stdout = String(result.stdout || "");
+  const stderr = String(result.stderr || "");
+  if (result.error
+    || result.signal
+    || !new Set([0, 1]).has(result.status)
+    || stderr !== ""
+    || Buffer.byteLength(stdout, "utf8") > MAX_OPERATION_OUTPUT_BYTES) {
+    throw trustError();
+  }
+  let payload;
+  try {
+    payload = JSON.parse(stdout);
+  } catch {
+    throw trustError();
+  }
+  if (!payload
+    || typeof payload !== "object"
+    || Array.isArray(payload)
+    || payload.ok !== (result.status === 0)) {
+    throw trustError();
+  }
+  return payload;
 }
 
 async function main() {
@@ -443,36 +498,24 @@ async function main() {
       MAX_RUNTIME_FILE_BYTES
     ))) throw trustError();
   }
-
-  const runtimeModule = path.join(runtimeRoot, "scripts/lib/worker-broker-evidence.mjs");
-  const api = await import(pathToFileURL(runtimeModule).href);
-  if (parsed.mode === "promote") {
-    return api.promotePhaseOneFromProtectedRuntime({
-      workspace: parsed.values["--workspace"],
-      requestPath: parsed.values["--request"],
-      attestation: await readBoundedAttestation()
-    });
-  }
-  if (parsed.mode === "prove-phase-2") {
-    return api.provePhaseTwoFromProtectedRuntime({
-      workspace: parsed.values["--workspace"]
-    });
-  }
-  if (parsed.mode === "verify-phase-2") {
-    return api.verifyPhaseTwoFromProtectedRuntime({
-      workspace: parsed.values["--workspace"]
-    });
-  }
-  return api.verifySignedLedgerFromProtectedRuntime({
-      workspace: parsed.values["--workspace"]
-  });
+  const attestation = parsed.mode === "promote"
+    ? await readBoundedAttestation()
+    : null;
+  return invokeProtectedOperation(runtimeRoot, parsed, attestation);
 }
 
-try {
-  const result = await main();
-  process.stdout.write(`${JSON.stringify(boundedResult(result), null, 2)}\n`);
-  if (result?.ok !== true) process.exitCode = 1;
-} catch (error) {
-  process.stdout.write(`${JSON.stringify(boundedFailure(error), null, 2)}\n`);
+if (import.meta.main === true) {
+  try {
+    const result = await main();
+    process.stdout.write(`${JSON.stringify(boundedResult(result), null, 2)}\n`);
+    if (result?.ok !== true) process.exitCode = 1;
+  } catch (error) {
+    process.stdout.write(`${JSON.stringify(boundedFailure(error), null, 2)}\n`);
+    process.exitCode = 1;
+  }
+} else if (import.meta.main === undefined) {
+  process.stdout.write(
+    `${JSON.stringify({ ok: false, code: "E_REVIEW_TRUST_UNAVAILABLE" }, null, 2)}\n`
+  );
   process.exitCode = 1;
 }

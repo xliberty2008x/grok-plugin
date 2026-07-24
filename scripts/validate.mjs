@@ -284,6 +284,7 @@ if (!versionsOnly) {
     "scripts/lib/installed-worker-mcp-mailbox-poll.mjs",
     "scripts/lib/installed-worker-mcp-setup-boundary.mjs",
     "scripts/lib/installed-worker-mcp-session-boundary.mjs",
+    "scripts/trusted/worker-broker-review-operation.cjs",
     "scripts/trusted/worker-broker-review.mjs",
     "tests/live-grok.test.mjs",
     "tests/installed-codex.test.mjs",
@@ -748,10 +749,15 @@ if (!versionsOnly) {
     "scripts/trusted/worker-broker-review.mjs",
     { required: false }
   );
+  const protectedReviewOperation = readText(
+    "scripts/trusted/worker-broker-review-operation.cjs",
+    { required: false }
+  );
   if (protectedReviewBootstrap != null) {
     const file = "scripts/trusted/worker-broker-review.mjs";
     const staticImports = staticImportSpecifiers(protectedReviewBootstrap, file);
     const expectedStaticImports = [
+      "node:child_process",
       "node:crypto",
       "node:fs",
       "node:path",
@@ -769,8 +775,8 @@ if (!versionsOnly) {
       "const bundleBefore = new Map();",
       "const descriptorAfter = readProtectedFile(",
       "if (!sameSnapshot(descriptorBefore, descriptorAfter))",
-      "const runtimeModule = path.join(",
-      "const api = await import(pathToFileURL(runtimeModule).href)"
+      "const attestation = parsed.mode === \"promote\"",
+      "return invokeProtectedOperation(runtimeRoot, parsed, attestation)"
     ].map((marker) => protectedReviewBootstrap.indexOf(marker));
     const verificationOrderIsBound = verificationMilestones.every((
       index,
@@ -781,11 +787,19 @@ if (!versionsOnly) {
       "scripts/lib/plugin-inventory.mjs",
       "scripts/lib/static-esm-import-parser.mjs",
       "scripts/lib/worker-broker-evidence.mjs",
+      "scripts/trusted/worker-broker-review-operation.cjs",
       "scripts/trusted/worker-broker-review.mjs"
     ];
     if (!staticImports
       || JSON.stringify(staticImports) !== JSON.stringify(expectedStaticImports)
-      || !protectedReviewBootstrap.includes("await import(pathToFileURL(runtimeModule).href)")
+      || protectedReviewBootstrap.includes("api.")
+      || protectedReviewBootstrap.includes("pathToFileURL")
+      || !protectedReviewBootstrap.includes("if (import.meta.main === true)")
+      || !protectedReviewBootstrap.includes("import.meta.main === undefined")
+      || !protectedReviewBootstrap.includes("function invokeProtectedOperation(")
+      || !protectedReviewBootstrap.includes("spawnSync(")
+      || !protectedReviewBootstrap.includes("OPERATION_RELATIVE_PATH")
+      || !protectedReviewBootstrap.includes("MAX_OPERATION_OUTPUT_BYTES")
       || !protectedReviewBootstrap.includes("runtimeBundleDigest")
       || !protectedReviewBootstrap.includes("stat.uid !== 0")
       || !protectedReviewBootstrap.includes("fs.constants.W_OK")
@@ -815,18 +829,22 @@ if (!versionsOnly) {
       )
       || !protectedReviewBootstrap.includes('new Set(["--workspace"])')
       || !protectedReviewBootstrap.includes(
-        "attestation: await readBoundedAttestation()"
+        "? await readBoundedAttestation()"
       )
       || !protectedReviewBootstrap.includes('"prove-phase-2"')
       || !protectedReviewBootstrap.includes('"verify-phase-2"')
-      || !protectedReviewBootstrap.includes("api.provePhaseTwoFromProtectedRuntime")
-      || !protectedReviewBootstrap.includes("api.verifyPhaseTwoFromProtectedRuntime")
       || requiredRuntimeBundlePaths.some((relative) => (
         !protectedReviewBootstrap.includes(JSON.stringify(relative))
       ))
+      || protectedReviewOperation == null
+      || !protectedReviewOperation.includes("if (require.main === module)")
+      || !protectedReviewOperation.includes("Object.freeze(module.exports)")
+      || !protectedReviewOperation.includes("worker-broker-evidence.mjs")
+      || !protectedReviewOperation.includes("GROK_PROTECTED_OPERATION_CHILD")
+      || !protectedReviewOperation.includes("spawnSync(")
       || !verificationOrderIsBound) {
       problem(
-        "Protected review bootstrap must bind clean process authority, exact Git, bounded stdin, and a fixed root-owned non-writable bundle before dynamic import.",
+        "Protected review bootstrap must bind clean process authority, exact Git, bounded stdin, and a fixed root-owned non-writable bundle before the fresh main-only operation process.",
         file
       );
     }

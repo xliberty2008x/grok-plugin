@@ -792,7 +792,8 @@ function removeContainer(binding, { strict = true } = {}) {
 function protectedCommand(name, mode, args, {
   input,
   pathValue = "/usr/bin:/bin",
-  nodeOptions = null
+  nodeOptions = null,
+  timeout = 120_000
 } = {}) {
   const environment = [`PATH=${pathValue}`];
   if (nodeOptions != null) environment.push(`NODE_OPTIONS=${nodeOptions}`);
@@ -809,7 +810,7 @@ function protectedCommand(name, mode, args, {
     REVIEW_BOOTSTRAP,
     mode,
     ...args
-  ], { input, timeout: 120_000 });
+  ], { input, timeout });
 }
 
 function parseProtectedResult(result, {
@@ -932,10 +933,15 @@ function inspectPositiveWorkspace(name, destination) {
   const historical = ledger.entries.filter((entry) => (
     entry.phase === "1" && entry.currency === "historical"
   ));
+  const phaseTwoCurrent = ledger.entries.filter((entry) => (
+    entry.phase === "2" && entry.currency === "current"
+  ));
   assert.equal(current.length, 1);
   assert.equal(current[0].status, "verified_on_draft");
   assert.equal(historical.length, 1);
   assert.equal(historical[0].status, "implemented_unverified");
+  assert.equal(phaseTwoCurrent.length, 1);
+  assert.equal(phaseTwoCurrent[0].status, "verified_on_draft");
   const record = JSON.parse(fs.readFileSync(
     path.join(root, path.relative(
       "tests/e2e-results/worker-broker",
@@ -943,12 +949,35 @@ function inspectPositiveWorkspace(name, destination) {
     )),
     "utf8"
   ));
-  return { root, ledger, current: current[0], historical: historical[0], record };
+  const phaseTwoRecord = JSON.parse(fs.readFileSync(
+    path.join(root, path.relative(
+      "tests/e2e-results/worker-broker",
+      phaseTwoCurrent[0].path
+    )),
+    "utf8"
+  ));
+  return {
+    root,
+    ledger,
+    current: current[0],
+    historical: historical[0],
+    record,
+    phaseTwoCurrent: phaseTwoCurrent[0],
+    phaseTwoRecord
+  };
 }
 
 test("protected runtime owns the exact fixed Phase 2 modes", () => {
   const bootstrap = fs.readFileSync(
     path.join(ROOT, "scripts/trusted/worker-broker-review.mjs"),
+    "utf8"
+  );
+  const operation = fs.readFileSync(
+    path.join(ROOT, "scripts/trusted/worker-broker-review-operation.cjs"),
+    "utf8"
+  );
+  const evidenceRuntime = fs.readFileSync(
+    path.join(ROOT, "scripts/lib/worker-broker-evidence.mjs"),
     "utf8"
   );
   assert.equal(PHASE_TWO_SLICE, "mailbox-context-roles");
@@ -960,11 +989,27 @@ test("protected runtime owns the exact fixed Phase 2 modes", () => {
   for (const marker of [
     '"prove-phase-2"',
     '"verify-phase-2"',
-    "api.provePhaseTwoFromProtectedRuntime",
-    "api.verifyPhaseTwoFromProtectedRuntime"
+    "invokeProtectedOperation(runtimeRoot, parsed, attestation)",
+    "OPERATION_RELATIVE_PATH",
+    "spawnSync"
   ]) {
     assert.equal(bootstrap.includes(marker), true, marker);
   }
+  assert.equal(bootstrap.includes("api."), false);
+  for (const marker of [
+    "if (require.main === module)",
+    "Object.freeze(module.exports)",
+    "worker-broker-evidence.mjs",
+    "GROK_PROTECTED_OPERATION_CHILD"
+  ]) {
+    assert.equal(operation.includes(marker), true, marker);
+  }
+  assert.equal(
+    /export\s+(?:async\s+)?function\s+(?:promotePhaseOneFromProtectedRuntime|verifySignedLedgerFromProtectedRuntime|provePhaseTwoFromProtectedRuntime|verifyPhaseTwoFromProtectedRuntime)/u
+      .test(evidenceRuntime),
+    false
+  );
+  assert.equal(evidenceRuntime.includes("if (import.meta.main === true)"), true);
   assert.equal(
     PHASE_PROOF_GATE_MANIFEST["2"][1].argv.join("\0"),
     ["node", "scripts/test-phase2-focused.mjs"].join("\0")
@@ -973,7 +1018,7 @@ test("protected runtime owns the exact fixed Phase 2 modes", () => {
 
 test("root-owned protected review runtime promotes and replays exact signed evidence", {
   skip: !REQUIRED,
-  timeout: 15 * 60_000
+  timeout: 60 * 60_000
 }, (t) => {
   dockerAuthority = establishDockerAuthority();
   try {
@@ -1115,19 +1160,56 @@ test("root-owned protected review runtime promotes and replays exact signed evid
       ["--workspace", WORKSPACE]
     )
   )), { status: 0, label: "post-promotion verify" });
+  const phaseTwo = parseProtectedResult(withBoundContainer(
+    positive,
+    (containerId) => protectedCommand(
+      containerId,
+      "prove-phase-2",
+      ["--workspace", WORKSPACE],
+      { timeout: 35 * 60_000 }
+    )
+  ), { status: 0, label: "Phase 2 proof" });
+  assert.equal(phaseTwo.phase, "2");
+  assert.equal(phaseTwo.slice, PHASE_TWO_SLICE);
+  assert.equal(phaseTwo.status, "verified_on_draft");
+  assert.match(phaseTwo.recordDigest, /^[0-9a-f]{64}$/);
+  const phaseTwoReplay = parseProtectedResult(withBoundContainer(
+    positive,
+    (containerId) => protectedCommand(
+      containerId,
+      "verify-phase-2",
+      ["--workspace", WORKSPACE]
+    )
+  ), { status: 0, label: "Phase 2 replay" });
+  assert.equal(phaseTwoReplay.integrityOk, true);
+  assert.equal(phaseTwoReplay.phase, "2");
+  assert.equal(phaseTwoReplay.slice, PHASE_TWO_SLICE);
+  assert.equal(phaseTwoReplay.status, "verified_on_draft");
+  assert.equal(phaseTwoReplay.recordDigest, phaseTwo.recordDigest);
+  assert.equal(phaseTwoReplay.verified, true);
   withBoundContainer(positive, (containerId) => (
     requireSuccess(docker(["stop", containerId]), "stop protected runtime")
   ));
   withBoundContainer(positive, (containerId) => (
     requireSuccess(docker(["start", containerId]), "restart protected runtime")
   ));
+  const phaseTwoRestartReplay = parseProtectedResult(withBoundContainer(
+    positive,
+    (containerId) => (
+    protectedCommand(
+      containerId,
+      "verify-phase-2",
+      ["--workspace", WORKSPACE]
+    )
+  )), { status: 0, label: "post-restart Phase 2 replay" });
+  assert.equal(phaseTwoRestartReplay.recordDigest, phaseTwo.recordDigest);
   parseProtectedResult(withBoundContainer(positive, (containerId) => (
     protectedCommand(
       containerId,
       "verify",
       ["--workspace", WORKSPACE]
     )
-  )), { status: 0, label: "post-restart verify" });
+  )), { status: 0, label: "post-restart full ledger verify" });
 
   const copied = tempDir("grok-protected-review-result-");
   temporary.add(copied);
@@ -1135,6 +1217,9 @@ test("root-owned protected review runtime promotes and replays exact signed evid
     inspectPositiveWorkspace(containerId, copied)
   ));
   assert.equal(inspected.current.recordDigest, promoted.recordDigest);
+  assert.equal(inspected.phaseTwoCurrent.recordDigest, phaseTwo.recordDigest);
+  assert.equal(inspected.phaseTwoRecord.phase, "2");
+  assert.equal(inspected.phaseTwoRecord.slice, PHASE_TWO_SLICE);
   assert.equal(inspected.historical.path, fixture.originalPhaseOnePath);
   assert.equal(inspected.record.independentReviewReceipt.schemaVersion, 2);
   const attestationRelative = inspected.record.independentReviewReceipt.attestation.path;
@@ -1515,6 +1600,8 @@ test("root-owned protected review runtime promotes and replays exact signed evid
     keyFingerprint: build.keyFingerprint,
     policyDigest: PROTECTED_REVIEW_POLICY_DIGEST,
     promotedRecordDigest: promoted.recordDigest,
+    phaseTwoRecordDigest: phaseTwo.recordDigest,
+    phaseTwoRestartVerified: true,
     restartVerified: true,
     negativeScenarios: negativeScenarios.map((scenario) => scenario.id)
   }));

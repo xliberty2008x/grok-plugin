@@ -68,7 +68,6 @@ import {
   phaseScopePaths,
   provePhaseZero,
   proveWorkerBrokerPhase,
-  promotePhaseOneFromProtectedRuntime,
   runCommandCapture,
   sanitizeProofEnvironment,
   statusSatisfiesVerifiedPrerequisite,
@@ -79,9 +78,6 @@ import {
   validatePhaseOneReviewRequest,
   verifyLedger,
   verifyPhase,
-  provePhaseTwoFromProtectedRuntime,
-  verifyPhaseTwoFromProtectedRuntime,
-  verifySignedLedgerFromProtectedRuntime,
   writeEvidenceRecord,
   sha256Text
 } from "../scripts/lib/worker-broker-evidence.mjs";
@@ -125,6 +121,10 @@ const REDACT_LIBRARY = path.join(ROOT, "plugins/grok/scripts/lib/redact.mjs");
 const PROTECTED_REVIEW_BOOTSTRAP = path.join(
   ROOT,
   "scripts/trusted/worker-broker-review.mjs"
+);
+const PROTECTED_REVIEW_OPERATION = path.join(
+  ROOT,
+  "scripts/trusted/worker-broker-review-operation.cjs"
 );
 const STATIC_ESM_IMPORT_PARSER = path.join(ROOT, "scripts/lib/static-esm-import-parser.mjs");
 const PHASE_ONE_FOCUSED_RUNNER = path.join(ROOT, "scripts/test-phase1-focused.mjs");
@@ -1936,6 +1936,21 @@ export function __testPublishPhaseTwo(record, root, trust) {
       signedReviewTrust
     );
     return { relative, prerequisites };
+  } finally {
+    const cleaned = proofContext.cleanup();
+    if (!cleaned?.ok) throw new Error("proof cleanup failed");
+  }
+}
+export function __testPublishPhaseZero(record, root) {
+  const proofContext = createProofExecutionContext();
+  try {
+    const source = captureProofSourceSnapshot("0", root, proofContext.toolchain);
+    return publishPhaseZeroProofRecord(
+      record,
+      root,
+      source,
+      proofContext.toolchain
+    );
   } finally {
     const cleaned = proofContext.cleanup();
     if (!cleaned?.ok) throw new Error("proof cleanup failed");
@@ -6173,7 +6188,7 @@ test("protected attestation import validates, publishes immutably, and promotes"
   assert.deepEqual(fs.readdirSync(external), []);
 });
 
-test("protected review entrypoints fail closed outside the fixed host runtime", () => {
+test("protected review entrypoints fail closed outside the fixed host runtime", async () => {
   const fixture = initPhaseOneSignedReviewFixture("review-protected-bootstrap");
   const requestResult = createReviewRequestFixture(fixture, { write: true });
   const keyPair = crypto.generateKeyPairSync("ed25519");
@@ -6251,35 +6266,100 @@ test("protected review entrypoints fail closed outside the fixed host runtime", 
     assert.equal(fs.readFileSync(ledgerPath, "utf8"), ledgerBefore, scenario.label);
   }
 
-  assert.throws(
-    () => promotePhaseOneFromProtectedRuntime({
-      workspace: fixture.root,
-      requestPath: requestResult.path,
-      attestation
-    }),
-    (error) => error?.code === "E_REVIEW_TRUST_UNAVAILABLE"
+  const directOperation = run(process.execPath, [
+    PROTECTED_REVIEW_OPERATION,
+    "verify",
+    "--workspace",
+    fixture.root
+  ], {
+    cwd: ROOT,
+    env: cleanEnvironment,
+    timeout: 10_000
+  });
+  assert.equal(directOperation.status, 1);
+  assert.equal(directOperation.signal, null);
+  assert.equal(directOperation.stderr, "");
+  assert.deepEqual(JSON.parse(directOperation.stdout), {
+    ok: false,
+    code: "E_REVIEW_TRUST_UNAVAILABLE"
+  });
+
+  const publicModule = await import(
+    `${EVIDENCE_MODULE_URL}?protected-surface=${
+      crypto.randomBytes(8).toString("hex")
+    }`
   );
-  assert.throws(
-    () => verifySignedLedgerFromProtectedRuntime({ workspace: fixture.root }),
-    (error) => error?.code === "E_REVIEW_TRUST_UNAVAILABLE"
+  for (const privileged of [
+    "promotePhaseOneFromProtectedRuntime",
+    "verifySignedLedgerFromProtectedRuntime",
+    "provePhaseTwoFromProtectedRuntime",
+    "verifyPhaseTwoFromProtectedRuntime"
+  ]) {
+    assert.equal(Object.hasOwn(publicModule, privileged), false, privileged);
+  }
+
+  const forgedSpawnMarker = path.join(
+    tempDir("worker-review-direct-import-"),
+    "spawned"
   );
-  assert.throws(
-    () => provePhaseTwoFromProtectedRuntime({ workspace: fixture.root }),
-    (error) => error?.code === "E_REVIEW_TRUST_UNAVAILABLE"
+  const adversarialSource = `
+import childProcess from "node:child_process";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+childProcess.spawnSync = () => {
+  fs.writeFileSync(${JSON.stringify(forgedSpawnMarker)}, "forged\\n");
+  return {
+    status: 0,
+    signal: null,
+    stdout: ${JSON.stringify(JSON.stringify({
+      ok: true,
+      converged: false,
+      recordDigest: "a".repeat(64)
+    }))},
+    stderr: ""
+  };
+};
+syncBuiltinESMExports();
+process.argv[1] = ${JSON.stringify(path.join(
+    ROOT,
+    "scripts/lib/worker-broker-evidence.mjs"
+  ))};
+await import(${JSON.stringify(pathToFileURL(PROTECTED_REVIEW_BOOTSTRAP).href)}
+  + "?adversarial-bootstrap=" + Math.random());
+const api = await import(${JSON.stringify(EVIDENCE_MODULE_URL)}
+  + "?adversarial=" + Math.random());
+const forbidden = [
+  "promotePhaseOneFromProtectedRuntime",
+  "verifySignedLedgerFromProtectedRuntime",
+  "provePhaseTwoFromProtectedRuntime",
+  "verifyPhaseTwoFromProtectedRuntime"
+];
+if (forbidden.some((name) => Object.hasOwn(api, name))) process.exitCode = 2;
+process.stdout.write(JSON.stringify({
+  inert: true,
+  privilegedExports: forbidden.filter((name) => Object.hasOwn(api, name))
+}));
+`;
+  const adversarialImport = run(process.execPath, [
+    "--input-type=module",
+    "--eval",
+    adversarialSource
+  ], {
+    cwd: ROOT,
+    env: process.env,
+    timeout: 10_000
+  });
+  assert.equal(
+    adversarialImport.status,
+    0,
+    `${adversarialImport.stdout}\n${adversarialImport.stderr}`
   );
-  assert.throws(
-    () => verifyPhaseTwoFromProtectedRuntime({ workspace: fixture.root }),
-    (error) => error?.code === "E_REVIEW_TRUST_UNAVAILABLE"
-  );
-  assert.throws(
-    () => promotePhaseOneFromProtectedRuntime({
-      workspace: fixture.root,
-      requestPath: requestResult.path,
-      attestation,
-      publicKey: keyPair.publicKey
-    }),
-    (error) => error?.code === "E_REVIEW_TRUST_UNAVAILABLE"
-  );
+  assert.equal(adversarialImport.stderr, "");
+  assert.deepEqual(JSON.parse(adversarialImport.stdout), {
+    inert: true,
+    privilegedExports: []
+  });
+  assert.equal(fs.existsSync(forgedSpawnMarker), false);
   assert.equal(fs.readFileSync(ledgerPath, "utf8"), ledgerBefore);
 });
 
@@ -6410,6 +6490,199 @@ test("protected Phase 2 publication requires the exact signed chain and replays 
   const afterRace = api.__testVerifyPhaseTwo(fixture.root, trust);
   assert.equal(afterRace.ok, true, afterRace.errors.join("; "));
   assert.equal(afterRace.recordDigest, record.recordDigest);
+});
+
+test("Phase 0 reproof after source evolution demotes a signed v4 Phase 1 and Phase 2 chain", async () => {
+  const fixture = initPhaseOneSignedReviewFixture("phase-zero-source-evolution");
+  const requestResult = createReviewRequestFixture(fixture, { write: true });
+  const keyPair = crypto.generateKeyPairSync("ed25519");
+  const attestation = signedReviewAttestation(requestResult, keyPair);
+  const attestationPath = writeReviewAttestationFixture(fixture.root, attestation);
+  const now = new Date(Date.parse(attestation.endedAt) + 1_000).toISOString();
+  const trust = {
+    publicKey: keyPair.publicKey,
+    expectedIssuer: "test-protected-reviewer",
+    revokedKeyFingerprints: [],
+    now
+  };
+  const { api } = await loadPrivateReviewPromotionHarness(fixture.root);
+  const promoted = api.__testPromoteSignedReview({
+    root: fixture.root,
+    requestPath: requestResult.path,
+    attestationPath,
+    trust,
+    now
+  });
+  assert.equal(promoted.ok, true);
+
+  let phaseTwo = buildEvidenceRecord({
+    root: fixture.root,
+    phase: "2",
+    slice: PHASE_TWO_SLICE,
+    status: "verified_on_draft",
+    verification: exactPhaseProof("2"),
+    qualification: deterministicQualification(),
+    evidenceSystemQualification: true,
+    prerequisites: [
+      {
+        phase: "0",
+        recordDigest: fixture.phaseZero.recordDigest,
+        gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]]
+      },
+      {
+        phase: "1",
+        recordDigest: promoted.recordDigest,
+        gateIds: [...PHASE_MANDATORY_GATE_IDS["1"]]
+      }
+    ]
+  });
+  phaseTwo = attachRecordDigest({
+    ...phaseTwo,
+    proofProducer: proofProducer("2")
+  });
+  const phaseTwoPublication = api.__testPublishPhaseTwo(
+    phaseTwo,
+    fixture.root,
+    trust
+  );
+  const protectedReplay = api.__testVerifyPhaseTwo(fixture.root, trust);
+  assert.equal(protectedReplay.ok, true, protectedReplay.errors.join("; "));
+
+  const immutableBefore = new Map(
+    loadLedger(fixture.root).entries.map((entry) => [
+      entry.recordDigest,
+      fs.readFileSync(path.join(fixture.root, entry.path))
+    ])
+  );
+  const evolvedSource = path.join(
+    fixture.root,
+    "plugins/grok/scripts/lib/errors.mjs"
+  );
+  fs.appendFileSync(evolvedSource, "\n// tracked source evolution after Phase 2\n");
+  git(fixture.root, "add", "plugins/grok/scripts/lib/errors.mjs");
+  git(fixture.root, "commit", "-m", "advance tracked source after phase 2");
+
+  let replacement = buildEvidenceRecord({
+    root: fixture.root,
+    phase: "0",
+    slice: "evidence-system",
+    status: "verified_on_draft",
+    verification: exactPhaseProof("0"),
+    qualification: deterministicQualification(),
+    evidenceSystemQualification: true
+  });
+  replacement = attachRecordDigest({
+    ...replacement,
+    proofProducer: proofProducer("0")
+  });
+  const replacementPath = api.__testPublishPhaseZero(
+    replacement,
+    fixture.root
+  );
+  assert.match(
+    replacementPath,
+    /^tests\/e2e-results\/worker-broker\/phase-0\//
+  );
+
+  const ledger = loadLedger(fixture.root);
+  for (const digest of [
+    fixture.phaseZero.recordDigest,
+    promoted.recordDigest,
+    phaseTwo.recordDigest
+  ]) {
+    assert.equal(
+      ledger.entries.find((entry) => entry.recordDigest === digest)?.currency,
+      "historical",
+      digest
+    );
+    assert.deepEqual(
+      fs.readFileSync(path.join(
+        fixture.root,
+        ledger.entries.find((entry) => entry.recordDigest === digest).path
+      )),
+      immutableBefore.get(digest),
+      `superseded record ${digest} must remain immutable`
+    );
+  }
+  const current = ledger.entries.filter((entry) => entry.currency === "current");
+  assert.equal(current.length, 1);
+  assert.equal(current[0].phase, "0");
+  assert.equal(current[0].recordDigest, replacement.recordDigest);
+  assert.equal(
+    ledger.entries.find((entry) => (
+      entry.recordDigest === phaseTwo.recordDigest
+    ))?.path,
+    phaseTwoPublication.relative
+  );
+  const strict = verifyLedger(fixture.root, { strict: true });
+  assert.equal(strict.ok, true, strict.errors.join("; "));
+});
+
+test("Phase 0 source-evolution recovery rejects a malformed current v4 producer", async () => {
+  const fixture = initPhaseOneSignedReviewFixture(
+    "phase-zero-source-evolution-malformed-v4"
+  );
+  const { api } = await loadPrivateReviewPromotionHarness(fixture.root);
+  const malformed = attachRecordDigest({
+    ...fixture.phaseOne,
+    proofProducer: {
+      ...fixture.phaseOne.proofProducer,
+      manifestDigest: "f".repeat(64)
+    }
+  });
+  fs.writeFileSync(
+    path.join(fixture.root, fixture.phaseOnePath),
+    `${JSON.stringify(malformed, null, 2)}\n`
+  );
+  const ledgerPath = path.join(
+    fixture.root,
+    "tests/e2e-results/worker-broker/ledger.json"
+  );
+  const malformedLedger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+  const phaseOneEntry = malformedLedger.entries.find((entry) => (
+    entry.phase === "1" && entry.currency === "current"
+  ));
+  phaseOneEntry.recordDigest = malformed.recordDigest;
+  fs.writeFileSync(ledgerPath, `${JSON.stringify(malformedLedger, null, 2)}\n`);
+
+  const evolvedSource = path.join(
+    fixture.root,
+    "plugins/grok/scripts/lib/errors.mjs"
+  );
+  fs.appendFileSync(
+    evolvedSource,
+    "\n// source evolution must not excuse malformed producer identity\n"
+  );
+  git(fixture.root, "add", "plugins/grok/scripts/lib/errors.mjs");
+  git(fixture.root, "commit", "-m", "advance source with malformed current v4");
+
+  let replacement = buildEvidenceRecord({
+    root: fixture.root,
+    phase: "0",
+    slice: "evidence-system",
+    status: "verified_on_draft",
+    verification: exactPhaseProof("0"),
+    qualification: deterministicQualification(),
+    evidenceSystemQualification: true
+  });
+  replacement = attachRecordDigest({
+    ...replacement,
+    proofProducer: proofProducer("0")
+  });
+  const ledgerBefore = fs.readFileSync(ledgerPath, "utf8");
+  assert.throws(
+    () => api.__testPublishPhaseZero(replacement, fixture.root),
+    /evidence|ledger/i
+  );
+  assert.equal(fs.readFileSync(ledgerPath, "utf8"), ledgerBefore);
+  const current = loadLedger(fixture.root).entries.filter((entry) => (
+    entry.currency === "current"
+  ));
+  assert.equal(current.length, 2);
+  assert.equal(
+    current.find((entry) => entry.phase === "1")?.recordDigest,
+    malformed.recordDigest
+  );
 });
 
 test("private signed review promotion is atomic, immutable, concurrent, and restart-fail-closed", async () => {
@@ -6565,12 +6838,13 @@ test("private signed review promotion is atomic, immutable, concurrent, and rest
   const publicModule = await import(
     `${EVIDENCE_MODULE_URL}?public-surface=${crypto.randomBytes(8).toString("hex")}`
   );
-  assert.equal(typeof publicModule.promotePhaseOneFromProtectedRuntime, "function");
-  assert.equal(typeof publicModule.verifySignedLedgerFromProtectedRuntime, "function");
+  assert.equal(typeof publicModule.promotePhaseOneFromProtectedRuntime, "undefined");
+  assert.equal(typeof publicModule.verifySignedLedgerFromProtectedRuntime, "undefined");
+  assert.equal(typeof publicModule.provePhaseTwoFromProtectedRuntime, "undefined");
+  assert.equal(typeof publicModule.verifyPhaseTwoFromProtectedRuntime, "undefined");
   assert.equal(
     Object.keys(publicModule).some((name) => (
       /promote.*review/i.test(name)
-      && name !== "promotePhaseOneFromProtectedRuntime"
     )),
     false
   );
@@ -6581,7 +6855,6 @@ test("private signed review promotion is atomic, immutable, concurrent, and rest
     publicFunctions.filter((name) => (
       /^(?:import|sign|mint|issue|load.*trust|create.*attestation|publish.*review|promote.*review)/i
         .test(name)
-      && name !== "promotePhaseOneFromProtectedRuntime"
     )),
     []
   );

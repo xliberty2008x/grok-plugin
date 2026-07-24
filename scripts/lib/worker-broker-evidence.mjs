@@ -259,6 +259,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "plugins/grok/scripts/lib/redact.mjs",
     "scripts/lib/worker-broker-evidence.mjs",
     "scripts/lib/static-esm-import-parser.mjs",
+    "scripts/trusted/worker-broker-review-operation.cjs",
     "scripts/trusted/worker-broker-review.mjs",
     "scripts/lib/zero-skip-test-reporter.mjs",
     "scripts/check-deterministic.mjs",
@@ -317,6 +318,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "scripts/lib/zero-skip-test-reporter.mjs",
     "scripts/lib/worker-broker-evidence.mjs",
     "scripts/lib/static-esm-import-parser.mjs",
+    "scripts/trusted/worker-broker-review-operation.cjs",
     "scripts/trusted/worker-broker-review.mjs",
     "scripts/check-deterministic.mjs",
     "scripts/test-deterministic.mjs",
@@ -395,6 +397,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "scripts/lib/worker-broker-evidence.mjs",
     "scripts/test-installed-worker-mcp.mjs",
     "scripts/test-phase2-focused.mjs",
+    "scripts/trusted/worker-broker-review-operation.cjs",
     "scripts/trusted/worker-broker-review.mjs",
     "scripts/validate.mjs",
     "package.json",
@@ -1416,11 +1419,14 @@ const PROTECTED_REVIEW_TRUST_MAX_BYTES = 64 * 1024;
 const PROTECTED_REVIEW_MODULE_MAX_BYTES = 2 * 1024 * 1024;
 const PROTECTED_REVIEW_GIT_PATH = "/usr/bin/git";
 const PROTECTED_REVIEW_EMPTY_HOOKS_PATH = ".worker-broker-host-state/empty-hooks";
+const PROTECTED_REVIEW_OPERATION_PATH =
+  "scripts/trusted/worker-broker-review-operation.cjs";
 export const PROTECTED_REVIEW_RUNTIME_BUNDLE_PATHS = Object.freeze([
   "plugins/grok/scripts/lib/redact.mjs",
   "scripts/lib/plugin-inventory.mjs",
   "scripts/lib/static-esm-import-parser.mjs",
   "scripts/lib/worker-broker-evidence.mjs",
+  PROTECTED_REVIEW_OPERATION_PATH,
   "scripts/trusted/worker-broker-review.mjs"
 ]);
 const PROTECTED_REVIEW_TRUST_FIELDS = new Set([
@@ -1447,6 +1453,7 @@ const PROTECTED_REVIEW_POLICY = Object.freeze({
   gitPath: PROTECTED_REVIEW_GIT_PATH,
   emptyHooksPath: PROTECTED_REVIEW_EMPTY_HOOKS_PATH,
   runtimeBundlePaths: PROTECTED_REVIEW_RUNTIME_BUNDLE_PATHS,
+  operationPath: PROTECTED_REVIEW_OPERATION_PATH,
   workspaceRole: "data-only",
   privateKeyLocation: "external-issuer-only"
 });
@@ -7508,7 +7515,7 @@ function importPhaseOneReviewAttestationInternal(options = {}, authority = null)
  * Trust is loaded only from a fixed protected-runtime sibling descriptor and
  * the reviewed workspace is treated solely as signed data.
  */
-export function promotePhaseOneFromProtectedRuntime(options = {}) {
+function promotePhaseOneFromProtectedRuntime(options = {}) {
   if (!options
     || typeof options !== "object"
     || Array.isArray(options)
@@ -7545,7 +7552,7 @@ export function promotePhaseOneFromProtectedRuntime(options = {}) {
   });
 }
 
-export function verifySignedLedgerFromProtectedRuntime(options = {}) {
+function verifySignedLedgerFromProtectedRuntime(options = {}) {
   if (!options
     || typeof options !== "object"
     || Array.isArray(options)
@@ -7585,7 +7592,7 @@ function protectedSignedReviewReplayTrust(protectedTrust) {
  * Phase 2; only the root-owned protected runtime can supply signed-review trust
  * for the exact current Phase 0/1 prerequisite chain.
  */
-export function provePhaseTwoFromProtectedRuntime(options = {}) {
+function provePhaseTwoFromProtectedRuntime(options = {}) {
   if (!options
     || typeof options !== "object"
     || Array.isArray(options)
@@ -7626,7 +7633,7 @@ export function provePhaseTwoFromProtectedRuntime(options = {}) {
 }
 
 /** Strict protected replay for the exact current fixed Phase 2 record. */
-export function verifyPhaseTwoFromProtectedRuntime(options = {}) {
+function verifyPhaseTwoFromProtectedRuntime(options = {}) {
   if (!options
     || typeof options !== "object"
     || Array.isArray(options)
@@ -7782,9 +7789,21 @@ function proofProducedStatusIsCurrent(record) {
   return phase === "aggregate" && record?.status === "qualified";
 }
 
-function priorProofProducedRecordIsSafelySupersedable(record, root) {
+/**
+ * Validate a current proof-produced record only for safe historical demotion.
+ *
+ * Source equality is intentionally not required: replacing Phase 0 is the
+ * recovery path after tracked source evolution. Immutable body/record digest,
+ * producer identity/version/manifest, fixed gates, status, and bounded shape
+ * remain mandatory. A signed Phase 1 record may report only the expected
+ * missing protected-trust error because demotion removes, rather than grants,
+ * its current authority.
+ */
+function proofProducedRecordIsSafelySupersedable(record, root) {
   const producer = record?.proofProducer;
   const version = producer?.version;
+  const phase = String(record?.phase ?? "");
+  const currentVersion = version === PROOF_PRODUCER_VERSION;
   const shapeIsSupported = Boolean(
     producer
     && typeof producer === "object"
@@ -7793,21 +7812,23 @@ function priorProofProducedRecordIsSafelySupersedable(record, root) {
     && producer.id === PROOF_PRODUCER_ID
     && Number.isInteger(version)
     && version >= 1
-    && version < PROOF_PRODUCER_VERSION
-    && producer.manifestDigest
-      === PRIOR_PROOF_MANIFEST_DIGESTS[version]?.[String(record.phase)]
-    && ((record.phase === "0" && record.status === "verified_on_draft")
-      || (record.phase === "1" && (
-        record.status === "implemented_unverified"
-        || record.status === "verified_on_draft"
-      )))
+    && version <= PROOF_PRODUCER_VERSION
+    && NUMBERED_PHASE_SET.has(phase)
+    && proofProducedStatusIsCurrent(record)
+    && (
+      currentVersion
+      || producer.manifestDigest
+        === PRIOR_PROOF_MANIFEST_DIGESTS[version]?.[phase]
+    )
   );
   if (!shapeIsSupported) return false;
   let normalized;
   try {
     normalized = structuredClone(record);
-    normalized.proofProducer.version = PROOF_PRODUCER_VERSION;
-    normalized = attachRecordDigest(normalized);
+    if (!currentVersion) {
+      normalized.proofProducer.version = PROOF_PRODUCER_VERSION;
+      normalized = attachRecordDigest(normalized);
+    }
   } catch {
     return false;
   }
@@ -7817,7 +7838,7 @@ function priorProofProducedRecordIsSafelySupersedable(record, root) {
     requireEvidenceSystem: true
   });
   if (validation.ok) return true;
-  return normalized.phase === "1"
+  return phase === "1"
     && normalized.status === "verified_on_draft"
     && validation.errors.length === 1
     && validation.errors[0]
@@ -7880,34 +7901,19 @@ function publishPhaseZeroProofRecord(record, root, expectedSource, toolchain) {
     ));
     const runnerCurrent = current.filter(({ record: existing }) => (
       Object.hasOwn(existing, "proofProducer")
-      && existing.proofProducer?.version === PROOF_PRODUCER_VERSION
-    ));
-    const priorRunnerCurrent = current.filter(({ record: existing }) => (
-      Object.hasOwn(existing, "proofProducer")
-      && priorProofProducedRecordIsSafelySupersedable(existing, root)
+      && proofProducedRecordIsSafelySupersedable(existing, root)
     ));
     const malformedRunnerCurrent = current.filter(({ record: existing }) => (
       Object.hasOwn(existing, "proofProducer")
-      && existing.proofProducer?.version !== PROOF_PRODUCER_VERSION
-      && !priorProofProducedRecordIsSafelySupersedable(existing, root)
+      && !proofProducedRecordIsSafelySupersedable(existing, root)
     ));
     const unsupportedCurrent = current.filter(({ record: existing }) => (
       !Object.hasOwn(existing, "proofProducer") && !VERIFIED_STATUS_SET.has(existing.status)
     ));
     if (unsupportedCurrent.length
       || malformedRunnerCurrent.length
-      || (legacyCurrent.length && (runnerCurrent.length || priorRunnerCurrent.length))) {
+      || (legacyCurrent.length && runnerCurrent.length)) {
       throw invalidLedgerDocumentError();
-    }
-    for (const { record: existing } of runnerCurrent) {
-      const existingValidation = validateEvidenceRecord(existing, {
-        strict: true,
-        root,
-        requireEvidenceSystem: true
-      });
-      if (!proofProducedStatusIsCurrent(existing) || !existingValidation.ok) {
-        throw invalidLedgerDocumentError();
-      }
     }
 
     const entries = inspected.map(({ entry, record: existing }) => {
@@ -8985,6 +8991,205 @@ export function provePhaseZero(options = {}) {
     return proofFailure("E_PROOF_ARGUMENT");
   }
   return proveWorkerBrokerPhase({ ...options, phase: "0" });
+}
+
+const PROTECTED_OPERATION_CHILD_MARKER =
+  "worker-broker-review-operation-v1";
+const PROTECTED_OPERATION_ENVIRONMENT = Object.freeze({
+  GROK_PROTECTED_OPERATION_CHILD: PROTECTED_OPERATION_CHILD_MARKER,
+  LANG: "C",
+  LC_ALL: "C",
+  PATH: "/usr/bin:/bin",
+  TZ: "UTC"
+});
+const PROTECTED_OPERATION_MAX_STDIN_BYTES = 256 * 1024;
+
+function parseProtectedOperationArguments(argv) {
+  const mode = argv[0];
+  const allowed = mode === "promote"
+    ? new Set(["--workspace", "--request"])
+    : new Set(["verify", "prove-phase-2", "verify-phase-2"]).has(mode)
+      ? new Set(["--workspace"])
+      : null;
+  if (!allowed || argv.length !== 1 + allowed.size * 2) {
+    throw protectedReviewTrustError();
+  }
+  const values = {};
+  for (let index = 1; index < argv.length; index += 2) {
+    const flag = argv[index];
+    const value = argv[index + 1];
+    if (!allowed.has(flag)
+      || Object.hasOwn(values, flag)
+      || typeof value !== "string"
+      || !value
+      || value.startsWith("--")) {
+      throw protectedReviewTrustError();
+    }
+    values[flag] = value;
+  }
+  if (Object.keys(values).length !== allowed.size) {
+    throw protectedReviewTrustError();
+  }
+  return Object.freeze({ mode, values: Object.freeze(values) });
+}
+
+function assertProtectedOperationProcess() {
+  const actualEnvironment = Object.fromEntries(
+    Object.keys(PROTECTED_OPERATION_ENVIRONMENT)
+      .map((name) => [name, process.env[name]])
+  );
+  if (process.platform === "win32"
+    || typeof process.getuid !== "function"
+    || process.getuid() === 0
+    || process.execArgv.length !== 0
+    || JSON.stringify(actualEnvironment)
+      !== JSON.stringify(PROTECTED_OPERATION_ENVIRONMENT)
+    || Object.keys(process.env).length
+      !== Object.keys(PROTECTED_OPERATION_ENVIRONMENT).length) {
+    throw protectedReviewTrustError();
+  }
+}
+
+async function readProtectedOperationAttestation() {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of process.stdin) {
+    size += chunk.length;
+    if (size > PROTECTED_OPERATION_MAX_STDIN_BYTES) {
+      throw protectedReviewTrustError();
+    }
+    chunks.push(chunk);
+  }
+  if (size < 2) throw protectedReviewTrustError();
+  let attestation;
+  try {
+    attestation = JSON.parse(Buffer.concat(chunks, size).toString("utf8"));
+  } catch {
+    throw protectedReviewTrustError();
+  }
+  if (!attestation
+    || typeof attestation !== "object"
+    || Array.isArray(attestation)) {
+    throw protectedReviewTrustError();
+  }
+  return attestation;
+}
+
+function boundedProtectedOperationResult(result) {
+  if (Object.hasOwn(result || {}, "integrityOk")) {
+    return {
+      ok: result.ok === true,
+      integrityOk: result.integrityOk === true,
+      errors: Array.isArray(result.errors)
+        ? result.errors.slice(0, 32).map((message) => String(message).slice(0, 512))
+        : [],
+      phase: result.phase || null,
+      slice: result.slice || null,
+      status: result.status || null,
+      recordDigest: result.recordDigest || null,
+      verified: result.verified === true
+    };
+  }
+  if (result?.code) {
+    return {
+      ok: false,
+      code: String(result.code).slice(0, 64),
+      gateId: result.gateId ? String(result.gateId).slice(0, 128) : null,
+      failureKind: result.failureKind
+        ? String(result.failureKind).slice(0, 64)
+        : null,
+      outputDigest: SHA256.test(result.outputDigest || "")
+        ? result.outputDigest
+        : null
+    };
+  }
+  if (result?.recordDigest) {
+    return {
+      ok: result.ok === true,
+      converged: result.converged === true,
+      path: result.path || null,
+      phase: result.phase || null,
+      slice: result.slice || null,
+      status: result.status || null,
+      recordDigest: result.recordDigest
+    };
+  }
+  return {
+    ok: result?.ok === true,
+    errors: Array.isArray(result?.errors)
+      ? result.errors.slice(0, 32).map((message) => String(message).slice(0, 512))
+      : []
+  };
+}
+
+function boundedProtectedOperationFailure(error) {
+  const allowedCodes = new Set([
+    "E_REVIEW_ATTESTATION_INVALID",
+    "E_REVIEW_PROMOTION_COMMIT_UNKNOWN",
+    "E_REVIEW_PROMOTION_CONFLICT",
+    "E_REVIEW_PROMOTION_FORBIDDEN",
+    "E_REVIEW_PROMOTION_INVALID",
+    "E_REVIEW_PROMOTION_RACE",
+    "E_REVIEW_REQUEST_INVALID",
+    "E_REVIEW_TRUST_UNAVAILABLE"
+  ]);
+  const code = allowedCodes.has(error?.code)
+    ? error.code
+    : "E_REVIEW_TRUST_UNAVAILABLE";
+  const result = { ok: false, code };
+  if (code === "E_REVIEW_PROMOTION_COMMIT_UNKNOWN") {
+    result.commitState = String(error?.commitState || "unknown").slice(0, 64);
+    result.recoveryRequired = true;
+    if (SHA256.test(error?.recordDigest || "")) {
+      result.recordDigest = error.recordDigest;
+    }
+  }
+  return result;
+}
+
+async function runProtectedOperationMain() {
+  assertProtectedOperationProcess();
+  const parsed = parseProtectedOperationArguments(process.argv.slice(2));
+  if (parsed.mode === "promote") {
+    return promotePhaseOneFromProtectedRuntime({
+      workspace: parsed.values["--workspace"],
+      requestPath: parsed.values["--request"],
+      attestation: await readProtectedOperationAttestation()
+    });
+  }
+  if (parsed.mode === "prove-phase-2") {
+    return provePhaseTwoFromProtectedRuntime({
+      workspace: parsed.values["--workspace"]
+    });
+  }
+  if (parsed.mode === "verify-phase-2") {
+    return verifyPhaseTwoFromProtectedRuntime({
+      workspace: parsed.values["--workspace"]
+    });
+  }
+  return verifySignedLedgerFromProtectedRuntime({
+    workspace: parsed.values["--workspace"]
+  });
+}
+
+// `import.meta.main` is engine-owned. Direct library import remains inert even
+// if caller code mutates process.argv or synchronizes patched Node built-ins.
+// Protected execution therefore requires a fresh supported Node direct-main
+// process started through the root-owned main-only CJS operation boundary.
+if (import.meta.main === true) {
+  void runProtectedOperationMain()
+    .then((result) => {
+      process.stdout.write(
+        `${JSON.stringify(boundedProtectedOperationResult(result), null, 2)}\n`
+      );
+      if (result?.ok !== true) process.exitCode = 1;
+    })
+    .catch((error) => {
+      process.stdout.write(
+        `${JSON.stringify(boundedProtectedOperationFailure(error), null, 2)}\n`
+      );
+      process.exitCode = 1;
+    });
 }
 
 export { REPO_ROOT, sha256Text };
