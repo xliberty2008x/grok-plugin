@@ -138,6 +138,7 @@ const QUALIFICATION_STAGES = new Set([
   "completion-send-replay",
   "completion-wait",
   "completion-result",
+  "completion-result-history-window",
   "completion-cleanup-private",
   "completion-cleanup-snapshot",
   "completion-cleanup-events",
@@ -186,6 +187,7 @@ const QUALIFICATION_STAGES = new Set([
   "cancellation-request",
   "cancellation-wait",
   "cancellation-result",
+  "cancellation-result-history-window",
   "cancellation-cleanup-private",
   "cancellation-cleanup-snapshot",
   "cancellation-cleanup-events",
@@ -1877,11 +1879,22 @@ function observePublicWorker(tracker, worker) {
   }
 }
 
-function observeTerminalResultWorker(tracker, worker) {
+function observeTerminalResultWorker(tracker, worker, historyWindowStage) {
   observePublicWorker(tracker, worker);
-  if (!sameJson(tracker.events.values(), worker.lifecycleEvents)) {
-    fail("E_PRIVATE_STATE");
+  const trackedEvents = tracker.events.values();
+  if (sameJson(trackedEvents, worker.lifecycleEvents)) return;
+  if (
+    Array.isArray(worker.lifecycleEvents)
+    && worker.lifecycleEvents.length > 0
+    && trackedEvents.length > worker.lifecycleEvents.length
+    && sameJson(
+      trackedEvents.slice(-worker.lifecycleEvents.length),
+      worker.lifecycleEvents
+    )
+  ) {
+    enterQualificationStage(historyWindowStage);
   }
+  fail("E_PRIVATE_STATE");
 }
 
 const SNAPSHOT_KEYS = new Set([
@@ -3879,7 +3892,11 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
     ["worker"]
   );
   tracker.calls.result += 1;
-  observeTerminalResultWorker(tracker, result.worker);
+  observeTerminalResultWorker(
+    tracker,
+    result.worker,
+    "completion-result-history-window"
+  );
   await closeMcp(context, client);
   client = null;
 
@@ -4061,7 +4078,11 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
     ["worker"]
   );
   tracker.calls.result += 1;
-  observeTerminalResultWorker(tracker, result.worker);
+  observeTerminalResultWorker(
+    tracker,
+    result.worker,
+    "cancellation-result-history-window"
+  );
   await closeMcp(context, client);
   client = null;
 

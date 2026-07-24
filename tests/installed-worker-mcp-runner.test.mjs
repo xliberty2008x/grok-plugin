@@ -838,7 +838,7 @@ test("installed Worker MCP mailbox polling tolerates valid pre-provider state", 
 test("installed Worker MCP terminal results converge after private cleanup", () => {
   const source = fs.readFileSync(RUNNER, "utf8");
   const observerStart = source.indexOf(
-    "function observeTerminalResultWorker(tracker, worker) {"
+    "function observeTerminalResultWorker(tracker, worker, historyWindowStage) {"
   );
   const observerEnd = source.indexOf("\nconst SNAPSHOT_KEYS", observerStart);
   assert.ok(observerStart >= 0 && observerEnd > observerStart);
@@ -846,13 +846,32 @@ test("installed Worker MCP terminal results converge after private cleanup", () 
   assert.ok(
     observer.indexOf("observePublicWorker(tracker, worker);")
       < observer.indexOf(
-        "sameJson(tracker.events.values(), worker.lifecycleEvents)"
+        "sameJson(trackedEvents, worker.lifecycleEvents)"
       )
   );
+  assert.match(
+    observer,
+    /trackedEvents\.length > worker\.lifecycleEvents\.length/
+  );
+  assert.match(
+    observer,
+    /trackedEvents\.slice\(-worker\.lifecycleEvents\.length\)/
+  );
+  assert.match(observer, /enterQualificationStage\(historyWindowStage\);/);
 
-  for (const [functionName, prefix, status] of [
-    ["runCompletionScenario", "completion", "completed"],
-    ["runCancellationScenario", "cancellation", "cancelled"]
+  for (const [functionName, prefix, status, historyWindowStage] of [
+    [
+      "runCompletionScenario",
+      "completion",
+      "completed",
+      "completion-result-history-window"
+    ],
+    [
+      "runCancellationScenario",
+      "cancellation",
+      "cancelled",
+      "cancellation-result-history-window"
+    ]
   ]) {
     const start = source.indexOf(`async function ${functionName}(`);
     const end = source.indexOf("\nasync function ", start + 1);
@@ -871,8 +890,12 @@ test("installed Worker MCP terminal results converge after private cleanup", () 
     );
     const callIndex = body.indexOf('"worker_result"', resultIndex);
     const observeIndex = body.indexOf(
-      "observeTerminalResultWorker(tracker, result.worker);",
+      "observeTerminalResultWorker(",
       callIndex
+    );
+    const historyWindowStageIndex = body.indexOf(
+      `"${historyWindowStage}"`,
+      observeIndex
     );
     const closeIndex = body.indexOf(
       "await closeMcp(context, client);",
@@ -884,6 +907,8 @@ test("installed Worker MCP terminal results converge after private cleanup", () 
     assert.ok(proofIndex < resultIndex);
     assert.ok(resultIndex < callIndex);
     assert.ok(callIndex < observeIndex);
+    assert.ok(observeIndex < historyWindowStageIndex);
+    assert.ok(historyWindowStageIndex < closeIndex);
     assert.ok(observeIndex < closeIndex);
     assert.equal(
       (body.match(/tracker\.calls\.result \+= 1;/g) || []).length,
