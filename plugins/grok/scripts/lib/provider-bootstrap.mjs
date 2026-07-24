@@ -25,6 +25,11 @@ const BINDING_KEYS = new Set([
   "providerGeneration",
   "providerSpawnIntentId"
 ]);
+const WRITE_BINDING_KEYS = new Set([
+  ...BINDING_KEYS,
+  "executionBindingDigest"
+]);
+const SHA256_HEX = /^[0-9a-f]{64}$/;
 const MIN_PROVIDER_VERSION = [0, 2, 99];
 const PROVIDER_SPEC_FD = 6;
 const MAX_PROVIDER_SPEC_BYTES = 64 * 1024;
@@ -65,9 +70,12 @@ function parseArguments(argv) {
 }
 
 function validateSpecification(spec, expected) {
+  const readBinding = exactRecord(spec?.binding, BINDING_KEYS);
+  const writeBinding = exactRecord(spec?.binding, WRITE_BINDING_KEYS)
+    && SHA256_HEX.test(spec.binding.executionBindingDigest || "");
   if (!exactRecord(spec, SPEC_KEYS)
     || spec.schemaVersion !== 1
-    || !exactRecord(spec.binding, BINDING_KEYS)
+    || (!readBinding && !writeBinding)
     || spec.marker !== expected.marker
     || spec.binding.providerGeneration !== expected.generation
     || spec.binding.providerSpawnIntentId !== expected.intentId
@@ -291,6 +299,9 @@ export async function runProviderBootstrap({
   }
   const expected = parseArguments(argv);
   const spec = await readProviderBootstrapSpec(specInput, expected);
+  const executionBindingDigest = Object.hasOwn(spec.binding, "executionBindingDigest")
+    ? spec.binding.executionBindingDigest
+    : null;
   const stateEnv = bootstrapStateEnvironment(env);
   const startToken = readStartToken(process.pid);
   const providerProcess = {
@@ -365,7 +376,10 @@ export async function runProviderBootstrap({
         type: "provider-promoted",
         marker: spec.marker,
         providerGeneration: spec.binding.providerGeneration,
-        providerSpawnIntentId: spec.binding.providerSpawnIntentId
+        providerSpawnIntentId: spec.binding.providerSpawnIntentId,
+        ...(executionBindingDigest
+          ? { executionBindingDigest }
+          : {})
       });
     } catch (error) {
       failControl(error);
@@ -422,7 +436,14 @@ export async function runProviderBootstrap({
     input.pipe(child.stdin);
     child.stdout.pipe(output);
     child.stderr.pipe(diagnostic);
-    ready({ type: "provider-ready", grokPid: child.pid, version });
+    ready({
+      type: "provider-ready",
+      grokPid: child.pid,
+      version,
+      ...(executionBindingDigest
+        ? { executionBindingDigest }
+        : {})
+    });
     readyPublished = true;
 
     const outcome = await childOutcome;

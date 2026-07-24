@@ -9,6 +9,8 @@ import { spawn } from "node:child_process";
 
 import { processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
 import {
+  assertProviderGuardForJob,
+  authenticateProviderBootstrapGuard,
   hasForeignActiveProvider,
   loadProviderGuard,
   registerProviderGuard,
@@ -382,6 +384,8 @@ test("bound provider guard registration is exact-idempotent and rejects a duplic
     binding,
     env
   );
+  assert.equal(first.schemaVersion, 2);
+  assert.equal(Object.hasOwn(first, "executionBindingDigest"), false);
 
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
   const replay = registerProviderGuard(
@@ -414,6 +418,178 @@ test("bound provider guard registration is exact-idempotent and rejects a duplic
     (error) => error?.code === "E_PROCESS_IDENTITY"
   );
   assert.deepEqual(loadProviderGuard(root, workerId), first, "duplicate registration overwrote the original guard");
+});
+
+test("write provider guard is schema-4 bound and rejects missing, mismatch, downgrade, and stale cleanup", (t) => {
+  const root = initRepo();
+  const scratch = tempDir("grok-guard-write-binding-");
+  const env = { ...process.env, CLAUDE_PLUGIN_DATA: path.join(scratch, "plugin-data") };
+  const workerId = "task-ddeeff001122334455667788";
+  const attemptId = "223344556677889900aabbccddeeff00";
+  const intentId = "3344556677889900aabbccddeeff0011";
+  const owner = "guard-write-binding-owner";
+  const control = resolveControlWorkspace(root, env);
+  const timestamp = new Date().toISOString();
+  const executionBindingDigest = "4".repeat(64);
+  const providerProcess = {
+    pid: 1_960_101,
+    startToken: "write-binding-provider-start-token",
+    processGroupId: process.platform === "win32" ? null : 1_960_101
+  };
+  t.after(() => {
+    try { unregisterProviderGuard(root, workerId, null, env); } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(scratch, { recursive: true, force: true });
+  });
+
+  writeJob(root, {
+    schemaVersion: 3,
+    id: workerId,
+    kind: "task",
+    jobClass: "task",
+    write: true,
+    status: "running",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    controlWorkspaceId: control.controlWorkspaceId,
+    host: { kind: "codex", sessionId: owner },
+    executionBinding: { bindingDigest: executionBindingDigest },
+    request: {
+      spawn: {
+        executionRoot: control.executionRoot,
+        executionBindingDigest,
+        dispatch: {
+          schemaVersion: 2,
+          state: "worker-started",
+          attemptId,
+          fence: 8,
+          providerGeneration: 0,
+          nextProviderGeneration: null
+        },
+        providerSpawnIntent: {
+          schemaVersion: 1,
+          intentId,
+          status: "pending",
+          attemptId,
+          dispatchFence: 8,
+          providerGeneration: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp
+        }
+      }
+    }
+  }, env);
+
+  const readShapeBinding = {
+    controlWorkspaceId: control.controlWorkspaceId,
+    executionRoot: control.executionRoot,
+    dispatchAttemptId: attemptId,
+    dispatchFence: 8,
+    providerGeneration: 1,
+    providerSpawnIntentId: intentId
+  };
+  const writeBinding = {
+    ...readShapeBinding,
+    executionBindingDigest
+  };
+  for (const [label, binding] of [
+    ["missing", readShapeBinding],
+    ["mismatch", {
+      ...writeBinding,
+      executionBindingDigest: "5".repeat(64)
+    }]
+  ]) {
+    assert.throws(
+      () => registerProviderGuard(
+        root,
+        workerId,
+        providerProcess,
+        owner,
+        "provider",
+        binding,
+        env
+      ),
+      (error) => error?.code === "E_PROCESS_IDENTITY",
+      label
+    );
+    assert.equal(loadProviderGuard(root, workerId), null, label);
+  }
+
+  const record = registerProviderGuard(
+    root,
+    workerId,
+    providerProcess,
+    owner,
+    "provider",
+    writeBinding,
+    env
+  );
+  assert.equal(record.schemaVersion, 4);
+  assert.equal(record.executionBindingDigest, executionBindingDigest);
+  const job = withWorkspaceStateTransaction(
+    root,
+    (transaction) => transaction.tryReadJob(workerId),
+    env
+  );
+  assert.equal(
+    assertProviderGuardForJob(root, job, record, { expectedGeneration: 1 }),
+    record
+  );
+  assert.deepEqual(
+    authenticateProviderBootstrapGuard(
+      root,
+      workerId,
+      providerProcess,
+      writeBinding,
+      env
+    ),
+    record
+  );
+  assert.throws(
+    () => authenticateProviderBootstrapGuard(
+      root,
+      workerId,
+      providerProcess,
+      {
+        ...writeBinding,
+        executionBindingDigest: "6".repeat(64)
+      },
+      env
+    ),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+
+  const missingDigest = { ...record };
+  delete missingDigest.executionBindingDigest;
+  assert.throws(
+    () => assertProviderGuardForJob(root, job, missingDigest, { expectedGeneration: 1 }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+  const schema3Downgrade = {
+    ...missingDigest,
+    schemaVersion: 3
+  };
+  assert.throws(
+    () => assertProviderGuardForJob(root, job, schema3Downgrade, { expectedGeneration: 1 }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+  const mismatchedRecord = {
+    ...record,
+    executionBindingDigest: "7".repeat(64)
+  };
+  assert.throws(
+    () => assertProviderGuardForJob(root, job, mismatchedRecord, { expectedGeneration: 1 }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+  for (const staleExpected of [schema3Downgrade, mismatchedRecord]) {
+    assert.throws(
+      () => unregisterProviderGuard(root, workerId, staleExpected, env),
+      (error) => error?.code === "E_PROCESS_IDENTITY"
+    );
+    assert.deepEqual(loadProviderGuard(root, workerId), record);
+  }
+  assert.equal(unregisterProviderGuard(root, workerId, record, env), true);
+  assert.equal(loadProviderGuard(root, workerId), null);
 });
 
 test("foreign-provider scan fails closed and preserves conflicting canonical and legacy aliases", {

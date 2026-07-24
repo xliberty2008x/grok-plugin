@@ -205,7 +205,10 @@ function bootstrapBinding(fixture, intent) {
     dispatchAttemptId: fixture.claim.attemptId,
     dispatchFence: fixture.claim.fence,
     providerGeneration: 1,
-    providerSpawnIntentId: intent.intentId
+    providerSpawnIntentId: intent.intentId,
+    ...(job.write === true
+      ? { executionBindingDigest: job.executionBinding.bindingDigest }
+      : {})
   };
 }
 
@@ -286,6 +289,8 @@ test("bootstrap argv contains only opaque dispatch coordinates while the private
   assert.equal(parsed.root, root);
   assert.equal(parsed.owner, owner);
   assert.deepEqual(parsed.args, ["agent", "stdio", "--private-argument"]);
+  assert.equal(Object.hasOwn(parsed.binding, "executionBindingDigest"), false);
+  assert.equal(launch.specPayload.includes("executionBindingDigest"), false);
   assert.throws(
     () => createProviderBootstrapLaunch({
       root,
@@ -322,6 +327,19 @@ test("private bootstrap spec channel rejects missing, truncated, extra, malforme
     args: ["agent", "stdio"]
   };
   const payload = `${JSON.stringify(spec)}\n`;
+  const executionBindingDigest = "1".repeat(64);
+  const writeSpec = {
+    ...spec,
+    binding: {
+      ...spec.binding,
+      executionBindingDigest
+    }
+  };
+  const parsedWrite = await readProviderBootstrapSpec(
+    Readable.from([`${JSON.stringify(writeSpec)}\n`]),
+    expected
+  );
+  assert.equal(parsedWrite.binding.executionBindingDigest, executionBindingDigest);
   await assert.rejects(
     () => readProviderBootstrapSpec(null, expected),
     (error) => error?.code === "E_PROTOCOL" && /unavailable/.test(error.message)
@@ -331,7 +349,21 @@ test("private bootstrap spec channel rejects missing, truncated, extra, malforme
     `${payload}extra`,
     "{malformed}\n",
     `${JSON.stringify({ ...spec, unexpected: true })}\n`,
-    `${JSON.stringify({ ...spec, args: ["x".repeat(8 * 1024 + 1)] })}\n`
+    `${JSON.stringify({ ...spec, args: ["x".repeat(8 * 1024 + 1)] })}\n`,
+    `${JSON.stringify({
+      ...writeSpec,
+      binding: {
+        ...writeSpec.binding,
+        executionBindingDigest: "not-a-digest"
+      }
+    })}\n`,
+    `${JSON.stringify({
+      ...writeSpec,
+      binding: {
+        ...writeSpec.binding,
+        unexpected: true
+      }
+    })}\n`
   ]) {
     await assert.rejects(
       () => readProviderBootstrapSpec(Readable.from([invalid]), expected),
@@ -526,6 +558,82 @@ test("failed bootstrap cleanup preserves an exact concurrent guard winner", {
   await killAndWait(winner, winnerIdentity);
 });
 
+test("write bootstrap retains its execution binding through spec, guard, readiness, promotion, and cleanup", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = await workerStartedFixture(t, "write-binding");
+  const prepared = prepareWorkerProviderSpawn({
+    root: fixture.root,
+    workerId: fixture.workerId,
+    attemptId: fixture.claim.attemptId,
+    fence: fixture.claim.fence,
+    providerGeneration: 1,
+    env: fixture.env
+  });
+  const executionBindingDigest = "2".repeat(64);
+  updateJob(fixture.root, fixture.workerId, (job) => ({
+    ...job,
+    write: true,
+    executionBinding: { bindingDigest: executionBindingDigest },
+    request: {
+      ...job.request,
+      spawn: {
+        ...job.request.spawn,
+        executionBindingDigest
+      }
+    }
+  }), fixture.env);
+
+  const providerSource = [
+    "process.stdin.resume();",
+    "setInterval(() => {}, 1000);"
+  ].join(" ");
+  const launch = bootstrapLaunch(fixture, prepared.intent, [
+    "-e", providerSource, fixture.workerId, "agent", "stdio"
+  ]);
+  const privateSpec = JSON.parse(launch.specPayload);
+  assert.equal(privateSpec.binding.executionBindingDigest, executionBindingDigest);
+
+  const child = spawn(
+    process.execPath,
+    launch.argv,
+    {
+      cwd: fixture.root,
+      env: {
+        ...fixture.env,
+        GROK_COMPANION_JOB_MARKER: fixture.workerId,
+        GROK_COMPANION_BOOTSTRAP_PLUGIN_DATA: fixture.pluginData
+      },
+      detached: true,
+      stdio: ["pipe", "pipe", "pipe", "pipe", "pipe", "pipe", "pipe"]
+    }
+  );
+  t.after(() => {
+    try { process.kill(-child.pid, "SIGKILL"); } catch {}
+  });
+  await publishProviderBootstrapSpec(child, launch.specPayload);
+  const ready = await readiness(child);
+  assert.equal(ready.type, "provider-ready");
+  assert.equal(ready.executionBindingDigest, executionBindingDigest);
+
+  const guard = loadProviderGuard(fixture.root, fixture.workerId);
+  assert.equal(guard.schemaVersion, 4);
+  assert.equal(guard.executionBindingDigest, executionBindingDigest);
+  const binding = bootstrapBinding(fixture, prepared.intent);
+  const acknowledgement = await promoteProviderBootstrap(child, {
+    marker: fixture.workerId,
+    providerGeneration: binding.providerGeneration,
+    providerSpawnIntentId: binding.providerSpawnIntentId
+  });
+  assert.equal(acknowledgement.type, "provider-promoted");
+  assert.equal(acknowledgement.executionBindingDigest, executionBindingDigest);
+
+  const closed = waitForClose(child);
+  child.stdin.end();
+  await closed;
+  assert.equal(loadProviderGuard(fixture.root, fixture.workerId), null);
+});
+
 test("post-guard version failure kills the whole owned group and retains exact recovery evidence", {
   skip: process.platform === "win32"
 }, async (t) => {
@@ -576,6 +684,7 @@ test("post-guard version failure kills the whole owned group and retains exact r
   await waitForClose(child);
   const guard = loadProviderGuard(fixture.root, fixture.workerId);
   assert.equal(guard?.schemaVersion, 3);
+  assert.equal(Object.hasOwn(guard, "executionBindingDigest"), false);
   assert.equal(guard?.providerSpawnIntentId, prepared.intent.intentId);
   assert.equal(await waitFor(() => processGroupGone(guard.providerProcess)), true);
   unregisterProviderGuard(fixture.root, fixture.workerId, guard, fixture.env);
@@ -623,8 +732,10 @@ test("an actual bootstrap guard wins recovery, is promoted exactly, and receives
   await publishProviderBootstrapSpec(child, launch.specPayload);
   const ready = await readiness(child);
   assert.equal(ready.type, "provider-ready");
+  assert.equal(Object.hasOwn(ready, "executionBindingDigest"), false);
   const guard = loadProviderGuard(fixture.root, fixture.workerId);
   assert.equal(guard.schemaVersion, 3);
+  assert.equal(Object.hasOwn(guard, "executionBindingDigest"), false);
   assert.equal(guard.providerSpawnIntentId, prepared.intent.intentId);
   assert.equal(guard.providerProcess.pid, child.pid);
   assert.equal(fs.existsSync(stdinEvidence), false, "bootstrap forwarded bytes before dispatch promotion");
@@ -702,6 +813,7 @@ test("bootstrap shutdown escalates a TERM-resistant Grok child and acknowledges 
     providerSpawnIntentId: binding.providerSpawnIntentId
   });
   assert.equal(acknowledgement.type, "provider-promoted");
+  assert.equal(Object.hasOwn(acknowledgement, "executionBindingDigest"), false);
 
   const closed = waitForClose(child);
   child.stdin.end();
