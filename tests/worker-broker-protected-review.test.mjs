@@ -423,7 +423,7 @@ function prepareBuildContext(fixture, keyPair) {
   fs.writeFileSync(path.join(context, "Dockerfile"), `
 FROM ${PINNED_NODE_IMAGE}
 RUN apt-get update \\
- && apt-get install -y --no-install-recommends git python3 \\
+ && apt-get install -y --no-install-recommends git procps python3 \\
  && rm -rf /var/lib/apt/lists/* \\
  && groupadd --gid 10001 reviewer \\
  && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin reviewer
