@@ -8,6 +8,7 @@ import {
   classifyPromptStopReason,
   isCancelledPromptStopReason,
   isSuccessfulPromptStopReason,
+  isValidJsonRpcNotification,
   validatePromptResponse
 } from "../plugins/grok/scripts/lib/acp-client.mjs";
 
@@ -132,4 +133,142 @@ test("asynchronous ACP stdin EPIPE closes dispatch, notify, and close paths with
       }
     });
   }
+});
+
+test("validated ACP notifications preserve update and unknown event behavior", () => {
+  const child = new FakeChild();
+  const client = new AcpClient(child, {
+    timeoutMs: 1000,
+    knownSecrets: ["xai-live-notification-secret"]
+  });
+  const notifications = [];
+  const updates = [];
+  const unknown = [];
+  const order = [];
+  client.on("notification", (message) => {
+    notifications.push(message);
+    order.push(`notification:${message.method}`);
+  });
+  client.on("update", (update) => {
+    updates.push(update);
+    order.push("update");
+  });
+  client.on("unknown", (message) => {
+    unknown.push(message);
+    order.push(`unknown:${message.method}`);
+  });
+
+  const extension = {
+    jsonrpc: "2.0",
+    method: "_x.ai/git/worktree/status",
+    params: {
+      sessionId: "operation-1",
+      status: "progress",
+      message: "safe",
+      apiKey: "xai-live-notification-secret"
+    }
+  };
+  const update = {
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: {
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { text: "hello" }
+      }
+    }
+  };
+  child.stdout.write(`${JSON.stringify(extension)}\n${JSON.stringify(update)}\n`);
+
+  assert.deepEqual(notifications, [
+    {
+      ...extension,
+      params: {
+        ...extension.params,
+        apiKey: "[REDACTED]"
+      }
+    },
+    update
+  ]);
+  assert.deepEqual(unknown, [{
+    ...extension,
+    params: {
+      ...extension.params,
+      apiKey: "[REDACTED]"
+    }
+  }]);
+  assert.deepEqual(updates, [{ type: "message", text: "hello" }]);
+  assert.deepEqual(order, [
+    "notification:_x.ai/git/worktree/status",
+    "unknown:_x.ai/git/worktree/status",
+    "notification:session/update",
+    "update"
+  ]);
+  assert.equal(client.closed, false);
+});
+
+test("ACP notification validation rejects malformed envelopes before publication", async (t) => {
+  const cases = [
+    ["wrong version", {
+      jsonrpc: "1.0",
+      method: "_x.ai/git/worktree/status",
+      params: {}
+    }],
+    ["id-bearing", {
+      jsonrpc: "2.0",
+      id: null,
+      method: "_x.ai/git/worktree/status",
+      params: {}
+    }],
+    ["response-shaped", {
+      jsonrpc: "2.0",
+      method: "_x.ai/git/worktree/status",
+      result: {},
+      params: {}
+    }],
+    ["extra field", {
+      jsonrpc: "2.0",
+      method: "_x.ai/git/worktree/status",
+      params: {},
+      extra: true
+    }],
+    ["primitive params", {
+      jsonrpc: "2.0",
+      method: "_x.ai/git/worktree/status",
+      params: 7
+    }]
+  ];
+
+  for (const [name, message] of cases) {
+    await t.test(name, async () => {
+      const child = new FakeChild();
+      const client = new AcpClient(child, { timeoutMs: 1000 });
+      const published = [];
+      client.on("notification", (value) => published.push(value));
+      client.on("unknown", (value) => published.push(value));
+      const closed = once(client, "closed");
+      child.stdout.write(`${JSON.stringify(message)}\n`);
+      const [error] = await closed;
+      assert.equal(error?.code, "E_PROTOCOL");
+      assert.deepEqual(published, []);
+      assert.equal(client.closed, true);
+    });
+  }
+});
+
+test("JSON-RPC notification validator accepts only id-less structured notification frames", () => {
+  assert.equal(isValidJsonRpcNotification({
+    jsonrpc: "2.0",
+    method: "notifications/no-params"
+  }), true);
+  assert.equal(isValidJsonRpcNotification({
+    jsonrpc: "2.0",
+    method: "notifications/array",
+    params: []
+  }), true);
+  assert.equal(isValidJsonRpcNotification({
+    jsonrpc: "2.0",
+    method: "notifications/null",
+    params: null
+  }), false);
 });

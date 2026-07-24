@@ -265,16 +265,25 @@ export class AcpClient extends EventEmitter {
       return;
     }
 
-    // Notifications
-    if (message.method === "session/update") {
-      if (message.jsonrpc !== "2.0" || Object.hasOwn(message, "id")) {
-        this.#close(new CompanionError("E_PROTOCOL", "ACP session update envelope is invalid."));
+    // Notifications: id-less JSON-RPC method messages.
+    // Emit one validated generic `notification` event, then preserve the
+    // existing session/update → `update` and other-method → `unknown` paths.
+    if (typeof message.method === "string") {
+      if (!isValidJsonRpcNotification(message)) {
+        this.#close(new CompanionError(
+          "E_PROTOCOL",
+          message.method === "session/update"
+            ? "ACP session update envelope is invalid."
+            : "ACP notification envelope is invalid."
+        ));
         return;
       }
-      this.emit("update", normalizeUpdate(redact(message.params?.update, this.knownSecrets)));
-      return;
-    }
-    if (typeof message.method === "string") {
+      const notification = redact(message, this.knownSecrets);
+      this.emit("notification", notification);
+      if (message.method === "session/update") {
+        this.emit("update", normalizeUpdate(redact(message.params?.update, this.knownSecrets)));
+        return;
+      }
       this.emit("unknown", redact(message, this.knownSecrets));
       return;
     }
@@ -482,4 +491,26 @@ export function normalizeUpdate(update) {
   if (kind.includes("plan")) return { type: "plan", value: update };
   if (kind.includes("usage")) return { type: "usage", value: update };
   return { type: "unknown", value: update };
+}
+
+/**
+ * Strict JSON-RPC 2.0 notification envelope (id-less method message).
+ * Allowed keys: jsonrpc, method, params. Rejects result/error/id and extras.
+ */
+export function isValidJsonRpcNotification(message) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+  if (message.jsonrpc !== "2.0") return false;
+  if (typeof message.method !== "string" || !message.method) return false;
+  if (Object.hasOwn(message, "id")) return false;
+  if (Object.hasOwn(message, "result") || Object.hasOwn(message, "error")) return false;
+  if (Object.hasOwn(message, "params")
+    && (!message.params
+      || typeof message.params !== "object")) {
+    return false;
+  }
+  const keys = Object.keys(message);
+  for (const key of keys) {
+    if (key !== "jsonrpc" && key !== "method" && key !== "params") return false;
+  }
+  return true;
 }
