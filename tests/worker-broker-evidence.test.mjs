@@ -6306,18 +6306,18 @@ test("protected review entrypoints fail closed outside the fixed host runtime", 
 import childProcess from "node:child_process";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-childProcess.spawnSync = () => {
-  fs.writeFileSync(${JSON.stringify(forgedSpawnMarker)}, "forged\\n");
-  return {
-    status: 0,
-    signal: null,
-    stdout: ${JSON.stringify(JSON.stringify({
-      ok: true,
-      converged: false,
-      recordDigest: "a".repeat(64)
-    }))},
-    stderr: ""
-  };
+const originalSpawnSync = childProcess.spawnSync.bind(childProcess);
+childProcess.spawnSync = (command, args, options) => {
+  const invocation = JSON.stringify({
+    command,
+    args,
+    protectedChild: options?.env?.GROK_PROTECTED_OPERATION_CHILD || null
+  });
+  if (/worker-broker-review-operation|prove-phase-2|verify-phase-2|promote/u
+    .test(invocation)) {
+    fs.writeFileSync(${JSON.stringify(forgedSpawnMarker)}, "privileged\\n");
+  }
+  return originalSpawnSync(command, args, options);
 };
 syncBuiltinESMExports();
 process.argv[1] = ${JSON.stringify(path.join(
