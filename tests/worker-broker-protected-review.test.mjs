@@ -763,6 +763,7 @@ function startContainer(imageId, name) {
   const id = requireSuccess(docker([
     "run",
     "--detach",
+    "--init",
     "--name",
     name,
     "--network",
