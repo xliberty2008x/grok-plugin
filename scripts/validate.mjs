@@ -499,9 +499,23 @@ if (!versionsOnly) {
     const proofProducer = workerEvidenceSchema.properties?.proofProducer;
     if (proofProducer?.additionalProperties !== false
       || proofProducer?.properties?.id?.const !== "worker-broker-gate-runner"
-      || proofProducer?.properties?.version?.const !== 3
+      || proofProducer?.properties?.version?.const !== 4
       || !proofProducer?.required?.includes("manifestDigest")) {
       problem("Worker Broker evidence schema must bind exact gate-runner provenance.", file);
+    }
+    const phaseTwoProducerRule = (workerEvidenceSchema.allOf || []).find((rule) => (
+      rule?.if?.properties?.phase?.const === "2"
+      && rule?.if?.properties?.proofProducer?.properties?.version?.const === 4
+      && rule?.then?.properties?.slice?.const === "mailbox-context-roles"
+      && rule?.then?.properties?.status?.const === "verified_on_draft"
+      && rule?.then?.properties?.qualification?.properties?.deterministic?.const === "pass"
+      && rule?.then?.properties?.qualification?.properties?.installedHost?.const === "not_run"
+      && rule?.then?.properties?.qualification?.properties?.provider?.const === "not_run"
+      && rule?.then?.properties?.qualification?.properties?.release?.const === "not_run"
+      && rule?.then?.not?.required?.includes("liveQualificationReceipts")
+    ));
+    if (!phaseTwoProducerRule) {
+      problem("Worker Broker Phase 2 schema must bind the protected deterministic-only producer contract.", file);
     }
     const reviewReceipt = workerEvidenceSchema.properties?.independentReviewReceipt;
     const signedPhaseOnePromotionRule = (workerEvidenceSchema.allOf || []).find((rule) => (
@@ -803,6 +817,10 @@ if (!versionsOnly) {
       || !protectedReviewBootstrap.includes(
         "attestation: await readBoundedAttestation()"
       )
+      || !protectedReviewBootstrap.includes('"prove-phase-2"')
+      || !protectedReviewBootstrap.includes('"verify-phase-2"')
+      || !protectedReviewBootstrap.includes("api.provePhaseTwoFromProtectedRuntime")
+      || !protectedReviewBootstrap.includes("api.verifyPhaseTwoFromProtectedRuntime")
       || requiredRuntimeBundlePaths.some((relative) => (
         !protectedReviewBootstrap.includes(JSON.stringify(relative))
       ))

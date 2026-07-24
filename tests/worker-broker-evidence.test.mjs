@@ -11,6 +11,7 @@ import {
   PHASE_SCOPE,
   PHASE_MANDATORY_GATE_IDS,
   PHASE_PROOF_GATE_MANIFEST,
+  PHASE_TWO_SLICE,
   PROOF_PRODUCER_ID,
   PROOF_PRODUCER_VERSION,
   INDEPENDENT_REVIEW_PRODUCER_ID,
@@ -78,6 +79,8 @@ import {
   validatePhaseOneReviewRequest,
   verifyLedger,
   verifyPhase,
+  provePhaseTwoFromProtectedRuntime,
+  verifyPhaseTwoFromProtectedRuntime,
   verifySignedLedgerFromProtectedRuntime,
   writeEvidenceRecord,
   sha256Text
@@ -91,6 +94,10 @@ import {
   PHASE1_FOCUSED_TEST_FILES,
   runPhaseOneFocusedTests
 } from "../scripts/test-phase1-focused.mjs";
+import {
+  PHASE2_FOCUSED_TEST_FILES,
+  runPhaseTwoFocusedTests
+} from "../scripts/test-phase2-focused.mjs";
 import {
   createPluginInventory,
   digestInventory
@@ -1908,6 +1915,41 @@ export function __testVerifySignedLedger(root, trust) {
     strict: true,
     signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
     signedReviewTrust: trust
+  });
+}
+export function __testPublishPhaseTwo(record, root, trust) {
+  const signedReviewTrust = {
+    ...trust,
+    requireFresh: false
+  };
+  const proofContext = createProofExecutionContext();
+  try {
+    const source = captureProofSourceSnapshot("2", root, proofContext.toolchain);
+    const prerequisites = captureProofPrerequisites("2", root, signedReviewTrust);
+    if (prerequisites == null) throw new Error("missing protected prerequisites");
+    const relative = publishDependentPhaseProofRecord(
+      record,
+      root,
+      source,
+      prerequisites,
+      proofContext.toolchain,
+      signedReviewTrust
+    );
+    return { relative, prerequisites };
+  } finally {
+    const cleaned = proofContext.cleanup();
+    if (!cleaned?.ok) throw new Error("proof cleanup failed");
+  }
+}
+export function __testVerifyPhaseTwo(root, trust) {
+  return verifyPhase("2", root, {
+    strict: true,
+    requireVerified: true,
+    signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
+    signedReviewTrust: {
+      ...trust,
+      requireFresh: false
+    }
   });
 }
 export function __testImportSignedReview(options) {
@@ -5289,6 +5331,91 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
   assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 27);
 });
 
+test("Phase 2 protected manifest, scope, and serial inventory are exact", () => {
+  assert.equal(PHASE_TWO_SLICE, "mailbox-context-roles");
+  assert.equal(PROOF_PRODUCER_VERSION, 4);
+  assert.deepEqual(PHASE_PROOF_GATE_MANIFEST["2"], [
+    {
+      gateId: "repository-check",
+      argv: ["node", "scripts/check-deterministic.mjs"],
+      boundary: "source-provider-neutral",
+      timeoutMs: 15 * 60_000
+    },
+    {
+      gateId: "phase-2-focused-tests",
+      argv: ["node", "scripts/test-phase2-focused.mjs"],
+      boundary: "focused-source-provider-neutral",
+      timeoutMs: 15 * 60_000
+    },
+    {
+      gateId: "git-diff-check",
+      argv: ["git", "show", "--check", "--format=", "HEAD"],
+      boundary: "source",
+      timeoutMs: 60_000
+    }
+  ]);
+  assert.equal(
+    computeProofManifestDigest("2"),
+    "a88795f9f48d632451eed5d7dfd1b7fe482638fc83386128d3f70490f33dac22"
+  );
+  assert.deepEqual(PHASE2_FOCUSED_TEST_FILES, [
+    "tests/acp-client.test.mjs",
+    "tests/provider-capability.test.mjs",
+    "tests/provider.test.mjs",
+    "tests/state.test.mjs",
+    "tests/worker-context-roles.test.mjs",
+    "tests/worker-host-actions.test.mjs",
+    "tests/worker-mailbox.test.mjs",
+    "tests/worker-mutation.test.mjs",
+    "tests/worker-protocol.test.mjs",
+    "tests/worker-service.test.mjs",
+    "tests/worker-dispatch-supervisor.test.mjs",
+    "tests/worker-terminal-intent.test.mjs",
+    "tests/worker-recovery-fence.test.mjs",
+    "tests/worker-provider-rotation-intent.test.mjs",
+    "tests/mcp-worker-broker.test.mjs",
+    "tests/mcp-worker-runtime.test.mjs",
+    "tests/installed-worker-mcp-contract.test.mjs",
+    "tests/installed-worker-mcp-runner.test.mjs"
+  ]);
+  assert.equal(typeof runPhaseTwoFocusedTests, "function");
+  for (const relative of [
+    "plugins/grok/.codex-plugin/plugin.json",
+    "plugins/grok/.mcp.json",
+    "plugins/grok/provider-agents/report-repair.md",
+    "plugins/grok/provider-agents/rescue-read.md",
+    "plugins/grok/provider-agents/rescue-write.md",
+    "plugins/grok/provider-agents/setup-probe.md",
+    "plugins/grok/schemas/review-output.schema.json",
+    "plugins/grok/schemas/worker-broker-evidence.schema.json",
+    "plugins/grok/schemas/worker-broker-live-receipt.schema.json",
+    "plugins/grok/schemas/worker-broker-review-attestation.schema.json",
+    "plugins/grok/schemas/worker-broker-review-request.schema.json",
+    "plugins/grok/schemas/worker-protocol.schema.json",
+    "plugins/grok/scripts/lib/worker-authority.mjs",
+    "plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs",
+    "plugins/grok/scripts/lib/worker-runtime.mjs",
+    "scripts/lib/deterministic-test-runner.mjs",
+    "scripts/lib/installed-worker-mcp-contract.mjs",
+    "scripts/lib/worker-broker-evidence.mjs",
+    "scripts/test-installed-worker-mcp.mjs",
+    "scripts/test-phase2-focused.mjs",
+    "scripts/trusted/worker-broker-review.mjs",
+    "scripts/validate.mjs",
+    "package.json",
+    "tests/worker-broker-evidence.test.mjs",
+    "tests/worker-broker-protected-review.test.mjs",
+    ...PHASE2_FOCUSED_TEST_FILES
+  ]) {
+    assert.equal(
+      PHASE_SCOPE["2"].filter((candidate) => candidate === relative).length,
+      1,
+      `${relative} must occur exactly once in the Phase 2 source scope`
+    );
+  }
+  assert.deepEqual(findMissingLocalStaticImportDependencies(PHASE_SCOPE["2"]), []);
+});
+
 test("Phase 1 proof rejects unsupported slices and caller-supplied execution authority", () => {
   const legacyPhaseZeroEntrypoint = provePhaseZero({ phase: "1", slice: "worker-api" });
   assert.equal(legacyPhaseZeroEntrypoint.ok, false);
@@ -5327,11 +5454,31 @@ test("Phase 1 proof rejects unsupported slices and caller-supplied execution aut
     "node"
   ], { cwd: ROOT });
   assert.equal(injected.status, 2);
+
+  const protectedOnlyPhaseTwo = proveWorkerBrokerPhase({
+    phase: "2",
+    slice: PHASE_TWO_SLICE
+  });
+  assert.deepEqual(protectedOnlyPhaseTwo, {
+    ok: false,
+    code: "E_PROOF_ARGUMENT"
+  });
+  const protectedOnlyCli = run(process.execPath, [
+    cli,
+    "prove",
+    "--phase",
+    "2",
+    "--slice",
+    PHASE_TWO_SLICE
+  ], { cwd: ROOT });
+  assert.equal(protectedOnlyCli.status, 1);
+  assert.equal(protectedOnlyCli.stderr, "");
+  assert.equal(JSON.parse(protectedOnlyCli.stdout).code, "E_PROOF_ARGUMENT");
 });
 
-test("numbered phases are draft-only and producer v3 preserves the signed Phase 1 barrier", () => {
-  assert.equal(PROOF_PRODUCER_VERSION, 3);
-  for (const phase of ["0", "1", "2", "3", "4", "5"]) {
+test("numbered phases are draft-only and producer v4 preserves the signed Phase 1 barrier", () => {
+  assert.equal(PROOF_PRODUCER_VERSION, 4);
+  for (const phase of ["0", "1", "3", "4", "5"]) {
     let unverified = buildEvidenceRecord({
       phase,
       slice: `phase-${phase}-state`,
@@ -5373,7 +5520,7 @@ test("numbered phases are draft-only and producer v3 preserves the signed Phase 
     path.join(ROOT, "plugins/grok/schemas/worker-broker-evidence.schema.json"),
     "utf8"
   ));
-  assert.equal(schema.properties.proofProducer.properties.version.const, 3);
+  assert.equal(schema.properties.proofProducer.properties.version.const, 4);
   const qualifiedRule = schema.allOf.find((rule) => (
     rule?.if?.properties?.status?.const === "qualified"
   ));
@@ -5385,6 +5532,78 @@ test("numbered phases are draft-only and producer v3 preserves the signed Phase 
     && rule?.then?.not?.properties?.status?.const === "qualified"
   ));
   assert.ok(numberedQualifiedProhibition);
+});
+
+test("Phase 2 proof record is fixed, ordered, deterministic-only, and non-live", () => {
+  let record = buildEvidenceRecord({
+    phase: "2",
+    slice: PHASE_TWO_SLICE,
+    status: "verified_on_draft",
+    verification: exactPhaseProof("2"),
+    qualification: deterministicQualification(),
+    evidenceSystemQualification: true,
+    prerequisites: [
+      {
+        phase: "0",
+        recordDigest: sha256Text("phase-2-prerequisite-0"),
+        gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]]
+      },
+      {
+        phase: "1",
+        recordDigest: sha256Text("phase-2-prerequisite-1"),
+        gateIds: [...PHASE_MANDATORY_GATE_IDS["1"]]
+      }
+    ]
+  });
+  record = attachRecordDigest({
+    ...record,
+    source: {
+      ...record.source,
+      cleanTreeAtVerification: true
+    },
+    proofProducer: proofProducer("2")
+  });
+  const accepted = validateEvidenceRecord(record);
+  assert.equal(accepted.ok, true, accepted.errors.join("; "));
+
+  const mutations = [
+    ["slice", (candidate) => { candidate.slice = "caller-selected"; }, /fixed slice/i],
+    ["status", (candidate) => { candidate.status = "implemented_unverified"; }, /verified_on_draft/i],
+    ["gate order", (candidate) => {
+      candidate.verification = [
+        candidate.verification[1],
+        candidate.verification[0],
+        candidate.verification[2]
+      ];
+    }, /exact ordered gate/i],
+    ["prerequisite order", (candidate) => {
+      candidate.prerequisites = [
+        candidate.prerequisites[1],
+        candidate.prerequisites[0]
+      ];
+    }, /exact ordered Phase 0 and signed Phase 1/i],
+    ["non-deterministic boundary", (candidate) => {
+      candidate.qualification.installedHost = "skip";
+    }, /deterministic-only/i],
+    ["live receipt slots", (candidate) => {
+      candidate.liveQualificationReceipts = {
+        syntheticDirectMcp: null,
+        naturalCodexHost: null
+      };
+    }, /cannot link live qualification/i]
+  ];
+  for (const [label, mutate, expected] of mutations) {
+    const candidate = structuredClone(record);
+    mutate(candidate);
+    const result = validateEvidenceRecord(attachRecordDigest(candidate));
+    assert.equal(result.ok, false, label);
+    assert.ok(result.errors.some((message) => expected.test(message)), label);
+  }
+  assert.throws(
+    () => writeEvidenceRecord(record),
+    /invalid/i,
+    "the generic writer cannot publish the protected Phase 2 claim"
+  );
 });
 
 test("Phase 1 rejects the reserved self-digested review receipt as unauthenticated", () => {
@@ -5972,6 +6191,16 @@ test("protected review entrypoints fail closed outside the fixed host runtime", 
       env: cleanEnvironment
     },
     {
+      label: "ordinary source checkout Phase 2 proof",
+      args: ["prove-phase-2", "--workspace", fixture.root],
+      env: cleanEnvironment
+    },
+    {
+      label: "ordinary source checkout Phase 2 replay",
+      args: ["verify-phase-2", "--workspace", fixture.root],
+      env: cleanEnvironment
+    },
+    {
       label: "caller PATH",
       args: ["verify", "--workspace", fixture.root],
       env: { PATH: `/caller-controlled${path.delimiter}/usr/bin:/bin` }
@@ -6035,6 +6264,14 @@ test("protected review entrypoints fail closed outside the fixed host runtime", 
     (error) => error?.code === "E_REVIEW_TRUST_UNAVAILABLE"
   );
   assert.throws(
+    () => provePhaseTwoFromProtectedRuntime({ workspace: fixture.root }),
+    (error) => error?.code === "E_REVIEW_TRUST_UNAVAILABLE"
+  );
+  assert.throws(
+    () => verifyPhaseTwoFromProtectedRuntime({ workspace: fixture.root }),
+    (error) => error?.code === "E_REVIEW_TRUST_UNAVAILABLE"
+  );
+  assert.throws(
     () => promotePhaseOneFromProtectedRuntime({
       workspace: fixture.root,
       requestPath: requestResult.path,
@@ -6044,6 +6281,135 @@ test("protected review entrypoints fail closed outside the fixed host runtime", 
     (error) => error?.code === "E_REVIEW_TRUST_UNAVAILABLE"
   );
   assert.equal(fs.readFileSync(ledgerPath, "utf8"), ledgerBefore);
+});
+
+test("protected Phase 2 publication requires the exact signed chain and replays atomically", async () => {
+  const fixture = initPhaseOneSignedReviewFixture("protected-phase-two");
+  const requestResult = createReviewRequestFixture(fixture, { write: true });
+  const keyPair = crypto.generateKeyPairSync("ed25519");
+  const attestation = signedReviewAttestation(requestResult, keyPair);
+  const attestationPath = writeReviewAttestationFixture(fixture.root, attestation);
+  const now = new Date(Date.parse(attestation.endedAt) + 1_000).toISOString();
+  const trust = {
+    publicKey: keyPair.publicKey,
+    expectedIssuer: "test-protected-reviewer",
+    revokedKeyFingerprints: [],
+    now
+  };
+  const { api } = await loadPrivateReviewPromotionHarness(fixture.root);
+
+  const buildPhaseTwoRecord = (phaseOneDigest) => {
+    let record = buildEvidenceRecord({
+      root: fixture.root,
+      phase: "2",
+      slice: PHASE_TWO_SLICE,
+      status: "verified_on_draft",
+      verification: exactPhaseProof("2"),
+      qualification: deterministicQualification(),
+      evidenceSystemQualification: true,
+      prerequisites: [
+        {
+          phase: "0",
+          recordDigest: fixture.phaseZero.recordDigest,
+          gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]]
+        },
+        {
+          phase: "1",
+          recordDigest: phaseOneDigest,
+          gateIds: [...PHASE_MANDATORY_GATE_IDS["1"]]
+        }
+      ]
+    });
+    record = attachRecordDigest({
+      ...record,
+      proofProducer: proofProducer("2")
+    });
+    return record;
+  };
+
+  assert.throws(
+    () => api.__testPublishPhaseTwo(
+      buildPhaseTwoRecord(fixture.phaseOne.recordDigest),
+      fixture.root,
+      trust
+    ),
+    /prerequisite/i,
+    "an unsigned current Phase 1 cannot authorize Phase 2 publication"
+  );
+  assert.equal(
+    loadLedger(fixture.root).entries.some((entry) => entry.phase === "2"),
+    false
+  );
+
+  const promoted = api.__testPromoteSignedReview({
+    root: fixture.root,
+    requestPath: requestResult.path,
+    attestationPath,
+    trust,
+    now
+  });
+  assert.equal(promoted.ok, true);
+  const signedLedgerWithoutPhaseTwo = api.__testVerifyPhaseTwo(
+    fixture.root,
+    trust
+  );
+  assert.equal(signedLedgerWithoutPhaseTwo.ok, false);
+  assert.ok(signedLedgerWithoutPhaseTwo.errors.some((message) => (
+    /no current ledger entry for phase 2/i.test(message)
+  )));
+  const record = buildPhaseTwoRecord(promoted.recordDigest);
+  const publication = api.__testPublishPhaseTwo(record, fixture.root, trust);
+  assert.deepEqual(publication.prerequisites, record.prerequisites);
+  assert.match(publication.relative, /^tests\/e2e-results\/worker-broker\/phase-2\//);
+
+  const replay = api.__testVerifyPhaseTwo(fixture.root, trust);
+  assert.equal(replay.ok, true, replay.errors.join("; "));
+  assert.equal(replay.integrityOk, true);
+  assert.equal(replay.slice, PHASE_TWO_SLICE);
+  assert.equal(replay.status, "verified_on_draft");
+  assert.equal(replay.recordDigest, record.recordDigest);
+  assert.equal(replay.verified, true);
+  const publishedRecord = JSON.parse(fs.readFileSync(
+    path.join(fixture.root, publication.relative),
+    "utf8"
+  ));
+  assert.equal(Object.hasOwn(publishedRecord, "liveQualificationReceipts"), false);
+  assert.deepEqual(publishedRecord.liveScenarios, []);
+  assert.deepEqual(publishedRecord.qualification, deterministicQualification());
+
+  const ordinaryReplay = verifyLedger(fixture.root, { strict: true });
+  assert.equal(ordinaryReplay.ok, false);
+  assert.ok(ordinaryReplay.errors.some((message) => /protected host trust/i.test(message)));
+
+  const ledgerPath = path.join(
+    fixture.root,
+    "tests/e2e-results/worker-broker/ledger.json"
+  );
+  const ledgerBeforeRace = fs.readFileSync(ledgerPath, "utf8");
+  const raced = attachRecordDigest({
+    ...record,
+    recordedAt: new Date(Date.parse(record.recordedAt) + 1_000).toISOString()
+  });
+  const rename = fs.renameSync;
+  fs.renameSync = (source, destination) => {
+    if (path.basename(destination) === "ledger.json"
+      && path.basename(source).startsWith(".ledger.json.")) {
+      throw new Error("injected Phase 2 ledger race");
+    }
+    return rename(source, destination);
+  };
+  try {
+    assert.throws(
+      () => api.__testPublishPhaseTwo(raced, fixture.root, trust),
+      /evidence|ledger/i
+    );
+  } finally {
+    fs.renameSync = rename;
+  }
+  assert.equal(fs.readFileSync(ledgerPath, "utf8"), ledgerBeforeRace);
+  const afterRace = api.__testVerifyPhaseTwo(fixture.root, trust);
+  assert.equal(afterRace.ok, true, afterRace.errors.join("; "));
+  assert.equal(afterRace.recordDigest, record.recordDigest);
 });
 
 test("private signed review promotion is atomic, immutable, concurrent, and restart-fail-closed", async () => {
@@ -7250,7 +7616,7 @@ test("Phase 0 proof safely supersedes a canonical current v1 proof runner record
 
   const result = provePhaseZero({
     phase: "0",
-    slice: "phase-zero-v3-baseline",
+    slice: "phase-zero-v4-baseline",
     root,
     write: true
   });
@@ -7303,44 +7669,82 @@ test("Phase 0 proof safely supersedes a canonical current v1 proof runner record
   assert.equal(loadLedger(malformedFixture.root).entries[0].currency, "current");
 });
 
-test("producer v3 atomically supersedes an immutable current v2 Phase 0/1 chain", () => {
-  const { root } = initPhaseOneProofRunnerFixture("proof-runner-v2-chain-cutover");
+test("producer v4 atomically supersedes an immutable current v3 Phase 0/1 chain", () => {
+  const { root } = initPhaseOneProofRunnerFixture("proof-runner-v3-chain-cutover");
   const priorPhaseZero = seedPriorProofRunnerCurrent(
     root,
     "0",
-    "runner-v2-phase-0",
-    2
+    "runner-v3-phase-0",
+    3
   );
   const priorPhaseOne = seedPriorProofRunnerCurrent(
     root,
     "1",
-    "runner-v2-phase-1",
-    2,
+    "runner-v3-phase-1",
+    3,
     [{
       phase: "0",
       recordDigest: priorPhaseZero.record.recordDigest,
       gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]]
     }]
   );
+  priorPhaseOne.record = attachRecordDigest({
+    ...priorPhaseOne.record,
+    status: "verified_on_draft",
+    authorities: {
+      ...priorPhaseOne.record.authorities,
+      independentValidation: "pass"
+    },
+    independentReviewReceipt: attachIndependentReviewReceiptDigest({
+      schemaVersion: 2,
+      producerId: "worker-broker-protected-review-promoter",
+      producerVersion: 1,
+      reviewRequest: {
+        path: "tests/e2e-results/worker-broker/review-requests/v1/0000000000000000-0000000000000000.json",
+        digest: "0".repeat(64)
+      },
+      attestation: {
+        path: "tests/e2e-results/worker-broker/review-attestations/v1/0000000000000000-0000000000000000.json",
+        digest: "0".repeat(64)
+      },
+      issuer: "historical-v3-protected-reviewer",
+      keyFingerprint: "0".repeat(64)
+    })
+  });
+  fs.writeFileSync(
+    path.join(root, priorPhaseOne.recordPath),
+    `${JSON.stringify(priorPhaseOne.record, null, 2)}\n`
+  );
+  const priorLedgerPath = path.join(
+    root,
+    "tests/e2e-results/worker-broker/ledger.json"
+  );
+  const priorLedger = JSON.parse(fs.readFileSync(priorLedgerPath, "utf8"));
+  const priorPhaseOneEntry = priorLedger.entries.find((entry) => (
+    entry.phase === "1" && entry.currency === "current"
+  ));
+  priorPhaseOneEntry.status = priorPhaseOne.record.status;
+  priorPhaseOneEntry.recordDigest = priorPhaseOne.record.recordDigest;
+  fs.writeFileSync(priorLedgerPath, `${JSON.stringify(priorLedger, null, 2)}\n`);
   const phaseZeroBytes = fs.readFileSync(path.join(root, priorPhaseZero.recordPath));
   const phaseOneBytes = fs.readFileSync(path.join(root, priorPhaseOne.recordPath));
-  fs.writeFileSync(path.join(root, "tracked.txt"), "source advanced after producer v2\n");
+  fs.writeFileSync(path.join(root, "tracked.txt"), "source advanced after producer v3\n");
   git(root, "add", "tracked.txt");
-  git(root, "commit", "-m", "advance source after producer v2");
+  git(root, "commit", "-m", "advance source after producer v3");
   assert.notEqual(
     priorPhaseZero.record.source.sourceInventoryDigest,
     computeInventoryDigest(root, { includeEvidence: false }),
-    "the v2 chain must be stale before cutover"
+    "the v3 chain must be stale before cutover"
   );
 
   const replacement = provePhaseZero({
     phase: "0",
-    slice: "producer-v3-baseline",
+    slice: "producer-v4-baseline",
     root,
     write: true
   });
   assert.equal(replacement.ok, true, replacement.code);
-  assert.equal(replacement.record.proofProducer.version, 3);
+  assert.equal(replacement.record.proofProducer.version, 4);
   const ledger = loadLedger(root);
   assert.equal(
     ledger.entries.find((entry) => (
@@ -7361,12 +7765,12 @@ test("producer v3 atomically supersedes an immutable current v2 Phase 0/1 chain"
   assert.deepEqual(
     fs.readFileSync(path.join(root, priorPhaseZero.recordPath)),
     phaseZeroBytes,
-    "Phase 0 v2 bytes remain immutable"
+    "Phase 0 v3 bytes remain immutable"
   );
   assert.deepEqual(
     fs.readFileSync(path.join(root, priorPhaseOne.recordPath)),
     phaseOneBytes,
-    "Phase 1 v2 bytes remain immutable"
+    "Phase 1 v3 bytes remain immutable"
   );
   const strict = verifyLedger(root, { strict: true });
   assert.equal(strict.ok, true, strict.errors.join("; "));

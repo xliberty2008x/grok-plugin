@@ -62,6 +62,39 @@
     {
       "if": {
         "properties": {
+          "phase": { "const": "2" },
+          "proofProducer": {
+            "properties": {
+              "id": { "const": "worker-broker-gate-runner" },
+              "version": { "const": 4 }
+            },
+            "required": ["id", "version"]
+          }
+        },
+        "required": ["phase", "proofProducer"]
+      },
+      "then": {
+        "properties": {
+          "slice": { "const": "mailbox-context-roles" },
+          "status": { "const": "verified_on_draft" },
+          "releaseQualification": { "const": false },
+          "provisionalSupportingRecord": { "const": false },
+          "qualification": {
+            "properties": {
+              "deterministic": { "const": "pass" },
+              "installedHost": { "const": "not_run" },
+              "provider": { "const": "not_run" },
+              "release": { "const": "not_run" }
+            }
+          },
+          "liveScenarios": { "maxItems": 0 }
+        },
+        "not": { "required": ["liveQualificationReceipts"] }
+      }
+    },
+    {
+      "if": {
+        "properties": {
           "status": { "const": "qualified" }
         },
         "required": ["status"]
@@ -389,7 +422,7 @@
       "required": ["id", "version", "manifestDigest"],
       "properties": {
         "id": { "type": "string", "const": "worker-broker-gate-runner" },
-        "version": { "type": "integer", "const": 3 },
+        "version": { "type": "integer", "const": 4 },
         "manifestDigest": {
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"

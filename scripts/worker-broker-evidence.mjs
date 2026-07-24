@@ -108,7 +108,9 @@ function parseProveArgs(argv) {
   const phaseZero = args.phase === "0"
     && /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(args.slice || "");
   const phaseOne = args.phase === "1" && args.slice === "worker-api";
-  if (!phaseZero && !phaseOne) usage();
+  const protectedPhaseTwo = args.phase === "2"
+    && args.slice === "mailbox-context-roles";
+  if (!phaseZero && !phaseOne && !protectedPhaseTwo) usage();
   return args;
 }
 

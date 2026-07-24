@@ -35,7 +35,22 @@ export const EVIDENCE_ONLY_PREFIXES = Object.freeze([
   "tests/e2e-results/qualification-"
 ]);
 export const PROOF_PRODUCER_ID = "worker-broker-gate-runner";
-export const PROOF_PRODUCER_VERSION = 3;
+export const PROOF_PRODUCER_VERSION = 4;
+export const PHASE_TWO_SLICE = "mailbox-context-roles";
+const PRIOR_PROOF_MANIFEST_DIGESTS = Object.freeze({
+  1: Object.freeze({
+    "0": "66426cce37e08f4041ed272bfe6c9400298b9f05e1494b5ebd47747e1f43de8a",
+    "1": "b2fa2be3c0f70da875c7fdc268694bbd0c97c3e087ae5aabe3c995c675dab74a"
+  }),
+  2: Object.freeze({
+    "0": "66426cce37e08f4041ed272bfe6c9400298b9f05e1494b5ebd47747e1f43de8a",
+    "1": "b2fa2be3c0f70da875c7fdc268694bbd0c97c3e087ae5aabe3c995c675dab74a"
+  }),
+  3: Object.freeze({
+    "0": "66426cce37e08f4041ed272bfe6c9400298b9f05e1494b5ebd47747e1f43de8a",
+    "1": "b2fa2be3c0f70da875c7fdc268694bbd0c97c3e087ae5aabe3c995c675dab74a"
+  })
+});
 export const INDEPENDENT_REVIEW_PRODUCER_ID = "codex-native-review-runner";
 export const INDEPENDENT_REVIEW_PRODUCER_VERSION = 1;
 export const INDEPENDENT_REVIEW_MANIFEST_DIGEST = "82792debed04937a264e759a1812ba1e33e0417aa555f87ce13e7f5417fd6f12";
@@ -344,23 +359,65 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "tests/helpers.mjs"
   ],
   "2": [
+    "plugins/grok/.codex-plugin/plugin.json",
+    "plugins/grok/.mcp.json",
+    "plugins/grok/mcp/broker.mjs",
+    "plugins/grok/mcp/server.mjs",
+    "plugins/grok/provider-agents/report-repair.md",
+    "plugins/grok/provider-agents/rescue-read.md",
+    "plugins/grok/provider-agents/rescue-write.md",
+    "plugins/grok/provider-agents/setup-probe.md",
+    "plugins/grok/schemas/review-output.schema.json",
+    "plugins/grok/schemas/worker-broker-evidence.schema.json",
+    "plugins/grok/schemas/worker-broker-live-receipt.schema.json",
+    "plugins/grok/schemas/worker-broker-review-attestation.schema.json",
+    "plugins/grok/schemas/worker-broker-review-request.schema.json",
+    "plugins/grok/schemas/worker-protocol.schema.json",
     "plugins/grok/scripts/lib/redact.mjs",
     "plugins/grok/scripts/lib/errors.mjs",
     "plugins/grok/scripts/lib/host.mjs",
+    "plugins/grok/scripts/lib/provider-capability.mjs",
+    "plugins/grok/scripts/lib/grok-provider.mjs",
+    "plugins/grok/scripts/lib/worker-authority.mjs",
+    "plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs",
     "plugins/grok/scripts/lib/worker-mailbox.mjs",
     "plugins/grok/scripts/lib/worker-roles.mjs",
     "plugins/grok/scripts/lib/worker-context.mjs",
     "plugins/grok/scripts/lib/worker-mutation.mjs",
+    "plugins/grok/scripts/lib/worker-runtime.mjs",
     "plugins/grok/scripts/lib/worker-service.mjs",
     "plugins/grok/scripts/lib/worker-protocol.mjs",
     "plugins/grok/scripts/lib/state.mjs",
     "plugins/grok/scripts/lib/task-contract.mjs",
     "plugins/grok/scripts/lib/workspace.mjs",
-    "plugins/grok/mcp/broker.mjs",
-    "tests/worker-mailbox.test.mjs",
+    "scripts/check-deterministic.mjs",
+    "scripts/lib/static-esm-import-parser.mjs",
+    "scripts/lib/worker-broker-evidence.mjs",
+    "scripts/test-installed-worker-mcp.mjs",
+    "scripts/test-phase2-focused.mjs",
+    "scripts/trusted/worker-broker-review.mjs",
+    "scripts/validate.mjs",
+    "package.json",
+    "tests/acp-client.test.mjs",
+    "tests/installed-worker-mcp-contract.test.mjs",
+    "tests/installed-worker-mcp-runner.test.mjs",
+    "tests/mcp-worker-broker.test.mjs",
+    "tests/mcp-worker-runtime.test.mjs",
+    "tests/provider-capability.test.mjs",
+    "tests/provider.test.mjs",
+    "tests/state.test.mjs",
     "tests/worker-context-roles.test.mjs",
-    "tests/args-redaction-profiles.test.mjs",
-    "tests/redact.test.mjs",
+    "tests/worker-dispatch-supervisor.test.mjs",
+    "tests/worker-host-actions.test.mjs",
+    "tests/worker-mailbox.test.mjs",
+    "tests/worker-mutation.test.mjs",
+    "tests/worker-protocol.test.mjs",
+    "tests/worker-provider-rotation-intent.test.mjs",
+    "tests/worker-recovery-fence.test.mjs",
+    "tests/worker-service.test.mjs",
+    "tests/worker-terminal-intent.test.mjs",
+    "tests/worker-broker-evidence.test.mjs",
+    "tests/worker-broker-protected-review.test.mjs",
     "tests/helpers.mjs"
   ],
   "3": [
@@ -797,15 +854,9 @@ export const PHASE_PROOF_GATE_MANIFEST = freezeGateManifest({
     },
     {
       gateId: "phase-2-focused-tests",
-      argv: [
-        "node",
-        "--test",
-        "--test-reporter=./scripts/lib/zero-skip-test-reporter.mjs",
-        "tests/worker-context-roles.test.mjs",
-        "tests/worker-mailbox.test.mjs"
-      ],
+      argv: ["node", "scripts/test-phase2-focused.mjs"],
       boundary: "focused-source-provider-neutral",
-      timeoutMs: 5 * 60_000
+      timeoutMs: 15 * 60_000
     },
     {
       gateId: "git-diff-check",
@@ -5694,6 +5745,34 @@ export function validateEvidenceRecord(record, options = {}) {
         fail(`Proof-produced evidence cannot include scenarios[${index}] with a non-passing outcome.`);
       }
     }
+    if (phase === "2") {
+      if (record.slice !== PHASE_TWO_SLICE
+        || record.status !== "verified_on_draft") {
+        fail(`Phase 2 proofProducer evidence requires fixed slice ${PHASE_TWO_SLICE} and verified_on_draft status.`);
+      }
+      if (JSON.stringify((record.verification || []).map((entry) => entry?.gateId))
+        !== JSON.stringify(PHASE_MANDATORY_GATE_IDS["2"])) {
+        fail("Phase 2 proofProducer evidence requires the exact ordered gate manifest.");
+      }
+      if (JSON.stringify((record.prerequisites || []).map((item) => ({
+        phase: String(item?.phase ?? ""),
+        gateIds: item?.gateIds
+      }))) !== JSON.stringify([
+        { phase: "0", gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]] },
+        { phase: "1", gateIds: [...PHASE_MANDATORY_GATE_IDS["1"]] }
+      ])) {
+        fail("Phase 2 proofProducer evidence requires exact ordered Phase 0 and signed Phase 1 prerequisites.");
+      }
+      if (qualification?.installedHost !== "not_run"
+        || qualification?.provider !== "not_run"
+        || qualification?.release !== "not_run"
+        || record.releaseQualification !== false
+        || record.provisionalSupportingRecord !== false
+        || Object.hasOwn(record, "liveQualificationReceipts")
+        || (record.liveScenarios || []).length !== 0) {
+        fail("Phase 2 proofProducer evidence is deterministic-only and cannot link live qualification.");
+      }
+    }
   }
 
   if (VERIFIED_STATUS_SET.has(record.status)) {
@@ -7491,7 +7570,121 @@ export function verifySignedLedgerFromProtectedRuntime(options = {}) {
   });
 }
 
-function prerequisiteSnapshotFromInspected(phase, inspected, root) {
+function protectedSignedReviewReplayTrust(protectedTrust) {
+  return Object.freeze({
+    publicKey: protectedTrust.publicKey,
+    expectedIssuer: protectedTrust.expectedIssuer,
+    revokedKeyFingerprints: protectedTrust.revokedKeyFingerprints,
+    now: new Date().toISOString(),
+    requireFresh: false
+  });
+}
+
+/**
+ * Protected Phase 2 producer. The public proof API intentionally rejects
+ * Phase 2; only the root-owned protected runtime can supply signed-review trust
+ * for the exact current Phase 0/1 prerequisite chain.
+ */
+export function provePhaseTwoFromProtectedRuntime(options = {}) {
+  if (!options
+    || typeof options !== "object"
+    || Array.isArray(options)
+    || unexpectedFields(options, new Set(["workspace"])).length) {
+    throw protectedReviewTrustError();
+  }
+  const protectedTrust = loadProtectedReviewTrust();
+  const root = protectedWorkspaceRoot(options.workspace, protectedTrust.runtimeRoot);
+  return withProtectedReviewGitBinding(protectedTrust.gitBinding, () => {
+    assertProtectedWorkspaceGitConfiguration(root);
+    const signedReviewTrust = protectedSignedReviewReplayTrust(protectedTrust);
+    let proofContext;
+    try {
+      proofContext = createProofExecutionContext();
+    } catch (error) {
+      return proofFailureForError(error, PROOF_TOOLCHAIN_ERROR);
+    }
+    let result;
+    try {
+      result = proveWorkerBrokerPhaseWithContext({
+        phase: "2",
+        slice: PHASE_TWO_SLICE,
+        root,
+        write: true
+      }, proofContext, signedReviewTrust);
+    } catch (error) {
+      result = proofFailureForError(error, "E_PROOF_SOURCE");
+    }
+    let cleaned;
+    try {
+      cleaned = proofContext.cleanup();
+    } catch {
+      cleaned = { ok: false };
+    }
+    if (!cleaned?.ok) return proofFailure("E_PROOF_CLEANUP");
+    return result;
+  });
+}
+
+/** Strict protected replay for the exact current fixed Phase 2 record. */
+export function verifyPhaseTwoFromProtectedRuntime(options = {}) {
+  if (!options
+    || typeof options !== "object"
+    || Array.isArray(options)
+    || unexpectedFields(options, new Set(["workspace"])).length) {
+    throw protectedReviewTrustError();
+  }
+  const protectedTrust = loadProtectedReviewTrust();
+  const root = protectedWorkspaceRoot(options.workspace, protectedTrust.runtimeRoot);
+  return withProtectedReviewGitBinding(protectedTrust.gitBinding, () => {
+    assertProtectedWorkspaceGitConfiguration(root);
+    const signedReviewTrust = protectedSignedReviewReplayTrust(protectedTrust);
+    const result = verifyPhase("2", root, {
+      strict: true,
+      requireVerified: true,
+      signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
+      signedReviewTrust
+    });
+    if (!result.ok || result.slice === PHASE_TWO_SLICE) return result;
+    const error = `Protected Phase 2 verification requires slice ${PHASE_TWO_SLICE}.`;
+    return {
+      ...result,
+      ok: false,
+      integrityOk: false,
+      errors: [...result.errors, error],
+      readinessReady: false,
+      verified: false
+    };
+  });
+}
+
+function proofSignedReviewOptions(root, signedReviewTrust = null) {
+  const options = {
+    strict: true,
+    root,
+    requireEvidenceSystem: true
+  };
+  if (signedReviewTrust) {
+    options.signedReviewAuthority = SIGNED_REVIEW_VALIDATION_AUTHORITY;
+    options.signedReviewTrust = signedReviewTrust;
+  }
+  return options;
+}
+
+function proofLedgerOptions(signedReviewTrust = null) {
+  const options = { strict: true };
+  if (signedReviewTrust) {
+    options.signedReviewAuthority = SIGNED_REVIEW_VALIDATION_AUTHORITY;
+    options.signedReviewTrust = signedReviewTrust;
+  }
+  return options;
+}
+
+function prerequisiteSnapshotFromInspected(
+  phase,
+  inspected,
+  root,
+  signedReviewTrust = null
+) {
   const snapshots = [];
   for (const prerequisitePhase of PHASE_PREREQUISITES[String(phase)] || []) {
     const candidates = inspected.filter(({ entry }) => (
@@ -7499,11 +7692,10 @@ function prerequisiteSnapshotFromInspected(phase, inspected, root) {
     ));
     if (candidates.length !== 1) return null;
     const { record } = candidates[0];
-    const validation = validateEvidenceRecord(record, {
-      strict: true,
-      root,
-      requireEvidenceSystem: true
-    });
+    const validation = validateEvidenceRecord(
+      record,
+      proofSignedReviewOptions(root, signedReviewTrust)
+    );
     if (!validation.ok
       || !statusSatisfiesVerifiedPrerequisite(record.status, record.phase)) return null;
     const requiredGateIds = PHASE_MANDATORY_GATE_IDS[prerequisitePhase] || [];
@@ -7518,10 +7710,10 @@ function prerequisiteSnapshotFromInspected(phase, inspected, root) {
   return snapshots;
 }
 
-function captureProofPrerequisites(phase, root) {
+function captureProofPrerequisites(phase, root, signedReviewTrust = null) {
   const expected = PHASE_PREREQUISITES[String(phase)] || [];
   if (expected.length === 0) return [];
-  const strict = verifyLedger(root, { strict: true });
+  const strict = verifyLedger(root, proofLedgerOptions(signedReviewTrust));
   if (!strict.ok) return null;
   let loaded;
   try {
@@ -7539,7 +7731,12 @@ function captureProofPrerequisites(phase, root) {
   } catch {
     return null;
   }
-  return prerequisiteSnapshotFromInspected(phase, inspected, root);
+  return prerequisiteSnapshotFromInspected(
+    phase,
+    inspected,
+    root,
+    signedReviewTrust
+  );
 }
 
 function sameProofPrerequisites(left, right) {
@@ -7597,11 +7794,12 @@ function priorProofProducedRecordIsSafelySupersedable(record, root) {
     && Number.isInteger(version)
     && version >= 1
     && version < PROOF_PRODUCER_VERSION
-    && producer.manifestDigest === computeProofManifestDigest(record.phase)
+    && producer.manifestDigest
+      === PRIOR_PROOF_MANIFEST_DIGESTS[version]?.[String(record.phase)]
     && ((record.phase === "0" && record.status === "verified_on_draft")
       || (record.phase === "1" && (
         record.status === "implemented_unverified"
-        || VERIFIED_STATUS_SET.has(record.status)
+        || record.status === "verified_on_draft"
       )))
   );
   if (!shapeIsSupported) return false;
@@ -7613,11 +7811,17 @@ function priorProofProducedRecordIsSafelySupersedable(record, root) {
   } catch {
     return false;
   }
-  return validateEvidenceRecord(normalized, {
+  const validation = validateEvidenceRecord(normalized, {
     strict: false,
     root,
     requireEvidenceSystem: true
-  }).ok;
+  });
+  if (validation.ok) return true;
+  return normalized.phase === "1"
+    && normalized.status === "verified_on_draft"
+    && validation.errors.length === 1
+    && validation.errors[0]
+      === "Signed independent review requires protected host trust verification.";
 }
 
 function supersedeCurrentProofChainEntry(entry, replacementPhase) {
@@ -7797,30 +8001,40 @@ function publishDependentPhaseProofRecord(
   root,
   expectedSource,
   expectedPrerequisites,
-  toolchain
+  toolchain,
+  signedReviewTrust = null
 ) {
   const phase = String(record?.phase ?? "");
+  const expectedStatus = phase === "2" && signedReviewTrust
+    ? "verified_on_draft"
+    : "implemented_unverified";
   if (phase === "0"
     || !PHASE_PROOF_GATE_MANIFEST[phase]
-    || record?.status !== "implemented_unverified"
+    || record?.status !== expectedStatus
     || !proofRecordMatchesPrerequisites(record, expectedPrerequisites)) {
     throw invalidEvidencePublicationError();
   }
-  const validation = validateEvidenceRecord(record, {
-    strict: true,
-    root,
-    requireEvidenceSystem: true
-  });
+  const validationOptions = proofSignedReviewOptions(root, signedReviewTrust);
+  const validation = validateEvidenceRecord(record, validationOptions);
   if (!validation.ok) throw invalidEvidencePublicationError();
   const immediatelyBeforeRecord = captureProofSourceSnapshot(phase, root, toolchain);
-  const immediatelyBeforePrerequisites = captureProofPrerequisites(phase, root);
+  const immediatelyBeforePrerequisites = captureProofPrerequisites(
+    phase,
+    root,
+    signedReviewTrust
+  );
   if (!sameProofSourceSnapshot(expectedSource, immediatelyBeforeRecord)
     || !sameProofPrerequisites(expectedPrerequisites, immediatelyBeforePrerequisites)
     || !proofRecordMatchesSnapshot(record, expectedSource)) {
     throw invalidEvidencePublicationError();
   }
 
-  const relative = writeEvidenceRecordInternal(record, root, PROOF_PUBLICATION_AUTHORITY);
+  const relative = writeEvidenceRecordInternal(
+    record,
+    root,
+    PROOF_PUBLICATION_AUTHORITY,
+    validationOptions
+  );
   withEvidenceLedgerLock(root, () => {
     const immediatelyBeforeLedger = captureProofSourceSnapshot(phase, root, toolchain);
     if (!sameProofSourceSnapshot(expectedSource, immediatelyBeforeLedger)
@@ -7845,7 +8059,12 @@ function publishDependentPhaseProofRecord(
     } catch {
       throw invalidLedgerDocumentError();
     }
-    const lockedPrerequisites = prerequisiteSnapshotFromInspected(phase, inspected, root);
+    const lockedPrerequisites = prerequisiteSnapshotFromInspected(
+      phase,
+      inspected,
+      root,
+      signedReviewTrust
+    );
     if (!sameProofPrerequisites(expectedPrerequisites, lockedPrerequisites)) {
       throw invalidLedgerDocumentError();
     }
@@ -7892,8 +8111,12 @@ function publishDependentPhaseProofRecord(
     let finalInsideLock;
     try {
       afterLedger = captureProofSourceSnapshot(phase, root, toolchain);
-      afterStrict = verifyLedger(root, { strict: true });
-      afterPrerequisites = captureProofPrerequisites(phase, root);
+      afterStrict = verifyLedger(root, proofLedgerOptions(signedReviewTrust));
+      afterPrerequisites = captureProofPrerequisites(
+        phase,
+        root,
+        signedReviewTrust
+      );
       finalInsideLock = captureProofSourceSnapshot(phase, root, toolchain);
     } catch {
       afterStrict = { ok: false };
@@ -7913,8 +8136,12 @@ function publishDependentPhaseProofRecord(
   let finalAfterRelease;
   try {
     afterRelease = captureProofSourceSnapshot(phase, root, toolchain);
-    strictAfterRelease = verifyLedger(root, { strict: true });
-    prerequisitesAfterRelease = captureProofPrerequisites(phase, root);
+    strictAfterRelease = verifyLedger(root, proofLedgerOptions(signedReviewTrust));
+    prerequisitesAfterRelease = captureProofPrerequisites(
+      phase,
+      root,
+      signedReviewTrust
+    );
     finalAfterRelease = captureProofSourceSnapshot(phase, root, toolchain);
   } catch {
     strictAfterRelease = { ok: false };
@@ -8251,10 +8478,16 @@ export function verifyLedger(root = REPO_ROOT, {
 
 export function verifyPhase(phase, root = REPO_ROOT, {
   strict = true,
-  requireVerified = false
+  requireVerified = false,
+  signedReviewAuthority = null,
+  signedReviewTrust = null
 } = {}) {
   const phaseId = String(phase);
-  const ledgerResult = verifyLedger(root, { strict });
+  const ledgerResult = verifyLedger(root, {
+    strict,
+    signedReviewAuthority,
+    signedReviewTrust
+  });
   const ledger = ledgerResult.ledger;
   const current = [...(ledger.entries || [])]
     .reverse()
@@ -8272,7 +8505,12 @@ export function verifyPhase(phase, root = REPO_ROOT, {
       integrityErrors.push("Current evidence file is unreadable, unsafe, or oversized.");
     }
     if (record) {
-      const recordResult = validateEvidenceRecord(record, { strict, root });
+      const recordResult = validateEvidenceRecord(record, {
+        strict,
+        root,
+        signedReviewAuthority,
+        signedReviewTrust
+      });
       integrityErrors.push(...recordResult.errors);
     }
   }
@@ -8497,7 +8735,10 @@ export function proveWorkerBrokerPhase(options = {}) {
   }
   let result;
   try {
-    result = proveWorkerBrokerPhaseWithContext({ phase, slice, root, write }, proofContext);
+    result = proveWorkerBrokerPhaseWithContext(
+      { phase, slice, root, write },
+      proofContext
+    );
   } catch (error) {
     result = proofFailureForError(error, "E_PROOF_SOURCE");
   }
@@ -8514,7 +8755,11 @@ export function proveWorkerBrokerPhase(options = {}) {
   return result;
 }
 
-function proveWorkerBrokerPhaseWithContext({ phase, slice, root, write }, proofContext) {
+function proveWorkerBrokerPhaseWithContext(
+  { phase, slice, root, write },
+  proofContext,
+  signedReviewTrust = null
+) {
   const manifest = PHASE_PROOF_GATE_MANIFEST[phase];
   let initial;
   try {
@@ -8523,7 +8768,11 @@ function proveWorkerBrokerPhaseWithContext({ phase, slice, root, write }, proofC
     return proofFailureForError(error, "E_PROOF_SOURCE");
   }
   if (initial.cleanTreeAtVerification !== true) return proofFailure("E_PROOF_SOURCE_DIRTY");
-  const initialPrerequisites = captureProofPrerequisites(phase, root);
+  const initialPrerequisites = captureProofPrerequisites(
+    phase,
+    root,
+    signedReviewTrust
+  );
   if (initialPrerequisites == null) return proofFailure("E_PROOF_PREREQUISITE");
 
   const verification = [];
@@ -8580,7 +8829,11 @@ function proveWorkerBrokerPhaseWithContext({ phase, slice, root, write }, proofC
     return proofFailureForError(error, "E_PROOF_SOURCE");
   }
   if (!sameProofSourceSnapshot(initial, afterGates)) return proofFailure("E_PROOF_SOURCE_DRIFT");
-  const afterGatePrerequisites = captureProofPrerequisites(phase, root);
+  const afterGatePrerequisites = captureProofPrerequisites(
+    phase,
+    root,
+    signedReviewTrust
+  );
   if (afterGatePrerequisites == null) return proofFailure("E_PROOF_PREREQUISITE");
   if (!sameProofPrerequisites(initialPrerequisites, afterGatePrerequisites)) {
     return proofFailure("E_PROOF_PREREQUISITE_DRIFT");
@@ -8660,13 +8913,20 @@ function proveWorkerBrokerPhaseWithContext({ phase, slice, root, write }, proofC
     || !proofRecordMatchesSnapshot(record, initial)) {
     return proofFailure("E_PROOF_SOURCE_DRIFT");
   }
-  const beforePublicationPrerequisites = captureProofPrerequisites(phase, root);
+  const beforePublicationPrerequisites = captureProofPrerequisites(
+    phase,
+    root,
+    signedReviewTrust
+  );
   if (beforePublicationPrerequisites == null) return proofFailure("E_PROOF_PREREQUISITE");
   if (!sameProofPrerequisites(initialPrerequisites, beforePublicationPrerequisites)
     || !proofRecordMatchesPrerequisites(record, initialPrerequisites)) {
     return proofFailure("E_PROOF_PREREQUISITE_DRIFT");
   }
-  const validated = validateEvidenceRecord(record, { strict: true, root, requireEvidenceSystem: true });
+  const validated = validateEvidenceRecord(
+    record,
+    proofSignedReviewOptions(root, signedReviewTrust)
+  );
   if (!validated.ok) return proofFailure("E_PROOF_RECORD");
 
   // Temporary-home cleanup must complete before any ledger/record publication so
@@ -8698,7 +8958,8 @@ function proveWorkerBrokerPhaseWithContext({ phase, slice, root, write }, proofC
         root,
         initial,
         initialPrerequisites,
-        proofContext.toolchain
+        proofContext.toolchain,
+        signedReviewTrust
       );
     return {
       ok: true,

@@ -292,7 +292,7 @@ function parseArguments(argv) {
   const mode = argv[0];
   const allowed = mode === "promote"
     ? new Set(["--workspace", "--request"])
-    : mode === "verify"
+    : new Set(["verify", "prove-phase-2", "verify-phase-2"]).has(mode)
       ? new Set(["--workspace"])
       : null;
   if (!allowed || argv.length !== 1 + allowed.size * 2) throw trustError();
@@ -335,6 +335,33 @@ async function readBoundedAttestation() {
 }
 
 function boundedResult(result) {
+  if (Object.hasOwn(result || {}, "integrityOk")) {
+    return {
+      ok: result.ok === true,
+      integrityOk: result.integrityOk === true,
+      errors: Array.isArray(result.errors)
+        ? result.errors.slice(0, 32).map((message) => String(message).slice(0, 512))
+        : [],
+      phase: result.phase || null,
+      slice: result.slice || null,
+      status: result.status || null,
+      recordDigest: result.recordDigest || null,
+      verified: result.verified === true
+    };
+  }
+  if (result?.code) {
+    return {
+      ok: false,
+      code: String(result.code).slice(0, 64),
+      gateId: result.gateId ? String(result.gateId).slice(0, 128) : null,
+      failureKind: result.failureKind
+        ? String(result.failureKind).slice(0, 64)
+        : null,
+      outputDigest: SHA256.test(result.outputDigest || "")
+        ? result.outputDigest
+        : null
+    };
+  }
   if (result?.recordDigest) {
     return {
       ok: result.ok === true,
@@ -419,15 +446,26 @@ async function main() {
 
   const runtimeModule = path.join(runtimeRoot, "scripts/lib/worker-broker-evidence.mjs");
   const api = await import(pathToFileURL(runtimeModule).href);
-  return parsed.mode === "promote"
-    ? api.promotePhaseOneFromProtectedRuntime({
+  if (parsed.mode === "promote") {
+    return api.promotePhaseOneFromProtectedRuntime({
       workspace: parsed.values["--workspace"],
       requestPath: parsed.values["--request"],
       attestation: await readBoundedAttestation()
-    })
-    : api.verifySignedLedgerFromProtectedRuntime({
+    });
+  }
+  if (parsed.mode === "prove-phase-2") {
+    return api.provePhaseTwoFromProtectedRuntime({
       workspace: parsed.values["--workspace"]
     });
+  }
+  if (parsed.mode === "verify-phase-2") {
+    return api.verifyPhaseTwoFromProtectedRuntime({
+      workspace: parsed.values["--workspace"]
+    });
+  }
+  return api.verifySignedLedgerFromProtectedRuntime({
+      workspace: parsed.values["--workspace"]
+  });
 }
 
 try {
