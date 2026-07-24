@@ -1089,7 +1089,9 @@ function seedLedgerFixtureEntry(root, entry) {
   const ledgerPath = path.join(root, "tests/e2e-results/worker-broker/ledger.json");
   fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
   let ledger = {
-    schemaVersion: LIVE_RECEIPT_SCHEMA_VERSION,
+    // Ledger and live-receipt schemas version independently. A live receipt
+    // version bump must never rewrite the immutable ledger contract.
+    schemaVersion: 1,
     roadmapVersion: "1.0",
     issue: "https://github.com/xliberty2008x/grok-plugin/issues/25",
     updatedAt: null,
