@@ -281,6 +281,7 @@ if (!versionsOnly) {
     "scripts/test-natural-codex.mjs",
     "scripts/test-installed-worker-mcp.mjs",
     "scripts/lib/installed-worker-mcp-failure.mjs",
+    "scripts/lib/installed-worker-mcp-mailbox-poll.mjs",
     "scripts/lib/installed-worker-mcp-setup-boundary.mjs",
     "scripts/lib/installed-worker-mcp-session-boundary.mjs",
     "scripts/trusted/worker-broker-review.mjs",

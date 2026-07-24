@@ -20,7 +20,15 @@ import {
   validateInstalledToolResult,
   validateProviderCapabilityAgreement
 } from "./lib/installed-worker-mcp-contract.mjs";
-import { selectInstalledWorkerMcpFailure } from "./lib/installed-worker-mcp-failure.mjs";
+import {
+  INSTALLED_WORKER_MCP_ERROR_MESSAGES,
+  classifyInstalledWorkerMcpCleanupOutcome,
+  formatInstalledWorkerMcpFailure,
+  selectInstalledWorkerMcpFailure
+} from "./lib/installed-worker-mcp-failure.mjs";
+import {
+  decideInstalledWorkerMcpMailboxPoll
+} from "./lib/installed-worker-mcp-mailbox-poll.mjs";
 import {
   SETUP_COMMAND_IDENTITY_INTERVAL_MS,
   SETUP_COMMAND_IDENTITY_TIMEOUT_MS,
@@ -86,22 +94,7 @@ const MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_RECEIPT_BYTES = 1024 * 1024;
 const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-const FIXED_ERRORS = Object.freeze({
-  E_ARGUMENT: "Unsupported runner argument.",
-  E_GATE: "All installed Worker MCP live gates must equal 1.",
-  E_PLATFORM: "Installed Worker MCP qualification requires a supported POSIX host.",
-  E_SOURCE: "The qualification source boundary is not clean and stable.",
-  E_INSTALL: "The private Codex plugin installation could not be verified.",
-  E_SETUP: "The installed provider setup could not be verified.",
-  E_CAPABILITY: "The installed provider capability could not be verified.",
-  E_MCP: "The installed Worker MCP protocol could not be verified.",
-  E_SCENARIO: "The installed Worker MCP scenario did not satisfy its contract.",
-  E_PRIVATE_STATE: "Installed private worker state did not satisfy its contract.",
-  E_SESSION: "The exact qualification provider session could not be verified.",
-  E_CLEANUP: "Exact qualification cleanup could not be proven.",
-  E_RECEIPT: "The provisional live receipt could not be validated or published.",
-  E_INTERRUPTED: "Installed Worker MCP qualification was interrupted."
-});
+const FIXED_ERRORS = INSTALLED_WORKER_MCP_ERROR_MESSAGES;
 const QUALIFICATION_STAGES = new Set([
   "startup",
   "source-boundary",
@@ -221,12 +214,15 @@ function enterQualificationStage(stage) {
 }
 
 class QualificationError extends Error {
-  constructor(code, stage = qualificationStage) {
+  constructor(code, stage = qualificationStage, diagnostic = null) {
     const normalized = Object.hasOwn(FIXED_ERRORS, code) ? code : "E_SCENARIO";
     super(FIXED_ERRORS[normalized]);
     this.name = "QualificationError";
     this.code = normalized;
     this.stage = QUALIFICATION_STAGES.has(stage) ? stage : "startup";
+    this.diagnostic = normalized === "E_CLEANUP" && diagnostic
+      ? Object.freeze({ ...diagnostic })
+      : null;
     this.stack = `${this.name}: ${this.message}`;
   }
 }
@@ -3564,10 +3560,7 @@ async function waitForInstalledMailboxOpen(context, tracker) {
   const deadline = Date.now() + 120_000;
   while (Date.now() <= deadline) {
     checkInterrupted(context.runner);
-    const job = readPrivateJob(context, tracker, {
-      requireLiveProvider: true,
-      recordProviderObservation: false
-    });
+    const waitingJob = readPrivateJob(context, tracker);
     let attempt = null;
     try {
       attempt = context.mailboxState.resolveOpenMailbox(
@@ -3578,7 +3571,21 @@ async function waitForInstalledMailboxOpen(context, tracker) {
     } catch {
       attempt = null;
     }
-    if (attempt?.state === "open") {
+    let decision;
+    try {
+      decision = decideInstalledWorkerMcpMailboxPoll({
+        workerStatus: waitingJob.status,
+        mailboxState: attempt?.state ?? null
+      });
+    } catch {
+      fail("E_PRIVATE_STATE");
+    }
+    if (decision === "terminal-before-open") fail("E_PRIVATE_STATE");
+    if (decision === "observe-live-provider") {
+      const job = readPrivateJob(context, tracker, {
+        requireLiveProvider: true,
+        recordProviderObservation: false
+      });
       const dispatch = job.request?.spawn?.dispatch;
       if (
         attempt.workerId !== tracker.workerId
@@ -5173,16 +5180,24 @@ async function main() {
       ? error.stage
       : qualificationStage;
     enterQualificationStage("emergency-cleanup");
-    let cleanupProven = false;
+    let cleanupOutcome = "proof-returned-false";
     try {
-      cleanupProven = await emergencyCleanup(runner);
-    } catch {}
+      cleanupOutcome = classifyInstalledWorkerMcpCleanupOutcome(
+        await emergencyCleanup(runner)
+      );
+    } catch {
+      cleanupOutcome = "cleanup-threw";
+    }
     const selected = selectInstalledWorkerMcpFailure({
       originalCode,
       originalStage,
-      cleanupProven
+      cleanupOutcome
     }, QUALIFICATION_STAGES);
-    throw new QualificationError(selected.code, selected.stage);
+    throw new QualificationError(
+      selected.code,
+      selected.stage,
+      selected.diagnostic
+    );
   } finally {
     process.removeListener("SIGINT", interrupt);
     process.removeListener("SIGTERM", interrupt);
@@ -5194,14 +5209,21 @@ const IS_MAIN = process.argv[1]
 
 if (IS_MAIN) {
   main().catch((error) => {
-    const code = error instanceof QualificationError ? error.code : "E_SCENARIO";
-    const stage = error instanceof QualificationError
-      && error.stage !== "startup"
-      && QUALIFICATION_STAGES.has(error.stage)
-        ? `; stage=${error.stage}`
-        : "";
     process.stderr.write(
-      `Installed Worker MCP E2E failed [${code}${stage}]: ${FIXED_ERRORS[code] || FIXED_ERRORS.E_SCENARIO}\n`
+      formatInstalledWorkerMcpFailure(
+        error instanceof QualificationError
+          ? {
+              code: error.code,
+              stage: error.stage,
+              diagnostic: error.diagnostic
+            }
+          : {
+              code: "E_SCENARIO",
+              stage: "startup",
+              diagnostic: null
+            },
+        QUALIFICATION_STAGES
+      )
     );
     process.exitCode = 1;
   });

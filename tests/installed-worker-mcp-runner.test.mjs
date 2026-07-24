@@ -8,7 +8,15 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
-import { selectInstalledWorkerMcpFailure } from "../scripts/lib/installed-worker-mcp-failure.mjs";
+import {
+  classifyInstalledWorkerMcpCleanupOutcome,
+  formatInstalledWorkerMcpDiagnostic,
+  formatInstalledWorkerMcpFailure,
+  selectInstalledWorkerMcpFailure
+} from "../scripts/lib/installed-worker-mcp-failure.mjs";
+import {
+  decideInstalledWorkerMcpMailboxPoll
+} from "../scripts/lib/installed-worker-mcp-mailbox-poll.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RUNNER = path.join(ROOT, "scripts", "test-installed-worker-mcp.mjs");
@@ -579,27 +587,132 @@ test("installed Worker MCP runner preserves original stages and lets cleanup fai
     "completion-wait",
     "emergency-cleanup"
   ]);
+  assert.equal(classifyInstalledWorkerMcpCleanupOutcome(true), "proven");
+  assert.equal(
+    classifyInstalledWorkerMcpCleanupOutcome(false),
+    "proof-returned-false"
+  );
+  for (const malformed of [null, 0, 1, "true", {}, []]) {
+    assert.equal(
+      classifyInstalledWorkerMcpCleanupOutcome(malformed),
+      "invalid-cleanup-result"
+    );
+  }
   assert.deepEqual(
     selectInstalledWorkerMcpFailure({
       originalCode: "E_PRIVATE_STATE",
       originalStage: "completion-spawn",
-      cleanupProven: true
+      cleanupOutcome: "proven"
     }, allowedStages),
-    { code: "E_PRIVATE_STATE", stage: "completion-spawn" }
+    {
+      code: "E_PRIVATE_STATE",
+      stage: "completion-spawn",
+      diagnostic: null
+    }
+  );
+  const cleanupFailure = selectInstalledWorkerMcpFailure({
+    originalCode: "E_SCENARIO",
+    originalStage: "completion-wait",
+    cleanupOutcome: "proof-returned-false"
+  }, allowedStages);
+  assert.deepEqual(
+    cleanupFailure,
+    {
+      code: "E_CLEANUP",
+      stage: "emergency-cleanup",
+      diagnostic: {
+        cleanupOutcome: "proof-returned-false",
+        originalCode: "E_SCENARIO",
+        originalStage: "completion-wait"
+      }
+    }
+  );
+  assert.equal(
+    formatInstalledWorkerMcpDiagnostic(
+      cleanupFailure.diagnostic,
+      allowedStages
+    ),
+    "Installed Worker MCP E2E diagnostic "
+      + "{\"cleanupOutcome\":\"proof-returned-false\","
+      + "\"originalCode\":\"E_SCENARIO\","
+      + "\"originalStage\":\"completion-wait\"}\n"
   );
   assert.deepEqual(
     selectInstalledWorkerMcpFailure({
-      originalCode: "E_SCENARIO",
+      originalCode: "E_PRIVATE_STATE",
       originalStage: "completion-wait",
-      cleanupProven: false
+      cleanupOutcome: "cleanup-threw"
     }, allowedStages),
-    { code: "E_CLEANUP", stage: "emergency-cleanup" }
+    {
+      code: "E_CLEANUP",
+      stage: "emergency-cleanup",
+      diagnostic: {
+        cleanupOutcome: "cleanup-threw",
+        originalCode: "E_PRIVATE_STATE",
+        originalStage: "completion-wait"
+      }
+    }
   );
   assert.throws(
     () => selectInstalledWorkerMcpFailure({
       originalCode: "E_PRIVATE_STATE",
       originalStage: "unbounded-secret-stage",
-      cleanupProven: true
+      cleanupOutcome: "proven"
+    }, allowedStages),
+    TypeError
+  );
+  assert.throws(
+    () => selectInstalledWorkerMcpFailure({
+      originalCode: "E_PRIVATE_STATE",
+      originalStage: "completion-spawn",
+      cleanupOutcome: "unbounded-cleanup-reason"
+    }, allowedStages),
+    TypeError
+  );
+  assert.throws(
+    () => selectInstalledWorkerMcpFailure({
+      originalCode: "E_PRIVATE_STATE",
+      originalStage: "completion-spawn",
+      cleanupOutcome: "proven",
+      details: "must-not-pass"
+    }, allowedStages),
+    TypeError
+  );
+  assert.throws(
+    () => selectInstalledWorkerMcpFailure({
+      originalCode: "E_UNBOUNDED_CODE",
+      originalStage: "completion-spawn",
+      cleanupOutcome: "proven"
+    }, allowedStages),
+    TypeError
+  );
+  assert.throws(
+    () => formatInstalledWorkerMcpDiagnostic({
+      cleanupOutcome: "proof-returned-false",
+      originalCode: "E_PRIVATE_STATE",
+      originalStage: "completion-spawn\nsecret"
+    }, allowedStages),
+    TypeError
+  );
+  const renderedCleanupFailure = formatInstalledWorkerMcpFailure(
+    cleanupFailure,
+    allowedStages
+  );
+  assert.equal(
+    renderedCleanupFailure,
+    "Installed Worker MCP E2E failed "
+      + "[E_CLEANUP; stage=emergency-cleanup]: "
+      + "Exact qualification cleanup could not be proven.\n"
+      + "Installed Worker MCP E2E diagnostic "
+      + "{\"cleanupOutcome\":\"proof-returned-false\","
+      + "\"originalCode\":\"E_SCENARIO\","
+      + "\"originalStage\":\"completion-wait\"}\n"
+  );
+  assert.doesNotMatch(renderedCleanupFailure, /canary-secret/);
+  assert.throws(
+    () => formatInstalledWorkerMcpFailure({
+      ...cleanupFailure,
+      details: "canary-secret"
     }, allowedStages),
     TypeError
   );
@@ -607,12 +720,118 @@ test("installed Worker MCP runner preserves original stages and lets cleanup fai
   const source = fs.readFileSync(RUNNER, "utf8");
   assert.match(source, /const QUALIFICATION_STAGES = new Set\(\[/);
   assert.match(source, /this\.stage = QUALIFICATION_STAGES\.has\(stage\) \? stage : "startup";/);
-  assert.match(source, /QUALIFICATION_STAGES\.has\(error\.stage\)/);
-  assert.match(source, /stage=\$\{error\.stage\}/);
   assert.doesNotMatch(source, /error\.(?:message|stack|details).*stage=/);
+  assert.doesNotMatch(
+    source,
+    /formatInstalledWorkerMcpDiagnostic\(\s*error\.(?:message|stack|details)\b/
+  );
+  assert.match(
+    source,
+    /process\.stderr\.write\(\s*formatInstalledWorkerMcpFailure\(/
+  );
+  const mainCatch = source.slice(source.indexOf("if (IS_MAIN) {"));
+  assert.equal(
+    (mainCatch.match(/process\.stderr\.write\(/g) || []).length,
+    1
+  );
+  assert.doesNotMatch(
+    mainCatch,
+    /error\.(?:message|stack|cause|details)\b/
+  );
   assert.ok(
     source.indexOf("const originalStage =")
       < source.indexOf('enterQualificationStage("emergency-cleanup")')
+  );
+});
+
+test("installed Worker MCP mailbox polling tolerates valid pre-provider state", () => {
+  for (const workerStatus of ["queued", "running"]) {
+    for (const mailboxState of [null, "preparing"]) {
+      assert.equal(
+        decideInstalledWorkerMcpMailboxPoll({
+          workerStatus,
+          mailboxState
+        }),
+        "wait"
+      );
+    }
+  }
+  assert.equal(
+    decideInstalledWorkerMcpMailboxPoll({
+      workerStatus: "running",
+      mailboxState: "open"
+    }),
+    "observe-live-provider"
+  );
+  for (const workerStatus of ["completed", "failed", "cancelled"]) {
+    for (const mailboxState of [null, "preparing", "open"]) {
+      assert.equal(
+        decideInstalledWorkerMcpMailboxPoll({
+          workerStatus,
+          mailboxState
+        }),
+        "terminal-before-open"
+      );
+    }
+  }
+  assert.throws(
+    () => decideInstalledWorkerMcpMailboxPoll({
+      workerStatus: "queued",
+      mailboxState: "open"
+    }),
+    TypeError
+  );
+  assert.throws(
+    () => decideInstalledWorkerMcpMailboxPoll({
+      workerStatus: "running",
+      mailboxState: "closed"
+    }),
+    TypeError
+  );
+
+  const source = fs.readFileSync(RUNNER, "utf8");
+  const start = source.indexOf(
+    "async function waitForInstalledMailboxOpen(context, tracker) {"
+  );
+  const end = source.indexOf(
+    "\nfunction snapshotInstalledMailboxProof(",
+    start
+  );
+  assert.ok(start >= 0 && end > start);
+  const body = source.slice(start, end);
+  const waitingReadIndex = body.indexOf(
+    "const waitingJob = readPrivateJob(context, tracker);"
+  );
+  const resolveIndex = body.indexOf(
+    "context.mailboxState.resolveOpenMailbox("
+  );
+  const decisionIndex = body.indexOf(
+    "decision = decideInstalledWorkerMcpMailboxPoll({"
+  );
+  const terminalIndex = body.indexOf(
+    'if (decision === "terminal-before-open")'
+  );
+  const acceptIndex = body.indexOf(
+    'if (decision === "observe-live-provider")'
+  );
+  const strictReadIndex = body.indexOf(
+    "const job = readPrivateJob(context, tracker, {"
+  );
+  const strictIndex = body.indexOf(
+    "requireLiveProvider: true",
+    strictReadIndex
+  );
+  assert.ok(waitingReadIndex >= 0);
+  assert.ok(resolveIndex >= 0);
+  assert.ok(waitingReadIndex < resolveIndex);
+  assert.ok(resolveIndex < decisionIndex);
+  assert.ok(decisionIndex < terminalIndex);
+  assert.ok(terminalIndex < acceptIndex);
+  assert.ok(acceptIndex < strictReadIndex);
+  assert.ok(strictReadIndex < strictIndex);
+  assert.match(
+    body.slice(strictReadIndex),
+    /observePrivateJob\(context, tracker, job, \{\s*requireLiveProvider: true/
   );
 });
 
