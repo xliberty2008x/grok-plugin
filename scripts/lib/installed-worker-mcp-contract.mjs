@@ -609,6 +609,7 @@ const TERMINAL_OPERATIONAL_EVENT_TYPES = new Set([
   "cancellation.requested"
 ]);
 const POST_COMPLETION_EVENT_TYPES = new Set(["checkpoint", "blocked"]);
+const MAX_TERMINAL_LIFECYCLE_EVENTS = 128;
 const PRIVATE_PROJECTION_FIELDS = new Set([
   "host",
   "sessionId",
@@ -1500,20 +1501,39 @@ function validLifecycleDetail(detail) {
   );
 }
 
-function validLifecycleEvents(events, worker, status) {
-  if (
-    !Array.isArray(events)
-    || events.length < 1
-    || events.length > 128
-    || events.filter((event) => event?.type === "task.accepted").length !== 1
-    || events[0]?.sequence !== 1
-    || events[0]?.type !== "task.accepted"
-    || !exactKeys(
-      events[0]?.detail,
+function validAdmissionLifecycleEvent(event) {
+  return (
+    event?.sequence === 1
+    && event?.type === "task.accepted"
+    && exactKeys(
+      event?.detail,
       new Set(["spawnSuccessDefinition", "write"])
     )
-    || events[0].detail.spawnSuccessDefinition !== "durable-job-commit"
-    || events[0].detail.write !== false
+    && event.detail.spawnSuccessDefinition === "durable-job-commit"
+    && event.detail.write === false
+  );
+}
+
+function validLifecycleEvents(events, worker, status) {
+  const terminalCursor = worker?.eventCursor?.sequence;
+  const expectedLength = Number.isSafeInteger(terminalCursor)
+    ? Math.min(MAX_TERMINAL_LIFECYCLE_EVENTS, terminalCursor)
+    : 0;
+  const expectedFirstSequence = terminalCursor - expectedLength + 1;
+  const retainsAdmission = expectedFirstSequence === 1;
+  const admissionEvents = Array.isArray(events)
+    ? events.filter((event) => event?.type === "task.accepted")
+    : [];
+  if (
+    !Array.isArray(events)
+    || expectedLength < 1
+    || events.length !== expectedLength
+    || events[0]?.sequence !== expectedFirstSequence
+    || admissionEvents.length !== (retainsAdmission ? 1 : 0)
+    || (
+      retainsAdmission
+      && !validAdmissionLifecycleEvent(events[0])
+    )
   ) {
     return false;
   }
@@ -1521,7 +1541,7 @@ function validLifecycleEvents(events, worker, status) {
   const updatedAt = Date.parse(worker.updatedAt);
   const startedAt = Date.parse(worker.startedAt);
   const completedAt = Date.parse(worker.completedAt);
-  let previousSequence = null;
+  let previousSequence = expectedFirstSequence - 1;
   let previousAt = null;
   for (const event of events) {
     const eventAt = Date.parse(event?.at);
@@ -1562,8 +1582,7 @@ function validLifecycleEvents(events, worker, status) {
       )
       || (previousAt !== null && eventAt < previousAt)
       || (
-        previousSequence !== null
-        && event.sequence !== previousSequence + 1
+        event.sequence !== previousSequence + 1
       )
       || (
         Object.hasOwn(event, "detail")
@@ -1577,7 +1596,10 @@ function validLifecycleEvents(events, worker, status) {
   }
   if (
     worker.eventCursor.sequence !== previousSequence
-    || Date.parse(events[0].at) > startedAt
+    || (
+      retainsAdmission
+      && Date.parse(events[0].at) > startedAt
+    )
   ) {
     return false;
   }
@@ -2328,22 +2350,32 @@ export function validateInstalledCancellationReplayScenario(value) {
 }
 
 function validTerminalLifecycleProjection(events, cursor, workerId) {
+  const cursorSequence = cursor?.sequence;
+  const expectedLength = Number.isSafeInteger(cursorSequence)
+    ? Math.min(MAX_TERMINAL_LIFECYCLE_EVENTS, cursorSequence)
+    : 0;
+  const expectedFirstSequence = cursorSequence - expectedLength + 1;
+  const retainsAdmission = expectedFirstSequence === 1;
   if (
     !Array.isArray(events)
-    || events.length < 1
-    || events.length > 128
+    || expectedLength < 1
+    || events.length !== expectedLength
     || !exactKeys(cursor, EVENT_CURSOR_KEYS)
     || cursor.schemaVersion !== 1
     || cursor.workerId !== workerId
-    || !Number.isSafeInteger(cursor.sequence)
-    || cursor.sequence < 1
-    || events[0]?.type !== "task.accepted"
-    || events[0]?.sequence !== 1
-    || events.filter((event) => event?.type === "task.accepted").length !== 1
+    || !Number.isSafeInteger(cursorSequence)
+    || cursorSequence < 1
+    || events[0]?.sequence !== expectedFirstSequence
+    || events.filter((event) => event?.type === "task.accepted").length
+      !== (retainsAdmission ? 1 : 0)
+    || (
+      retainsAdmission
+      && !validAdmissionLifecycleEvent(events[0])
+    )
   ) {
     return false;
   }
-  let previousSequence = 0;
+  let previousSequence = expectedFirstSequence - 1;
   for (const event of events) {
     if (
       !allowedKeys(
@@ -2370,6 +2402,81 @@ function validTerminalLifecycleProjection(events, cursor, workerId) {
   return cursor.sequence === previousSequence;
 }
 
+function validFullTrackedLifecycleHistory(events, cursor, workerId, status) {
+  if (
+    !Array.isArray(events)
+    || !new Set(["completed", "cancelled"]).has(status)
+    || !exactKeys(cursor, EVENT_CURSOR_KEYS)
+    || cursor.schemaVersion !== 1
+    || cursor.workerId !== workerId
+    || !Number.isSafeInteger(cursor.sequence)
+    || cursor.sequence < 1
+    || events.length !== cursor.sequence
+    || !validAdmissionLifecycleEvent(events[0])
+    || events.filter((event) => event?.type === "task.accepted").length !== 1
+  ) {
+    return false;
+  }
+  let previousSequence = 0;
+  let previousAt = null;
+  for (const event of events) {
+    const eventAt = Date.parse(event?.at);
+    if (
+      !allowedKeys(
+        event,
+        LIFECYCLE_EVENT_KEYS,
+        new Set([...LIFECYCLE_EVENT_KEYS, "detail"])
+      )
+      || event.workerProtocolVersion !== 1
+      || event.eventSchemaVersion !== 1
+      || !PUBLIC_LIFECYCLE_EVENT_TYPES.has(event.type)
+      || !canonicalIsoTimestamp(event.at)
+      || !validPublicText(event.summary, 2_000, { nullable: true })
+      || !Number.isSafeInteger(event.sequence)
+      || event.sequence !== previousSequence + 1
+      || (previousAt !== null && eventAt < previousAt)
+      || (
+        Object.hasOwn(event, "detail")
+        && !validLifecycleDetail(event.detail)
+      )
+    ) {
+      return false;
+    }
+    previousSequence = event.sequence;
+    previousAt = eventAt;
+  }
+  const finalReports = events.filter(
+    (event) => event.type === "final.report"
+  );
+  const cancellationEvents = events.filter(
+    (event) => event.type === "cancellation.requested"
+  );
+  const terminalMarker = status === "completed"
+    ? finalReports[0]
+    : cancellationEvents[0];
+  const terminalMarkerIndex = events.indexOf(terminalMarker);
+  return (
+    cursor.sequence === previousSequence
+    && terminalMarkerIndex >= 0
+    && (
+      status === "completed"
+        ? (
+            finalReports.length === 1
+            && cancellationEvents.length === 0
+            && finalReports[0].detail?.outcome === "complete"
+            && finalReports[0].detail?.structured === true
+          )
+        : (
+            cancellationEvents.length === 1
+            && finalReports.length === 0
+          )
+    )
+    && events.slice(terminalMarkerIndex + 1).every(
+      (event) => POST_COMPLETION_EVENT_TYPES.has(event.type)
+    )
+  );
+}
+
 /**
  * Bind a terminal public lifecycle stream to the exact installed projection of
  * the durable private record. Private lifecycle text is intentionally compared
@@ -2380,6 +2487,7 @@ export function validateInstalledTerminalEventHistory(value) {
   if (
     !exactKeys(evidence, new Set([
       "workerId",
+      "status",
       "trackedEvents",
       "publicEvents",
       "publicCursor",
@@ -2387,16 +2495,26 @@ export function validateInstalledTerminalEventHistory(value) {
       "projectedCursor"
     ]))
     || !WORKER_ID.test(evidence.workerId || "")
+    || !new Set(["completed", "cancelled"]).has(evidence.status)
     || !Array.isArray(evidence.trackedEvents)
     || !Array.isArray(evidence.publicEvents)
     || !Array.isArray(evidence.projectedEvents)
-    || !sameJson(evidence.trackedEvents, evidence.publicEvents)
     || !sameJson(evidence.publicEvents, evidence.projectedEvents)
     || !sameJson(evidence.publicCursor, evidence.projectedCursor)
+    || !validFullTrackedLifecycleHistory(
+      evidence.trackedEvents,
+      evidence.publicCursor,
+      evidence.workerId,
+      evidence.status
+    )
     || !validTerminalLifecycleProjection(
       evidence.publicEvents,
       evidence.publicCursor,
       evidence.workerId
+    )
+    || !sameJson(
+      evidence.trackedEvents.slice(-evidence.publicEvents.length),
+      evidence.publicEvents
     )
   ) {
     fail("E_LIVE_PRIVATE_STATE");

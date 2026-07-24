@@ -838,40 +838,34 @@ test("installed Worker MCP mailbox polling tolerates valid pre-provider state", 
 test("installed Worker MCP terminal results converge after private cleanup", () => {
   const source = fs.readFileSync(RUNNER, "utf8");
   const observerStart = source.indexOf(
-    "function observeTerminalResultWorker(tracker, worker, historyWindowStage) {"
+    "function observeTerminalResultWorker(tracker, worker, terminalStreamCursor) {"
   );
   const observerEnd = source.indexOf("\nconst SNAPSHOT_KEYS", observerStart);
   assert.ok(observerStart >= 0 && observerEnd > observerStart);
   const observer = source.slice(observerStart, observerEnd);
+  assert.doesNotMatch(
+    observer,
+    /observePublicWorker\(tracker, worker\);/
+  );
+  assert.match(observer, /trackedEvents\.length !== cursorSequence/);
+  assert.match(observer, /trackedEvents\[0\]\?\.sequence !== 1/);
+  assert.match(observer, /trackedEvents\.at\(-1\)\?\.sequence !== cursorSequence/);
+  assert.match(observer, /worker\.lifecycleEvents\.length !== expectedLength/);
+  assert.match(
+    observer,
+    /cursorSequence - expectedLength \+ 1/
+  );
+  assert.match(observer, /trackedEvents\.slice\(-expectedLength\)/);
   assert.ok(
-    observer.indexOf("observePublicWorker(tracker, worker);")
+    observer.indexOf("trackedEvents.slice(-expectedLength)")
       < observer.indexOf(
-        "sameJson(trackedEvents, worker.lifecycleEvents)"
+        "observePublicWorker(tracker, worker, { observeEvents: false });"
       )
   );
-  assert.match(
-    observer,
-    /trackedEvents\.length > worker\.lifecycleEvents\.length/
-  );
-  assert.match(
-    observer,
-    /trackedEvents\.slice\(-worker\.lifecycleEvents\.length\)/
-  );
-  assert.match(observer, /enterQualificationStage\(historyWindowStage\);/);
 
-  for (const [functionName, prefix, status, historyWindowStage] of [
-    [
-      "runCompletionScenario",
-      "completion",
-      "completed",
-      "completion-result-history-window"
-    ],
-    [
-      "runCancellationScenario",
-      "cancellation",
-      "cancelled",
-      "cancellation-result-history-window"
-    ]
+  for (const [functionName, prefix, status] of [
+    ["runCompletionScenario", "completion", "completed"],
+    ["runCancellationScenario", "cancellation", "cancelled"]
   ]) {
     const start = source.indexOf(`async function ${functionName}(`);
     const end = source.indexOf("\nasync function ", start + 1);
@@ -879,11 +873,22 @@ test("installed Worker MCP terminal results converge after private cleanup", () 
     const waitIndex = body.indexOf(
       `enterQualificationStage("${prefix}-wait")`
     );
+    const waitCursorIndex = body.indexOf(
+      "const terminalWaitCursor = await waitForTerminal(",
+      waitIndex
+    );
     const cleanupIndex = body.indexOf(
       `enterQualificationStage("${prefix}-cleanup-private")`
     );
     const proofIndex = body.indexOf(
       `await proveTerminalCleanup(context, tracker, "${status}")`
+    );
+    const drainStageIndex = body.indexOf(
+      `enterQualificationStage("${prefix}-terminal-drain")`
+    );
+    const drainIndex = body.indexOf(
+      "await drainTerminalEventStream(",
+      drainStageIndex
     );
     const resultIndex = body.indexOf(
       `enterQualificationStage("${prefix}-result")`
@@ -893,8 +898,8 @@ test("installed Worker MCP terminal results converge after private cleanup", () 
       "observeTerminalResultWorker(",
       callIndex
     );
-    const historyWindowStageIndex = body.indexOf(
-      `"${historyWindowStage}"`,
+    const streamCursorIndex = body.indexOf(
+      "terminalStreamCursor",
       observeIndex
     );
     const closeIndex = body.indexOf(
@@ -902,13 +907,17 @@ test("installed Worker MCP terminal results converge after private cleanup", () 
       observeIndex
     );
     assert.ok(waitIndex >= 0);
-    assert.ok(waitIndex < cleanupIndex);
+    assert.ok(waitIndex < waitCursorIndex);
+    assert.ok(waitCursorIndex < cleanupIndex);
     assert.ok(cleanupIndex < proofIndex);
+    assert.ok(proofIndex < drainStageIndex);
+    assert.ok(drainStageIndex < drainIndex);
+    assert.ok(drainIndex < resultIndex);
     assert.ok(proofIndex < resultIndex);
     assert.ok(resultIndex < callIndex);
     assert.ok(callIndex < observeIndex);
-    assert.ok(observeIndex < historyWindowStageIndex);
-    assert.ok(historyWindowStageIndex < closeIndex);
+    assert.ok(observeIndex < streamCursorIndex);
+    assert.ok(streamCursorIndex < closeIndex);
     assert.ok(observeIndex < closeIndex);
     assert.equal(
       (body.match(/tracker\.calls\.result \+= 1;/g) || []).length,

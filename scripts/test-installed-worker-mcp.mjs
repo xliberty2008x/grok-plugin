@@ -92,6 +92,7 @@ const TERMINAL_PROCESS_CLOSURE_TIMEOUT_MS = 30_000;
 const STATE_POLL_MS = 100;
 const MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_RECEIPT_BYTES = 1024 * 1024;
+const MAX_TERMINAL_LIFECYCLE_EVENTS = 128;
 const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 const FIXED_ERRORS = INSTALLED_WORKER_MCP_ERROR_MESSAGES;
@@ -138,8 +139,8 @@ const QUALIFICATION_STAGES = new Set([
   "completion-send-replay",
   "completion-wait",
   "completion-result",
-  "completion-result-history-window",
   "completion-cleanup-private",
+  "completion-terminal-drain",
   "completion-cleanup-snapshot",
   "completion-cleanup-events",
   "completion-cleanup-binding",
@@ -187,8 +188,8 @@ const QUALIFICATION_STAGES = new Set([
   "cancellation-request",
   "cancellation-wait",
   "cancellation-result",
-  "cancellation-result-history-window",
   "cancellation-cleanup-private",
+  "cancellation-terminal-drain",
   "cancellation-cleanup-snapshot",
   "cancellation-cleanup-events",
   "cancellation-cleanup-binding",
@@ -1446,7 +1447,7 @@ function orderedEventObserver() {
           fail("E_PRIVATE_STATE");
         }
         if (!events.has(sequence)) {
-          if (sequence <= maximum) fail("E_PRIVATE_STATE");
+          if (sequence !== maximum + 1) fail("E_PRIVATE_STATE");
           events.set(sequence, serialized);
           maximum = sequence;
         }
@@ -1871,30 +1872,44 @@ async function pollPrivateJob(context, tracker, predicate, {
   fail("E_PRIVATE_STATE");
 }
 
-function observePublicWorker(tracker, worker) {
+function observePublicWorker(tracker, worker, { observeEvents = true } = {}) {
   if (!worker || worker.id !== tracker.workerId) fail("E_SCENARIO");
   tracker.publicWorkers.push(structuredClone(worker));
-  if (Array.isArray(worker.lifecycleEvents)) {
+  if (observeEvents && Array.isArray(worker.lifecycleEvents)) {
     tracker.events.observe(worker.lifecycleEvents);
   }
 }
 
-function observeTerminalResultWorker(tracker, worker, historyWindowStage) {
-  observePublicWorker(tracker, worker);
+function observeTerminalResultWorker(tracker, worker, terminalStreamCursor) {
+  if (!worker || worker.id !== tracker.workerId) fail("E_SCENARIO");
   const trackedEvents = tracker.events.values();
-  if (sameJson(trackedEvents, worker.lifecycleEvents)) return;
+  const cursorSequence = validateCursor(worker.eventCursor, tracker.workerId);
+  const streamCursorSequence = validateCursor(
+    terminalStreamCursor,
+    tracker.workerId
+  );
+  const expectedLength = Math.min(
+    MAX_TERMINAL_LIFECYCLE_EVENTS,
+    cursorSequence
+  );
   if (
-    Array.isArray(worker.lifecycleEvents)
-    && worker.lifecycleEvents.length > 0
-    && trackedEvents.length > worker.lifecycleEvents.length
-    && sameJson(
-      trackedEvents.slice(-worker.lifecycleEvents.length),
+    !Array.isArray(worker.lifecycleEvents)
+    || expectedLength < 1
+    || streamCursorSequence !== cursorSequence
+    || trackedEvents.length !== cursorSequence
+    || trackedEvents[0]?.sequence !== 1
+    || trackedEvents.at(-1)?.sequence !== cursorSequence
+    || worker.lifecycleEvents.length !== expectedLength
+    || worker.lifecycleEvents[0]?.sequence
+      !== cursorSequence - expectedLength + 1
+    || !sameJson(
+      trackedEvents.slice(-expectedLength),
       worker.lifecycleEvents
     )
   ) {
-    enterQualificationStage(historyWindowStage);
+    fail("E_PRIVATE_STATE");
   }
-  fail("E_PRIVATE_STATE");
+  observePublicWorker(tracker, worker, { observeEvents: false });
 }
 
 const SNAPSHOT_KEYS = new Set([
@@ -2063,7 +2078,11 @@ function nullableBounded(value, maximum) {
 }
 
 function validatePublicLifecycleHistory(events, expectedWorkerId, eventCursor) {
-  if (!Array.isArray(events) || events.length < 1 || events.length > 128) {
+  if (
+    !Array.isArray(events)
+    || events.length < 1
+    || events.length > MAX_TERMINAL_LIFECYCLE_EVENTS
+  ) {
     fail("E_PRIVATE_STATE");
   }
   let prior = 0;
@@ -2073,6 +2092,42 @@ function validatePublicLifecycleHistory(events, expectedWorkerId, eventCursor) {
     prior = event.sequence;
   }
   if (validateCursor(eventCursor, expectedWorkerId) !== prior) {
+    fail("E_PRIVATE_STATE");
+  }
+}
+
+function validateTerminalPublicLifecycleHistory(
+  events,
+  expectedWorkerId,
+  eventCursor,
+  trackedEvents
+) {
+  const cursorSequence = validateCursor(eventCursor, expectedWorkerId);
+  const expectedLength = Math.min(
+    MAX_TERMINAL_LIFECYCLE_EVENTS,
+    cursorSequence
+  );
+  if (
+    !Array.isArray(events)
+    || expectedLength < 1
+    || events.length !== expectedLength
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  let prior = cursorSequence - expectedLength;
+  for (const event of events) {
+    validateLifecycleEvent(event);
+    if (event.sequence !== prior + 1) fail("E_PRIVATE_STATE");
+    prior = event.sequence;
+  }
+  if (
+    cursorSequence !== prior
+    || !Array.isArray(trackedEvents)
+    || trackedEvents.length !== cursorSequence
+    || trackedEvents[0]?.sequence !== 1
+    || trackedEvents.at(-1)?.sequence !== cursorSequence
+    || !sameJson(trackedEvents.slice(-expectedLength), events)
+  ) {
     fail("E_PRIVATE_STATE");
   }
 }
@@ -2466,10 +2521,11 @@ function validateTerminalWorkerSnapshot(worker, tracker, job, expectedStatus) {
   ) {
     fail("E_PRIVATE_STATE");
   }
-  validatePublicLifecycleHistory(
+  validateTerminalPublicLifecycleHistory(
     worker.lifecycleEvents,
     tracker.workerId,
-    worker.eventCursor
+    worker.eventCursor,
+    tracker.events.values()
   );
   validateTaskContractProjection(worker, job);
   if (worker.contextBindingMode !== "context-receipt-v1") fail("E_PRIVATE_STATE");
@@ -2494,7 +2550,13 @@ function validateTerminalWorkerSnapshot(worker, tracker, job, expectedStatus) {
   }
 }
 
-function assertTerminalEventHistory(context, tracker, publicWorker, terminalJob) {
+function assertTerminalEventHistory(
+  context,
+  tracker,
+  publicWorker,
+  terminalJob,
+  expectedStatus
+) {
   let projected;
   try {
     projected = context.workerProtocol.projectWorkerSnapshot(terminalJob, {
@@ -2503,6 +2565,7 @@ function assertTerminalEventHistory(context, tracker, publicWorker, terminalJob)
     });
     validateInstalledTerminalEventHistory({
       workerId: tracker.workerId,
+      status: expectedStatus,
       trackedEvents: tracker.events.values(),
       publicEvents: publicWorker.lifecycleEvents,
       publicCursor: publicWorker.eventCursor,
@@ -2904,6 +2967,50 @@ async function waitForTerminal(context, client, tracker, cursor) {
     if (page.stream.terminal === true) return currentCursor;
   }
   fail("E_SCENARIO");
+}
+
+async function drainTerminalEventStream(
+  context,
+  client,
+  tracker,
+  cursor,
+  terminalJob
+) {
+  const expectedSequence = terminalJob?.lifecycleEvents?.at(-1)?.sequence;
+  let currentCursor = cursor;
+  let currentSequence = validateCursor(currentCursor, tracker.workerId);
+  if (
+    !Number.isSafeInteger(expectedSequence)
+    || expectedSequence < currentSequence
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  const deadline = Date.now() + 30_000;
+  while (currentSequence < expectedSequence && Date.now() < deadline) {
+    const page = await callTool(
+      context,
+      client,
+      "worker_wait",
+      {
+        id: tracker.workerId,
+        cursor: currentCursor,
+        timeoutMs: 30_000
+      },
+      ["stream"]
+    );
+    if (page.stream?.terminal !== true) fail("E_PRIVATE_STATE");
+    currentCursor = observeStream(
+      tracker.events,
+      page.stream,
+      tracker.workerId,
+      { wait: true, cursor: currentCursor }
+    );
+    const nextSequence = validateCursor(currentCursor, tracker.workerId);
+    if (nextSequence <= currentSequence) fail("E_PRIVATE_STATE");
+    currentSequence = nextSequence;
+  }
+  if (currentSequence !== expectedSequence) fail("E_PRIVATE_STATE");
+  return currentCursor;
 }
 
 function sessionBoundaryIdentity(binding) {
@@ -3880,9 +3987,22 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   }
   tracker.mailboxMessageCountAfterReplay = afterReplayMessages.length;
   enterQualificationStage("completion-wait");
-  await waitForTerminal(context, client, tracker, started.cursor);
+  const terminalWaitCursor = await waitForTerminal(
+    context,
+    client,
+    tracker,
+    started.cursor
+  );
   enterQualificationStage("completion-cleanup-private");
   const terminalJob = await proveTerminalCleanup(context, tracker, "completed");
+  enterQualificationStage("completion-terminal-drain");
+  const terminalStreamCursor = await drainTerminalEventStream(
+    context,
+    client,
+    tracker,
+    terminalWaitCursor,
+    terminalJob
+  );
   enterQualificationStage("completion-result");
   const result = await callTool(
     context,
@@ -3895,7 +4015,7 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   observeTerminalResultWorker(
     tracker,
     result.worker,
-    "completion-result-history-window"
+    terminalStreamCursor
   );
   await closeMcp(context, client);
   client = null;
@@ -3912,7 +4032,8 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
     context,
     tracker,
     result.worker,
-    terminalJob
+    terminalJob,
+    "completed"
   );
   enterQualificationStage("completion-cleanup-binding");
   assertPublicPrivateBinding(result.worker, terminalJob);
@@ -4066,9 +4187,22 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
   }
 
   enterQualificationStage("cancellation-wait");
-  await waitForTerminal(context, client, tracker, started.cursor);
+  const terminalWaitCursor = await waitForTerminal(
+    context,
+    client,
+    tracker,
+    started.cursor
+  );
   enterQualificationStage("cancellation-cleanup-private");
   const terminalJob = await proveTerminalCleanup(context, tracker, "cancelled");
+  enterQualificationStage("cancellation-terminal-drain");
+  const terminalStreamCursor = await drainTerminalEventStream(
+    context,
+    client,
+    tracker,
+    terminalWaitCursor,
+    terminalJob
+  );
   enterQualificationStage("cancellation-result");
   const result = await callTool(
     context,
@@ -4081,7 +4215,7 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
   observeTerminalResultWorker(
     tracker,
     result.worker,
-    "cancellation-result-history-window"
+    terminalStreamCursor
   );
   await closeMcp(context, client);
   client = null;
@@ -4098,7 +4232,8 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
     context,
     tracker,
     result.worker,
-    terminalJob
+    terminalJob,
+    "cancelled"
   );
   enterQualificationStage("cancellation-cleanup-binding");
   assertPublicPrivateBinding(result.worker, terminalJob);
@@ -4966,6 +5101,12 @@ async function qualify(runner) {
     installedRoot,
     "scripts/lib/worker-protocol.mjs"
   );
+  if (
+    workerProtocol.MAX_LIFECYCLE_EVENTS
+      !== MAX_TERMINAL_LIFECYCLE_EVENTS
+  ) {
+    fail("E_INSTALL");
+  }
   const mailboxState = await importInstalled(
     installedRoot,
     "scripts/lib/worker-mailbox-state.mjs"

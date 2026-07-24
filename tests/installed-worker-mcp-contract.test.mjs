@@ -11,6 +11,7 @@ import {
   codexMetadataCapabilityMatrix
 } from "../plugins/grok/scripts/lib/worker-presentation.mjs";
 import {
+  MAX_LIFECYCLE_EVENTS,
   projectWorkerHandle,
   projectWorkerSnapshot
 } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
@@ -626,6 +627,49 @@ function cancellationBundle() {
       worker: worker("cancelled", { terminal: true, cancellation: true })
     }
   };
+}
+
+function withRetainedTerminalWindow(bundle, status) {
+  const evidence = clone(bundle);
+  const terminalWorker = evidence.terminalResult.worker;
+  const originalEvents = terminalWorker.lifecycleEvents;
+  const terminalType = status === "completed"
+    ? "final.report"
+    : "cancellation.requested";
+  const terminalMarker = clone(
+    originalEvents.find((event) => event.type === terminalType)
+  );
+  const cleanupMarker = clone(originalEvents.at(-1));
+  const checkpointTemplate = clone(
+    originalEvents.find((event) => event.type === "checkpoint")
+      || cleanupMarker
+  );
+  const retained = [];
+  for (let sequence = 13; sequence <= 138; sequence += 1) {
+    retained.push({
+      ...clone(checkpointTemplate),
+      type: "checkpoint",
+      at: status === "completed"
+        ? "2026-07-23T10:02:10.000Z"
+        : "2026-07-23T10:01:50.000Z",
+      summary: `Retained checkpoint ${sequence}`,
+      sequence
+    });
+  }
+  retained.push({
+    ...terminalMarker,
+    sequence: 139
+  }, {
+    ...cleanupMarker,
+    sequence: 140
+  });
+  terminalWorker.lifecycleEvents = retained;
+  terminalWorker.eventCursor.sequence = 140;
+  if (status === "cancelled") {
+    evidence.cancel.receipt.cancellationRequestSequence = 139;
+    evidence.cancelReplay.receipt.cancellationRequestSequence = 139;
+  }
+  return evidence;
 }
 
 function privateObservation(scenarioId) {
@@ -1623,6 +1667,82 @@ test("non-replayed spawn accepts only the committed initial handle", () => {
   }
 });
 
+test("terminal scenario validators accept only the canonical retained window", () => {
+  assert.equal(MAX_LIFECYCLE_EVENTS, 128);
+  const completion = withRetainedTerminalWindow(
+    completionBundle(),
+    "completed"
+  );
+  const cancellation = withRetainedTerminalWindow(
+    cancellationBundle(),
+    "cancelled"
+  );
+  assert.equal(completion.terminalResult.worker.lifecycleEvents.length, 128);
+  assert.equal(
+    completion.terminalResult.worker.lifecycleEvents[0].sequence,
+    13
+  );
+  assert.doesNotThrow(
+    () => validateInstalledCompletionScenario(completion)
+  );
+  assert.doesNotThrow(
+    () => validateInstalledCancellationReplayScenario(cancellation)
+  );
+
+  for (const mutate of [
+    (value) => { value.terminalResult.worker.lifecycleEvents.shift(); },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[0].sequence += 1;
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[40].sequence += 1;
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents[0] = {
+        ...clone(value.terminalResult.worker.lifecycleEvents[0]),
+        type: "task.accepted",
+        detail: {
+          spawnSuccessDefinition: "durable-job-commit",
+          write: false
+        }
+      };
+    },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents
+        .find((event) => event.type === "final.report")
+        .type = "checkpoint";
+    },
+    (value) => { value.terminalResult.worker.eventCursor.sequence = 139; }
+  ]) {
+    const drift = clone(completion);
+    mutate(drift);
+    assert.throws(
+      () => validateInstalledCompletionScenario(drift),
+      assertContractError("E_LIVE_COMPLETION")
+    );
+  }
+
+  for (const mutate of [
+    (value) => { value.terminalResult.worker.lifecycleEvents.pop(); },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents
+        .find((event) => event.type === "cancellation.requested")
+        .type = "checkpoint";
+    },
+    (value) => { value.cancel.receipt.cancellationRequestSequence = 138; },
+    (value) => {
+      value.terminalResult.worker.lifecycleEvents.at(-1).sequence = 141;
+    }
+  ]) {
+    const drift = clone(cancellation);
+    mutate(drift);
+    assert.throws(
+      () => validateInstalledCancellationReplayScenario(drift),
+      assertContractError("E_LIVE_CANCELLATION")
+    );
+  }
+});
+
 test("cancellation replay preserves immutable admission receipt and one public event", () => {
   const valid = validateInstalledCancellationReplayScenario(cancellationBundle());
   assert.equal(valid.cancel.replayed, false);
@@ -1937,6 +2057,7 @@ test("terminal event history compares the installed projection and rejects malfo
 
   const valid = {
     workerId: WORKER_ID,
+    status: "completed",
     trackedEvents: clone(projected.lifecycleEvents),
     publicEvents: clone(projected.lifecycleEvents),
     publicCursor: clone(projected.eventCursor),
@@ -1944,6 +2065,129 @@ test("terminal event history compares the installed projection and rejects malfo
     projectedCursor: clone(projected.eventCursor)
   };
   assert.doesNotThrow(() => validateInstalledTerminalEventHistory(valid));
+
+  const fullTrackedEvents = [clone(projected.lifecycleEvents[0])];
+  for (let sequence = 2; sequence <= 138; sequence += 1) {
+    const event = clone(projected.lifecycleEvents.at(-1));
+    event.type = "checkpoint";
+    event.at = "2026-07-23T10:02:10.000Z";
+    event.summary = `Tracked checkpoint ${sequence}`;
+    event.sequence = sequence;
+    delete event.detail;
+    fullTrackedEvents.push(event);
+  }
+  const fullFinalReport = clone(
+    projected.lifecycleEvents.find((event) => event.type === "final.report")
+  );
+  fullFinalReport.sequence = 139;
+  const fullCleanup = clone(projected.lifecycleEvents.at(-1));
+  fullCleanup.sequence = 140;
+  fullTrackedEvents.push(fullFinalReport, fullCleanup);
+  const retainedCursor = clone(projected.eventCursor);
+  retainedCursor.sequence = 140;
+  const retained = {
+    workerId: WORKER_ID,
+    status: "completed",
+    trackedEvents: fullTrackedEvents,
+    publicEvents: clone(fullTrackedEvents.slice(-128)),
+    publicCursor: clone(retainedCursor),
+    projectedEvents: clone(fullTrackedEvents.slice(-128)),
+    projectedCursor: clone(retainedCursor)
+  };
+  assert.doesNotThrow(
+    () => validateInstalledTerminalEventHistory(retained)
+  );
+  const retainedCancellation = clone(retained);
+  retainedCancellation.status = "cancelled";
+  for (const events of [
+    retainedCancellation.trackedEvents,
+    retainedCancellation.publicEvents,
+    retainedCancellation.projectedEvents
+  ]) {
+    const marker = events.find((event) => event.sequence === 139);
+    marker.type = "cancellation.requested";
+    marker.detail = { requestAcceptedAt: marker.at };
+  }
+  assert.doesNotThrow(
+    () => validateInstalledTerminalEventHistory(retainedCancellation)
+  );
+  for (const cursorSequence of [127, 128, 129]) {
+    const trackedEvents = [clone(projected.lifecycleEvents[0])];
+    for (let sequence = 2; sequence < cursorSequence - 1; sequence += 1) {
+      const event = clone(projected.lifecycleEvents.at(-1));
+      event.type = "checkpoint";
+      event.at = "2026-07-23T10:02:10.000Z";
+      event.summary = `Boundary checkpoint ${sequence}`;
+      event.sequence = sequence;
+      delete event.detail;
+      trackedEvents.push(event);
+    }
+    const finalReport = clone(
+      projected.lifecycleEvents.find((event) => event.type === "final.report")
+    );
+    finalReport.sequence = cursorSequence - 1;
+    const cleanup = clone(projected.lifecycleEvents.at(-1));
+    cleanup.sequence = cursorSequence;
+    trackedEvents.push(finalReport, cleanup);
+    const cursor = clone(projected.eventCursor);
+    cursor.sequence = cursorSequence;
+    const publicEvents = trackedEvents.slice(-128);
+    const boundary = {
+      workerId: WORKER_ID,
+      status: "completed",
+      trackedEvents,
+      publicEvents: clone(publicEvents),
+      publicCursor: clone(cursor),
+      projectedEvents: clone(publicEvents),
+      projectedCursor: clone(cursor)
+    };
+    assert.equal(
+      boundary.publicEvents[0].sequence,
+      cursorSequence === 129 ? 2 : 1
+    );
+    assert.doesNotThrow(
+      () => validateInstalledTerminalEventHistory(boundary)
+    );
+  }
+
+  for (const mutate of [
+    (value) => {
+      value.publicEvents.shift();
+      value.projectedEvents.shift();
+    },
+    (value) => {
+      value.publicEvents[0].summary = "drift";
+      value.projectedEvents[0].summary = "drift";
+    },
+    (value) => { value.trackedEvents[50].sequence += 1; },
+    (value) => { value.trackedEvents[0].type = "checkpoint"; },
+    (value) => {
+      value.publicCursor.sequence = 139;
+      value.projectedCursor.sequence = 139;
+    },
+    (value) => { value.projectedEvents.at(-1).summary = "projection drift"; },
+    (value) => {
+      value.trackedEvents[10] = {
+        ...clone(value.trackedEvents[10]),
+        type: "final.report",
+        detail: { outcome: "complete", structured: true }
+      };
+    },
+    (value) => {
+      value.trackedEvents[10] = {
+        ...clone(value.trackedEvents[10]),
+        type: "cancellation.requested",
+        detail: { requestAcceptedAt: value.trackedEvents[10].at }
+      };
+    }
+  ]) {
+    const drift = clone(retained);
+    mutate(drift);
+    assert.throws(
+      () => validateInstalledTerminalEventHistory(drift),
+      assertContractError("E_LIVE_PRIVATE_STATE")
+    );
+  }
 
   for (const mutate of [
     (value) => {
