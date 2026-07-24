@@ -6,6 +6,8 @@ Target release: `0.3.0`
 
 Companion specification: [SPEC.md](SPEC.md)
 
+Worker Broker roadmap and evidence ledger: [WORKER_BROKER_PLAN.md](WORKER_BROKER_PLAN.md)
+
 ## 1. Objective
 
 Harden and qualify `grok-plugin` as a dual-host Claude Code and Codex marketplace plugin that exposes the official Grok Build CLI as a companion coding agent. The implemented target is user-visible parity with [`openai/codex-plugin-cc` v1.0.6](https://github.com/openai/codex-plugin-cc/tree/db52e28f4d9ded852ab3942cea316258ae4ef346), while using Grok-supported runtime interfaces and a host control plane for rescue.

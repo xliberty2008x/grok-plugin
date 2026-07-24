@@ -1,0 +1,831 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xliberty2008x/grok-plugin/schemas/worker-broker-evidence.schema.json",
+  "title": "Worker Broker Evidence Record",
+  "description": "Immutable numbered-phase and aggregate evidence for the Worker Broker roadmap (issue #25).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "roadmapVersion",
+    "recordType",
+    "issue",
+    "phase",
+    "slice",
+    "status",
+    "recordedAt",
+    "releaseQualification",
+    "evidenceSystemQualification",
+    "provisionalSupportingRecord",
+    "qualification",
+    "source",
+    "installation",
+    "runtime",
+    "prerequisites",
+    "verification",
+    "scenarios",
+    "liveScenarios",
+    "authorities",
+    "limits",
+    "recordDigest"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": { "enum": ["verified_on_draft", "qualified"] }
+        },
+        "required": ["status"]
+      },
+      "then": { "required": ["proofProducer"] }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": { "const": "1" },
+          "status": { "const": "verified_on_draft" }
+        },
+        "required": ["phase", "status"]
+      },
+      "then": {
+        "required": ["independentReviewReceipt"],
+        "properties": {
+          "independentReviewReceipt": {
+            "properties": {
+              "schemaVersion": { "const": 2 }
+            },
+            "required": ["schemaVersion"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": { "const": "qualified" }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "required": ["liveQualificationReceipts"],
+        "properties": {
+          "phase": { "const": "aggregate" },
+          "recordType": { "const": "worker-broker-aggregate" },
+          "releaseQualification": { "const": true },
+          "provisionalSupportingRecord": { "const": false },
+          "qualification": {
+            "properties": {
+              "installedHost": { "const": "pass" },
+              "provider": { "const": "pass" },
+              "release": { "const": "pass" }
+            }
+          },
+          "liveQualificationReceipts": {
+            "properties": {
+              "syntheticDirectMcp": { "type": "object" },
+              "naturalCodexHost": { "type": "object" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": { "enum": ["0", "1", "2", "3", "4", "5"] }
+        },
+        "required": ["phase"]
+      },
+      "then": {
+        "not": {
+          "properties": {
+            "status": { "const": "qualified" }
+          },
+          "required": ["status"]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": { "const": "aggregate" }
+        },
+        "required": ["phase"]
+      },
+      "then": {
+        "properties": {
+          "recordType": { "const": "worker-broker-aggregate" },
+          "source": {
+            "properties": {
+              "phaseScopePaths": { "minItems": 1 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "required": ["independentReviewReceipt"] },
+      "then": {
+        "properties": {
+          "phase": { "const": "1" },
+          "status": { "const": "verified_on_draft" },
+          "authorities": {
+            "properties": {
+              "independentValidation": { "const": "pass" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "qualification": {
+            "properties": {
+              "provider": { "enum": ["fail", "skip", "not_run"] }
+            },
+            "required": ["provider"]
+          }
+        },
+        "required": ["qualification"]
+      },
+      "then": {
+        "properties": {
+          "liveQualificationReceipts": {
+            "properties": {
+              "syntheticDirectMcp": { "type": "null" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "qualification": {
+            "properties": { "provider": { "const": "pass" } },
+            "required": ["provider"]
+          }
+        },
+        "required": ["qualification"]
+      },
+      "then": {
+        "required": ["liveQualificationReceipts"],
+        "properties": {
+          "phase": { "enum": ["1", "4", "aggregate"] },
+          "liveQualificationReceipts": {
+            "properties": {
+              "syntheticDirectMcp": { "type": "object" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "qualification": {
+            "properties": { "installedHost": { "const": "pass" } },
+            "required": ["installedHost"]
+          }
+        },
+        "required": ["qualification"]
+      },
+      "then": {
+        "required": ["liveQualificationReceipts"],
+        "properties": {
+          "phase": { "enum": ["4", "aggregate"] },
+          "qualification": {
+            "properties": { "provider": { "const": "pass" } }
+          },
+          "liveQualificationReceipts": {
+            "properties": {
+              "syntheticDirectMcp": { "type": "object" },
+              "naturalCodexHost": { "type": "object" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "qualification": {
+            "properties": {
+              "installedHost": { "enum": ["fail", "skip", "not_run"] }
+            },
+            "required": ["installedHost"]
+          }
+        },
+        "required": ["qualification"]
+      },
+      "then": {
+        "properties": {
+          "liveQualificationReceipts": {
+            "properties": {
+              "naturalCodexHost": { "type": "null" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "liveQualificationReceipts": {
+            "properties": {
+              "syntheticDirectMcp": { "type": "object" }
+            },
+            "required": ["syntheticDirectMcp"]
+          }
+        },
+        "required": ["liveQualificationReceipts"]
+      },
+      "then": {
+        "properties": {
+          "phase": { "enum": ["1", "4", "aggregate"] },
+          "qualification": {
+            "properties": { "provider": { "const": "pass" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "liveQualificationReceipts": {
+            "properties": {
+              "naturalCodexHost": { "type": "object" }
+            },
+            "required": ["naturalCodexHost"]
+          }
+        },
+        "required": ["liveQualificationReceipts"]
+      },
+      "then": {
+        "properties": {
+          "phase": { "enum": ["4", "aggregate"] },
+          "qualification": {
+            "properties": {
+              "provider": { "const": "pass" },
+              "installedHost": { "const": "pass" }
+            }
+          },
+          "liveQualificationReceipts": {
+            "properties": {
+              "syntheticDirectMcp": { "type": "object" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "anyOf": [
+          {
+            "properties": {
+              "qualification": {
+                "properties": { "provider": { "const": "pass" } },
+                "required": ["provider"]
+              }
+            },
+            "required": ["qualification"]
+          },
+          {
+            "properties": {
+              "qualification": {
+                "properties": { "installedHost": { "const": "pass" } },
+                "required": ["installedHost"]
+              }
+            },
+            "required": ["qualification"]
+          },
+          {
+            "properties": {
+              "liveQualificationReceipts": {
+                "properties": {
+                  "syntheticDirectMcp": { "type": "object" }
+                },
+                "required": ["syntheticDirectMcp"]
+              }
+            },
+            "required": ["liveQualificationReceipts"]
+          },
+          {
+            "properties": {
+              "liveQualificationReceipts": {
+                "properties": {
+                  "naturalCodexHost": { "type": "object" }
+                },
+                "required": ["naturalCodexHost"]
+              }
+            },
+            "required": ["liveQualificationReceipts"]
+          }
+        ],
+        "not": {
+          "properties": {
+            "phase": { "const": "aggregate" },
+            "status": { "const": "qualified" }
+          },
+          "required": ["phase", "status"]
+        }
+      },
+      "then": {
+        "properties": {
+          "status": { "const": "implemented_unverified" },
+          "provisionalSupportingRecord": { "const": true },
+          "releaseQualification": { "const": false },
+          "qualification": {
+            "properties": {
+              "release": { "enum": ["fail", "skip", "not_run"] }
+            }
+          },
+          "authorities": {
+            "properties": {
+              "hostVerification": { "const": "not_run" }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "roadmapVersion": { "type": "string", "const": "1.0" },
+    "recordType": {
+      "type": "string",
+      "enum": ["worker-broker-slice", "worker-broker-aggregate"]
+    },
+    "issue": {
+      "type": "string",
+      "const": "https://github.com/xliberty2008x/grok-plugin/issues/25"
+    },
+    "pullRequest": { "type": ["string", "null"], "maxLength": 256 },
+    "phase": {
+      "type": "string",
+      "enum": ["0", "1", "2", "3", "4", "5", "aggregate"]
+    },
+    "slice": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "status": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "implemented_unverified",
+        "verified_on_draft",
+        "qualified",
+        "blocked",
+        "deferred",
+        "historical"
+      ]
+    },
+    "recordedAt": { "type": "string", "format": "date-time" },
+    "releaseQualification": { "type": "boolean" },
+    "evidenceSystemQualification": { "type": "boolean" },
+    "provisionalSupportingRecord": { "type": "boolean" },
+    "proofProducer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "manifestDigest"],
+      "properties": {
+        "id": { "type": "string", "const": "worker-broker-gate-runner" },
+        "version": { "type": "integer", "const": 3 },
+        "manifestDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "independentReviewReceipt": {
+      "type": "object",
+      "description": "Receipt v1 remains parseable historical structure but cannot authenticate promotion. Receipt v2 references an exact immutable request and external signed attestation and still requires protected trust replay in runtime code.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "producerId",
+            "producerVersion",
+            "manifestDigest",
+            "reviewerRuntimeDigest",
+            "headCommit",
+            "headTree",
+            "sourceInventoryDigest",
+            "phaseScopeDigest",
+            "startedAt",
+            "endedAt",
+            "outcome",
+            "unresolvedFindings",
+            "receiptDigest"
+          ],
+          "properties": {
+            "schemaVersion": { "type": "integer", "const": 1 },
+            "producerId": { "type": "string", "const": "codex-native-review-runner" },
+            "producerVersion": { "type": "integer", "const": 1 },
+            "manifestDigest": {
+              "type": "string",
+              "const": "82792debed04937a264e759a1812ba1e33e0417aa555f87ce13e7f5417fd6f12"
+            },
+            "reviewerRuntimeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "headCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            "headTree": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            "sourceInventoryDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "phaseScopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "startedAt": { "type": "string", "format": "date-time" },
+            "endedAt": { "type": "string", "format": "date-time" },
+            "outcome": { "type": "string", "const": "pass" },
+            "unresolvedFindings": { "type": "integer", "const": 0 },
+            "receiptDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "producerId",
+            "producerVersion",
+            "reviewRequest",
+            "attestation",
+            "issuer",
+            "keyFingerprint",
+            "receiptDigest"
+          ],
+          "properties": {
+            "schemaVersion": { "type": "integer", "const": 2 },
+            "producerId": {
+              "type": "string",
+              "const": "worker-broker-protected-review-promoter"
+            },
+            "producerVersion": { "type": "integer", "const": 1 },
+            "reviewRequest": { "$ref": "#/$defs/signedReviewReference" },
+            "attestation": { "$ref": "#/$defs/signedReviewReference" },
+            "issuer": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$"
+            },
+            "keyFingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "receiptDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
+        }
+      ]
+    },
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deterministic", "installedHost", "provider", "release"],
+      "properties": {
+        "deterministic": { "type": "string", "enum": ["pass", "fail", "skip", "not_run"] },
+        "installedHost": { "type": "string", "enum": ["pass", "fail", "skip", "not_run"] },
+        "provider": { "type": "string", "enum": ["pass", "fail", "skip", "not_run"] },
+        "release": { "type": "string", "enum": ["pass", "fail", "skip", "not_run"] }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pluginVersion",
+        "headCommit",
+        "headTree",
+        "sourceInventoryDigest",
+        "phaseScopeDigest",
+        "cleanTreeAtVerification",
+        "phaseScopePaths"
+      ],
+      "properties": {
+        "pluginVersion": { "type": "string", "minLength": 1 },
+        "foundationCommit": { "type": ["string", "null"] },
+        "headCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "headTree": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "sourceInventoryDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "phaseScopeDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "cleanTreeAtVerification": { "type": "boolean" },
+        "phaseScopePaths": {
+          "type": "array",
+          "description": "Sorted unique source paths in the phase scope. Aggregate records must enumerate every current non-evidence source path.",
+          "items": { "type": "string" },
+          "uniqueItems": true,
+          "maxItems": 512
+        }
+      }
+    },
+    "installation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "sourcePluginInventoryDigest",
+        "installedPluginInventoryDigest",
+        "installedFileCount",
+        "sourceAndInstalledInventoriesEqual",
+        "privateInstallPathRecorded"
+      ],
+      "properties": {
+        "method": { "type": "string" },
+        "sourcePluginInventoryDigest": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "installedPluginInventoryDigest": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "installedFileCount": { "type": ["integer", "null"], "minimum": 0 },
+        "sourceAndInstalledInventoriesEqual": { "type": ["boolean", "null"] },
+        "privateInstallPathRecorded": { "type": "boolean", "const": false }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "architecture", "node", "git"],
+      "properties": {
+        "platform": { "type": "string" },
+        "architecture": { "type": "string" },
+        "node": { "type": "string" },
+        "git": { "type": "string" },
+        "codexStandalone": { "type": ["string", "null"] },
+        "codexDesktopBundled": { "type": ["string", "null"] },
+        "grokBuild": { "type": ["string", "null"] },
+        "grokBuildRevision": { "type": ["string", "null"] },
+        "mcpProtocolVersion": { "type": ["string", "null"] }
+      }
+    },
+    "prerequisites": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["phase", "recordDigest", "gateIds"],
+        "properties": {
+          "phase": { "type": "string" },
+          "recordDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "gateIds": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "verification": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["gateId", "boundary", "outcome"],
+        "oneOf": [
+          { "required": ["command"], "not": { "required": ["argv"] } },
+          { "required": ["argv"], "not": { "required": ["command"] } }
+        ],
+        "properties": {
+          "gateId": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "command": { "type": "string", "minLength": 1 },
+          "argv": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 256,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "boundary": { "type": "string", "minLength": 1 },
+          "outcome": {
+            "type": "string",
+            "enum": ["pass", "fail", "skip", "not_run"]
+          },
+          "startedAt": { "type": ["string", "null"] },
+          "endedAt": { "type": ["string", "null"] },
+          "exitCode": { "type": ["integer", "null"] },
+          "testsPassed": { "type": ["integer", "null"], "minimum": 0 },
+          "testsSkipped": { "type": ["integer", "null"], "minimum": 0 },
+          "testsFailed": { "type": ["integer", "null"], "minimum": 0 },
+          "outputDigest": {
+            "type": ["string", "null"],
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "assertions": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "skipMeaning": { "type": ["string", "null"] }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "outcome": { "enum": ["pass", "fail"] } } },
+            "then": {
+              "required": ["startedAt", "endedAt", "exitCode", "outputDigest"]
+            }
+          },
+          {
+            "if": { "properties": { "outcome": { "enum": ["skip", "not_run"] } } },
+            "then": { "required": ["skipMeaning"] }
+          }
+        ]
+      }
+    },
+    "scenarios": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "expected", "actual", "outcome"],
+        "properties": {
+          "id": { "type": "string" },
+          "boundary": { "type": ["string", "null"] },
+          "expected": { "type": "string" },
+          "actual": { "type": "string" },
+          "outcome": {
+            "type": "string",
+            "enum": ["pass", "fail", "skip", "not_run"]
+          },
+          "measurements": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "durationMs": { "type": "number", "minimum": 0 },
+              "spawnLatencyMs": { "type": "number", "minimum": 0 },
+              "terminalVisibilityMs": { "type": "number", "minimum": 0 },
+              "cancellationRequestToProcessGroupGoneMs": { "type": "number", "minimum": 0 },
+              "cancellationRequestToTerminalRecordMs": { "type": "number", "minimum": 0 },
+              "workerCount": { "type": "number", "minimum": 0 },
+              "messageCount": { "type": "number", "minimum": 0 },
+              "deliveredCount": { "type": "number", "minimum": 0 },
+              "rejectedCount": { "type": "number", "minimum": 0 },
+              "deliveryUnknownCount": { "type": "number", "minimum": 0 },
+              "duplicateDeliveryCount": { "type": "number", "minimum": 0 },
+              "providerLaunchCount": { "type": "number", "minimum": 0 },
+              "artifactCount": { "type": "number", "minimum": 0 },
+              "changedFileCount": { "type": "number", "minimum": 0 },
+              "parentMutationCount": { "type": "number", "minimum": 0 },
+              "assertionCount": { "type": "number", "minimum": 0 },
+              "testsPassed": { "type": "number", "minimum": 0 },
+              "testsFailed": { "type": "number", "minimum": 0 },
+              "testsSkipped": { "type": "number", "minimum": 0 },
+              "retryCount": { "type": "number", "minimum": 0 },
+              "conflictCount": { "type": "number", "minimum": 0 },
+              "gapCount": { "type": "number", "minimum": 0 },
+              "bytes": { "type": "number", "minimum": 0 },
+              "parentUnchanged": { "type": "boolean" },
+              "workspaceIsolated": { "type": "boolean" },
+              "terminalObserved": { "type": "boolean" },
+              "processGroupGone": { "type": "boolean" }
+            }
+          },
+          "negative": { "type": "boolean" }
+        }
+      }
+    },
+    "liveScenarios": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "boundary", "outcome"],
+        "properties": {
+          "id": { "type": "string" },
+          "boundary": { "type": "string" },
+          "runtime": { "type": ["string", "null"] },
+          "expected": { "type": ["string", "null"] },
+          "actual": { "type": ["string", "null"] },
+          "outcome": {
+            "type": "string",
+            "enum": ["pass", "fail", "skip", "not_run"]
+          }
+        }
+      }
+    },
+    "liveQualificationReceipts": {
+      "type": "object",
+      "description": "Digest references for strict offline integrity replay only. The generic writer rejects this field, no supported publication API currently exists, and historical origin cannot be authenticated without a protected signature or external immutable anchor.",
+      "additionalProperties": false,
+      "required": ["syntheticDirectMcp", "naturalCodexHost"],
+      "properties": {
+        "syntheticDirectMcp": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "receiptDigest"],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "pattern": "^tests/e2e-results/worker-broker/live-receipts/v1/synthetic-direct-mcp/[0-9a-f]{16}-[0-9a-f]{16}\\.json$"
+                },
+                "receiptDigest": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              }
+            }
+          ]
+        },
+        "naturalCodexHost": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "receiptDigest"],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "pattern": "^tests/e2e-results/worker-broker/live-receipts/v1/natural-codex-host/[0-9a-f]{16}-[0-9a-f]{16}\\.json$"
+                },
+                "receiptDigest": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "ci": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "workflowUrl": { "type": ["string", "null"] },
+        "runId": { "type": ["string", "null"] },
+        "attempt": { "type": ["integer", "null"] },
+        "jobs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "result"],
+            "properties": {
+              "name": { "type": "string" },
+              "result": {
+                "type": "string",
+                "enum": ["success", "failure", "skipped", "cancelled"]
+              }
+            }
+          }
+        }
+      }
+    },
+    "authorities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workerClaims",
+        "runtimeObservations",
+        "hostVerification",
+        "independentValidation"
+      ],
+      "properties": {
+        "workerClaims": { "type": "string" },
+        "runtimeObservations": { "type": "string" },
+        "hostVerification": { "type": "string" },
+        "independentValidation": { "type": "string" }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["residualRisks", "unsupportedPlatforms", "invalidationTriggers"],
+      "properties": {
+        "residualRisks": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "unsupportedPlatforms": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "invalidationTriggers": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "supersededBy": { "type": ["string", "null"] },
+        "liveQualificationGaps": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "recordDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of the canonical record body excluding this field."
+    }
+  },
+  "$defs": {
+    "signedReviewReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "digest"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  }
+}

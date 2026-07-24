@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "roadmapVersion": "1.0",
+  "issue": "https://github.com/xliberty2008x/grok-plugin/issues/25",
+  "updatedAt": "2026-07-23T03:58:12.648Z",
+  "entries": [
+    {
+      "phase": "0",
+      "slice": "evidence-system",
+      "status": "verified_on_draft",
+      "path": "tests/e2e-results/worker-broker/phase-0/e31fc69ff4321578.json",
+      "recordDigest": "eaff655b7d4f01d283d6142eed48d4fb42e1f40ed2e82ae26d37cc1f43ac2c71",
+      "sourceCommit": "8aec42e70bb38d2440c886f036d88fb9b80b55c0",
+      "currency": "invalidated",
+      "recordedAt": "2026-07-16T11:16:56.200Z"
+    },
+    {
+      "phase": "1",
+      "slice": "worker-api-spawn-cancel-schemas",
+      "status": "verified_on_draft",
+      "path": "tests/e2e-results/worker-broker/phase-1/e31fc69ff4321578.json",
+      "recordDigest": "e0b8a239135d1545fbb40fd69c2fee43ca3d719cc218f74b197ffbabc0861480",
+      "sourceCommit": "8aec42e70bb38d2440c886f036d88fb9b80b55c0",
+      "currency": "invalidated",
+      "recordedAt": "2026-07-16T11:16:56.304Z"
+    },
+    {
+      "phase": "2",
+      "slice": "mailbox-context-roles",
+      "status": "verified_on_draft",
+      "path": "tests/e2e-results/worker-broker/phase-2/e31fc69ff4321578.json",
+      "recordDigest": "46b6a35649cc84f4023bc797c40d87a7d087ef328d265811bf17b32a7625f76e",
+      "sourceCommit": "8aec42e70bb38d2440c886f036d88fb9b80b55c0",
+      "currency": "invalidated",
+      "recordedAt": "2026-07-16T11:16:56.406Z"
+    },
+    {
+      "phase": "3",
+      "slice": "control-workspace-worktrees",
+      "status": "verified_on_draft",
+      "path": "tests/e2e-results/worker-broker/phase-3/e31fc69ff4321578.json",
+      "recordDigest": "2c5fe9705db4fc04cfd12d6d2de5257610582c0dff3b5aba59a4e02cd8d7d7dd",
+      "sourceCommit": "8aec42e70bb38d2440c886f036d88fb9b80b55c0",
+      "currency": "invalidated",
+      "recordedAt": "2026-07-16T11:16:56.506Z"
+    },
+    {
+      "phase": "4",
+      "slice": "host-presentation",
+      "status": "verified_on_draft",
+      "path": "tests/e2e-results/worker-broker/phase-4/e31fc69ff4321578.json",
+      "recordDigest": "342960bd726f26ceac4f31657b460d9430b93158ecabd0e03b96bebf3bcd1edc",
+      "sourceCommit": "8aec42e70bb38d2440c886f036d88fb9b80b55c0",
+      "currency": "invalidated",
+      "recordedAt": "2026-07-16T11:16:56.608Z"
+    },
+    {
+      "phase": "5",
+      "slice": "safety-proofs-aggregate-deterministic",
+      "status": "verified_on_draft",
+      "path": "tests/e2e-results/worker-broker/phase-5/e31fc69ff4321578.json",
+      "recordDigest": "d3e7ae5ade7eaed337c21f34316fbc2d281791986b019692ec24df9e538b9243",
+      "sourceCommit": "8aec42e70bb38d2440c886f036d88fb9b80b55c0",
+      "currency": "invalidated",
+      "recordedAt": "2026-07-16T11:16:56.704Z"
+    },
+    {
+      "phase": "0",
+      "slice": "evidence-system",
+      "status": "verified_on_draft",
+      "path": "tests/e2e-results/worker-broker/phase-0/afbd44b660acf365-f7c9779e2dcd.json",
+      "recordDigest": "f7c9779e2dcd980dcfd4fcd248229a25ba2e7c91677569adbee65ad0dfe55a36",
+      "sourceCommit": "2b39e137c2def0962438f08b626ad5af5bb797dd",
+      "currency": "current",
+      "recordedAt": "2026-07-23T03:39:41.299Z"
+    },
+    {
+      "phase": "1",
+      "slice": "worker-api",
+      "status": "implemented_unverified",
+      "path": "tests/e2e-results/worker-broker/phase-1/afbd44b660acf365-53bb71c612cb.json",
+      "recordDigest": "53bb71c612cb696c5a7a845a8b04cd728dea9b1c0626684c886d04aa0bc06489",
+      "sourceCommit": "2b39e137c2def0962438f08b626ad5af5bb797dd",
+      "currency": "current",
+      "recordedAt": "2026-07-23T03:58:09.079Z"
+    }
+  ]
+}

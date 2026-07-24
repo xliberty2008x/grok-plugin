@@ -11,6 +11,9 @@ import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
 import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 import { CompanionError, attachTransferCleanupEvidence, asErrorPayload } from "../plugins/grok/scripts/lib/errors.mjs";
 import { redact } from "../plugins/grok/scripts/lib/redact.mjs";
+import { spawnReadOnlyWorker } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
+import { buildTaskEnvelope, scrubStoredJob } from "../plugins/grok/scripts/lib/task-contract.mjs";
+import { launchContractDigest } from "../plugins/grok/scripts/lib/worker-launch-contract.mjs";
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import {
@@ -24,7 +27,7 @@ import {
   testEnvironment,
   waitFor
 } from "./helpers.mjs";
-import { writeCodexSessionMetadata } from "../plugins/grok/scripts/lib/host.mjs";
+import { pluginDataRoot, writeCodexSessionMetadata } from "../plugins/grok/scripts/lib/host.mjs";
 
 function parseJson(result) {
   assert.equal(result.status, 0, `command failed\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
@@ -83,6 +86,32 @@ test("setup validates headless isolation before enabling the stop gate", () => {
   assert.equal(failed.config.stopReviewGate, false);
 });
 
+test("a failed setup attempt revokes the previously published provider capability", () => {
+  const root = initRepo();
+  const readyFixture = fixture();
+  const ready = parseJson(runCompanion(["setup", "--json"], { cwd: root, env: readyFixture.env }));
+  assert.equal(ready.ready, true);
+  const receipt = path.join(
+    pluginDataRoot(readyFixture.env),
+    "capabilities",
+    "provider-capability-v1.json"
+  );
+  assert.equal(fs.existsSync(receipt), true);
+
+  const failedFake = installFakeGrok(tempDir("fake-grok-setup-revocation-"), {
+    helpText: "Usage: grok --sandbox PROFILE\n"
+  });
+  const failedEnv = {
+    ...readyFixture.env,
+    GROK_BIN: failedFake.binary,
+    GROK_AUTH_PATH: failedFake.authPath
+  };
+  const failed = parseJson(runCompanion(["setup", "--json"], { cwd: root, env: failedEnv }));
+  assert.equal(failed.ready, false);
+  assert.equal(failed.grok.error.code, "E_CAPABILITY");
+  assert.equal(fs.existsSync(receipt), false);
+});
+
 function transferFixture(config = {}) {
   const root = initRepo();
   const runtime = fixture(config);
@@ -100,6 +129,8 @@ test("transfer helpers format model-qualified resume and parse non-isolated mode
     parseAdvertisedModels,
     selectTransferModel,
     assertTransferEffort,
+    deleteSession,
+    inspectImportedSessionPresence,
     isImportedSessionReady,
     waitForImportedSession
   } = await import("../plugins/grok/scripts/lib/grok-provider.mjs");
@@ -147,6 +178,10 @@ Available models:
   fs.writeFileSync(storePath, JSON.stringify({
     sessions: [{ id: sessionId, readyAt: Date.now(), neverReady: true }]
   }), "utf8");
+  assert.deepEqual(inspectImportedSessionPresence(sessionId, fake.binary), {
+    ok: true,
+    present: false
+  });
   assert.equal(isImportedSessionReady(sessionId, fake.binary), false);
   const publish = setTimeout(() => fs.writeFileSync(storePath, JSON.stringify({
     sessions: [{ id: sessionId, readyAt: Date.now(), neverReady: false }]
@@ -160,7 +195,16 @@ Available models:
   } finally {
     clearTimeout(publish);
   }
+  assert.deepEqual(inspectImportedSessionPresence(sessionId, fake.binary), {
+    ok: true,
+    present: true
+  });
   assert.equal(isImportedSessionReady(sessionId, fake.binary), true);
+  assert.equal(deleteSession(sessionId, fake.binary).ok, true);
+  assert.deepEqual(inspectImportedSessionPresence(sessionId, fake.binary), {
+    ok: true,
+    present: false
+  });
   const listEvents = readFakeLog(fake.logFile).filter((entry) => entry.event === "sessions-list");
   assert.ok(listEvents.length >= 2);
 
@@ -171,6 +215,100 @@ Available models:
     () => waitForImportedSession(sessionId, { binary: fake.binary, timeoutMs: 120, intervalMs: 30 }),
     (error) => error?.code === "E_IMPORT_RESULT" && /not yet observable/i.test(error.message)
   );
+
+  const missingBinary = path.join(path.dirname(fake.binary), "missing-grok");
+  assert.deepEqual(inspectImportedSessionPresence(sessionId, missingBinary), {
+    ok: false,
+    present: false
+  });
+  assert.equal(isImportedSessionReady(sessionId, missingBinary), false);
+  assert.deepEqual(inspectImportedSessionPresence("", fake.binary), {
+    ok: false,
+    present: false
+  });
+
+  const header = "SESSION ID                            CREATED     UPDATED     STATUS      SUMMARY\n";
+  for (const [label, output, stderr, expected] of [
+    ["empty", "", "", { ok: false, present: false }],
+    ["official-empty", "No sessions found.\n", "", { ok: true, present: false }],
+    ["header-only", header, "", { ok: false, present: false }],
+    ["malformed", "not a session table\n", "", { ok: false, present: false }],
+    [
+      "summary-only",
+      `${header}aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa  2026-07-14  2026-07-14  local  ${sessionId}\n`,
+      "",
+      { ok: true, present: false }
+    ],
+    ["stderr-only", header, `${sessionId}\n`, { ok: false, present: false }],
+    [
+      "sentinel-with-table",
+      `No sessions found.\n${header}`,
+      "",
+      { ok: false, present: false }
+    ],
+    [
+      "malformed-label",
+      `Label:\n${header}${sessionId}  2026-07-14  2026-07-14  local  imported\n`,
+      "",
+      { ok: false, present: false }
+    ],
+    [
+      "empty-labeled-group",
+      `Label: empty\n${header}`,
+      "",
+      { ok: false, present: false }
+    ],
+    [
+      "duplicate-label",
+      `Label: duplicate\n${header}aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa  2026-07-14  2026-07-14  local  one\nLabel: duplicate\n${header}bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb  2026-07-14  2026-07-14  local  two\n`,
+      "",
+      { ok: false, present: false }
+    ],
+    [
+      "warning-row",
+      `${header}WARNING partial output truncated now\n`,
+      "",
+      { ok: false, present: false }
+    ],
+    [
+      "impossible-date",
+      `${header}aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa  9999-99-99  2026-02-31  local  row\n`,
+      "",
+      { ok: false, present: false }
+    ]
+  ]) {
+    const special = installFakeGrok(tempDir(`fake-grok-ready-${label}-`), {
+      sessionsListOutput: output,
+      sessionsListStderr: stderr
+    });
+    assert.deepEqual(inspectImportedSessionPresence(sessionId, special.binary), expected, label);
+  }
+
+  const saturatedRows = Array.from({ length: 200 }, (_, index) => (
+    `${String(index + 1).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa  2026-07-14  2026-07-14  local  row-${index}`
+  ));
+  const saturated = installFakeGrok(tempDir("fake-grok-ready-saturated-"), {
+    sessionsListOutput: `${header}${saturatedRows.join("\n")}\n`
+  });
+  assert.deepEqual(inspectImportedSessionPresence(sessionId, saturated.binary), {
+    ok: false,
+    present: false
+  });
+
+  const grouped = installFakeGrok(tempDir("fake-grok-ready-grouped-"), {
+    sessionsListOutput: `(no label)\n${header}${sessionId}  2026-07-14  2026-07-14  local  imported\n`
+  });
+  assert.deepEqual(inspectImportedSessionPresence(sessionId, grouped.binary), {
+    ok: true,
+    present: true
+  });
+  const officiallyGrouped = installFakeGrok(tempDir("fake-grok-ready-official-grouped-"), {
+    sessionsListOutput: `Label: qualification\n${header}${sessionId}  2026-07-14  2026-07-14  local  imported\n`
+  });
+  assert.deepEqual(inspectImportedSessionPresence(sessionId, officiallyGrouped.binary), {
+    ok: true,
+    present: true
+  });
 });
 
 function spawnCompanion(args, { cwd, env }) {
@@ -351,6 +489,67 @@ test("runtime write task forwards model and effort under the write security prof
   assert.equal(invocation.args.includes("explore"), false);
   assert.ok(providerLog.some((entry) => entry.event === "rpc" && entry.message.method === "session/prompt"));
   assert.equal(providerLog.some((entry) => entry.event === "headless"), false);
+});
+
+test("successful task storage digests duplicate private objectives and preserves a distinct public objective", () => {
+  const root = initRepo();
+  const { env, pluginData } = fixture({ taskText: taskReport("Stored request privacy complete", ["AC-01"]) });
+  const privateRequest = "private terminal request literal 8de43c3f";
+  const expectedDigest = crypto.createHash("sha256").update(privateRequest).digest("hex");
+  const launchEnvelope = buildTaskEnvelope({ userRequest: privateRequest, objective: privateRequest });
+  const launchJob = {
+    id: "task-launch-privacy",
+    kind: "task",
+    jobClass: "task",
+    write: false,
+    title: privateRequest,
+    host: { kind: "codex", sessionId: "privacy-test-thread" },
+    controlWorkspaceId: "privacy-test-workspace",
+    profile: null,
+    role: null,
+    model: null,
+    effort: null,
+    request: {
+      prompt: "assembled provider prompt",
+      promptDigest: null,
+      providerPromptDigest: crypto.createHash("sha256").update("assembled provider prompt").digest("hex"),
+      publicObjective: privateRequest,
+      envelope: launchEnvelope,
+      spawn: {}
+    }
+  };
+  const scrubbedLaunchJob = scrubStoredJob(launchJob);
+  assert.equal(launchContractDigest(scrubbedLaunchJob), launchContractDigest(launchJob));
+  assert.equal(scrubbedLaunchJob.title, `task:${expectedDigest.slice(0, 24)}`);
+
+  const duplicate = parseJson(runCompanion(
+    ["task", "--wait", "--write", "--envelope-stdin", "--json"],
+    { cwd: root, env, input: writeEnvelope(privateRequest) }
+  ));
+  assert.equal(duplicate.status, "completed");
+  const duplicateStored = persistedJob(pluginData, duplicate.id);
+  assert.equal(duplicateStored.request.prompt, null);
+  assert.match(duplicateStored.request.promptDigest, /^[a-f0-9]{64}$/);
+  assert.equal(duplicateStored.request.envelope.userRequest, null);
+  assert.equal(duplicateStored.request.envelope.userRequestDigest, expectedDigest);
+  assert.equal(duplicateStored.request.envelope.objective, expectedDigest);
+  assert.equal(duplicateStored.request.publicObjective, null);
+  assert.equal(duplicateStored.title, `task:${expectedDigest.slice(0, 24)}`);
+  assert.equal(JSON.stringify(duplicateStored).includes(privateRequest), false);
+
+  const publicObjective = "Summarize the bounded fixture change";
+  const distinct = parseJson(runCompanion(
+    ["task", "--wait", "--write", "--envelope-stdin", "--json"],
+    { cwd: root, env, input: writeEnvelope(privateRequest, { objective: publicObjective }) }
+  ));
+  assert.equal(distinct.status, "completed");
+  const distinctStored = persistedJob(pluginData, distinct.id);
+  assert.equal(distinctStored.request.envelope.userRequest, null);
+  assert.equal(distinctStored.request.envelope.userRequestDigest, expectedDigest);
+  assert.equal(distinctStored.request.envelope.objective, publicObjective);
+  assert.equal(distinctStored.request.publicObjective, publicObjective);
+  assert.equal(distinctStored.title, publicObjective);
+  assert.equal(JSON.stringify(distinctStored).includes(privateRequest), false);
 });
 
 test("resume candidates preserve read/write profiles and never escalate an existing session", () => {
@@ -711,6 +910,199 @@ function writeSeededJob(stateRoot, job) {
   fs.writeFileSync(job.logFile, "", { mode: 0o600 });
 }
 
+function codexBrokerFixture() {
+  const runtime = fixture();
+  const threadId = "codex-broker-runtime-session";
+  return {
+    ...runtime,
+    threadId,
+    env: {
+      ...runtime.env,
+      GROK_COMPANION_HOST: "codex",
+      GROK_COMPANION_HOST_SESSION_ID: threadId,
+      CODEX_THREAD_ID: threadId
+    }
+  };
+}
+
+function spawnPendingBrokerJob(root, { env, threadId }, idempotencyKey) {
+  return spawnReadOnlyWorker({
+    root,
+    principal: { threadId, source: "codex" },
+    envelope: buildTaskEnvelope({
+      userRequest: "Inspect the repository without writing files.",
+      mode: "read"
+    }),
+    idempotencyKey,
+    env
+  });
+}
+
+test("legacy CLI recovery preserves broker jobs at every unsettled launch boundary", () => {
+  const root = fs.realpathSync(initRepo());
+  const runtime = codexBrokerFixture();
+  const spawned = spawnPendingBrokerJob(root, runtime, "runtime-pending-recovery");
+  const id = spawned.handle.id;
+  const old = new Date(Date.now() - 10_000).toISOString();
+  updateJob(root, id, (job) => ({ ...job, createdAt: old }), runtime.env);
+
+  const states = [
+    { providerLaunchPending: true, providerLaunchInFlight: false, providerLaunchOutcome: null },
+    { providerLaunchPending: false, providerLaunchInFlight: true, providerLaunchOutcome: null },
+    { providerLaunchPending: false, providerLaunchInFlight: false, providerLaunchOutcome: "unknown" }
+  ];
+  for (const launchState of states) {
+    updateJob(root, id, (job) => ({
+      ...job,
+      status: "queued",
+      phase: "provider-launching",
+      error: null,
+      request: {
+        ...job.request,
+        spawn: { ...job.request.spawn, ...launchState }
+      }
+    }), runtime.env);
+    const status = parseJson(runCompanion(["status", id, "--json"], {
+      cwd: root,
+      env: runtime.env
+    }));
+    assert.equal(status.status, "queued");
+    assert.equal(readJob(root, id, runtime.env).error, null);
+  }
+});
+
+test("legacy CLI cancel extracts the broker object authorization nonce", async () => {
+  const root = fs.realpathSync(initRepo());
+  const runtime = codexBrokerFixture();
+  const spawned = spawnPendingBrokerJob(root, runtime, "runtime-object-nonce-cancel");
+  const id = spawned.handle.id;
+  const nonce = readJob(root, id, runtime.env).workerAuthorization.nonce;
+  const stateRoot = workspaceState(root, runtime.env);
+  const marker = path.join(stateRoot, "jobs", `${id}.cancel`);
+
+  const canceling = spawnCompanion(["cancel", id, "--json"], { cwd: root, env: runtime.env });
+  await waitFor(() => fs.existsSync(marker), { timeoutMs: 5000 });
+  assert.equal(fs.readFileSync(marker, "utf8"), `${nonce}\n`);
+
+  updateJob(root, id, (job) => ({
+    ...job,
+    status: "cancelled",
+    phase: "cancelled",
+    completedAt: new Date().toISOString(),
+    error: { code: "E_CANCELLED", message: "cancelled during broker launch window" },
+    summary: "cancelled during broker launch window"
+  }), runtime.env);
+  const completed = await canceling.completed;
+  assert.equal(completed.code, 0, completed.stderr || completed.stdout);
+  assert.equal(JSON.parse(completed.stdout).status, "cancelled");
+});
+
+test("CLI cancel terminalizes only cleanup-proven broker boundaries and retains ambiguous launch states", { timeout: 30_000 }, async () => {
+  const root = fs.realpathSync(initRepo());
+  const runtime = codexBrokerFixture();
+  const stateRoot = workspaceState(root, runtime.env);
+  const cases = [
+    {
+      name: "pending",
+      launch: { providerLaunchPending: true, providerLaunchInFlight: false, providerLaunchOutcome: null },
+      retained: false
+    },
+    {
+      name: "inflight",
+      launch: { providerLaunchPending: false, providerLaunchInFlight: true, providerLaunchOutcome: null },
+      retained: true
+    },
+    {
+      name: "unknown",
+      launch: { providerLaunchPending: false, providerLaunchInFlight: false, providerLaunchOutcome: "unknown" },
+      retained: true
+    },
+    {
+      name: "authorization-only",
+      launch: null,
+      retained: true
+    },
+    {
+      name: "not-launched",
+      launch: { providerLaunchPending: false, providerLaunchInFlight: false, providerLaunchOutcome: "not-launched" },
+      retained: false
+    }
+  ];
+
+  for (const fixture of cases) {
+    const spawned = spawnPendingBrokerJob(root, runtime, `runtime-cancel-settlement-${fixture.name}`);
+    fixture.id = spawned.handle.id;
+    updateJob(root, fixture.id, (job) => {
+      const spawnState = { ...job.request.spawn };
+      if (fixture.launch) Object.assign(spawnState, fixture.launch);
+      else {
+        delete spawnState.providerLaunchPending;
+        delete spawnState.providerLaunchInFlight;
+        delete spawnState.providerLaunchOutcome;
+      }
+      return {
+        ...job,
+        request: { ...job.request, spawn: spawnState }
+      };
+    }, runtime.env);
+    fixture.before = readJob(root, fixture.id, runtime.env);
+    fixture.nonce = fixture.before.workerAuthorization.nonce;
+    fixture.runtimeFile = path.join(stateRoot, "task-homes", fixture.id, ".grok", "auth.json");
+    fs.mkdirSync(path.dirname(fixture.runtimeFile), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(fixture.runtimeFile, `private-${fixture.name}-runtime\n`, { mode: 0o600 });
+  }
+
+  const canceling = cases.map((fixture) => ({
+    fixture,
+    process: spawnCompanion(["cancel", fixture.id, "--json"], { cwd: root, env: runtime.env })
+  }));
+  await waitFor(() => cases.every((fixture) => {
+    const marker = path.join(stateRoot, "jobs", `${fixture.id}.cancel`);
+    return fs.existsSync(marker) && fs.readFileSync(marker, "utf8") === `${fixture.nonce}\n`;
+  }), { timeoutMs: 5000 });
+
+  const outcomes = await Promise.all(canceling.map(async ({ fixture, process: running }) => ({
+    fixture,
+    completed: await running.completed
+  })));
+  for (const { fixture, completed } of outcomes) {
+    assert.equal(completed.code, 0, completed.stderr || completed.stdout);
+    const projected = JSON.parse(completed.stdout);
+    const stored = readJob(root, fixture.id, runtime.env);
+    const marker = path.join(stateRoot, "jobs", `${fixture.id}.cancel`);
+    assert.equal(fs.readFileSync(marker, "utf8"), `${fixture.nonce}\n`);
+
+    if (!fixture.retained) {
+      assert.equal(projected.status, "cancelled");
+      assert.equal(stored.status, "cancelled");
+      assert.equal(stored.result?.taskRuntimeCleaned, true);
+      assert.equal(fs.existsSync(fixture.runtimeFile), false, "explicit not-launched runtime must be cleaned");
+      continue;
+    }
+
+    assert.equal(projected.status, "queued");
+    assert.equal(projected.phase, "cancellation-requested");
+    assert.equal(stored.status, "queued");
+    assert.equal(stored.phase, "cancellation-requested");
+    assert.equal(stored.completedAt, null);
+    assert.deepEqual(stored.request, fixture.before.request, `${fixture.name} launch state must remain intact`);
+    assert.deepEqual(stored.workerAuthorization, fixture.before.workerAuthorization);
+    assert.equal(
+      stored.lifecycleEvents.length,
+      fixture.before.lifecycleEvents.length + 1,
+      `${fixture.name} must append exactly one durable cancellation event`
+    );
+    assert.equal(stored.lifecycleEvents.at(-1).type, "cancellation.requested");
+    assert.equal(stored.error, null);
+    assert.equal(stored.result?.taskRuntimeCleaned, undefined);
+    assert.equal(fs.existsSync(fixture.runtimeFile), true, `${fixture.name} runtime must be retained`);
+    assert.doesNotMatch(stored.error?.message || "", new RegExp(fixture.id));
+    assert.doesNotMatch(stored.error?.message || "", new RegExp(fixture.nonce));
+    assert.doesNotMatch(completed.stdout, new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.doesNotMatch(completed.stderr, new RegExp(fixture.nonce));
+  }
+});
+
 test("cancel during worker launch window uses workerAuthorization when workerProcess is null", async () => {
   // Launch window: startJob persists workerAuthorization before workerProcess exists.
   // requestCancel must use that authenticated nonce rather than throwing E_PROCESS_IDENTITY.
@@ -971,7 +1363,7 @@ test("force-cancel uses provider guard when providerProcess is missing", { skip:
     updatedAt: stamped,
     completedAt: null,
     workerAuthorization: workerNonce,
-    workerProcess: null,
+    workerProcess: { pid: 999999992, startToken: "dead-worker-token", nonce: workerNonce, processGroupId: 999999992, commandMarker: id },
     providerProcess: null,
     profile: { id: "review", transport: "headless" },
     model: null,
@@ -1030,7 +1422,7 @@ test("force-cancel successful home cleanup clears prior privacy warning", { skip
     updatedAt: stamped,
     completedAt: null,
     workerAuthorization: workerNonce,
-    workerProcess: null,
+    workerProcess: { pid: 999999991, startToken: "dead-worker-token", nonce: workerNonce, processGroupId: 999999991, commandMarker: id },
     providerProcess: null,
     profile: { id: "review", transport: "headless" },
     model: null,
@@ -1096,7 +1488,7 @@ test("force-cancel failed home cleanup appends privacyWarning without erasing pr
     updatedAt: stamped,
     completedAt: null,
     workerAuthorization: workerNonce,
-    workerProcess: null,
+    workerProcess: { pid: 999999993, startToken: "dead-worker-token", nonce: workerNonce, processGroupId: 999999993, commandMarker: id },
     providerProcess: null,
     profile: { id: "review", transport: "headless" },
     model: null,
@@ -1176,7 +1568,7 @@ test("force-cancel preserves guard and home when guard identity is live/unverifi
     updatedAt: stamped,
     completedAt: null,
     workerAuthorization: workerNonce,
-    workerProcess: null,
+    workerProcess: { pid: 999999990, startToken: "dead-worker-token", nonce: workerNonce, processGroupId: 999999990, commandMarker: id },
     providerProcess: null,
     profile: { id: "review", transport: "headless" },
     model: null,
@@ -1635,21 +2027,32 @@ test("a foreground caller returns the recovered worker-crash failure", { skip: p
     }, { timeoutMs: 10000 });
     process.kill(running.workerProcess.pid, "SIGKILL");
 
-    const recovered = await waitFor(() => {
-      const status = runCompanion(["status", running.id, "--json"], { cwd: root, env });
-      if (status.status !== 0) return false;
-      const job = JSON.parse(status.stdout);
-      return job.status === "failed" ? job : false;
-    }, { timeoutMs: 15000 });
-    assert.equal(recovered.error.code, "E_WORKER_LOST");
-
-    const completed = await Promise.race([
-      foreground.completed,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("Foreground caller did not observe recovered worker failure.")), 10000))
-    ]);
+    let completionTimer;
+    let completed;
+    try {
+      completed = await Promise.race([
+        foreground.completed,
+        new Promise((_, reject) => {
+          completionTimer = setTimeout(
+            () => reject(new Error("Foreground caller did not observe recovered worker failure.")),
+            25000
+          );
+        })
+      ]);
+    } finally {
+      clearTimeout(completionTimer);
+    }
+    assert.equal(completed.signal, null);
     assert.notEqual(completed.code, 0, completed.stdout);
-    const error = JSON.parse(completed.stdout).error;
-    assert.equal(error.code, "E_WORKER_LOST");
+    const payload = JSON.parse(completed.stdout);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.error.code, "E_WORKER_LOST");
+    const recovered = persistedJob(pluginData, running.id);
+    assert.equal(recovered.id, running.id);
+    assert.equal(recovered.status, "failed");
+    assert.equal(recovered.phase, "failed");
+    assert.equal(recovered.error.code, "E_WORKER_LOST");
+    assert.ok(recovered.completedAt);
     assert.ok(readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length <= 1, "crashed foreground prompt was replayed");
   } finally {
     if (foreground.child.exitCode == null && foreground.child.signalCode == null) foreground.child.kill("SIGKILL");
@@ -2163,7 +2566,7 @@ test("transfer waits for import readiness delay then succeeds", () => {
   const sessionId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   const { root, source, env, fake } = transferFixture({
     importSessionId: sessionId,
-    importReadyAfterMs: 150
+    importReadyAfterPolls: 2
   });
   const imported = parseJson(runCompanion(["transfer", "--source", source, "--json"], {
     cwd: root,

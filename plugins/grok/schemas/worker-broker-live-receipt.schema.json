@@ -1,0 +1,393 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xliberty2008x/grok-plugin/schemas/worker-broker-live-receipt.schema.json",
+  "title": "Worker Broker Live Qualification Receipt",
+  "description": "Immutable bounded live-qualification receipt v1 for strict offline structural and source-bound integrity replay. Offline validation cannot authenticate historical origin against manual JSON authorship without a protected signature or external immutable anchor. No supported receipt mint or publication API exists until a future fixed runner derives the cache root from verified installation output, capabilities from the setup receipt and tools/list, binary digests from launched files, natural identity from trusted host events, and invocation/replay counts from code-observed private installed state rather than public provider-start or session-created events.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "producerId",
+    "producerVersion",
+    "manifestDigest",
+    "authorityMode",
+    "phase",
+    "pluginVersion",
+    "headCommit",
+    "headTree",
+    "sourceInventoryDigest",
+    "phaseScopeDigest",
+    "repositoryBeforeDigest",
+    "repositoryAfterDigest",
+    "sourcePluginInventoryDigest",
+    "installedPluginInventoryDigest",
+    "installedFileCount",
+    "installedEntrypointDigest",
+    "providerCapabilityDigest",
+    "observedToolIds",
+    "providerBinaryDigest",
+    "providerVersion",
+    "providerRevision",
+    "mcpProtocolVersion",
+    "codexBinaryDigest",
+    "codexVersion",
+    "codexModel",
+    "hostTaskDigest",
+    "installationMethod",
+    "scenarios",
+    "outcome",
+    "startedAt",
+    "endedAt",
+    "receiptDigest"
+  ],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "producerId": {
+      "type": "string",
+      "const": "worker-broker-live-receipt-runner"
+    },
+    "producerVersion": { "type": "integer", "const": 1 },
+    "manifestDigest": {
+      "type": "string",
+      "const": "aee11910fb0ff30ac4d7475fbd29c79cc07fed679e037b602d383a94e7694833"
+    },
+    "authorityMode": {
+      "type": "string",
+      "enum": ["synthetic-direct-mcp", "natural-codex-host"]
+    },
+    "phase": { "type": "string", "enum": ["1", "4"] },
+    "pluginVersion": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$"
+    },
+    "headCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "headTree": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sourceInventoryDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "phaseScopeDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "repositoryBeforeDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "repositoryAfterDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sourcePluginInventoryDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "installedPluginInventoryDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "installedFileCount": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096
+    },
+    "installedEntrypointDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "providerCapabilityDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "observedToolIds": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 9,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "worker_list_owned",
+          "worker_get",
+          "worker_events_after",
+          "worker_wait",
+          "worker_result",
+          "worker_spawn",
+          "worker_decide_host_action",
+          "worker_followup",
+          "worker_cancel"
+        ]
+      }
+    },
+    "providerBinaryDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "providerVersion": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$"
+    },
+    "providerRevision": {
+      "type": "string",
+      "pattern": "^binary-sha256-[0-9a-f]{64}$",
+      "description": "The runtime validator additionally requires the suffix to equal providerBinaryDigest exactly (binary-sha256-v1)."
+    },
+    "mcpProtocolVersion": {
+      "type": "string",
+      "const": "2025-11-25"
+    },
+    "codexBinaryDigest": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "codexVersion": {
+      "type": ["string", "null"],
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$"
+    },
+    "codexModel": {
+      "type": ["string", "null"],
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$"
+    },
+    "hostTaskDigest": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Digest of the bounded host authority context; never a raw task or thread identifier."
+    },
+    "installationMethod": {
+      "type": "string",
+      "enum": ["codex-local-plugin-cache", "exact-source-plugin-install"]
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "spawnInvocationCount",
+          "spawnReplayCount",
+          "providerLaunchCount",
+          "providerTerminalCount",
+          "workerTerminalCount",
+          "resultReadCount",
+          "reconnectCount",
+          "cancelInvocationCount",
+          "cancelReplayCount",
+          "uniqueCancelRequestCount",
+          "cancellationEventCount",
+          "duplicateLaunchCount",
+          "workerHostVerification",
+          "processGroupGone",
+          "taskRuntimeCleaned",
+          "runnerTemporaryArtifactsRemoved",
+          "qualificationSessionDeleted"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "authenticated-completion",
+              "mcp-restart-reconnect-cancellation",
+              "natural-codex-installed-host"
+            ]
+          },
+          "spawnInvocationCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 8,
+            "description": "Code-observed worker_spawn invocations, including idempotent replays."
+          },
+          "spawnReplayCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 8,
+            "description": "Code-observed worker_spawn invocations resolved as replays without a new provider launch."
+          },
+          "providerLaunchCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 8,
+            "description": "Unique provider generations launched by the runner/private installed state."
+          },
+          "providerTerminalCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 8,
+            "description": "Unique launched provider generations whose captured process group is later observed gone by the runner/private installed state; never inferred from public provider-start or session-created events."
+          },
+          "workerTerminalCount": { "type": "integer", "minimum": 0, "maximum": 8 },
+          "resultReadCount": { "type": "integer", "minimum": 0, "maximum": 8 },
+          "reconnectCount": { "type": "integer", "minimum": 0, "maximum": 8 },
+          "cancelInvocationCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 8,
+            "description": "Code-observed worker_cancel invocations, including idempotent replays."
+          },
+          "cancelReplayCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 8,
+            "description": "Code-observed worker_cancel invocations resolved as replays."
+          },
+          "uniqueCancelRequestCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 8,
+            "description": "Unique cancellation requests admitted after replay collapse."
+          },
+          "cancellationEventCount": { "type": "integer", "minimum": 0, "maximum": 8 },
+          "duplicateLaunchCount": { "type": "integer", "minimum": 0, "maximum": 8 },
+          "workerHostVerification": { "type": "string", "const": "not_run" },
+          "processGroupGone": { "type": "boolean" },
+          "taskRuntimeCleaned": { "type": "boolean" },
+          "runnerTemporaryArtifactsRemoved": { "type": "boolean" },
+          "qualificationSessionDeleted": { "type": "boolean" }
+        }
+      }
+    },
+    "outcome": { "type": "string", "const": "pass" },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "endedAt": { "type": "string", "format": "date-time" },
+    "receiptDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of the canonical receipt body excluding this field."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "authorityMode": { "const": "synthetic-direct-mcp" } },
+        "required": ["authorityMode"]
+      },
+      "then": {
+        "properties": {
+          "phase": { "const": "1" },
+          "codexBinaryDigest": { "type": "null" },
+          "codexVersion": { "type": "null" },
+          "codexModel": { "type": "null" },
+          "hostTaskDigest": { "type": "null" },
+          "observedToolIds": {
+            "const": [
+              "worker_list_owned",
+              "worker_get",
+              "worker_events_after",
+              "worker_wait",
+              "worker_result",
+              "worker_spawn",
+              "worker_decide_host_action",
+              "worker_followup",
+              "worker_cancel"
+            ]
+          },
+          "installationMethod": {
+            "enum": ["codex-local-plugin-cache", "exact-source-plugin-install"]
+          },
+          "scenarios": {
+            "const": [
+              {
+                "id": "authenticated-completion",
+                "spawnInvocationCount": 1,
+                "spawnReplayCount": 0,
+                "providerLaunchCount": 1,
+                "providerTerminalCount": 1,
+                "workerTerminalCount": 1,
+                "resultReadCount": 1,
+                "reconnectCount": 0,
+                "cancelInvocationCount": 0,
+                "cancelReplayCount": 0,
+                "uniqueCancelRequestCount": 0,
+                "cancellationEventCount": 0,
+                "duplicateLaunchCount": 0,
+                "workerHostVerification": "not_run",
+                "processGroupGone": true,
+                "taskRuntimeCleaned": true,
+                "runnerTemporaryArtifactsRemoved": true,
+                "qualificationSessionDeleted": true
+              },
+              {
+                "id": "mcp-restart-reconnect-cancellation",
+                "spawnInvocationCount": 2,
+                "spawnReplayCount": 1,
+                "providerLaunchCount": 1,
+                "providerTerminalCount": 1,
+                "workerTerminalCount": 1,
+                "resultReadCount": 1,
+                "reconnectCount": 1,
+                "cancelInvocationCount": 2,
+                "cancelReplayCount": 1,
+                "uniqueCancelRequestCount": 1,
+                "cancellationEventCount": 1,
+                "duplicateLaunchCount": 0,
+                "workerHostVerification": "not_run",
+                "processGroupGone": true,
+                "taskRuntimeCleaned": true,
+                "runnerTemporaryArtifactsRemoved": true,
+                "qualificationSessionDeleted": true
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "authorityMode": { "const": "natural-codex-host" } },
+        "required": ["authorityMode"]
+      },
+      "then": {
+        "properties": {
+          "phase": { "const": "4" },
+          "installationMethod": { "const": "codex-local-plugin-cache" },
+          "codexBinaryDigest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "codexVersion": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$"
+          },
+          "hostTaskDigest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "observedToolIds": {
+            "const": [
+              "worker_list_owned",
+              "worker_spawn",
+              "worker_wait",
+              "worker_result"
+            ]
+          },
+          "scenarios": {
+            "const": [
+              {
+                "id": "natural-codex-installed-host",
+                "spawnInvocationCount": 1,
+                "spawnReplayCount": 0,
+                "providerLaunchCount": 1,
+                "providerTerminalCount": 1,
+                "workerTerminalCount": 1,
+                "resultReadCount": 1,
+                "reconnectCount": 0,
+                "cancelInvocationCount": 0,
+                "cancelReplayCount": 0,
+                "uniqueCancelRequestCount": 0,
+                "cancellationEventCount": 0,
+                "duplicateLaunchCount": 0,
+                "workerHostVerification": "not_run",
+                "processGroupGone": true,
+                "taskRuntimeCleaned": true,
+                "runnerTemporaryArtifactsRemoved": true,
+                "qualificationSessionDeleted": true
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

@@ -4,6 +4,15 @@ import path from "node:path";
 import { CompanionError } from "./errors.mjs";
 import { git } from "./workspace.mjs";
 import { redact, redactText, sanitizeDisplayText } from "./redact.mjs";
+import {
+  MAX_CONTEXT_CONSTRAINTS,
+  MAX_CONTEXT_CONSTRAINT_CHARS,
+  MAX_CONTEXT_FACTS,
+  MAX_CONTEXT_FACT_CHARS,
+  composeEffectiveProviderPrompt,
+  validateExplicitContextItems
+} from "./worker-context.mjs";
+import { validateProviderHostActionRequest } from "./worker-host-actions.mjs";
 
 const timestamp = () => new Date().toISOString();
 
@@ -17,9 +26,11 @@ export const LIFECYCLE_EVENT_TYPES = Object.freeze([
   "activity.completed",
   "checkpoint",
   "blocked",
-  "final.report"
+  "final.report",
+  "cancellation.requested"
 ]);
-const MAX_LIFECYCLE_EVENTS = 128;
+/** Bounded retention for durable lifecycle evidence (oldest entries are dropped first). */
+export const MAX_LIFECYCLE_EVENTS = 128;
 const MAX_TEXT = 16 * 1024;
 const MAX_USER_REQUEST = 64 * 1024;
 const MAX_LIST = 64;
@@ -41,9 +52,87 @@ const TASK_ENVELOPE_INPUT_KEYS = new Set([
   "requiredVerification",
   "expectedReturnFormat"
 ]);
+const TASK_ENVELOPE_KEYS = new Set([
+  "schemaVersion",
+  "userRequest",
+  "objective",
+  "mode",
+  "scope",
+  "context",
+  "nonGoals",
+  "acceptanceCriteria",
+  "requiredVerification",
+  "expectedReturnFormat",
+  "contextManifestId",
+  "envelopeId",
+  "digest"
+]);
 
 function sha(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+const SHA256_HEX = /^[a-f0-9]{64}$/;
+const CONTEXT_MANIFEST_ID = /^ctx-[a-f0-9]{24}$/;
+
+function retainedTextDigest(literal, existingDigest) {
+  if (typeof literal === "string") return sha(literal);
+  return SHA256_HEX.test(existingDigest || "") ? existingDigest : null;
+}
+
+/**
+ * Remove raw provider/request text before a job record is durably retained.
+ *
+ * Literal text is authoritative when present: its digest replaces any stale or
+ * forged pre-existing digest. Without a literal, only a well-formed SHA-256
+ * witness is retained. A default objective is another copy of userRequest, so
+ * replace it with the same digest; a distinct caller-supplied objective remains
+ * available as the bounded public task description.
+ */
+export function scrubStoredRequest(request) {
+  if (!request || typeof request !== "object" || Array.isArray(request)) return null;
+
+  const prompt = typeof request.prompt === "string" ? request.prompt : null;
+  const envelope = request.envelope && typeof request.envelope === "object" && !Array.isArray(request.envelope)
+    ? request.envelope
+    : null;
+  const userRequest = typeof envelope?.userRequest === "string" ? envelope.userRequest : null;
+  const userRequestDigest = retainedTextDigest(userRequest, envelope?.userRequestDigest);
+  const defaultObjective = userRequest !== null && envelope?.objective === userRequest;
+  const duplicatePublicObjective = userRequest !== null && request.publicObjective === userRequest;
+
+  return {
+    ...request,
+    prompt: null,
+    promptDigest: retainedTextDigest(prompt, request.promptDigest),
+    ...(duplicatePublicObjective ? { publicObjective: null } : {}),
+    envelope: envelope ? {
+      ...envelope,
+      userRequest: null,
+      userRequestDigest,
+      ...(defaultObjective ? { objective: userRequestDigest } : {})
+    } : null
+  };
+}
+
+/** Normalize the request and any title derived from its default objective. */
+export function scrubStoredJob(job) {
+  if (!job || typeof job !== "object" || Array.isArray(job)) return null;
+  const userRequest = typeof job.request?.envelope?.userRequest === "string"
+    ? job.request.envelope.userRequest
+    : null;
+  const defaultTitle = userRequest !== null
+    && typeof job.title === "string"
+    && job.title === userRequest.slice(0, 100);
+  const request = scrubStoredRequest(job.request);
+  const digest = request?.envelope?.userRequestDigest;
+  return {
+    ...job,
+    request,
+    ...(defaultTitle && SHA256_HEX.test(digest || "")
+      ? { title: `task:${digest.slice(0, 24)}` }
+      : {})
+  };
 }
 
 function clip(value, limit = MAX_TEXT) {
@@ -133,6 +222,8 @@ export function buildTaskEnvelope({
   contextManifestId = null
 } = {}) {
   const request = boundedLiteral(userRequest, "userRequest");
+  const resolvedObjective = clip(String(objective ?? request).trim() || request);
+  const defaultObjective = objective == null ? resolvedObjective : null;
   const resolvedMode = mode === "write" ? "write" : "read";
   const criteria = normalizeAcceptance(
     acceptanceCriteria?.length
@@ -144,18 +235,48 @@ export function buildTaskEnvelope({
     if (acceptanceIds.has(criterion.id)) throw new CompanionError("E_USAGE", `Duplicate acceptance criterion ID ${criterion.id}.`);
     acceptanceIds.add(criterion.id);
   }
+  const explicitFacts = validateExplicitContextItems(
+    context?.facts ?? contextFacts,
+    {
+      name: "context.facts",
+      maxItems: MAX_CONTEXT_FACTS,
+      maxChars: MAX_CONTEXT_FACT_CHARS
+    }
+  );
+  const explicitConstraints = validateExplicitContextItems(
+    context?.constraints ?? constraints,
+    {
+      name: "context.constraints",
+      maxItems: MAX_CONTEXT_CONSTRAINTS,
+      maxChars: MAX_CONTEXT_CONSTRAINT_CHARS
+    }
+  );
+  for (const [name, items] of [
+    ["context.facts", explicitFacts],
+    ["context.constraints", explicitConstraints]
+  ]) {
+    const duplicate = items.findIndex((item) => (
+      item === request || (defaultObjective !== null && item === defaultObjective)
+    ));
+    if (duplicate >= 0) {
+      throw new CompanionError(
+        "E_POLICY",
+        `${name}[${duplicate}] duplicates the literal user request/default objective.`
+      );
+    }
+  }
   const envelope = {
     schemaVersion: TASK_ENVELOPE_VERSION,
     userRequest: request,
-    objective: clip(String(objective ?? request).trim() || request),
+    objective: resolvedObjective,
     mode: resolvedMode,
     scope: {
       include: asStringList(scope?.include),
       exclude: asStringList(scope?.exclude)
     },
     context: {
-      facts: asStringList(context?.facts ?? contextFacts),
-      constraints: asStringList(context?.constraints ?? constraints),
+      facts: explicitFacts,
+      constraints: explicitConstraints,
       expectedProjectMarkers: asStringList(context?.expectedProjectMarkers, { max: 32 }),
       requiredPaths: asRepositoryPathList(context?.requiredPaths, "context.requiredPaths"),
       workspaceState: ["complete", "task_scoped", "unknown"].includes(context?.workspaceState)
@@ -178,6 +299,75 @@ export function buildTaskEnvelope({
     envelopeId: `env-${digest.slice(0, 24)}`,
     digest
   };
+}
+
+function taskEnvelopeSchemaError() {
+  return new CompanionError(
+    "E_SCHEMA",
+    "TaskEnvelope does not match its canonical versioned contract."
+  );
+}
+
+function taskEnvelopeBuilderInput(envelope, contextManifestId = envelope?.contextManifestId ?? null) {
+  return {
+    userRequest: envelope.userRequest,
+    objective: envelope.objective,
+    mode: envelope.mode,
+    scope: envelope.scope,
+    context: envelope.context,
+    nonGoals: envelope.nonGoals,
+    acceptanceCriteria: envelope.acceptanceCriteria,
+    requiredVerification: envelope.requiredVerification,
+    expectedReturnFormat: envelope.expectedReturnFormat,
+    contextManifestId
+  };
+}
+
+/**
+ * Validate an executable TaskEnvelope before it enters durable launch state.
+ *
+ * Canonically rebuilding the envelope enforces the same key, type, bound,
+ * normalization, digest, and envelope-id contract used by the sole builder.
+ * Privacy-scrubbed durable envelopes are deliberately not accepted here: this
+ * boundary is for a new executable request while its literal text is present.
+ */
+export function assertTaskEnvelope(envelope) {
+  try {
+    if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+      throw taskEnvelopeSchemaError();
+    }
+    const keys = Object.keys(envelope);
+    if (keys.length !== TASK_ENVELOPE_KEYS.size
+      || keys.some((key) => !TASK_ENVELOPE_KEYS.has(key))
+      || envelope.schemaVersion !== TASK_ENVELOPE_VERSION
+      || typeof envelope.userRequest !== "string"
+      || typeof envelope.objective !== "string"
+      || !["read", "write"].includes(envelope.mode)
+      || (envelope.contextManifestId !== null
+        && !CONTEXT_MANIFEST_ID.test(envelope.contextManifestId || ""))
+      || typeof envelope.expectedReturnFormat !== "string"
+      || !/^env-[a-f0-9]{24}$/.test(envelope.envelopeId || "")
+      || !SHA256_HEX.test(envelope.digest || "")) {
+      throw taskEnvelopeSchemaError();
+    }
+    const rebuilt = buildTaskEnvelope(taskEnvelopeBuilderInput(envelope));
+    if (canonicalJson(envelope) !== canonicalJson(rebuilt)) {
+      throw taskEnvelopeSchemaError();
+    }
+    return envelope;
+  } catch (error) {
+    if (error instanceof CompanionError && error.code === "E_SCHEMA") throw error;
+    throw taskEnvelopeSchemaError();
+  }
+}
+
+/** Rebuild a validated envelope after binding the trusted context identity. */
+export function bindTaskEnvelopeContext(envelope, contextManifestId) {
+  const validated = assertTaskEnvelope(envelope);
+  if (typeof contextManifestId !== "string" || !contextManifestId) {
+    throw taskEnvelopeSchemaError();
+  }
+  return buildTaskEnvelope(taskEnvelopeBuilderInput(validated, contextManifestId));
 }
 
 /** Parse and validate the bounded JSON object accepted by --envelope-stdin. */
@@ -679,15 +869,57 @@ export function assertContextCompatible(root, expected, { mode = "execute" } = {
   return current;
 }
 
+/**
+ * Assign strictly increasing integer sequences to lifecycle events.
+ * Legacy entries without a sequence receive deterministic 1..n values in array order.
+ * Existing valid sequences are preserved when they remain strictly increasing.
+ */
+export function normalizeLifecycleEventSequences(events) {
+  if (!Array.isArray(events) || events.length === 0) return [];
+  let lastSequence = 0;
+  return events.map((event) => {
+    const base = event && typeof event === "object" && !Array.isArray(event)
+      ? { ...event }
+      : { type: "checkpoint", at: null, summary: "" };
+    const provided = base.sequence;
+    let sequence;
+    if (Number.isSafeInteger(provided) && provided > lastSequence) {
+      sequence = provided;
+    } else {
+      if (lastSequence >= Number.MAX_SAFE_INTEGER) {
+        throw new CompanionError("E_STATE", "Lifecycle event sequence space is exhausted.");
+      }
+      sequence = lastSequence + 1;
+    }
+    lastSequence = sequence;
+    return { ...base, sequence };
+  });
+}
+
+/**
+ * Append a typed lifecycle event with a durable monotonic sequence number.
+ * Retention keeps the newest MAX_LIFECYCLE_EVENTS entries; sequences of retained
+ * events are unchanged so cursors survive normal append/restart behavior.
+ */
 export function appendLifecycleEvent(events, type, summary, detail = undefined) {
   if (!LIFECYCLE_EVENT_TYPES.includes(type)) {
     throw new CompanionError("E_STATE", `Unknown lifecycle event type ${type}.`);
   }
-  const list = Array.isArray(events) ? events.slice(-MAX_LIFECYCLE_EVENTS + 1) : [];
+  const normalized = normalizeLifecycleEventSequences(Array.isArray(events) ? events : []);
+  const list = normalized.length >= MAX_LIFECYCLE_EVENTS
+    ? normalized.slice(-(MAX_LIFECYCLE_EVENTS - 1))
+    : normalized.slice();
+  const lastSequence = list.length
+    ? list[list.length - 1].sequence
+    : (normalized.length ? normalized[normalized.length - 1].sequence : 0);
+  if (lastSequence >= Number.MAX_SAFE_INTEGER) {
+    throw new CompanionError("E_STATE", "Lifecycle event sequence space is exhausted.");
+  }
   const entry = {
     type,
     at: timestamp(),
-    summary: clip(redactText(summary || type), 500)
+    summary: clip(redactText(summary || type), 500),
+    sequence: lastSequence + 1
   };
   if (detail !== undefined) entry.detail = redact(boundLifecycleDetail(detail));
   list.push(entry);
@@ -726,13 +958,14 @@ export function buildWorkerReport({
   acceptanceResults = null,
   risks = null,
   questions = null,
+  hostActionRequest = undefined,
   acceptanceCriteria = []
 } = {}) {
   const parsedReport = parseStructuredWorkerPayload(providerText);
   const parsed = parsedReport?.value || null;
   const text = clip(String(providerText || "").trim());
   const requiredFields = ["outcome", "summary", "changedFiles", "checksClaimed", "acceptanceResults", "risks", "questions"];
-  const allowedFields = new Set(requiredFields);
+  const allowedFields = new Set([...requiredFields, "hostActionRequest"]);
   const shapeIssues = [];
   if (parsed) {
     for (const field of requiredFields) if (!Object.hasOwn(parsed, field)) shapeIssues.push(`Structured worker report omitted ${field}.`);
@@ -755,12 +988,23 @@ export function buildWorkerReport({
   const questionsList = asStringList(questions ?? parsed?.questions);
   const criteria = Array.isArray(acceptanceCriteria) ? acceptanceCriteria : [];
   const normalizedAcceptance = normalizeAcceptanceResults(acceptanceResults ?? parsed?.acceptanceResults, criteria);
+  const hostActionPresent = hostActionRequest !== undefined
+    || Boolean(parsed && Object.hasOwn(parsed, "hostActionRequest"));
+  const normalizedHostAction = validateProviderHostActionRequest(
+    hostActionRequest !== undefined ? hostActionRequest : parsed?.hostActionRequest,
+    { present: hostActionPresent }
+  );
   const requestedOutcome = ["complete", "partial", "blocked"].includes(outcome)
     ? outcome
     : ["complete", "partial", "blocked"].includes(parsed?.outcome)
       ? parsed.outcome
       : null;
-  const validationIssues = [...shapeIssues, ...normalizedPaths.issues, ...normalizedAcceptance.issues];
+  const validationIssues = [
+    ...shapeIssues,
+    ...normalizedPaths.issues,
+    ...normalizedAcceptance.issues,
+    ...normalizedHostAction.issues
+  ];
   if (parsed && !requestedOutcome) validationIssues.push("Structured worker report omitted a valid outcome.");
   if (!parsed) validationIssues.push("Provider did not return a GROK_WORKER_REPORT JSON object.");
   else if (!parsedReport.markerPresent) validationIssues.push("Provider returned JSON without the required GROK_WORKER_REPORT marker.");
@@ -776,11 +1020,14 @@ export function buildWorkerReport({
     acceptanceResults: normalizedAcceptance.results,
     risks: risksList,
     questions: questionsList,
+    ...(hostActionPresent && normalizedHostAction.ok
+      ? { hostActionRequest: normalizedHostAction.value }
+      : {}),
     validationIssues
   };
 }
 
-/** Build one same-session, no-tool repair turn for a malformed final worker report. */
+/** Build one same-session, no-tool-use repair turn for a malformed final worker report. */
 export function composeWorkerReportRepairPrompt(envelope, report) {
   const criteria = Array.isArray(envelope?.acceptanceCriteria) ? envelope.acceptanceCriteria : [];
   const acceptanceTemplate = criteria.map((criterion) => ({
@@ -795,7 +1042,8 @@ export function composeWorkerReportRepairPrompt(envelope, report) {
     checksClaimed: ["only checks actually run with available tools"],
     acceptanceResults: acceptanceTemplate,
     risks: ["remaining risk"],
-    questions: ["blocking question"]
+    questions: ["blocking question"],
+    hostActionRequest: null
   };
   const issues = asStringList(report?.validationIssues, { max: 20 });
   return [
@@ -803,7 +1051,7 @@ export function composeWorkerReportRepairPrompt(envelope, report) {
     "Do not call tools, inspect files, modify the workspace, or repeat implementation.",
     `The previous report was invalid: ${issues.join("; ") || "required report marker/schema missing"}.`,
     "Return exactly one line. It must begin with GROK_WORKER_REPORT: followed immediately by one JSON object.",
-    "Use exactly the seven keys shown below, no Markdown fence, no prose before or after, and exactly one acceptance result for every supplied ID. Choose outcome from complete, partial, or blocked; choose each status from met, unmet, or unknown.",
+    "Use exactly the eight keys shown below, no Markdown fence, no prose before or after, and exactly one acceptance result for every supplied ID. Choose outcome from complete, partial, or blocked; choose each status from met, unmet, or unknown. hostActionRequest must be null unless the worker is requesting one future read-only role admission.",
     `GROK_WORKER_REPORT: ${JSON.stringify(template)}`
   ].join("\n");
 }
@@ -1135,7 +1383,28 @@ function observeIgnoredDrift(preGit, postGit, changed, { observer }) {
 /**
  * Compose the provider prompt from a TaskEnvelope without putting envelope JSON on argv.
  */
-export function composeProviderPrompt(envelope, { root, constraints = null, contextManifest = null } = {}) {
+export function composeProviderPrompt(envelope, {
+  root,
+  constraints = null,
+  contextManifest = null,
+  contextPacket = null,
+  runtimeRolePolicy = null
+} = {}) {
+  if (contextPacket !== null || runtimeRolePolicy !== null) {
+    if (constraints !== null || contextPacket === null || runtimeRolePolicy === null) {
+      throw new CompanionError(
+        "E_STATE",
+        "Receipt-backed provider prompt requires one packet/policy pair and no prompt override."
+      );
+    }
+    return composeEffectiveProviderPrompt({
+      envelope,
+      contextPacket,
+      rolePolicy: runtimeRolePolicy,
+      contextManifest,
+      root
+    });
+  }
   const context = envelope.context || { facts: [], constraints: [], expectedProjectMarkers: [], requiredPaths: [], workspaceState: "unknown", upstreamFreshness: "not_checked" };
   const facts = Array.isArray(context.facts) ? context.facts : [];
   const hostConstraints = Array.isArray(context.constraints) ? context.constraints : [];

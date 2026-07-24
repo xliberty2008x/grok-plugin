@@ -97,7 +97,8 @@ Status: hardening candidate; not release-qualified.
   progress/heartbeat/lifecycle events, public JSON projection, host-scoped
   explicit job IDs, exact completion/recorded-verification-manifest resume, and
   final `GROK_WORKER_REPORT` validation with one same-session format-repair turn
-  under a checked-in zero-tool profile. A completed second invalid report fails
+  under a checked-in no-workspace profile with only the provider-required
+  plan-state compatibility tool. A completed second invalid report fails
   with `E_SCHEMA`; repair transport/auth/capability failures preserve their
   operational error code. Runtime evidence is separated from provider claims;
   `hostVerification` remains `not_run` until the host records bounded outcomes.
@@ -110,7 +111,7 @@ Status: hardening candidate; not release-qualified.
   post-verification manifest used by that continuation. Empty records, repeated
   reconciliation, out-of-scope drift, and reconciliation during an active writer
   fail closed.
-- Profile contract v3 with `rescue-read-v3`, `rescue-write-v3`, and zero-tool
+- Profile contract v3 with `rescue-read-v3`, `rescue-write-v3`, and no-workspace
   `rescue-report-v3` under **strict**
   sandbox. Write tools are only `GrokBuild:read_file`, `list_dir`, `grep`,
   `search_replace`, and `todo_write` (no terminal, kill_task, get_task_output,

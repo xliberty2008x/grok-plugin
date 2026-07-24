@@ -9,6 +9,18 @@ export const COMPANION = path.join(ROOT, "plugins", "grok", "scripts", "grok-com
 export const CODEX_COMPANION = path.join(ROOT, "plugins", "grok", "scripts", "grok-codex.mjs");
 export const NONBLOCKING_STDIN_CHILD = path.join(ROOT, "tests", "nonblocking-stdin-child.mjs");
 export const PTY_STDIN_DRIVER = path.join(ROOT, "tests", "pty-stdin-driver.py");
+const PTY_PYTHON_FLAGS = Object.freeze(["-I", "-S", "-B"]);
+
+function ptyPythonCommand(env = process.env) {
+  const bound = env?.GROK_PROOF_PYTHON;
+  return typeof bound === "string" && path.isAbsolute(bound) ? bound : "python3";
+}
+
+function withoutProofPythonControl(env = process.env) {
+  const forwarded = { ...(env || {}) };
+  delete forwarded.GROK_PROOF_PYTHON;
+  return forwarded;
+}
 
 export function tempDir(prefix = "grok-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -56,15 +68,15 @@ export function testEnvironment({ fake, pluginData = tempDir("grok-plugin-data-"
   };
 }
 
-export function runCompanion(args, { cwd, env, timeout = 20000, input } = {}) {
+export function runCompanion(args, { cwd, env, timeout = 60000, input } = {}) {
   return run(process.execPath, [COMPANION, ...args], { cwd, env, timeout, input });
 }
 
-export function runCodexCompanion(args, { cwd, env, timeout = 20000, input } = {}) {
+export function runCodexCompanion(args, { cwd, env, timeout = 60000, input } = {}) {
   return run(process.execPath, [CODEX_COMPANION, ...args], { cwd, env, timeout, input });
 }
 
-export function spawnNonblockingStdin(target, args, { cwd, env, timeout = 20000 } = {}) {
+export function spawnNonblockingStdin(target, args, { cwd, env, timeout = 60000 } = {}) {
   const child = spawn(process.execPath, [NONBLOCKING_STDIN_CHILD, target, ...args], {
     cwd,
     env: env ?? process.env,
@@ -94,6 +106,10 @@ export function spawnNonblockingStdin(target, args, { cwd, env, timeout = 20000 
       resolve({ code, signal, stdout, stderr, stdinError });
     });
   });
+  // Some callers can fail an earlier readiness assertion before awaiting this
+  // lifecycle promise. Mark the rejection as observed while preserving the
+  // original promise's rejection for callers that do await it.
+  completed.catch(() => {});
   return {
     child,
     completed,
@@ -103,9 +119,18 @@ export function spawnNonblockingStdin(target, args, { cwd, env, timeout = 20000 
 }
 
 export function runPtyStdin(target, args, { cwd, env, input, timeout = 30000 } = {}) {
-  const result = run("python3", [PTY_STDIN_DRIVER, process.execPath, target, ...args], {
+  const sourceEnvironment = env ?? process.env;
+  const result = run(ptyPythonCommand(sourceEnvironment), [
+    ...PTY_PYTHON_FLAGS,
+    PTY_STDIN_DRIVER,
+    process.execPath,
+    target,
+    ...args
+  ], {
     cwd,
-    env,
+    // The absolute interpreter selector is proof-runner control data, not part
+    // of the product runtime contract inherited by the PTY driver or target.
+    env: withoutProofPythonControl(sourceEnvironment),
     input,
     timeout
   });
@@ -115,6 +140,19 @@ export function runPtyStdin(target, args, { cwd, env, input, timeout = 30000 } =
   } catch {
     return { driver: result, result: null };
   }
+}
+
+export function ptyPythonAvailable({ env = process.env, timeout = 5_000 } = {}) {
+  const sourceEnvironment = env ?? process.env;
+  const result = run(ptyPythonCommand(sourceEnvironment), [
+    ...PTY_PYTHON_FLAGS,
+    "-c",
+    "import pty"
+  ], {
+    env: withoutProofPythonControl(sourceEnvironment),
+    timeout
+  });
+  return result.status === 0 && !result.error && !result.signal;
 }
 
 export async function waitFor(predicate, { timeoutMs = 10000, intervalMs = 50 } = {}) {

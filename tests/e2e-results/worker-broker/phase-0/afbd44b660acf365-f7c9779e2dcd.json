@@ -1,0 +1,171 @@
+{
+  "schemaVersion": 1,
+  "roadmapVersion": "1.0",
+  "recordType": "worker-broker-slice",
+  "issue": "https://github.com/xliberty2008x/grok-plugin/issues/25",
+  "pullRequest": "https://github.com/xliberty2008x/grok-plugin/pull/26",
+  "phase": "0",
+  "slice": "evidence-system",
+  "status": "verified_on_draft",
+  "recordedAt": "2026-07-23T03:39:41.299Z",
+  "releaseQualification": false,
+  "evidenceSystemQualification": true,
+  "provisionalSupportingRecord": false,
+  "qualification": {
+    "deterministic": "pass",
+    "installedHost": "not_run",
+    "provider": "not_run",
+    "release": "not_run"
+  },
+  "source": {
+    "pluginVersion": "0.3.0-dev.1",
+    "foundationCommit": null,
+    "headCommit": "2b39e137c2def0962438f08b626ad5af5bb797dd",
+    "headTree": "134c5c17033c4f329d26d5d95bd2cef5007d5bd9",
+    "sourceInventoryDigest": "afbd44b660acf365a856979b7aa45fff0ec6b34b7297ada4757e952571f3f5e1",
+    "phaseScopeDigest": "1b0033e77a3646d69345933190c24afd15d108869a12540dadf045fc152b1a05",
+    "cleanTreeAtVerification": true,
+    "phaseScopePaths": [
+      ".github/workflows/ci.yml",
+      "package.json",
+      "plugins/grok/schemas/worker-broker-evidence.schema.json",
+      "plugins/grok/scripts/lib/redact.mjs",
+      "scripts/check-deterministic.mjs",
+      "scripts/lib/deterministic-test-runner.mjs",
+      "scripts/lib/frontmatter.mjs",
+      "scripts/lib/static-esm-import-parser.mjs",
+      "scripts/lib/version-policy.mjs",
+      "scripts/lib/worker-broker-evidence.mjs",
+      "scripts/lib/zero-skip-test-reporter.mjs",
+      "scripts/test-deterministic.mjs",
+      "scripts/test-phase1-focused.mjs",
+      "scripts/validate.mjs",
+      "scripts/worker-broker-evidence.mjs",
+      "tests/helpers.mjs",
+      "tests/worker-broker-evidence.test.mjs"
+    ]
+  },
+  "installation": {
+    "method": "source-tree",
+    "sourcePluginInventoryDigest": null,
+    "installedPluginInventoryDigest": null,
+    "installedFileCount": null,
+    "sourceAndInstalledInventoriesEqual": null,
+    "privateInstallPathRecorded": false
+  },
+  "runtime": {
+    "platform": "macOS",
+    "architecture": "arm64",
+    "node": "25.5.0",
+    "git": "2.45.1",
+    "codexStandalone": null,
+    "codexDesktopBundled": null,
+    "grokBuild": null,
+    "grokBuildRevision": null,
+    "mcpProtocolVersion": "2025-11-25"
+  },
+  "prerequisites": [],
+  "verification": [
+    {
+      "gateId": "repository-check",
+      "argv": [
+        "node",
+        "scripts/check-deterministic.mjs"
+      ],
+      "boundary": "source-provider-neutral",
+      "outcome": "pass",
+      "startedAt": "2026-07-23T03:26:47.119Z",
+      "endedAt": "2026-07-23T03:37:26.719Z",
+      "exitCode": 0,
+      "outputDigest": "a10f172e875b5348431cfd09564f2fa94d9dd85da418c1ee91d4be8d8a7e6fa7",
+      "assertions": [
+        "code-owned manifest gate exited successfully",
+        "output was bounded and redacted before digest"
+      ]
+    },
+    {
+      "gateId": "phase-0-focused-tests",
+      "argv": [
+        "node",
+        "--test",
+        "--test-reporter=./scripts/lib/zero-skip-test-reporter.mjs",
+        "tests/worker-broker-evidence.test.mjs"
+      ],
+      "boundary": "focused-source-provider-neutral",
+      "outcome": "pass",
+      "startedAt": "2026-07-23T03:37:26.825Z",
+      "endedAt": "2026-07-23T03:39:41.059Z",
+      "exitCode": 0,
+      "outputDigest": "84cea12f6038c8d93e5939f2d49b36dba20008a1a2d7dcc0fc3dcb05e2582658",
+      "assertions": [
+        "code-owned manifest gate exited successfully",
+        "output was bounded and redacted before digest"
+      ]
+    },
+    {
+      "gateId": "git-diff-check",
+      "argv": [
+        "git",
+        "show",
+        "--check",
+        "--format=",
+        "HEAD"
+      ],
+      "boundary": "source",
+      "outcome": "pass",
+      "startedAt": "2026-07-23T03:39:41.138Z",
+      "endedAt": "2026-07-23T03:39:41.157Z",
+      "exitCode": 0,
+      "outputDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "assertions": [
+        "code-owned manifest gate exited successfully",
+        "output was bounded and redacted before digest"
+      ]
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "phase-0-proof-runner",
+      "boundary": "deterministic",
+      "expected": "all fixed Phase 0 gates pass on one stable clean source identity",
+      "actual": "all fixed gates passed and source identity remained stable",
+      "outcome": "pass"
+    }
+  ],
+  "liveScenarios": [],
+  "ci": null,
+  "authorities": {
+    "workerClaims": "none",
+    "runtimeObservations": "broker-owned bounded Phase 0 gate runner",
+    "hostVerification": "not_run",
+    "independentValidation": "not_run"
+  },
+  "limits": {
+    "residualRisks": [
+      "Installed-host and authenticated-provider qualification remain unproven.",
+      "The local producer assumes reviewed gates and all descendants are quiescent; hostile same-UID races and data retained through open descriptors require a separately privileged supervisor."
+    ],
+    "unsupportedPlatforms": [
+      "windows-proof-producer-cleanup",
+      "windows-provider-execution",
+      "linux-provider-unqualified"
+    ],
+    "invalidationTriggers": [
+      "source inventory change outside evidence-only paths",
+      "phase-scope path change",
+      "proof gate manifest change",
+      "dirty tree when cleanTreeAtVerification claimed"
+    ],
+    "supersededBy": null,
+    "liveQualificationGaps": [
+      "installed natural host proof not run",
+      "authenticated Grok provider proof not run"
+    ]
+  },
+  "proofProducer": {
+    "id": "worker-broker-gate-runner",
+    "version": 2,
+    "manifestDigest": "66426cce37e08f4041ed272bfe6c9400298b9f05e1494b5ebd47747e1f43de8a"
+  },
+  "recordDigest": "f7c9779e2dcd980dcfd4fcd248229a25ba2e7c91677569adbee65ad0dfe55a36"
+}

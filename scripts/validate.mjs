@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -69,6 +70,48 @@ function readJson(relative) {
     problem(`Invalid JSON: ${error.message}`, relative);
     return null;
   }
+}
+
+function staticImportSpecifiers(source, relative) {
+  const id = crypto.createHash("sha256").update(source).digest("hex");
+  try {
+    const stdout = execFileSync(process.execPath, [
+      "--no-warnings",
+      "--experimental-vm-modules",
+      absolute("scripts/lib/static-esm-import-parser.mjs")
+    ], {
+      cwd: ROOT,
+      env: {},
+      input: JSON.stringify({
+        schemaVersion: 1,
+        sources: [{ id, source }]
+      }),
+      encoding: "utf8",
+      timeout: 30_000,
+      maxBuffer: 16 * 1024 * 1024
+    });
+    const payload = JSON.parse(stdout);
+    const result = payload?.schemaVersion === 1
+      && Array.isArray(payload.results)
+      && payload.results.length === 1
+      && payload.results[0]?.id === id
+      && Array.isArray(payload.results[0]?.specifiers)
+      ? payload.results[0].specifiers
+      : null;
+    if (!result || result.some((specifier) => typeof specifier !== "string")) {
+      throw new Error("malformed parser output");
+    }
+    return result;
+  } catch (error) {
+    problem(`Could not parse static imports: ${error.message}`, relative);
+    return null;
+  }
+}
+
+function exactStringSet(actual, expected) {
+  return Array.isArray(actual)
+    && actual.length === expected.length
+    && JSON.stringify([...actual].sort()) === JSON.stringify([...expected].sort());
 }
 
 function walk(relative) {
@@ -224,6 +267,7 @@ if (!versionsOnly) {
     "README.md",
     "SPEC.md",
     "PLAN.md",
+    "WORKER_BROKER_PLAN.md",
     "UPSTREAM.md",
     "package.json",
     "package-lock.json",
@@ -235,17 +279,30 @@ if (!versionsOnly) {
     "scripts/bump-version.mjs",
     "scripts/update-local-codex.mjs",
     "scripts/test-natural-codex.mjs",
+    "scripts/test-installed-worker-mcp.mjs",
+    "scripts/lib/installed-worker-mcp-failure.mjs",
+    "scripts/lib/installed-worker-mcp-setup-boundary.mjs",
+    "scripts/lib/installed-worker-mcp-session-boundary.mjs",
+    "scripts/trusted/worker-broker-review.mjs",
     "tests/live-grok.test.mjs",
     "tests/installed-codex.test.mjs",
+    "tests/installed-worker-mcp-runner.test.mjs",
+    "tests/installed-worker-mcp-setup-boundary.test.mjs",
+    "tests/installed-worker-mcp-session-boundary.test.mjs",
     "tests/natural-codex-output.schema.json",
+    "tests/worker-broker-evidence.test.mjs",
+    "tests/worker-broker-protected-review.test.mjs",
+    "tests/worker-protocol.test.mjs",
     "tests/nonblocking-stdin-child.mjs",
     "tests/pty-ingress.test.mjs",
     "tests/pty-stdin-driver.py",
     "tests/stdin.test.mjs",
     "tests/e2e-results/macos-0.2.99-2026-07-13.json",
+    "tests/e2e-results/worker-broker/phase-1-readonly-dcb78b8.json",
     "tests/windows-neutral.test.mjs",
     "plugins/grok/.claude-plugin/plugin.json",
     "plugins/grok/.codex-plugin/plugin.json",
+    "plugins/grok/.mcp.json",
     "plugins/grok/CHANGELOG.md",
     "plugins/grok/LICENSE",
     "plugins/grok/NOTICE",
@@ -260,8 +317,15 @@ if (!versionsOnly) {
     "plugins/grok/prompts/adversarial-review.md",
     "plugins/grok/prompts/stop-review-gate.md",
     "plugins/grok/schemas/review-output.schema.json",
+    "plugins/grok/schemas/worker-broker-evidence.schema.json",
+    "plugins/grok/schemas/worker-broker-live-receipt.schema.json",
+    "plugins/grok/schemas/worker-broker-review-request.schema.json",
+    "plugins/grok/schemas/worker-broker-review-attestation.schema.json",
+    "plugins/grok/schemas/worker-protocol.schema.json",
     "plugins/grok/scripts/grok-companion.mjs",
     "plugins/grok/scripts/grok-codex.mjs",
+    "plugins/grok/mcp/broker.mjs",
+    "plugins/grok/mcp/server.mjs",
     "plugins/grok/scripts/session-lifecycle-hook.mjs",
     "plugins/grok/scripts/stop-review-gate-hook.mjs",
     "plugins/grok/scripts/lib/process-control.mjs",
@@ -285,7 +349,7 @@ if (!versionsOnly) {
     if (packageJson.type !== "module") problem("The package must use ESM (`type: module`).", "package.json");
     if (packageJson.license !== "Apache-2.0") problem("Package license must be Apache-2.0.", "package.json");
     if (packageJson.engines?.node !== ">=18.18") problem("Node engine must remain >=18.18.", "package.json");
-    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "codex:update-local", "validate", "version:check", "version:bump", "check"]) {
+    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "test:protected-review", "test:installed-worker-mcp", "codex:update-local", "validate", "version:check", "version:bump", "check"]) {
       if (!packageJson.scripts?.[script]) problem(`Missing npm script: ${script}.`, "package.json");
     }
     if (packageJson.scripts?.["test:pty-ingress"] !== "node --test tests/pty-ingress.test.mjs") {
@@ -293,6 +357,19 @@ if (!versionsOnly) {
     }
     if (packageJson.scripts?.["test:installed-codex"] !== "node --test tests/installed-codex.test.mjs") {
       problem("test:installed-codex must execute the installed Codex gate directly.", "package.json");
+    }
+    if (packageJson.scripts?.["test:installed-worker-mcp"] !== "node scripts/test-installed-worker-mcp.mjs") {
+      problem("test:installed-worker-mcp must execute the opt-in installed Worker MCP gate directly.", "package.json");
+    }
+    if (packageJson.scripts?.["test:protected-review"]
+      !== "node --test tests/worker-broker-protected-review.test.mjs") {
+      problem("test:protected-review must execute the external protected-review boundary directly.", "package.json");
+    }
+    if (packageJson.scripts?.["test:deterministic"] !== "node scripts/test-deterministic.mjs") {
+      problem("test:deterministic must execute the zero-skip deterministic runner directly.", "package.json");
+    }
+    if (packageJson.scripts?.check !== "npm run validate && npm run test:deterministic") {
+      problem("check must run validation and the zero-skip deterministic suite.", "package.json");
     }
     if (packageJson.scripts?.["codex:update-local"] !== "node scripts/update-local-codex.mjs") {
       problem("codex:update-local must execute the verified local-cache updater directly.", "package.json");
@@ -355,6 +432,7 @@ if (!versionsOnly) {
   }
   if (codexPluginManifest?.name !== "grok") problem("Codex plugin manifest name must be grok.", "plugins/grok/.codex-plugin/plugin.json");
   if (codexPluginManifest?.skills !== "./skills/") problem("Codex plugin manifest must expose ./skills/.", "plugins/grok/.codex-plugin/plugin.json");
+  if (codexPluginManifest?.mcpServers !== "./.mcp.json") problem("Codex plugin manifest must expose the bundled MCP config.", "plugins/grok/.codex-plugin/plugin.json");
 
   const hooks = readJson("plugins/grok/hooks/hooks.json");
   if (hooks) {
@@ -395,6 +473,448 @@ if (!versionsOnly) {
       if (!schema.required?.includes(field) || !schema.properties?.[field]) problem(`Review schema is missing required field ${field}.`, "plugins/grok/schemas/review-output.schema.json");
     }
     if (schema.properties?.verdict || schema.required?.includes("verdict")) problem("Review schema must not accept a model-controlled verdict; runtime derives it from findings.", "plugins/grok/schemas/review-output.schema.json");
+  }
+
+  const workerEvidenceSchema = readJson("plugins/grok/schemas/worker-broker-evidence.schema.json");
+  if (workerEvidenceSchema) {
+    const file = "plugins/grok/schemas/worker-broker-evidence.schema.json";
+    if (workerEvidenceSchema.$schema !== "https://json-schema.org/draft/2020-12/schema") {
+      problem("Worker Broker evidence schema must use JSON Schema 2020-12.", file);
+    }
+    for (const field of ["phase", "status", "qualification", "source", "verification", "recordDigest"]) {
+      if (!workerEvidenceSchema.required?.includes(field) || !workerEvidenceSchema.properties?.[field]) {
+        problem(`Worker Broker evidence schema is missing required field ${field}.`, file);
+      }
+    }
+    const proofRule = (workerEvidenceSchema.allOf || []).find((rule) => (
+      rule?.then?.required?.includes("proofProducer")
+    ));
+    const proofStatuses = proofRule?.if?.properties?.status?.enum || [];
+    for (const status of ["verified_on_draft", "qualified"]) {
+      if (!proofStatuses.includes(status)) {
+        problem(`Worker Broker evidence schema must require proofProducer for ${status}.`, file);
+      }
+    }
+    const proofProducer = workerEvidenceSchema.properties?.proofProducer;
+    if (proofProducer?.additionalProperties !== false
+      || proofProducer?.properties?.id?.const !== "worker-broker-gate-runner"
+      || proofProducer?.properties?.version?.const !== 3
+      || !proofProducer?.required?.includes("manifestDigest")) {
+      problem("Worker Broker evidence schema must bind exact gate-runner provenance.", file);
+    }
+    const reviewReceipt = workerEvidenceSchema.properties?.independentReviewReceipt;
+    const signedPhaseOnePromotionRule = (workerEvidenceSchema.allOf || []).find((rule) => (
+      rule?.if?.properties?.phase?.const === "1"
+      && rule?.if?.properties?.status?.const === "verified_on_draft"
+      && rule?.then?.required?.includes("independentReviewReceipt")
+      && rule?.then?.properties?.independentReviewReceipt
+        ?.properties?.schemaVersion?.const === 2
+    ));
+    const reviewReceiptV1 = reviewReceipt?.oneOf?.find((candidate) => (
+      candidate?.properties?.schemaVersion?.const === 1
+    ));
+    const reviewReceiptV2 = reviewReceipt?.oneOf?.find((candidate) => (
+      candidate?.properties?.schemaVersion?.const === 2
+    ));
+    const reviewReceiptV2Fields = [
+      "schemaVersion",
+      "producerId",
+      "producerVersion",
+      "reviewRequest",
+      "attestation",
+      "issuer",
+      "keyFingerprint",
+      "receiptDigest"
+    ];
+    const signedReviewReference = workerEvidenceSchema.$defs?.signedReviewReference;
+    if (reviewReceiptV1?.additionalProperties !== false
+      || reviewReceiptV1?.properties?.producerId?.const !== "codex-native-review-runner"
+      || reviewReceiptV1?.properties?.producerVersion?.const !== 1
+      || reviewReceiptV1?.properties?.outcome?.const !== "pass"
+      || reviewReceiptV1?.properties?.unresolvedFindings?.const !== 0
+      || !reviewReceiptV1?.required?.includes("receiptDigest")
+      || reviewReceiptV2?.additionalProperties !== false
+      || reviewReceiptV2?.properties?.producerId?.const
+        !== "worker-broker-protected-review-promoter"
+      || reviewReceiptV2?.properties?.producerVersion?.const !== 1
+      || !exactStringSet(reviewReceiptV2?.required, reviewReceiptV2Fields)
+      || !exactStringSet(
+        Object.keys(reviewReceiptV2?.properties || {}),
+        reviewReceiptV2Fields
+      )
+      || signedReviewReference?.additionalProperties !== false
+      || !exactStringSet(
+        signedReviewReference?.required,
+        ["path", "digest"]
+      )
+      || !exactStringSet(
+        Object.keys(signedReviewReference?.properties || {}),
+        ["path", "digest"]
+      )
+      || signedReviewReference?.properties?.digest?.pattern !== "^[0-9a-f]{64}$"
+      || !signedPhaseOnePromotionRule) {
+      problem("Worker Broker Phase 1 evidence schema must require exact signed review receipt v2 promotion.", file);
+    }
+    if (workerEvidenceSchema.properties?.scenarios?.items?.properties?.measurements?.additionalProperties !== false) {
+      problem("Worker Broker scenario measurements must be a bounded allowlist.", file);
+    }
+    const liveReferences = workerEvidenceSchema.properties?.liveQualificationReceipts;
+    const liveSemanticsRule = (workerEvidenceSchema.allOf || []).find((rule) => (
+      Array.isArray(rule?.if?.anyOf)
+      && rule?.then?.properties?.status?.const === "implemented_unverified"
+      && rule?.then?.properties?.provisionalSupportingRecord?.const === true
+      && rule?.then?.properties?.releaseQualification?.const === false
+      && rule?.then?.properties?.authorities?.properties?.hostVerification?.const === "not_run"
+    ));
+    const aggregateQualificationRule = (workerEvidenceSchema.allOf || []).find((rule) => (
+      rule?.if?.properties?.status?.const === "qualified"
+      && rule?.then?.properties?.phase?.const === "aggregate"
+      && rule?.then?.properties?.recordType?.const === "worker-broker-aggregate"
+      && rule?.then?.properties?.releaseQualification?.const === true
+      && rule?.then?.properties?.provisionalSupportingRecord?.const === false
+      && rule?.then?.properties?.qualification?.properties?.provider?.const === "pass"
+      && rule?.then?.properties?.qualification?.properties?.installedHost?.const === "pass"
+      && rule?.then?.properties?.qualification?.properties?.release?.const === "pass"
+      && rule?.then?.required?.includes("liveQualificationReceipts")
+      && rule?.then?.properties?.liveQualificationReceipts
+        ?.properties?.syntheticDirectMcp?.type === "object"
+      && rule?.then?.properties?.liveQualificationReceipts
+        ?.properties?.naturalCodexHost?.type === "object"
+    ));
+    if (liveReferences?.additionalProperties !== false
+      || !liveReferences?.required?.includes("syntheticDirectMcp")
+      || !liveReferences?.required?.includes("naturalCodexHost")
+      || !liveSemanticsRule) {
+      problem("Worker Broker evidence schema must bind bidirectional provisional live-receipt semantics.", file);
+    }
+    if (!aggregateQualificationRule) {
+      problem("Worker Broker evidence schema must reserve qualification for a complete aggregate record.", file);
+    }
+  }
+
+  const reviewRequestSchema = readJson(
+    "plugins/grok/schemas/worker-broker-review-request.schema.json"
+  );
+  if (reviewRequestSchema) {
+    const file = "plugins/grok/schemas/worker-broker-review-request.schema.json";
+    const required = [
+      "schemaVersion",
+      "domain",
+      "producerId",
+      "producerVersion",
+      "manifestDigest",
+      "phase",
+      "createdAt",
+      "expiresAt",
+      "nonce",
+      "source",
+      "diff",
+      "proof",
+      "prerequisite",
+      "requestDigest"
+    ];
+    const exactNestedRequestShape = (
+      key,
+      fields
+    ) => reviewRequestSchema.properties?.[key]?.additionalProperties === false
+      && exactStringSet(reviewRequestSchema.properties?.[key]?.required, fields)
+      && exactStringSet(
+        Object.keys(reviewRequestSchema.properties?.[key]?.properties || {}),
+        fields
+      );
+    if (reviewRequestSchema.$schema !== "https://json-schema.org/draft/2020-12/schema"
+      || reviewRequestSchema.additionalProperties !== false
+      || !exactStringSet(reviewRequestSchema.required, required)
+      || !exactStringSet(Object.keys(reviewRequestSchema.properties || {}), required)
+      || reviewRequestSchema.properties?.schemaVersion?.const !== 1
+      || reviewRequestSchema.properties?.domain?.const
+        !== "grok-plugin/worker-broker/phase-1-review-request/v1"
+      || reviewRequestSchema.properties?.producerId?.const
+        !== "worker-broker-review-request-runner"
+      || reviewRequestSchema.properties?.producerVersion?.const !== 1
+      || reviewRequestSchema.properties?.manifestDigest?.const
+        !== "16adb6811c1e0d16c3b8919a7cc31c9ab6f725df062ae6fadfcc0c7d62529c65"
+      || reviewRequestSchema.properties?.phase?.const !== "1"
+      || reviewRequestSchema.properties?.createdAt?.format !== "date-time"
+      || reviewRequestSchema.properties?.expiresAt?.format !== "date-time"
+      || !exactNestedRequestShape("source", [
+        "headCommit",
+        "headTree",
+        "sourceInventoryDigest",
+        "phaseScopeDigest",
+        "phaseScopePaths"
+      ])
+      || !exactNestedRequestShape("diff", [
+        "baseCommit",
+        "headCommit",
+        "patchDigest",
+        "pathsDigest",
+        "paths"
+      ])
+      || !exactNestedRequestShape("proof", [
+        "path",
+        "recordDigest",
+        "producerManifestDigest",
+        "gateIds"
+      ])
+      || !exactNestedRequestShape("prerequisite", [
+        "phase",
+        "path",
+        "recordDigest",
+        "gateIds"
+      ])) {
+      problem("Worker Broker review request schema must bind the exact source, diff, and proof request.", file);
+    }
+  }
+
+  const reviewAttestationSchema = readJson(
+    "plugins/grok/schemas/worker-broker-review-attestation.schema.json"
+  );
+  if (reviewAttestationSchema) {
+    const file = "plugins/grok/schemas/worker-broker-review-attestation.schema.json";
+    const required = [
+      "schemaVersion",
+      "domain",
+      "issuer",
+      "keyFingerprint",
+      "algorithm",
+      "requestPath",
+      "requestDigest",
+      "nonce",
+      "manifestDigest",
+      "reviewerRuntimeDigest",
+      "headCommit",
+      "headTree",
+      "sourceInventoryDigest",
+      "phaseScopeDigest",
+      "diffBaseCommit",
+      "diffPatchDigest",
+      "diffPathsDigest",
+      "proofRecordDigest",
+      "prerequisiteRecordDigest",
+      "startedAt",
+      "endedAt",
+      "outcome",
+      "unresolvedFindings",
+      "signature",
+      "attestationDigest"
+    ];
+    if (reviewAttestationSchema.$schema !== "https://json-schema.org/draft/2020-12/schema"
+      || reviewAttestationSchema.additionalProperties !== false
+      || !exactStringSet(reviewAttestationSchema.required, required)
+      || !exactStringSet(
+        Object.keys(reviewAttestationSchema.properties || {}),
+        required
+      )
+      || reviewAttestationSchema.properties?.schemaVersion?.const !== 1
+      || reviewAttestationSchema.properties?.domain?.const
+        !== "grok-plugin/worker-broker/phase-1-review-attestation/v1"
+      || reviewAttestationSchema.properties?.algorithm?.const !== "Ed25519"
+      || reviewAttestationSchema.properties?.manifestDigest?.const
+        !== "16adb6811c1e0d16c3b8919a7cc31c9ab6f725df062ae6fadfcc0c7d62529c65"
+      || reviewAttestationSchema.properties?.outcome?.const !== "pass"
+      || reviewAttestationSchema.properties?.unresolvedFindings?.const !== 0
+      || reviewAttestationSchema.properties?.startedAt?.format !== "date-time"
+      || reviewAttestationSchema.properties?.endedAt?.format !== "date-time"
+      || reviewAttestationSchema.properties?.signature?.pattern
+        !== "^[A-Za-z0-9_-]{86}$") {
+      problem("Worker Broker review attestation schema must bind exact Ed25519 review authority.", file);
+    }
+  }
+
+  const protectedReviewBootstrap = readText(
+    "scripts/trusted/worker-broker-review.mjs",
+    { required: false }
+  );
+  if (protectedReviewBootstrap != null) {
+    const file = "scripts/trusted/worker-broker-review.mjs";
+    const staticImports = staticImportSpecifiers(protectedReviewBootstrap, file);
+    const expectedStaticImports = [
+      "node:crypto",
+      "node:fs",
+      "node:path",
+      "node:process",
+      "node:url"
+    ];
+    const verificationMilestones = [
+      "assertCleanProcess();",
+      "const parsed = parseArguments(process.argv.slice(2));",
+      "assertRootOwnedNonWritable(emptyHooksPath, \"directory\");",
+      "if (fs.readdirSync(emptyHooksPath).length !== 0) throw trustError();",
+      "const descriptorBefore = readProtectedFile(",
+      "validateDescriptor(descriptor);",
+      "if (digestProtectedBinary(PROTECTED_GIT_PATH, MAX_EXECUTABLE_BYTES)",
+      "const bundleBefore = new Map();",
+      "const descriptorAfter = readProtectedFile(",
+      "if (!sameSnapshot(descriptorBefore, descriptorAfter))",
+      "const runtimeModule = path.join(",
+      "const api = await import(pathToFileURL(runtimeModule).href)"
+    ].map((marker) => protectedReviewBootstrap.indexOf(marker));
+    const verificationOrderIsBound = verificationMilestones.every((
+      index,
+      position
+    ) => index >= 0 && (position === 0 || index > verificationMilestones[position - 1]));
+    const requiredRuntimeBundlePaths = [
+      "plugins/grok/scripts/lib/redact.mjs",
+      "scripts/lib/plugin-inventory.mjs",
+      "scripts/lib/static-esm-import-parser.mjs",
+      "scripts/lib/worker-broker-evidence.mjs",
+      "scripts/trusted/worker-broker-review.mjs"
+    ];
+    if (!staticImports
+      || JSON.stringify(staticImports) !== JSON.stringify(expectedStaticImports)
+      || !protectedReviewBootstrap.includes("await import(pathToFileURL(runtimeModule).href)")
+      || !protectedReviewBootstrap.includes("runtimeBundleDigest")
+      || !protectedReviewBootstrap.includes("stat.uid !== 0")
+      || !protectedReviewBootstrap.includes("fs.constants.W_OK")
+      || !protectedReviewBootstrap.includes('process.env.PATH !== CLEAN_PATH')
+      || !protectedReviewBootstrap.includes("process.execArgv.length !== 0")
+      || !protectedReviewBootstrap.includes("process.getuid() === 0")
+      || !protectedReviewBootstrap.includes('"NODE_OPTIONS"')
+      || !protectedReviewBootstrap.includes('const PROTECTED_GIT_PATH = "/usr/bin/git";')
+      || !protectedReviewBootstrap.includes(
+        'const EMPTY_HOOKS_RELATIVE_PATH = ".worker-broker-host-state/empty-hooks";'
+      )
+      || !protectedReviewBootstrap.includes('"gitDigest"')
+      || !protectedReviewBootstrap.includes("gitPath: PROTECTED_GIT_PATH")
+      || !protectedReviewBootstrap.includes(
+        "emptyHooksPath: EMPTY_HOOKS_RELATIVE_PATH"
+      )
+      || !protectedReviewBootstrap.includes(
+        "digestProtectedBinary(PROTECTED_GIT_PATH, MAX_EXECUTABLE_BYTES)"
+      )
+      || !protectedReviewBootstrap.includes(
+        "const MAX_ATTESTATION_BYTES = 256 * 1024;"
+      )
+      || !protectedReviewBootstrap.includes("async function readBoundedAttestation()")
+      || !protectedReviewBootstrap.includes("if (size > MAX_ATTESTATION_BYTES)")
+      || !protectedReviewBootstrap.includes(
+        'new Set(["--workspace", "--request"])'
+      )
+      || !protectedReviewBootstrap.includes('new Set(["--workspace"])')
+      || !protectedReviewBootstrap.includes(
+        "attestation: await readBoundedAttestation()"
+      )
+      || requiredRuntimeBundlePaths.some((relative) => (
+        !protectedReviewBootstrap.includes(JSON.stringify(relative))
+      ))
+      || !verificationOrderIsBound) {
+      problem(
+        "Protected review bootstrap must bind clean process authority, exact Git, bounded stdin, and a fixed root-owned non-writable bundle before dynamic import.",
+        file
+      );
+    }
+    for (const forbidden of [
+      "--key",
+      "--public-key",
+      "--signature",
+      "--trust",
+      "--issuer",
+      "--now",
+      "--attestation",
+      "--attestation-path"
+    ]) {
+      if (protectedReviewBootstrap.includes(forbidden)) {
+        problem(`Protected review bootstrap must not accept ${forbidden}.`, file);
+      }
+    }
+  }
+
+  const liveReceiptSchema = readJson("plugins/grok/schemas/worker-broker-live-receipt.schema.json");
+  if (liveReceiptSchema) {
+    const file = "plugins/grok/schemas/worker-broker-live-receipt.schema.json";
+    if (liveReceiptSchema.$schema !== "https://json-schema.org/draft/2020-12/schema") {
+      problem("Worker Broker live receipt schema must use JSON Schema 2020-12.", file);
+    }
+    const expectedRequired = [
+      "schemaVersion",
+      "producerId",
+      "producerVersion",
+      "manifestDigest",
+      "authorityMode",
+      "phase",
+      "sourceInventoryDigest",
+      "phaseScopeDigest",
+      "sourcePluginInventoryDigest",
+      "installedPluginInventoryDigest",
+      "installedEntrypointDigest",
+      "providerCapabilityDigest",
+      "observedToolIds",
+      "providerBinaryDigest",
+      "mcpProtocolVersion",
+      "installationMethod",
+      "scenarios",
+      "outcome",
+      "receiptDigest"
+    ];
+    for (const field of expectedRequired) {
+      if (!liveReceiptSchema.required?.includes(field)
+        || !liveReceiptSchema.properties?.[field]) {
+        problem(`Worker Broker live receipt schema is missing required field ${field}.`, file);
+      }
+    }
+    const expectedManifestDigest = "aee11910fb0ff30ac4d7475fbd29c79cc07fed679e037b602d383a94e7694833";
+    if (liveReceiptSchema.properties?.schemaVersion?.const !== 1
+      || liveReceiptSchema.properties?.producerId?.const !== "worker-broker-live-receipt-runner"
+      || liveReceiptSchema.properties?.producerVersion?.const !== 1
+      || liveReceiptSchema.properties?.manifestDigest?.const !== expectedManifestDigest
+      || liveReceiptSchema.properties?.mcpProtocolVersion?.const !== "2025-11-25"
+      || liveReceiptSchema.properties?.providerRevision?.pattern
+        !== "^binary-sha256-[0-9a-f]{64}$"
+      || liveReceiptSchema.properties?.outcome?.const !== "pass") {
+      problem("Worker Broker live receipt schema must bind exact producer and protocol identity.", file);
+    }
+    const scenarioSchema = liveReceiptSchema.properties?.scenarios?.items;
+    const requiredScenarioFields = [
+      "spawnInvocationCount",
+      "spawnReplayCount",
+      "providerLaunchCount",
+      "providerTerminalCount",
+      "cancelInvocationCount",
+      "cancelReplayCount",
+      "uniqueCancelRequestCount",
+      "runnerTemporaryArtifactsRemoved",
+      "qualificationSessionDeleted"
+    ];
+    if (!requiredScenarioFields.every((field) => (
+      scenarioSchema?.required?.includes(field) && scenarioSchema?.properties?.[field]
+    ))
+      || ["cancelRequestCount", "temporaryArtifactsRemoved", "providerSessionClosed"]
+        .some((field) => scenarioSchema?.required?.includes(field)
+          || scenarioSchema?.properties?.[field])
+      || !/unique launched provider generations/i.test(
+        scenarioSchema?.properties?.providerTerminalCount?.description || ""
+      )) {
+      problem("Worker Broker live receipt schema must bind exact invocation, replay, terminal, and cleanup semantics.", file);
+    }
+    const syntheticRule = (liveReceiptSchema.allOf || []).find((rule) => (
+      rule?.if?.properties?.authorityMode?.const === "synthetic-direct-mcp"
+    ));
+    const naturalRule = (liveReceiptSchema.allOf || []).find((rule) => (
+      rule?.if?.properties?.authorityMode?.const === "natural-codex-host"
+    ));
+    if (syntheticRule?.then?.properties?.phase?.const !== "1"
+      || syntheticRule?.then?.properties?.observedToolIds?.const?.length !== 9
+      || syntheticRule?.then?.properties?.scenarios?.const?.length !== 2
+      || naturalRule?.then?.properties?.phase?.const !== "4"
+      || naturalRule?.then?.properties?.installationMethod?.const !== "codex-local-plugin-cache"
+      || naturalRule?.then?.properties?.observedToolIds?.const?.length !== 4
+      || naturalRule?.then?.properties?.scenarios?.const?.length !== 1) {
+      problem("Worker Broker live receipt schema must bind exact authority scenarios and tool inventories.", file);
+    }
+  }
+
+  const workerProtocolSchema = readJson("plugins/grok/schemas/worker-protocol.schema.json");
+  if (workerProtocolSchema) {
+    const file = "plugins/grok/schemas/worker-protocol.schema.json";
+    if (workerProtocolSchema.$schema !== "https://json-schema.org/draft/2020-12/schema") {
+      problem("Worker Protocol schema must use JSON Schema 2020-12.", file);
+    }
+    for (const definition of ["WorkerHandle", "WorkerSnapshot", "WorkerEvent", "WorkerEventPage", "WorkerResult", "WorkerError"]) {
+      if (!workerProtocolSchema.$defs?.[definition]) {
+        problem(`Worker Protocol schema is missing ${definition}.`, file);
+      }
+    }
   }
 
   const macosEvidence = readJson("tests/e2e-results/macos-0.2.99-2026-07-13.json");
@@ -447,15 +967,47 @@ if (!versionsOnly) {
     if (!/modified|adapted/i.test(agent) || !/openai\/codex-plugin-cc/i.test(agent)) problem("Adapted agent must carry a prominent upstream modification notice.", "plugins/grok/agents/grok-rescue.md");
   }
 
-  const reportRepairFile = "plugins/grok/provider-agents/report-repair.md";
-  const reportRepair = readText(reportRepairFile, { required: false });
-  if (reportRepair != null) {
-    const frontmatter = reportRepair.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] || "";
-    if (!frontmatter) problem("Report-repair profile must start with YAML frontmatter.", reportRepairFile);
-    if (!/^permission_mode:\s*dontAsk\s*$/m.test(frontmatter)) problem("Report-repair profile must deny interactive permission escalation.", reportRepairFile);
-    if (!/^injectDefaultTools:\s*false\s*$/m.test(frontmatter)) problem("Report-repair profile must disable default tools.", reportRepairFile);
-    if (!/^toolConfig:\s*\r?\n\s+tools:\s*\[\s*\]\s*$/m.test(frontmatter)) problem("Report-repair profile must declare an empty tool list.", reportRepairFile);
-    if (/GrokBuild:[A-Za-z_]/.test(frontmatter)) problem("Report-repair profile must not name any Grok tool.", reportRepairFile);
+  for (const [label, profileFile, expectedName, expectedDescription] of [
+    [
+      "Report-repair",
+      "plugins/grok/provider-agents/report-repair.md",
+      "grok-companion-report-repair",
+      "No-workspace formatter for a completed Grok Companion task report."
+    ],
+    [
+      "Setup-probe",
+      "plugins/grok/provider-agents/setup-probe.md",
+      "grok-companion-setup-probe",
+      "Restricted no-workspace ACP setup probe agent for Grok Companion."
+    ]
+  ]) {
+    const profile = readText(profileFile, { required: false });
+    if (profile == null) continue;
+    const frontmatter = profile.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] || "";
+    if (!frontmatter) problem(`${label} profile must start with YAML frontmatter.`, profileFile);
+    const canonicalFrontmatter = [
+      `name: ${expectedName}`,
+      `description: ${expectedDescription}`,
+      "prompt_mode: full",
+      "permission_mode: dontAsk",
+      "agents_md: false",
+      "injectDefaultTools: false",
+      "toolConfig:",
+      "  tools:",
+      "    - id: GrokBuild:todo_write"
+    ].join("\n");
+    if (frontmatter.replace(/\r\n/g, "\n") !== canonicalFrontmatter) {
+      problem(`${label} profile frontmatter must use the exact canonical compatibility-only shape.`, profileFile);
+    }
+    if (!/^permission_mode:\s*dontAsk\s*$/m.test(frontmatter)) problem(`${label} profile must deny interactive permission escalation.`, profileFile);
+    if (!/^injectDefaultTools:\s*false\s*$/m.test(frontmatter)) problem(`${label} profile must disable default tools.`, profileFile);
+    if (!/^toolConfig:\s*\r?\n\s+tools:\s*\r?\n\s+- id:\s*GrokBuild:todo_write\s*$/m.test(frontmatter)) {
+      problem(`${label} profile must expose only the compatibility plan-state tool.`, profileFile);
+    }
+    const toolIds = [...frontmatter.matchAll(/^\s+- id:\s*(\S+)\s*$/gm)].map((match) => match[1]);
+    if (toolIds.length !== 1 || toolIds[0] !== "GrokBuild:todo_write") {
+      problem(`${label} profile must not expose workspace, execution, network, or orchestration tools.`, profileFile);
+    }
   }
 
   const rootLicense = readText("LICENSE");
@@ -483,11 +1035,13 @@ if (!versionsOnly) {
     ...walk("plugins/grok/skills"),
     ...walk("plugins/grok/hooks"),
     ...walk("plugins/grok/prompts"),
+    ...walk("plugins/grok/mcp"),
     ...walk("plugins/grok/scripts"),
     absolute(".claude-plugin/marketplace.json"),
     absolute(".agents/plugins/marketplace.json"),
     absolute("plugins/grok/.claude-plugin/plugin.json"),
-    absolute("plugins/grok/.codex-plugin/plugin.json")
+    absolute("plugins/grok/.codex-plugin/plugin.json"),
+    absolute("plugins/grok/.mcp.json")
   ].filter((file) => fs.existsSync(file) && fs.statSync(file).isFile());
   const stalePatterns = [
     [/\/codex:/i, "Codex slash-command namespace"],
@@ -513,7 +1067,12 @@ if (!versionsOnly) {
     if (forbiddenNames.test(name)) problem("Potential secret or runtime-state file would be included in the repository.", name);
   }
 
-  const moduleFiles = [...walk("scripts"), ...walk("tests"), ...walk("plugins/grok/scripts")].filter((file) => file.endsWith(".mjs"));
+  const moduleFiles = [
+    ...walk("scripts"),
+    ...walk("tests"),
+    ...walk("plugins/grok/scripts"),
+    ...walk("plugins/grok/mcp")
+  ].filter((file) => file.endsWith(".mjs"));
   for (const file of moduleFiles) {
     try {
       execFileSync(process.execPath, ["--check", file], { cwd: ROOT, stdio: "pipe" });
@@ -528,6 +1087,10 @@ if (!versionsOnly) {
     if (!/permissions:\s*\n\s+contents:\s*read/m.test(workflow)) problem("CI must declare read-only contents permission.", ".github/workflows/ci.yml");
     if (/GROK_E2E\s*[:=]\s*["']?1/i.test(workflow) || /test:e2e/.test(workflow)) problem("Default CI must not run quota-consuming Grok E2E tests.", ".github/workflows/ci.yml");
     if (!/npm run test:pty-ingress/.test(workflow)) problem("CI must expose the source nonblocking PTY regression as a named gate.", ".github/workflows/ci.yml");
+    if (!/npm run test:deterministic/.test(workflow)) problem("Linux/macOS CI must run the deterministic zero-skip suite.", ".github/workflows/ci.yml");
+    if (!/validate-and-test:[\s\S]{0,220}?timeout-minutes:\s*30\b/.test(workflow)) {
+      problem("The deterministic validation matrix must retain its 30-minute completion budget.", ".github/workflows/ci.yml");
+    }
     if (!/CODEX_PLUGIN_RUNNER_ENABLED/.test(workflow) || !/npm run test:installed-codex/.test(workflow)) {
       problem("CI must define the opt-in Codex-equipped installed-snapshot gate.", ".github/workflows/ci.yml");
     }

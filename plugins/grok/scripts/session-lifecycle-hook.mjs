@@ -3,12 +3,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { listJobs, requestCancel, terminal, removeJob, updateJob, now } from "./lib/state.mjs";
+import { listJobs, requestCancel, terminal, removeJob, updateJob, now, withWorkspaceStateTransaction } from "./lib/state.mjs";
 import { workspaceRoot, workspaceState } from "./lib/workspace.mjs";
 import { cleanupReviewEnvironment, cleanupTaskRuntimeArtifacts } from "./lib/grok-provider.mjs";
 import { hasGrokAncestor, identityMatches, processGroupAlive, processGroupGone, processIsZombie, processStartToken } from "./lib/process-control.mjs";
 import { hasForeignActiveProvider, resolveProviderCleanupTarget, unregisterProviderGuard } from "./lib/recursion-guard.mjs";
 import { pluginDataRoot, sameHostSession, writeCodexSessionMetadata } from "./lib/host.mjs";
+import { cancellationNonce } from "./lib/worker-mutation.mjs";
+import { providerLaunchCleanupBlocked } from "./lib/worker-reconcile.mjs";
 
 if (process.env.GROK_COMPANION_CHILD === "1" || process.env.GROK_COMPANION_JOB_MARKER || process.env.GROK_AGENT || process.env.GROK_LEADER_SOCKET || hasGrokAncestor()) process.exit(0);
 
@@ -101,6 +103,46 @@ function includeGuardCleanup(root, id, cleanup) {
   }
 }
 
+function recheckAndRetainUnsettledLaunch(root, id) {
+  let retained = false;
+  try {
+    const job = withWorkspaceStateTransaction(root, (transaction) => {
+      const current = transaction.tryReadJob(id);
+      if (!current) return null;
+      return transaction.updateJob(id, (latest) => {
+        if (!providerLaunchCleanupBlocked(latest)) return latest;
+        retained = true;
+        const review = latest.jobClass === "review";
+        const reason = "SessionEnd retained the job because provider launch settlement is incomplete. Wait for launcher or reconciler settlement before cleanup.";
+        return {
+          ...latest,
+          status: "running",
+          phase: "launch-unsettled",
+          completedAt: null,
+          progress: "Cancellation is durable; provider launch settlement is still pending",
+          summary: reason,
+          error: { code: "E_STATE", message: reason },
+          result: {
+            ...(latest.result || {}),
+            ...(review ? { providerSessionDeleted: false } : { taskRuntimeCleaned: false }),
+            privacyWarning: [...new Set([
+              latest.result?.privacyWarning,
+              review
+                ? "Isolated review home retained because provider launch settlement is incomplete."
+                : "Task runtime artifacts retained because provider launch settlement is incomplete."
+            ].filter(Boolean))].join("; ")
+          }
+        };
+      });
+    });
+    return { job, retained };
+  } catch {
+    // An unreadable or contended authoritative record cannot authorize process
+    // cleanup or marker deletion. Preserve durable state for later settlement.
+    return { job: null, retained: true };
+  }
+}
+
 const event = await readInput();
 const phase = process.argv[2] || event.hook_event_name;
 const hostSessionId = event.session_id || event.sessionId || process.env.GROK_COMPANION_HOST_SESSION_ID || process.env.GROK_COMPANION_CLAUDE_SESSION_ID || null;
@@ -150,14 +192,16 @@ if (phase === "SessionEnd" && hostSessionId) {
   }
   // Prefer live worker nonce; fall back to the launch-window workerAuthorization; skip (fail closed) if neither.
   for (const job of owned) {
-    const nonce = job.workerProcess?.nonce || job.workerAuthorization;
+    const nonce = cancellationNonce(job);
     if (!terminal(job) && nonce) { try { requestCancel(root, job.id, nonce); } catch {} }
   }
   const deadline = Date.now() + 4000;
   while (owned.some((job) => { try { return !terminal(listJobs(root).find((x) => x.id === job.id)); } catch { return false; } }) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
   const cleanupFailures = new Map();
   await Promise.all(owned.map(async (original) => {
-    const job = listJobs(root).find((candidate) => candidate.id === original.id);
+    const settlement = recheckAndRetainUnsettledLaunch(root, original.id);
+    if (settlement.retained) return;
+    const job = settlement.job;
     if (!job) return;
     try {
       const { identity: providerIdentity, kind: providerKind } = resolveProviderCleanupTarget(root, job);
@@ -168,7 +212,12 @@ if (phase === "SessionEnd" && hostSessionId) {
     } catch (error) { cleanupFailures.set(job.id, error); }
   }));
   for (const original of owned) {
-    let job = listJobs(root).find((candidate) => candidate.id === original.id);
+    const settlement = recheckAndRetainUnsettledLaunch(root, original.id);
+    if (settlement.retained) {
+      process.stderr.write("Grok Companion retained a job because provider launch settlement is incomplete.\n");
+      continue;
+    }
+    let job = settlement.job;
     if (!job) continue;
     // allGone must use the same resolved provider identity so a null job.providerProcess
     // never snapshots "gone" while a live guard-backed group still exists.

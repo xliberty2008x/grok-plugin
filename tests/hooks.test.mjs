@@ -212,6 +212,7 @@ test("SessionEnd requests cancellation and removes only jobs owned by the ending
       host: { kind: "claude-code", sessionId: "session-a" }
     }));
     writeJob(root, record(ownedActive, "session-a", "running", {
+      workerAuthorization: { nonce: "owned-stale-authorization-nonce" },
       workerProcess: { nonce: "owned-worker-nonce" }
     }));
     writeJob(root, record(foreignFinished, "session-b"));
@@ -240,6 +241,15 @@ test("SessionEnd requests cancellation and removes only jobs owned by the ending
   withPluginData(pluginData, () => updateJob(root, ownedActive, (job) => {
     job.status = "cancelled";
     job.phase = "cancelled";
+    job.request = {
+      ...(job.request || {}),
+      spawn: {
+        ...(job.request?.spawn || {}),
+        providerLaunchPending: false,
+        providerLaunchInFlight: false,
+        providerLaunchOutcome: "not-launched"
+      }
+    };
     return job;
   }));
 
@@ -411,7 +421,7 @@ test("SessionEnd refuses to signal a replaced leader PID after ownership snapsho
   // job/guard/home evidence with E_PROCESS_IDENTITY.
   const root = fs.realpathSync(initRepo());
   const pluginData = tempDir("grok-hook-data-");
-  const id = generateId("task");
+  const id = generateId("review");
   const original = spawn(process.execPath, [
     "-e",
     "process.on('SIGTERM',()=>{}); console.log('ready'); setInterval(()=>{},1000);",
@@ -547,6 +557,15 @@ test("SessionEnd cancel uses workerAuthorization when workerProcess is null", as
   withPluginData(pluginData, () => updateJob(root, id, (job) => {
     job.status = "cancelled";
     job.phase = "cancelled";
+    job.request = {
+      ...(job.request || {}),
+      spawn: {
+        ...(job.request?.spawn || {}),
+        providerLaunchPending: false,
+        providerLaunchInFlight: false,
+        providerLaunchOutcome: "not-launched"
+      }
+    };
     return job;
   }));
 
@@ -554,6 +573,200 @@ test("SessionEnd cancel uses workerAuthorization when workerProcess is null", as
   assert.equal(completed.code, 0, completed.stderr);
   withPluginData(pluginData, () => {
     assert.throws(() => readJob(root, id), (error) => error.code === "E_JOB_NOT_FOUND");
+  });
+});
+
+test("SessionEnd cancel extracts broker workerAuthorization nonce during launch window", async () => {
+  const root = fs.realpathSync(initRepo());
+  const pluginData = tempDir("grok-hook-data-");
+  const id = generateId("task");
+  const authNonce = "session-end-broker-authorization-nonce";
+  withPluginData(pluginData, () => writeJob(root, record(id, "session-a", "running", {
+    workerAuthorization: { nonce: authNonce },
+    workerProcess: null,
+    providerProcess: null
+  })));
+
+  const running = spawnHook(
+    SESSION_HOOK,
+    "SessionEnd",
+    { cwd: root, session_id: "session-a" },
+    { cwd: root, env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData } }
+  );
+
+  let markerContents = null;
+  await waitFor(() => withPluginData(pluginData, () => {
+    const marker = cancelFile(root, id);
+    if (!fs.existsSync(marker)) return false;
+    markerContents = fs.readFileSync(marker, "utf8");
+    return true;
+  }));
+  assert.equal(markerContents, `${authNonce}\n`);
+
+  withPluginData(pluginData, () => updateJob(root, id, (job) => {
+    job.status = "cancelled";
+    job.phase = "cancelled";
+    job.request = {
+      ...(job.request || {}),
+      spawn: {
+        ...(job.request?.spawn || {}),
+        providerLaunchPending: false,
+        providerLaunchInFlight: false,
+        providerLaunchOutcome: "not-launched"
+      }
+    };
+    return job;
+  }));
+
+  const completed = await running.completed;
+  assert.equal(completed.code, 0, completed.stderr);
+  withPluginData(pluginData, () => {
+    assert.throws(() => readJob(root, id), (error) => error.code === "E_JOB_NOT_FOUND");
+  });
+});
+
+test("SessionEnd retains launch-unsettled jobs and only cleans explicit not-launched jobs after timeout", async () => {
+  const root = fs.realpathSync(initRepo());
+  const pluginData = tempDir("grok-hook-data-");
+  const cases = [
+    {
+      name: "pending",
+      id: generateId("task"),
+      nonce: "session-end-pending-authorization-nonce",
+      providerHomeId: "session-end-pending-home",
+      spawn: {
+        providerLaunchPending: true,
+        providerLaunchInFlight: false,
+        providerLaunchOutcome: null
+      },
+      retained: true
+    },
+    {
+      name: "inflight",
+      id: generateId("task"),
+      nonce: "session-end-inflight-authorization-nonce",
+      providerHomeId: "session-end-inflight-home",
+      spawn: {
+        providerLaunchPending: false,
+        providerLaunchInFlight: true,
+        providerLaunchOutcome: null
+      },
+      retained: true
+    },
+    {
+      name: "unknown",
+      id: generateId("task"),
+      nonce: "session-end-unknown-authorization-nonce",
+      providerHomeId: "session-end-unknown-home",
+      spawn: {
+        providerLaunchPending: false,
+        providerLaunchInFlight: false,
+        providerLaunchOutcome: "unknown"
+      },
+      retained: true
+    },
+    {
+      name: "review-pending",
+      id: generateId("review"),
+      kind: "review",
+      jobClass: "review",
+      nonce: "session-end-review-pending-authorization-nonce",
+      providerHomeId: "session-end-review-pending-home",
+      spawn: {
+        providerLaunchPending: true,
+        providerLaunchInFlight: false,
+        providerLaunchOutcome: null
+      },
+      retained: true
+    },
+    {
+      name: "not-launched",
+      id: generateId("task"),
+      nonce: "session-end-not-launched-authorization-nonce",
+      providerHomeId: "session-end-not-launched-home",
+      spawn: {
+        providerLaunchPending: false,
+        providerLaunchInFlight: false,
+        providerLaunchOutcome: "not-launched"
+      },
+      retained: false
+    }
+  ];
+
+  const runtimeFiles = new Map();
+  withPluginData(pluginData, () => {
+    const stateRoot = workspaceState(root);
+    for (const fixture of cases) {
+      writeJob(root, record(fixture.id, "session-a", "running", {
+        kind: fixture.kind || "task",
+        jobClass: fixture.jobClass || "task",
+        request: {
+          providerHomeId: fixture.providerHomeId,
+          spawn: fixture.spawn
+        },
+        workerAuthorization: { nonce: fixture.nonce },
+        workerProcess: null,
+        providerProcess: null
+      }));
+      const runtimeFile = fixture.jobClass === "review"
+        ? path.join(stateRoot, "review-homes", fixture.id, "retained.txt")
+        : path.join(stateRoot, "task-homes", fixture.providerHomeId, ".grok", "auth.json");
+      fs.mkdirSync(path.dirname(runtimeFile), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(runtimeFile, "private-runtime-evidence\n", { mode: 0o600 });
+      runtimeFiles.set(fixture.id, runtimeFile);
+    }
+  });
+
+  const running = spawnHook(
+    SESSION_HOOK,
+    "SessionEnd",
+    { cwd: root, session_id: "session-a" },
+    { cwd: root, env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData } }
+  );
+
+  await waitFor(() => withPluginData(pluginData, () => cases.every((fixture) => {
+    const marker = cancelFile(root, fixture.id);
+    return fs.existsSync(marker) && fs.readFileSync(marker, "utf8") === `${fixture.nonce}\n`;
+  })));
+
+  const completed = await running.completed;
+  assert.equal(completed.code, 0, completed.stderr);
+  assert.equal(completed.stdout, "");
+  assert.match(completed.stderr, /retained a job because provider launch settlement is incomplete/i);
+  assert.doesNotMatch(completed.stderr, new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+
+  withPluginData(pluginData, () => {
+    for (const fixture of cases) {
+      const marker = cancelFile(root, fixture.id);
+      const runtimeFile = runtimeFiles.get(fixture.id);
+      if (!fixture.retained) {
+        assert.throws(() => readJob(root, fixture.id), (error) => error.code === "E_JOB_NOT_FOUND");
+        assert.equal(fs.existsSync(marker), false, `${fixture.name} cancellation marker must be removed`);
+        assert.equal(fs.existsSync(runtimeFile), false, `${fixture.name} runtime evidence must be cleaned`);
+        continue;
+      }
+
+      const job = readJob(root, fixture.id);
+      assert.equal(job.status, "running", `${fixture.name} job must remain non-terminal`);
+      assert.equal(job.phase, "launch-unsettled", `${fixture.name} job must advertise launch settlement`);
+      assert.equal(job.completedAt, null);
+      assert.deepEqual(job.request?.spawn, fixture.spawn);
+      assert.deepEqual(job.workerAuthorization, { nonce: fixture.nonce });
+      if (fixture.jobClass === "review") {
+        assert.equal(job.result?.providerSessionDeleted, false);
+        assert.equal(job.result?.taskRuntimeCleaned, undefined);
+        assert.match(job.result?.privacyWarning || "", /isolated review home retained/i);
+      } else {
+        assert.equal(job.result?.taskRuntimeCleaned, false);
+        assert.match(job.result?.privacyWarning || "", /task runtime artifacts retained/i);
+      }
+      assert.equal(job.error?.code, "E_STATE");
+      assert.match(job.error?.message || "", /provider launch settlement is incomplete/i);
+      assert.equal(fs.readFileSync(marker, "utf8"), `${fixture.nonce}\n`);
+      assert.equal(fs.existsSync(runtimeFile), true, `${fixture.name} runtime evidence must be retained`);
+      assert.doesNotMatch(completed.stderr, new RegExp(fixture.id));
+      assert.doesNotMatch(completed.stderr, new RegExp(fixture.nonce));
+    }
   });
 });
 
@@ -672,7 +885,7 @@ test("SessionEnd refuses to signal a replaced leader when only the provider guar
   // terminateOwned must fail closed: never kill(-pgid) the replacement; retain job/guard/home.
   const root = fs.realpathSync(initRepo());
   const pluginData = tempDir("grok-hook-data-");
-  const id = generateId("task");
+  const id = generateId("review");
   const original = spawn(process.execPath, [
     "-e",
     "process.on('SIGTERM',()=>{}); console.log('ready'); setInterval(()=>{},1000);",
@@ -930,7 +1143,7 @@ test("enabled stop gate emits Claude block JSON for BLOCK output", () => {
   assert.equal(log.some((entry) => entry.event === "rpc"), false);
 });
 
-test("enabled stop gate preserves primary BLOCK reason when isolated-home cleanup also fails", { skip: process.platform === "win32" }, () => {
+test("enabled stop gate preserves primary BLOCK reason when isolated-home cleanup also fails", { skip: process.platform === "win32" }, (t) => {
   const root = fs.realpathSync(initRepo());
   const fake = installFakeGrok(tempDir("fake-grok-stop-cleanup-"), {
     taskText: "BLOCK: add the missing regression test",
@@ -938,6 +1151,21 @@ test("enabled stop gate preserves primary BLOCK reason when isolated-home cleanu
   });
   const pluginData = tempDir("grok-hook-data-");
   withPluginData(pluginData, () => setConfig(root, { stopReviewGate: true }));
+  t.after(() => withPluginData(pluginData, () => {
+    const homes = path.join(workspaceState(root), "review-homes");
+    if (fs.existsSync(homes)) {
+      for (const name of fs.readdirSync(homes)) {
+        const nest = path.join(homes, name, "undeletable-cleanup");
+        if (fs.existsSync(nest)) fs.chmodSync(nest, 0o700);
+      }
+      fs.rmSync(homes, { recursive: true, force: true });
+    }
+    assert.equal(
+      fs.existsSync(homes),
+      false,
+      "stop-gate teardown must remove retained review homes after unlocking mode-000 nests"
+    );
+  }));
   const result = hook(
     STOP_HOOK,
     null,
@@ -952,15 +1180,6 @@ test("enabled stop gate preserves primary BLOCK reason when isolated-home cleanu
   // Primary BLOCK text must remain, not be replaced by cleanup-only wording.
   assert.doesNotMatch(payload.reason, /^Grok stop review could not remove its isolated credential environment/);
 
-  // Best-effort unlock of any retained review homes so the temp tree can be removed later.
-  const homes = path.join(workspaceState(root), "review-homes");
-  if (fs.existsSync(homes)) {
-    for (const name of fs.readdirSync(homes)) {
-      const nest = path.join(homes, name, "undeletable-cleanup");
-      try { fs.chmodSync(nest, 0o700); } catch {}
-    }
-    try { fs.rmSync(homes, { recursive: true, force: true }); } catch {}
-  }
 });
 
 test("Codex stop gate classifies PLUGIN_DATA host, preserves session id, and uses $grok remediation", async () => {

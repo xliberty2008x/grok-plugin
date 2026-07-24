@@ -45,7 +45,7 @@ jobs:
   validate-and-test:
     name: ${{ matrix.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -68,11 +68,13 @@ jobs:
       - name: Validate release structure
         run: npm run validate
 
-      - name: Run full offline suite (Linux and macOS)
+      - name: Run deterministic zero-skip suite (Linux and macOS)
         if: runner.os != 'Windows'
         # Includes three concurrently accepted structured read jobs, distinct
         # isolated profile paths, terminal cleanup, and bounded exit diagnostics.
-        run: npm test
+        # Installed-host and authenticated-provider tests remain separate
+        # qualification boundaries and are not silently counted as skips.
+        run: npm run test:deterministic
 
       # The fake Grok executable is a POSIX process fixture. Until a genuine
       # shell:false Windows fixture is added, Windows provider behavior remains

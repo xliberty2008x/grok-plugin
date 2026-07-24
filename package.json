@@ -9,15 +9,22 @@
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
+    "test:deterministic": "node scripts/test-deterministic.mjs",
     "test:e2e": "node --test tests/live-grok.test.mjs",
     "test:pty-ingress": "node --test tests/pty-ingress.test.mjs",
     "test:installed-codex": "node --test tests/installed-codex.test.mjs",
+    "test:protected-review": "node --test tests/worker-broker-protected-review.test.mjs",
+    "test:installed-worker-mcp": "node scripts/test-installed-worker-mcp.mjs",
     "test:natural-codex": "node scripts/test-natural-codex.mjs",
     "codex:update-local": "node scripts/update-local-codex.mjs",
     "validate": "node scripts/validate.mjs",
     "version:check": "node scripts/validate.mjs --versions-only",
     "version:bump": "node scripts/bump-version.mjs",
-    "check": "npm run validate && npm test"
+    "check": "npm run validate && npm run test:deterministic",
+    "worker:evidence": "node scripts/worker-broker-evidence.mjs",
+    "worker:prove": "node scripts/worker-broker-evidence.mjs prove",
+    "worker:verify": "node scripts/worker-broker-evidence.mjs verify",
+    "worker:qualify": "node scripts/worker-broker-evidence.mjs qualify"
   },
   "license": "Apache-2.0"
 }

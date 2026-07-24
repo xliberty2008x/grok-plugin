@@ -7,6 +7,7 @@ import test from "node:test";
 
 import {
   initRepo,
+  ptyPythonAvailable,
   run,
   runPtyStdin,
   tempDir,
@@ -18,8 +19,7 @@ import { STDIN_READY_MARKER } from "../plugins/grok/scripts/lib/stdin.mjs";
 
 const codexProbe = run("codex", ["plugin", "--help"], { timeout: 5000 });
 const CODEX_AVAILABLE = codexProbe.status === 0;
-const pythonProbe = run("python3", ["--version"], { timeout: 5000 });
-const PYTHON_AVAILABLE = pythonProbe.status === 0;
+const PYTHON_AVAILABLE = ptyPythonAvailable();
 const CODEX_REQUIRED = process.env.CODEX_INSTALL_E2E_REQUIRED === "1"
   || process.env.npm_lifecycle_event === "test:installed-codex";
 
