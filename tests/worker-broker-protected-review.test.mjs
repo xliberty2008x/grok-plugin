@@ -40,7 +40,8 @@ const STARTED_AT = "2026-07-23T10:00:00.000Z";
 const ENDED_AT = "2026-07-23T10:00:01.000Z";
 const VALIDATION_SUPPORT_FILES = Object.freeze([
   "tests/e2e-results/macos-0.2.99-2026-07-13.json",
-  "tests/e2e-results/worker-broker/phase-1-readonly-dcb78b8.json"
+  "tests/e2e-results/worker-broker/phase-1-readonly-dcb78b8.json",
+  "tests/e2e-results/worker-broker/live-receipts/v1/synthetic-direct-mcp/9e109ac49369cb53-2babb2f1362e0b7e.json"
 ]);
 const REQUIRED = process.env.GROK_PROTECTED_REVIEW_E2E === "1"
   || process.env.npm_lifecycle_event === "test:protected-review";

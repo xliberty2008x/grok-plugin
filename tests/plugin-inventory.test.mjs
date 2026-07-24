@@ -340,7 +340,9 @@ test("inventory revalidates files after traversal to reject a mixed-time snapsho
   fs.openSync = function patchedOpen(candidate, ...args) {
     if (!mutated && path.resolve(String(candidate)) === canonicalSecond) {
       mutated = true;
-      fs.writeFileSync(canonicalFirst, "modified", "utf8");
+      // Change size as well as contents so coarse/overlay timestamps cannot
+      // make the mixed-time snapshot indistinguishable.
+      fs.writeFileSync(canonicalFirst, "modified-with-different-size", "utf8");
     }
     return originalOpen.call(this, candidate, ...args);
   };
