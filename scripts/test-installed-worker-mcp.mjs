@@ -1877,6 +1877,13 @@ function observePublicWorker(tracker, worker) {
   }
 }
 
+function observeTerminalResultWorker(tracker, worker) {
+  observePublicWorker(tracker, worker);
+  if (!sameJson(tracker.events.values(), worker.lifecycleEvents)) {
+    fail("E_PRIVATE_STATE");
+  }
+}
+
 const SNAPSHOT_KEYS = new Set([
   "workerProtocolVersion",
   "snapshotSchemaVersion",
@@ -3861,6 +3868,8 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   tracker.mailboxMessageCountAfterReplay = afterReplayMessages.length;
   enterQualificationStage("completion-wait");
   await waitForTerminal(context, client, tracker, started.cursor);
+  enterQualificationStage("completion-cleanup-private");
+  const terminalJob = await proveTerminalCleanup(context, tracker, "completed");
   enterQualificationStage("completion-result");
   const result = await callTool(
     context,
@@ -3870,15 +3879,10 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
     ["worker"]
   );
   tracker.calls.result += 1;
-  if (!sameJson(tracker.events.values(), result.worker?.lifecycleEvents)) {
-    fail("E_PRIVATE_STATE");
-  }
-  observePublicWorker(tracker, result.worker);
+  observeTerminalResultWorker(tracker, result.worker);
   await closeMcp(context, client);
   client = null;
 
-  enterQualificationStage("completion-cleanup-private");
-  const terminalJob = await proveTerminalCleanup(context, tracker, "completed");
   enterQualificationStage("completion-cleanup-snapshot");
   validateTerminalWorkerSnapshot(
     result.worker,
@@ -4046,6 +4050,8 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
 
   enterQualificationStage("cancellation-wait");
   await waitForTerminal(context, client, tracker, started.cursor);
+  enterQualificationStage("cancellation-cleanup-private");
+  const terminalJob = await proveTerminalCleanup(context, tracker, "cancelled");
   enterQualificationStage("cancellation-result");
   const result = await callTool(
     context,
@@ -4055,15 +4061,10 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
     ["worker"]
   );
   tracker.calls.result += 1;
-  if (!sameJson(tracker.events.values(), result.worker?.lifecycleEvents)) {
-    fail("E_PRIVATE_STATE");
-  }
-  observePublicWorker(tracker, result.worker);
+  observeTerminalResultWorker(tracker, result.worker);
   await closeMcp(context, client);
   client = null;
 
-  enterQualificationStage("cancellation-cleanup-private");
-  const terminalJob = await proveTerminalCleanup(context, tracker, "cancelled");
   enterQualificationStage("cancellation-cleanup-snapshot");
   validateTerminalWorkerSnapshot(
     result.worker,

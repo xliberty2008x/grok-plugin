@@ -835,6 +835,63 @@ test("installed Worker MCP mailbox polling tolerates valid pre-provider state", 
   );
 });
 
+test("installed Worker MCP terminal results converge after private cleanup", () => {
+  const source = fs.readFileSync(RUNNER, "utf8");
+  const observerStart = source.indexOf(
+    "function observeTerminalResultWorker(tracker, worker) {"
+  );
+  const observerEnd = source.indexOf("\nconst SNAPSHOT_KEYS", observerStart);
+  assert.ok(observerStart >= 0 && observerEnd > observerStart);
+  const observer = source.slice(observerStart, observerEnd);
+  assert.ok(
+    observer.indexOf("observePublicWorker(tracker, worker);")
+      < observer.indexOf(
+        "sameJson(tracker.events.values(), worker.lifecycleEvents)"
+      )
+  );
+
+  for (const [functionName, prefix, status] of [
+    ["runCompletionScenario", "completion", "completed"],
+    ["runCancellationScenario", "cancellation", "cancelled"]
+  ]) {
+    const start = source.indexOf(`async function ${functionName}(`);
+    const end = source.indexOf("\nasync function ", start + 1);
+    const body = source.slice(start, end < 0 ? source.length : end);
+    const waitIndex = body.indexOf(
+      `enterQualificationStage("${prefix}-wait")`
+    );
+    const cleanupIndex = body.indexOf(
+      `enterQualificationStage("${prefix}-cleanup-private")`
+    );
+    const proofIndex = body.indexOf(
+      `await proveTerminalCleanup(context, tracker, "${status}")`
+    );
+    const resultIndex = body.indexOf(
+      `enterQualificationStage("${prefix}-result")`
+    );
+    const callIndex = body.indexOf('"worker_result"', resultIndex);
+    const observeIndex = body.indexOf(
+      "observeTerminalResultWorker(tracker, result.worker);",
+      callIndex
+    );
+    const closeIndex = body.indexOf(
+      "await closeMcp(context, client);",
+      observeIndex
+    );
+    assert.ok(waitIndex >= 0);
+    assert.ok(waitIndex < cleanupIndex);
+    assert.ok(cleanupIndex < proofIndex);
+    assert.ok(proofIndex < resultIndex);
+    assert.ok(resultIndex < callIndex);
+    assert.ok(callIndex < observeIndex);
+    assert.ok(observeIndex < closeIndex);
+    assert.equal(
+      (body.match(/tracker\.calls\.result \+= 1;/g) || []).length,
+      1
+    );
+  }
+});
+
 test("installed Worker MCP cleanup waits for exact process closure and proves durable cancellation markers", () => {
   const source = fs.readFileSync(RUNNER, "utf8");
   assert.match(
