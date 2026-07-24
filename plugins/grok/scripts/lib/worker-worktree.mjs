@@ -131,13 +131,153 @@ function resolveExactCommit(root, revision) {
   return exact;
 }
 
-function workerWorktreeSlug(workerId) {
+export function workerWorktreeSlug(workerId) {
   const rawWorkerId = String(workerId);
   const readable = rawWorkerId
     .replace(/[^a-zA-Z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 48) || "worker";
   return `${readable}-${sha(rawWorkerId).slice(0, 12)}`;
+}
+
+/**
+ * Return the one broker-owned detached-worktree path for a worker identity.
+ *
+ * The path is derived from the control-workspace state root and never from
+ * provider input. Callers may persist this path before provisioning so crash
+ * recovery can distinguish exact adoption from an unrelated directory.
+ */
+export function expectedWorkerWorktreeRoot(controlRoot, workerId, env = process.env) {
+  if (!controlRoot || !workerId) {
+    throw new CompanionError("E_USAGE", "controlRoot and workerId are required.");
+  }
+  const control = resolveControlWorkspace(controlRoot, env);
+  const state = controlStateDir(control, env);
+  return path.join(state, "worktrees", workerWorktreeSlug(workerId));
+}
+
+function readSmallRegularFileNoFollow(file, label, maxBytes = 16 * 1024) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(
+      file,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+    );
+    const before = fs.fstatSync(descriptor);
+    if (!before.isFile() || before.size < 1 || before.size > maxBytes) {
+      throw new CompanionError("E_WORKTREE", `Managed worker ${label} is unsafe.`);
+    }
+    const contents = fs.readFileSync(descriptor, "utf8");
+    const after = fs.fstatSync(descriptor);
+    const pathStat = fs.lstatSync(file);
+    if (
+      pathStat.isSymbolicLink()
+      || !pathStat.isFile()
+      || fs.realpathSync(file) !== file
+      || before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs
+      || after.dev !== pathStat.dev
+      || after.ino !== pathStat.ino
+    ) {
+      throw new CompanionError("E_WORKTREE", `Managed worker ${label} changed during validation.`);
+    }
+    return contents;
+  } catch (error) {
+    if (error instanceof CompanionError) throw error;
+    throw new CompanionError("E_WORKTREE", `Managed worker ${label} is unavailable.`);
+  } finally {
+    if (descriptor != null) fs.closeSync(descriptor);
+  }
+}
+
+function worktreePorcelainRecords(controlRoot) {
+  const raw = git(
+    controlRoot,
+    ["worktree", "list", "--porcelain", "-z"],
+    { encoding: null }
+  ).stdout || Buffer.alloc(0);
+  const tokens = raw.toString("utf8").split("\0");
+  const records = [];
+  let fields = [];
+  for (const token of tokens) {
+    if (!token) {
+      if (fields.length) {
+        records.push(fields);
+        fields = [];
+      }
+      continue;
+    }
+    fields.push(token);
+  }
+  if (fields.length) {
+    throw new CompanionError("E_WORKTREE", "Git worktree inventory is truncated.");
+  }
+  return records;
+}
+
+function exactDetachedWorktreeRecord(controlRoot, executionRoot, baseCommit) {
+  const matching = worktreePorcelainRecords(controlRoot).filter((fields) => (
+    fields.some((field) => field === `worktree ${executionRoot}`)
+  ));
+  if (matching.length !== 1) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Managed worker worktree is not registered with one exact Git identity."
+    );
+  }
+  const fields = matching[0];
+  const expected = new Set([
+    `worktree ${executionRoot}`,
+    `HEAD ${baseCommit}`,
+    "detached"
+  ]);
+  if (fields.length !== expected.size || fields.some((field) => !expected.has(field))) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Managed worker worktree is not the exact detached base registration."
+    );
+  }
+}
+
+function assertLinkedWorktreeMetadata(control, executionRoot) {
+  const dotGit = path.join(executionRoot, ".git");
+  const pointer = readSmallRegularFileNoFollow(dotGit, "Git pointer");
+  const match = pointer.match(/^gitdir: (.+)\r?\n$/);
+  if (!match || !path.isAbsolute(match[1]) || path.normalize(match[1]) !== match[1]) {
+    throw new CompanionError("E_WORKTREE", "Managed worker Git pointer is malformed.");
+  }
+  let adminDirectory;
+  try {
+    adminDirectory = fs.realpathSync(match[1]);
+  } catch {
+    throw new CompanionError("E_WORKTREE", "Managed worker Git directory is unavailable.");
+  }
+  const adminStat = fs.lstatSync(adminDirectory);
+  const expectedAdminParent = path.join(control.gitCommonDir, "worktrees");
+  if (
+    adminDirectory !== match[1]
+    || !adminStat.isDirectory()
+    || adminStat.isSymbolicLink()
+    || path.dirname(adminDirectory) !== expectedAdminParent
+  ) {
+    throw new CompanionError("E_WORKTREE", "Managed worker Git directory is not broker-owned.");
+  }
+  const observedAdmin = String(
+    git(executionRoot, ["rev-parse", "--path-format=absolute", "--absolute-git-dir"]).stdout || ""
+  ).trim();
+  if (observedAdmin !== adminDirectory) {
+    throw new CompanionError("E_WORKTREE", "Managed worker Git directory identity changed.");
+  }
+  const backlink = readSmallRegularFileNoFollow(
+    path.join(adminDirectory, "gitdir"),
+    "Git backlink"
+  );
+  if (backlink !== `${dotGit}\n`) {
+    throw new CompanionError("E_WORKTREE", "Managed worker Git backlink does not match its root.");
+  }
 }
 
 function statSignature(stat) {
@@ -456,6 +596,88 @@ export function createWorkerWorktree({
     parentStatusAfterCreate: git(control.controlRoot, ["status", "--porcelain"]).stdout,
     gitCommonDir: control.gitCommonDir
   });
+}
+
+/**
+ * Validate an already-created managed worktree for exact crash adoption.
+ * No path is accepted unless it is the deterministic path for workerId, a
+ * registered worktree of the expected common directory, and still points at
+ * the exact detached base commit with no local changes.
+ */
+export function assertRegisteredWorkerWorktreeIdentity({
+  controlRoot,
+  executionRoot,
+  baseCommit,
+  workerId,
+  env = process.env
+} = {}) {
+  if (!controlRoot || !executionRoot || !baseCommit || !workerId) {
+    throw new CompanionError(
+      "E_USAGE",
+      "controlRoot, executionRoot, baseCommit, and workerId are required."
+    );
+  }
+  const control = resolveControlWorkspace(controlRoot, env);
+  const expectedRoot = expectedWorkerWorktreeRoot(control.controlRoot, workerId, env);
+  if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(baseCommit)) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Managed worker base must be one persisted exact lowercase object ID."
+    );
+  }
+  let canonicalRoot;
+  try {
+    canonicalRoot = fs.realpathSync(executionRoot);
+  } catch {
+    throw new CompanionError("E_WORKTREE", "Managed worker worktree is unavailable.");
+  }
+  if (executionRoot !== canonicalRoot || canonicalRoot !== expectedRoot) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Managed worker worktree path does not match its exact worker identity."
+    );
+  }
+  if (!listedWorktreeRoots(control.controlRoot).includes(canonicalRoot)) {
+    throw new CompanionError("E_WORKTREE", "Managed worker worktree is not registered with Git.");
+  }
+  const exactBaseCommit = resolveExactCommit(control.controlRoot, baseCommit);
+  const actualHead = resolveExactCommit(canonicalRoot, "HEAD");
+  if (exactBaseCommit !== baseCommit
+    || actualHead !== exactBaseCommit
+    || gitCommonDir(canonicalRoot) !== control.gitCommonDir) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Managed worker worktree no longer matches its exact base or control repository."
+    );
+  }
+  exactDetachedWorktreeRecord(control.controlRoot, canonicalRoot, exactBaseCommit);
+  assertLinkedWorktreeMetadata(control, canonicalRoot);
+  return Object.freeze({
+    controlWorkspaceId: control.controlWorkspaceId,
+    controlRoot: control.controlRoot,
+    executionRoot: canonicalRoot,
+    baseCommit: exactBaseCommit,
+    branch: null,
+    detached: true,
+    gitCommonDir: control.gitCommonDir
+  });
+}
+
+export function assertManagedWorkerWorktree(options = {}) {
+  const identity = assertRegisteredWorkerWorktreeIdentity(options);
+  const fingerprint = captureParentFingerprint(identity.executionRoot);
+  if (!fingerprint.clean || fingerprint.head !== identity.baseCommit) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      "A provisioning worktree is not clean at its exact base and cannot be adopted."
+    );
+  }
+  // Repeat the symlink preflight used by createWorkerWorktree so an interrupted
+  // provision cannot be adopted after its base contents were path-swapped.
+  captureWithStableVisibleIndex(identity.executionRoot, () => (
+    captureWorktreeEntries(identity.executionRoot, { rejectEscapingSymlink: true })
+  ));
+  return identity;
 }
 
 export function captureParentFingerprint(root) {

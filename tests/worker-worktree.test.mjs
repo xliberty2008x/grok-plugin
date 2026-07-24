@@ -20,6 +20,8 @@ import {
   captureParentFingerprint,
   assertParentUnchanged,
   createWorkerWorktree,
+  expectedWorkerWorktreeRoot,
+  assertManagedWorkerWorktree,
   buildArtifactManifest,
   validateArtifactForIntegration,
   prepareIntegration,
@@ -926,6 +928,117 @@ test("worktree create leaves parent content fingerprint unchanged; scope/tamper 
   assert.equal(prep.requiresExplicitHostApply, true);
 
   assert.equal(removeWorkerWorktree(worktree.executionRoot, root, "task-aaaaaaaaaaaaaaaa", env), true);
+});
+
+test("managed worktree adoption requires one exact detached registration and immutable base", () => {
+  const root = initRepo();
+  const env = envFor();
+  const base = git(root, "rev-parse", "HEAD");
+  const workerId = "task-adoption00000001";
+  const worktree = createWorkerWorktree({ controlRoot: root, baseCommit: base, workerId, env });
+
+  const adopted = assertManagedWorkerWorktree({
+    controlRoot: root,
+    executionRoot: worktree.executionRoot,
+    baseCommit: base,
+    workerId,
+    env
+  });
+  assert.equal(adopted.executionRoot, worktree.executionRoot);
+  assert.equal(adopted.baseCommit, base);
+  assert.equal(adopted.detached, true);
+
+  for (const symbolicBase of ["HEAD", "refs/heads/main"]) {
+    assert.throws(
+      () => assertManagedWorkerWorktree({
+        controlRoot: root,
+        executionRoot: worktree.executionRoot,
+        baseCommit: symbolicBase,
+        workerId,
+        env
+      }),
+      (error) => error?.code === "E_WORKTREE"
+    );
+  }
+  assert.throws(
+    () => assertManagedWorkerWorktree({
+      controlRoot: root,
+      executionRoot: worktree.executionRoot,
+      baseCommit: "0".repeat(base.length),
+      workerId,
+      env
+    }),
+    (error) => error?.code === "E_GIT_REQUIRED" || error?.code === "E_WORKTREE"
+  );
+
+  assert.equal(removeWorkerWorktree(worktree.executionRoot, root, workerId, env), true);
+});
+
+test("managed worktree adoption rejects branch attachment at the deterministic path", () => {
+  const root = initRepo();
+  const env = envFor();
+  const base = git(root, "rev-parse", "HEAD");
+  const workerId = "task-adoption00000002";
+  const expectedRoot = expectedWorkerWorktreeRoot(root, workerId, env);
+  fs.mkdirSync(path.dirname(expectedRoot), { recursive: true, mode: 0o700 });
+  git(root, "worktree", "add", "-b", "worker-adoption-branch", expectedRoot, base);
+
+  assert.throws(
+    () => assertManagedWorkerWorktree({
+      controlRoot: root,
+      executionRoot: fs.realpathSync(expectedRoot),
+      baseCommit: base,
+      workerId,
+      env
+    }),
+    (error) => error?.code === "E_WORKTREE"
+  );
+
+  git(root, "worktree", "remove", "--force", expectedRoot);
+});
+
+test("managed worktree adoption rejects a sibling Git pointer swap and symlink", () => {
+  const root = initRepo();
+  const env = envFor();
+  const base = git(root, "rev-parse", "HEAD");
+  const workerId = "task-adoption00000003";
+  const worktree = createWorkerWorktree({ controlRoot: root, baseCommit: base, workerId, env });
+  const sibling = addLinkedWorktree(root, "adoption-sibling");
+  const dotGit = path.join(worktree.executionRoot, ".git");
+  const originalPointer = fs.readFileSync(dotGit, "utf8");
+  const siblingPointer = fs.readFileSync(path.join(sibling, ".git"), "utf8");
+
+  fs.writeFileSync(dotGit, siblingPointer);
+  assert.throws(
+    () => assertManagedWorkerWorktree({
+      controlRoot: root,
+      executionRoot: worktree.executionRoot,
+      baseCommit: base,
+      workerId,
+      env
+    }),
+    (error) => error?.code === "E_WORKTREE"
+  );
+  fs.writeFileSync(dotGit, originalPointer);
+
+  const savedPointer = `${dotGit}.saved`;
+  fs.renameSync(dotGit, savedPointer);
+  fs.symlinkSync(savedPointer, dotGit);
+  assert.throws(
+    () => assertManagedWorkerWorktree({
+      controlRoot: root,
+      executionRoot: worktree.executionRoot,
+      baseCommit: base,
+      workerId,
+      env
+    }),
+    (error) => error?.code === "E_WORKTREE"
+  );
+  fs.unlinkSync(dotGit);
+  fs.renameSync(savedPointer, dotGit);
+
+  git(root, "worktree", "remove", "--force", sibling);
+  assert.equal(removeWorkerWorktree(worktree.executionRoot, root, workerId, env), true);
 });
 
 test("integration fails closed when the captured parent already has tracked, untracked, or ignored content", () => {
