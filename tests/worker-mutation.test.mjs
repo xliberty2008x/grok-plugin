@@ -38,7 +38,10 @@ import {
   createMcpBrokerRuntime,
   handleMcpRequest
 } from "../plugins/grok/mcp/broker.mjs";
-import { ROOT_READ_PROVIDER_CAPABILITY } from "../plugins/grok/scripts/lib/provider-capability.mjs";
+import {
+  ROOT_READ_PROVIDER_CAPABILITY,
+  SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+} from "../plugins/grok/scripts/lib/provider-capability.mjs";
 import { processGroupGone, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
 import {
   loadProviderGuard,
@@ -1906,7 +1909,10 @@ test("MCP worker_spawn and worker_cancel drive real service functions", async ()
   const auth = principal(root);
   const providerCapabilityReceipt = {
     capabilityDigest: "d".repeat(64),
-    capabilities: [ROOT_READ_PROVIDER_CAPABILITY]
+    capabilities: [
+      ROOT_READ_PROVIDER_CAPABILITY,
+      SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+    ]
   };
   const runtime = createMcpBrokerRuntime({
     providerCapabilityReceipt

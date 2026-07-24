@@ -4689,9 +4689,11 @@ async function qualify(runner) {
     observedAt: Date.now()
   });
   if (
-    capability.capabilities?.length !== 1
+    capability.capabilities?.length !== 2
     || capability.capabilities[0]
       !== providerCapability.ROOT_READ_PROVIDER_CAPABILITY
+    || capability.capabilities[1]
+      !== providerCapability.SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
     || broker.DEFAULT_MCP_PROTOCOL_VERSION !== PROTOCOL_VERSION
     || broker.MCP_SERVER_NAME !== "grok-worker-broker"
     || broker.MCP_SERVER_VERSION

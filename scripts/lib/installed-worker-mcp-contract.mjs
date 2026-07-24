@@ -38,6 +38,8 @@ export const INSTALLED_WORKER_TOOL_NAMES = Object.freeze([
   "worker_wait",
   "worker_result",
   "worker_spawn",
+  "worker_decide_host_action",
+  "worker_followup",
   "worker_cancel"
 ]);
 
@@ -1053,7 +1055,10 @@ export function validateProviderCapabilityAgreement(value, valueExpectations) {
     || receipt.loadSession !== true
     || !SHA256_HEX.test(receipt.setupProfileDigest || "")
     || !SHA256_HEX.test(receipt.rootReadProfileDigest || "")
-    || !validTextArray(receipt.capabilities, ["root-read-spawn-v1"])
+    || !validTextArray(receipt.capabilities, [
+      "root-read-spawn-v1",
+      "same-session-read-followup-v1"
+    ])
     || !canonicalIsoTimestamp(receipt.issuedAt)
     || !canonicalIsoTimestamp(receipt.expiresAt)
     || !SHA256_HEX.test(receipt.capabilityDigest || "")
@@ -1183,7 +1188,7 @@ function validTool(tool, expectedName) {
 }
 
 /**
- * Require both the fixed seven-tool order and exact structural equality with
+ * Require both the fixed nine-tool order and exact structural equality with
  * the WORKER_TOOLS projection loaded from the same installed artifact.
  */
 export function validateInstalledToolInventory(value, valueExpectedTools) {
@@ -1204,7 +1209,7 @@ export function validateInstalledToolInventory(value, valueExpectedTools) {
   const spawn = result.tools[5];
   if (
     Object.hasOwn(spawn.inputSchema.properties || {}, "write")
-    || result.tools.some((tool) => ["worker_send", "worker_followup"].includes(tool.name))
+    || result.tools.some((tool) => tool.name === "worker_send")
   ) {
     fail("E_LIVE_TOOLS");
   }

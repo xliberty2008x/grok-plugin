@@ -148,7 +148,7 @@ function capabilityFixture() {
     schemaVersion: 1,
     receiptType: "grok-provider-capability",
     pluginVersion: "0.3.0-dev.1",
-    mcpCapabilityContractVersion: "1.1.0",
+    mcpCapabilityContractVersion: "1.2.0",
     platform: "darwin",
     architecture: "arm64",
     providerVersion: "0.2.99",
@@ -157,7 +157,10 @@ function capabilityFixture() {
     loadSession: true,
     setupProfileDigest: DIGESTS.setup,
     rootReadProfileDigest: DIGESTS.rootRead,
-    capabilities: ["root-read-spawn-v1"]
+    capabilities: [
+      "root-read-spawn-v1",
+      "same-session-read-followup-v1"
+    ]
   };
   const body = {
     ...stable,
@@ -172,7 +175,7 @@ function capabilityExpectations() {
   return {
     setup: setupFixture(),
     pluginVersion: "0.3.0-dev.1",
-    mcpCapabilityContractVersion: "1.1.0",
+    mcpCapabilityContractVersion: "1.2.0",
     platform: "darwin",
     architecture: "arm64",
     providerFileIdentity: providerIdentity(),
@@ -188,7 +191,7 @@ function initializeFixture() {
       tools: { listChanged: false },
       experimental: clone(CODEX_MCP_EXPERIMENTAL_CAPABILITIES)
     },
-    serverInfo: { name: "grok-worker-broker", version: "1.1.0" },
+    serverInfo: { name: "grok-worker-broker", version: "1.2.0" },
     instructions: "External worker broker; host verification is not promoted.",
     _meta: {
       "grok/capability-matrix": clone(EXPECTED_CAPABILITY_MATRIX),
@@ -202,7 +205,7 @@ function initializeFixture() {
 
 function initializeExpectations() {
   return {
-    serverVersion: "1.1.0",
+    serverVersion: "1.2.0",
     capabilityDigest: capabilityFixture().capabilityDigest,
     experimentalCapabilities: clone(CODEX_MCP_EXPERIMENTAL_CAPABILITIES),
     capabilityMatrix: clone(EXPECTED_CAPABILITY_MATRIX)
@@ -752,6 +755,7 @@ test("capability receipt is cryptographically bound to setup and installed ident
     capabilityExpectations()
   );
   assert.equal(receipt.capabilities[0], "root-read-spawn-v1");
+  assert.equal(receipt.capabilities[1], "same-session-read-followup-v1");
   assert.equal(receipt.providerVersion, setupFixture().grok.version);
 });
 

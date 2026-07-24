@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   MCP_CAPABILITY_CONTRACT_VERSION,
   ROOT_READ_PROVIDER_CAPABILITY,
+  SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
   clearProviderCapabilityReceipt,
   readValidProviderCapabilityReceipt,
   writeProviderCapabilityReceipt
@@ -49,7 +50,10 @@ test("provider capability receipt is private, body-free, tamper-evident, and dur
   const issuedAt = Date.parse("2026-07-23T10:00:00.000Z");
   const receipt = writeProviderCapabilityReceipt({ runtime, env, clock: () => issuedAt });
 
-  assert.deepEqual(receipt.capabilities, [ROOT_READ_PROVIDER_CAPABILITY]);
+  assert.deepEqual(receipt.capabilities, [
+    ROOT_READ_PROVIDER_CAPABILITY,
+    SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+  ]);
   assert.match(receipt.capabilityDigest, /^[a-f0-9]{64}$/);
   assert.equal(receipt.mcpCapabilityContractVersion, MCP_CAPABILITY_CONTRACT_VERSION);
   assert.equal(fs.lstatSync(receiptFile).mode & 0o077, 0);
@@ -110,6 +114,40 @@ test("provider capability receipt fails closed on expiry and every bound identit
   }
 
   assert.equal(receipt.mcpCapabilityContractVersion, MCP_CAPABILITY_CONTRACT_VERSION);
+});
+
+test("provider capability receipt rejects missing, reordered, duplicated, and extra capability entries", () => {
+  const { env, runtime, receiptFile } = fixture();
+  const issuedAt = Date.parse("2026-07-23T10:00:00.000Z");
+  const cases = [
+    [ROOT_READ_PROVIDER_CAPABILITY],
+    [SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY],
+    [
+      SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
+      ROOT_READ_PROVIDER_CAPABILITY
+    ],
+    [
+      ROOT_READ_PROVIDER_CAPABILITY,
+      SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
+      SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+    ],
+    [
+      ROOT_READ_PROVIDER_CAPABILITY,
+      SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
+      "unexpected-provider-capability"
+    ]
+  ];
+  for (const capabilities of cases) {
+    writeProviderCapabilityReceipt({ runtime, env, clock: () => issuedAt });
+    const stored = JSON.parse(fs.readFileSync(receiptFile, "utf8"));
+    stored.capabilities = capabilities;
+    fs.writeFileSync(receiptFile, `${JSON.stringify(stored)}\n`, { mode: 0o600 });
+    assert.equal(
+      readValidProviderCapabilityReceipt({ env, clock: () => issuedAt + 1000 }),
+      null,
+      JSON.stringify(capabilities)
+    );
+  }
 });
 
 test("provider file replacement invalidates the capability receipt", () => {

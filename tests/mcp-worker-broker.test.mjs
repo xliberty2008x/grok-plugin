@@ -11,7 +11,10 @@ import {
   createMcpBrokerRuntime,
   handleMcpRequest
 } from "../plugins/grok/mcp/broker.mjs";
-import { ROOT_READ_PROVIDER_CAPABILITY } from "../plugins/grok/scripts/lib/provider-capability.mjs";
+import {
+  ROOT_READ_PROVIDER_CAPABILITY,
+  SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+} from "../plugins/grok/scripts/lib/provider-capability.mjs";
 import { MCP_SANDBOX_STATE_META_CAPABILITY } from "../plugins/grok/scripts/lib/worker-authority.mjs";
 import { ROOT, run, tempDir } from "./helpers.mjs";
 
@@ -25,7 +28,10 @@ const PRINCIPAL = Object.freeze({
 const BASE_RUNTIME = createMcpBrokerRuntime({ providerCapabilityReceipt: null });
 const SPAWN_RECEIPT = Object.freeze({
   capabilityDigest: "a".repeat(64),
-  capabilities: [ROOT_READ_PROVIDER_CAPABILITY]
+  capabilities: [
+    ROOT_READ_PROVIDER_CAPABILITY,
+    SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+  ]
 });
 const SPAWN_RUNTIME = createMcpBrokerRuntime({
   providerCapabilityReceipt: SPAWN_RECEIPT
@@ -33,6 +39,64 @@ const SPAWN_RUNTIME = createMcpBrokerRuntime({
 const LIVE_SPAWN_OPTIONS = Object.freeze({
   runtime: SPAWN_RUNTIME,
   readProviderCapabilityReceipt: () => SPAWN_RECEIPT
+});
+
+test("decision and follow-up tools are advertised only by the exact combined capability receipt", () => {
+  const receipts = [
+    {
+      label: "root-only",
+      capabilities: [ROOT_READ_PROVIDER_CAPABILITY],
+      expected: BASE_WORKER_TOOLS
+    },
+    {
+      label: "followup-only",
+      capabilities: [SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY],
+      expected: BASE_WORKER_TOOLS
+    },
+    {
+      label: "reordered",
+      capabilities: [
+        SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
+        ROOT_READ_PROVIDER_CAPABILITY
+      ],
+      expected: BASE_WORKER_TOOLS
+    },
+    {
+      label: "duplicated",
+      capabilities: [
+        ROOT_READ_PROVIDER_CAPABILITY,
+        SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
+        SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+      ],
+      expected: BASE_WORKER_TOOLS
+    },
+    {
+      label: "extra",
+      capabilities: [
+        ROOT_READ_PROVIDER_CAPABILITY,
+        SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
+        "unexpected-provider-capability"
+      ],
+      expected: BASE_WORKER_TOOLS
+    },
+    {
+      label: "exact",
+      capabilities: [
+        ROOT_READ_PROVIDER_CAPABILITY,
+        SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+      ],
+      expected: WORKER_TOOLS
+    }
+  ];
+  for (const fixture of receipts) {
+    const runtime = createMcpBrokerRuntime({
+      providerCapabilityReceipt: {
+        capabilityDigest: "f".repeat(64),
+        capabilities: fixture.capabilities
+      }
+    });
+    assert.deepEqual(runtime.tools, fixture.expected, fixture.label);
+  }
 });
 
 test("MCP broker advertises sandbox metadata, pins protocol versions, and lists structured tools", async () => {
@@ -80,10 +144,12 @@ test("MCP broker advertises sandbox metadata, pins protocol versions, and lists 
     "worker_wait",
     "worker_result",
     "worker_spawn",
+    "worker_decide_host_action",
+    "worker_followup",
     "worker_cancel"
   ]);
   assert.deepEqual(full.result.tools, WORKER_TOOLS);
-  assert.equal(full.result.tools.some((tool) => ["worker_send", "worker_followup"].includes(tool.name)), false);
+  assert.equal(full.result.tools.some((tool) => tool.name === "worker_send"), false);
   assert.equal(Object.hasOwn(full.result.tools.find((tool) => tool.name === "worker_spawn").inputSchema.properties, "write"), false);
   for (const tool of listed.result.tools) {
     assert.equal(tool.annotations.idempotentHint, true);
@@ -139,9 +205,13 @@ test("frozen broker runtime cannot be widened and hidden operations never reach 
     SPAWN_RUNTIME.tools[0].inputSchema.properties.root = { type: "string" };
   }, TypeError);
 
-  for (const name of ["worker_send", "worker_followup", "worker_spawn"]) {
+  for (const [name, runtime, expectedCode] of [
+    ["worker_send", SPAWN_RUNTIME, "E_USAGE"],
+    ["worker_spawn", BASE_RUNTIME, "E_CAPABILITY"],
+    ["worker_decide_host_action", BASE_RUNTIME, "E_CAPABILITY"],
+    ["worker_followup", BASE_RUNTIME, "E_CAPABILITY"]
+  ]) {
     let serviceCreated = false;
-    const runtime = name === "worker_spawn" ? BASE_RUNTIME : SPAWN_RUNTIME;
     const result = await callWorkerTool({ name, arguments: {} }, {
       runtime,
       resolveAuthority() {
@@ -153,43 +223,60 @@ test("frozen broker runtime cannot be widened and hidden operations never reach 
       }
     });
     assert.equal(result.isError, true);
-    assert.equal(result.structuredContent.error.code, name === "worker_spawn" ? "E_CAPABILITY" : "E_USAGE");
+    assert.equal(result.structuredContent.error.code, expectedCode);
     assert.equal(serviceCreated, false);
   }
 });
 
-test("spawn revalidates the live receipt before authority or service admission", async () => {
+test("every admission tool revalidates the live receipt before authority or service admission", async () => {
   const unavailable = [
     ["expired", null],
     ["cleared", null],
     ["binary-drift", null],
     ["digest-drift", { ...SPAWN_RECEIPT, capabilityDigest: "b".repeat(64) }]
   ];
+  const calls = [
+    ["worker_spawn", {
+      idempotencyKey: "live-receipt-spawn-0001",
+      userRequest: "Must not be admitted"
+    }],
+    ["worker_decide_host_action", {
+      id: "task-aaaaaaaaaaaaaaaa",
+      requestId: "har-aaaaaaaaaaaaaaaaaaaaaaaa",
+      decision: "grant",
+      idempotencyKey: "live-receipt-decision-0001"
+    }],
+    ["worker_followup", {
+      id: "task-aaaaaaaaaaaaaaaa",
+      grantId: "hag-aaaaaaaaaaaaaaaaaaaaaaaa",
+      message: "Must not be admitted",
+      idempotencyKey: "live-receipt-followup-0001"
+    }]
+  ];
   for (const [label, currentReceipt] of unavailable) {
-    let authorityResolved = false;
-    let serviceCreated = false;
-    const result = await callWorkerTool({
-      name: "worker_spawn",
-      arguments: {
-        idempotencyKey: `live-receipt-${label}-0001`,
-        userRequest: "Must not be admitted"
-      }
-    }, {
-      runtime: SPAWN_RUNTIME,
-      readProviderCapabilityReceipt: () => currentReceipt,
-      resolveAuthority() {
-        authorityResolved = true;
-        return PRINCIPAL;
-      },
-      createService() {
-        serviceCreated = true;
-        throw new Error("invalid live receipt must not reach service");
-      }
-    });
-    assert.equal(result.isError, true, label);
-    assert.equal(result.structuredContent.error.code, "E_CAPABILITY", label);
-    assert.equal(authorityResolved, false, label);
-    assert.equal(serviceCreated, false, label);
+    for (const [name, arguments_] of calls) {
+      let authorityResolved = false;
+      let serviceCreated = false;
+      const result = await callWorkerTool({
+        name,
+        arguments: arguments_
+      }, {
+        runtime: SPAWN_RUNTIME,
+        readProviderCapabilityReceipt: () => currentReceipt,
+        resolveAuthority() {
+          authorityResolved = true;
+          return PRINCIPAL;
+        },
+        createService() {
+          serviceCreated = true;
+          throw new Error("invalid live receipt must not reach service");
+        }
+      });
+      assert.equal(result.isError, true, `${label}:${name}`);
+      assert.equal(result.structuredContent.error.code, "E_CAPABILITY", `${label}:${name}`);
+      assert.equal(authorityResolved, false, `${label}:${name}`);
+      assert.equal(serviceCreated, false, `${label}:${name}`);
+    }
   }
 });
 
@@ -228,6 +315,18 @@ test("MCP calls fail closed without metadata and reject identity or root spoof a
 });
 
 test("MCP calls enforce the advertised input schemas without Boolean coercion", async () => {
+  const privateAuthorityFields = [
+    "requestDigest",
+    "grantDigest",
+    "roleId",
+    "profile",
+    "context",
+    "sessionId",
+    "resumeSessionId",
+    "root",
+    "providerHomeId",
+    "lineageWorkerId"
+  ];
   const invalid = [
     { name: "worker_list_owned", arguments: { extra: true } },
     { name: "worker_get", arguments: { id: "" } },
@@ -261,9 +360,67 @@ test("MCP calls enforce the advertised input schemas without Boolean coercion", 
       arguments: { idempotencyKey: "schema-0005", userRequest: "valid", roleId: "reviewer" }
     },
     {
+      name: "worker_decide_host_action",
+      arguments: {
+        id: "task-aaaaaaaaaaaaaaaa",
+        requestId: "",
+        decision: "grant",
+        idempotencyKey: "schema-decision-0001"
+      }
+    },
+    {
+      name: "worker_decide_host_action",
+      arguments: {
+        id: "task-aaaaaaaaaaaaaaaa",
+        requestId: "har-aaaaaaaaaaaaaaaaaaaaaaaa",
+        decision: "allow",
+        idempotencyKey: "schema-decision-0002"
+      }
+    },
+    {
+      name: "worker_followup",
+      arguments: {
+        id: "task-aaaaaaaaaaaaaaaa",
+        grantId: "",
+        message: "review",
+        idempotencyKey: "schema-followup-0001"
+      }
+    },
+    {
+      name: "worker_followup",
+      arguments: {
+        id: "task-aaaaaaaaaaaaaaaa",
+        grantId: "hag-aaaaaaaaaaaaaaaaaaaaaaaa",
+        message: "",
+        idempotencyKey: "schema-followup-0002"
+      }
+    },
+    {
       name: "worker_send",
       arguments: { id: "task-aaaaaaaaaaaaaaaa", idempotencyKey: "schema-0004", message: "" }
-    }
+    },
+    ...privateAuthorityFields.flatMap((field) => ([
+      {
+        name: "worker_decide_host_action",
+        arguments: {
+          id: "task-aaaaaaaaaaaaaaaa",
+          requestId: "har-aaaaaaaaaaaaaaaaaaaaaaaa",
+          decision: "grant",
+          idempotencyKey: "schema-decision-hostile",
+          [field]: "caller-controlled"
+        }
+      },
+      {
+        name: "worker_followup",
+        arguments: {
+          id: "task-aaaaaaaaaaaaaaaa",
+          grantId: "hag-aaaaaaaaaaaaaaaaaaaaaaaa",
+          message: "review",
+          idempotencyKey: "schema-followup-hostile",
+          [field]: "caller-controlled"
+        }
+      }
+    ]))
   ];
   for (const request of invalid) {
     let serviceCreated = false;
@@ -342,6 +499,87 @@ test("MCP calls enforce the advertised input schemas without Boolean coercion", 
   });
   assert.equal(unicodeValid.isError, undefined);
   assert.equal(observed.userRequest, unicodeRequest);
+});
+
+test("MCP exposes only bounded host-action decisions and grant-bound follow-up handles", async () => {
+  const privateDigest = "d".repeat(64);
+  let decisionArgs = null;
+  let followupArgs = null;
+  const options = {
+    ...LIVE_SPAWN_OPTIONS,
+    resolveAuthority: () => PRINCIPAL,
+    createService: () => ({
+      decideRoleAdmission(args) {
+        decisionArgs = args;
+        return {
+          workerId: args.id,
+          requestId: args.requestId,
+          requestDigest: privateDigest,
+          requestedRoleId: "reviewer",
+          decision: "grant",
+          decidedAt: "2026-07-23T00:00:00.000Z",
+          application: "future-admission-only",
+          applied: false,
+          grant: {
+            grantId: "hag-aaaaaaaaaaaaaaaaaaaaaaaa",
+            grantDigest: privateDigest,
+            requestedRoleId: "reviewer",
+            targetRoleDigest: privateDigest,
+            targetRuntimeRolePolicyDigest: privateDigest,
+            application: "future-admission-only",
+            applied: false,
+            consumable: true
+          },
+          replayed: false
+        };
+      },
+      followup(args) {
+        followupArgs = args;
+        return {
+          handle: { id: "task-bbbbbbbbbbbbbbbb" },
+          replayed: false,
+          spawnSuccessDefinition: "durable-job-commit",
+          providerLaunchState: "pending",
+          providerLaunched: false
+        };
+      }
+    })
+  };
+  const decided = await callWorkerTool({
+    name: "worker_decide_host_action",
+    arguments: {
+      id: "task-aaaaaaaaaaaaaaaa",
+      requestId: "har-aaaaaaaaaaaaaaaaaaaaaaaa",
+      decision: "grant",
+      idempotencyKey: "mcp-decision-0001"
+    }
+  }, options);
+  assert.deepEqual(decisionArgs, {
+    id: "task-aaaaaaaaaaaaaaaa",
+    requestId: "har-aaaaaaaaaaaaaaaaaaaaaaaa",
+    decision: "grant",
+    idempotencyKey: "mcp-decision-0001"
+  });
+  assert.equal(decided.structuredContent.decision.grant.grantId, "hag-aaaaaaaaaaaaaaaaaaaaaaaa");
+  assert.equal(JSON.stringify(decided).includes(privateDigest), false);
+
+  const followed = await callWorkerTool({
+    name: "worker_followup",
+    arguments: {
+      id: "task-aaaaaaaaaaaaaaaa",
+      grantId: "hag-aaaaaaaaaaaaaaaaaaaaaaaa",
+      message: "Review the completed result",
+      idempotencyKey: "mcp-followup-0001"
+    }
+  }, options);
+  assert.deepEqual(followupArgs, {
+    id: "task-aaaaaaaaaaaaaaaa",
+    grantId: "hag-aaaaaaaaaaaaaaaaaaaaaaaa",
+    message: "Review the completed result",
+    idempotencyKey: "mcp-followup-0001"
+  });
+  assert.equal(followed.structuredContent.worker.id, "task-bbbbbbbbbbbbbbbb");
+  assert.equal(followed.structuredContent.providerLaunched, false);
 });
 
 test("MCP broker routes owned reads and allowlists errors without private details", async () => {

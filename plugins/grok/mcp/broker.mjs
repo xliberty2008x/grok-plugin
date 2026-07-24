@@ -7,6 +7,7 @@ import { MAX_WORKER_WAIT_MS, createWorkerService } from "../scripts/lib/worker-s
 import {
   MCP_CAPABILITY_CONTRACT_VERSION,
   ROOT_READ_PROVIDER_CAPABILITY,
+  SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
   readValidProviderCapabilityReceipt
 } from "../scripts/lib/provider-capability.mjs";
 import { reconcileBrokerWorkers } from "../scripts/lib/worker-recovery.mjs";
@@ -161,20 +162,70 @@ export const WORKER_SPAWN_TOOL = deepFreeze({
   annotations: MUTATION_ANNOTATIONS
 });
 
-/** Complete root-read inventory; runtime advertisement may omit spawn. */
+export const WORKER_DECIDE_HOST_ACTION_TOOL = deepFreeze({
+  name: "worker_decide_host_action",
+  title: "Decide a Grok worker host action",
+  description: "Idempotently grant or deny the exact future read-only role admission requested by an owned terminal Grok worker.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["id", "requestId", "decision", "idempotencyKey"],
+    properties: {
+      id: WORKER_ID_SCHEMA,
+      requestId: { type: "string", minLength: 1, maxLength: 256 },
+      decision: { type: "string", enum: ["grant", "deny"] },
+      idempotencyKey: { type: "string", minLength: 8, maxLength: 256 }
+    }
+  },
+  annotations: MUTATION_ANNOTATIONS
+});
+
+export const WORKER_FOLLOWUP_TOOL = deepFreeze({
+  name: "worker_followup",
+  title: "Continue a Grok worker session",
+  description: "Idempotently commit one grant-bound read-only continuation in the exact provider session of an owned terminal Grok worker.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["id", "grantId", "message", "idempotencyKey"],
+    properties: {
+      id: WORKER_ID_SCHEMA,
+      grantId: { type: "string", minLength: 1, maxLength: 256 },
+      message: { type: "string", minLength: 1, maxLength: 16000 },
+      idempotencyKey: { type: "string", minLength: 8, maxLength: 256 }
+    }
+  },
+  annotations: MUTATION_ANNOTATIONS
+});
+
+/** Complete root-read continuation inventory; runtime advertisement is atomic. */
 export const WORKER_TOOLS = deepFreeze([
   ...BASE_WORKER_TOOLS.slice(0, -1),
   WORKER_SPAWN_TOOL,
+  WORKER_DECIDE_HOST_ACTION_TOOL,
+  WORKER_FOLLOWUP_TOOL,
   BASE_WORKER_TOOLS.at(-1)
 ]);
 
 const MUTATION_AUTHORITY_TOOLS = new Set([
   "worker_wait",
   "worker_spawn",
+  "worker_decide_host_action",
+  "worker_followup",
   "worker_cancel"
 ]);
 
 const SHA256_HEX = /^[a-f0-9]{64}$/;
+
+function validProviderCapabilityReceipt(receipt) {
+  return Boolean(
+    SHA256_HEX.test(receipt?.capabilityDigest || "")
+    && Array.isArray(receipt?.capabilities)
+    && receipt.capabilities.length === 2
+    && receipt.capabilities[0] === ROOT_READ_PROVIDER_CAPABILITY
+    && receipt.capabilities[1] === SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+  );
+}
 
 export function createMcpBrokerRuntime({
   env = process.env,
@@ -183,9 +234,7 @@ export function createMcpBrokerRuntime({
   const receipt = providerCapabilityReceipt === undefined
     ? readValidProviderCapabilityReceipt({ env })
     : providerCapabilityReceipt;
-  const providerCapabilityDigest = SHA256_HEX.test(receipt?.capabilityDigest || "")
-    && Array.isArray(receipt?.capabilities)
-    && receipt.capabilities.includes(ROOT_READ_PROVIDER_CAPABILITY)
+  const providerCapabilityDigest = validProviderCapabilityReceipt(receipt)
     ? receipt.capabilityDigest
     : null;
   const tools = deepFreeze(providerCapabilityDigest
@@ -212,7 +261,8 @@ function currentProviderCapabilityDigest(runtime, options) {
     const readReceipt = options?.readProviderCapabilityReceipt
       || readValidProviderCapabilityReceipt;
     const receipt = readReceipt({ env: options?.env || process.env });
-    return receipt?.capabilityDigest === runtime.providerCapabilityDigest
+    return validProviderCapabilityReceipt(receipt)
+      && receipt.capabilityDigest === runtime.providerCapabilityDigest
       ? receipt.capabilityDigest
       : null;
   } catch {
@@ -338,14 +388,14 @@ export async function callWorkerTool(params, options = {}) {
   const name = params?.name;
   const runtime = brokerRuntime(options);
   if (!runtime.tools.some((tool) => tool.name === name)) {
-    return name === "worker_spawn"
+    return ["worker_spawn", "worker_decide_host_action", "worker_followup"].includes(name)
       ? toolResult({ code: "E_CAPABILITY", message: "Required worker broker capability is unavailable." }, true)
       : toolResult({ code: "E_USAGE", message: "Invalid worker broker request." }, true);
   }
   // tools/list is frozen for the MCP process lifetime, but provider readiness
   // is not. Revalidate immediately before any new admission and again inside
   // the service so expiry, setup revocation, or binary/profile drift fail closed.
-  if (name === "worker_spawn"
+  if (["worker_spawn", "worker_decide_host_action", "worker_followup"].includes(name)
     && currentProviderCapabilityDigest(runtime, options) === null) {
     return toolResult({
       code: "E_CAPABILITY",
@@ -401,6 +451,50 @@ export async function callWorkerTool(params, options = {}) {
         providerLaunched: spawned.providerLaunched
       });
     }
+    if (name === "worker_decide_host_action") {
+      const decided = service.decideRoleAdmission({
+        id: args.id,
+        requestId: args.requestId,
+        decision: args.decision,
+        idempotencyKey: args.idempotencyKey
+      });
+      return toolResult({
+        decision: {
+          workerId: decided.workerId,
+          requestId: decided.requestId,
+          requestedRoleId: decided.requestedRoleId,
+          decision: decided.decision,
+          decidedAt: decided.decidedAt,
+          application: decided.application,
+          applied: decided.applied,
+          grant: decided.grant
+            ? {
+                grantId: decided.grant.grantId,
+                requestedRoleId: decided.grant.requestedRoleId,
+                application: decided.grant.application,
+                applied: decided.grant.applied,
+                consumable: decided.grant.consumable
+              }
+            : null,
+          replayed: decided.replayed
+        }
+      });
+    }
+    if (name === "worker_followup") {
+      const followed = service.followup({
+        id: args.id,
+        grantId: args.grantId,
+        message: args.message,
+        idempotencyKey: args.idempotencyKey
+      });
+      return toolResult({
+        worker: followed.handle,
+        replayed: followed.replayed,
+        spawnSuccessDefinition: followed.spawnSuccessDefinition,
+        providerLaunchState: followed.providerLaunchState,
+        providerLaunched: followed.providerLaunched
+      });
+    }
     if (name === "worker_cancel") {
       const cancelled = service.cancel({
         id: args.id,
@@ -431,7 +525,7 @@ export async function handleMcpRequest(message, options = {}) {
             experimental: CODEX_MCP_EXPERIMENTAL_CAPABILITIES
           },
           serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
-          instructions: "Task-owned Grok worker broker (structured list/get/events/wait/result/cancel, plus read-only spawn only when advertised). Grok workers are external, not native host subagents. Host verification is not trusted or promoted by this MCP surface.",
+          instructions: "Task-owned Grok worker broker (structured list/get/events/wait/result/cancel, plus read-only spawn and exact grant-bound same-session follow-up only when advertised). Grok workers are external, not native host subagents. Host verification is not trusted or promoted by this MCP surface.",
           _meta: {
             "grok/capability-matrix": capability,
             "grok/capabilityDigest": runtime.providerCapabilityDigest,

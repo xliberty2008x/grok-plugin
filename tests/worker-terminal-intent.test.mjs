@@ -4,7 +4,6 @@ import path from "node:path";
 import process from "node:process";
 import test from "node:test";
 
-import { followupWorker } from "../plugins/grok/scripts/lib/worker-mailbox.mjs";
 import { reconcileBrokerWorkers } from "../plugins/grok/scripts/lib/worker-recovery.mjs";
 import {
   cancelWorker,
@@ -297,15 +296,24 @@ test("a stale recovery actor cannot clean a newly admitted same-lineage continua
   assert.equal(cleanupCalls, 1);
   assert.equal(fs.existsSync(credential), false);
 
-  const followup = followupWorker({
+  const continuation = spawnReadOnlyWorker({
     root: fixture.root,
     principal: principal(fixture.root),
-    workerId: fixture.workerId,
-    message: "Continue after the recovered result",
+    envelope: buildTaskEnvelope({
+      userRequest: "Continue after the recovered result",
+      mode: "read"
+    }),
     idempotencyKey: "terminal-cleanup-followup-0001",
     env: fixture.env
   });
-  const child = tryReadJob(fixture.root, followup.handle.id, fixture.env);
+  updateJob(fixture.root, continuation.handle.id, (job) => ({
+    ...job,
+    request: {
+      ...job.request,
+      providerHomeId: fixture.workerId
+    }
+  }), fixture.env);
+  const child = tryReadJob(fixture.root, continuation.handle.id, fixture.env);
   assert.equal(child.request.providerHomeId, fixture.workerId);
   fs.writeFileSync(credential, "{\"continuation\":true}\n", { mode: 0o600 });
 

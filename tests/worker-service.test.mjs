@@ -8,13 +8,19 @@ import { WORKER_SPAWN_TOOL } from "../plugins/grok/mcp/broker.mjs";
 import { resolveWorkerAuthority } from "../plugins/grok/scripts/lib/worker-authority.mjs";
 import {
   assertTaskEnvelope,
-  buildTaskEnvelope
+  buildTaskEnvelope,
+  captureContextManifest
 } from "../plugins/grok/scripts/lib/task-contract.mjs";
-import { tryReadJob } from "../plugins/grok/scripts/lib/state.mjs";
+import {
+  attachHostActionRequestToJob,
+  readHostActionRequestBinding
+} from "../plugins/grok/scripts/lib/worker-host-actions.mjs";
+import { tryReadJob, updateJob } from "../plugins/grok/scripts/lib/state.mjs";
 import { createWorkerService } from "../plugins/grok/scripts/lib/worker-service.mjs";
 import {
   claimWorkerDispatch,
-  providerLaunchState
+  providerLaunchState,
+  spawnReadOnlyWorker
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import { materializeRole } from "../plugins/grok/scripts/lib/worker-roles.mjs";
 import { workspaceStateSegment } from "../plugins/grok/scripts/lib/workspace.mjs";
@@ -23,6 +29,8 @@ import { initRepo, tempDir } from "./helpers.mjs";
 const THREAD_A = "019f666a-6469-7cc1-9a8d-8c1adf61e103";
 const THREAD_B = "019f666b-1e72-74b1-b27c-9d186d7f1016";
 const TURN_ID = "019f666e-4084-7902-8447-249f72043a37";
+const FOLLOWUP_ATTEMPT = "e".repeat(32);
+const FOLLOWUP_SESSION = "019f918e-9a33-7781-b96a-2b2ddc635be1";
 
 function metadata(cwd, overrides = {}) {
   const value = {
@@ -88,6 +96,94 @@ function stateFixture(root) {
     write(job) {
       fs.writeFileSync(path.join(jobs, `${job.id}.json`), `${JSON.stringify(job)}\n`, { mode: 0o600 });
     }
+  };
+}
+
+function awaitingRoleAdmissionParent(root, env) {
+  const principal = resolveWorkerAuthority(metadata(root), { mutation: true });
+  const admitted = spawnReadOnlyWorker({
+    root,
+    principal,
+    envelope: buildTaskEnvelope({ userRequest: "Service follow-up parent", mode: "read" }),
+    contextManifest: captureContextManifest(root),
+    idempotencyKey: "service-followup-parent-0001",
+    env
+  });
+  const workerId = admitted.handle.id;
+  const at = new Date().toISOString();
+  updateJob(root, workerId, (current) => {
+    const active = {
+      ...current,
+      status: "running",
+      phase: "finalizing",
+      workerProcess: {
+        pid: 997_991,
+        startToken: "service-worker-start",
+        processGroupId: process.platform === "win32" ? null : 997_991,
+        commandMarker: workerId,
+        dispatchAttemptId: FOLLOWUP_ATTEMPT,
+        dispatchFence: 1,
+        nonce: "service-worker-nonce"
+      },
+      providerProcess: {
+        pid: 997_992,
+        startToken: "service-provider-start",
+        processGroupId: process.platform === "win32" ? null : 997_992,
+        commandMarker: workerId,
+        dispatchAttemptId: FOLLOWUP_ATTEMPT,
+        dispatchFence: 1,
+        providerGeneration: 1
+      },
+      request: {
+        ...current.request,
+        spawn: {
+          ...current.request.spawn,
+          dispatch: {
+            ...current.request.spawn.dispatch,
+            state: "provider-started",
+            attemptId: FOLLOWUP_ATTEMPT,
+            fence: 1,
+            lease: null,
+            providerGeneration: 1,
+            nextProviderGeneration: null,
+            claimedAt: at,
+            controllerStartedAt: at,
+            workerStartedAt: at,
+            providerStartedAt: at,
+            updatedAt: at
+          },
+          consumedLaunchContractDigest: "d".repeat(64),
+          launchContractConsumedAt: at
+        }
+      }
+    };
+    return {
+      ...attachHostActionRequestToJob(active, {
+        providerRequest: {
+          schemaVersion: 1,
+          kind: "role_admission",
+          requestedRoleId: "security"
+        },
+        dispatchAttemptId: FOLLOWUP_ATTEMPT,
+        dispatchFence: 1,
+        providerGeneration: 1,
+        providerSessionId: FOLLOWUP_SESSION
+      }),
+      grokSessionId: FOLLOWUP_SESSION,
+      status: "completed",
+      phase: "done",
+      completedAt: at,
+      completionContextManifest: captureContextManifest(root),
+      result: {
+        hostVerification: "not_run",
+        taskRuntimeCleaned: true
+      }
+    };
+  }, env);
+  return {
+    principal,
+    workerId,
+    binding: readHostActionRequestBinding(tryReadJob(root, workerId, env))
   };
 }
 
@@ -605,4 +701,123 @@ test("worker service validates caller envelopes and delegates canonical context 
     (error) => error?.code === "E_SCHEMA"
   );
   assert.equal(dispatches, 1);
+});
+
+test("WorkerService resolves private decision bindings after owner authorization and starts a grant-bound followup", () => {
+  const root = initRepo();
+  const fixture = stateFixture(root);
+  const parent = awaitingRoleAdmissionParent(root, fixture.env);
+  const capabilityDigest = "a".repeat(64);
+  let validations = 0;
+  let dispatches = 0;
+  const service = createWorkerService({
+    root,
+    principal: parent.principal,
+    env: fixture.env,
+    providerCapabilityDigest: capabilityDigest,
+    validateProviderCapability() {
+      validations += 1;
+      return capabilityDigest;
+    },
+    allowUnboundDispatch: false,
+    dispatchWorker({ workerId }) {
+      dispatches += 1;
+      const job = tryReadJob(root, workerId, fixture.env);
+      assert.equal(job.request.spawn.dispatch.state, "pending");
+      return { providerLaunchState: "pending", providerLaunched: false };
+    }
+  });
+  const decision = service.decideRoleAdmission({
+    id: parent.workerId,
+    requestId: parent.binding.requestId,
+    decision: "grant",
+    idempotencyKey: "service-role-decision-0001"
+  });
+  assert.equal(decision.grant.requestedRoleId, "security");
+  assert.equal(Object.hasOwn(decision, "requestDigest"), false);
+
+  const followup = service.followup({
+    id: parent.workerId,
+    grantId: decision.grant.grantId,
+    message: "Perform the bounded security review",
+    idempotencyKey: "service-role-followup-0001"
+  });
+  assert.equal(followup.providerLaunchState, "pending");
+  assert.equal(followup.providerLaunched, false);
+  assert.equal(dispatches, 1);
+  assert.equal(validations, 3);
+  const child = tryReadJob(root, followup.handle.id, fixture.env);
+  assert.equal(child.role.id, "security");
+  assert.equal(child.request.resumeSessionId, FOLLOWUP_SESSION);
+  assert.equal(child.request.spawn.providerCapabilityDigest, capabilityDigest);
+});
+
+test("WorkerService preserves a committed followup outbox when capability expires at dispatch", () => {
+  const root = initRepo();
+  const fixture = stateFixture(root);
+  const parent = awaitingRoleAdmissionParent(root, fixture.env);
+  const capabilityDigest = "b".repeat(64);
+  let validations = 0;
+  let dispatches = 0;
+  const service = createWorkerService({
+    root,
+    principal: parent.principal,
+    env: fixture.env,
+    providerCapabilityDigest: capabilityDigest,
+    validateProviderCapability() {
+      validations += 1;
+      return validations <= 2 ? capabilityDigest : null;
+    },
+    allowUnboundDispatch: false,
+    dispatchWorker() {
+      dispatches += 1;
+      return { providerLaunchState: "pending", providerLaunched: false };
+    }
+  });
+  const decision = service.decideRoleAdmission({
+    id: parent.workerId,
+    requestId: parent.binding.requestId,
+    decision: "grant",
+    idempotencyKey: "service-role-decision-race"
+  });
+  const followup = service.followup({
+    id: parent.workerId,
+    grantId: decision.grant.grantId,
+    message: "Preserve this continuation if readiness expires",
+    idempotencyKey: "service-role-followup-race"
+  });
+  assert.equal(validations, 3);
+  assert.equal(dispatches, 0);
+  assert.equal(followup.providerLaunchState, "pending");
+  assert.equal(
+    tryReadJob(root, followup.handle.id, fixture.env).request.spawn.dispatch.state,
+    "pending"
+  );
+});
+
+test("WorkerService does not persist a role decision after provider capability expiry", () => {
+  const root = initRepo();
+  const fixture = stateFixture(root);
+  const parent = awaitingRoleAdmissionParent(root, fixture.env);
+  const capabilityDigest = "c".repeat(64);
+  const service = createWorkerService({
+    root,
+    principal: parent.principal,
+    env: fixture.env,
+    providerCapabilityDigest: capabilityDigest,
+    validateProviderCapability: () => null,
+    allowUnboundDispatch: false
+  });
+  assert.throws(
+    () => service.decideRoleAdmission({
+      id: parent.workerId,
+      requestId: parent.binding.requestId,
+      decision: "grant",
+      idempotencyKey: "service-expired-decision-0001"
+    }),
+    (error) => error?.code === "E_CAPABILITY"
+  );
+  const stored = tryReadJob(root, parent.workerId, fixture.env);
+  assert.equal(stored.hostAction.decision, null);
+  assert.equal(stored.hostAction.grant, null);
 });

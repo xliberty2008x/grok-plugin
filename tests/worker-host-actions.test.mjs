@@ -7,7 +7,8 @@ import crypto from "node:crypto";
 
 import {
   buildTaskEnvelope,
-  buildWorkerReport
+  buildWorkerReport,
+  captureContextManifest
 } from "../plugins/grok/scripts/lib/task-contract.mjs";
 import {
   attachHostActionRequestToJob,
@@ -20,10 +21,19 @@ import {
 import {
   resolveWorkerAuthority
 } from "../plugins/grok/scripts/lib/worker-authority.mjs";
-import { spawnReadOnlyWorker } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
+import {
+  assertDispatchContract,
+  assertDurableSpawnRequestBinding,
+  assertFollowupAdmissionBinding,
+  claimWorkerDispatch,
+  spawnGrantedFollowupWorker,
+  spawnReadOnlyWorker
+} from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
 import { projectWorkerSnapshot } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
 import {
+  listJobs,
+  retain,
   tryReadJob,
   updateJob
 } from "../plugins/grok/scripts/lib/state.mjs";
@@ -225,6 +235,126 @@ function decide(fixture, overrides = {}) {
     env: fixture.env,
     ...overrides
   });
+}
+
+function admittedFollowupFixture() {
+  const fixture = providerStartedJob();
+  const decision = decide(fixture);
+  const finalContext = captureContextManifest(fixture.root);
+  updateJob(fixture.root, fixture.workerId, (job) => ({
+    ...job,
+    completionContextManifest: finalContext,
+    result: {
+      ...(job.result || {}),
+      hostVerification: "not_run",
+      taskRuntimeCleaned: true
+    }
+  }), fixture.env);
+  const admitted = spawnGrantedFollowupWorker({
+    root: fixture.root,
+    principal: authority(fixture.root),
+    workerId: fixture.workerId,
+    grantId: decision.grant.grantId,
+    message: "Inspect the completed result as reviewer",
+    idempotencyKey: "host-action-followup-0001",
+    providerCapabilityDigest: "c".repeat(64),
+    env: fixture.env
+  });
+  return {
+    ...fixture,
+    decision,
+    finalContext,
+    childId: admitted.handle.id,
+    child: tryReadJob(fixture.root, admitted.handle.id, fixture.env)
+  };
+}
+
+function completeWorkerWithHostAction(fixture, workerId, {
+  requestedRoleId = "reviewer",
+  sessionId = SESSION,
+  attemptId = "e".repeat(32)
+} = {}) {
+  const finalContext = captureContextManifest(fixture.root);
+  const completed = updateJob(fixture.root, workerId, (current) => {
+    const at = new Date().toISOString();
+    const nonce = current.workerAuthorization?.nonce || "followup-worker-nonce";
+    const consumedLaunchContractDigest = current.workerAuthorization?.launchContractDigest
+      || current.request.spawn.consumedLaunchContractDigest;
+    const active = {
+      ...current,
+      status: "running",
+      phase: "finalizing",
+      workerAuthorization: null,
+      workerProcess: {
+        pid: 999_971,
+        startToken: `followup-worker-${workerId}`,
+        processGroupId: process.platform === "win32" ? null : 999_971,
+        commandMarker: workerId,
+        dispatchAttemptId: attemptId,
+        dispatchFence: 1,
+        nonce
+      },
+      providerProcess: {
+        pid: 999_972,
+        startToken: `followup-provider-${workerId}`,
+        processGroupId: process.platform === "win32" ? null : 999_972,
+        commandMarker: workerId,
+        dispatchAttemptId: attemptId,
+        dispatchFence: 1,
+        providerGeneration: 1
+      },
+      request: {
+        ...current.request,
+        spawn: {
+          ...current.request.spawn,
+          consumedLaunchContractDigest,
+          launchContractConsumedAt: at,
+          providerLaunchPending: false,
+          providerLaunchInFlight: false,
+          providerLaunchOutcome: "launched",
+          providerLaunchCompletedAt: at,
+          dispatch: {
+            ...current.request.spawn.dispatch,
+            state: "provider-started",
+            attemptId,
+            fence: 1,
+            lease: null,
+            providerGeneration: 1,
+            nextProviderGeneration: null,
+            claimedAt: at,
+            controllerStartedAt: at,
+            workerStartedAt: at,
+            providerStartedAt: at,
+            updatedAt: at
+          }
+        }
+      }
+    };
+    return {
+      ...attachHostActionRequestToJob(active, {
+        providerRequest: {
+          schemaVersion: 1,
+          kind: "role_admission",
+          requestedRoleId
+        },
+        dispatchAttemptId: attemptId,
+        dispatchFence: 1,
+        providerGeneration: 1,
+        providerSessionId: sessionId
+      }),
+      grokSessionId: sessionId,
+      status: "completed",
+      phase: "done",
+      completedAt: at,
+      completionContextManifest: finalContext,
+      result: {
+        ...(current.result || {}),
+        hostVerification: "not_run",
+        taskRuntimeCleaned: true
+      }
+    };
+  }, fixture.env);
+  return { completed, finalContext };
 }
 
 function sidecarPath(fixture, key) {
@@ -682,4 +812,410 @@ test("deny is durable and never creates a grant", () => {
   const job = tryReadJob(fixture.root, fixture.workerId, fixture.env);
   assert.equal(job.hostAction.grant, null);
   assert.equal(projectWorkerSnapshot(job).awaitingHostAction.status, "denied");
+});
+
+test("a granted role admits one child with a child-bound receipt and normal launch outbox", () => {
+  const fixture = admittedFollowupFixture();
+  const { child, decision, finalContext } = fixture;
+  assert.equal(child.request.providerHomeId, fixture.workerId);
+  assert.equal(child.request.resumeJobId, fixture.workerId);
+  assert.equal(child.request.resumeSessionId, SESSION);
+  assert.equal(child.role.id, "reviewer");
+  assert.equal(child.request.contextReceipt.lineageWorkerId, child.id);
+  assert.equal(child.request.contextManifest.digest, finalContext.digest);
+  assert.equal(child.request.spawn.dispatch.state, "pending");
+  assert.equal(child.request.spawn.providerCapabilityDigest, "c".repeat(64));
+  assert.doesNotThrow(() => assertFollowupAdmissionBinding(child, {
+    root: fixture.root,
+    env: fixture.env
+  }));
+  assert.doesNotThrow(() => assertDispatchContract(child));
+  assert.doesNotThrow(() => assertDurableSpawnRequestBinding(child, fixture.env));
+
+  const publicChild = projectWorkerSnapshot(child);
+  assert.equal(publicChild.id, child.id);
+  assert.equal(publicChild.parentWorkerId, fixture.workerId);
+  assert.equal(publicChild.lineageWorkerId, fixture.workerId);
+  assert.equal(publicChild.contextReceipt.lineageWorkerId, child.id);
+  const serialized = JSON.stringify(publicChild);
+  for (const secret of [
+    SESSION,
+    decision.grant.grantId,
+    child.request.followup.grantDigest,
+    "Inspect the completed result as reviewer"
+  ]) {
+    assert.equal(serialized.includes(secret), false);
+  }
+
+  const followupSidecar = path.join(
+    workspaceState(fixture.root, fixture.env),
+    "idempotency",
+    "followup",
+    `${crypto.createHash("sha256").update("host-action-followup-0001").digest("hex")}.json`
+  );
+  assert.equal(fs.existsSync(followupSidecar), true);
+  fs.unlinkSync(followupSidecar);
+  const replay = spawnGrantedFollowupWorker({
+    root: fixture.root,
+    principal: authority(fixture.root),
+    workerId: fixture.workerId,
+    grantId: decision.grant.grantId,
+    message: "Inspect the completed result as reviewer",
+    idempotencyKey: "host-action-followup-0001",
+    providerCapabilityDigest: "c".repeat(64),
+    env: fixture.env
+  });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.handle.id, child.id);
+  assert.equal(fs.existsSync(followupSidecar), true);
+  const equivalentVerificationContext = captureContextManifest(fixture.root);
+  assert.equal(equivalentVerificationContext.digest, finalContext.digest);
+  updateJob(fixture.root, fixture.workerId, (parent) => ({
+    ...parent,
+    verificationContextManifest: equivalentVerificationContext
+  }), fixture.env);
+  const replayAfterVerification = spawnGrantedFollowupWorker({
+    root: fixture.root,
+    principal: authority(fixture.root),
+    workerId: fixture.workerId,
+    grantId: decision.grant.grantId,
+    message: "Inspect the completed result as reviewer",
+    idempotencyKey: "host-action-followup-0001",
+    providerCapabilityDigest: "c".repeat(64),
+    env: fixture.env
+  });
+  assert.equal(replayAfterVerification.replayed, true);
+  assert.equal(replayAfterVerification.handle.id, child.id);
+  const beforeCapabilityDrift = listJobs(fixture.root, fixture.env);
+  assert.throws(
+    () => spawnGrantedFollowupWorker({
+      root: fixture.root,
+      principal: authority(fixture.root),
+      workerId: fixture.workerId,
+      grantId: decision.grant.grantId,
+      message: "Inspect the completed result as reviewer",
+      idempotencyKey: "host-action-followup-0001",
+      providerCapabilityDigest: "d".repeat(64),
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_CONTEXT_DRIFT"
+  );
+  const afterCapabilityDrift = listJobs(fixture.root, fixture.env);
+  assert.equal(afterCapabilityDrift.length, beforeCapabilityDrift.length);
+  assert.equal(
+    tryReadJob(fixture.root, child.id, fixture.env).request.spawn.dispatch.state,
+    "pending"
+  );
+  assert.equal(
+    tryReadJob(fixture.root, child.id, fixture.env).request.spawn.dispatch.fence,
+    0
+  );
+  assert.throws(
+    () => spawnGrantedFollowupWorker({
+      root: fixture.root,
+      principal: authority(fixture.root),
+      workerId: fixture.workerId,
+      grantId: decision.grant.grantId,
+      message: "Different follow-up",
+      idempotencyKey: "host-action-followup-0002",
+      providerCapabilityDigest: "c".repeat(64),
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_IDEMPOTENCY_CONFLICT"
+  );
+  const claim = claimWorkerDispatch({
+    root: fixture.root,
+    workerId: child.id,
+    principal: authority(fixture.root),
+    env: fixture.env
+  });
+  assert.equal(claim.claimed, true);
+  assert.equal(claim.job.request.spawn.dispatch.state, "claimed");
+});
+
+test("followup witness, session, context, grant, role, policy, receipt, and prompt tamper fail before claim", () => {
+  const cases = [
+    ["witness", ({ child }) => {
+      child.request.followup.witnessDigest = "0".repeat(64);
+    }],
+    ["resume session", ({ child }) => {
+      child.request.resumeSessionId = "019f918e-9a33-7781-b96a-2b2ddc635be9";
+    }],
+    ["final context", ({ parent }) => {
+      parent.completionContextManifest.digest = "0".repeat(64);
+    }],
+    ["grant", ({ parent }) => {
+      parent.hostAction.grant.grantDigest = "0".repeat(64);
+    }],
+    ["role", ({ child }) => {
+      child.role.digest = "0".repeat(64);
+    }],
+    ["runtime policy", ({ child }) => {
+      child.request.runtimeRolePolicy.digest = "0".repeat(64);
+    }],
+    ["context receipt", ({ child }) => {
+      child.request.contextReceipt.receiptDigest = "0".repeat(64);
+    }],
+    ["provider prompt", ({ child }) => {
+      child.request.providerPromptDigest = "0".repeat(64);
+    }],
+    ["consumed launch digest", ({ child }) => {
+      child.request.spawn.consumedLaunchContractDigest = "0".repeat(64);
+    }],
+    ["launch consumption timestamp", ({ child }) => {
+      child.request.spawn.launchContractConsumedAt = "2030-01-01T00:00:00.000Z";
+    }],
+    ["dispatch structure", ({ child }) => {
+      child.request.spawn.dispatch.unrecognizedAuthority = true;
+    }]
+  ];
+  for (const [label, mutate] of cases) {
+    const fixture = admittedFollowupFixture();
+    const child = structuredClone(fixture.child);
+    const parent = structuredClone(tryReadJob(fixture.root, fixture.workerId, fixture.env));
+    mutate({ child, parent });
+    updateJob(fixture.root, child.id, () => child, fixture.env);
+    updateJob(fixture.root, parent.id, () => parent, fixture.env);
+    const before = JSON.stringify(tryReadJob(fixture.root, child.id, fixture.env));
+    assert.throws(
+      () => claimWorkerDispatch({
+        root: fixture.root,
+        workerId: child.id,
+        principal: authority(fixture.root),
+        env: fixture.env
+      }),
+      (error) => [
+        "E_AUTH_REQUIRED",
+        "E_CONTEXT_DRIFT",
+        "E_PROCESS_IDENTITY",
+        "E_ROLE",
+        "E_STATE"
+      ].includes(error?.code),
+      label
+    );
+    assert.equal(
+      JSON.stringify(tryReadJob(fixture.root, child.id, fixture.env)),
+      before,
+      `${label} mutated the child before rejection`
+    );
+  }
+});
+
+test("plain and foreign callers cannot distinguish nonterminal, unclean, or missing parents", () => {
+  const fixture = providerStartedJob();
+  const decision = decide(fixture);
+  const finalContext = captureContextManifest(fixture.root);
+  const states = [
+    {
+      label: "nonterminal",
+      mutate: (job) => ({
+        ...job,
+        status: "running",
+        phase: "finalizing",
+        completedAt: null,
+        completionContextManifest: finalContext,
+        result: { ...(job.result || {}), taskRuntimeCleaned: false }
+      })
+    },
+    {
+      label: "unclean",
+      mutate: (job) => ({
+        ...job,
+        status: "completed",
+        phase: "done",
+        completedAt: new Date().toISOString(),
+        completionContextManifest: finalContext,
+        result: { ...(job.result || {}), taskRuntimeCleaned: false }
+      })
+    }
+  ];
+  for (const scenario of states) {
+    updateJob(fixture.root, fixture.workerId, scenario.mutate, fixture.env);
+    const input = {
+      root: fixture.root,
+      workerId: fixture.workerId,
+      grantId: decision.grant.grantId,
+      message: "Attempt a foreign continuation",
+      idempotencyKey: `foreign-opacity-${scenario.label}`,
+      providerCapabilityDigest: "c".repeat(64),
+      env: fixture.env
+    };
+    assert.throws(
+      () => spawnGrantedFollowupWorker({
+        ...input,
+        principal: spawnPrincipal(fixture.root)
+      }),
+      (error) => error?.code === "E_AUTH_REQUIRED",
+      `${scenario.label} plain principal`
+    );
+    assert.throws(
+      () => spawnGrantedFollowupWorker({
+        ...input,
+        principal: authority(fixture.root, { threadId: THREAD_B })
+      }),
+      (error) => error?.code === "E_JOB_NOT_FOUND",
+      `${scenario.label} foreign principal`
+    );
+  }
+  assert.throws(
+    () => spawnGrantedFollowupWorker({
+      root: fixture.root,
+      principal: authority(fixture.root, { threadId: THREAD_B }),
+      workerId: "task-ffffffffffffffff",
+      grantId: decision.grant.grantId,
+      message: "Attempt a missing continuation",
+      idempotencyKey: "foreign-opacity-missing",
+      providerCapabilityDigest: "c".repeat(64),
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_JOB_NOT_FOUND"
+  );
+});
+
+test("two-hop follow-up preserves root lineage, immediate resume identity, and transitive retention", () => {
+  const fixture = admittedFollowupFixture();
+  completeWorkerWithHostAction(fixture, fixture.childId, {
+    requestedRoleId: "test",
+    attemptId: "f".repeat(32)
+  });
+  const secondDecision = decide({
+    ...fixture,
+    workerId: fixture.childId
+  }, {
+    idempotencyKey: "host-action-decision-0002"
+  });
+  const second = spawnGrantedFollowupWorker({
+    root: fixture.root,
+    principal: authority(fixture.root),
+    workerId: fixture.childId,
+    grantId: secondDecision.grant.grantId,
+    message: "Run the second read-only verification hop",
+    idempotencyKey: "host-action-followup-0002",
+    providerCapabilityDigest: "c".repeat(64),
+    env: fixture.env
+  });
+  const grandchild = tryReadJob(fixture.root, second.handle.id, fixture.env);
+  assert.equal(grandchild.request.providerHomeId, fixture.workerId);
+  assert.equal(grandchild.request.resumeJobId, fixture.childId);
+  assert.equal(grandchild.request.resumeSessionId, SESSION);
+  assert.equal(grandchild.request.followup.parentWorkerId, fixture.childId);
+  assert.equal(grandchild.request.followup.lineageWorkerId, fixture.workerId);
+  assert.equal(grandchild.request.contextReceipt.lineageWorkerId, grandchild.id);
+  assert.equal(grandchild.role.id, "test");
+  assert.doesNotThrow(() => assertFollowupAdmissionBinding(grandchild, {
+    root: fixture.root,
+    env: fixture.env
+  }));
+
+  retain(fixture.root, 0, fixture.env);
+  const retainedIds = new Set(listJobs(fixture.root, fixture.env).map((job) => job.id));
+  assert.equal(retainedIds.has(fixture.workerId), true, "root lineage parent was pruned");
+  assert.equal(retainedIds.has(fixture.childId), true, "immediate parent was pruned");
+  assert.equal(retainedIds.has(grandchild.id), true, "active continuation was pruned");
+
+  const replay = spawnGrantedFollowupWorker({
+    root: fixture.root,
+    principal: authority(fixture.root),
+    workerId: fixture.childId,
+    grantId: secondDecision.grant.grantId,
+    message: "Run the second read-only verification hop",
+    idempotencyKey: "host-action-followup-0002",
+    providerCapabilityDigest: "c".repeat(64),
+    env: fixture.env
+  });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.handle.id, grandchild.id);
+  const claim = claimWorkerDispatch({
+    root: fixture.root,
+    workerId: grandchild.id,
+    principal: authority(fixture.root),
+    env: fixture.env
+  });
+  assert.equal(claim.claimed, true);
+});
+
+test("follow-up admission rejects exact consumed-launch and dispatch drift before child commit", () => {
+  const cases = [
+    ["consumed digest", (job) => {
+      job.request.spawn.consumedLaunchContractDigest = "0".repeat(64);
+    }],
+    ["consumed timestamp", (job) => {
+      job.request.spawn.launchContractConsumedAt = "2030-01-01T00:00:00.000Z";
+    }],
+    ["dispatch structure", (job) => {
+      job.request.spawn.dispatch.unrecognizedAuthority = true;
+    }]
+  ];
+  for (const [label, mutate] of cases) {
+    const fixture = providerStartedJob();
+    const decision = decide(fixture);
+    const finalContext = captureContextManifest(fixture.root);
+    updateJob(fixture.root, fixture.workerId, (current) => {
+      const next = structuredClone(current);
+      next.completionContextManifest = finalContext;
+      next.result = {
+        ...(next.result || {}),
+        hostVerification: "not_run",
+        taskRuntimeCleaned: true
+      };
+      mutate(next);
+      return next;
+    }, fixture.env);
+    const beforeIds = listJobs(fixture.root, fixture.env).map((job) => job.id);
+    assert.throws(
+      () => spawnGrantedFollowupWorker({
+        root: fixture.root,
+        principal: authority(fixture.root),
+        workerId: fixture.workerId,
+        grantId: decision.grant.grantId,
+        message: "This admission must not commit",
+        idempotencyKey: `followup-source-tamper-${label.replaceAll(" ", "-")}`,
+        providerCapabilityDigest: "c".repeat(64),
+        env: fixture.env
+      }),
+      (error) => [
+        "E_AUTH_REQUIRED",
+        "E_CONTEXT_DRIFT",
+        "E_PROCESS_IDENTITY",
+        "E_RECURSION",
+        "E_STATE"
+      ].includes(error?.code),
+      label
+    );
+    assert.deepEqual(
+      listJobs(fixture.root, fixture.env).map((job) => job.id),
+      beforeIds,
+      `${label} committed a child before rejection`
+    );
+  }
+});
+
+test("a write-profile parent cannot resume its provider session as a read-role child", () => {
+  const fixture = providerStartedJob({ sourceWrite: true });
+  const decision = decide(fixture);
+  const finalContext = captureContextManifest(fixture.root);
+  updateJob(fixture.root, fixture.workerId, (job) => ({
+    ...job,
+    completionContextManifest: finalContext,
+    result: {
+      ...(job.result || {}),
+      hostVerification: "not_run",
+      taskRuntimeCleaned: true
+    }
+  }), fixture.env);
+  const before = listJobs(fixture.root, fixture.env).length;
+  assert.throws(
+    () => spawnGrantedFollowupWorker({
+      root: fixture.root,
+      principal: authority(fixture.root),
+      workerId: fixture.workerId,
+      grantId: decision.grant.grantId,
+      message: "Do not cross the write/read security profile boundary",
+      idempotencyKey: "write-parent-read-child",
+      providerCapabilityDigest: "c".repeat(64),
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_CAPABILITY"
+  );
+  assert.equal(listJobs(fixture.root, fixture.env).length, before);
 });

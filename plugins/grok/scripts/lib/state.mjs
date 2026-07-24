@@ -1043,16 +1043,44 @@ export function listJobs(root, env = process.env) {
   return jobs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
-export function retain(root, limit = 50) {
-  // Keep review jobs whose isolated homes were not cleaned, except explicit empty-target skips
-  // (no provider session or home was ever created for those).
-  const needsPrivacyRetention = (job) => (
-    job.jobClass === "review"
-      ? job.result?.providerSessionDeleted === false && job.result?.skipReason !== "empty-target"
-      : job.jobClass === "task" && job.result?.taskRuntimeCleaned === false
-  );
-  const jobs = listJobs(root), terminalJobs = jobs.filter((job) => terminal(job) && !needsPrivacyRetention(job)), removable = terminalJobs.slice(Math.max(0, limit - jobs.filter((x) => !terminal(x)).length));
-  for (const job of removable) for (const file of [jobFile(root, job.id), logFile(root, job.id), cancelFile(root, job.id)]) try { fs.unlinkSync(file); } catch (e) { if (e.code !== "ENOENT") throw e; }
+export function retain(root, limit = 50, env = process.env) {
+  return withWorkspaceStateTransaction(root, (transaction) => {
+    // Keep review jobs whose isolated homes were not cleaned, except explicit empty-target skips
+    // (no provider session or home was ever created for those).
+    const needsPrivacyRetention = (job) => (
+      job.jobClass === "review"
+        ? job.result?.providerSessionDeleted === false && job.result?.skipReason !== "empty-target"
+        : job.jobClass === "task" && job.result?.taskRuntimeCleaned === false
+    );
+    const jobs = transaction.listJobs();
+    const activeJobs = jobs.filter((job) => !terminal(job));
+    const privacyRetained = jobs.filter((job) => terminal(job) && needsPrivacyRetention(job));
+    const ordinaryTerminal = jobs.filter((job) => terminal(job) && !needsPrivacyRetention(job));
+    const retained = new Set([
+      ...activeJobs.map((job) => job.id),
+      ...privacyRetained.map((job) => job.id),
+      ...ordinaryTerminal
+        .slice(0, Math.max(0, limit - activeJobs.length))
+        .map((job) => job.id)
+    ]);
+    const jobsById = new Map(jobs.map((job) => [job.id, job]));
+    const pending = [...retained];
+    while (pending.length > 0) {
+      const retainedJob = jobsById.get(pending.pop());
+      const parentId = retainedJob?.request?.resumeJobId;
+      if (typeof parentId !== "string" || retained.has(parentId) || !jobsById.has(parentId)) {
+        continue;
+      }
+      retained.add(parentId);
+      pending.push(parentId);
+    }
+    const removable = ordinaryTerminal.filter((job) => !retained.has(job.id));
+    for (const job of removable) {
+      for (const file of [jobFile(root, job.id, env), logFile(root, job.id, env), cancelFile(root, job.id, env)]) {
+        try { fs.unlinkSync(file); } catch (error) { if (error.code !== "ENOENT") throw error; }
+      }
+    }
+  }, env);
 }
 
 export function selectJob(root, { id, host, claudeSessionId, active, finished, allSessions = false } = {}) {

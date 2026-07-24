@@ -22,6 +22,7 @@ import {
   now,
   readPrivateJsonFile,
   requestCancel,
+  tryReadJob,
   writePrivateJsonFile,
   ensurePrivateStateDirectory,
   withWorkspaceStateTransaction
@@ -31,6 +32,7 @@ import {
   assertContextCompatible,
   assertTaskEnvelope,
   bindTaskEnvelopeContext,
+  buildTaskEnvelope,
   captureContextManifest,
   composeProviderPrompt,
   scrubStoredJob
@@ -53,6 +55,12 @@ import {
 } from "./worker-roles.mjs";
 import { profileFor, sameSecurityProfile } from "./profiles.mjs";
 import { processGroupGone, processStartToken } from "./process-control.mjs";
+import { assertBrokerMutationAuthority } from "./worker-authority.mjs";
+import {
+  assertAdmissionGrantEligible,
+  assertHostActionRequestStillBound,
+  assertHostActionRecord
+} from "./worker-host-actions.mjs";
 import {
   assertProviderGuardForJob,
   loadProviderGuard,
@@ -76,6 +84,7 @@ import {
 } from "./worker-launch-contract.mjs";
 
 export const SPAWN_OWNERSHIP_MODE = "exact-thread-or-host-attested-parent";
+export const FOLLOWUP_SPAWN_OWNERSHIP_MODE = "exact-root-owner-grant";
 export const SPAWN_SUCCESS_DEFINITION = "durable-job-commit";
 export const WORKER_DISPATCH_SCHEMA_VERSION = WORKER_DISPATCH_OUTBOX_SCHEMA_VERSION;
 export const WORKER_SPAWN_INTENT_SCHEMA_VERSION = 1;
@@ -551,6 +560,44 @@ const SPAWN_IDEMPOTENCY_SCHEMA_VERSION = 4;
 const SPAWN_RESPONSE_WITNESS_SCHEMA_VERSION = 1;
 const SPAWN_RESPONSE_WITNESS_PROJECTION = "worker-handle-v1-untrusted-host";
 const SPAWN_RESPONSE_WITNESS_ID = /^spawnw-[0-9a-f]{24}$/;
+export const FOLLOWUP_ADMISSION_WITNESS_SCHEMA_VERSION = 1;
+export const FOLLOWUP_ADMISSION_KIND = "granted-read-role-continuation";
+const FOLLOWUP_ADMISSION_WITNESS_KEYS = new Set([
+  "schemaVersion",
+  "kind",
+  "childWorkerId",
+  "parentWorkerId",
+  "lineageWorkerId",
+  "sourceRequestId",
+  "sourceRequestDigest",
+  "sourceDecisionId",
+  "sourceDecisionDigest",
+  "grantId",
+  "grantDigest",
+  "requestedRoleId",
+  "targetRoleDigest",
+  "targetRuntimeRolePolicyDigest",
+  "resumeSessionDigest",
+  "finalContextManifestId",
+  "finalContextManifestDigest",
+  "messageDigest",
+  "ownerThreadDigest",
+  "idempotencyKeyDigest",
+  "followupRequestDigest",
+  "witnessDigest"
+]);
+const FOLLOWUP_IDEMPOTENCY_SCHEMA_VERSION = 1;
+const FOLLOWUP_IDEMPOTENCY_KEYS = new Set([
+  "schemaVersion",
+  "workerId",
+  "parentWorkerId",
+  "grantId",
+  "ownerThreadDigest",
+  "idempotencyKeyDigest",
+  "followupRequestDigest",
+  "committedAt",
+  "recordDigest"
+]);
 const LEGACY_SPAWN_IDEMPOTENCY_KEYS = new Set([
   "schemaVersion",
   "workerId",
@@ -615,6 +662,12 @@ function stableDigest(value) {
 
 function isPlainRecord(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function hasExactKeys(value, keys) {
+  return isPlainRecord(value)
+    && Object.keys(value).length === keys.size
+    && Object.keys(value).every((key) => keys.has(key));
 }
 
 function runSuccessfulRuntimeCleanup(runtimeCleanup, job) {
@@ -2097,6 +2150,9 @@ export function claimWorkerDispatch({
           profile: profileFor("task", Boolean(current.write))
         }
       : current);
+    if (current.request?.followup !== undefined) {
+      assertDurableSpawnRequestBinding(current, env);
+    }
     const nonce = cancellationNonce(current);
     if (
       !["queued", "running"].includes(current.status)
@@ -2144,6 +2200,9 @@ export function claimWorkerDispatch({
           }
         : latest;
       assertDispatchContract(dispatchContractJob);
+      if (latest.request?.followup !== undefined) {
+        assertDurableSpawnRequestBinding(latest, env);
+      }
       const upgradedDispatch = latestLegacyPending
         ? createDispatchOutbox({ createdAt: latestDispatch.createdAt || latest.createdAt || claimedAt })
         : latestDispatch;
@@ -3780,6 +3839,591 @@ export function settleStartedWorkerLoss({
   }, env);
 }
 
+function followupStateError(message) {
+  throw new CompanionError("E_STATE", message);
+}
+
+function followupRequestBody({
+  parentWorkerId,
+  lineageWorkerId,
+  grant,
+  finalContextManifest,
+  messageDigest,
+  ownerThreadDigest,
+  idempotencyKeyDigest
+}) {
+  return {
+    schemaVersion: FOLLOWUP_ADMISSION_WITNESS_SCHEMA_VERSION,
+    kind: FOLLOWUP_ADMISSION_KIND,
+    parentWorkerId,
+    lineageWorkerId,
+    sourceRequestId: grant.sourceRequestId,
+    sourceRequestDigest: grant.sourceRequestDigest,
+    sourceDecisionId: grant.sourceDecisionId,
+    sourceDecisionDigest: grant.sourceDecisionDigest,
+    grantId: grant.grantId,
+    grantDigest: grant.grantDigest,
+    requestedRoleId: grant.requestedRoleId,
+    targetRoleDigest: grant.targetRole.digest,
+    targetRuntimeRolePolicyDigest: grant.targetRuntimeRolePolicy.digest,
+    finalContextManifestId: finalContextManifest.manifestId,
+    finalContextManifestDigest: finalContextManifest.digest,
+    messageDigest,
+    ownerThreadDigest,
+    idempotencyKeyDigest
+  };
+}
+
+function followupWitnessBody(witness) {
+  const { witnessDigest: _witnessDigest, ...body } = witness;
+  return body;
+}
+
+function normalizeFollowupAdmissionWitness(witness) {
+  if (!hasExactKeys(witness, FOLLOWUP_ADMISSION_WITNESS_KEYS)
+    || witness.schemaVersion !== FOLLOWUP_ADMISSION_WITNESS_SCHEMA_VERSION
+    || witness.kind !== FOLLOWUP_ADMISSION_KIND
+    || !/^task-[a-f0-9]{16,64}$/.test(witness.childWorkerId || "")
+    || !/^task-[a-f0-9]{16,64}$/.test(witness.parentWorkerId || "")
+    || !/^task-[a-f0-9]{16,64}$/.test(witness.lineageWorkerId || "")
+    || !/^har-[a-f0-9]{24}$/.test(witness.sourceRequestId || "")
+    || !/^had-[a-f0-9]{24}$/.test(witness.sourceDecisionId || "")
+    || !/^hag-[a-f0-9]{24}$/.test(witness.grantId || "")
+    || !["reviewer", "security", "test"].includes(witness.requestedRoleId)
+    || !/^ctx-[a-f0-9]{24}$/.test(witness.finalContextManifestId || "")
+    || [
+      "sourceRequestDigest",
+      "sourceDecisionDigest",
+      "grantDigest",
+      "targetRoleDigest",
+      "targetRuntimeRolePolicyDigest",
+      "resumeSessionDigest",
+      "finalContextManifestDigest",
+      "messageDigest",
+      "ownerThreadDigest",
+      "idempotencyKeyDigest",
+      "followupRequestDigest",
+      "witnessDigest"
+    ].some((key) => !SHA256_HEX.test(witness[key] || ""))) {
+    followupStateError("Follow-up admission witness is malformed.");
+  }
+  if (witness.witnessDigest !== stableDigest(followupWitnessBody(witness))) {
+    followupStateError("Follow-up admission witness digest is invalid.");
+  }
+  return Object.freeze({ ...witness });
+}
+
+function messageDigestFromEnvelope(envelope) {
+  if (typeof envelope?.userRequest === "string") return digestKey(envelope.userRequest);
+  if (envelope?.userRequest === null && SHA256_HEX.test(envelope.userRequestDigest || "")) {
+    return envelope.userRequestDigest;
+  }
+  followupStateError("Follow-up worker request text binding is malformed.");
+}
+
+function terminalFollowupParent(parent) {
+  return Boolean(
+    parent
+    && ["completed", "failed", "cancelled"].includes(parent.status)
+    && typeof parent.grokSessionId === "string"
+    && parent.grokSessionId.length > 0
+    && parent.grokSessionId.length <= 256
+    && !/[\r\n\0]/.test(parent.grokSessionId)
+    && parent.result?.taskRuntimeCleaned === true
+  );
+}
+
+function resolveParentAdmission(parent, {
+  root,
+  principal = null,
+  grantId,
+  child = null,
+  verifyCurrentContext = true
+} = {}) {
+  if (principal) {
+    assertBrokerMutationAuthority(principal, {
+      root,
+      exactThreadId: parent?.host?.sessionId ?? null
+    });
+  }
+  if (!terminalFollowupParent(parent)) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Follow-up requires a terminal parent with an exact provider session and completed task-runtime cleanup."
+    );
+  }
+  if (parent.host?.kind !== "codex"
+    || typeof parent.host.sessionId !== "string"
+    || (child && (
+      child.host?.kind !== parent.host.kind
+      || child.host?.sessionId !== parent.host.sessionId
+    ))) {
+    throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+  }
+  const record = assertHostActionRecord(parent.hostAction);
+  if (!record
+    || record.decision?.decision !== "grant"
+    || record.grant?.grantId !== grantId
+    || record.grant.sourceWorkerId !== parent.id
+    || record.grant.sourceRequestId !== record.request.requestId
+    || record.grant.sourceRequestDigest !== record.request.requestDigest
+    || record.grant.sourceDecisionId !== record.decision.decisionId
+    || record.grant.sourceDecisionDigest !== record.decision.decisionDigest) {
+    throw new CompanionError("E_CAPABILITY", "Worker does not own the requested durable role-admission grant.");
+  }
+
+  assertHostActionRequestStillBound(parent, record.request, {
+    providerSessionId: parent.grokSessionId
+  });
+
+  const targetProfile = profileFor("task", false);
+  if (!sameSecurityProfile(parent.profile, targetProfile)) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Follow-up cannot resume a provider session across different security profiles."
+    );
+  }
+  assertContextPacket(parent.request?.contextPacket, {
+    envelope: parent.request?.envelope
+  });
+  assertContextReceipt(parent.request?.contextReceipt, {
+    contextPacket: parent.request.contextPacket,
+    rolePolicy: parent.request.runtimeRolePolicy,
+    contextManifest: parent.request.contextManifest,
+    lineageWorkerId: parent.request?.followup ? parent.id : parent.request.providerHomeId,
+    effectivePromptDigest: parent.request.providerPromptDigest
+  });
+  const grant = assertAdmissionGrantEligible(record.grant, {
+    sourceWorkerId: parent.id,
+    sourceRequestId: record.request.requestId,
+    sourceRequestDigest: record.request.requestDigest,
+    sourceDecisionId: record.decision.decisionId,
+    sourceDecisionDigest: record.decision.decisionDigest,
+    grantId: record.grant.grantId,
+    grantDigest: record.grant.grantDigest,
+    lineageWorkerId: parent.request.providerHomeId,
+    resumeJobId: parent.request.resumeJobId ?? null,
+    parentRole: parent.role,
+    parentRuntimeRolePolicy: parent.request.runtimeRolePolicy,
+    parentProfile: parent.profile,
+    parentContextManifest: parent.request.contextManifest,
+    parentContextReceipt: parent.request.contextReceipt,
+    providerPromptDigest: parent.request.providerPromptDigest,
+    targetProfile
+  });
+  const availableFinalContexts = [
+    parent.verificationContextManifest,
+    parent.completionContextManifest
+  ].filter(Boolean);
+  const childContext = child?.request?.contextManifest;
+  const finalContextManifest = childContext
+    ? availableFinalContexts.find((candidate) => (
+        candidate.manifestId === childContext.manifestId
+        && candidate.digest === childContext.digest
+      )) || null
+    : availableFinalContexts[0] || null;
+  if (!finalContextManifest) {
+    throw new CompanionError(
+      "E_CONTEXT_DRIFT",
+      "Follow-up parent has no final completion or verification context."
+    );
+  }
+  if (verifyCurrentContext) {
+    assertContextCompatible(root, finalContextManifest, { mode: "resume" });
+  }
+  return Object.freeze({
+    record,
+    grant,
+    targetProfile,
+    finalContextManifest,
+    lineageWorkerId: parent.request.providerHomeId,
+    resumeSessionId: parent.grokSessionId
+  });
+}
+
+function buildFollowupAdmissionWitness({
+  childWorkerId,
+  parent,
+  admission,
+  messageDigest,
+  ownerThreadDigest,
+  idempotencyKeyDigest,
+  followupRequestDigest
+}) {
+  const body = {
+    ...followupRequestBody({
+      parentWorkerId: parent.id,
+      lineageWorkerId: admission.lineageWorkerId,
+      grant: admission.grant,
+      finalContextManifest: admission.finalContextManifest,
+      messageDigest,
+      ownerThreadDigest,
+      idempotencyKeyDigest
+    }),
+    childWorkerId,
+    resumeSessionDigest: digestKey(admission.resumeSessionId),
+    followupRequestDigest
+  };
+  return normalizeFollowupAdmissionWitness({
+    ...body,
+    witnessDigest: stableDigest(body)
+  });
+}
+
+export function assertFollowupAdmissionBinding(job, {
+  root = job?.request?.spawn?.executionRoot,
+  env = process.env,
+  verifyCurrentContext = true
+} = {}) {
+  const witness = normalizeFollowupAdmissionWitness(job?.request?.followup);
+  if (witness.childWorkerId !== job.id
+    || witness.parentWorkerId !== job.request?.resumeJobId
+    || witness.lineageWorkerId !== job.request?.providerHomeId
+    || witness.requestedRoleId !== job.request?.roleId
+    || witness.targetRoleDigest !== job.role?.digest
+    || witness.targetRuntimeRolePolicyDigest !== job.request?.runtimeRolePolicy?.digest
+    || witness.resumeSessionDigest !== digestKey(job.request?.resumeSessionId || "")
+    || witness.finalContextManifestId !== job.request?.contextManifest?.manifestId
+    || witness.finalContextManifestDigest !== job.request?.contextManifest?.digest
+    || witness.messageDigest !== messageDigestFromEnvelope(job.request?.envelope)
+    || witness.ownerThreadDigest !== digestKey(job.host?.sessionId || "")
+    || witness.idempotencyKeyDigest !== job.request?.spawn?.idempotencyKeyDigest) {
+    followupStateError("Follow-up admission witness no longer matches its child worker.");
+  }
+  const parent = tryReadJob(root, witness.parentWorkerId, env);
+  if (!parent) followupStateError("Follow-up admission parent is missing.");
+  const admission = resolveParentAdmission(parent, {
+    root,
+    grantId: witness.grantId,
+    child: job,
+    verifyCurrentContext
+  });
+  const expectedRequestBody = followupRequestBody({
+    parentWorkerId: parent.id,
+    lineageWorkerId: admission.lineageWorkerId,
+    grant: admission.grant,
+    finalContextManifest: admission.finalContextManifest,
+    messageDigest: witness.messageDigest,
+    ownerThreadDigest: witness.ownerThreadDigest,
+    idempotencyKeyDigest: witness.idempotencyKeyDigest
+  });
+  if (witness.followupRequestDigest !== stableDigest(expectedRequestBody)
+    || witness.sourceRequestId !== admission.grant.sourceRequestId
+    || witness.sourceRequestDigest !== admission.grant.sourceRequestDigest
+    || witness.sourceDecisionId !== admission.grant.sourceDecisionId
+    || witness.sourceDecisionDigest !== admission.grant.sourceDecisionDigest
+    || witness.grantDigest !== admission.grant.grantDigest) {
+    followupStateError("Follow-up admission grant or request binding drifted.");
+  }
+  return witness;
+}
+
+function followupIdempotencyBody(record) {
+  const { recordDigest: _recordDigest, ...body } = record;
+  return body;
+}
+
+function normalizeFollowupIdempotencyRecord(record, { keyDigest }) {
+  if (!hasExactKeys(record, FOLLOWUP_IDEMPOTENCY_KEYS)
+    || record.schemaVersion !== FOLLOWUP_IDEMPOTENCY_SCHEMA_VERSION
+    || !/^task-[a-f0-9]{16,64}$/.test(record.workerId || "")
+    || !/^task-[a-f0-9]{16,64}$/.test(record.parentWorkerId || "")
+    || !/^hag-[a-f0-9]{24}$/.test(record.grantId || "")
+    || record.idempotencyKeyDigest !== keyDigest
+    || !validIsoTimestamp(record.committedAt)
+    || ["ownerThreadDigest", "followupRequestDigest", "recordDigest"]
+      .some((key) => !SHA256_HEX.test(record[key] || ""))
+    || record.recordDigest !== stableDigest(followupIdempotencyBody(record))) {
+    followupStateError("Follow-up idempotency record is malformed.");
+  }
+  return Object.freeze({ ...record });
+}
+
+function followupIdempotencyRecord(job) {
+  const witness = normalizeFollowupAdmissionWitness(job.request?.followup);
+  const body = {
+    schemaVersion: FOLLOWUP_IDEMPOTENCY_SCHEMA_VERSION,
+    workerId: job.id,
+    parentWorkerId: witness.parentWorkerId,
+    grantId: witness.grantId,
+    ownerThreadDigest: witness.ownerThreadDigest,
+    idempotencyKeyDigest: witness.idempotencyKeyDigest,
+    followupRequestDigest: witness.followupRequestDigest,
+    committedAt: job.createdAt
+  };
+  return normalizeFollowupIdempotencyRecord({
+    ...body,
+    recordDigest: stableDigest(body)
+  }, { keyDigest: witness.idempotencyKeyDigest });
+}
+
+/**
+ * Commit one grant-bound, read-only continuation through the normal dispatch-v2
+ * outbox. The child witness is the authoritative one-time grant reservation;
+ * the adjacent idempotency file is derived and repaired after child commit.
+ */
+export function spawnGrantedFollowupWorker({
+  root,
+  principal,
+  workerId,
+  grantId,
+  message,
+  idempotencyKey,
+  env = process.env,
+  providerCapabilityDigest = null
+} = {}) {
+  assertIdempotencyKey(idempotencyKey);
+  if (typeof workerId !== "string" || !workerId) {
+    throw new CompanionError("E_USAGE", "workerId is required for follow-up.");
+  }
+  if (!/^hag-[a-f0-9]{24}$/.test(grantId || "")) {
+    throw new CompanionError("E_USAGE", "grantId is required and malformed.");
+  }
+  if (typeof message !== "string" || !message.trim() || message.length > 16000) {
+    throw new CompanionError("E_USAGE", "message must be a non-empty string of at most 16000 characters.");
+  }
+  if (providerCapabilityDigest !== null && !SHA256_HEX.test(providerCapabilityDigest)) {
+    throw new CompanionError("E_CAPABILITY", "Provider capability binding is missing or malformed.");
+  }
+  const keyDigest = digestKey(idempotencyKey);
+  const messageDigest = digestKey(message);
+  const ownerThreadDigest = digestKey(principal?.threadId || "");
+  // Authenticate the broker brand and workspace before reading whether any
+  // requested parent exists. Exact owner equality is checked after the read.
+  assertBrokerMutationAuthority(principal, { root });
+
+  const admitted = withWorkspaceStateTransaction(root, (transaction) => {
+    const parent = transaction.tryReadJob(workerId);
+    if (!parent) throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+    const jobs = transaction.listJobs();
+    const grantOwners = jobs.filter((candidate) => candidate.request?.followup?.grantId === grantId);
+    const keyOwners = jobs.filter((candidate) => (
+      candidate.request?.followup?.idempotencyKeyDigest === keyDigest
+    ));
+    if (grantOwners.length > 1 || keyOwners.length > 1) {
+      followupStateError("Follow-up admission ownership is ambiguous across durable jobs.");
+    }
+    if (grantOwners[0] && keyOwners[0] && grantOwners[0].id !== keyOwners[0].id) {
+      idempotencyConflict("Role-admission grant and idempotencyKey belong to different follow-up jobs.");
+    }
+    const existingChild = grantOwners[0] || keyOwners[0] || null;
+    const admission = resolveParentAdmission(parent, {
+      root,
+      principal,
+      grantId,
+      child: existingChild,
+      verifyCurrentContext: true
+    });
+    const requestBody = followupRequestBody({
+      parentWorkerId: parent.id,
+      lineageWorkerId: admission.lineageWorkerId,
+      grant: admission.grant,
+      finalContextManifest: admission.finalContextManifest,
+      messageDigest,
+      ownerThreadDigest,
+      idempotencyKeyDigest: keyDigest
+    });
+    const followupRequestDigest = stableDigest(requestBody);
+    if (existingChild) {
+      const witness = assertFollowupAdmissionBinding(existingChild, {
+        root,
+        env,
+        verifyCurrentContext: true
+      });
+      if (witness.grantId !== grantId
+        || witness.idempotencyKeyDigest !== keyDigest
+        || witness.followupRequestDigest !== followupRequestDigest
+        || witness.ownerThreadDigest !== ownerThreadDigest) {
+        idempotencyConflict("Role-admission grant or idempotencyKey was already used for a different follow-up.");
+      }
+      assertBrokerMutationAuthority(principal, {
+        root,
+        exactThreadId: existingChild.host?.sessionId
+      });
+      assertDispatchContract(existingChild);
+      assertDurableSpawnRequestBinding(existingChild, env);
+      if (providerCapabilityDigest !== null
+        && existingChild.request?.spawn?.providerCapabilityDigest !== providerCapabilityDigest) {
+        throw new CompanionError(
+          "E_CONTEXT_DRIFT",
+          "Provider capability changed since durable follow-up admission."
+        );
+      }
+      return { committed: existingChild, replayed: true };
+    }
+
+    const sidecar = readIdempotency(root, "followup", idempotencyKey, env);
+    if (sidecar) {
+      normalizeFollowupIdempotencyRecord(sidecar, { keyDigest });
+      followupStateError("Follow-up idempotency record exists without its authoritative child job.");
+    }
+
+    const controlWorkspace = resolveControlWorkspace(root, env);
+    const { controlWorkspaceId, executionRoot } = controlWorkspace;
+    if (parent.controlWorkspaceId !== controlWorkspaceId
+      || parent.request?.spawn?.executionRoot !== executionRoot) {
+      throw new CompanionError("E_CONTEXT_DRIFT", "Follow-up parent belongs to a different control workspace.");
+    }
+    const envelope = bindTaskEnvelopeContext(
+      buildTaskEnvelope({
+        userRequest: message,
+        objective: message,
+        mode: "read",
+        contextManifestId: admission.finalContextManifest.manifestId
+      }),
+      admission.finalContextManifest.manifestId
+    );
+    const role = assertRoleDigest(admission.grant.targetRole);
+    const profile = admission.targetProfile;
+    const runtimeRolePolicy = assertRuntimeRolePolicy(
+      admission.grant.targetRuntimeRolePolicy,
+      { role, profile }
+    );
+    const contextPacket = buildContextPacket({
+      mode: "explicit-envelope",
+      envelope,
+      facts: envelope.context.facts,
+      constraints: envelope.context.constraints
+    });
+    assertContextPacket(contextPacket, { envelope });
+    const providerPrompt = composeProviderPrompt(envelope, {
+      root: executionRoot,
+      contextManifest: admission.finalContextManifest,
+      contextPacket,
+      runtimeRolePolicy
+    });
+    const providerPromptDigest = digestKey(providerPrompt);
+    const contextBindingDigest = stableDigest({
+      mode: CONTEXT_BINDING_MODE,
+      packetDigest: contextPacket.digest,
+      runtimeRolePolicyDigest: runtimeRolePolicy.digest,
+      providerPromptDigest
+    });
+    const spawnDigest = requestDigest({
+      principal,
+      controlWorkspaceId,
+      executionRoot,
+      envelope,
+      contextManifest: admission.finalContextManifest,
+      roleId: role.id,
+      write: false,
+      contextBinding: {
+        mode: CONTEXT_BINDING_MODE,
+        digest: contextBindingDigest
+      }
+    });
+    const id = generateId("task");
+    const createdAt = now();
+    const contextReceipt = buildContextReceipt({
+      contextPacket,
+      rolePolicy: runtimeRolePolicy,
+      contextManifest: admission.finalContextManifest,
+      lineageWorkerId: id,
+      effectivePromptDigest: providerPromptDigest
+    });
+    const followup = buildFollowupAdmissionWitness({
+      childWorkerId: id,
+      parent,
+      admission,
+      messageDigest,
+      ownerThreadDigest,
+      idempotencyKeyDigest: keyDigest,
+      followupRequestDigest
+    });
+    const job = {
+      schemaVersion: 3,
+      id,
+      kind: "task",
+      jobClass: "task",
+      write: false,
+      status: "queued",
+      phase: "accepted",
+      summary: "Follow-up committed",
+      progress: "Grant-bound continuation committed to the durable launch outbox.",
+      createdAt,
+      updatedAt: createdAt,
+      startedAt: null,
+      completedAt: null,
+      heartbeatAt: createdAt,
+      host: ownershipHost(principal),
+      profile,
+      role: {
+        ...role,
+        tools: [...role.tools]
+      },
+      model: null,
+      effort: null,
+      controlWorkspaceId,
+      request: {
+        contextBindingMode: CONTEXT_BINDING_MODE,
+        contextPacket,
+        runtimeRolePolicy,
+        contextReceipt,
+        envelope,
+        contextManifest: admission.finalContextManifest,
+        providerPromptDigest,
+        providerHomeId: admission.lineageWorkerId,
+        resumeJobId: parent.id,
+        resumeSessionId: admission.resumeSessionId,
+        publicObjective: null,
+        roleId: role.id,
+        followup,
+        spawn: {
+          executionRoot,
+          idempotencyKeyDigest: keyDigest,
+          ownerThreadId: principal.threadId,
+          requestDigest: spawnDigest,
+          contextBindingDigest,
+          successDefinition: SPAWN_SUCCESS_DEFINITION,
+          ownershipMode: FOLLOWUP_SPAWN_OWNERSHIP_MODE,
+          ...(providerCapabilityDigest !== null ? { providerCapabilityDigest } : {}),
+          providerLaunchPending: true,
+          providerLaunchInFlight: false,
+          providerLaunchOutcome: "pending",
+          dispatch: createDispatchOutbox({ createdAt })
+        }
+      },
+      lifecycleEvents: appendLifecycleEvent(
+        [],
+        "task.accepted",
+        "Durable grant-bound follow-up accepted by worker broker.",
+        { parentWorkerId: parent.id }
+      ),
+      result: null,
+      error: null,
+      workerAuthorization: null
+    };
+    job.workerAuthorization = createWorkerAuthorization({
+      job,
+      principal,
+      issuedAt: createdAt
+    });
+    const committed = transaction.admitJob(job);
+    assertFollowupAdmissionBinding(committed, {
+      root,
+      env,
+      verifyCurrentContext: true
+    });
+    return { committed, replayed: false };
+  }, env);
+
+  // The child commit is authoritative and precedes this derived publication.
+  // A crash here is repaired by the child scan on the same-key replay.
+  writeIdempotency(
+    root,
+    "followup",
+    idempotencyKey,
+    followupIdempotencyRecord(admitted.committed),
+    env
+  );
+  return {
+    handle: projectWorkerHandle(admitted.committed, { trustHostAuthority: false }),
+    replayed: admitted.replayed,
+    spawnSuccessDefinition: SPAWN_SUCCESS_DEFINITION,
+    providerLaunched: false
+  };
+}
+
 /**
  * Commit a durable read-only worker job. Provider launch is intentionally not performed.
  * write:true is rejected until Phase 3 enables broker write spawn after identity redesign.
@@ -4151,6 +4795,7 @@ function requestDigest({
 export function assertDurableSpawnRequestBinding(job, env = process.env) {
   const spawn = job?.request?.spawn;
   const executionRoot = spawn?.executionRoot;
+  const isGrantedFollowup = job?.request?.followup !== undefined;
   if (typeof executionRoot !== "string"
     || !path.isAbsolute(executionRoot)
     || path.normalize(executionRoot) !== executionRoot
@@ -4173,7 +4818,7 @@ export function assertDurableSpawnRequestBinding(job, env = process.env) {
     acceptedContext = assertContextCompatible(
       executionRoot,
       job.request?.contextManifest,
-      { mode: "execute" }
+      { mode: isGrantedFollowup ? "resume" : "execute" }
     );
   } catch (error) {
     if (error instanceof CompanionError) throw error;
@@ -4201,10 +4846,15 @@ export function assertDurableSpawnRequestBinding(job, env = process.env) {
   }
   let contextBinding;
   if (hasCompleteContextBinding) {
-    if (job.request?.providerHomeId !== job.id
+    const validRootLineage = !isGrantedFollowup && job.request?.providerHomeId === job.id;
+    const validFollowupLineage = isGrantedFollowup
+      && job.request?.providerHomeId !== job.id
+      && job.request?.resumeJobId === job.request?.followup?.parentWorkerId
+      && ["reviewer", "security", "test"].includes(job.request?.roleId);
+    if ((!validRootLineage && !validFollowupLineage)
       || typeof job.request?.roleId !== "string"
       || job.role?.id !== job.request.roleId
-      || (!job.write && job.request.roleId !== "explorer")) {
+      || (!job.write && !isGrantedFollowup && job.request.roleId !== "explorer")) {
       spawnIdempotencyStateError("Durable worker context lineage or logical role is malformed.");
     }
     const expectedRole = materializeRole(job.request.roleId);
@@ -4225,7 +4875,7 @@ export function assertDurableSpawnRequestBinding(job, env = process.env) {
         contextPacket: job.request.contextPacket,
         rolePolicy: job.request.runtimeRolePolicy,
         contextManifest: acceptedContext,
-        lineageWorkerId: job.id,
+        lineageWorkerId: isGrantedFollowup ? job.id : job.request.providerHomeId,
         effectivePromptDigest: job.request?.providerPromptDigest
       });
     } catch {
@@ -4244,6 +4894,18 @@ export function assertDurableSpawnRequestBinding(job, env = process.env) {
       mode: CONTEXT_BINDING_MODE,
       digest: expectedContextBindingDigest
     };
+    if (isGrantedFollowup) {
+      try {
+        assertFollowupAdmissionBinding(job, {
+          root: executionRoot,
+          env,
+          verifyCurrentContext: true
+        });
+      } catch (error) {
+        if (error instanceof CompanionError) throw error;
+        spawnIdempotencyStateError("Durable follow-up admission witness drifted.");
+      }
+    }
   }
   const recomputedRequestDigest = requestDigest({
     principal: {

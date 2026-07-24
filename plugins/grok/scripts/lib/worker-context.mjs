@@ -958,8 +958,18 @@ export function resolveJobProviderPrompt(job, {
         "Receipt-backed worker is missing its exact context discriminator, packet, policy, or receipt."
       );
     }
-    if (job.request?.providerHomeId !== job.id) {
-      throw new CompanionError("E_AUTH_REQUIRED", "Root worker lineage does not match its durable worker id.");
+    const followup = job.request?.followup;
+    const rootLineage = followup === undefined && job.request?.providerHomeId === job.id;
+    const continuationLineage = followup
+      && followup.childWorkerId === job.id
+      && followup.parentWorkerId === job.request?.resumeJobId
+      && followup.lineageWorkerId === job.request?.providerHomeId
+      && job.request?.providerHomeId !== job.id;
+    if (!rootLineage && !continuationLineage) {
+      throw new CompanionError(
+        "E_AUTH_REQUIRED",
+        "Worker lineage does not match its durable root or continuation admission."
+      );
     }
     assertContextPacket(packet, { envelope: job.request?.envelope });
     assertRuntimeRolePolicy(policy, { role: job.role, profile: job.profile });
@@ -968,7 +978,7 @@ export function resolveJobProviderPrompt(job, {
       contextPacket: packet,
       rolePolicy: policy,
       contextManifest: manifest,
-      lineageWorkerId: job.request.providerHomeId,
+      lineageWorkerId: continuationLineage ? job.id : job.request.providerHomeId,
       effectivePromptDigest: job.request?.providerPromptDigest
     });
     return composeEffectiveProviderPrompt({

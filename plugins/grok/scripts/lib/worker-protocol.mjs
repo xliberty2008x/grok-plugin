@@ -107,7 +107,12 @@ const PRIVATE_PROJECTION_FIELDS = new Set([
   "userRequest",
   "rawProviderMessage",
   "rawProviderMessages",
-  "hostAction"
+  "hostAction",
+  "followup",
+  "resumeSessionId",
+  "grantId",
+  "grantDigest",
+  "messageDigest"
 ]);
 
 function omitPrivateProjectionFields(value, ancestors = new WeakSet()) {
@@ -999,11 +1004,16 @@ function projectContextReceipt(job) {
     request.contextReceipt
   ];
   if (fields.every((value) => value === undefined)) return null;
+  const continuation = request.followup
+    && request.followup.childWorkerId === job.id
+    && request.followup.parentWorkerId === request.resumeJobId
+    && request.followup.lineageWorkerId === request.providerHomeId
+    && request.providerHomeId !== job.id;
   if (request.contextBindingMode !== CONTEXT_BINDING_MODE
     || !request.contextPacket
     || !request.runtimeRolePolicy
     || !request.contextReceipt
-    || request.providerHomeId !== job.id) {
+    || (!continuation && request.providerHomeId !== job.id)) {
     throw new CompanionError("E_STATE", "Worker context binding is partial or downgraded.");
   }
   assertContextPacket(request.contextPacket, { envelope: request.envelope });
@@ -1015,7 +1025,7 @@ function projectContextReceipt(job) {
     contextPacket: request.contextPacket,
     rolePolicy: request.runtimeRolePolicy,
     contextManifest: request.contextManifest,
-    lineageWorkerId: request.providerHomeId,
+    lineageWorkerId: continuation ? job.id : request.providerHomeId,
     effectivePromptDigest: request.providerPromptDigest
   });
   return structuredClone(request.contextReceipt);
@@ -1080,9 +1090,12 @@ export function projectWorkerSnapshot(job, { detail = true, trustHostAuthority =
 }
 
 function assertPublicContextReceiptBinding(receipt, snapshot) {
+  const rootWorker = snapshot.parentWorkerId === null;
   const mismatches = [
     receipt.lineageWorkerId !== snapshot.id,
-    snapshot.lineageWorkerId !== snapshot.id,
+    rootWorker
+      ? snapshot.lineageWorkerId !== snapshot.id
+      : snapshot.lineageWorkerId === snapshot.id,
     snapshot.write !== (receipt.logicalRoleId === "implementer"),
     receipt.logicalRoleId !== snapshot.roleId,
     receipt.providerProfileId !== snapshot.profileId,

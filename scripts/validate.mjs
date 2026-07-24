@@ -853,7 +853,7 @@ if (!versionsOnly) {
         problem(`Worker Broker live receipt schema is missing required field ${field}.`, file);
       }
     }
-    const expectedManifestDigest = "0641afd02156262492b10f52dd71f4ce18aa6b338179324a34d6b2b111b6370b";
+    const expectedManifestDigest = "aee11910fb0ff30ac4d7475fbd29c79cc07fed679e037b602d383a94e7694833";
     if (liveReceiptSchema.properties?.schemaVersion?.const !== 1
       || liveReceiptSchema.properties?.producerId?.const !== "worker-broker-live-receipt-runner"
       || liveReceiptSchema.properties?.producerVersion?.const !== 1
@@ -894,7 +894,7 @@ if (!versionsOnly) {
       rule?.if?.properties?.authorityMode?.const === "natural-codex-host"
     ));
     if (syntheticRule?.then?.properties?.phase?.const !== "1"
-      || syntheticRule?.then?.properties?.observedToolIds?.const?.length !== 7
+      || syntheticRule?.then?.properties?.observedToolIds?.const?.length !== 9
       || syntheticRule?.then?.properties?.scenarios?.const?.length !== 2
       || naturalRule?.then?.properties?.phase?.const !== "4"
       || naturalRule?.then?.properties?.installationMethod?.const !== "codex-local-plugin-cache"

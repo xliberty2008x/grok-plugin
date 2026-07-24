@@ -9,7 +9,10 @@ import {
   projectWorkerLifecycleCursor,
   projectWorkerSnapshot
 } from "./worker-protocol.mjs";
-import { isCanonicalUuid } from "./worker-authority.mjs";
+import {
+  assertBrokerMutationAuthority,
+  isCanonicalUuid
+} from "./worker-authority.mjs";
 import {
   cancelWorker,
   providerLaunchState,
@@ -21,6 +24,10 @@ import {
   followupWorker,
   sendWorkerMessage
 } from "./worker-mailbox.mjs";
+import {
+  decideHostActionRoleAdmission,
+  readHostActionRequestBinding
+} from "./worker-host-actions.mjs";
 import {
   assertTaskEnvelope,
   buildTaskEnvelope,
@@ -263,18 +270,73 @@ export function createWorkerService({
       });
     },
 
-    followup({ id, message, idempotencyKey, envelope = null, contextManifest = null } = {}) {
-      if (!id) throw new CompanionError("E_USAGE", "id is required for followup.");
-      return followupWorker({
+    decideRoleAdmission({ id, requestId, decision, idempotencyKey } = {}) {
+      if (!id) throw new CompanionError("E_USAGE", "id is required for role admission.");
+      assertBrokerMutationAuthority(principal, { root });
+      const job = ownedJob(id);
+      if (typeof providerCapabilityDigest === "string"
+        && currentCapabilityDigest() !== providerCapabilityDigest) {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "The installed provider capability changed before role-admission decision."
+        );
+      }
+      const binding = readHostActionRequestBinding(job);
+      if (!binding || binding.requestId !== requestId) throw notFound();
+      return decideHostActionRoleAdmission({
         root,
         principal,
         workerId: id,
-        message,
+        requestId,
+        // Never accept the private request digest from tool/caller input.
+        requestDigest: binding.requestDigest,
+        decision,
         idempotencyKey,
-        envelope,
-        contextManifest,
         env
       });
+    },
+
+    followup({ id, grantId, message, idempotencyKey } = {}) {
+      if (!id) throw new CompanionError("E_USAGE", "id is required for followup.");
+      // Preserve foreign/nonexistent equivalence before observing provider
+      // readiness or any parent/grant state.
+      assertBrokerMutationAuthority(principal, { root });
+      ownedJob(id);
+      if (typeof providerCapabilityDigest === "string"
+        && currentCapabilityDigest() !== providerCapabilityDigest) {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "The installed provider capability changed before follow-up admission."
+        );
+      }
+      const admitted = followupWorker({
+        root,
+        principal,
+        workerId: id,
+        grantId,
+        message,
+        idempotencyKey,
+        env,
+        providerCapabilityDigest
+      });
+      const mayLaunch = typeof providerCapabilityDigest !== "string"
+        || currentCapabilityDigest() === providerCapabilityDigest;
+      const launch = mayLaunch
+        ? dispatchWorker({
+          root,
+          workerId: admitted.handle.id,
+          principal,
+          env
+        })
+        : null;
+      const launchState = launch?.providerLaunchState
+        || providerLaunchState(readJob(root, admitted.handle.id, env));
+      return {
+        ...admitted,
+        handle: admitted.handle,
+        providerLaunchState: launchState,
+        providerLaunched: launch?.providerLaunched === true
+      };
     }
   });
 }

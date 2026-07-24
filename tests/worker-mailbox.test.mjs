@@ -3,13 +3,23 @@ import { spawn as spawnProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   buildTaskEnvelope,
   captureContextManifest
 } from "../plugins/grok/scripts/lib/task-contract.mjs";
-import { spawnReadOnlyWorker, cancelWorker } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
+import {
+  attachHostActionRequestToJob,
+  decideHostActionRoleAdmission,
+  readHostActionRequestBinding
+} from "../plugins/grok/scripts/lib/worker-host-actions.mjs";
+import { resolveWorkerAuthority } from "../plugins/grok/scripts/lib/worker-authority.mjs";
+import {
+  assertDispatchContract,
+  cancelWorker,
+  spawnReadOnlyWorker
+} from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import {
   acpDeliveryCapability,
   followupWorker,
@@ -35,6 +45,9 @@ const THREAD = "019f666a-6469-7cc1-9a8d-8c1adf61e103";
 const THREAD_B = "019f666b-1e72-74b1-b27c-9d186d7f1016";
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const MAILBOX_MODULE = new URL("../plugins/grok/scripts/lib/worker-mailbox.mjs", import.meta.url).href;
+const AUTHORITY_MODULE = new URL("../plugins/grok/scripts/lib/worker-authority.mjs", import.meta.url).href;
+const ATTEMPT = "a".repeat(32);
+const SESSION = "019f918e-9a33-7781-b96a-2b2ddc635be1";
 
 function principal(root, threadId = THREAD) {
   return {
@@ -44,6 +57,21 @@ function principal(root, threadId = THREAD) {
     pluginId: "grok@grok-companion",
     root
   };
+}
+
+function authority(root, threadId = THREAD) {
+  return resolveWorkerAuthority({
+    threadId,
+    plugin_id: "grok@grok-companion",
+    "x-codex-turn-metadata": {
+      thread_id: threadId,
+      turn_id: "019f666e-4084-7902-8447-249f72043a37",
+      plugin_id: "grok@grok-companion"
+    },
+    "codex/sandbox-state-meta": {
+      sandboxCwd: pathToFileURL(root).href
+    }
+  }, { mutation: true });
 }
 
 function runIsolatedModule(source) {
@@ -74,6 +102,105 @@ function envFor() {
     GROK_COMPANION_HOST: "codex",
     GROK_COMPANION_PLUGIN_DATA: pluginData
   };
+}
+
+function terminalGrantedParent({
+  root = initRepo(),
+  env = envFor(),
+  threadId = THREAD,
+  requestedRoleId = "reviewer"
+} = {}) {
+  const admitted = spawnReadOnlyWorker({
+    root,
+    principal: principal(root, threadId),
+    envelope: buildTaskEnvelope({ userRequest: "Terminal role-admission parent", mode: "read" }),
+    contextManifest: captureContextManifest(root),
+    idempotencyKey: `mb-granted-parent-${threadId}-${requestedRoleId}`,
+    env
+  });
+  const workerId = admitted.handle.id;
+  const at = new Date().toISOString();
+  updateJob(root, workerId, (current) => {
+    const active = {
+      ...current,
+      status: "running",
+      phase: "finalizing",
+      workerProcess: {
+        pid: 998_991,
+        startToken: "mailbox-worker-start",
+        processGroupId: process.platform === "win32" ? null : 998_991,
+        commandMarker: workerId,
+        dispatchAttemptId: ATTEMPT,
+        dispatchFence: 1,
+        nonce: "mailbox-worker-nonce"
+      },
+      providerProcess: {
+        pid: 998_992,
+        startToken: "mailbox-provider-start",
+        processGroupId: process.platform === "win32" ? null : 998_992,
+        commandMarker: workerId,
+        dispatchAttemptId: ATTEMPT,
+        dispatchFence: 1,
+        providerGeneration: 1
+      },
+      request: {
+        ...current.request,
+        spawn: {
+          ...current.request.spawn,
+          dispatch: {
+            ...current.request.spawn.dispatch,
+            state: "provider-started",
+            attemptId: ATTEMPT,
+            fence: 1,
+            lease: null,
+            providerGeneration: 1,
+            nextProviderGeneration: null,
+            claimedAt: at,
+            controllerStartedAt: at,
+            workerStartedAt: at,
+            providerStartedAt: at,
+            updatedAt: at
+          },
+          consumedLaunchContractDigest: "b".repeat(64),
+          launchContractConsumedAt: at
+        }
+      }
+    };
+    return {
+      ...attachHostActionRequestToJob(active, {
+        providerRequest: {
+          schemaVersion: 1,
+          kind: "role_admission",
+          requestedRoleId
+        },
+        dispatchAttemptId: ATTEMPT,
+        dispatchFence: 1,
+        providerGeneration: 1,
+        providerSessionId: SESSION
+      }),
+      grokSessionId: SESSION,
+      status: "completed",
+      phase: "done",
+      completedAt: at,
+      completionContextManifest: captureContextManifest(root),
+      result: {
+        hostVerification: "not_run",
+        taskRuntimeCleaned: true
+      }
+    };
+  }, env);
+  const binding = readHostActionRequestBinding(tryReadJob(root, workerId, env));
+  const decision = decideHostActionRoleAdmission({
+    root,
+    principal: authority(root, threadId),
+    workerId,
+    requestId: binding.requestId,
+    requestDigest: binding.requestDigest,
+    decision: "grant",
+    idempotencyKey: `mb-grant-${threadId}-${requestedRoleId}`,
+    env
+  });
+  return { root, env, workerId, grantId: decision.grant.grantId };
 }
 
 test("ACP spike record does not claim exactly-once without ack+dedup", () => {
@@ -210,223 +337,135 @@ test("send ends as delivered, rejected, or delivery_unknown; unknown never auto-
   assert.equal(thenable.receipt.reason, "async-delivery-unsupported");
 });
 
-test("followup preserves lineage and rejects profile/context drift", () => {
-  const root = initRepo();
-  const env = envFor();
-  const envelope = buildTaskEnvelope({ userRequest: "Parent task", mode: "read" });
-  const spawned = spawnReadOnlyWorker({
-    root,
-    principal: principal(root),
-    envelope,
-    contextManifest: captureContextManifest(root),
-    idempotencyKey: "mb-parent-0001",
-    env
-  });
-  cancelWorker({
-    root,
-    principal: principal(root),
-    workerId: spawned.handle.id,
-    idempotencyKey: "mb-parent-cancel",
-    env
-  });
-
+test("followup preserves root lineage through an exact grant and rejects caller authority fields", () => {
+  const fixture = terminalGrantedParent();
   const followed = followupWorker({
-    root,
-    principal: principal(root),
-    workerId: spawned.handle.id,
+    root: fixture.root,
+    principal: authority(fixture.root),
+    workerId: fixture.workerId,
+    grantId: fixture.grantId,
     message: "Continue from results",
     idempotencyKey: "mb-follow-0001",
-    env
+    env: fixture.env
   });
   assert.equal(followed.replayed, false);
-  assert.equal(followed.handle.parentWorkerId, spawned.handle.id);
+  assert.equal(followed.handle.parentWorkerId, fixture.workerId);
   assert.equal(
-    tryReadJob(root, followed.handle.id, env).controlWorkspaceId,
-    tryReadJob(root, spawned.handle.id, env).controlWorkspaceId
+    tryReadJob(fixture.root, followed.handle.id, fixture.env).controlWorkspaceId,
+    tryReadJob(fixture.root, fixture.workerId, fixture.env).controlWorkspaceId
   );
 
   assert.throws(
     () => followupWorker({
-      root,
-      principal: principal(root),
-      workerId: spawned.handle.id,
+      root: fixture.root,
+      principal: authority(fixture.root),
+      workerId: fixture.workerId,
+      grantId: fixture.grantId,
       message: "Different follow-up",
       idempotencyKey: "mb-follow-0001",
-      env
+      env: fixture.env
     }),
     (error) => error?.code === "E_IDEMPOTENCY_CONFLICT"
   );
 
   assert.throws(
     () => followupWorker({
-      root,
-      principal: principal(root),
-      workerId: spawned.handle.id,
+      root: fixture.root,
+      principal: authority(fixture.root),
+      workerId: fixture.workerId,
+      grantId: fixture.grantId,
       message: "Drift",
       idempotencyKey: "mb-follow-drift",
       contextManifest: { manifestId: "m2", digest: "b".repeat(64) },
-      env
+      env: fixture.env
     }),
-    (error) => error?.code === "E_CONTEXT_DRIFT"
+    (error) => error?.code === "E_USAGE"
   );
 });
 
-test("legacy followup launch state survives reconciliation and cancellation fails closed without dispatch authority", () => {
-  const root = initRepo();
-  const env = envFor();
-  const owner = principal(root);
-  const parent = spawnReadOnlyWorker({
-    root,
-    principal: owner,
-    envelope: buildTaskEnvelope({ userRequest: "Follow-up launch parent", mode: "read" }),
-    idempotencyKey: "mb-launch-parent",
-    env
-  });
-  cancelWorker({
-    root,
-    principal: owner,
-    workerId: parent.handle.id,
-    idempotencyKey: "mb-launch-parent-cancel",
-    env
-  });
-
+test("grant-bound followup uses the normal dispatch-v2 contract and cancellation consumes the grant", () => {
+  const fixture = terminalGrantedParent();
+  const owner = authority(fixture.root);
   const first = followupWorker({
-    root,
+    root: fixture.root,
     principal: owner,
-    workerId: parent.handle.id,
+    workerId: fixture.workerId,
+    grantId: fixture.grantId,
     message: "First continuation",
     idempotencyKey: "mb-launch-followup-1",
-    env
+    env: fixture.env
   });
-  const pending = tryReadJob(root, first.handle.id, env);
+  const pending = tryReadJob(fixture.root, first.handle.id, fixture.env);
   assert.equal(pending.request.spawn.providerLaunchPending, true);
+  assert.equal(pending.request.spawn.dispatch.schemaVersion, 2);
+  assert.equal(pending.request.spawn.dispatch.state, "pending");
+  assert.doesNotThrow(() => assertDispatchContract(pending));
 
   const reconciliation = reconcileOwnedWorkers({
-    root,
+    root: fixture.root,
     principal: owner,
     trusted: true,
     processAlive: () => false,
-    env
+    env: fixture.env
   });
   const childDecision = reconciliation.results.find((item) => item.workerId === first.handle.id);
-  assert.deepEqual(childDecision, {
-    workerId: first.handle.id,
-    action: "none",
-    reason: "provider-launch-unsettled"
-  });
-  assert.equal(tryReadJob(root, first.handle.id, env).status, "queued");
+  assert.equal(childDecision.action, "none");
+  assert.equal(tryReadJob(fixture.root, first.handle.id, fixture.env).status, "queued");
 
   cancelWorker({
-    root,
+    root: fixture.root,
     principal: owner,
     workerId: first.handle.id,
     idempotencyKey: "mb-launch-followup-1-cancel",
-    env
+    env: fixture.env
   });
-  const retained = tryReadJob(root, first.handle.id, env);
-  assert.equal(retained.status, "queued");
-  assert.equal(retained.phase, "cancellation-requested");
-  assert.equal(retained.result.taskRuntimeCleaned, false);
-  assert.match(retained.result.privacyWarning, /dispatch metadata is malformed|launch-safe/i);
+  const retained = tryReadJob(fixture.root, first.handle.id, fixture.env);
+  assert.equal(retained.status, "cancelled");
+  assert.equal(retained.result.taskRuntimeCleaned, true);
 
   assert.throws(
     () => followupWorker({
-      root,
+      root: fixture.root,
       principal: owner,
-      workerId: first.handle.id,
+      workerId: fixture.workerId,
+      grantId: fixture.grantId,
       message: "Second continuation",
       idempotencyKey: "mb-launch-followup-2",
-      env
-    }),
-    (error) => error?.code === "E_JOB_ACTIVE"
-  );
-});
-
-test("followup idempotency is owner-bound and write parents cannot bypass write gating", () => {
-  const root = initRepo();
-  const env = envFor();
-  const parentA = spawnReadOnlyWorker({
-    root,
-    principal: principal(root),
-    envelope: buildTaskEnvelope({ userRequest: "Parent A", mode: "read" }),
-    idempotencyKey: "mb-owner-parent-a",
-    env
-  });
-  const parentB = spawnReadOnlyWorker({
-    root,
-    principal: principal(root, THREAD_B),
-    envelope: buildTaskEnvelope({ userRequest: "Parent B", mode: "read" }),
-    idempotencyKey: "mb-owner-parent-b",
-    env
-  });
-  cancelWorker({
-    root,
-    principal: principal(root),
-    workerId: parentA.handle.id,
-    idempotencyKey: "mb-owner-cancel-a",
-    env
-  });
-  cancelWorker({
-    root,
-    principal: principal(root, THREAD_B),
-    workerId: parentB.handle.id,
-    idempotencyKey: "mb-owner-cancel-b",
-    env
-  });
-  const childA = followupWorker({
-    root,
-    principal: principal(root),
-    workerId: parentA.handle.id,
-    message: "Owner A follows up",
-    idempotencyKey: "mb-shared-followup-key",
-    env
-  });
-  assert.throws(
-    () => followupWorker({
-      root,
-      principal: principal(root, THREAD_B),
-      workerId: parentB.handle.id,
-      message: "Owner B follows up",
-      idempotencyKey: "mb-shared-followup-key",
-      env
+      env: fixture.env
     }),
     (error) => error?.code === "E_IDEMPOTENCY_CONFLICT"
-      && !String(error.message).includes(childA.handle.id)
-  );
-
-  const writeRoot = initRepo();
-  const writeEnv = envFor();
-  const writer = spawnReadOnlyWorker({
-    root: writeRoot,
-    principal: principal(writeRoot),
-    envelope: buildTaskEnvelope({ userRequest: "Write parent", mode: "write" }),
-    idempotencyKey: "mb-write-parent",
-    roleId: "implementer",
-    write: true,
-    allowWriteSpawn: true,
-    env: writeEnv
-  });
-  cancelWorker({
-    root: writeRoot,
-    principal: principal(writeRoot),
-    workerId: writer.handle.id,
-    idempotencyKey: "mb-write-parent-cancel",
-    env: writeEnv
-  });
-  assert.throws(
-    () => followupWorker({
-      root: writeRoot,
-      principal: principal(writeRoot),
-      workerId: writer.handle.id,
-      message: "Continue writing",
-      idempotencyKey: "mb-write-followup",
-      env: writeEnv
-    }),
-    (error) => error?.code === "E_CAPABILITY"
   );
 });
 
-test("mailbox send and followup stay idempotent across process boundaries and crash ambiguity", async () => {
+test("followup requires the broker-branded exact root owner", () => {
+  const fixture = terminalGrantedParent();
+  assert.throws(
+    () => followupWorker({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      grantId: fixture.grantId,
+      message: "Plain object cannot spend a grant",
+      idempotencyKey: "mb-plain-owner-followup",
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_AUTH_REQUIRED"
+  );
+  assert.throws(
+    () => followupWorker({
+      root: fixture.root,
+      principal: authority(fixture.root, THREAD_B),
+      workerId: fixture.workerId,
+      grantId: fixture.grantId,
+      message: "Foreign owner cannot spend a grant",
+      idempotencyKey: "mb-foreign-owner-followup",
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_JOB_NOT_FOUND"
+  );
+});
+
+test("mailbox send stays idempotent across process boundaries and crash ambiguity", async () => {
   const root = initRepo();
   const env = envFor();
   const spawned = spawnReadOnlyWorker({
@@ -551,40 +590,73 @@ test("mailbox send and followup stay idempotent across process boundaries and cr
   assert.equal(recovered.receipt.reason, "interrupted-delivery");
   assert.equal(redeliveries, 0);
 
-  const followRoot = initRepo();
-  const followEnv = envFor();
-  const parent = spawnReadOnlyWorker({
-    root: followRoot,
-    principal: principal(followRoot),
-    envelope: buildTaskEnvelope({ userRequest: "Follow-up parent", mode: "read" }),
-    idempotencyKey: "mb-cross-follow-parent",
-    env: followEnv
-  });
-  cancelWorker({
-    root: followRoot,
-    principal: principal(followRoot),
-    workerId: parent.handle.id,
-    idempotencyKey: "mb-cross-follow-cancel",
-    env: followEnv
-  });
-  const followSource = `
+});
+
+test("one grant has one cross-process child reservation and cancellation never refunds it", async () => {
+  const fixture = terminalGrantedParent();
+  const sandboxCwd = pathToFileURL(fixture.root).href;
+  const source = `
     import { followupWorker } from ${JSON.stringify(MAILBOX_MODULE)};
+    import { resolveWorkerAuthority } from ${JSON.stringify(AUTHORITY_MODULE)};
+    const principal = resolveWorkerAuthority({
+      threadId: ${JSON.stringify(THREAD)},
+      plugin_id: "grok@grok-companion",
+      "x-codex-turn-metadata": {
+        thread_id: ${JSON.stringify(THREAD)},
+        turn_id: "019f666e-4084-7902-8447-249f72043a37",
+        plugin_id: "grok@grok-companion"
+      },
+      "codex/sandbox-state-meta": { sandboxCwd: ${JSON.stringify(sandboxCwd)} }
+    }, { mutation: true });
     const result = followupWorker({
-      root: ${JSON.stringify(followRoot)},
-      env: ${JSON.stringify(followEnv)},
-      principal: ${JSON.stringify(principal(followRoot))},
-      workerId: ${JSON.stringify(parent.handle.id)},
-      message: "Concurrent continuation",
-      idempotencyKey: "mb-cross-followup"
+      root: ${JSON.stringify(fixture.root)},
+      env: ${JSON.stringify(fixture.env)},
+      principal,
+      workerId: ${JSON.stringify(fixture.workerId)},
+      grantId: ${JSON.stringify(fixture.grantId)},
+      message: "One concurrent continuation",
+      idempotencyKey: "mb-cross-process-grant"
     });
     console.log(JSON.stringify(result));
   `;
-  const followRuns = await Promise.all([runIsolatedModule(followSource), runIsolatedModule(followSource)]);
-  for (const run of followRuns) assert.equal(run.code, 0, run.stderr);
-  const followResults = followRuns.map((run) => lastJson(run.stdout));
-  assert.equal(followResults[0].handle.id, followResults[1].handle.id);
-  assert.deepEqual(followResults.map((result) => result.replayed).sort(), [false, true]);
-  assert.equal(listJobs(followRoot, followEnv).length, 2);
+  const runs = await Promise.all([runIsolatedModule(source), runIsolatedModule(source)]);
+  for (const run of runs) assert.equal(run.code, 0, run.stderr);
+  const results = runs.map((run) => lastJson(run.stdout));
+  assert.equal(results[0].handle.id, results[1].handle.id);
+  assert.deepEqual(results.map((result) => result.replayed).sort(), [false, true]);
+  assert.equal(listJobs(fixture.root, fixture.env).length, 2);
+
+  const childId = results[0].handle.id;
+  cancelWorker({
+    root: fixture.root,
+    principal: authority(fixture.root),
+    workerId: childId,
+    idempotencyKey: "mb-cross-process-child-cancel",
+    env: fixture.env
+  });
+  const replay = followupWorker({
+    root: fixture.root,
+    principal: authority(fixture.root),
+    workerId: fixture.workerId,
+    grantId: fixture.grantId,
+    message: "One concurrent continuation",
+    idempotencyKey: "mb-cross-process-grant",
+    env: fixture.env
+  });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.handle.id, childId);
+  assert.throws(
+    () => followupWorker({
+      root: fixture.root,
+      principal: authority(fixture.root),
+      workerId: fixture.workerId,
+      grantId: fixture.grantId,
+      message: "Try to spend cancelled grant again",
+      idempotencyKey: "mb-cross-process-grant-new-key",
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_IDEMPOTENCY_CONFLICT"
+  );
 });
 
 test("explicit-envelope context never exports hidden material; strong modes gated", () => {

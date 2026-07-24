@@ -93,6 +93,8 @@ export const LIVE_RECEIPT_CAPABILITY_TOOL_IDS = Object.freeze([
   "worker_wait",
   "worker_result",
   "worker_spawn",
+  "worker_decide_host_action",
+  "worker_followup",
   "worker_cancel"
 ]);
 export const LIVE_RECEIPT_NATURAL_TOOL_IDS = Object.freeze([

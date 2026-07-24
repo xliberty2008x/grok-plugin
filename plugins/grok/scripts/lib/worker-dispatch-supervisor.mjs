@@ -15,6 +15,7 @@ import {
 import {
   assertDurableSpawnRequestBinding,
   assertDispatchContract,
+  FOLLOWUP_SPAWN_OWNERSHIP_MODE,
   SPAWN_OWNERSHIP_MODE,
   SPAWN_SUCCESS_DEFINITION
 } from "./worker-mutation.mjs";
@@ -103,11 +104,14 @@ export function validateRecoveryCandidate(candidate, {
     throw new CompanionError("E_CAPABILITY", "Worker recovery capability receipt is missing, stale, or mismatched.");
   }
   const spawn = job.request?.spawn;
+  const expectedOwnershipMode = job.request?.followup === undefined
+    ? SPAWN_OWNERSHIP_MODE
+    : FOLLOWUP_SPAWN_OWNERSHIP_MODE;
   if (!spawn
     || !SHA256_HEX.test(spawn.idempotencyKeyDigest || "")
     || spawn.ownerThreadId !== authorization.owner.sessionId
     || spawn.successDefinition !== SPAWN_SUCCESS_DEFINITION
-    || spawn.ownershipMode !== SPAWN_OWNERSHIP_MODE
+    || spawn.ownershipMode !== expectedOwnershipMode
     || spawn.providerLaunchPending !== true
     || spawn.providerLaunchInFlight !== false
     || spawn.providerLaunchOutcome !== "pending"

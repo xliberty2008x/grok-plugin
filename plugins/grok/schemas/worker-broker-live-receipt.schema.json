@@ -49,7 +49,7 @@
     "producerVersion": { "type": "integer", "const": 1 },
     "manifestDigest": {
       "type": "string",
-      "const": "0641afd02156262492b10f52dd71f4ce18aa6b338179324a34d6b2b111b6370b"
+      "const": "aee11910fb0ff30ac4d7475fbd29c79cc07fed679e037b602d383a94e7694833"
     },
     "authorityMode": {
       "type": "string",
@@ -102,7 +102,7 @@
     "observedToolIds": {
       "type": "array",
       "minItems": 4,
-      "maxItems": 7,
+      "maxItems": 9,
       "uniqueItems": true,
       "items": {
         "type": "string",
@@ -113,6 +113,8 @@
           "worker_wait",
           "worker_result",
           "worker_spawn",
+          "worker_decide_host_action",
+          "worker_followup",
           "worker_cancel"
         ]
       }
@@ -276,6 +278,8 @@
               "worker_wait",
               "worker_result",
               "worker_spawn",
+              "worker_decide_host_action",
+              "worker_followup",
               "worker_cancel"
             ]
           },

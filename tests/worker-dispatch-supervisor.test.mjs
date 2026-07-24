@@ -3,12 +3,19 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 import {
+  attachHostActionRequestToJob,
+  decideHostActionRoleAdmission,
+  readHostActionRequestBinding
+} from "../plugins/grok/scripts/lib/worker-host-actions.mjs";
+import { resolveWorkerAuthority } from "../plugins/grok/scripts/lib/worker-authority.mjs";
+import {
   claimWorkerDispatch,
   prepareDispatchProcessSpawn,
+  spawnGrantedFollowupWorker,
   spawnReadOnlyWorker
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import { createWorkerAuthorization } from "../plugins/grok/scripts/lib/worker-launch-contract.mjs";
@@ -19,7 +26,10 @@ import {
   requestCancel,
   updateJob
 } from "../plugins/grok/scripts/lib/state.mjs";
-import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
+import {
+  buildTaskEnvelope,
+  captureContextManifest
+} from "../plugins/grok/scripts/lib/task-contract.mjs";
 import {
   drainAuthorizedPendingDispatches,
   startWorkerDispatchSupervisor,
@@ -88,6 +98,134 @@ function fixture(t, label, { pluginId = "grok@grok-companion" } = {}) {
   return { root, pluginData, env, principal, workerId };
 }
 
+function mutationAuthority(root) {
+  return resolveWorkerAuthority({
+    threadId: THREAD_ID,
+    plugin_id: "grok@grok-companion",
+    "x-codex-turn-metadata": {
+      thread_id: THREAD_ID,
+      turn_id: "019f8112-1a2b-7c3d-8e4f-1234567890ab",
+      plugin_id: "grok@grok-companion"
+    },
+    "codex/sandbox-state-meta": {
+      sandboxCwd: pathToFileURL(root).href
+    }
+  }, { mutation: true });
+}
+
+function pendingFollowupFixture(t, label) {
+  const state = fixture(t, label);
+  const attemptId = "b".repeat(32);
+  const sessionId = "019f8113-1a2b-7c3d-8e4f-1234567890ab";
+  const finalContext = captureContextManifest(state.root);
+  updateJob(state.root, state.workerId, (current) => {
+    const at = new Date().toISOString();
+    const active = {
+      ...current,
+      status: "running",
+      phase: "finalizing",
+      workerAuthorization: null,
+      workerProcess: {
+        pid: 999_961,
+        startToken: "supervisor-followup-worker",
+        processGroupId: process.platform === "win32" ? null : 999_961,
+        commandMarker: state.workerId,
+        dispatchAttemptId: attemptId,
+        dispatchFence: 1,
+        nonce: current.workerAuthorization.nonce
+      },
+      providerProcess: {
+        pid: 999_962,
+        startToken: "supervisor-followup-provider",
+        processGroupId: process.platform === "win32" ? null : 999_962,
+        commandMarker: state.workerId,
+        dispatchAttemptId: attemptId,
+        dispatchFence: 1,
+        providerGeneration: 1
+      },
+      request: {
+        ...current.request,
+        spawn: {
+          ...current.request.spawn,
+          consumedLaunchContractDigest: current.workerAuthorization.launchContractDigest,
+          launchContractConsumedAt: at,
+          providerLaunchPending: false,
+          providerLaunchInFlight: false,
+          providerLaunchOutcome: "launched",
+          providerLaunchCompletedAt: at,
+          dispatch: {
+            ...current.request.spawn.dispatch,
+            state: "provider-started",
+            attemptId,
+            fence: 1,
+            lease: null,
+            providerGeneration: 1,
+            nextProviderGeneration: null,
+            claimedAt: at,
+            controllerStartedAt: at,
+            workerStartedAt: at,
+            providerStartedAt: at,
+            updatedAt: at
+          }
+        }
+      }
+    };
+    return {
+      ...attachHostActionRequestToJob(active, {
+        providerRequest: {
+          schemaVersion: 1,
+          kind: "role_admission",
+          requestedRoleId: "reviewer"
+        },
+        dispatchAttemptId: attemptId,
+        dispatchFence: 1,
+        providerGeneration: 1,
+        providerSessionId: sessionId
+      }),
+      grokSessionId: sessionId,
+      status: "completed",
+      phase: "done",
+      completedAt: at,
+      completionContextManifest: finalContext,
+      result: {
+        ...(current.result || {}),
+        hostVerification: "not_run",
+        taskRuntimeCleaned: true
+      }
+    };
+  }, state.env);
+  const binding = readHostActionRequestBinding(
+    readJob(state.root, state.workerId, state.env)
+  );
+  const authority = mutationAuthority(state.root);
+  const decision = decideHostActionRoleAdmission({
+    root: state.root,
+    principal: authority,
+    workerId: state.workerId,
+    requestId: binding.requestId,
+    requestDigest: binding.requestDigest,
+    decision: "grant",
+    idempotencyKey: `supervisor-followup-decision-${label}`,
+    env: state.env
+  });
+  const admitted = spawnGrantedFollowupWorker({
+    root: state.root,
+    principal: authority,
+    workerId: state.workerId,
+    grantId: decision.grant.grantId,
+    message: "Recover this pending read-only follow-up",
+    idempotencyKey: `supervisor-followup-child-${label}`,
+    providerCapabilityDigest: CAPABILITY_DIGEST,
+    env: state.env
+  });
+  return {
+    ...state,
+    parentWorkerId: state.workerId,
+    workerId: admitted.handle.id,
+    authority
+  };
+}
+
 function receipt(digest = CAPABILITY_DIGEST) {
   return Object.freeze({ capabilityDigest: digest });
 }
@@ -122,6 +260,32 @@ test("startup drain launches one capability-bound pending job and restart does n
     pluginId: "grok@grok-companion"
   });
   assert.equal(readJob(state.root, state.workerId, state.env).request.spawn.dispatch.fence, 1);
+});
+
+test("startup recovery accepts and claims one valid pending grant-bound follow-up", async (t) => {
+  const state = pendingFollowupFixture(t, "grant-bound");
+  const candidates = listBrokerRecoveryCandidates({ env: state.env });
+  const candidate = candidates.find(({ job }) => job.id === state.workerId);
+  assert.ok(candidate);
+  assert.equal(candidate.job.request.resumeJobId, state.parentWorkerId);
+  assert.equal(candidate.job.request.spawn.ownershipMode, "exact-root-owner-grant");
+  assert.doesNotThrow(() => validateRecoveryCandidate(candidate, {
+    capabilityReceipt: receipt(),
+    env: state.env
+  }));
+
+  const calls = [];
+  const result = await drainAuthorizedPendingDispatches({
+    env: state.env,
+    readCapability: () => receipt(),
+    launchWorker: claimOnly(calls)
+  });
+  assert.equal(result.launched, 1);
+  assert.equal(calls.filter((entry) => entry.claimed).length, 1);
+  assert.equal(
+    readJob(state.root, state.workerId, state.env).request.spawn.dispatch.state,
+    "claimed"
+  );
 });
 
 test("startup drain revalidates capability immediately before launch", async (t) => {

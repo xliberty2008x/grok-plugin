@@ -68,7 +68,9 @@ const SOURCE_BINDING_KEYS = new Set([
   "providerGeneration",
   "workerProcessDigest",
   "providerProcessDigest",
-  "providerSessionDigest"
+  "providerSessionDigest",
+  "consumedLaunchContractDigest",
+  "launchContractConsumedAt"
 ]);
 const PARENT_BINDING_KEYS = new Set([
   "lineageWorkerId",
@@ -355,7 +357,9 @@ function normalizeSourceBinding(binding) {
     || binding.providerGeneration < 1
     || !SHA256_HEX.test(binding.workerProcessDigest || "")
     || !SHA256_HEX.test(binding.providerProcessDigest || "")
-    || !SHA256_HEX.test(binding.providerSessionDigest || "")) {
+    || !SHA256_HEX.test(binding.providerSessionDigest || "")
+    || !SHA256_HEX.test(binding.consumedLaunchContractDigest || "")
+    || !validIsoTimestamp(binding.launchContractConsumedAt)) {
     stateError("Host-action source binding is malformed.");
   }
   return Object.freeze({ ...binding });
@@ -423,7 +427,9 @@ function assertDispatchSource(job, {
     providerGeneration,
     workerProcessDigest: stableDigest(workerProcess),
     providerProcessDigest: stableDigest(providerProcess),
-    providerSessionDigest: providerSessionDigest(providerSessionId)
+    providerSessionDigest: providerSessionDigest(providerSessionId),
+    consumedLaunchContractDigest: job.request.spawn.consumedLaunchContractDigest,
+    launchContractConsumedAt: job.request.spawn.launchContractConsumedAt
   });
 }
 
@@ -446,12 +452,29 @@ function buildParentBinding(job) {
   if (typeof lineageWorkerId !== "string" || !lineageWorkerId) {
     throw new CompanionError("E_CONTEXT_DRIFT", "Host-action request requires exact root lineage.");
   }
+  const continuation = request.followup;
+  const receiptLineageWorkerId = continuation === undefined
+    ? lineageWorkerId
+    : (
+        continuation?.childWorkerId === job.id
+        && continuation?.parentWorkerId === request.resumeJobId
+        && continuation?.lineageWorkerId === lineageWorkerId
+        && lineageWorkerId !== job.id
+          ? job.id
+          : null
+      );
+  if (receiptLineageWorkerId === null) {
+    throw new CompanionError(
+      "E_CONTEXT_DRIFT",
+      "Host-action continuation lineage is malformed."
+    );
+  }
   assertContextPacket(request.contextPacket, { envelope: request.envelope });
   assertContextReceipt(request.contextReceipt, {
     contextPacket: request.contextPacket,
     rolePolicy: policy,
     contextManifest: manifest,
-    lineageWorkerId,
+    lineageWorkerId: receiptLineageWorkerId,
     effectivePromptDigest: request.providerPromptDigest
   });
   if (!SHA256_HEX.test(request.providerPromptDigest || "")) {
@@ -657,7 +680,11 @@ export function assertHostActionRecord(record) {
   });
 }
 
-function assertRequestStillBound(job, request, { providerSessionId = job?.grokSessionId } = {}) {
+export function assertHostActionRequestStillBound(
+  job,
+  request,
+  { providerSessionId = job?.grokSessionId } = {}
+) {
   if (job?.id !== request.sourceBinding.workerId) {
     throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
   }
@@ -956,7 +983,7 @@ export function decideHostActionRoleAdmission({
       || record.request.sourceBinding.workerId !== workerId) {
       throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
     }
-    assertRequestStillBound(initial, record.request);
+    assertHostActionRequestStillBound(initial, record.request);
 
     const sidecar = readIdempotency(root, keyDigest, env);
     if (sidecar) {
@@ -1010,7 +1037,7 @@ export function decideHostActionRoleAdmission({
         || currentRecord.decision !== null) {
         stateError("Host-action request changed during decision.");
       }
-      assertRequestStillBound(current, currentRecord.request);
+      assertHostActionRequestStillBound(current, currentRecord.request);
       return {
         ...current,
         hostAction: assertHostActionRecord({

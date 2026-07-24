@@ -1076,3 +1076,86 @@ test("retain never prunes unclean review or task jobs while empty-target skips s
     else process.env.CLAUDE_PLUGIN_DATA = previous;
   }
 });
+
+test("retain at a zero terminal limit preserves the full resume-parent chain of an active child", () => {
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = tempDir("grok-state-data-");
+  try {
+    const root = initRepo();
+    const rootId = generateId("task");
+    const parentId = generateId("task");
+    const childId = generateId("task");
+    writeJob(root, job(rootId, {
+      status: "completed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      request: { providerHomeId: rootId },
+      result: { taskRuntimeCleaned: true }
+    }));
+    writeJob(root, job(parentId, {
+      status: "completed",
+      createdAt: "2026-01-02T00:00:00.000Z",
+      request: {
+        providerHomeId: rootId,
+        resumeJobId: rootId
+      },
+      result: { taskRuntimeCleaned: true }
+    }));
+    writeJob(root, job(childId, {
+      status: "queued",
+      createdAt: "2026-01-03T00:00:00.000Z",
+      request: {
+        providerHomeId: rootId,
+        resumeJobId: parentId
+      }
+    }));
+    retain(root, 0);
+    const retainedIds = new Set(listJobs(root).map((record) => record.id));
+    assert.deepEqual(retainedIds, new Set([rootId, parentId, childId]));
+
+    updateJob(root, childId, (current) => ({
+      ...current,
+      status: "completed",
+      result: { taskRuntimeCleaned: true }
+    }));
+    retain(root, 0);
+    assert.deepEqual(listJobs(root), []);
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_PLUGIN_DATA;
+    else process.env.CLAUDE_PLUGIN_DATA = previous;
+  }
+});
+
+test("retain serializes behind the same workspace transaction used by follow-up admission", async () => {
+  const pluginData = tempDir("grok-state-data-");
+  const env = { ...process.env, CLAUDE_PLUGIN_DATA: pluginData };
+  const root = initRepo();
+  const signals = tempDir("grok-retain-admission-lock-");
+  const ready = path.join(signals, "ready");
+  const holdMs = 350;
+  const source = `
+    import fs from "node:fs";
+    import { withWorkspaceStateTransaction } from ${JSON.stringify(STATE_MODULE_URL)};
+    withWorkspaceStateTransaction(process.argv[1], () => {
+      fs.writeFileSync(process.argv[2], "ready\\n", { mode: 0o600 });
+      Atomics.wait(
+        new Int32Array(new SharedArrayBuffer(4)),
+        0,
+        0,
+        Number(process.argv[3])
+      );
+    }, process.env);
+  `;
+  const holder = runStateChild(source, [root, ready, String(holdMs)], env);
+  try {
+    await waitForPath(ready);
+    const startedAt = Date.now();
+    retain(root, 0, env);
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed >= 200, `retain bypassed the admission lock after ${elapsed}ms`);
+    await holder.completion;
+  } finally {
+    if (holder.child.exitCode == null && holder.child.signalCode == null) {
+      holder.child.kill("SIGKILL");
+    }
+  }
+});

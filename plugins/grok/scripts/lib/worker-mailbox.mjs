@@ -11,16 +11,16 @@ import path from "node:path";
 import { CompanionError } from "./errors.mjs";
 import {
   ensurePrivateStateDirectory,
-  generateId,
   now,
   readPrivateJsonFile,
   writePrivateJsonFile,
   withWorkspaceStateTransaction
 } from "./state.mjs";
 import { appendLifecycleEvent } from "./task-contract.mjs";
-import { projectWorkerHandle } from "./worker-protocol.mjs";
-import { assertMutationOwnership } from "./worker-mutation.mjs";
-import { resolveControlWorkspace } from "./workspace.mjs";
+import {
+  assertMutationOwnership,
+  spawnGrantedFollowupWorker
+} from "./worker-mutation.mjs";
 
 export const MAILBOX_SCHEMA_VERSION = 1;
 export const MAX_MAILBOX_MESSAGE_LENGTH = 16000;
@@ -94,14 +94,6 @@ function messagePath(root, messageId, env = process.env) {
 function writeMessage(root, record, env = process.env) {
   const file = messagePath(root, record.messageId, env);
   return writePrivateJsonFile(file, record);
-}
-
-function writePrivateJson(file, record) {
-  return writePrivateJsonFile(file, record);
-}
-
-function readPrivateJson(file, label) {
-  return readPrivateJsonFile(file, { missing: null, label });
 }
 
 function readMessage(root, messageId, env = process.env) {
@@ -373,174 +365,28 @@ export function retryDelivery(root, messageId, env = process.env) {
 }
 
 /**
- * Lineage-preserving follow-up for terminal/idle workers.
+ * Grant-bound follow-up compatibility wrapper. Caller-selected envelopes,
+ * context, role, profile, session, root, and lineage are intentionally absent.
  */
-export function followupWorker({
-  root,
-  principal,
-  workerId,
-  message,
-  idempotencyKey,
-  envelope = null,
-  contextManifest = null,
-  env = process.env
-} = {}) {
-  assertIdempotencyKey(idempotencyKey);
-  if (!principal?.threadId) {
-    throw new CompanionError("E_AUTH_REQUIRED", "Trusted Codex task identity is unavailable.");
+export function followupWorker(options = {}) {
+  const allowed = new Set([
+    "root",
+    "principal",
+    "workerId",
+    "grantId",
+    "message",
+    "idempotencyKey",
+    "env",
+    "providerCapabilityDigest"
+  ]);
+  if (!options || typeof options !== "object" || Array.isArray(options)
+    || Object.keys(options).some((key) => !allowed.has(key))) {
+    throw new CompanionError(
+      "E_USAGE",
+      "Follow-up accepts only workerId, grantId, message, and idempotencyKey."
+    );
   }
-  assertMessage(message);
-  const keyDigest = digest(idempotencyKey);
-  const mutationDigest = stableDigest({
-    ownerThreadId: principal.threadId,
-    parentWorkerId: workerId,
-    message,
-    envelope,
-    contextManifest
-  });
-  const idemFile = path.join(mailboxDir(root, env), `followup-${keyDigest}.json`);
-
-  return withWorkspaceStateTransaction(root, (transaction) => {
-    const prior = readPrivateJson(idemFile, "follow-up idempotency record");
-    if (prior) {
-      if (
-        prior.ownerThreadId !== principal.threadId
-        || prior.parentId !== workerId
-        || prior.requestDigest !== mutationDigest
-      ) {
-        idempotencyConflict("idempotencyKey was reused with a different follow-up owner or request.");
-      }
-      const committed = transaction.tryReadJob(prior.workerId);
-      if (!committed) {
-        throw new CompanionError("E_STATE", "Follow-up idempotency record refers to a missing durable job.");
-      }
-      assertMutationOwnership(committed, principal);
-      return { handle: projectWorkerHandle(committed), replayed: true };
-    }
-
-    // Recover a child commit whose adjacent idempotency publication was interrupted.
-    const orphan = transaction.listJobs().find((candidate) => (
-      candidate.request?.followup?.idempotencyKeyDigest === keyDigest
-    ));
-    if (orphan) {
-      if (
-        orphan.request?.followup?.ownerThreadId !== principal.threadId
-        || orphan.request?.followup?.parentWorkerId !== workerId
-        || orphan.request?.followup?.requestDigest !== mutationDigest
-      ) {
-        idempotencyConflict("idempotencyKey was reused with a different follow-up owner or request.");
-      }
-      assertMutationOwnership(orphan, principal);
-      writePrivateJson(idemFile, {
-        workerId: orphan.id,
-        parentId: workerId,
-        ownerThreadId: principal.threadId,
-        requestDigest: mutationDigest,
-        committedAt: orphan.createdAt || now()
-      });
-      return { handle: projectWorkerHandle(orphan), replayed: true };
-    }
-
-    const parent = transaction.tryReadJob(workerId);
-    if (!parent) throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
-    assertMutationOwnership(parent, principal);
-
-    if (parent.status === "queued" || parent.status === "running") {
-      throw new CompanionError(
-        "E_JOB_ACTIVE",
-        "followup requires a terminal or idle worker; use send for active workers."
-      );
-    }
-    if (parent.write || envelope?.mode === "write") {
-      throw new CompanionError(
-        "E_CAPABILITY",
-        "Write-worker follow-up requires the isolated write-spawn control path."
-      );
-    }
-
-    // Context/profile drift rejection.
-    const parentProfile = parent.profile?.agentProfileDigest || parent.role?.digest || null;
-    if (envelope?.profileDigest && parentProfile && envelope.profileDigest !== parentProfile) {
-      throw new CompanionError("E_CONTEXT_DRIFT", "Follow-up profile digest does not match parent.");
-    }
-    const parentContext = parent.request?.contextManifest?.digest || null;
-    if (contextManifest?.digest && parentContext && contextManifest.digest !== parentContext) {
-      // Allow explicit new context only when envelope declares supersession.
-      if (envelope?.contextSupersession !== true) {
-        throw new CompanionError("E_CONTEXT_DRIFT", "Follow-up context digest drifted from parent.");
-      }
-    }
-
-    let controlWorkspaceId = parent.controlWorkspaceId || null;
-    if (!controlWorkspaceId) {
-      try { controlWorkspaceId = resolveControlWorkspace(root, env).controlWorkspaceId; }
-      catch { controlWorkspaceId = null; }
-    }
-
-    const id = generateId("task");
-    const createdAt = now();
-    const child = {
-      schemaVersion: 3,
-      id,
-      kind: "task",
-      jobClass: "task",
-      write: false,
-      status: "queued",
-      phase: "accepted",
-      summary: "Follow-up committed",
-      progress: "Lineage-preserving follow-up spawn committed.",
-      createdAt,
-      updatedAt: createdAt,
-      host: { kind: "codex", sessionId: principal.threadId },
-      controlWorkspaceId,
-      profile: parent.profile || null,
-      role: parent.role || null,
-      request: {
-        envelope: envelope || {
-          schemaVersion: 1,
-          userRequest: message,
-          objective: message,
-          mode: "read",
-          digest: digest(message)
-        },
-        contextManifest: contextManifest || parent.request?.contextManifest || null,
-        resumeJobId: parent.id,
-        providerHomeId: parent.request?.providerHomeId || parent.id,
-        publicObjective: message,
-        // Follow-up admission is also a commit-before-launch boundary. The
-        // shared reconciler/recovery/cancellation logic must not mistake the
-        // absence of a process here for a lost worker.
-        spawn: {
-          providerLaunchPending: true
-        },
-        followup: {
-          parentWorkerId: parent.id,
-          ownerThreadId: principal.threadId,
-          requestDigest: mutationDigest,
-          idempotencyKeyDigest: keyDigest
-        }
-      },
-      lifecycleEvents: appendLifecycleEvent(
-        [],
-        "task.accepted",
-        "Follow-up worker committed with parent lineage.",
-        { parentWorkerId: parent.id }
-      ),
-      result: null,
-      error: null,
-      workerAuthorization: { nonce: crypto.randomBytes(16).toString("hex") }
-    };
-
-    const committed = transaction.admitJob(child);
-    writePrivateJson(idemFile, {
-      workerId: committed.id,
-      parentId: parent.id,
-      ownerThreadId: principal.threadId,
-      requestDigest: mutationDigest,
-      committedAt: createdAt
-    });
-    return { handle: projectWorkerHandle(committed), replayed: false };
-  }, env);
+  return spawnGrantedFollowupWorker(options);
 }
 
 export function listMailboxMessages(root, workerId, env = process.env) {

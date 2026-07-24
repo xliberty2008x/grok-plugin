@@ -10,7 +10,10 @@ import {
   createMcpBrokerRuntime,
   handleMcpRequest
 } from "../plugins/grok/mcp/broker.mjs";
-import { ROOT_READ_PROVIDER_CAPABILITY } from "../plugins/grok/scripts/lib/provider-capability.mjs";
+import {
+  ROOT_READ_PROVIDER_CAPABILITY,
+  SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+} from "../plugins/grok/scripts/lib/provider-capability.mjs";
 import {
   assertDispatchContract,
   authorizeWorkerProviderRotation,
@@ -54,7 +57,10 @@ const TURN_ID = "019f666e-4084-7902-8447-249f72043a37";
 let requestId = 0;
 const TEST_PROVIDER_RECEIPT = Object.freeze({
   capabilityDigest: "c".repeat(64),
-  capabilities: [ROOT_READ_PROVIDER_CAPABILITY]
+  capabilities: [
+    ROOT_READ_PROVIDER_CAPABILITY,
+    SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+  ]
 });
 const TEST_BROKER_RUNTIME = createMcpBrokerRuntime({
   providerCapabilityReceipt: TEST_PROVIDER_RECEIPT
@@ -737,6 +743,115 @@ test("provider final report persists one body-free future-admission request at t
     assert.equal(publicText.includes(privateValue), false);
   }
   await assertAllProcessesGone(privateJob);
+});
+
+test("MCP grant-bound follow-up loads the exact provider session once and replay sends no third prompt", { skip: process.platform === "win32" }, async (t) => {
+  const { root, fake, env } = fixture({
+    taskTexts: [
+      taskReport("Request an independent review", {
+        hostActionRequest: {
+          schemaVersion: 1,
+          kind: "role_admission",
+          requestedRoleId: "reviewer"
+        }
+      }),
+      taskReport("Independent review completed")
+    ]
+  });
+  const options = { env };
+  const workerIds = [];
+  t.after(() => {
+    for (const workerId of workerIds) {
+      emergencyStop(tryReadJob(root, workerId, env));
+    }
+  });
+
+  const spawned = await callTool(root, "worker_spawn", {
+    idempotencyKey: "mcp-runtime-followup-root-0001",
+    userRequest: "Inspect the fixture, then request one independent reviewer."
+  }, options);
+  workerIds.push(spawned.worker.id);
+  await waitForTerminal(root, spawned.worker.id, options);
+  const rootResult = await callTool(root, "worker_result", {
+    id: spawned.worker.id
+  }, options);
+  assert.equal(rootResult.worker.status, "completed");
+  assert.equal(rootResult.worker.awaitingHostAction.status, "awaiting");
+  const parent = tryReadJob(root, spawned.worker.id, env);
+
+  const decided = await callTool(root, "worker_decide_host_action", {
+    id: spawned.worker.id,
+    requestId: rootResult.worker.awaitingHostAction.requestId,
+    decision: "grant",
+    idempotencyKey: "mcp-runtime-followup-decision-0001"
+  }, options);
+  assert.equal(decided.decision.decision, "grant");
+  assert.equal(decided.decision.grant.requestedRoleId, "reviewer");
+  assert.equal(Object.hasOwn(decided.decision, "requestDigest"), false);
+  assert.equal(Object.hasOwn(decided.decision.grant, "grantDigest"), false);
+
+  const followed = await callTool(root, "worker_followup", {
+    id: spawned.worker.id,
+    grantId: decided.decision.grant.grantId,
+    message: "Independently review the completed result.",
+    idempotencyKey: "mcp-runtime-followup-child-0001"
+  }, options);
+  workerIds.push(followed.worker.id);
+  const replay = await callTool(root, "worker_followup", {
+    id: spawned.worker.id,
+    grantId: decided.decision.grant.grantId,
+    message: "Independently review the completed result.",
+    idempotencyKey: "mcp-runtime-followup-child-0001"
+  }, options);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.worker.id, followed.worker.id);
+
+  await waitForTerminal(root, followed.worker.id, options);
+  const childResult = await callTool(root, "worker_result", {
+    id: followed.worker.id
+  }, options);
+  assert.equal(childResult.worker.status, "completed");
+  assert.equal(childResult.worker.parentWorkerId, spawned.worker.id);
+  assert.equal(childResult.worker.lineageWorkerId, spawned.worker.id);
+  assert.equal(childResult.worker.roleId, "reviewer");
+  assert.equal(childResult.worker.contextReceipt.lineageWorkerId, followed.worker.id);
+
+  const child = tryReadJob(root, followed.worker.id, env);
+  assert.equal(child.request.resumeJobId, parent.id);
+  assert.equal(child.request.providerHomeId, parent.id);
+  assert.equal(child.request.resumeSessionId, parent.grokSessionId);
+  assert.equal(child.grokSessionId, parent.grokSessionId);
+  assert.equal(parent.result.taskRuntimeCleaned, true);
+  assert.equal(child.result.taskRuntimeCleaned, true);
+  const decidedParent = tryReadJob(root, spawned.worker.id, env);
+
+  const log = readFakeLog(fake.logFile);
+  const sessionNew = log.filter((entry) => entry.event === "rpc"
+    && entry.message?.method === "session/new");
+  const sessionLoad = log.filter((entry) => entry.event === "rpc"
+    && entry.message?.method === "session/load");
+  const prompts = log.filter((entry) => entry.event === "prompt");
+  assert.equal(sessionNew.length, 1);
+  assert.equal(sessionLoad.length, 1);
+  assert.equal(sessionLoad[0].message.params.sessionId, parent.grokSessionId);
+  assert.equal(prompts.length, 2);
+  assert.deepEqual(prompts.map((entry) => entry.sessionId), [
+    parent.grokSessionId,
+    parent.grokSessionId
+  ]);
+
+  const publicText = JSON.stringify([decided, followed, replay, childResult]);
+  for (const privateValue of [
+    parent.hostAction.request.requestDigest,
+    decidedParent.hostAction.grant.grantDigest,
+    parent.request.spawn.ownerThreadId,
+    parent.grokSessionId,
+    root
+  ]) {
+    assert.equal(publicText.includes(privateValue), false);
+  }
+  await assertAllProcessesGone(parent);
+  await assertAllProcessesGone(child);
 });
 
 test("implementer host-action request fails E_CAPABILITY and leaves no durable grant request", { skip: process.platform === "win32" }, async (t) => {
