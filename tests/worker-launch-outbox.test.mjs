@@ -19,6 +19,9 @@ import {
   WORKER_AUTHORIZATION_SCHEMA_VERSION,
   WORKER_DISPATCH_OUTBOX_SCHEMA_VERSION,
   assertWorkerAuthorization,
+  bindWorkerAuthorizationAttempt,
+  createWorkerAuthorization,
+  executionBindingDigestForJob,
   launchContractDigest
 } from "../plugins/grok/scripts/lib/worker-launch-contract.mjs";
 import { launchCommittedWorker } from "../plugins/grok/scripts/lib/worker-runtime.mjs";
@@ -80,6 +83,51 @@ function fixture(idempotencyKey) {
     env
   });
   return { root, env, principal, workerId: admitted.handle.id };
+}
+
+function deterministicReadLaunchJob() {
+  return {
+    id: "worker-read-compat",
+    kind: "task",
+    jobClass: "review",
+    write: false,
+    host: {
+      kind: "codex",
+      sessionId: THREAD_ID
+    },
+    controlWorkspaceId: `cws-${"d".repeat(32)}`,
+    profile: {
+      id: "default",
+      grokVersion: "0.2.111",
+      providerToolIds: ["read_file"]
+    },
+    role: {
+      id: "explorer",
+      title: "Explorer"
+    },
+    model: "grok-4.5",
+    effort: "high",
+    request: {
+      envelope: {
+        schemaVersion: 1,
+        userRequest: "Inspect the repository",
+        objective: "Inspect the repository",
+        mode: "read",
+        successDefinition: "Report findings"
+      },
+      publicObjective: "Inspect the repository",
+      providerPromptDigest: "e".repeat(64),
+      spawn: {
+        idempotencyKeyDigest: "a".repeat(64),
+        ownerThreadId: THREAD_ID,
+        requestDigest: "b".repeat(64),
+        successDefinition: "Report findings",
+        ownershipMode: "thread",
+        executionRoot: "/tmp/read-only-repo",
+        providerCapabilityDigest: "c".repeat(64)
+      }
+    }
+  };
 }
 
 function addLinkedWorktree(primaryRoot, name) {
@@ -273,6 +321,199 @@ test("new broker admissions bind WorkerAuthorization v2 to dispatch-v2", () => {
   assert.equal(job.request.spawn.dispatch.state, "pending");
   assert.equal(job.request.spawn.dispatch.fence, 0);
   assert.equal(job.request.spawn.dispatch.lease, null);
+});
+
+test("read launch digest and authorization remain execution-binding-free and byte-compatible", () => {
+  const compatibilityJob = deterministicReadLaunchJob();
+  assert.equal(executionBindingDigestForJob(compatibilityJob), null);
+  assert.equal(
+    launchContractDigest(compatibilityJob),
+    "57b42ea51bdba6d6d292c9b9df8ba0171984080c993b31bc511ea49fde30da58"
+  );
+
+  const state = fixture("launch-contract-read-compat-0001");
+  const job = tryReadJob(state.root, state.workerId, state.env);
+  const authorization = assertWorkerAuthorization(job, { allowLegacy: false });
+  assert.deepEqual(
+    Object.keys(authorization).sort(),
+    [
+      "authorizationId",
+      "controlWorkspaceId",
+      "dispatchAttemptId",
+      "dispatchFence",
+      "issuedAt",
+      "launchContractDigest",
+      "nonce",
+      "owner",
+      "purpose",
+      "requestDigest",
+      "schemaVersion",
+      "workerId"
+    ]
+  );
+  assert.equal(Object.hasOwn(authorization, "executionBindingDigest"), false);
+  assert.equal(Object.hasOwn(job.executionBinding || {}, "bindingDigest"), false);
+  assert.equal(Object.hasOwn(job.request.spawn, "executionBindingDigest"), false);
+});
+
+test("read launch authorization rejects execution-binding digest injection", () => {
+  const state = fixture("launch-contract-read-binding-injection-0001");
+  const original = tryReadJob(state.root, state.workerId, state.env);
+  const digest = "1".repeat(64);
+  const cases = [
+    ["job", {
+      ...structuredClone(original),
+      executionBinding: { bindingDigest: digest }
+    }],
+    ["spawn", {
+      ...structuredClone(original),
+      request: {
+        ...structuredClone(original.request),
+        spawn: {
+          ...structuredClone(original.request.spawn),
+          executionBindingDigest: digest
+        }
+      }
+    }],
+    ["authorization", {
+      ...structuredClone(original),
+      workerAuthorization: {
+        ...structuredClone(original.workerAuthorization),
+        executionBindingDigest: digest
+      }
+    }]
+  ];
+
+  for (const [label, candidate] of cases) {
+    assert.throws(
+      () => assertWorkerAuthorization(candidate, { allowLegacy: false }),
+      (error) => error?.code === "E_AUTH_REQUIRED",
+      label
+    );
+  }
+});
+
+test("write launch requires a complete matching execution-binding digest pair", () => {
+  const state = fixture("launch-contract-write-binding-required-0001");
+  const readJob = tryReadJob(state.root, state.workerId, state.env);
+  const digest = "2".repeat(64);
+  const differentDigest = "3".repeat(64);
+  const baseWrite = {
+    ...structuredClone(readJob),
+    write: true
+  };
+  delete baseWrite.workerAuthorization;
+
+  const cases = [
+    ["missing", structuredClone(baseWrite)],
+    ["job-only", {
+      ...structuredClone(baseWrite),
+      executionBinding: { bindingDigest: digest }
+    }],
+    ["spawn-only", {
+      ...structuredClone(baseWrite),
+      request: {
+        ...structuredClone(baseWrite.request),
+        spawn: {
+          ...structuredClone(baseWrite.request.spawn),
+          executionBindingDigest: digest
+        }
+      }
+    }],
+    ["mismatch", {
+      ...structuredClone(baseWrite),
+      executionBinding: { bindingDigest: digest },
+      request: {
+        ...structuredClone(baseWrite.request),
+        spawn: {
+          ...structuredClone(baseWrite.request.spawn),
+          executionBindingDigest: differentDigest
+        }
+      }
+    }]
+  ];
+
+  for (const [label, candidate] of cases) {
+    assert.throws(
+      () => executionBindingDigestForJob(candidate),
+      (error) => error?.code === "E_AUTH_REQUIRED",
+      label
+    );
+    assert.throws(
+      () => createWorkerAuthorization({
+        job: candidate,
+        principal: state.principal,
+        nonce: "4".repeat(32),
+        issuedAt: readJob.createdAt
+      }),
+      (error) => error?.code === "E_AUTH_REQUIRED",
+      label
+    );
+  }
+});
+
+test("exact write execution binding authorizes, survives attempt binding, and rejects drift", () => {
+  const state = fixture("launch-contract-write-binding-exact-0001");
+  const readJob = tryReadJob(state.root, state.workerId, state.env);
+  const bindingDigest = "5".repeat(64);
+  const writeJob = {
+    ...structuredClone(readJob),
+    write: true,
+    executionBinding: {
+      bindingDigest
+    },
+    request: {
+      ...structuredClone(readJob.request),
+      spawn: {
+        ...structuredClone(readJob.request.spawn),
+        executionBindingDigest: bindingDigest
+      }
+    }
+  };
+  delete writeJob.workerAuthorization;
+
+  const authorization = createWorkerAuthorization({
+    job: writeJob,
+    principal: state.principal,
+    nonce: "6".repeat(32),
+    issuedAt: readJob.createdAt
+  });
+  assert.equal(executionBindingDigestForJob(writeJob), bindingDigest);
+  assert.equal(authorization.executionBindingDigest, bindingDigest);
+  writeJob.workerAuthorization = authorization;
+  assert.equal(
+    assertWorkerAuthorization(writeJob, { allowLegacy: false }).executionBindingDigest,
+    bindingDigest
+  );
+
+  const missingAuthorizationDigest = structuredClone(writeJob);
+  delete missingAuthorizationDigest.workerAuthorization.executionBindingDigest;
+  assert.throws(
+    () => assertWorkerAuthorization(missingAuthorizationDigest, { allowLegacy: false }),
+    (error) => error?.code === "E_AUTH_REQUIRED"
+  );
+  const mismatchedAuthorizationDigest = structuredClone(writeJob);
+  mismatchedAuthorizationDigest.workerAuthorization.executionBindingDigest = "9".repeat(64);
+  assert.throws(
+    () => assertWorkerAuthorization(mismatchedAuthorizationDigest, { allowLegacy: false }),
+    (error) => error?.code === "E_AUTH_REQUIRED"
+  );
+
+  writeJob.workerAuthorization = bindWorkerAuthorizationAttempt(authorization, {
+    attemptId: "7".repeat(32),
+    fence: 1
+  });
+  assert.equal(writeJob.workerAuthorization.executionBindingDigest, bindingDigest);
+  assertWorkerAuthorization(writeJob, { allowLegacy: false });
+
+  const driftDigest = "8".repeat(64);
+  const drifted = structuredClone(writeJob);
+  drifted.executionBinding.bindingDigest = driftDigest;
+  drifted.request.spawn.executionBindingDigest = driftDigest;
+  assert.throws(
+    () => assertWorkerAuthorization(drifted, { allowLegacy: false }),
+    (error) => error?.code === "E_AUTH_REQUIRED"
+  );
 });
 
 test("the Codex CLI task entrypoint uses the shared versioned launcher", {

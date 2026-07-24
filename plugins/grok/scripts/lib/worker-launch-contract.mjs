@@ -88,9 +88,45 @@ function validIsoTimestamp(value) {
   return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
 }
 
+export function executionBindingDigestForJob(job) {
+  const executionBinding = isPlainRecord(job?.executionBinding)
+    ? job.executionBinding
+    : {};
+  const spawn = isPlainRecord(job?.request?.spawn)
+    ? job.request.spawn
+    : {};
+  const hasBindingDigest = Object.hasOwn(executionBinding, "bindingDigest");
+  const hasSpawnDigest = Object.hasOwn(spawn, "executionBindingDigest");
+  const bindingDigest = executionBinding.bindingDigest;
+  const spawnDigest = spawn.executionBindingDigest;
+
+  if (job?.write === true) {
+    if (!hasBindingDigest
+      || !hasSpawnDigest
+      || !SHA256_HEX.test(bindingDigest || "")
+      || !SHA256_HEX.test(spawnDigest || "")
+      || bindingDigest !== spawnDigest) {
+      throw new CompanionError(
+        "E_AUTH_REQUIRED",
+        "Write worker launch requires one matching durable execution-binding digest."
+      );
+    }
+    return bindingDigest;
+  }
+
+  if (hasBindingDigest || hasSpawnDigest) {
+    throw new CompanionError(
+      "E_AUTH_REQUIRED",
+      "Read-only worker launch must not include an execution-binding digest."
+    );
+  }
+  return null;
+}
+
 function stableRequestBinding(job) {
   const request = isPlainRecord(job?.request) ? job.request : {};
   const sourceEnvelope = isPlainRecord(request.envelope) ? request.envelope : {};
+  const executionBindingDigest = executionBindingDigestForJob(job);
   let durableUserRequestDigest = null;
   if (typeof sourceEnvelope.userRequest === "string") {
     durableUserRequestDigest = textDigest(sourceEnvelope.userRequest);
@@ -160,6 +196,9 @@ function stableRequestBinding(job) {
     executionRoot: spawn.executionRoot || null,
     ...(Object.hasOwn(spawn, "providerCapabilityDigest")
       ? { providerCapabilityDigest: spawn.providerCapabilityDigest }
+      : {}),
+    ...(executionBindingDigest
+      ? { executionBindingDigest }
       : {})
   };
   return stable;
@@ -175,6 +214,7 @@ function stableProfileBinding(profile) {
 }
 
 function launchBinding(job) {
+  const executionBindingDigest = executionBindingDigestForJob(job);
   return {
     schemaVersion: 2,
     workerId: job?.id,
@@ -187,7 +227,10 @@ function launchBinding(job) {
     role: job?.role || null,
     model: job?.model || null,
     effort: job?.effort || null,
-    request: stableRequestBinding(job)
+    request: stableRequestBinding(job),
+    ...(executionBindingDigest
+      ? { executionBindingDigest }
+      : {})
   };
 }
 
@@ -212,6 +255,7 @@ export function createWorkerAuthorization({
     || !SHA256_HEX.test(job.request?.providerPromptDigest || "")) {
     throw new CompanionError("E_STATE", "Worker launch authorization requires durable request and provider-prompt digests.");
   }
+  const executionBindingDigest = executionBindingDigestForJob(job);
   return Object.freeze({
     schemaVersion: WORKER_AUTHORIZATION_SCHEMA_VERSION,
     authorizationId: crypto.randomBytes(16).toString("hex"),
@@ -228,7 +272,10 @@ export function createWorkerAuthorization({
     nonce,
     issuedAt,
     dispatchAttemptId: null,
-    dispatchFence: null
+    dispatchFence: null,
+    ...(executionBindingDigest
+      ? { executionBindingDigest }
+      : {})
   });
 }
 
@@ -238,6 +285,7 @@ export function assertWorkerAuthorization(job, { allowLegacy = true } = {}) {
   if (!authorization || authorization.schemaVersion !== WORKER_AUTHORIZATION_SCHEMA_VERSION) {
     throw new CompanionError("E_AUTH_REQUIRED", "Worker launch authorization is missing or unsupported.");
   }
+  const executionBindingDigest = executionBindingDigestForJob(job);
   const authorizationKeys = new Set([
     "schemaVersion",
     "authorizationId",
@@ -250,11 +298,16 @@ export function assertWorkerAuthorization(job, { allowLegacy = true } = {}) {
     "nonce",
     "issuedAt",
     "dispatchAttemptId",
-    "dispatchFence"
+    "dispatchFence",
+    ...(executionBindingDigest ? ["executionBindingDigest"] : [])
   ]);
   const ownerKeys = new Set(["hostKind", "sessionId", "pluginId"]);
-  const exact = Object.keys(authorization).every((key) => authorizationKeys.has(key))
-    && Object.keys(authorization.owner || {}).every((key) => ownerKeys.has(key))
+  const exact = isPlainRecord(authorization)
+    && Object.keys(authorization).length === authorizationKeys.size
+    && Object.keys(authorization).every((key) => authorizationKeys.has(key))
+    && isPlainRecord(authorization.owner)
+    && Object.keys(authorization.owner).length === ownerKeys.size
+    && Object.keys(authorization.owner).every((key) => ownerKeys.has(key))
     && authorization.purpose === "launch-worker"
     && ID_HEX.test(authorization.authorizationId || "")
     && ID_HEX.test(authorization.nonce || "")
@@ -270,6 +323,8 @@ export function assertWorkerAuthorization(job, { allowLegacy = true } = {}) {
     && (typeof job.request?.prompt !== "string"
       || textDigest(job.request.prompt) === job.request.providerPromptDigest)
     && authorization.launchContractDigest === launchContractDigest(job)
+    && (executionBindingDigest === null
+      || authorization.executionBindingDigest === executionBindingDigest)
     && validIsoTimestamp(authorization.issuedAt)
     && (authorization.dispatchAttemptId === null || ID_HEX.test(authorization.dispatchAttemptId || ""))
     && (authorization.dispatchFence === null
