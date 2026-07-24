@@ -6730,7 +6730,10 @@ test("private signed review promotion is atomic, immutable, concurrent, and rest
     ready: secondReady,
     barrier
   });
-  await waitFor(() => fs.existsSync(firstReady) && fs.existsSync(secondReady), 10_000);
+  // Hosted macOS runners may need more than ten seconds to start both isolated
+  // ESM children. This extends only readiness scheduling; both writers still
+  // block on the same barrier before the concurrency assertion begins.
+  await waitFor(() => fs.existsSync(firstReady) && fs.existsSync(secondReady), 30_000);
   fs.writeFileSync(barrier, "go\n");
   const results = await Promise.all([first.completed, second.completed]);
   assert.deepEqual(

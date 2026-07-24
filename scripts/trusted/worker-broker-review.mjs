@@ -504,7 +504,29 @@ async function main() {
   return invokeProtectedOperation(runtimeRoot, parsed, attestation);
 }
 
-if (import.meta.main === true) {
+function canonicalEntrypointPath(candidate) {
+  if (typeof candidate !== "string" || !candidate) return null;
+  try {
+    const resolved = path.resolve(candidate);
+    return typeof fs.realpathSync.native === "function"
+      ? fs.realpathSync.native(resolved)
+      : fs.realpathSync(resolved);
+  } catch {
+    return null;
+  }
+}
+
+function isDirectMainInvocation() {
+  // Node 22.18+ supplies the engine-owned signal. Node 18 needs the canonical
+  // argv fallback so direct execution still reaches the fail-closed bootstrap,
+  // while ordinary module import remains inert.
+  if (typeof import.meta.main === "boolean") return import.meta.main;
+  const modulePath = canonicalEntrypointPath(fileURLToPath(import.meta.url));
+  const invokedPath = canonicalEntrypointPath(process.argv[1]);
+  return modulePath !== null && invokedPath === modulePath;
+}
+
+if (isDirectMainInvocation()) {
   try {
     const result = await main();
     process.stdout.write(`${JSON.stringify(boundedResult(result), null, 2)}\n`);
@@ -513,9 +535,4 @@ if (import.meta.main === true) {
     process.stdout.write(`${JSON.stringify(boundedFailure(error), null, 2)}\n`);
     process.exitCode = 1;
   }
-} else if (import.meta.main === undefined) {
-  process.stdout.write(
-    `${JSON.stringify({ ok: false, code: "E_REVIEW_TRUST_UNAVAILABLE" }, null, 2)}\n`
-  );
-  process.exitCode = 1;
 }
