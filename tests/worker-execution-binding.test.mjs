@@ -10,6 +10,7 @@ import {
   assertProvisioningJournal,
   createExecutionBinding,
   createProvisioningJournal,
+  createPublicExecutionProjection,
   reclaimProvisioningJournal,
   transitionProvisioningJournal
 } from "../plugins/grok/scripts/lib/worker-execution-binding.mjs";
@@ -30,6 +31,13 @@ function sha256(value) {
 
 function clone(value) {
   return structuredClone(value);
+}
+
+function redigestJournal(journal) {
+  journal.journalDigest = sha256(Object.fromEntries(
+    Object.entries(journal).filter(([key]) => key !== "journalDigest")
+  ));
+  return journal;
 }
 
 function assertStateError(action) {
@@ -122,8 +130,32 @@ function plannedFixture(binding = bindingFixture()) {
   });
 }
 
+function transitionRequest(journal, patch) {
+  if (patch.state === journal.state) return { ...patch };
+  const request = {
+    expectedCurrentJournalDigest: journal.journalDigest,
+    ...patch
+  };
+  if (journal.state === "provisioning") {
+    if (!Object.hasOwn(request, "actorAttemptId")) {
+      request.actorAttemptId = journal.attemptId;
+    }
+    if (!Object.hasOwn(request, "actorFence")) {
+      request.actorFence = journal.fence;
+    }
+    if (!Object.hasOwn(request, "actorHolderId")) {
+      request.actorHolderId = journal.provisioner.holderId;
+    }
+  }
+  return request;
+}
+
+function transition(binding, journal, patch) {
+  return transitionProvisioningJournal(binding, journal, transitionRequest(journal, patch));
+}
+
 function provisioningFixture(binding = bindingFixture(), journal = plannedFixture(binding)) {
-  return transitionProvisioningJournal(binding, journal, {
+  return transition(binding, journal, {
     state: "provisioning",
     attemptId: ATTEMPT_ID,
     fence: 1,
@@ -140,8 +172,6 @@ function provisioningFixture(binding = bindingFixture(), journal = plannedFixtur
 function readyPatch() {
   return {
     state: "ready",
-    provisioner: null,
-    leaseExpiresAt: null,
     readyAt: TIMES.ready,
     executionContextManifestId: `ctx-${"5".repeat(24)}`,
     executionContextManifestDigest: sha256("execution-context")
@@ -169,8 +199,11 @@ test("builders create exact immutable digest-bound binding and planned journal",
   assert.equal(journal.schemaVersion, EXECUTION_PROVISIONING_SCHEMA_VERSION);
   assert.equal(journal.bindingDigest, binding.bindingDigest);
   assert.equal(journal.state, "planned");
+  assert.equal(journal.journalRevision, 0);
+  assert.equal(journal.previousJournalDigest, null);
   assert.equal(journal.attemptId, null);
   assert.equal(journal.fence, 0);
+  assert.equal(journal.cleanupProvisioner, null);
   assert.equal(journal.plannedAt, TIMES.planned);
   assert.equal(journal.journalDigest, sha256(Object.fromEntries(
     Object.entries(journal).filter(([key]) => key !== "journalDigest")
@@ -184,19 +217,25 @@ test("happy provisioning sequence reaches ready with exact execution context", (
   const planned = plannedFixture(binding);
   const provisioning = provisioningFixture(binding, planned);
   assert.equal(provisioning.state, "provisioning");
+  assert.equal(provisioning.journalRevision, 1);
+  assert.equal(provisioning.previousJournalDigest, planned.journalDigest);
   assert.equal(provisioning.fence, 1);
   assert.deepEqual(provisioning.provisioner, {
     pid: 42,
     startToken: "process-birth-token",
     holderId: HOLDER_ID
   });
+  assert.equal(provisioning.cleanupProvisioner, null);
 
-  const ready = transitionProvisioningJournal(binding, provisioning, readyPatch());
+  const ready = transition(binding, provisioning, readyPatch());
   assert.equal(ready.state, "ready");
   assert.equal(ready.provisioner, null);
+  assert.equal(ready.cleanupProvisioner, null);
   assert.equal(ready.leaseExpiresAt, null);
   assert.equal(ready.attemptId, ATTEMPT_ID);
   assert.equal(ready.fence, 1);
+  assert.equal(ready.journalRevision, 2);
+  assert.equal(ready.previousJournalDigest, provisioning.journalDigest);
   assert.match(ready.executionContextManifestId, /^ctx-[a-f0-9]{24}$/);
   assert.equal(assertProvisioningJournal(binding, ready), ready);
   assert.equal(transitionProvisioningJournal(binding, ready, { state: "ready" }), ready);
@@ -205,13 +244,14 @@ test("happy provisioning sequence reaches ready with exact execution context", (
 test("planned cancellation can clean without creating a provisioning attempt", () => {
   const binding = bindingFixture();
   const planned = plannedFixture(binding);
-  const cleanupPending = transitionProvisioningJournal(binding, planned, {
+  const cleanupPending = transition(binding, planned, {
     state: "cleanup_pending",
     cleanupPendingAt: TIMES.cleanup
   });
   assert.equal(cleanupPending.attemptId, null);
   assert.equal(cleanupPending.fence, 0);
-  const cleaned = transitionProvisioningJournal(binding, cleanupPending, {
+  assert.equal(cleanupPending.cleanupProvisioner, null);
+  const cleaned = transition(binding, cleanupPending, {
     state: "cleaned",
     cleanedAt: TIMES.cleaned
   });
@@ -235,40 +275,78 @@ test("planned cancellation can clean without creating a provisioning attempt", (
       error: { code: "E_WORKTREE", message: "Provisioning failed." }
     }
   ]) {
-    assertStateError(() => transitionProvisioningJournal(binding, planned, patch));
+    assertStateError(() => transition(binding, planned, patch));
   }
 });
 
 test("provisioning cancellation retains attempt evidence through cleanup", () => {
   const binding = bindingFixture();
   const provisioning = provisioningFixture(binding);
-  const cleanupPending = transitionProvisioningJournal(binding, provisioning, {
+  const cleanupPending = transition(binding, provisioning, {
     state: "cleanup_pending",
-    provisioner: null,
-    leaseExpiresAt: null,
     cleanupPendingAt: TIMES.cleanup
   });
   assert.equal(cleanupPending.attemptId, ATTEMPT_ID);
   assert.equal(cleanupPending.provisioningAt, TIMES.provisioning);
-  const cleaned = transitionProvisioningJournal(binding, cleanupPending, {
+  assert.deepEqual(cleanupPending.cleanupProvisioner, provisioning.provisioner);
+  assert.equal(cleanupPending.provisioner, null);
+  assert.equal(cleanupPending.leaseExpiresAt, null);
+  assert.equal(Object.isFrozen(cleanupPending.cleanupProvisioner), true);
+  const cleaned = transition(binding, cleanupPending, {
     state: "cleaned",
     cleanedAt: TIMES.cleaned
   });
   assert.equal(cleaned.attemptId, ATTEMPT_ID);
   assert.equal(cleaned.fence, 1);
+  assert.deepEqual(cleaned.cleanupProvisioner, provisioning.provisioner);
+  const failed = transition(binding, cleanupPending, {
+    state: "failed",
+    failedAt: TIMES.failed,
+    error: { code: "E_CLEANUP", message: "Provisioner cleanup failed closed." }
+  });
+  assert.deepEqual(failed.cleanupProvisioner, provisioning.provisioner);
+});
+
+test("active provisioning cannot fail without first retaining its cleanup process identity", () => {
+  const binding = bindingFixture();
+  const provisioning = provisioningFixture(binding);
+  assertStateError(() => transition(binding, provisioning, {
+    state: "failed",
+    failedAt: TIMES.failed,
+    error: { code: "E_WORKTREE", message: "Provisioning failed." }
+  }));
+  assert.equal(provisioning.state, "provisioning");
+  assert.deepEqual(provisioning.provisioner, {
+    pid: 42,
+    startToken: "process-birth-token",
+    holderId: HOLDER_ID
+  });
+  assert.equal(provisioning.cleanupProvisioner, null);
+
+  const directFailure = clone(transition(binding, plannedFixture(binding), {
+    state: "failed",
+    failedAt: TIMES.failed,
+    error: { code: "E_WORKTREE", message: "Pre-provisioning failure." }
+  }));
+  directFailure.attemptId = ATTEMPT_ID;
+  directFailure.fence = 1;
+  directFailure.provisioningAt = TIMES.provisioning;
+  redigestJournal(directFailure);
+  assertStateError(() => assertProvisioningJournal(binding, directFailure));
 });
 
 test("ready cancellation retains execution context through cleanup and cleanup failure", () => {
   const binding = bindingFixture();
-  const ready = transitionProvisioningJournal(
+  const ready = transition(
     binding,
     provisioningFixture(binding),
     readyPatch()
   );
-  const cleanupPending = transitionProvisioningJournal(binding, ready, {
+  const cleanupPending = transition(binding, ready, {
     state: "cleanup_pending",
     cleanupPendingAt: TIMES.cleanup
   });
+  assert.equal(cleanupPending.cleanupProvisioner, null);
   assert.equal(cleanupPending.readyAt, TIMES.ready);
   assert.equal(cleanupPending.executionContextManifestId, ready.executionContextManifestId);
   assert.equal(
@@ -276,14 +354,14 @@ test("ready cancellation retains execution context through cleanup and cleanup f
     ready.executionContextManifestDigest
   );
 
-  const cleaned = transitionProvisioningJournal(binding, cleanupPending, {
+  const cleaned = transition(binding, cleanupPending, {
     state: "cleaned",
     cleanedAt: TIMES.cleaned
   });
   assert.equal(cleaned.readyAt, TIMES.ready);
   assert.equal(cleaned.executionContextManifestId, ready.executionContextManifestId);
 
-  const failed = transitionProvisioningJournal(binding, cleanupPending, {
+  const failed = transition(binding, cleanupPending, {
     state: "failed",
     failedAt: TIMES.failed,
     error: { code: "E_CLEANUP", message: "Ready worktree cleanup failed closed." }
@@ -295,7 +373,11 @@ test("ready cancellation retains execution context through cleanup and cleanup f
 test("dead-owner provisioning can be reclaimed before lease expiry with a fresh monotonic fence", () => {
   const binding = bindingFixture();
   const current = provisioningFixture(binding);
-  const reclaimed = reclaimProvisioningJournal(binding, current, {
+  const valid = {
+    expectedCurrentJournalDigest: current.journalDigest,
+    priorAttemptId: current.attemptId,
+    priorFence: current.fence,
+    priorHolderId: current.provisioner.holderId,
     attemptId: "d".repeat(32),
     fence: 2,
     provisioner: {
@@ -304,38 +386,180 @@ test("dead-owner provisioning can be reclaimed before lease expiry with a fresh 
       holderId: "e".repeat(32)
     },
     provisioningAt: "2026-07-24T12:00:03.000Z",
-    leaseExpiresAt: "2026-07-24T12:01:03.000Z"
-  });
+    leaseExpiresAt: "2026-07-24T12:01:03.000Z",
+    reclaimEvidence: {
+      kind: "process-dead",
+      pid: current.provisioner.pid,
+      startToken: current.provisioner.startToken,
+      observedAt: "2026-07-24T12:00:02.500Z"
+    }
+  };
+  const reclaimed = reclaimProvisioningJournal(binding, current, valid);
   assert.equal(reclaimed.state, "provisioning");
   assert.equal(reclaimed.attemptId, "d".repeat(32));
   assert.equal(reclaimed.fence, 2);
+  assert.equal(reclaimed.journalRevision, current.journalRevision + 1);
+  assert.equal(reclaimed.previousJournalDigest, current.journalDigest);
   assert.equal(reclaimed.executionContextManifestId, null);
   assert.equal(assertProvisioningJournal(binding, reclaimed), reclaimed);
 
-  const valid = {
-    attemptId: "d".repeat(32),
-    fence: 2,
-    provisioner: {
-      pid: 43,
-      startToken: "replacement-process-birth-token",
-      holderId: "e".repeat(32)
-    },
-    provisioningAt: "2026-07-24T12:00:03.000Z",
-    leaseExpiresAt: "2026-07-24T12:01:03.000Z"
-  };
   for (const patch of [
+    { ...valid, expectedCurrentJournalDigest: sha256("stale") },
+    { ...valid, priorAttemptId: "f".repeat(32) },
+    { ...valid, priorFence: 0 },
+    { ...valid, priorHolderId: "f".repeat(32) },
     { ...valid, attemptId: ATTEMPT_ID },
     { ...valid, fence: 1 },
     { ...valid, fence: 3 },
     { ...valid, provisioningAt: TIMES.planned },
     { ...valid, leaseExpiresAt: valid.provisioningAt },
+    { ...valid, leaseExpiresAt: "2026-07-24T12:05:03.001Z" },
     { ...valid, provisioner: { ...valid.provisioner, holderId: HOLDER_ID } },
+    {
+      ...valid,
+      reclaimEvidence: { ...valid.reclaimEvidence, pid: current.provisioner.pid + 1 }
+    },
+    {
+      ...valid,
+      reclaimEvidence: {
+        ...valid.reclaimEvidence,
+        startToken: "wrong-process-birth-token"
+      }
+    },
+    {
+      ...valid,
+      reclaimEvidence: { ...valid.reclaimEvidence, observedAt: TIMES.planned }
+    },
     { ...valid, extra: true }
   ]) {
     assertStateError(() => reclaimProvisioningJournal(binding, current, patch));
   }
-  const ready = transitionProvisioningJournal(binding, current, readyPatch());
+  const ready = transition(binding, current, readyPatch());
   assertStateError(() => reclaimProvisioningJournal(binding, ready, valid));
+});
+
+test("lease-expiry reclaim requires observation at expiry and starts a new bounded lease", () => {
+  const binding = bindingFixture();
+  const current = provisioningFixture(binding);
+  const base = {
+    expectedCurrentJournalDigest: current.journalDigest,
+    priorAttemptId: current.attemptId,
+    priorFence: current.fence,
+    priorHolderId: current.provisioner.holderId,
+    attemptId: "d".repeat(32),
+    fence: current.fence + 1,
+    provisioner: {
+      pid: 43,
+      startToken: "replacement-process-birth-token",
+      holderId: "e".repeat(32)
+    },
+    provisioningAt: "2026-07-24T12:00:32.001Z",
+    leaseExpiresAt: "2026-07-24T12:01:32.001Z",
+    reclaimEvidence: {
+      kind: "lease-expired",
+      observedAt: TIMES.lease
+    }
+  };
+  const reclaimed = reclaimProvisioningJournal(binding, current, base);
+  assert.equal(reclaimed.previousJournalDigest, current.journalDigest);
+  assert.equal(reclaimed.journalRevision, current.journalRevision + 1);
+  assert.equal("reclaimEvidence" in reclaimed, false);
+  assertStateError(() => reclaimProvisioningJournal(binding, current, {
+    ...base,
+    reclaimEvidence: {
+      kind: "lease-expired",
+      observedAt: "2026-07-24T12:00:31.999Z"
+    }
+  }));
+});
+
+test("stale expected digests and stale provisioning actors cannot settle a reclaimed attempt", () => {
+  const binding = bindingFixture();
+  const first = provisioningFixture(binding);
+  const latest = reclaimProvisioningJournal(binding, first, {
+    expectedCurrentJournalDigest: first.journalDigest,
+    priorAttemptId: first.attemptId,
+    priorFence: first.fence,
+    priorHolderId: first.provisioner.holderId,
+    attemptId: "d".repeat(32),
+    fence: 2,
+    provisioner: {
+      pid: 43,
+      startToken: "replacement-process-birth-token",
+      holderId: "e".repeat(32)
+    },
+    provisioningAt: "2026-07-24T12:00:03.000Z",
+    leaseExpiresAt: "2026-07-24T12:01:03.000Z",
+    reclaimEvidence: {
+      kind: "process-dead",
+      pid: first.provisioner.pid,
+      startToken: first.provisioner.startToken,
+      observedAt: "2026-07-24T12:00:02.500Z"
+    }
+  });
+  const valid = transitionRequest(latest, readyPatch());
+  for (const request of [
+    { ...valid, expectedCurrentJournalDigest: first.journalDigest },
+    { ...valid, actorAttemptId: first.attemptId },
+    { ...valid, actorFence: first.fence },
+    { ...valid, actorHolderId: first.provisioner.holderId }
+  ]) {
+    assertStateError(() => transitionProvisioningJournal(binding, latest, request));
+  }
+
+  const ready = transitionProvisioningJournal(binding, latest, valid);
+  assert.equal(ready.state, "ready");
+  assert.equal(ready.attemptId, latest.attemptId);
+  assert.equal(ready.fence, latest.fence);
+  assert.equal(ready.previousJournalDigest, latest.journalDigest);
+  for (const field of [
+    "expectedCurrentJournalDigest",
+    "actorAttemptId",
+    "actorFence",
+    "actorHolderId"
+  ]) {
+    assert.equal(field in ready, false);
+  }
+});
+
+test("edge-specific transition requests cannot rewrite prior journal evidence", () => {
+  const binding = bindingFixture();
+  const planned = plannedFixture(binding);
+  const provisioning = provisioningFixture(binding, planned);
+  const ready = transition(binding, provisioning, readyPatch());
+  const cleanupPending = transition(binding, ready, {
+    state: "cleanup_pending",
+    cleanupPendingAt: TIMES.cleanup
+  });
+
+  for (const [current, patch] of [
+    [planned, {
+      state: "cleanup_pending",
+      cleanupPendingAt: TIMES.cleanup,
+      plannedAt: planned.plannedAt
+    }],
+    [provisioning, {
+      ...readyPatch(),
+      provisioningAt: provisioning.provisioningAt
+    }],
+    [ready, {
+      state: "cleanup_pending",
+      cleanupPendingAt: TIMES.cleanup,
+      executionContextManifestDigest: ready.executionContextManifestDigest
+    }],
+    [cleanupPending, {
+      state: "cleaned",
+      cleanedAt: TIMES.cleaned,
+      cleanupPendingAt: cleanupPending.cleanupPendingAt
+    }]
+  ]) {
+    assertStateError(() => transition(binding, current, patch));
+  }
+
+  assertStateError(() => transitionProvisioningJournal(binding, planned, {
+    state: "cleanup_pending",
+    cleanupPendingAt: TIMES.cleanup
+  }));
 });
 
 test("failure paths retain only bounded error evidence", () => {
@@ -354,21 +578,23 @@ test("failure paths retain only bounded error evidence", () => {
     },
     () => {
       const binding = bindingFixture();
+      const cleanupPending = transition(binding, provisioningFixture(binding), {
+        state: "cleanup_pending",
+        cleanupPendingAt: TIMES.cleanup
+      });
       return {
         binding,
-        journal: provisioningFixture(binding),
+        journal: cleanupPending,
         patch: {
           state: "failed",
-          provisioner: null,
-          leaseExpiresAt: null,
           failedAt: TIMES.failed,
-          error: { code: "E_WORKTREE", message: "Worktree provisioning failed." }
+          error: { code: "E_CLEANUP", message: "Provisioner cleanup failed closed." }
         }
       };
     },
     () => {
       const binding = bindingFixture();
-      const cleanupPending = transitionProvisioningJournal(binding, plannedFixture(binding), {
+      const cleanupPending = transition(binding, plannedFixture(binding), {
         state: "cleanup_pending",
         cleanupPendingAt: TIMES.cleanup
       });
@@ -384,9 +610,12 @@ test("failure paths retain only bounded error evidence", () => {
     }
   ]) {
     const { binding, journal, patch } = fixture();
-    const failed = transitionProvisioningJournal(binding, journal, patch);
+    const failed = transition(binding, journal, patch);
     assert.equal(failed.state, "failed");
     assert.equal(failed.error.code, patch.error.code);
+    if (journal.cleanupProvisioner !== null) {
+      assert.deepEqual(failed.cleanupProvisioner, journal.cleanupProvisioner);
+    }
     assert.equal(assertProvisioningJournal(binding, failed), failed);
   }
 });
@@ -550,7 +779,7 @@ test("binding and journal timestamps must be canonical, safe, and monotonic", ()
   }));
 
   const planned = plannedFixture(binding);
-  assertStateError(() => transitionProvisioningJournal(binding, planned, {
+  assertStateError(() => transition(binding, planned, {
     state: "provisioning",
     attemptId: ATTEMPT_ID,
     fence: 1,
@@ -578,6 +807,50 @@ test("journal binds the raw cancellation nonce without retaining it in the bindi
   assertStateError(() => assertProvisioningJournal(binding, journal));
 });
 
+test("public execution projection is immutable and exposes only digest-safe lifecycle state", () => {
+  const binding = bindingFixture();
+  const provisioning = provisioningFixture(binding);
+  const journal = transition(binding, provisioning, {
+    state: "cleanup_pending",
+    cleanupPendingAt: TIMES.cleanup
+  });
+  const projection = createPublicExecutionProjection(binding, journal);
+  assert.deepEqual(projection, {
+    bindingDigest: binding.bindingDigest,
+    cancellationNonceDigest: binding.cancellationNonceDigest,
+    journalState: journal.state,
+    journalRevision: journal.journalRevision,
+    journalDigest: journal.journalDigest,
+    previousJournalDigest: journal.previousJournalDigest,
+    executionContextManifestDigest: null
+  });
+  assert.equal(Object.isFrozen(projection), true);
+
+  const serialized = JSON.stringify(projection);
+  for (const forbidden of [
+    CANCELLATION_NONCE,
+    binding.controlRoot,
+    binding.gitCommonDir,
+    binding.expectedExecutionRoot,
+    binding.parentFingerprint.statusDigest,
+    journal.cleanupProvisioner.startToken,
+    journal.cleanupProvisioner.holderId,
+    journal.plannedAt,
+    journal.provisioningAt,
+    "controlRoot",
+    "gitCommonDir",
+    "expectedExecutionRoot",
+    "parentFingerprint",
+    "provisioner",
+    "cleanupProvisioner",
+    "holderId",
+    "plannedAt",
+    "provisioningAt"
+  ]) {
+    assert.equal(serialized.includes(forbidden), false);
+  }
+});
+
 test("journal exact keys, binding, digest, and nested identities fail closed on tamper", () => {
   const binding = bindingFixture();
   for (const mutate of [
@@ -595,6 +868,78 @@ test("journal exact keys, binding, digest, and nested identities fail closed on 
   const provisioning = clone(provisioningFixture(binding));
   provisioning.provisioner.extra = true;
   assertStateError(() => assertProvisioningJournal(binding, provisioning));
+});
+
+test("cleanup process identity exists only for cleanup entered from active provisioning", () => {
+  const binding = bindingFixture();
+  const provisioning = provisioningFixture(binding);
+  const provisioningCleanup = transition(binding, provisioning, {
+    state: "cleanup_pending",
+    cleanupPendingAt: TIMES.cleanup
+  });
+  assert.deepEqual(provisioningCleanup.cleanupProvisioner, provisioning.provisioner);
+
+  for (const mutate of [
+    (journal) => { journal.cleanupProvisioner = null; },
+    (journal) => { journal.cleanupProvisioner.extra = true; },
+    (journal) => { journal.cleanupProvisioner.holderId = "f".repeat(31); }
+  ]) {
+    const journal = clone(provisioningCleanup);
+    mutate(journal);
+    redigestJournal(journal);
+    assertStateError(() => assertProvisioningJournal(binding, journal));
+  }
+
+  const plannedCleanup = transition(binding, plannedFixture(binding), {
+    state: "cleanup_pending",
+    cleanupPendingAt: TIMES.cleanup
+  });
+  const ready = transition(binding, provisioningFixture(binding), readyPatch());
+  const readyCleanup = transition(binding, ready, {
+    state: "cleanup_pending",
+    cleanupPendingAt: TIMES.cleanup
+  });
+  assert.equal(plannedCleanup.cleanupProvisioner, null);
+  assert.equal(readyCleanup.cleanupProvisioner, null);
+
+  for (const source of [plannedCleanup, readyCleanup, provisioning]) {
+    const journal = clone(source);
+    journal.cleanupProvisioner = {
+      pid: 42,
+      startToken: "invented-process-token",
+      holderId: HOLDER_ID
+    };
+    redigestJournal(journal);
+    assertStateError(() => assertProvisioningJournal(binding, journal));
+  }
+});
+
+test("journal revisions and predecessor digests use exact bounded durable shapes", () => {
+  const binding = bindingFixture();
+  const planned = plannedFixture(binding);
+  const provisioning = provisioningFixture(binding, planned);
+  assert.equal(planned.journalRevision, 0);
+  assert.equal(planned.previousJournalDigest, null);
+  assert.equal(provisioning.journalRevision, 1);
+  assert.equal(provisioning.previousJournalDigest, planned.journalDigest);
+
+  for (const mutate of [
+    (journal) => { journal.journalRevision = -1; },
+    (journal) => { journal.journalRevision = 0.5; },
+    (journal) => { journal.journalRevision = "1"; },
+    (journal) => { journal.previousJournalDigest = "A".repeat(64); }
+  ]) {
+    const journal = clone(provisioning);
+    mutate(journal);
+    redigestJournal(journal);
+    assertStateError(() => assertProvisioningJournal(binding, journal));
+  }
+
+  const fakeInitial = clone(planned);
+  fakeInitial.journalRevision = 1;
+  fakeInitial.previousJournalDigest = sha256("predecessor");
+  redigestJournal(fakeInitial);
+  assertStateError(() => assertProvisioningJournal(binding, fakeInitial));
 });
 
 test("provisioning requires one exact fenced attempt, process identity, and future lease", () => {
@@ -617,9 +962,10 @@ test("provisioning requires one exact fenced attempt, process identity, and futu
     { ...valid, provisioner: { pid: 0, startToken: "token", holderId: HOLDER_ID } },
     { ...valid, provisioner: { pid: 42, startToken: "[REDACTED]", holderId: HOLDER_ID } },
     { ...valid, provisioner: { pid: 42, startToken: "token", holderId: "raw-owner" } },
-    { ...valid, leaseExpiresAt: TIMES.provisioning }
+    { ...valid, leaseExpiresAt: TIMES.provisioning },
+    { ...valid, leaseExpiresAt: "2026-07-24T12:05:02.001Z" }
   ]) {
-    assertStateError(() => transitionProvisioningJournal(binding, planned, patch));
+    assertStateError(() => transition(binding, planned, patch));
   }
 });
 
@@ -632,7 +978,7 @@ test("ready requires exact context identity and cannot retain an active lease", 
     { ...readyPatch(), provisioner: provisioning.provisioner },
     { ...readyPatch(), leaseExpiresAt: provisioning.leaseExpiresAt }
   ]) {
-    assertStateError(() => transitionProvisioningJournal(binding, provisioning, patch));
+    assertStateError(() => transition(binding, provisioning, patch));
   }
 });
 
@@ -640,16 +986,16 @@ test("only the specified monotonic state transitions are legal", () => {
   const binding = bindingFixture();
   const planned = plannedFixture(binding);
   const provisioning = provisioningFixture(binding, planned);
-  const ready = transitionProvisioningJournal(binding, provisioning, readyPatch());
-  const cleanupPending = transitionProvisioningJournal(binding, planned, {
+  const ready = transition(binding, provisioning, readyPatch());
+  const cleanupPending = transition(binding, planned, {
     state: "cleanup_pending",
     cleanupPendingAt: TIMES.cleanup
   });
-  const cleaned = transitionProvisioningJournal(binding, cleanupPending, {
+  const cleaned = transition(binding, cleanupPending, {
     state: "cleaned",
     cleanedAt: TIMES.cleaned
   });
-  const failed = transitionProvisioningJournal(binding, planned, {
+  const failed = transition(binding, planned, {
     state: "failed",
     failedAt: TIMES.failed,
     error: { code: "E_WORKTREE", message: "Provisioning failed." }
@@ -659,23 +1005,24 @@ test("only the specified monotonic state transitions are legal", () => {
     [planned, "ready"],
     [planned, "cleaned"],
     [provisioning, "planned"],
+    [provisioning, "failed"],
     [ready, "failed"],
     [cleanupPending, "provisioning"],
     [cleaned, "failed"],
     [failed, "cleanup_pending"]
   ]) {
-    assertStateError(() => transitionProvisioningJournal(binding, journal, { state }));
+    assertStateError(() => transition(binding, journal, { state }));
   }
 });
 
-test("same-state transitions are idempotent only when the complete body is unchanged", () => {
+test("same-state transitions accept only the exact state-only idempotent request", () => {
   const binding = bindingFixture();
   const journal = plannedFixture(binding);
   assert.equal(transitionProvisioningJournal(binding, journal, { state: "planned" }), journal);
-  assert.equal(transitionProvisioningJournal(binding, journal, {
+  assertStateError(() => transitionProvisioningJournal(binding, journal, {
     state: "planned",
     plannedAt: journal.plannedAt
-  }), journal);
+  }));
   assertStateError(() => transitionProvisioningJournal(binding, journal, {
     state: "planned",
     failedAt: TIMES.failed
@@ -699,14 +1046,14 @@ test("state-specific nullability and timeline tampering are rejected even with a
     if (kind === "planned") journal = clone(plannedFixture(binding));
     if (kind === "provisioning") journal = clone(provisioningFixture(binding));
     if (kind === "ready") {
-      journal = clone(transitionProvisioningJournal(
+      journal = clone(transition(
         binding,
         provisioningFixture(binding),
         readyPatch()
       ));
     }
     if (kind === "cleanup") {
-      journal = clone(transitionProvisioningJournal(binding, plannedFixture(binding), {
+      journal = clone(transition(binding, plannedFixture(binding), {
         state: "cleanup_pending",
         cleanupPendingAt: TIMES.cleanup
       }));
@@ -718,6 +1065,24 @@ test("state-specific nullability and timeline tampering are rejected even with a
     journal.journalDigest = sha256(unsigned);
     assertStateError(() => assertProvisioningJournal(binding, journal));
   }
+});
+
+test("failed journal chronology cannot place failure before retained ready evidence", () => {
+  const binding = bindingFixture();
+  const ready = transition(binding, provisioningFixture(binding), readyPatch());
+  const cleanupPending = transition(binding, ready, {
+    state: "cleanup_pending",
+    cleanupPendingAt: TIMES.cleanup
+  });
+  const failed = transition(binding, cleanupPending, {
+    state: "failed",
+    failedAt: TIMES.failed,
+    error: { code: "E_CLEANUP", message: "Ready cleanup failed." }
+  });
+  const forged = clone(failed);
+  forged.readyAt = "2026-07-24T12:00:07.000Z";
+  redigestJournal(forged);
+  assertStateError(() => assertProvisioningJournal(binding, forged));
 });
 
 test("failed state enforces exact bounded display-safe errors", () => {
@@ -739,7 +1104,7 @@ test("failed state enforces exact bounded display-safe errors", () => {
     { code: "E_WORKTREE", message: "password=top-secret-value" },
     { code: "E_WORKTREE", message: "Failed.", details: "not-allowed" }
   ]) {
-    assertStateError(() => transitionProvisioningJournal(binding, planned, {
+    assertStateError(() => transition(binding, planned, {
       ...base,
       error
     }));

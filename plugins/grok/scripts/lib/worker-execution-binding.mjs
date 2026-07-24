@@ -20,6 +20,7 @@ const MAX_SCOPE_ITEMS = 64;
 const MAX_SCOPE_ITEM_CHARS = 2_048;
 const MAX_PROCESS_TOKEN_CHARS = 256;
 const MAX_ERROR_MESSAGE_CHARS = 1_024;
+const MAX_PROVISIONING_LEASE_MS = 300_000;
 
 const BINDING_INPUT_KEYS = new Set([
   "workerId",
@@ -106,10 +107,13 @@ const JOURNAL_KEYS = new Set([
   "schemaVersion",
   "bindingDigest",
   "state",
+  "journalRevision",
+  "previousJournalDigest",
   "cancellationNonce",
   "attemptId",
   "fence",
   "provisioner",
+  "cleanupProvisioner",
   "leaseExpiresAt",
   "plannedAt",
   "provisioningAt",
@@ -134,42 +138,93 @@ const JOURNAL_STATES = new Set([
   "failed"
 ]);
 
-const TRANSITION_PATCH_KEYS = new Set([
-  "state",
-  "attemptId",
-  "fence",
-  "provisioner",
-  "leaseExpiresAt",
-  "plannedAt",
-  "provisioningAt",
-  "readyAt",
-  "cleanupPendingAt",
-  "cleanedAt",
-  "failedAt",
-  "executionContextManifestId",
-  "executionContextManifestDigest",
-  "error"
-]);
-
 const LEGAL_TRANSITIONS = new Set([
   "planned:provisioning",
   "planned:cleanup_pending",
   "planned:failed",
   "provisioning:ready",
   "provisioning:cleanup_pending",
-  "provisioning:failed",
   "ready:cleanup_pending",
   "cleanup_pending:cleaned",
   "cleanup_pending:failed"
 ]);
 
+const TRANSITION_EDGE_KEYS = new Map([
+  ["planned:provisioning", new Set([
+    "state",
+    "expectedCurrentJournalDigest",
+    "attemptId",
+    "fence",
+    "provisioner",
+    "leaseExpiresAt",
+    "provisioningAt"
+  ])],
+  ["planned:cleanup_pending", new Set([
+    "state",
+    "expectedCurrentJournalDigest",
+    "cleanupPendingAt"
+  ])],
+  ["planned:failed", new Set([
+    "state",
+    "expectedCurrentJournalDigest",
+    "failedAt",
+    "error"
+  ])],
+  ["provisioning:ready", new Set([
+    "state",
+    "expectedCurrentJournalDigest",
+    "actorAttemptId",
+    "actorFence",
+    "actorHolderId",
+    "readyAt",
+    "executionContextManifestId",
+    "executionContextManifestDigest"
+  ])],
+  ["provisioning:cleanup_pending", new Set([
+    "state",
+    "expectedCurrentJournalDigest",
+    "actorAttemptId",
+    "actorFence",
+    "actorHolderId",
+    "cleanupPendingAt"
+  ])],
+  ["ready:cleanup_pending", new Set([
+    "state",
+    "expectedCurrentJournalDigest",
+    "cleanupPendingAt"
+  ])],
+  ["cleanup_pending:cleaned", new Set([
+    "state",
+    "expectedCurrentJournalDigest",
+    "cleanedAt"
+  ])],
+  ["cleanup_pending:failed", new Set([
+    "state",
+    "expectedCurrentJournalDigest",
+    "failedAt",
+    "error"
+  ])]
+]);
+
 const RECLAIM_KEYS = new Set([
+  "expectedCurrentJournalDigest",
+  "priorAttemptId",
+  "priorFence",
+  "priorHolderId",
   "attemptId",
   "fence",
   "provisioner",
   "provisioningAt",
-  "leaseExpiresAt"
+  "leaseExpiresAt",
+  "reclaimEvidence"
 ]);
+const PROCESS_DEAD_EVIDENCE_KEYS = new Set([
+  "kind",
+  "pid",
+  "startToken",
+  "observedAt"
+]);
+const LEASE_EXPIRED_EVIDENCE_KEYS = new Set(["kind", "observedAt"]);
 
 function stateError(message) {
   throw new CompanionError("E_STATE", message);
@@ -540,6 +595,18 @@ function reachedProvisioning(journal) {
 }
 
 function assertJournalStateShape(journal) {
+  if (
+    !Number.isSafeInteger(journal.journalRevision)
+    || journal.journalRevision < 0
+    || (
+      journal.journalRevision === 0
+        ? journal.previousJournalDigest !== null || journal.state !== "planned"
+        : !SHA256_HEX.test(journal.previousJournalDigest || "") || journal.state === "planned"
+    )
+  ) {
+    stateError("Provisioning journal revision chain is malformed.");
+  }
+
   const hasAttempt = journal.attemptId !== null;
   if (
     (hasAttempt && (!EXACT_NONCE_ID.test(journal.attemptId) || journal.fence < 1))
@@ -558,6 +625,18 @@ function assertJournalStateShape(journal) {
     }
   } else if (journal.provisioner !== null || journal.leaseExpiresAt !== null) {
     stateError("Provisioning journal retains a provisioner lease outside provisioning.");
+  }
+
+  const cleanupProvisionerRequired = (
+    ["cleanup_pending", "cleaned", "failed"].includes(journal.state)
+    && journal.cleanupPendingAt !== null
+    && hasAttempt
+    && journal.readyAt === null
+  );
+  if (cleanupProvisionerRequired) {
+    assertProvisioner(journal.cleanupProvisioner);
+  } else if (journal.cleanupProvisioner !== null) {
+    stateError("Provisioning journal retains cleanup process identity outside active cleanup.");
   }
 
   const executionContextRequired = journal.readyAt !== null;
@@ -603,6 +682,7 @@ function assertJournalStateShape(journal) {
   if (journal.state === "failed") {
     if (
       (journal.provisioningAt !== null) !== hasAttempt
+      || (hasAttempt && journal.cleanupPendingAt === null)
       || journal.cleanedAt !== null
       || journal.failedAt === null
     ) {
@@ -643,11 +723,18 @@ function assertJournalTimeline(binding, journal) {
   if (cleanedAt !== null && (cleanupPendingAt === null || cleanedAt < cleanupPendingAt)) {
     stateError("Provisioning journal cleaned timestamp is not monotonic.");
   }
-  const latestBeforeFailure = cleanupPendingAt ?? provisioningAt ?? plannedAt;
+  const latestBeforeFailure = cleanupPendingAt ?? readyAt ?? provisioningAt ?? plannedAt;
   if (failedAt !== null && failedAt < latestBeforeFailure) {
     stateError("Provisioning journal failure timestamp is not monotonic.");
   }
-  if (leaseExpiresAt !== null && (provisioningAt === null || leaseExpiresAt <= provisioningAt)) {
+  if (
+    leaseExpiresAt !== null
+    && (
+      provisioningAt === null
+      || leaseExpiresAt <= provisioningAt
+      || leaseExpiresAt - provisioningAt > MAX_PROVISIONING_LEASE_MS
+    )
+  ) {
     stateError("Provisioning journal lease must expire after provisioning begins.");
   }
 }
@@ -685,10 +772,13 @@ export function createProvisioningJournal({
     schemaVersion: EXECUTION_PROVISIONING_SCHEMA_VERSION,
     bindingDigest: trustedBinding.bindingDigest,
     state: "planned",
+    journalRevision: 0,
+    previousJournalDigest: null,
     cancellationNonce,
     attemptId: null,
     fence: 0,
     provisioner: null,
+    cleanupProvisioner: null,
     leaseExpiresAt: null,
     plannedAt: createdAt,
     provisioningAt: null,
@@ -706,48 +796,93 @@ export function createProvisioningJournal({
   return deepFreeze(journal);
 }
 
-function assertTransitionPatch(patch) {
-  if (!isPlainRecord(patch)
-    || !Object.hasOwn(patch, "state")
-    || Object.keys(patch).some((key) => !TRANSITION_PATCH_KEYS.has(key))
-    || !JOURNAL_STATES.has(patch.state)) {
-    stateError("Provisioning journal transition patch is malformed.");
+function nextJournalRevision(current) {
+  if (current.journalRevision >= Number.MAX_SAFE_INTEGER) {
+    stateError("Provisioning journal revision is exhausted.");
+  }
+  return current.journalRevision + 1;
+}
+
+function assertProvisioningActor(current, request) {
+  if (
+    request.actorAttemptId !== current.attemptId
+    || request.actorFence !== current.fence
+    || request.actorHolderId !== current.provisioner.holderId
+  ) {
+    stateError("Provisioning transition actor does not own the current fenced attempt.");
   }
 }
 
-export function transitionProvisioningJournal(binding, journal, patch) {
+function assertTransitionRequest(current, request) {
+  if (
+    !isPlainRecord(request)
+    || !Object.hasOwn(request, "state")
+    || !JOURNAL_STATES.has(request.state)
+  ) {
+    stateError("Provisioning journal transition request is malformed.");
+  }
+  if (request.state === current.state) {
+    if (!hasExactKeys(request, new Set(["state"]))) {
+      stateError("A same-state provisioning transition must be exactly idempotent.");
+    }
+    return null;
+  }
+
+  const edge = `${current.state}:${request.state}`;
+  const edgeKeys = TRANSITION_EDGE_KEYS.get(edge);
+  if (!LEGAL_TRANSITIONS.has(edge) || !edgeKeys || !hasExactKeys(request, edgeKeys)) {
+    stateError("Provisioning journal transition is illegal or non-monotonic.");
+  }
+  assertDigest(request.expectedCurrentJournalDigest, "expectedCurrentJournalDigest");
+  if (request.expectedCurrentJournalDigest !== current.journalDigest) {
+    stateError("Provisioning journal transition does not match the current durable revision.");
+  }
+  if (current.state === "provisioning") assertProvisioningActor(current, request);
+  return edge;
+}
+
+export function transitionProvisioningJournal(binding, journal, request) {
   const trustedBinding = assertExecutionBinding(binding);
   const current = assertProvisioningJournal(trustedBinding, journal);
-  assertTransitionPatch(patch);
+  const edge = assertTransitionRequest(current, request);
+  if (edge === null) return current;
 
-  const nextState = patch.state;
   const next = {
     ...current,
-    ...patch,
-    provisioner: patch.provisioner === undefined
-      ? current.provisioner
-      : (patch.provisioner === null ? null : { ...patch.provisioner }),
-    error: patch.error === undefined
-      ? current.error
-      : (patch.error === null ? null : { ...patch.error }),
+    state: request.state,
+    journalRevision: nextJournalRevision(current),
+    previousJournalDigest: current.journalDigest,
     journalDigest: null
   };
 
-  if (nextState === current.state) {
-    const currentBody = journalWithoutDigest(current);
-    const nextBody = journalWithoutDigest(next);
-    if (stableStringify(currentBody) !== stableStringify(nextBody)) {
-      stateError("A same-state provisioning transition must be exactly idempotent.");
+  if (edge === "planned:provisioning") {
+    next.attemptId = request.attemptId;
+    next.fence = request.fence;
+    next.provisioner = { ...request.provisioner };
+    next.leaseExpiresAt = request.leaseExpiresAt;
+    next.provisioningAt = request.provisioningAt;
+  } else if (edge.endsWith(":cleanup_pending")) {
+    next.cleanupPendingAt = request.cleanupPendingAt;
+    if (current.state === "provisioning") {
+      next.cleanupProvisioner = { ...current.provisioner };
+      next.provisioner = null;
+      next.leaseExpiresAt = null;
     }
-    return current;
+  } else if (edge.endsWith(":failed")) {
+    next.failedAt = request.failedAt;
+    next.error = { ...request.error };
+  } else if (edge === "provisioning:ready") {
+    next.provisioner = null;
+    next.leaseExpiresAt = null;
+    next.readyAt = request.readyAt;
+    next.executionContextManifestId = request.executionContextManifestId;
+    next.executionContextManifestDigest = request.executionContextManifestDigest;
+  } else if (edge === "cleanup_pending:cleaned") {
+    next.cleanedAt = request.cleanedAt;
   }
 
-  if (!LEGAL_TRANSITIONS.has(`${current.state}:${nextState}`)) {
-    stateError("Provisioning journal transition is illegal or non-monotonic.");
-  }
   if (
-    current.state === "planned"
-    && nextState === "provisioning"
+    edge === "planned:provisioning"
     && (
       !EXACT_NONCE_ID.test(next.attemptId || "")
       || next.fence !== current.fence + 1
@@ -755,27 +890,39 @@ export function transitionProvisioningJournal(binding, journal, patch) {
   ) {
     stateError("Provisioning transition requires a new fenced attempt identity.");
   }
-  if (
-    current.state === "planned"
-    && nextState !== "provisioning"
-    && (
-      next.attemptId !== current.attemptId
-      || next.fence !== current.fence
-      || next.provisioningAt !== current.provisioningAt
-    )
-  ) {
-    stateError("A planned journal cannot invent provisioning-attempt evidence.");
-  }
-  if (
-    current.state !== "planned"
-    && (next.attemptId !== current.attemptId || next.fence !== current.fence)
-  ) {
-    stateError("Provisioning transition cannot replace its fenced attempt identity.");
-  }
 
   next.journalDigest = sha256(journalWithoutDigest(next));
   assertProvisioningJournal(trustedBinding, next);
   return deepFreeze(next);
+}
+
+function assertReclaimEvidence(current, evidence) {
+  if (!isPlainRecord(evidence)) {
+    stateError("Provisioning reclaim evidence is malformed.");
+  }
+  let observedAt;
+  if (evidence.kind === "process-dead") {
+    if (!hasExactKeys(evidence, PROCESS_DEAD_EVIDENCE_KEYS)
+      || evidence.pid !== current.provisioner.pid
+      || evidence.startToken !== current.provisioner.startToken) {
+      stateError("Process-death evidence does not match the current provisioner.");
+    }
+    observedAt = timestampMs(evidence.observedAt, "reclaimEvidence.observedAt");
+  } else if (evidence.kind === "lease-expired") {
+    if (!hasExactKeys(evidence, LEASE_EXPIRED_EVIDENCE_KEYS)) {
+      stateError("Lease-expiry evidence is malformed.");
+    }
+    observedAt = timestampMs(evidence.observedAt, "reclaimEvidence.observedAt");
+    if (observedAt < timestampMs(current.leaseExpiresAt, "leaseExpiresAt")) {
+      stateError("Lease-expiry evidence predates the current lease expiry.");
+    }
+  } else {
+    stateError("Provisioning reclaim evidence uses an unsupported kind.");
+  }
+  if (observedAt < timestampMs(current.provisioningAt, "provisioningAt")) {
+    stateError("Provisioning reclaim evidence predates the current attempt.");
+  }
+  return observedAt;
 }
 
 export function reclaimProvisioningJournal(binding, journal, reclaim = {}) {
@@ -787,8 +934,20 @@ export function reclaimProvisioningJournal(binding, journal, reclaim = {}) {
   if (!hasExactKeys(reclaim, RECLAIM_KEYS)) {
     stateError("Provisioning reclaim has an unsupported shape.");
   }
+  assertDigest(reclaim.expectedCurrentJournalDigest, "expectedCurrentJournalDigest");
+  assertExactNonceId(reclaim.priorAttemptId, "priorAttemptId");
+  assertOpaqueId(reclaim.priorHolderId, "priorHolderId");
+  if (
+    reclaim.expectedCurrentJournalDigest !== current.journalDigest
+    || reclaim.priorAttemptId !== current.attemptId
+    || reclaim.priorFence !== current.fence
+    || reclaim.priorHolderId !== current.provisioner.holderId
+  ) {
+    stateError("Provisioning reclaim does not match the current fenced attempt.");
+  }
   assertProvisioner(reclaim.provisioner);
   assertExactNonceId(reclaim.attemptId, "attemptId");
+  const observedAt = assertReclaimEvidence(current, reclaim.reclaimEvidence);
   const priorProvisioningAt = timestampMs(current.provisioningAt, "provisioningAt");
   const nextProvisioningAt = timestampMs(reclaim.provisioningAt, "provisioningAt");
   const nextLeaseExpiresAt = timestampMs(reclaim.leaseExpiresAt, "leaseExpiresAt");
@@ -797,7 +956,9 @@ export function reclaimProvisioningJournal(binding, journal, reclaim = {}) {
     || reclaim.fence !== current.fence + 1
     || !Number.isSafeInteger(reclaim.fence)
     || nextProvisioningAt < priorProvisioningAt
+    || nextProvisioningAt < observedAt
     || nextLeaseExpiresAt <= nextProvisioningAt
+    || nextLeaseExpiresAt - nextProvisioningAt > MAX_PROVISIONING_LEASE_MS
     || reclaim.provisioner.holderId === current.provisioner.holderId
   ) {
     stateError("Provisioning reclaim requires a fresh dead-owner fence and provisioner.");
@@ -809,9 +970,25 @@ export function reclaimProvisioningJournal(binding, journal, reclaim = {}) {
     provisioner: { ...reclaim.provisioner },
     provisioningAt: reclaim.provisioningAt,
     leaseExpiresAt: reclaim.leaseExpiresAt,
+    journalRevision: nextJournalRevision(current),
+    previousJournalDigest: current.journalDigest,
     journalDigest: null
   };
   next.journalDigest = sha256(journalWithoutDigest(next));
   assertProvisioningJournal(trustedBinding, next);
   return deepFreeze(next);
+}
+
+export function createPublicExecutionProjection(binding, journal) {
+  const trustedBinding = assertExecutionBinding(binding);
+  const trustedJournal = assertProvisioningJournal(trustedBinding, journal);
+  return deepFreeze({
+    bindingDigest: trustedBinding.bindingDigest,
+    cancellationNonceDigest: trustedBinding.cancellationNonceDigest,
+    journalState: trustedJournal.state,
+    journalRevision: trustedJournal.journalRevision,
+    journalDigest: trustedJournal.journalDigest,
+    previousJournalDigest: trustedJournal.previousJournalDigest,
+    executionContextManifestDigest: trustedJournal.executionContextManifestDigest
+  });
 }
