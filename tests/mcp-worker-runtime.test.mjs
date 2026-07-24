@@ -60,7 +60,7 @@ const TEST_BROKER_RUNTIME = createMcpBrokerRuntime({
   providerCapabilityReceipt: TEST_PROVIDER_RECEIPT
 });
 
-function taskReport(summary = "Fake broker task completed") {
+function taskReport(summary = "Fake broker task completed", extra = {}) {
   return `GROK_WORKER_REPORT: ${JSON.stringify({
     outcome: "complete",
     summary,
@@ -68,7 +68,8 @@ function taskReport(summary = "Fake broker task completed") {
     checksClaimed: [],
     acceptanceResults: ["AC-01", "AC-02"].map((id) => ({ id, status: "met" })),
     risks: [],
-    questions: []
+    questions: [],
+    ...extra
   })}`;
 }
 
@@ -685,6 +686,84 @@ test("MCP spawn runs one fake provider, replays idempotently, waits, returns a p
   ]) {
     assert.equal(serialized.includes(secret), false, `public MCP payload leaked ${secret}`);
   }
+  await assertAllProcessesGone(privateJob);
+});
+
+test("provider final report persists one body-free future-admission request at the exact provider boundary", { skip: process.platform === "win32" }, async (t) => {
+  const { root, env } = fixture({
+    taskText: taskReport("Request review admission", {
+      hostActionRequest: {
+        schemaVersion: 1,
+        kind: "role_admission",
+        requestedRoleId: "reviewer"
+      }
+    })
+  });
+  const options = { env };
+  let workerId = null;
+  t.after(() => workerId && emergencyStop(tryReadJob(root, workerId, env)));
+  const spawned = await callTool(root, "worker_spawn", {
+    idempotencyKey: "mcp-runtime-host-action-0001",
+    userRequest: "Inspect and request an independent reviewer."
+  }, options);
+  workerId = spawned.worker.id;
+  await waitForTerminal(root, workerId, options);
+  const result = await callTool(root, "worker_result", { id: workerId }, options);
+  assert.equal(result.worker.status, "completed");
+  assert.deepEqual(result.worker.awaitingHostAction, {
+    schemaVersion: 1,
+    kind: "role_admission",
+    requestId: result.worker.awaitingHostAction.requestId,
+    requestedRoleId: "reviewer",
+    requestedAt: result.worker.awaitingHostAction.requestedAt,
+    status: "awaiting",
+    decision: null,
+    application: "future-admission-only",
+    applied: false
+  });
+  const privateJob = tryReadJob(root, workerId, env);
+  assert.equal(privateJob.hostAction.request.requestedRoleId, "reviewer");
+  assert.equal(privateJob.hostAction.decision, null);
+  assert.equal(privateJob.hostAction.grant, null);
+  const publicText = JSON.stringify(result.worker.awaitingHostAction);
+  for (const privateValue of [
+    privateJob.host.sessionId,
+    privateJob.grokSessionId,
+    privateJob.workerProcess.nonce,
+    privateJob.hostAction.request.requestDigest,
+    privateJob.hostAction.request.sourceBinding.workerProcessDigest,
+    privateJob.hostAction.request.sourceBinding.providerProcessDigest
+  ]) {
+    assert.equal(publicText.includes(privateValue), false);
+  }
+  await assertAllProcessesGone(privateJob);
+});
+
+test("implementer host-action request fails E_CAPABILITY and leaves no durable grant request", { skip: process.platform === "win32" }, async (t) => {
+  const { root, env } = fixture({
+    taskText: taskReport("Request write admission", {
+      hostActionRequest: {
+        schemaVersion: 1,
+        kind: "role_admission",
+        requestedRoleId: "implementer"
+      }
+    })
+  });
+  const options = { env };
+  let workerId = null;
+  t.after(() => workerId && emergencyStop(tryReadJob(root, workerId, env)));
+  const spawned = await callTool(root, "worker_spawn", {
+    idempotencyKey: "mcp-runtime-host-action-write-0001",
+    userRequest: "Inspect and request implementation authority."
+  }, options);
+  workerId = spawned.worker.id;
+  await waitForTerminal(root, workerId, options);
+  const result = await callTool(root, "worker_result", { id: workerId }, options);
+  assert.equal(result.worker.status, "failed");
+  assert.equal(result.worker.error.code, "E_CAPABILITY");
+  assert.equal(result.worker.awaitingHostAction, null);
+  const privateJob = tryReadJob(root, workerId, env);
+  assert.equal(privateJob.hostAction, undefined);
   await assertAllProcessesGone(privateJob);
 });
 

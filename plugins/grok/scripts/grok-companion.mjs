@@ -96,6 +96,7 @@ import {
 } from "./lib/worker-launch-contract.mjs";
 import { launchCommittedWorker } from "./lib/worker-runtime.mjs";
 import { materializeRole } from "./lib/worker-roles.mjs";
+import { attachHostActionRequestToJob } from "./lib/worker-host-actions.mjs";
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = path.resolve(path.dirname(SCRIPT), "..");
@@ -1403,27 +1404,51 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
             validationIssues: workerReport.validationIssues
           }
         );
+      } else if (workerReport.hostActionRequest?.requestedRoleId === "implementer") {
+        finalTaskError = new CompanionError(
+          "E_CAPABILITY",
+          "Implementer admission is disabled until Phase 3 isolated execution is available."
+        );
       }
       const intendedTerminal = terminalIntentFor(finalTaskError, finalTaskError?.message || workerReport.summary);
-      updateJob(root, id, (current) => terminal(current) ? current : touchJob(current, {
-        phase: "finalizing",
-        completionContextManifest: postContext,
-        grokSessionId: result.sessionId,
-        providerProcess: current.providerProcess || result.provider?.process || null,
-        profile: { ...current.profile, grokVersion: result.provider?.version || null },
-        result: safeResult,
-        summary: workerReport.summary.slice(0, 160),
-        progress: "Final report ready",
-        ...terminalIntentPatch(current, intendedTerminal),
-        lifecycleEvents: appendLifecycleEvent(
-          workerReport.outcome === "blocked"
-            ? appendLifecycleEvent(current.lifecycleEvents, "blocked", workerReport.summary, { questions: workerReport.questions })
-            : current.lifecycleEvents,
-          "final.report",
-          "Worker report ready",
-          { outcome: workerReport.outcome, structured: workerReport.structured, hostVerification: "not_run" }
-        )
-      }));
+      try {
+        updateJob(root, id, (current) => {
+          if (terminal(current)) return current;
+          const withHostAction = !finalTaskError && workerReport.hostActionRequest
+            ? attachHostActionRequestToJob(current, {
+              providerRequest: workerReport.hostActionRequest,
+              dispatchAttemptId,
+              dispatchFence,
+              providerGeneration,
+              providerSessionId: result.sessionId
+            })
+            : current;
+          return touchJob(withHostAction, {
+            phase: "finalizing",
+            completionContextManifest: postContext,
+            grokSessionId: result.sessionId,
+            providerProcess: withHostAction.providerProcess || result.provider?.process || null,
+            profile: { ...withHostAction.profile, grokVersion: result.provider?.version || null },
+            result: safeResult,
+            summary: workerReport.summary.slice(0, 160),
+            progress: "Final report ready",
+            ...terminalIntentPatch(withHostAction, intendedTerminal),
+            lifecycleEvents: appendLifecycleEvent(
+              workerReport.outcome === "blocked"
+                ? appendLifecycleEvent(withHostAction.lifecycleEvents, "blocked", workerReport.summary, { questions: workerReport.questions })
+                : withHostAction.lifecycleEvents,
+              "final.report",
+              "Worker report ready",
+              { outcome: workerReport.outcome, structured: workerReport.structured, hostVerification: "not_run" }
+            )
+          });
+        });
+      } catch (finalizationError) {
+        // A late binding failure must not inherit an already-cached successful
+        // terminal intent.
+        brokerTerminalIntent = null;
+        throw finalizationError;
+      }
       if (finalTaskError) throw finalTaskError;
     }
   } catch (error) {

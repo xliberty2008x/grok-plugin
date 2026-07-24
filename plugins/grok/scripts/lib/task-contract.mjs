@@ -12,6 +12,7 @@ import {
   composeEffectiveProviderPrompt,
   validateExplicitContextItems
 } from "./worker-context.mjs";
+import { validateProviderHostActionRequest } from "./worker-host-actions.mjs";
 
 const timestamp = () => new Date().toISOString();
 
@@ -957,13 +958,14 @@ export function buildWorkerReport({
   acceptanceResults = null,
   risks = null,
   questions = null,
+  hostActionRequest = undefined,
   acceptanceCriteria = []
 } = {}) {
   const parsedReport = parseStructuredWorkerPayload(providerText);
   const parsed = parsedReport?.value || null;
   const text = clip(String(providerText || "").trim());
   const requiredFields = ["outcome", "summary", "changedFiles", "checksClaimed", "acceptanceResults", "risks", "questions"];
-  const allowedFields = new Set(requiredFields);
+  const allowedFields = new Set([...requiredFields, "hostActionRequest"]);
   const shapeIssues = [];
   if (parsed) {
     for (const field of requiredFields) if (!Object.hasOwn(parsed, field)) shapeIssues.push(`Structured worker report omitted ${field}.`);
@@ -986,12 +988,23 @@ export function buildWorkerReport({
   const questionsList = asStringList(questions ?? parsed?.questions);
   const criteria = Array.isArray(acceptanceCriteria) ? acceptanceCriteria : [];
   const normalizedAcceptance = normalizeAcceptanceResults(acceptanceResults ?? parsed?.acceptanceResults, criteria);
+  const hostActionPresent = hostActionRequest !== undefined
+    || Boolean(parsed && Object.hasOwn(parsed, "hostActionRequest"));
+  const normalizedHostAction = validateProviderHostActionRequest(
+    hostActionRequest !== undefined ? hostActionRequest : parsed?.hostActionRequest,
+    { present: hostActionPresent }
+  );
   const requestedOutcome = ["complete", "partial", "blocked"].includes(outcome)
     ? outcome
     : ["complete", "partial", "blocked"].includes(parsed?.outcome)
       ? parsed.outcome
       : null;
-  const validationIssues = [...shapeIssues, ...normalizedPaths.issues, ...normalizedAcceptance.issues];
+  const validationIssues = [
+    ...shapeIssues,
+    ...normalizedPaths.issues,
+    ...normalizedAcceptance.issues,
+    ...normalizedHostAction.issues
+  ];
   if (parsed && !requestedOutcome) validationIssues.push("Structured worker report omitted a valid outcome.");
   if (!parsed) validationIssues.push("Provider did not return a GROK_WORKER_REPORT JSON object.");
   else if (!parsedReport.markerPresent) validationIssues.push("Provider returned JSON without the required GROK_WORKER_REPORT marker.");
@@ -1007,6 +1020,9 @@ export function buildWorkerReport({
     acceptanceResults: normalizedAcceptance.results,
     risks: risksList,
     questions: questionsList,
+    ...(hostActionPresent && normalizedHostAction.ok
+      ? { hostActionRequest: normalizedHostAction.value }
+      : {}),
     validationIssues
   };
 }
@@ -1026,7 +1042,8 @@ export function composeWorkerReportRepairPrompt(envelope, report) {
     checksClaimed: ["only checks actually run with available tools"],
     acceptanceResults: acceptanceTemplate,
     risks: ["remaining risk"],
-    questions: ["blocking question"]
+    questions: ["blocking question"],
+    hostActionRequest: null
   };
   const issues = asStringList(report?.validationIssues, { max: 20 });
   return [
@@ -1034,7 +1051,7 @@ export function composeWorkerReportRepairPrompt(envelope, report) {
     "Do not call tools, inspect files, modify the workspace, or repeat implementation.",
     `The previous report was invalid: ${issues.join("; ") || "required report marker/schema missing"}.`,
     "Return exactly one line. It must begin with GROK_WORKER_REPORT: followed immediately by one JSON object.",
-    "Use exactly the seven keys shown below, no Markdown fence, no prose before or after, and exactly one acceptance result for every supplied ID. Choose outcome from complete, partial, or blocked; choose each status from met, unmet, or unknown.",
+    "Use exactly the eight keys shown below, no Markdown fence, no prose before or after, and exactly one acceptance result for every supplied ID. Choose outcome from complete, partial, or blocked; choose each status from met, unmet, or unknown. hostActionRequest must be null unless the worker is requesting one future read-only role admission.",
     `GROK_WORKER_REPORT: ${JSON.stringify(template)}`
   ].join("\n");
 }

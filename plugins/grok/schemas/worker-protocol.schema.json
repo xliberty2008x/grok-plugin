@@ -65,6 +65,62 @@
       "type": "string",
       "maxLength": 2000
     },
+    "hostActionDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision", "decidedAt", "application", "applied"],
+      "properties": {
+        "decision": { "type": "string", "enum": ["grant", "deny"] },
+        "decidedAt": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "application": { "const": "future-admission-only" },
+        "applied": { "const": false }
+      }
+    },
+    "awaitingHostAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "requestId",
+        "requestedRoleId",
+        "requestedAt",
+        "status",
+        "decision",
+        "application",
+        "applied"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "role_admission" },
+        "requestId": { "type": "string", "pattern": "^har-[a-f0-9]{24}$" },
+        "requestedRoleId": { "type": "string", "enum": ["reviewer", "security", "test"] },
+        "requestedAt": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "status": { "type": "string", "enum": ["awaiting", "granted", "denied"] },
+        "decision": {
+          "anyOf": [
+            { "$ref": "#/$defs/hostActionDecision" },
+            { "type": "null" }
+          ]
+        },
+        "application": { "const": "future-admission-only" },
+        "applied": { "const": false }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "awaiting" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": { "decision": { "type": "null" } }
+          },
+          "else": {
+            "properties": { "decision": { "$ref": "#/$defs/hostActionDecision" } }
+          }
+        }
+      ]
+    },
     "publicPath": {
       "type": "string",
       "minLength": 1,
@@ -833,7 +889,12 @@
         "executionRootDigest": { "type": ["string", "null"], "maxLength": 256 },
         "roleId": { "type": ["string", "null"], "maxLength": 256 },
         "externalWorkerLabel": { "type": ["string", "null"], "maxLength": 64 },
-        "awaitingHostAction": { "type": "null" }
+        "awaitingHostAction": {
+          "anyOf": [
+            { "$ref": "#/$defs/awaitingHostAction" },
+            { "type": "null" }
+          ]
+        }
       },
       "allOf": [
         {

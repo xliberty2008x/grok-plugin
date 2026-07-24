@@ -11,6 +11,7 @@ export const CODEX_MCP_EXPERIMENTAL_CAPABILITIES = Object.freeze({
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const GROK_PLUGIN_ID = /^grok(?:@[a-zA-Z0-9][a-zA-Z0-9._-]{0,127})?$/;
+const RESOLVED_AUTHORITIES = new WeakMap();
 
 function authFailure() {
   return new CompanionError("E_AUTH_REQUIRED", "Trusted Codex task identity is unavailable.");
@@ -88,7 +89,7 @@ export function resolveWorkerAuthority(meta, { mutation = false } = {}) {
   } catch {
     throw capabilityFailure();
   }
-  return Object.freeze({
+  const authority = Object.freeze({
     hostKind: "codex",
     threadId,
     turnId,
@@ -99,4 +100,47 @@ export function resolveWorkerAuthority(meta, { mutation = false } = {}) {
     attestedParentThreadId: attestedByHost ? attestedParentThreadId : null,
     mutationCapable: Boolean(pluginId && GROK_PLUGIN_ID.test(String(pluginId)))
   });
+  RESOLVED_AUTHORITIES.set(authority, Object.freeze({
+    mutation: Boolean(mutation),
+    root
+  }));
+  return authority;
+}
+
+/**
+ * Require the exact, in-process authority object produced by a mutation-mode
+ * MCP metadata resolution. Plain objects, serialized copies, and parent-task
+ * attestations are not mutation authority for host-action decisions.
+ */
+export function assertBrokerMutationAuthority(
+  authority,
+  { root = null, exactThreadId = null } = {}
+) {
+  const proof = authority && typeof authority === "object"
+    ? RESOLVED_AUTHORITIES.get(authority)
+    : null;
+  if (!proof?.mutation
+    || authority.hostKind !== "codex"
+    || authority.source !== "codex-mcp-stdio"
+    || authority.mutationCapable !== true
+    || !isCanonicalUuid(authority.threadId)
+    || !GROK_PLUGIN_ID.test(String(authority.pluginId || ""))) {
+    throw authFailure();
+  }
+  if (root !== null) {
+    let expectedRoot;
+    try {
+      expectedRoot = fs.realpathSync(root);
+    } catch {
+      throw capabilityFailure();
+    }
+    if (proof.root !== expectedRoot || authority.root !== expectedRoot) {
+      throw capabilityFailure();
+    }
+  }
+  if (exactThreadId !== null && authority.threadId !== exactThreadId) {
+    // Preserve the mutation surface's foreign/nonexistent equivalence.
+    throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+  }
+  return authority;
 }

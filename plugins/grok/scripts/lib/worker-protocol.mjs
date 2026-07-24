@@ -19,6 +19,7 @@ import {
   assertContextReceiptShape
 } from "./worker-context.mjs";
 import { assertRuntimeRolePolicy } from "./worker-roles.mjs";
+import { projectAwaitingHostAction } from "./worker-host-actions.mjs";
 import {
   LIFECYCLE_EVENT_TYPES,
   MAX_LIFECYCLE_EVENTS,
@@ -105,7 +106,8 @@ const PRIVATE_PROJECTION_FIELDS = new Set([
   "prompt",
   "userRequest",
   "rawProviderMessage",
-  "rawProviderMessages"
+  "rawProviderMessages",
+  "hostAction"
 ]);
 
 function omitPrivateProjectionFields(value, ancestors = new WeakSet()) {
@@ -1072,9 +1074,7 @@ export function projectWorkerSnapshot(job, { detail = true, trustHostAuthority =
     controlWorkspaceId: nullableText(job.controlWorkspaceId, 256),
     roleId: nullableText(job.role?.id || job.profile?.id, 256),
     externalWorkerLabel: "external-grok-worker",
-    // Reserved until a broker-owned host-action schema exists. Never forward an
-    // arbitrary provider object across the public boundary.
-    awaitingHostAction: null,
+    awaitingHostAction: projectAwaitingHostAction(job),
     terminal: isWorkerTerminal(job)
   });
 }
