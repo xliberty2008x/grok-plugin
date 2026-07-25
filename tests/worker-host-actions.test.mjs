@@ -125,8 +125,7 @@ function providerReport(hostActionRequest = undefined) {
 function providerStartedJob({
   requestedRoleId = "reviewer",
   attach = true,
-  threadId = THREAD,
-  sourceWrite = false
+  threadId = THREAD
 } = {}) {
   const root = initRepo();
   const env = envFor();
@@ -135,12 +134,10 @@ function providerStartedJob({
     principal: spawnPrincipal(root, threadId),
     envelope: buildTaskEnvelope({
       userRequest: "Inspect repository",
-      mode: sourceWrite ? "write" : "read"
+      mode: "read"
     }),
     idempotencyKey: `host-action-spawn-${crypto.randomBytes(6).toString("hex")}`,
-    roleId: sourceWrite ? "implementer" : "explorer",
-    write: sourceWrite,
-    allowWriteSpawn: sourceWrite,
+    roleId: "explorer",
     env
   });
   const workerId = admitted.handle.id;
@@ -217,6 +214,35 @@ function providerStartedJob({
     env,
     workerId,
     job: tryReadJob(root, workerId, env)
+  };
+}
+
+function plannedWriteJob() {
+  const root = initRepo();
+  const env = envFor();
+  const admitted = spawnReadOnlyWorker({
+    root,
+    principal: spawnPrincipal(root),
+    envelope: buildTaskEnvelope({
+      userRequest: "Edit one bounded file",
+      mode: "write",
+      scope: {
+        include: ["tracked.txt"],
+        exclude: []
+      }
+    }),
+    idempotencyKey: `host-action-write-plan-${crypto.randomBytes(6).toString("hex")}`,
+    roleId: "implementer",
+    write: true,
+    allowWriteSpawn: true,
+    writeLifecycleCapabilityDigest: "d".repeat(64),
+    env
+  });
+  return {
+    root,
+    env,
+    workerId: admitted.handle.id,
+    job: tryReadJob(root, admitted.handle.id, env)
   };
 }
 
@@ -784,11 +810,10 @@ test("grant eligibility requires every exact parent and target binding", () => {
   );
 });
 
-test("a write-source worker can only mint a read-only target role policy", () => {
-  const fixture = providerStartedJob({ sourceWrite: true });
+test("role admission can only mint a read-only target role policy", () => {
+  const fixture = providerStartedJob();
   decide(fixture);
   const job = tryReadJob(fixture.root, fixture.workerId, fixture.env);
-  assert.equal(job.profile.id, "rescue-write-v3");
   assert.equal(job.hostAction.grant.targetRole.write, false);
   assert.equal(job.hostAction.grant.targetRuntimeRolePolicy.providerProfileId, "rescue-read-v3");
   assert.equal(
@@ -1190,28 +1215,36 @@ test("follow-up admission rejects exact consumed-launch and dispatch drift befor
   }
 });
 
-test("a write-profile parent cannot resume its provider session as a read-role child", () => {
-  const fixture = providerStartedJob({ sourceWrite: true });
-  const decision = decide(fixture);
-  const finalContext = captureContextManifest(fixture.root);
-  updateJob(fixture.root, fixture.workerId, (job) => ({
-    ...job,
-    completionContextManifest: finalContext,
-    result: {
-      ...(job.result || {}),
-      hostVerification: "not_run",
-      taskRuntimeCleaned: true
-    }
-  }), fixture.env);
+test("a planned write worker cannot mint or consume host-action authority before ready", () => {
+  const fixture = plannedWriteJob();
+  assert.equal(fixture.job.provisioning.state, "planned");
+  assert.equal(Object.hasOwn(fixture.job.request.spawn, "dispatch"), false);
+  assert.equal(Object.hasOwn(fixture.job, "workerAuthorization"), false);
+  assert.equal(Object.hasOwn(fixture.job, "grokSessionId"), false);
+  assert.equal(Object.hasOwn(fixture.job, "hostAction"), false);
+  assert.throws(
+    () => mintHostActionRequest(fixture.job, {
+      providerRequest: {
+        schemaVersion: 1,
+        kind: "role_admission",
+        requestedRoleId: "reviewer"
+      },
+      dispatchAttemptId: ATTEMPT,
+      dispatchFence: FENCE,
+      providerGeneration: GENERATION,
+      providerSessionId: SESSION
+    }),
+    (error) => error?.code === "E_STATE"
+  );
   const before = listJobs(fixture.root, fixture.env).length;
   assert.throws(
     () => spawnGrantedFollowupWorker({
       root: fixture.root,
       principal: authority(fixture.root),
       workerId: fixture.workerId,
-      grantId: decision.grant.grantId,
-      message: "Do not cross the write/read security profile boundary",
-      idempotencyKey: "write-parent-read-child",
+      grantId: `hag-${"a".repeat(24)}`,
+      message: "Do not admit a child before the write parent is ready",
+      idempotencyKey: "planned-write-parent-read-child",
       providerCapabilityDigest: "c".repeat(64),
       env: fixture.env
     }),

@@ -18,6 +18,7 @@ import {
 } from "../plugins/grok/scripts/lib/worker-launch-contract.mjs";
 import { projectWorkerSnapshot } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
 import {
+  admitWriteWorkerPlan,
   assertDurableSpawnRequestBinding,
   cancelWorker,
   claimWorkerDispatch,
@@ -26,6 +27,11 @@ import {
   spawnReadOnlyWorker,
   SPAWN_SUCCESS_DEFINITION
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
+import {
+  assertExecutionBinding,
+  assertProvisioningJournal,
+  transitionProvisioningJournal
+} from "../plugins/grok/scripts/lib/worker-execution-binding.mjs";
 import {
   assertContextReceipt,
   assertContextReceiptShape,
@@ -62,7 +68,7 @@ import {
   workspaceState,
   workspaceStateSegment
 } from "../plugins/grok/scripts/lib/workspace.mjs";
-import { initRepo, tempDir, waitFor } from "./helpers.mjs";
+import { git, initRepo, tempDir, waitFor } from "./helpers.mjs";
 
 const THREAD = "019f666a-6469-7cc1-9a8d-8c1adf61e103";
 const THREAD_B = "019f666b-1e72-74b1-b27c-9d186d7f1016";
@@ -1071,6 +1077,453 @@ test("write spawn is rejected until allowWriteSpawn is enabled", () => {
     }),
     (error) => error?.code === "E_CAPABILITY"
   );
+});
+
+test("write admission durably binds one planned journal without creating launch authority", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const idempotencyKey = "spawn-write-plan-0001";
+  const writeLifecycleCapabilityDigest = "c".repeat(64);
+  const envelope = buildTaskEnvelope({
+    userRequest: "Edit only target.txt",
+    mode: "write",
+    scope: {
+      include: ["target.txt"],
+      exclude: ["secrets/**"]
+    },
+    acceptanceCriteria: ["target.txt contains the requested change"],
+    requiredVerification: ["node --test"]
+  });
+  const request = {
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey,
+    roleId: "implementer",
+    write: true,
+    allowWriteSpawn: true,
+    writeLifecycleCapabilityDigest,
+    env
+  };
+
+  const first = spawnReadOnlyWorker(request);
+  assert.equal(first.replayed, false);
+  assert.equal(first.providerLaunchState, "not-ready");
+  assert.equal(first.providerLaunched, false);
+  assert.equal(first.handle.write, true);
+  assert.equal(first.handle.phase, "provisioning-planned");
+
+  const job = tryReadJob(root, first.handle.id, env);
+  const binding = assertExecutionBinding(job.executionBinding, {
+    workerId: job.id,
+    controlWorkspaceId: job.controlWorkspaceId,
+    scope: job.request.envelope.scope,
+    envelopeDigest: job.request.envelope.digest,
+    roleDigest: job.role.digest,
+    providerCapabilityDigest: writeLifecycleCapabilityDigest
+  });
+  const journal = assertProvisioningJournal(binding, job.provisioning);
+  assert.equal(journal.state, "planned");
+  assert.equal(journal.journalRevision, 0);
+  assert.equal(journal.bindingDigest, binding.bindingDigest);
+  assert.equal(fs.existsSync(binding.expectedExecutionRoot), false);
+  assert.equal(job.request.spawn.providerLaunchOutcome, "not-ready");
+  assert.equal(job.request.spawn.providerLaunchPending, false);
+  assert.equal(job.request.spawn.providerLaunchInFlight, false);
+  for (const field of [
+    "executionRoot",
+    "requestDigest",
+    "contextBindingDigest",
+    "executionBindingDigest",
+    "dispatch",
+    "consumedLaunchContractDigest",
+    "launchContractConsumedAt",
+    "controllerSpawnIntent",
+    "workerSpawnIntent",
+    "providerSpawnIntent",
+    "providerRotationIntent"
+  ]) assert.equal(Object.hasOwn(job.request.spawn, field), false, field);
+  for (const field of [
+    "contextBindingMode",
+    "contextPacket",
+    "contextReceipt",
+    "contextManifest",
+    "providerPrompt",
+    "providerPromptDigest"
+  ]) assert.equal(Object.hasOwn(job.request, field), false, field);
+  for (const field of [
+    "workerAuthorization",
+    "controllerProcess",
+    "workerProcess",
+    "providerProcess",
+    "grokSessionId"
+  ]) assert.equal(Object.hasOwn(job, field), false, field);
+  assert.doesNotThrow(() => projectWorkerSnapshot(job, { trustHostAuthority: false }));
+
+  const recordFile = spawnIdempotencyFile(root, idempotencyKey, env);
+  const firstRecord = JSON.parse(fs.readFileSync(recordFile, "utf8"));
+  assert.equal(firstRecord.schemaVersion, 5);
+  assert.equal(firstRecord.workerId, job.id);
+  assert.equal(firstRecord.expectedExecutionRoot, binding.expectedExecutionRoot);
+  assert.equal(firstRecord.executionBindingDigest, binding.bindingDigest);
+  assert.equal(
+    firstRecord.admissionRequestDigest,
+    job.request.spawn.admissionRequestDigest
+  );
+  assert.equal(firstRecord.responseWitness.responseSequence, 1);
+  assert.equal(
+    firstRecord.responseWitness.requestDigest,
+    firstRecord.admissionRequestDigest
+  );
+
+  const replay = spawnReadOnlyWorker(request);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.handle.id, first.handle.id);
+  const replayedJob = tryReadJob(root, first.handle.id, env);
+  assert.equal(replayedJob.provisioning.journalRevision, 0);
+  assert.equal(replayedJob.provisioning.journalDigest, journal.journalDigest);
+  assert.equal(replayedJob.lifecycleEvents.length, 1);
+  assert.equal(listJobs(root, env).length, 1);
+  assert.equal(
+    JSON.parse(fs.readFileSync(recordFile, "utf8")).responseWitness.responseSequence,
+    2
+  );
+
+  fs.unlinkSync(recordFile);
+  const recovered = admitWriteWorkerPlan({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey,
+    roleId: "implementer",
+    allowWriteSpawn: true,
+    writeLifecycleCapabilityDigest,
+    env
+  });
+  assert.equal(recovered.replayed, true);
+  assert.equal(recovered.handle.id, first.handle.id);
+  assert.equal(tryReadJob(root, first.handle.id, env).provisioning.journalRevision, 0);
+  assert.equal(listJobs(root, env).length, 1);
+
+  git(root, "update-index", "--assume-unchanged", "tracked.txt");
+  assert.throws(
+    () => spawnReadOnlyWorker(request),
+    (error) => error?.code === "E_SCOPE_VIOLATION"
+      && /unsafe Git index state/i.test(error.message)
+  );
+  git(root, "update-index", "--no-assume-unchanged", "tracked.txt");
+  assert.equal(spawnReadOnlyWorker(request).handle.id, first.handle.id);
+});
+
+test("write admission is cross-process idempotent under the workspace transaction", async () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const source = `
+    import { spawnReadOnlyWorker } from ${JSON.stringify(MUTATION_MODULE)};
+    import { buildTaskEnvelope } from ${JSON.stringify(TASK_CONTRACT_MODULE)};
+    const result = spawnReadOnlyWorker({
+      root: ${JSON.stringify(root)},
+      env: ${JSON.stringify(env)},
+      principal: ${JSON.stringify(principal(root))},
+      envelope: buildTaskEnvelope({
+        userRequest: "Concurrent bounded write admission",
+        mode: "write",
+        scope: { include: ["tracked.txt"], exclude: [] }
+      }),
+      idempotencyKey: "spawn-write-cross-process-0001",
+      roleId: "implementer",
+      write: true,
+      allowWriteSpawn: true,
+      writeLifecycleCapabilityDigest: ${JSON.stringify("c".repeat(64))}
+    });
+    console.log(JSON.stringify(result));
+  `;
+  const runs = await Promise.all([runIsolatedModule(source), runIsolatedModule(source)]);
+  for (const run of runs) assert.equal(run.code, 0, run.stderr);
+  const results = runs.map((run) => lastJson(run.stdout));
+  assert.equal(results[0].handle.id, results[1].handle.id);
+  assert.deepEqual(results.map((result) => result.replayed).sort(), [false, true]);
+  assert.equal(results[0].providerLaunchState, "not-ready");
+  assert.equal(results[1].providerLaunchState, "not-ready");
+  assert.equal(results[0].providerLaunched, false);
+  assert.equal(results[1].providerLaunched, false);
+
+  const jobs = listJobs(root, env);
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].provisioning.state, "planned");
+  assert.equal(jobs[0].provisioning.journalRevision, 0);
+  assert.equal(jobs[0].lifecycleEvents.length, 1);
+  assert.equal(
+    Object.hasOwn(jobs[0].request.spawn, "dispatch"),
+    false
+  );
+});
+
+test("write admission requires a distinct capability and fails closed on dirty or mismatched input", () => {
+  const capability = "d".repeat(64);
+  const envelopeFor = (scope = ["target.txt"]) => buildTaskEnvelope({
+    userRequest: "Bounded write admission",
+    mode: "write",
+    scope: { include: scope, exclude: [] }
+  });
+
+  {
+    const root = initRepo();
+    const { env } = envFor(root);
+    assert.throws(
+      () => admitWriteWorkerPlan({
+        root,
+        principal: principal(root),
+        envelope: envelopeFor(),
+        idempotencyKey: "spawn-write-capability-0001",
+        allowWriteSpawn: true,
+        env
+      }),
+      (error) => error?.code === "E_CAPABILITY"
+    );
+    assert.equal(
+      fs.existsSync(path.join(workspaceState(root, env), "jobs")),
+      false
+    );
+  }
+
+  {
+    const root = initRepo();
+    const { env } = envFor(root);
+    fs.writeFileSync(path.join(root, "untracked.txt"), "dirty\n");
+    assert.throws(
+      () => admitWriteWorkerPlan({
+        root,
+        principal: principal(root),
+        envelope: envelopeFor(),
+        idempotencyKey: "spawn-write-dirty-0001",
+        allowWriteSpawn: true,
+        writeLifecycleCapabilityDigest: capability,
+        env
+      }),
+      (error) => error?.code === "E_WORKTREE"
+    );
+    assert.equal(listJobs(root, env).length, 0);
+  }
+
+  {
+    const root = initRepo();
+    const { env } = envFor(root);
+    const base = {
+      root,
+      principal: principal(root),
+      envelope: envelopeFor(),
+      idempotencyKey: "spawn-write-mismatch-0001",
+      allowWriteSpawn: true,
+      writeLifecycleCapabilityDigest: capability,
+      env
+    };
+    const admitted = admitWriteWorkerPlan(base);
+    const before = tryReadJob(root, admitted.handle.id, env);
+    for (const mismatch of [
+      { ...base, envelope: envelopeFor(["other.txt"]) },
+      { ...base, writeLifecycleCapabilityDigest: "e".repeat(64) },
+      {
+        ...base,
+        principal: principal(root, {
+          threadId: THREAD_B
+        })
+      }
+    ]) {
+      assert.throws(
+        () => admitWriteWorkerPlan(mismatch),
+        (error) => error?.code === "E_IDEMPOTENCY_CONFLICT"
+      );
+    }
+    const after = tryReadJob(root, admitted.handle.id, env);
+    assert.equal(after.provisioning.journalDigest, before.provisioning.journalDigest);
+    assert.equal(after.lifecycleEvents.length, 1);
+    assert.equal(listJobs(root, env).length, 1);
+  }
+});
+
+test("write admission schema-v5 records and pre-ready jobs fail closed on tamper", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const envelope = buildTaskEnvelope({
+    userRequest: "Reject tampered write admission",
+    mode: "write",
+    scope: { include: ["tracked.txt"], exclude: [] }
+  });
+  const idempotencyKey = "spawn-write-tamper-0001";
+  const request = {
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey,
+    roleId: "implementer",
+    write: true,
+    allowWriteSpawn: true,
+    writeLifecycleCapabilityDigest: "c".repeat(64),
+    env
+  };
+  const admitted = spawnReadOnlyWorker(request);
+  const recordFile = spawnIdempotencyFile(root, idempotencyKey, env);
+  const originalRecord = JSON.parse(fs.readFileSync(recordFile, "utf8"));
+  const recordCorruptions = [
+    (record) => { record.expectedExecutionRoot = path.join(root, "foreign"); },
+    (record) => { record.executionBindingDigest = "0".repeat(64); },
+    (record) => { record.admissionRequestDigest = "0".repeat(64); },
+    (record) => { record.responseWitness.requestDigest = "0".repeat(64); },
+    (record) => { record.responseWitness.witnessId = `spawnw-${"0".repeat(24)}`; }
+  ];
+  for (const corrupt of recordCorruptions) {
+    const record = structuredClone(originalRecord);
+    corrupt(record);
+    fs.writeFileSync(recordFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    assert.throws(
+      () => spawnReadOnlyWorker(request),
+      (error) => error?.code === "E_STATE"
+        && !String(error.message).includes(admitted.handle.id)
+    );
+  }
+  fs.writeFileSync(recordFile, `${JSON.stringify(originalRecord)}\n`, { mode: 0o600 });
+
+  const jobFile = path.join(
+    workspaceState(root, env),
+    "jobs",
+    `${admitted.handle.id}.json`
+  );
+  const originalJob = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  const jobCorruptions = [
+    {
+      name: "capability",
+      mutate(job) {
+        job.request.spawn.writeLifecycleCapabilityDigest = "e".repeat(64);
+      },
+      message: /execution binding does not match/i
+    },
+    {
+      name: "role",
+      mutate(job) {
+        job.role.id = "explorer";
+      },
+      message: /role|digest/i
+    },
+    {
+      name: "context",
+      mutate(job) {
+        job.request.admissionContextManifest.git.dirtyDigest = "e".repeat(64);
+      },
+      message: /workspace identity drifted|context/i
+    },
+    {
+      name: "pre-ready authority",
+      mutate(job) {
+        job.request.spawn.executionRoot = job.executionBinding.expectedExecutionRoot;
+      },
+      message: /launch or provider authority/i
+    },
+    {
+      name: "pre-ready launch pending",
+      mutate(job) {
+        job.request.spawn.providerLaunchPending = true;
+      },
+      message: /launch or provider authority/i
+    },
+    {
+      name: "pre-ready launch outcome",
+      mutate(job) {
+        job.request.spawn.providerLaunchOutcome = "started";
+      },
+      message: /launch or provider authority/i
+    },
+    {
+      name: "pre-ready runtime policy",
+      mutate(job) {
+        job.request.runtimeRolePolicy = { digest: "f".repeat(64) };
+      },
+      message: /launch or provider authority/i
+    },
+    {
+      name: "pre-ready prompt",
+      mutate(job) {
+        job.request.providerPromptDigest = "f".repeat(64);
+      },
+      message: /launch or provider authority/i
+    },
+    {
+      name: "pre-ready resume authority",
+      mutate(job) {
+        job.request.resumeSessionId = "session-that-must-not-exist";
+      },
+      message: /launch or provider authority/i
+    },
+    {
+      name: "pre-ready cleanup authority",
+      mutate(job) {
+        job.request.spawn.cleanupRequired = true;
+      },
+      message: /launch or provider authority/i
+    }
+  ];
+  for (const { name, mutate, message } of jobCorruptions) {
+    const job = structuredClone(originalJob);
+    mutate(job);
+    fs.writeFileSync(jobFile, `${JSON.stringify(job)}\n`, { mode: 0o600 });
+    assert.throws(
+      () => spawnReadOnlyWorker(request),
+      (error) => error?.code !== undefined
+        && message.test(String(error.message))
+        && !String(error.message).includes(admitted.handle.id),
+      name
+    );
+  }
+  fs.writeFileSync(jobFile, `${JSON.stringify(originalJob)}\n`, { mode: 0o600 });
+
+  const provisioningAt = new Date(Date.parse(originalJob.createdAt) + 1_000).toISOString();
+  const leaseExpiresAt = new Date(Date.parse(originalJob.createdAt) + 31_000).toISOString();
+  const readyAt = new Date(Date.parse(originalJob.createdAt) + 2_000).toISOString();
+  const provisioning = transitionProvisioningJournal(
+    originalJob.executionBinding,
+    originalJob.provisioning,
+    {
+      state: "provisioning",
+      expectedCurrentJournalDigest: originalJob.provisioning.journalDigest,
+      attemptId: "a".repeat(32),
+      fence: 1,
+      provisioner: {
+        pid: 42,
+        startToken: "test-process-start-token",
+        holderId: "b".repeat(32)
+      },
+      leaseExpiresAt,
+      provisioningAt
+    }
+  );
+  const ready = transitionProvisioningJournal(
+    originalJob.executionBinding,
+    provisioning,
+    {
+      state: "ready",
+      expectedCurrentJournalDigest: provisioning.journalDigest,
+      actorAttemptId: provisioning.attemptId,
+      actorFence: provisioning.fence,
+      actorHolderId: provisioning.provisioner.holderId,
+      readyAt,
+      executionContextManifestId: `ctx-${"f".repeat(24)}`,
+      executionContextManifestDigest: "f".repeat(64)
+    }
+  );
+  const unsupportedReadyJob = structuredClone(originalJob);
+  unsupportedReadyJob.provisioning = ready;
+  fs.writeFileSync(
+    jobFile,
+    `${JSON.stringify(unsupportedReadyJob)}\n`,
+    { mode: 0o600 }
+  );
+  assert.throws(
+    () => spawnReadOnlyWorker(request),
+    (error) => error?.code === "E_STATE"
+      && /atomic launch-authority promotion/i.test(String(error.message))
+  );
+  fs.writeFileSync(jobFile, `${JSON.stringify(originalJob)}\n`, { mode: 0o600 });
+  assert.equal(spawnReadOnlyWorker(request).handle.id, admitted.handle.id);
 });
 
 test("spawn binds role capability, envelope mode, and job write flag", () => {

@@ -65,6 +65,8 @@ export function createWorkerService({
   clock = () => performance.now(),
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   allowWriteSpawn = false,
+  writeLifecycleCapabilityDigest = null,
+  validateWriteLifecycleCapability = null,
   providerCapabilityDigest = null,
   validateProviderCapability = null,
   allowUnboundDispatch = true,
@@ -85,6 +87,18 @@ export function createWorkerService({
     if (typeof validateProviderCapability !== "function") return providerCapabilityDigest;
     try {
       const observed = validateProviderCapability();
+      return typeof observed === "string" ? observed : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const currentWriteLifecycleCapabilityDigest = () => {
+    if (typeof validateWriteLifecycleCapability !== "function") {
+      return writeLifecycleCapabilityDigest;
+    }
+    try {
+      const observed = validateWriteLifecycleCapability();
       return typeof observed === "string" ? observed : null;
     } catch {
       return null;
@@ -196,11 +210,19 @@ export function createWorkerService({
         mode: write ? "write" : "read",
         contextManifestId: boundContextManifest.manifestId
       });
-      if (typeof providerCapabilityDigest === "string"
+      if (!write
+        && typeof providerCapabilityDigest === "string"
         && currentCapabilityDigest() !== providerCapabilityDigest) {
         throw new CompanionError(
           "E_CAPABILITY",
           "The installed provider capability changed before worker admission."
+        );
+      }
+      if (write && currentWriteLifecycleCapabilityDigest()
+        !== writeLifecycleCapabilityDigest) {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "The internal write-lifecycle capability changed before worker admission."
         );
       }
       const admitted = spawnReadOnlyWorker({
@@ -213,8 +235,17 @@ export function createWorkerService({
         write,
         env,
         allowWriteSpawn,
+        writeLifecycleCapabilityDigest,
         providerCapabilityDigest
       });
+      if (write) {
+        return {
+          ...admitted,
+          handle: admitted.handle,
+          providerLaunchState: "not-ready",
+          providerLaunched: false
+        };
+      }
       // Admission is intentionally durable before provider launch. Revalidate
       // once more at that exact boundary: if readiness changed while the job
       // was being committed, preserve the pending outbox for a later valid

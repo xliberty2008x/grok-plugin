@@ -626,6 +626,85 @@ test("worker spawn returns a stable admission snapshot while dispatch advances p
   );
 });
 
+test("internal write admission returns not-ready and never dispatches before provisioning", async () => {
+  const root = initRepo();
+  const fixture = stateFixture(root);
+  const writeLifecycleCapabilityDigest = "c".repeat(64);
+  let writeCapabilityChecks = 0;
+  let readCapabilityChecks = 0;
+  let dispatchCalls = 0;
+  const service = createWorkerService({
+    root,
+    principal: { hostKind: "codex", threadId: THREAD_A },
+    env: fixture.env,
+    allowWriteSpawn: true,
+    writeLifecycleCapabilityDigest,
+    validateWriteLifecycleCapability() {
+      writeCapabilityChecks += 1;
+      return writeLifecycleCapabilityDigest;
+    },
+    providerCapabilityDigest: "a".repeat(64),
+    validateProviderCapability() {
+      readCapabilityChecks += 1;
+      return null;
+    },
+    dispatchWorker() {
+      dispatchCalls += 1;
+      return { providerLaunchState: "started", providerLaunched: true };
+    }
+  });
+  const envelope = buildTaskEnvelope({
+    userRequest: "Edit target.txt through a planned isolated worker",
+    mode: "write",
+    scope: { include: ["target.txt"], exclude: [] }
+  });
+
+  const first = service.spawn({
+    envelope,
+    idempotencyKey: "service-write-plan-0001",
+    roleId: "implementer",
+    write: true
+  });
+  assert.equal(first.replayed, false);
+  assert.equal(first.handle.phase, "provisioning-planned");
+  assert.equal(first.providerLaunchState, "not-ready");
+  assert.equal(first.providerLaunched, false);
+  assert.equal(dispatchCalls, 0);
+  assert.equal(readCapabilityChecks, 0);
+  assert.equal(writeCapabilityChecks, 1);
+
+  const privateJob = tryReadJob(root, first.handle.id, fixture.env);
+  assert.equal(privateJob.provisioning.state, "planned");
+  assert.equal(Object.hasOwn(privateJob.request.spawn, "dispatch"), false);
+  assert.equal(Object.hasOwn(privateJob, "workerAuthorization"), false);
+  assert.equal(Object.hasOwn(privateJob, "workerProcess"), false);
+  assert.equal(Object.hasOwn(privateJob, "providerProcess"), false);
+  assert.equal(service.get(first.handle.id).phase, "provisioning-planned");
+  assert.equal(service.listOwned().some((worker) => worker.id === first.handle.id), true);
+
+  const observed = await service.wait(first.handle.id, { timeoutMs: 0 });
+  assert.equal(observed.events.length, 1);
+  assert.equal(dispatchCalls, 0);
+
+  const replay = service.spawn({
+    envelope,
+    idempotencyKey: "service-write-plan-0001",
+    roleId: "implementer",
+    write: true
+  });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.handle.id, first.handle.id);
+  assert.equal(replay.providerLaunchState, "not-ready");
+  assert.equal(replay.providerLaunched, false);
+  assert.equal(dispatchCalls, 0);
+  assert.equal(readCapabilityChecks, 0);
+  assert.equal(writeCapabilityChecks, 2);
+  assert.equal(
+    tryReadJob(root, first.handle.id, fixture.env).provisioning.journalRevision,
+    0
+  );
+});
+
 test("MCP advertises only the generic explorer role until runtime role policy exists", () => {
   const advertisedRoles = WORKER_SPAWN_TOOL.inputSchema.properties.roleId.enum;
   assert.deepEqual(advertisedRoles, ["explorer"]);

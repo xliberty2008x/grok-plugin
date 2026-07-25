@@ -67,6 +67,17 @@ import {
 } from "./recursion-guard.mjs";
 import { resolveControlWorkspace, workspaceState } from "./workspace.mjs";
 import {
+  assertParentUnchanged,
+  captureParentFingerprint,
+  expectedWorkerWorktreeRoot
+} from "./worker-worktree.mjs";
+import {
+  assertExecutionBinding,
+  assertProvisioningJournal,
+  createExecutionBinding,
+  createProvisioningJournal
+} from "./worker-execution-binding.mjs";
+import {
   DEFAULT_DISPATCH_LEASE_MS,
   WORKER_DISPATCH_OUTBOX_SCHEMA_VERSION,
   assertDispatchFence,
@@ -556,6 +567,7 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 const CONTROL_WORKSPACE_ID = /^cws-[0-9a-f]{32}$/;
 const LEGACY_SPAWN_IDEMPOTENCY_SCHEMA_VERSION = 3;
 const SPAWN_IDEMPOTENCY_SCHEMA_VERSION = 4;
+const WRITE_SPAWN_IDEMPOTENCY_SCHEMA_VERSION = 5;
 const SPAWN_RESPONSE_WITNESS_SCHEMA_VERSION = 1;
 const SPAWN_RESPONSE_WITNESS_PROJECTION = "worker-handle-v1-untrusted-host";
 const SPAWN_RESPONSE_WITNESS_ID = /^spawnw-[0-9a-f]{24}$/;
@@ -612,6 +624,18 @@ const SPAWN_IDEMPOTENCY_KEYS = new Set([
   ...LEGACY_SPAWN_IDEMPOTENCY_KEYS,
   "responseWitness"
 ]);
+const WRITE_SPAWN_IDEMPOTENCY_KEYS = new Set([
+  "schemaVersion",
+  "workerId",
+  "owner",
+  "controlWorkspaceId",
+  "expectedExecutionRoot",
+  "admissionRequestDigest",
+  "executionBindingDigest",
+  "idempotencyKeyDigest",
+  "committedAt",
+  "responseWitness"
+]);
 const SPAWN_IDEMPOTENCY_OWNER_KEYS = new Set(["hostKind", "sessionId"]);
 const SPAWN_RESPONSE_WITNESS_KEYS = new Set([
   "schemaVersion",
@@ -625,6 +649,25 @@ const SPAWN_RESPONSE_WITNESS_KEYS = new Set([
   "handleDigest",
   "eventCursorSequence",
   "recordedAt"
+]);
+const PRE_READY_WRITE_REQUEST_KEYS = new Set([
+  "admissionContextManifest",
+  "envelope",
+  "providerHomeId",
+  "publicObjective",
+  "roleId",
+  "spawn"
+]);
+const PRE_READY_WRITE_SPAWN_KEYS = new Set([
+  "idempotencyKeyDigest",
+  "ownerThreadId",
+  "admissionRequestDigest",
+  "successDefinition",
+  "ownershipMode",
+  "writeLifecycleCapabilityDigest",
+  "providerLaunchPending",
+  "providerLaunchInFlight",
+  "providerLaunchOutcome"
 ]);
 const CANCELLATION_RECEIPT_STATUSES = new Set([
   "accepted",
@@ -930,6 +973,18 @@ function spawnResponseWitnessBody(witness) {
   };
 }
 
+function recordSpawnRequestDigest(record) {
+  return record?.schemaVersion === WRITE_SPAWN_IDEMPOTENCY_SCHEMA_VERSION
+    ? record.admissionRequestDigest
+    : record?.requestDigest;
+}
+
+function jobSpawnRequestDigest(job) {
+  return job?.write === true && job?.executionBinding
+    ? job.request?.spawn?.admissionRequestDigest
+    : job?.request?.spawn?.requestDigest;
+}
+
 function normalizeSpawnResponseWitness(witness, { record, keyDigest }) {
   if (!isPlainRecord(witness)
     || Object.keys(witness).length !== SPAWN_RESPONSE_WITNESS_KEYS.size
@@ -942,7 +997,7 @@ function normalizeSpawnResponseWitness(witness, { record, keyDigest }) {
     || !Number.isSafeInteger(witness.responseSequence)
     || witness.responseSequence < 1
     || witness.workerId !== record.workerId
-    || witness.requestDigest !== record.requestDigest
+    || witness.requestDigest !== recordSpawnRequestDigest(record)
     || witness.idempotencyKeyDigest !== record.idempotencyKeyDigest
     || witness.idempotencyKeyDigest !== keyDigest
     || typeof witness.replayed !== "boolean"
@@ -972,7 +1027,9 @@ function normalizeSpawnIdempotencyRecord(record, { keyDigest }) {
     ? LEGACY_SPAWN_IDEMPOTENCY_KEYS
     : record.schemaVersion === SPAWN_IDEMPOTENCY_SCHEMA_VERSION
       ? SPAWN_IDEMPOTENCY_KEYS
-      : null;
+      : record.schemaVersion === WRITE_SPAWN_IDEMPOTENCY_SCHEMA_VERSION
+        ? WRITE_SPAWN_IDEMPOTENCY_KEYS
+        : null;
   if (!expectedKeys
     || Object.keys(record).length !== expectedKeys.size
     || Object.keys(record).some((key) => !expectedKeys.has(key))) {
@@ -993,14 +1050,34 @@ function normalizeSpawnIdempotencyRecord(record, { keyDigest }) {
     || !record.owner.sessionId
     || record.owner.sessionId.length > 256
     || !CONTROL_WORKSPACE_ID.test(record.controlWorkspaceId || "")
-    || typeof record.executionRoot !== "string"
+    || record.idempotencyKeyDigest !== keyDigest
+    || !validIsoTimestamp(record.committedAt)) {
+    spawnIdempotencyStateError("Spawn idempotency binding is malformed.");
+  }
+  if (record.schemaVersion === WRITE_SPAWN_IDEMPOTENCY_SCHEMA_VERSION) {
+    if (typeof record.expectedExecutionRoot !== "string"
+      || !path.isAbsolute(record.expectedExecutionRoot)
+      || path.normalize(record.expectedExecutionRoot) !== record.expectedExecutionRoot
+      || record.expectedExecutionRoot.length > 4096
+      || !SHA256_HEX.test(record.admissionRequestDigest || "")
+      || !SHA256_HEX.test(record.executionBindingDigest || "")) {
+      spawnIdempotencyStateError("Write-spawn idempotency binding is malformed.");
+    }
+    return Object.freeze({
+      ...record,
+      owner: Object.freeze({ ...record.owner }),
+      responseWitness: normalizeSpawnResponseWitness(record.responseWitness, {
+        record,
+        keyDigest
+      })
+    });
+  }
+  if (typeof record.executionRoot !== "string"
     || !path.isAbsolute(record.executionRoot)
     || path.normalize(record.executionRoot) !== record.executionRoot
     || record.executionRoot.length > 4096
     || !SHA256_HEX.test(record.requestDigest || "")
-    || !SHA256_HEX.test(record.launchContractDigest || "")
-    || record.idempotencyKeyDigest !== keyDigest
-    || !validIsoTimestamp(record.committedAt)) {
+    || !SHA256_HEX.test(record.launchContractDigest || "")) {
     spawnIdempotencyStateError("Spawn idempotency binding is malformed.");
   }
   if (record.schemaVersion === SPAWN_IDEMPOTENCY_SCHEMA_VERSION) {
@@ -1043,7 +1120,7 @@ function buildSpawnResponseWitness({
     projection: SPAWN_RESPONSE_WITNESS_PROJECTION,
     responseSequence,
     workerId: job.id,
-    requestDigest: job.request?.spawn?.requestDigest,
+    requestDigest: jobSpawnRequestDigest(job),
     idempotencyKeyDigest: keyDigest,
     replayed,
     handleDigest: stableDigest(handle),
@@ -1069,6 +1146,23 @@ function buildSpawnResponseWitness({
 }
 
 function buildSpawnIdempotencyRecord({ job, keyDigest, responseWitness }) {
+  if (job?.write === true && job?.executionBinding) {
+    return {
+      schemaVersion: WRITE_SPAWN_IDEMPOTENCY_SCHEMA_VERSION,
+      workerId: job.id,
+      owner: {
+        hostKind: job.host.kind,
+        sessionId: job.host.sessionId
+      },
+      controlWorkspaceId: job.controlWorkspaceId,
+      expectedExecutionRoot: job.executionBinding.expectedExecutionRoot,
+      admissionRequestDigest: job.request.spawn.admissionRequestDigest,
+      executionBindingDigest: job.executionBinding.bindingDigest,
+      idempotencyKeyDigest: keyDigest,
+      committedAt: job.createdAt,
+      responseWitness
+    };
+  }
   return {
     schemaVersion: SPAWN_IDEMPOTENCY_SCHEMA_VERSION,
     workerId: job.id,
@@ -1087,20 +1181,33 @@ function buildSpawnIdempotencyRecord({ job, keyDigest, responseWitness }) {
 }
 
 function assertSpawnIdempotencyJobBinding(record, job, { keyDigest, responseHandle = null }) {
+  const writeBindingMismatch = record?.schemaVersion === WRITE_SPAWN_IDEMPOTENCY_SCHEMA_VERSION
+    ? (
+      job?.write !== true
+      || record.expectedExecutionRoot !== job?.executionBinding?.expectedExecutionRoot
+      || record.admissionRequestDigest !== job?.request?.spawn?.admissionRequestDigest
+      || record.executionBindingDigest !== job?.executionBinding?.bindingDigest
+    )
+    : (
+      record.executionRoot !== job?.request?.spawn?.executionRoot
+      || record.requestDigest !== job?.request?.spawn?.requestDigest
+      || record.launchContractDigest !== launchContractDigest(job)
+    );
   if (!job
     || record.workerId !== job.id
     || record.owner.hostKind !== job.host?.kind
     || record.owner.sessionId !== job.host?.sessionId
     || record.controlWorkspaceId !== job.controlWorkspaceId
-    || record.executionRoot !== job.request?.spawn?.executionRoot
-    || record.requestDigest !== job.request?.spawn?.requestDigest
-    || record.launchContractDigest !== launchContractDigest(job)
+    || writeBindingMismatch
     || record.idempotencyKeyDigest !== job.request?.spawn?.idempotencyKeyDigest
     || record.idempotencyKeyDigest !== keyDigest
     || record.committedAt !== job.createdAt) {
     spawnIdempotencyStateError("Spawn idempotency record disagrees with its durable job.");
   }
-  if (record.schemaVersion === SPAWN_IDEMPOTENCY_SCHEMA_VERSION) {
+  if (
+    record.schemaVersion === SPAWN_IDEMPOTENCY_SCHEMA_VERSION
+    || record.schemaVersion === WRITE_SPAWN_IDEMPOTENCY_SCHEMA_VERSION
+  ) {
     const witness = normalizeSpawnResponseWitness(record.responseWitness, { record, keyDigest });
     const currentHandle = projectWorkerHandle(job, { trustHostAuthority: false });
     const currentCursorSequence = currentHandle?.eventCursor?.sequence;
@@ -1142,6 +1249,24 @@ function captureSpawnResponse({
   );
   assertSpawnIdempotencyJobBinding(record, job, { keyDigest, responseHandle: handle });
   return Object.freeze({ handle, record });
+}
+
+function nextSpawnResponseSequence(record, recordedAt = now()) {
+  const witnessed = record?.schemaVersion === SPAWN_IDEMPOTENCY_SCHEMA_VERSION
+    || record?.schemaVersion === WRITE_SPAWN_IDEMPOTENCY_SCHEMA_VERSION;
+  if (!witnessed) {
+    return Object.freeze({ responseSequence: 1, recordedAt });
+  }
+  if (record.responseWitness.responseSequence === Number.MAX_SAFE_INTEGER) {
+    spawnIdempotencyStateError("Spawn response sequence cannot be incremented safely.");
+  }
+  if (Date.parse(recordedAt) < Date.parse(record.responseWitness.recordedAt)) {
+    spawnIdempotencyStateError("Spawn response witness time moved backwards.");
+  }
+  return Object.freeze({
+    responseSequence: record.responseWitness.responseSequence + 1,
+    recordedAt
+  });
 }
 
 /**
@@ -4423,9 +4548,482 @@ export function spawnGrantedFollowupWorker({
   };
 }
 
+function writeAdmissionOwnerDigest(host) {
+  return stableDigest({
+    hostKind: host?.kind || null,
+    sessionId: host?.sessionId || null
+  });
+}
+
+function writeAdmissionRequestDigest({
+  binding,
+  idempotencyKeyDigest
+}) {
+  return stableDigest({
+    schemaVersion: 1,
+    executionBindingDigest: binding.bindingDigest,
+    idempotencyKeyDigest
+  });
+}
+
+function assertWriteExecutionJob(job, env = process.env) {
+  if (job?.write !== true
+    || !["queued", "running", "failed", "cancelled"].includes(job?.status)
+    || !SHA256_HEX.test(job?.request?.spawn?.admissionRequestDigest || "")
+    || !SHA256_HEX.test(job?.request?.spawn?.idempotencyKeyDigest || "")
+    || !SHA256_HEX.test(job?.request?.spawn?.writeLifecycleCapabilityDigest || "")
+    || job?.request?.spawn?.ownerThreadId !== job?.host?.sessionId) {
+    throw new CompanionError("E_STATE", "Write worker execution binding is malformed.");
+  }
+
+  const envelope = assertTaskEnvelope(job.request?.envelope);
+  const role = assertRoleDigest(job.role);
+  const profile = profileFor("task", true);
+  if (envelope.mode !== "write"
+    || role.id !== "implementer"
+    || role.write !== true
+    || job.request?.roleId !== role.id
+    || !sameSecurityProfile(job.profile, profile)) {
+    throw new CompanionError(
+      "E_STATE",
+      "Write worker role, envelope, or provider profile is not admission-bound."
+    );
+  }
+  const runtimeRolePolicy = buildRuntimeRolePolicy({ role, profile });
+  assertRuntimeRolePolicy(runtimeRolePolicy, { role, profile });
+  const ownerDigest = writeAdmissionOwnerDigest(job.host);
+  const binding = assertExecutionBinding(job.executionBinding, {
+    workerId: job.id,
+    controlWorkspaceId: job.controlWorkspaceId,
+    scope: envelope.scope,
+    envelopeDigest: envelope.digest,
+    roleDigest: role.digest,
+    profileDigest: stableDigest(profile),
+    runtimeRolePolicyDigest: runtimeRolePolicy.digest,
+    providerCapabilityDigest: job.request.spawn.writeLifecycleCapabilityDigest,
+    ownerDigest
+  });
+  const admissionContextManifest = assertContextCompatible(
+    binding.controlRoot,
+    job.request?.admissionContextManifest,
+    { mode: "execute" }
+  );
+  assertExecutionBinding(binding, {
+    admissionContextManifestId: admissionContextManifest.manifestId,
+    admissionContextManifestDigest: admissionContextManifest.digest
+  });
+  const journal = assertProvisioningJournal(binding, job.provisioning);
+  const expectedAdmissionDigest = writeAdmissionRequestDigest({
+    binding,
+    idempotencyKeyDigest: job.request.spawn.idempotencyKeyDigest
+  });
+  if (job.request.spawn.admissionRequestDigest !== expectedAdmissionDigest) {
+    throw new CompanionError("E_STATE", "Write worker admission digest is inconsistent.");
+  }
+  if (journal.readyAt !== null) {
+    throw new CompanionError(
+      "E_STATE",
+      "Ready write-worker replay is unsupported until atomic launch-authority promotion is installed."
+    );
+  }
+
+  const control = resolveControlWorkspace(binding.controlRoot, env);
+  if (control.executionRoot !== control.controlRoot
+    || control.controlWorkspaceId !== binding.controlWorkspaceId
+    || control.controlRoot !== binding.controlRoot
+    || control.gitCommonDir !== binding.gitCommonDir
+    || expectedWorkerWorktreeRoot(binding.controlRoot, job.id, env)
+      !== binding.expectedExecutionRoot) {
+    throw new CompanionError(
+      "E_STATE",
+      "Write execution binding no longer matches its exact control workspace."
+    );
+  }
+
+  // A ContextManifest does not bind hidden index security flags such as
+  // assume-unchanged or skip-worktree. Preserve the stronger admission-time
+  // parent fingerprint until provisioning has produced an execution root.
+  assertParentUnchanged(binding.parentFingerprint, binding.controlRoot);
+  const spawn = job.request.spawn;
+  const requestKeys = Object.keys(job.request);
+  const spawnKeys = Object.keys(spawn);
+  const forbiddenJobFields = [
+    "workerAuthorization",
+    "controllerProcess",
+    "workerProcess",
+    "providerProcess",
+    "grokSessionId"
+  ];
+  const expectedPublicObjective = envelope.objective !== envelope.userRequest
+    ? envelope.objective
+    : null;
+  if (requestKeys.length !== PRE_READY_WRITE_REQUEST_KEYS.size
+    || requestKeys.some((field) => !PRE_READY_WRITE_REQUEST_KEYS.has(field))
+    || spawnKeys.length !== PRE_READY_WRITE_SPAWN_KEYS.size
+    || spawnKeys.some((field) => !PRE_READY_WRITE_SPAWN_KEYS.has(field))
+    || job.request.providerHomeId !== job.id
+    || job.request.publicObjective !== expectedPublicObjective
+    || spawn.successDefinition !== SPAWN_SUCCESS_DEFINITION
+    || spawn.ownershipMode !== SPAWN_OWNERSHIP_MODE
+    || spawn.providerLaunchPending !== false
+    || spawn.providerLaunchInFlight !== false
+    || spawn.providerLaunchOutcome !== "not-ready"
+    || forbiddenJobFields.some((field) => Object.hasOwn(job, field))) {
+    throw new CompanionError(
+      "E_STATE",
+      "Write worker contains launch or provider authority before provisioning is ready."
+    );
+  }
+  return Object.freeze({
+    binding,
+    journal,
+    envelope,
+    role,
+    profile,
+    runtimeRolePolicy,
+    admissionContextManifest
+  });
+}
+
+function assertWriteAdmissionReplayMatches(binding, expected) {
+  try {
+    assertExecutionBinding(binding, expected);
+  } catch (error) {
+    if (error instanceof CompanionError && error.code === "E_STATE") {
+      idempotencyConflict("idempotencyKey was reused with a different write-spawn request.");
+    }
+    throw error;
+  }
+}
+
+/**
+ * Persist only a write-worker plan. This is an internal Phase 3 admission
+ * boundary: it creates no worktree and grants no dispatch or provider
+ * authority. A later fenced provisioner must promote the journal to ready.
+ */
+export function admitWriteWorkerPlan({
+  root,
+  principal,
+  envelope,
+  contextManifest = null,
+  idempotencyKey,
+  roleId = "implementer",
+  env = process.env,
+  allowWriteSpawn = false,
+  writeLifecycleCapabilityDigest = null
+} = {}) {
+  assertIdempotencyKey(idempotencyKey);
+  if (!allowWriteSpawn) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Internal broker write admission is disabled until official provisioning is enabled."
+    );
+  }
+  if (!principal?.threadId) {
+    throw new CompanionError("E_AUTH_REQUIRED", "Trusted Codex task identity is unavailable.");
+  }
+  const validatedEnvelope = assertTaskEnvelope(envelope);
+  if (validatedEnvelope.mode !== "write") {
+    throw new CompanionError("E_ROLE", "Write worker admission requires a write TaskEnvelope.");
+  }
+  const role = materializeRole(roleId);
+  if (role.id !== "implementer" || role.write !== true) {
+    throw new CompanionError(
+      "E_ROLE",
+      "Write worker admission requires the immutable implementer role."
+    );
+  }
+  assertRoleDigest(role);
+  if (!SHA256_HEX.test(writeLifecycleCapabilityDigest || "")) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "A distinct composite write-lifecycle capability binding is required for admission."
+    );
+  }
+  const profile = profileFor("task", true);
+  const runtimeRolePolicy = buildRuntimeRolePolicy({ role, profile });
+  assertRuntimeRolePolicy(runtimeRolePolicy, { role, profile });
+
+  const control = resolveControlWorkspace(root, env);
+  if (control.executionRoot !== control.controlRoot) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Write worker admission must originate from the canonical control checkout."
+    );
+  }
+  const admissionContextManifest = contextManifest
+    ? assertContextCompatible(control.controlRoot, contextManifest, { mode: "execute" })
+    : captureContextManifest(control.controlRoot);
+  if (validatedEnvelope.contextManifestId != null
+    && validatedEnvelope.contextManifestId !== admissionContextManifest.manifestId) {
+    throw new CompanionError(
+      "E_CONTEXT_DRIFT",
+      "TaskEnvelope context identity does not match the trusted control checkout."
+    );
+  }
+  const admissionEnvelope = bindTaskEnvelopeContext(
+    validatedEnvelope,
+    admissionContextManifest.manifestId
+  );
+  const requestOwner = spawnRequestOwner(principal);
+  const ownerDigest = writeAdmissionOwnerDigest({
+    kind: requestOwner.hostKind,
+    sessionId: requestOwner.sessionId
+  });
+  const keyDigest = digestKey(idempotencyKey);
+
+  const admitted = withWorkspaceStateTransaction(control.controlRoot, (transaction) => {
+    const digestOwners = transaction.listJobs().filter((candidate) => (
+      candidate.request?.spawn?.idempotencyKeyDigest === keyDigest
+    ));
+    const existing = readIdempotency(
+      control.controlRoot,
+      "spawn",
+      idempotencyKey,
+      env
+    );
+    if (existing) {
+      const record = normalizeSpawnIdempotencyRecord(existing, { keyDigest });
+      if (record.schemaVersion !== WRITE_SPAWN_IDEMPOTENCY_SCHEMA_VERSION
+        || record.owner.hostKind !== requestOwner.hostKind
+        || record.owner.sessionId !== requestOwner.sessionId
+        || record.controlWorkspaceId !== control.controlWorkspaceId) {
+        idempotencyConflict("idempotencyKey was reused with a different write-spawn owner.");
+      }
+      const committed = transaction.tryReadJob(record.workerId);
+      if (!committed || digestOwners.length !== 1 || digestOwners[0].id !== record.workerId) {
+        spawnIdempotencyStateError("Write-spawn idempotency ownership is missing or ambiguous.");
+      }
+      const verified = assertWriteExecutionJob(committed, env);
+      assertWriteAdmissionReplayMatches(verified.binding, {
+        controlRoot: control.controlRoot,
+        gitCommonDir: control.gitCommonDir,
+        scope: admissionEnvelope.scope,
+        envelopeDigest: admissionEnvelope.digest,
+        roleDigest: role.digest,
+        profileDigest: stableDigest(profile),
+        runtimeRolePolicyDigest: runtimeRolePolicy.digest,
+        admissionContextManifestId: admissionContextManifest.manifestId,
+        admissionContextManifestDigest: admissionContextManifest.digest,
+        providerCapabilityDigest: writeLifecycleCapabilityDigest,
+        ownerDigest
+      });
+      if (record.admissionRequestDigest !== committed.request.spawn.admissionRequestDigest) {
+        spawnIdempotencyStateError("Write-spawn idempotency record disagrees with its durable job.");
+      }
+      assertSpawnIdempotencyJobBinding(record, committed, { keyDigest });
+      assertMutationOwnership(committed, principal);
+      const { responseSequence, recordedAt } = nextSpawnResponseSequence(record);
+      const captured = captureSpawnResponse({
+        job: committed,
+        keyDigest,
+        replayed: true,
+        responseSequence,
+        recordedAt
+      });
+      writeIdempotency(
+        control.controlRoot,
+        "spawn",
+        idempotencyKey,
+        captured.record,
+        env
+      );
+      return Object.freeze({
+        committed,
+        handle: captured.handle,
+        replayed: true
+      });
+    }
+
+    if (digestOwners.length > 1) {
+      spawnIdempotencyStateError("Write-spawn idempotency ownership is ambiguous.");
+    }
+    const orphan = digestOwners[0] || null;
+    if (orphan) {
+      if (orphan.write !== true
+        || orphan.host?.kind !== requestOwner.hostKind
+        || orphan.host?.sessionId !== requestOwner.sessionId
+        || orphan.controlWorkspaceId !== control.controlWorkspaceId) {
+        idempotencyConflict("idempotencyKey was reused with a different write-spawn request.");
+      }
+      const verified = assertWriteExecutionJob(orphan, env);
+      assertWriteAdmissionReplayMatches(verified.binding, {
+        controlRoot: control.controlRoot,
+        gitCommonDir: control.gitCommonDir,
+        scope: admissionEnvelope.scope,
+        envelopeDigest: admissionEnvelope.digest,
+        roleDigest: role.digest,
+        profileDigest: stableDigest(profile),
+        runtimeRolePolicyDigest: runtimeRolePolicy.digest,
+        admissionContextManifestId: admissionContextManifest.manifestId,
+        admissionContextManifestDigest: admissionContextManifest.digest,
+        providerCapabilityDigest: writeLifecycleCapabilityDigest,
+        ownerDigest
+      });
+      assertMutationOwnership(orphan, principal);
+      const captured = captureSpawnResponse({
+        job: orphan,
+        keyDigest,
+        replayed: true,
+        responseSequence: 1
+      });
+      writeIdempotency(
+        control.controlRoot,
+        "spawn",
+        idempotencyKey,
+        captured.record,
+        env
+      );
+      return Object.freeze({
+        committed: orphan,
+        handle: captured.handle,
+        replayed: true
+      });
+    }
+
+    const parentFingerprint = captureParentFingerprint(control.controlRoot);
+    if (!parentFingerprint.clean) {
+      throw new CompanionError(
+        "E_WORKTREE",
+        "Write worker admission requires a completely clean control checkout."
+      );
+    }
+    assertContextCompatible(
+      control.controlRoot,
+      admissionContextManifest,
+      { mode: "execute" }
+    );
+    const id = generateId("task");
+    const createdAt = now();
+    const cancellationNonce = crypto.randomBytes(16).toString("hex");
+    const expectedExecutionRoot = expectedWorkerWorktreeRoot(
+      control.controlRoot,
+      id,
+      env
+    );
+    const binding = createExecutionBinding({
+      workerId: id,
+      controlWorkspaceId: control.controlWorkspaceId,
+      controlRoot: control.controlRoot,
+      gitCommonDir: control.gitCommonDir,
+      baseCommit: parentFingerprint.head,
+      baseTree: parentFingerprint.tree,
+      parentFingerprint,
+      expectedExecutionRoot,
+      scope: admissionEnvelope.scope,
+      envelopeDigest: admissionEnvelope.digest,
+      roleDigest: role.digest,
+      profileDigest: stableDigest(profile),
+      runtimeRolePolicyDigest: runtimeRolePolicy.digest,
+      admissionContextManifestId: admissionContextManifest.manifestId,
+      admissionContextManifestDigest: admissionContextManifest.digest,
+      providerCapabilityDigest: writeLifecycleCapabilityDigest,
+      ownerDigest,
+      cancellationNonce,
+      createdAt
+    });
+    const admissionRequestDigest = writeAdmissionRequestDigest({
+      binding,
+      idempotencyKeyDigest: keyDigest
+    });
+    const provisioning = createProvisioningJournal({
+      binding,
+      cancellationNonce,
+      createdAt
+    });
+    assertParentUnchanged(parentFingerprint, control.controlRoot);
+    const job = {
+      schemaVersion: 3,
+      id,
+      kind: "task",
+      jobClass: "task",
+      write: true,
+      status: "queued",
+      phase: "provisioning-planned",
+      summary: "Write worker provisioning planned",
+      progress: "Durable execution binding committed; no provider dispatch authority exists.",
+      createdAt,
+      updatedAt: createdAt,
+      startedAt: null,
+      completedAt: null,
+      heartbeatAt: createdAt,
+      host: ownershipHost(principal),
+      profile,
+      role: {
+        ...role,
+        tools: [...role.tools]
+      },
+      model: null,
+      effort: null,
+      controlWorkspaceId: control.controlWorkspaceId,
+      executionBinding: binding,
+      provisioning,
+      request: {
+        admissionContextManifest,
+        envelope: admissionEnvelope,
+        providerHomeId: id,
+        publicObjective: admissionEnvelope.objective !== admissionEnvelope.userRequest
+          ? admissionEnvelope.objective
+          : null,
+        roleId: role.id,
+        spawn: {
+          idempotencyKeyDigest: keyDigest,
+          ownerThreadId: principal.threadId,
+          admissionRequestDigest,
+          successDefinition: SPAWN_SUCCESS_DEFINITION,
+          ownershipMode: SPAWN_OWNERSHIP_MODE,
+          writeLifecycleCapabilityDigest,
+          providerLaunchPending: false,
+          providerLaunchInFlight: false,
+          providerLaunchOutcome: "not-ready"
+        }
+      },
+      lifecycleEvents: appendLifecycleEvent(
+        [],
+        "task.accepted",
+        "Durable write execution binding committed without launch authority.",
+        {
+          state: "provisioning-planned",
+          write: true
+        }
+      ),
+      result: null,
+      error: null
+    };
+    const committed = transaction.admitJob(job);
+    assertWriteExecutionJob(committed, env);
+    const captured = captureSpawnResponse({
+      job: committed,
+      keyDigest,
+      replayed: false,
+      responseSequence: 1
+    });
+    writeIdempotency(
+      control.controlRoot,
+      "spawn",
+      idempotencyKey,
+      captured.record,
+      env
+    );
+    return Object.freeze({
+      committed,
+      handle: captured.handle,
+      replayed: false
+    });
+  }, env);
+
+  return Object.freeze({
+    handle: admitted.handle,
+    replayed: admitted.replayed,
+    spawnSuccessDefinition: SPAWN_SUCCESS_DEFINITION,
+    providerLaunchState: "not-ready",
+    providerLaunched: false
+  });
+}
+
 /**
  * Commit a durable read-only worker job. Provider launch is intentionally not performed.
- * write:true is rejected until Phase 3 enables broker write spawn after identity redesign.
+ * write:true routes only to the internal admission-only Phase 3 plan.
  */
 export function spawnReadOnlyWorker({
   root,
@@ -4437,6 +5035,7 @@ export function spawnReadOnlyWorker({
   write = false,
   env = process.env,
   allowWriteSpawn = false,
+  writeLifecycleCapabilityDigest = null,
   providerCapabilityDigest = null,
   providerLaunch = undefined
 } = {}) {
@@ -4468,6 +5067,19 @@ export function spawnReadOnlyWorker({
       "E_CAPABILITY",
       "Broker write spawn is disabled until Phase 3 control-workspace identity and worktrees are enabled."
     );
+  }
+  if (write) {
+    return admitWriteWorkerPlan({
+      root,
+      principal,
+      envelope: validatedEnvelope,
+      contextManifest,
+      idempotencyKey,
+      roleId,
+      env,
+      allowWriteSpawn,
+      writeLifecycleCapabilityDigest
+    });
   }
 
   const role = materializeRole(roleId);
