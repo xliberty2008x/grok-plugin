@@ -20,6 +20,7 @@ import {
   captureParentFingerprint,
   assertParentUnchanged,
   createWorkerWorktree,
+  expectedWorkerWorktreeParent,
   expectedWorkerWorktreeRoot,
   assertManagedWorkerWorktree,
   buildArtifactManifest,
@@ -67,6 +68,28 @@ function principal(root) {
 function scopeFor(...include) {
   return { include, exclude: [] };
 }
+
+test("worker worktree paths use unique private parents and a fixed checkout child", () => {
+  const root = initRepo();
+  const env = envFor();
+  const control = resolveControlWorkspace(root, env);
+  const worktrees = path.join(controlStateDir(control, env), "worktrees");
+  const firstId = "task-private-parent-0001";
+  const secondId = "task-private-parent-0002";
+  const firstParent = expectedWorkerWorktreeParent(root, firstId, env);
+  const secondParent = expectedWorkerWorktreeParent(root, secondId, env);
+  const firstRoot = expectedWorkerWorktreeRoot(root, firstId, env);
+  const secondRoot = expectedWorkerWorktreeRoot(root, secondId, env);
+
+  assert.equal(path.dirname(firstParent), worktrees);
+  assert.equal(path.dirname(secondParent), worktrees);
+  assert.notEqual(firstParent, secondParent);
+  assert.equal(firstRoot, path.join(firstParent, "checkout"));
+  assert.equal(secondRoot, path.join(secondParent, "checkout"));
+  assert.equal(path.basename(firstRoot), "checkout");
+  assert.equal(path.basename(secondRoot), "checkout");
+  assert.notEqual(path.dirname(firstRoot), path.dirname(secondRoot));
+});
 
 /**
  * Create a real linked git worktree sibling of the primary repo.
@@ -1595,7 +1618,10 @@ test("artifact validation binds untracked content and rejects escaping symlinks 
     (error) => error?.code === "E_WORKTREE"
   );
   assert.ok(fs.existsSync(path.join(victim, "important.txt")));
-  const unregistered = path.join(path.dirname(worktree.executionRoot), "not-a-worktree");
+  const unregistered = path.join(
+    path.dirname(path.dirname(worktree.executionRoot)),
+    "not-a-worktree"
+  );
   fs.mkdirSync(unregistered);
   fs.writeFileSync(path.join(unregistered, "important.txt"), "keep\n");
   assert.throws(

@@ -239,6 +239,10 @@ test("happy provisioning sequence reaches ready with exact execution context", (
   assert.match(ready.executionContextManifestId, /^ctx-[a-f0-9]{24}$/);
   assert.equal(assertProvisioningJournal(binding, ready), ready);
   assert.equal(transitionProvisioningJournal(binding, ready, { state: "ready" }), ready);
+  assertStateError(() => transition(binding, provisioning, {
+    ...readyPatch(),
+    readyAt: "2026-07-24T12:00:32.001Z"
+  }));
 });
 
 test("planned cancellation can clean without creating a provisioning attempt", () => {

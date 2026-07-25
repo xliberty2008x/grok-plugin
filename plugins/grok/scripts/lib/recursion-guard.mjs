@@ -5,8 +5,13 @@ import path from "node:path";
 import process from "node:process";
 
 import { CompanionError } from "./errors.mjs";
+import { assertExecutableAttestation } from "./executable-identity.mjs";
 import { identityMatches, processGroupAlive } from "./process-control.mjs";
 import { withWorkspaceStateTransaction } from "./state.mjs";
+import {
+  assertExecutionBinding,
+  assertProvisioningJournal
+} from "./worker-execution-binding.mjs";
 import {
   gitCommonDir,
   listedWorktreeRoots,
@@ -15,9 +20,122 @@ import {
 
 const ROOT = path.join(os.tmpdir(), `grok-companion-guards-${typeof process.getuid === "function" ? process.getuid() : "user"}`);
 const SHA256_HEX = /^[0-9a-f]{64}$/;
+const EXACT_NONCE_ID = /^[0-9a-f]{32}$/;
+const OPAQUE_ID = /^[0-9a-f]{32,64}$/;
+const WORKTREE_PROVISIONING_PURPOSE = "worktree-provisioning";
+const WORKTREE_PROVISIONING_RUNTIME_KEYS = new Set([
+  "schemaVersion",
+  "intent",
+  "activatedJournalDigest",
+  "activationDigest",
+  "officialReceipt",
+  "executionContextManifest",
+  "executionContextManifestRecordDigest",
+  "cleanupProof"
+]);
+const WORKTREE_PROVISIONING_INTENT_KEYS = new Set([
+  "schemaVersion",
+  "purpose",
+  "workerId",
+  "intentId",
+  "providerSpawnIntentId",
+  "operationId",
+  "executionBindingDigest",
+  "expectedPlannedJournalDigest",
+  "provisioningAttemptId",
+  "provisioningFence",
+  "holderId",
+  "executableIdentity",
+  "status",
+  "processIdentity",
+  "preparedAt",
+  "activatedAt",
+  "registeredAt",
+  "settledAt",
+  "noChildAt",
+  "resolution",
+  "updatedAt",
+  "intentDigest"
+]);
+const WORKTREE_PROVISIONING_PROCESS_KEYS = new Set([
+  "pid",
+  "startToken",
+  "processGroupId"
+]);
+const PRE_READY_WRITE_REQUEST_KEYS = new Set([
+  "admissionContextManifest",
+  "envelope",
+  "providerHomeId",
+  "publicObjective",
+  "roleId",
+  "spawn"
+]);
+const PRE_READY_WRITE_SPAWN_KEYS = new Set([
+  "idempotencyKeyDigest",
+  "ownerThreadId",
+  "admissionRequestDigest",
+  "successDefinition",
+  "ownershipMode",
+  "writeLifecycleCapabilityDigest",
+  "providerLaunchPending",
+  "providerLaunchInFlight",
+  "providerLaunchOutcome"
+]);
+const WORKTREE_PROVISIONING_JOB_KEYS = new Set([
+  "schemaVersion",
+  "id",
+  "kind",
+  "jobClass",
+  "write",
+  "status",
+  "phase",
+  "summary",
+  "progress",
+  "createdAt",
+  "updatedAt",
+  "startedAt",
+  "completedAt",
+  "heartbeatAt",
+  "host",
+  "profile",
+  "role",
+  "model",
+  "effort",
+  "controlWorkspaceId",
+  "executionBinding",
+  "provisioning",
+  "provisioningRuntime",
+  "request",
+  "lifecycleEvents",
+  "result",
+  "error"
+]);
 
 function digest(value) {
   return crypto.createHash("sha256").update(String(value)).digest("hex");
+}
+
+function canonicalize(value, stack = new Set()) {
+  if (value === null || typeof value !== "object") return value;
+  if (stack.has(value)) {
+    throw new CompanionError("E_PROCESS_IDENTITY", "Provisioning guard evidence must not be cyclic.");
+  }
+  stack.add(value);
+  let result;
+  if (Array.isArray(value)) {
+    result = value.map((item) => canonicalize(item, stack));
+  } else {
+    result = {};
+    for (const key of Object.keys(value).sort()) {
+      if (value[key] !== undefined) result[key] = canonicalize(value[key], stack);
+    }
+  }
+  stack.delete(value);
+  return result;
+}
+
+function stableDigest(value) {
+  return digest(JSON.stringify(canonicalize(value)));
 }
 
 function markerName(marker) {
@@ -90,6 +208,30 @@ function completeProviderProcess(identity) {
       : identity.processGroupId === identity.pid);
 }
 
+function canonicalTimestamp(value) {
+  if (typeof value !== "string" || !value) return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
+function completeWorktreeProvisioningProcess(identity) {
+  return completeProviderProcess(identity)
+    && exactKeys(identity, WORKTREE_PROVISIONING_PROCESS_KEYS)
+    && Number.isSafeInteger(identity.pid)
+    && identity.pid <= 2_147_483_647
+    && identity.startToken.trim() === identity.startToken
+    && !identity.startToken.includes("\0")
+    && identity.startToken !== "[REDACTED]";
+}
+
+function sameWorktreeProvisioningProcess(left, right) {
+  return completeWorktreeProvisioningProcess(left)
+    && completeWorktreeProvisioningProcess(right)
+    && left.pid === right.pid
+    && left.startToken === right.startToken
+    && left.processGroupId === right.processGroupId;
+}
+
 function normalizeProviderGuardBinding(workspaceRoot, marker, binding, env) {
   const legacyKeys = new Set([
     "controlWorkspaceId",
@@ -138,6 +280,249 @@ function normalizeProviderGuardBinding(workspaceRoot, marker, binding, env) {
       ? { executionBindingDigest: binding.executionBindingDigest }
       : {})
   });
+}
+
+function normalizeWorktreeProvisioningGuardBinding(workspaceRoot, marker, binding, env) {
+  const keys = new Set([
+    "purpose",
+    "controlWorkspaceId",
+    "controlRoot",
+    "expectedExecutionRoot",
+    "executionBindingDigest",
+    "provisioningAttemptId",
+    "provisioningFence",
+    "holderId",
+    "providerSpawnIntentId"
+  ]);
+  if (!exactKeys(binding, keys)) {
+    throw new CompanionError("E_PROCESS_IDENTITY", "Worktree provisioning guard binding is malformed.");
+  }
+  let callerRoot;
+  let control;
+  try {
+    callerRoot = fs.realpathSync(workspaceRoot);
+    control = resolveControlWorkspace(callerRoot, env);
+  } catch {
+    throw new CompanionError("E_PROCESS_IDENTITY", "Worktree provisioning control root is unavailable.");
+  }
+  if (binding.purpose !== WORKTREE_PROVISIONING_PURPOSE
+    || binding.controlWorkspaceId !== control.controlWorkspaceId
+    || binding.controlRoot !== callerRoot
+    || binding.controlRoot !== control.controlRoot
+    || typeof binding.expectedExecutionRoot !== "string"
+    || !path.isAbsolute(binding.expectedExecutionRoot)
+    || path.normalize(binding.expectedExecutionRoot) !== binding.expectedExecutionRoot
+    || binding.expectedExecutionRoot.length > 4_096
+    || binding.expectedExecutionRoot === binding.controlRoot
+    || !SHA256_HEX.test(binding.executionBindingDigest || "")
+    || !EXACT_NONCE_ID.test(binding.provisioningAttemptId || "")
+    || !Number.isSafeInteger(binding.provisioningFence)
+    || binding.provisioningFence < 1
+    || !OPAQUE_ID.test(binding.holderId || "")
+    || !EXACT_NONCE_ID.test(binding.providerSpawnIntentId || "")
+    || !markerName(marker)) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Worktree provisioning guard is not exactly bound to its control workspace and fenced attempt."
+    );
+  }
+  return Object.freeze({ ...binding });
+}
+
+function worktreeProvisioningIntentDigestBody(intent) {
+  return {
+    schemaVersion: intent.schemaVersion,
+    purpose: intent.purpose,
+    workerId: intent.workerId,
+    intentId: intent.intentId,
+    providerSpawnIntentId: intent.providerSpawnIntentId,
+    operationId: intent.operationId,
+    executionBindingDigest: intent.executionBindingDigest,
+    expectedPlannedJournalDigest: intent.expectedPlannedJournalDigest,
+    provisioningAttemptId: intent.provisioningAttemptId,
+    provisioningFence: intent.provisioningFence,
+    holderId: intent.holderId,
+    executableIdentity: intent.executableIdentity,
+    preparedAt: intent.preparedAt
+  };
+}
+
+function validExecutableAttestation(value) {
+  try {
+    assertExecutableAttestation(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function worktreeProvisioningActivationDigest(runtime) {
+  return stableDigest({
+    schemaVersion: 1,
+    intentDigest: runtime.intent.intentDigest,
+    providerSpawnIntentId: runtime.intent.providerSpawnIntentId,
+    processIdentity: runtime.intent.processIdentity,
+    executableIdentityDigest: runtime.intent.executableIdentity.identityDigest,
+    activatedAt: runtime.intent.activatedAt,
+    activatedJournalDigest: runtime.activatedJournalDigest
+  });
+}
+
+function assertCanonicalWorktreeProvisioningState(
+  job,
+  guard,
+  allowedStatuses = ["pending", "registered"]
+) {
+  const binding = assertExecutionBinding(job?.executionBinding, {
+    workerId: job?.id,
+    controlWorkspaceId: guard.controlWorkspaceId,
+    controlRoot: guard.controlRoot,
+    expectedExecutionRoot: guard.expectedExecutionRoot,
+    bindingDigest: guard.executionBindingDigest
+  });
+  const journal = assertProvisioningJournal(binding, job?.provisioning);
+  const runtime = job?.provisioningRuntime;
+  const intent = runtime?.intent;
+  const processIdentity = intent?.processIdentity;
+  const operationIdValid = typeof intent?.operationId === "string"
+    && intent.operationId.length > 0
+    && intent.operationId.length <= 128
+    && intent.operationId.trim() === intent.operationId
+    && !/[\u0000-\u001f\u007f]/u.test(intent.operationId);
+  const timestampsValid = canonicalTimestamp(intent?.preparedAt)
+    && canonicalTimestamp(intent?.activatedAt)
+    && canonicalTimestamp(intent?.updatedAt)
+    && Date.parse(intent.preparedAt) >= Date.parse(binding.createdAt)
+    && Date.parse(intent.activatedAt) >= Date.parse(intent.preparedAt)
+    && Date.parse(intent.updatedAt) >= Date.parse(intent.activatedAt)
+    && (
+      intent.status === "pending"
+        ? intent.registeredAt === null
+        : canonicalTimestamp(intent.registeredAt)
+          && Date.parse(intent.registeredAt) >= Date.parse(intent.activatedAt)
+          && Date.parse(intent.updatedAt) >= Date.parse(intent.registeredAt)
+    );
+  const canonical = exactKeys(job, WORKTREE_PROVISIONING_JOB_KEYS)
+    && job.schemaVersion === 3
+    && job.kind === "task"
+    && job.jobClass === "task"
+    && job.write === true
+    && job.status === "queued"
+    && job.phase === "worktree-provisioning"
+    && job.controlWorkspaceId === guard.controlWorkspaceId
+    && job.startedAt === null
+    && job.completedAt === null
+    && job.result === null
+    && job.error === null
+    && exactKeys(job.request, PRE_READY_WRITE_REQUEST_KEYS)
+    && job.request.providerHomeId === job.id
+    && job.request.roleId === "implementer"
+    && exactKeys(job.request.spawn, PRE_READY_WRITE_SPAWN_KEYS)
+    && job.request.spawn.ownerThreadId === job.host?.sessionId
+    && job.request.spawn.providerLaunchPending === false
+    && job.request.spawn.providerLaunchInFlight === false
+    && job.request.spawn.providerLaunchOutcome === "not-ready"
+    && !Object.hasOwn(job.request.spawn, "dispatch")
+    && !Object.hasOwn(job, "workerAuthorization")
+    && !Object.hasOwn(job, "controllerProcess")
+    && !Object.hasOwn(job, "workerProcess")
+    && !Object.hasOwn(job, "providerProcess")
+    && !Object.hasOwn(job, "grokSessionId")
+    && journal.state === "provisioning"
+    && journal.bindingDigest === binding.bindingDigest
+    && journal.attemptId === guard.provisioningAttemptId
+    && journal.fence === guard.provisioningFence
+    && journal.provisioner?.pid === guard.providerProcess.pid
+    && journal.provisioner?.startToken === guard.providerProcess.startToken
+    && journal.provisioner?.holderId === guard.holderId
+    && exactKeys(runtime, WORKTREE_PROVISIONING_RUNTIME_KEYS)
+    && runtime.schemaVersion === 1
+    && exactKeys(intent, WORKTREE_PROVISIONING_INTENT_KEYS)
+    && intent.schemaVersion === 1
+    && intent.purpose === WORKTREE_PROVISIONING_PURPOSE
+    && intent.workerId === job.id
+    && intent.intentId === guard.providerSpawnIntentId
+    && intent.providerSpawnIntentId === intent.intentId
+    && intent.executionBindingDigest === binding.bindingDigest
+    && intent.expectedPlannedJournalDigest === journal.previousJournalDigest
+    && intent.provisioningAttemptId === journal.attemptId
+    && intent.provisioningFence === journal.fence
+    && intent.holderId === journal.provisioner.holderId
+    && validExecutableAttestation(intent.executableIdentity)
+    && allowedStatuses.includes(intent.status)
+    && intent.settledAt === null
+    && intent.noChildAt === null
+    && intent.resolution === null
+    && operationIdValid
+    && timestampsValid
+    && completeWorktreeProvisioningProcess(processIdentity)
+    && sameWorktreeProvisioningProcess(processIdentity, guard.providerProcess)
+    && intent.intentDigest === stableDigest(worktreeProvisioningIntentDigestBody(intent))
+    && runtime.activatedJournalDigest === journal.journalDigest
+    && runtime.activationDigest === worktreeProvisioningActivationDigest(runtime)
+    && runtime.officialReceipt === null
+    && runtime.executionContextManifest === null
+    && runtime.executionContextManifestRecordDigest === null
+    && runtime.cleanupProof === null;
+  if (!canonical) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Worktree provisioning durable state is not canonical or exposes premature authority."
+    );
+  }
+  return Object.freeze({ binding, journal, runtime, intent });
+}
+
+function provisioningRuntimeIntent(job) {
+  try {
+    return assertCanonicalWorktreeProvisioningState(
+      job,
+      {
+        controlWorkspaceId: job?.controlWorkspaceId,
+        controlRoot: job?.executionBinding?.controlRoot,
+        expectedExecutionRoot: job?.executionBinding?.expectedExecutionRoot,
+        executionBindingDigest: job?.executionBinding?.bindingDigest,
+        provisioningAttemptId: job?.provisioning?.attemptId,
+        provisioningFence: job?.provisioning?.fence,
+        holderId: job?.provisioning?.provisioner?.holderId,
+        providerSpawnIntentId: job?.provisioningRuntime?.intent?.providerSpawnIntentId,
+        providerProcess: job?.provisioningRuntime?.intent?.processIdentity
+      }
+    ).intent;
+  } catch {
+    return null;
+  }
+}
+
+function worktreeProvisioningIntentMatches(job, binding, allowedStatuses = ["pending", "registered"]) {
+  try {
+    assertCanonicalWorktreeProvisioningState(job, binding, allowedStatuses);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function registeredProvisioningRuntime(latest, binding, registeredAt) {
+  const verified = assertCanonicalWorktreeProvisioningState(
+    latest,
+    binding,
+    ["pending"]
+  );
+  const next = {
+    ...latest,
+    provisioningRuntime: {
+      ...verified.runtime,
+      intent: {
+        ...verified.intent,
+        status: "registered",
+        registeredAt,
+        updatedAt: registeredAt
+      }
+    }
+  };
+  assertCanonicalWorktreeProvisioningState(next, binding, ["registered"]);
+  return next;
 }
 
 function atomicJson(file, value) {
@@ -362,6 +747,123 @@ export function registerProviderGuard(
   }, env);
 }
 
+/**
+ * Publish the distinct provider-bootstrap guard used while a write worker is
+ * still provisioning its execution worktree. This path is authorized by the
+ * fenced provisioning journal and its dedicated durable intent, never by a
+ * synthetic worker dispatch.
+ */
+export function registerWorktreeProvisioningGuard(
+  workspaceRoot,
+  marker,
+  providerProcess,
+  owner,
+  binding,
+  env = process.env
+) {
+  if (!completeProviderProcess(providerProcess)
+    || typeof owner !== "string"
+    || !owner
+    || owner.length > 256) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Worktree provisioning guard requires a complete provider identity."
+    );
+  }
+  const normalized = normalizeWorktreeProvisioningGuardBinding(
+    workspaceRoot,
+    marker,
+    binding,
+    env
+  );
+  const record = {
+    schemaVersion: 5,
+    marker: markerName(marker),
+    owner: ownerDigest(owner),
+    identityKind: "provider",
+    launcherKind: "node-bootstrap-v1",
+    purpose: WORKTREE_PROVISIONING_PURPOSE,
+    providerProcess,
+    controlWorkspaceId: normalized.controlWorkspaceId,
+    controlRoot: normalized.controlRoot,
+    expectedExecutionRoot: normalized.expectedExecutionRoot,
+    executionBindingDigest: normalized.executionBindingDigest,
+    provisioningAttemptId: normalized.provisioningAttemptId,
+    provisioningFence: normalized.provisioningFence,
+    holderId: normalized.holderId,
+    providerSpawnIntentId: normalized.providerSpawnIntentId,
+    createdAt: new Date().toISOString()
+  };
+  return withWorkspaceStateTransaction(workspaceRoot, (transaction) => {
+    const job = transaction.tryReadJob(String(marker));
+    if (!job) throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+    try {
+      assertWorktreeProvisioningGuardForJob(workspaceRoot, job, record, {
+        expectedBinding: normalized,
+        env
+      });
+    } catch {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "Worktree provisioning guard no longer matches its durable fenced authorization."
+      );
+    }
+
+    let existing;
+    try { existing = loadProviderGuard(workspaceRoot, marker); }
+    catch {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "Existing provider guard aliases are malformed or conflicting."
+      );
+    }
+    if (existing) {
+      let authenticated;
+      try {
+        authenticated = assertWorktreeProvisioningGuardForJob(
+          workspaceRoot,
+          job,
+          existing,
+          { expectedBinding: normalized, env }
+        );
+      } catch {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "Existing worktree provisioning guard does not match the durable authorization."
+        );
+      }
+      if (!sameGuardProcessIdentity(authenticated.providerProcess, providerProcess)) {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "A different provider identity already owns this provisioning attempt."
+        );
+      }
+      if (provisioningRuntimeIntent(job)?.status === "pending") {
+        const registeredAt = new Date().toISOString();
+        transaction.updateJob(
+          String(marker),
+          (latest) => registeredProvisioningRuntime(latest, record, registeredAt)
+        );
+      }
+      return authenticated;
+    }
+
+    atomicJson(guardFile(workspaceRoot, marker), record);
+    try {
+      const registeredAt = new Date().toISOString();
+      transaction.updateJob(
+        String(marker),
+        (latest) => registeredProvisioningRuntime(latest, record, registeredAt)
+      );
+    } catch (error) {
+      try { unregisterProviderGuardInWorkspaceTransaction(workspaceRoot, marker, record); }
+      catch { /* Preserve the primary authorization failure. */ }
+      throw error;
+    }
+    return record;
+  }, env);
+}
+
 function guardChangedBeforeDelete() {
   return new CompanionError(
     "E_PROCESS_IDENTITY",
@@ -532,6 +1034,156 @@ export function assertProviderGuardForJob(workspaceRoot, job, record, {
     throw new CompanionError("E_PROCESS_IDENTITY", "Provider guard is not bound to the durable worker dispatch.");
   }
   return record;
+}
+
+/**
+ * Authenticate the schema-5 guard used only for the pre-dispatch worktree
+ * provisioning phase. The expected execution root need not exist yet, so its
+ * authority comes from the immutable execution binding plus the active fenced
+ * provisioning journal.
+ */
+export function assertWorktreeProvisioningGuardForJob(
+  workspaceRoot,
+  job,
+  record,
+  {
+    expectedBinding = null,
+    env = process.env
+  } = {}
+) {
+  if (record == null) return null;
+  const guardKeys = new Set([
+    "schemaVersion",
+    "marker",
+    "owner",
+    "identityKind",
+    "launcherKind",
+    "purpose",
+    "providerProcess",
+    "controlWorkspaceId",
+    "controlRoot",
+    "expectedExecutionRoot",
+    "executionBindingDigest",
+    "provisioningAttemptId",
+    "provisioningFence",
+    "holderId",
+    "providerSpawnIntentId",
+    "createdAt"
+  ]);
+  let callerControl;
+  let guardedControl;
+  try {
+    callerControl = resolveControlWorkspace(workspaceRoot, env);
+    guardedControl = resolveControlWorkspace(record?.controlRoot, env);
+  } catch {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Worktree provisioning guard control workspace is unavailable."
+    );
+  }
+  const executionBinding = isPlainRecord(job?.executionBinding)
+    ? job.executionBinding
+    : {};
+  const provisioning = isPlainRecord(job?.provisioning)
+    ? job.provisioning
+    : {};
+  const provisioner = isPlainRecord(provisioning.provisioner)
+    ? provisioning.provisioner
+    : {};
+  const expectedMatches = expectedBinding == null || (
+    record.purpose === expectedBinding.purpose
+    && record.controlWorkspaceId === expectedBinding.controlWorkspaceId
+    && record.controlRoot === expectedBinding.controlRoot
+    && record.expectedExecutionRoot === expectedBinding.expectedExecutionRoot
+    && record.executionBindingDigest === expectedBinding.executionBindingDigest
+    && record.provisioningAttemptId === expectedBinding.provisioningAttemptId
+    && record.provisioningFence === expectedBinding.provisioningFence
+    && record.holderId === expectedBinding.holderId
+    && record.providerSpawnIntentId === expectedBinding.providerSpawnIntentId
+  );
+  const valid = record.schemaVersion === 5
+    && exactKeys(record, guardKeys)
+    && record.marker === markerName(job?.id)
+    && record.owner === ownerDigest(job?.host?.sessionId)
+    && record.identityKind === "provider"
+    && record.launcherKind === "node-bootstrap-v1"
+    && record.purpose === WORKTREE_PROVISIONING_PURPOSE
+    && completeProviderProcess(record.providerProcess)
+    && job?.write === true
+    && job.status === "queued"
+    && job.controlWorkspaceId === record.controlWorkspaceId
+    && executionBinding.workerId === job?.id
+    && executionBinding.controlWorkspaceId === record.controlWorkspaceId
+    && executionBinding.controlRoot === record.controlRoot
+    && executionBinding.expectedExecutionRoot === record.expectedExecutionRoot
+    && executionBinding.bindingDigest === record.executionBindingDigest
+    && SHA256_HEX.test(record.executionBindingDigest || "")
+    && provisioning.state === "provisioning"
+    && provisioning.bindingDigest === record.executionBindingDigest
+    && provisioning.attemptId === record.provisioningAttemptId
+    && provisioning.fence === record.provisioningFence
+    && provisioner.pid === record.providerProcess.pid
+    && provisioner.startToken === record.providerProcess.startToken
+    && provisioner.holderId === record.holderId
+    && worktreeProvisioningIntentMatches(job, record)
+    && callerControl.controlWorkspaceId === record.controlWorkspaceId
+    && callerControl.controlRoot === record.controlRoot
+    && guardedControl.controlWorkspaceId === record.controlWorkspaceId
+    && guardedControl.controlRoot === record.controlRoot
+    && guardedControl.executionRoot === record.controlRoot
+    && typeof record.expectedExecutionRoot === "string"
+    && path.isAbsolute(record.expectedExecutionRoot)
+    && path.normalize(record.expectedExecutionRoot) === record.expectedExecutionRoot
+    && record.expectedExecutionRoot !== record.controlRoot
+    && EXACT_NONCE_ID.test(record.provisioningAttemptId || "")
+    && Number.isSafeInteger(record.provisioningFence)
+    && record.provisioningFence > 0
+    && OPAQUE_ID.test(record.holderId || "")
+    && EXACT_NONCE_ID.test(record.providerSpawnIntentId || "")
+    && expectedMatches
+    && typeof record.createdAt === "string"
+    && Number.isFinite(Date.parse(record.createdAt));
+  if (!valid) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Worktree provisioning guard is not bound to the durable fenced provisioning attempt."
+    );
+  }
+  return record;
+}
+
+/** Authenticate the exact worktree-provisioning bootstrap before ACP exists. */
+export function authenticateWorktreeProvisioningBootstrapGuard(
+  workspaceRoot,
+  marker,
+  providerProcess,
+  binding,
+  env = process.env
+) {
+  const normalized = normalizeWorktreeProvisioningGuardBinding(
+    workspaceRoot,
+    marker,
+    binding,
+    env
+  );
+  return withWorkspaceStateTransaction(workspaceRoot, (transaction) => {
+    const job = transaction.tryReadJob(String(marker));
+    if (!job) throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+    const guard = loadProviderGuard(workspaceRoot, marker);
+    const authenticated = assertWorktreeProvisioningGuardForJob(
+      workspaceRoot,
+      job,
+      guard,
+      { expectedBinding: normalized, env }
+    );
+    if (!sameGuardProcessIdentity(authenticated?.providerProcess, providerProcess)) {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "Worktree provisioning bootstrap guard does not match the exact spawned process and intent."
+      );
+    }
+    return authenticated;
+  }, env);
 }
 
 /** Authenticate the exact bootstrap guard and durable intent under one lock. */

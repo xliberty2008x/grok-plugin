@@ -19,11 +19,18 @@ import {
 import { projectWorkerSnapshot } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
 import {
   admitWriteWorkerPlan,
+  activateWriteProvisioningAttempt,
   assertDurableSpawnRequestBinding,
+  assertWriteExecutionJob,
   cancelWorker,
   claimWorkerDispatch,
   assertDispatchContract,
+  prepareWriteProvisionerIntent,
   prepareDispatchProcessSpawn,
+  promoteWriteWorkerReady,
+  recordOfficialWorktreeReceipt,
+  recordWriteProvisionerNoChild,
+  retainWriteProvisioningCleanupPending,
   spawnReadOnlyWorker,
   SPAWN_SUCCESS_DEFINITION
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
@@ -50,6 +57,7 @@ import {
   SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
 } from "../plugins/grok/scripts/lib/provider-capability.mjs";
 import { processGroupGone, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
+import { createExecutableAttestation } from "../plugins/grok/scripts/lib/executable-identity.mjs";
 import {
   loadProviderGuard,
   registerProviderGuard,
@@ -68,6 +76,9 @@ import {
   workspaceState,
   workspaceStateSegment
 } from "../plugins/grok/scripts/lib/workspace.mjs";
+import {
+  createWorkerWorktree
+} from "../plugins/grok/scripts/lib/worker-worktree.mjs";
 import { git, initRepo, tempDir, waitFor } from "./helpers.mjs";
 
 const THREAD = "019f666a-6469-7cc1-9a8d-8c1adf61e103";
@@ -75,6 +86,27 @@ const THREAD_B = "019f666b-1e72-74b1-b27c-9d186d7f1016";
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const MUTATION_MODULE = new URL("../plugins/grok/scripts/lib/worker-mutation.mjs", import.meta.url).href;
 const TASK_CONTRACT_MODULE = new URL("../plugins/grok/scripts/lib/task-contract.mjs", import.meta.url).href;
+const TEST_EXECUTABLE_IDENTITY = createExecutableAttestation({
+  canonicalPath: "/private/test/grok",
+  device: "1",
+  inode: "2",
+  mode: 0o100755,
+  size: 4096,
+  executableDigest: "1".repeat(64)
+}, {
+  releaseSource: "official-package-pin-v1",
+  packageName: "@xai-official/grok",
+  packageVersion: "0.2.112",
+  packageGitHead: "9".repeat(40),
+  packageIntegrityDigest: "3".repeat(64),
+  platform: process.platform,
+  arch: process.arch,
+  version: "0.2.112",
+  buildCommit: "9bbd559437aa",
+  channel: "stable",
+  size: 4096,
+  executableDigest: "1".repeat(64)
+});
 
 function runIsolatedModule(source) {
   return new Promise((resolve, reject) => {
@@ -169,6 +201,126 @@ function providerGuardFile(root, marker) {
     `grok-companion-guards-${typeof process.getuid === "function" ? process.getuid() : "user"}`
   );
   return path.join(guardRoot, scopeDigest, `${marker}.json`);
+}
+
+function plannedWriteProvisioningFixture(label) {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const envelope = buildTaskEnvelope({
+    userRequest: `Provision bounded write ${label}`,
+    mode: "write",
+    scope: { include: ["tracked.txt"], exclude: [] }
+  });
+  const admitted = admitWriteWorkerPlan({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey: `write-provisioning-${label}-0001`,
+    roleId: "implementer",
+    allowWriteSpawn: true,
+    writeLifecycleCapabilityDigest: "c".repeat(64),
+    env
+  });
+  const job = tryReadJob(root, admitted.handle.id, env);
+  return {
+    root,
+    env,
+    envelope,
+    workerId: job.id,
+    binding: job.executionBinding,
+    journal: job.provisioning,
+    actor: {
+      attemptId: "a".repeat(32),
+      fence: 1,
+      holderId: "b".repeat(32),
+      executableIdentity: TEST_EXECUTABLE_IDENTITY
+    }
+  };
+}
+
+async function detachedProvisioner(t, workerId) {
+  const child = spawnProcess(
+    process.execPath,
+    ["-e", "setInterval(() => {}, 1000)", workerId, "worktree-provisioning"],
+    { detached: true, stdio: "ignore" }
+  );
+  const identity = {
+    pid: child.pid,
+    startToken: await waitFor(() => processStartToken(child.pid), {
+      timeoutMs: 5_000,
+      intervalMs: 25
+    }),
+    processGroupId: child.pid
+  };
+  t.after(async () => {
+    try { process.kill(-child.pid, "SIGKILL"); } catch {}
+    try {
+      await waitFor(() => processGroupGone(identity), {
+        timeoutMs: 5_000,
+        intervalMs: 25
+      });
+    } catch {}
+  });
+  return { child, identity };
+}
+
+function prepareProvisioningIntent(fixture) {
+  return prepareWriteProvisionerIntent({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: fixture.journal.journalDigest,
+    ...fixture.actor,
+    env: fixture.env
+  });
+}
+
+async function activateRegisteredProvisioning(t, fixture) {
+  const prepared = prepareProvisioningIntent(fixture);
+  const { child, identity } = await detachedProvisioner(t, fixture.workerId);
+  const provisioningAt = new Date(
+    Math.max(Date.now(), Date.parse(prepared.intent.preparedAt) + 1)
+  ).toISOString();
+  const leaseExpiresAt = new Date(Date.parse(provisioningAt) + 60_000).toISOString();
+  const activated = activateWriteProvisioningAttempt({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: fixture.journal.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: prepared.intent.intentId,
+    processIdentity: identity,
+    provisioningAt,
+    leaseExpiresAt,
+    env: fixture.env
+  });
+  const registeredAt = new Date(
+    Math.max(Date.now(), Date.parse(provisioningAt) + 1)
+  ).toISOString();
+  updateJob(fixture.root, fixture.workerId, (job) => ({
+    ...job,
+    provisioningRuntime: {
+      ...job.provisioningRuntime,
+      intent: {
+        ...job.provisioningRuntime.intent,
+        status: "registered",
+        registeredAt,
+        updatedAt: registeredAt
+      }
+    }
+  }), fixture.env);
+  const registered = tryReadJob(fixture.root, fixture.workerId, fixture.env);
+  assert.doesNotThrow(() => assertWriteExecutionJob(registered, fixture.env));
+  return {
+    prepared,
+    child,
+    identity,
+    activated,
+    registered,
+    registeredAt
+  };
 }
 
 test("spawn commits durable job without provider launch; retry is idempotent", () => {
@@ -1079,6 +1231,1081 @@ test("write spawn is rejected until allowWriteSpawn is enabled", () => {
   );
 });
 
+test("write provisioner intent is private, idempotent, fenced, and exactly settles without a child", () => {
+  const fixture = plannedWriteProvisioningFixture("intent-no-child");
+  const prepared = prepareProvisioningIntent(fixture);
+  assert.equal(prepared.prepared, true);
+  assert.equal(prepared.replayed, false);
+  assert.equal(prepared.intent.status, "pending");
+  assert.equal(prepared.intent.intentId, prepared.intent.providerSpawnIntentId);
+  assert.match(prepared.intent.intentId, /^[a-f0-9]{32}$/);
+  assert.equal(prepared.intent.executionBindingDigest, fixture.binding.bindingDigest);
+  assert.equal(prepared.intent.expectedPlannedJournalDigest, fixture.journal.journalDigest);
+  assert.equal(prepared.intent.processIdentity, null);
+
+  const pending = tryReadJob(fixture.root, fixture.workerId, fixture.env);
+  assert.equal(pending.phase, "provisioning-intent-prepared");
+  assert.equal(pending.provisioning.state, "planned");
+  assert.equal(pending.provisioningRuntime.intent.intentId, prepared.intent.intentId);
+  assert.equal(Object.hasOwn(pending.request.spawn, "providerSpawnIntent"), false);
+  assert.equal(Object.hasOwn(pending.request.spawn, "dispatch"), false);
+  assert.equal(Object.hasOwn(pending, "workerAuthorization"), false);
+  assert.doesNotThrow(() => assertWriteExecutionJob(pending, fixture.env));
+
+  const replay = prepareProvisioningIntent(fixture);
+  assert.equal(replay.prepared, false);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.intent.intentId, prepared.intent.intentId);
+  assert.equal(replay.intent.operationId, prepared.intent.operationId);
+  assert.equal(
+    tryReadJob(fixture.root, fixture.workerId, fixture.env).lifecycleEvents.length,
+    pending.lifecycleEvents.length
+  );
+
+  for (const stale of [
+    { attemptId: "d".repeat(32) },
+    { fence: 2 },
+    { holderId: "e".repeat(32) },
+    { executionBindingDigest: "f".repeat(64) },
+    { expectedJournalDigest: "0".repeat(64) }
+  ]) {
+    assert.throws(
+      () => prepareWriteProvisionerIntent({
+        root: fixture.root,
+        principal: principal(fixture.root),
+        workerId: fixture.workerId,
+        executionBindingDigest: fixture.binding.bindingDigest,
+        expectedJournalDigest: fixture.journal.journalDigest,
+        ...fixture.actor,
+        ...stale,
+        env: fixture.env
+      }),
+      (error) => ["E_STATE", "E_PROCESS_IDENTITY"].includes(error?.code)
+    );
+  }
+
+  const failedAt = new Date(
+    Math.max(Date.now(), Date.parse(prepared.intent.preparedAt) + 1)
+  ).toISOString();
+  const settled = recordWriteProvisionerNoChild({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: fixture.journal.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: prepared.intent.intentId,
+    resolution: "spawn-not-created",
+    processIdentity: null,
+    cleanupProof: null,
+    failedAt,
+    env: fixture.env
+  });
+  assert.equal(settled.settled, true);
+  assert.equal(settled.replayed, false);
+  assert.equal(settled.job.status, "failed");
+  assert.equal(settled.job.phase, "provisioning-failed");
+  assert.equal(settled.job.provisioning.state, "failed");
+  assert.equal(settled.job.provisioningRuntime.intent.status, "no-child");
+  assert.equal(settled.job.request.spawn.providerLaunchOutcome, "not-launched");
+  assert.equal(Object.hasOwn(settled.job.request.spawn, "dispatch"), false);
+  assert.doesNotThrow(() => assertWriteExecutionJob(settled.job, fixture.env));
+
+  const settledReplay = recordWriteProvisionerNoChild({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: fixture.journal.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: prepared.intent.intentId,
+    resolution: "spawn-not-created",
+    processIdentity: null,
+    cleanupProof: null,
+    failedAt,
+    env: fixture.env
+  });
+  assert.equal(settledReplay.settled, false);
+  assert.equal(settledReplay.replayed, true);
+});
+
+test("planned preactivation cleanup records one transient process proof without activation authority", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = plannedWriteProvisioningFixture("preactivation-cleanup");
+  const prepared = prepareProvisioningIntent(fixture);
+  const { child, identity } = await detachedProvisioner(t, fixture.workerId);
+  process.kill(-child.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(identity), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+
+  const observedAt = new Date(
+    Math.max(Date.now(), Date.parse(prepared.intent.preparedAt) + 1)
+  ).toISOString();
+  const cleanupProof = {
+    processIdentity: identity,
+    processGroupGone: true,
+    providerGuardAbsent: true,
+    observedAt
+  };
+  const request = {
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: fixture.journal.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: prepared.intent.intentId,
+    resolution: "preactivation-cleanup-proven",
+    processIdentity: identity,
+    cleanupProof,
+    failedAt: observedAt,
+    env: fixture.env
+  };
+  const settled = recordWriteProvisionerNoChild(request);
+  assert.equal(settled.settled, true);
+  assert.equal(settled.replayed, false);
+  assert.equal(settled.job.status, "failed");
+  assert.equal(settled.job.phase, "provisioning-failed");
+  assert.equal(settled.job.provisioning.state, "failed");
+  assert.equal(
+    settled.job.provisioning.previousJournalDigest,
+    fixture.journal.journalDigest
+  );
+  assert.equal(settled.job.provisioningRuntime.intent.status, "no-child");
+  assert.equal(
+    settled.job.provisioningRuntime.intent.resolution,
+    "preactivation-cleanup-proven"
+  );
+  assert.equal(settled.job.provisioningRuntime.intent.processIdentity, null);
+  assert.equal(settled.job.provisioningRuntime.intent.activatedAt, null);
+  assert.equal(settled.job.provisioningRuntime.activatedJournalDigest, null);
+  assert.equal(settled.job.provisioningRuntime.activationDigest, null);
+  assert.deepEqual(
+    settled.job.provisioningRuntime.cleanupProof.processIdentity,
+    identity
+  );
+  assert.equal(settled.job.provisioningRuntime.cleanupProof.processGroupGone, true);
+  assert.equal(settled.job.provisioningRuntime.cleanupProof.providerGuardAbsent, true);
+  for (const forbidden of [
+    "workerAuthorization",
+    "controllerProcess",
+    "workerProcess",
+    "providerProcess",
+    "grokSessionId"
+  ]) {
+    assert.equal(Object.hasOwn(settled.job, forbidden), false, forbidden);
+  }
+  assert.equal(Object.hasOwn(settled.job.request.spawn, "dispatch"), false);
+  assert.doesNotThrow(() => assertWriteExecutionJob(settled.job, fixture.env));
+
+  const replay = recordWriteProvisionerNoChild(request);
+  assert.equal(replay.settled, false);
+  assert.equal(replay.replayed, true);
+  assert.equal(
+    replay.job.provisioningRuntime.cleanupProof.proofDigest,
+    settled.job.provisioningRuntime.cleanupProof.proofDigest
+  );
+
+  assert.throws(
+    () => recordWriteProvisionerNoChild({
+      ...request,
+      processIdentity: {
+        ...identity,
+        startToken: `${identity.startToken}-forged`
+      }
+    }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+  const changedObservedAt = new Date(Date.parse(observedAt) + 1).toISOString();
+  assert.throws(
+    () => recordWriteProvisionerNoChild({
+      ...request,
+      cleanupProof: {
+        ...cleanupProof,
+        observedAt: changedObservedAt
+      }
+    }),
+    (error) => error?.code === "E_STATE"
+  );
+
+  for (const tamper of [
+    (job) => { job.provisioningRuntime.cleanupProof.processGroupGone = false; },
+    (job) => {
+      job.provisioningRuntime.cleanupProof.processIdentity.startToken =
+        `${identity.startToken}-forged`;
+    },
+    (job) => { job.provisioningRuntime.activationDigest = "0".repeat(64); },
+    (job) => { job.provisioningRuntime.intent.processIdentity = identity; }
+  ]) {
+    const corrupted = structuredClone(settled.job);
+    tamper(corrupted);
+    assert.throws(
+      () => assertWriteExecutionJob(corrupted, fixture.env),
+      (error) => ["E_STATE", "E_PROCESS_IDENTITY"].includes(error?.code)
+    );
+  }
+});
+
+test("preactivation cleanup rejects live groups, mismatched proof, present guards, and provisioning journals", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = plannedWriteProvisioningFixture("preactivation-reject");
+  const prepared = prepareProvisioningIntent(fixture);
+  const { child, identity } = await detachedProvisioner(t, fixture.workerId);
+  const observedAt = new Date(
+    Math.max(Date.now(), Date.parse(prepared.intent.preparedAt) + 1)
+  ).toISOString();
+  const cleanupProof = {
+    processIdentity: identity,
+    processGroupGone: true,
+    providerGuardAbsent: true,
+    observedAt
+  };
+  const request = {
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: fixture.journal.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: prepared.intent.intentId,
+    resolution: "preactivation-cleanup-proven",
+    processIdentity: identity,
+    cleanupProof,
+    failedAt: observedAt,
+    env: fixture.env
+  };
+
+  assert.throws(
+    () => recordWriteProvisionerNoChild(request),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+  assert.throws(
+    () => recordWriteProvisionerNoChild({
+      ...request,
+      cleanupProof: { ...cleanupProof, processGroupGone: false }
+    }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+  assert.throws(
+    () => recordWriteProvisionerNoChild({
+      ...request,
+      cleanupProof: {
+        ...cleanupProof,
+        processIdentity: {
+          ...identity,
+          startToken: `${identity.startToken}-forged`
+        }
+      }
+    }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+
+  process.kill(-child.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(identity), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  registerProviderGuard(fixture.root, fixture.workerId, identity, THREAD);
+  t.after(() => {
+    try { unregisterProviderGuard(fixture.root, fixture.workerId); } catch {}
+  });
+  assert.throws(
+    () => recordWriteProvisionerNoChild(request),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+  unregisterProviderGuard(fixture.root, fixture.workerId);
+
+  const provisioningFixture = plannedWriteProvisioningFixture(
+    "preactivation-provisioning-reject"
+  );
+  const active = await activateRegisteredProvisioning(t, provisioningFixture);
+  process.kill(-active.child.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(active.identity), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  const activeObservedAt = new Date(
+    Math.max(Date.now(), Date.parse(active.registeredAt) + 1)
+  ).toISOString();
+  assert.throws(
+    () => recordWriteProvisionerNoChild({
+      root: provisioningFixture.root,
+      principal: principal(provisioningFixture.root),
+      workerId: provisioningFixture.workerId,
+      executionBindingDigest: provisioningFixture.binding.bindingDigest,
+      expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+      ...provisioningFixture.actor,
+      providerSpawnIntentId: active.prepared.intent.intentId,
+      resolution: "preactivation-cleanup-proven",
+      processIdentity: active.identity,
+      cleanupProof: {
+        processIdentity: active.identity,
+        processGroupGone: true,
+        providerGuardAbsent: true,
+        observedAt: activeObservedAt
+      },
+      failedAt: activeObservedAt,
+      env: provisioningFixture.env
+    }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+});
+
+test("write provisioner activation persists the exact detached identity and cleanup-fenced failure", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = plannedWriteProvisioningFixture("activate-cleanup");
+  const prepared = prepareProvisioningIntent(fixture);
+  const { child, identity } = await detachedProvisioner(t, fixture.workerId);
+  const provisioningAt = new Date(
+    Math.max(Date.now(), Date.parse(prepared.intent.preparedAt) + 1)
+  ).toISOString();
+  const leaseExpiresAt = new Date(Date.parse(provisioningAt) + 60_000).toISOString();
+  const activateRequest = {
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: fixture.journal.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: prepared.intent.intentId,
+    processIdentity: identity,
+    provisioningAt,
+    leaseExpiresAt,
+    env: fixture.env
+  };
+  const activated = activateWriteProvisioningAttempt(activateRequest);
+  assert.equal(activated.activated, true);
+  assert.equal(activated.replayed, false);
+  assert.deepEqual(activated.intent.processIdentity, identity);
+  assert.equal(activated.job.provisioning.state, "provisioning");
+  assert.equal(activated.job.provisioning.provisioner.pid, identity.pid);
+  assert.equal(activated.job.provisioning.provisioner.startToken, identity.startToken);
+  assert.equal(activated.job.provisioning.provisioner.holderId, fixture.actor.holderId);
+  assert.equal(activated.job.provisioningRuntime.activatedJournalDigest, activated.job.provisioning.journalDigest);
+  assert.equal(Object.hasOwn(activated.job.request.spawn, "dispatch"), false);
+
+  const replay = activateWriteProvisioningAttempt(activateRequest);
+  assert.equal(replay.activated, false);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.intent.processIdentity, identity);
+
+  assert.throws(
+    () => activateWriteProvisioningAttempt({
+      ...activateRequest,
+      holderId: "c".repeat(32)
+    }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+  assert.throws(
+    () => activateWriteProvisioningAttempt({
+      ...activateRequest,
+      processIdentity: { ...identity, startToken: `${identity.startToken}-forged` }
+    }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+
+  process.kill(-child.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(identity), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  const observedAt = new Date(
+    Math.max(Date.now(), Date.parse(provisioningAt) + 1)
+  ).toISOString();
+  assert.throws(
+    () => recordWriteProvisionerNoChild({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      executionBindingDigest: fixture.binding.bindingDigest,
+      expectedJournalDigest: activated.job.provisioning.journalDigest,
+      ...fixture.actor,
+      providerSpawnIntentId: prepared.intent.intentId,
+      resolution: "cleanup-proven",
+      processIdentity: identity,
+      cleanupProof: {
+        processIdentity: identity,
+        processGroupGone: true,
+        providerGuardAbsent: true,
+        observedAt
+      },
+      failedAt: provisioningAt,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_STATE"
+  );
+  const settled = recordWriteProvisionerNoChild({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: prepared.intent.intentId,
+    resolution: "cleanup-proven",
+    processIdentity: identity,
+    cleanupProof: {
+      processIdentity: identity,
+      processGroupGone: true,
+      providerGuardAbsent: true,
+      observedAt
+    },
+    failedAt: observedAt,
+    env: fixture.env
+  });
+  assert.equal(settled.job.status, "failed");
+  assert.equal(settled.job.provisioning.state, "failed");
+  assert.equal(settled.job.provisioning.cleanupPendingAt, observedAt);
+  assert.equal(settled.job.provisioning.failedAt, observedAt);
+  assert.equal(settled.job.provisioningRuntime.cleanupProof.processGroupGone, true);
+  assert.equal(settled.job.provisioningRuntime.cleanupProof.providerGuardAbsent, true);
+  assert.equal(settled.job.provisioningRuntime.intent.status, "no-child");
+  assert.equal(Object.hasOwn(settled.job, "providerProcess"), false);
+  assert.doesNotThrow(() => assertWriteExecutionJob(settled.job, fixture.env));
+});
+
+test("cleanup-pending retention preserves a known official receipt without launch or worktree-cleaned authority", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = plannedWriteProvisioningFixture("cleanup-pending-known");
+  const active = await activateRegisteredProvisioning(t, fixture);
+  const official = createWorkerWorktree({
+    controlRoot: fixture.root,
+    baseCommit: fixture.binding.baseCommit,
+    workerId: fixture.workerId,
+    env: fixture.env
+  });
+  t.after(() => {
+    try { git(fixture.root, "worktree", "remove", "--force", official.executionRoot); }
+    catch {}
+  });
+  const officialReceipt = {
+    status: "created",
+    sessionId: active.prepared.intent.operationId,
+    worktreePath: official.executionRoot,
+    sourceGitRoot: fixture.binding.controlRoot,
+    commit: fixture.binding.baseCommit
+  };
+  const recorded = recordOfficialWorktreeReceipt({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    officialReceipt,
+    receivedAt: active.registeredAt,
+    env: fixture.env
+  });
+
+  process.kill(-active.child.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(active.identity), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  const cleanupPendingAt = new Date(
+    Math.max(
+      Date.now(),
+      Date.parse(recorded.receipt.hostVerification.verifiedAt) + 1
+    )
+  ).toISOString();
+  const cleanupProof = {
+    processIdentity: active.identity,
+    processGroupGone: true,
+    providerGuardAbsent: true,
+    observedAt: cleanupPendingAt
+  };
+  const retained = retainWriteProvisioningCleanupPending({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    processIdentity: active.identity,
+    cleanupProof,
+    cleanupPendingAt,
+    env: fixture.env
+  });
+
+  assert.equal(retained.retained, true);
+  assert.equal(retained.replayed, false);
+  assert.equal(retained.job.status, "queued");
+  assert.equal(retained.job.phase, "worktree-cleanup-pending");
+  assert.equal(retained.job.provisioning.state, "cleanup_pending");
+  assert.equal(retained.job.provisioning.cleanupPendingAt, cleanupPendingAt);
+  assert.equal(retained.job.provisioning.cleanedAt, null);
+  assert.equal(retained.job.provisioning.failedAt, null);
+  assert.equal(
+    retained.job.provisioningRuntime.officialReceipt.receiptDigest,
+    recorded.receipt.receiptDigest
+  );
+  assert.equal(retained.job.provisioningRuntime.intent.status, "registered");
+  assert.equal(retained.job.provisioningRuntime.intent.updatedAt, cleanupPendingAt);
+  assert.deepEqual(
+    retained.job.provisioningRuntime.cleanupProof.processIdentity,
+    active.identity
+  );
+  assert.equal(retained.job.request.spawn.providerLaunchOutcome, "not-ready");
+  assert.equal(retained.job.request.spawn.providerLaunchPending, false);
+  assert.equal(retained.job.request.spawn.providerLaunchInFlight, false);
+  for (const forbidden of [
+    "workerAuthorization",
+    "controllerProcess",
+    "workerProcess",
+    "providerProcess",
+    "grokSessionId"
+  ]) {
+    assert.equal(Object.hasOwn(retained.job, forbidden), false);
+  }
+  assert.equal(Object.hasOwn(retained.job.request.spawn, "dispatch"), false);
+  assert.equal(fs.existsSync(fixture.binding.expectedExecutionRoot), true);
+  assert.equal(JSON.stringify(retained.job).includes("\"worktreeAbsent\""), false);
+  assert.equal(JSON.stringify(retained.job).includes("\"worktreeCleaned\""), false);
+  assert.doesNotThrow(() => assertWriteExecutionJob(retained.job, fixture.env));
+
+  const eventCount = retained.job.lifecycleEvents.length;
+  const replay = retainWriteProvisioningCleanupPending({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    processIdentity: active.identity,
+    cleanupProof,
+    cleanupPendingAt,
+    env: fixture.env
+  });
+  assert.equal(replay.retained, false);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.job.provisioning.journalDigest, retained.job.provisioning.journalDigest);
+  assert.equal(replay.job.lifecycleEvents.length, eventCount);
+
+  const changedReplayAt = new Date(Date.parse(cleanupPendingAt) + 1).toISOString();
+  assert.throws(
+    () => retainWriteProvisioningCleanupPending({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      executionBindingDigest: fixture.binding.bindingDigest,
+      expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+      ...fixture.actor,
+      providerSpawnIntentId: active.prepared.intent.intentId,
+      processIdentity: active.identity,
+      cleanupProof: { ...cleanupProof, observedAt: changedReplayAt },
+      cleanupPendingAt: changedReplayAt,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_STATE"
+  );
+
+  const tamperCases = [
+    (job) => { job.provisioningRuntime.cleanupProof.processGroupGone = false; },
+    (job) => { job.provisioningRuntime.intent.status = "no-child"; },
+    (job) => {
+      job.provisioningRuntime.intent.executableIdentity.identityDigest =
+        "0".repeat(64);
+    },
+    (job) => { job.provisioningRuntime.officialReceipt.receivedAt = changedReplayAt; },
+    (job) => { job.request.spawn.dispatch = { schemaVersion: 2 }; },
+    (job) => { job.grokSessionId = "forged-session"; }
+  ];
+  for (const tamper of tamperCases) {
+    const corrupted = structuredClone(retained.job);
+    tamper(corrupted);
+    assert.throws(
+      () => assertWriteExecutionJob(corrupted, fixture.env),
+      (error) => ["E_STATE", "E_PROCESS_IDENTITY"].includes(error?.code)
+    );
+  }
+});
+
+test("cleanup-pending retention records unknown worktree effect without claiming absence or cleanup", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = plannedWriteProvisioningFixture("cleanup-pending-unknown");
+  const active = await activateRegisteredProvisioning(t, fixture);
+  assert.equal(
+    tryReadJob(fixture.root, fixture.workerId, fixture.env)
+      .provisioningRuntime.officialReceipt,
+    null
+  );
+  assert.equal(fs.existsSync(fixture.binding.expectedExecutionRoot), false);
+
+  process.kill(-active.child.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(active.identity), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  const cleanupPendingAt = new Date(
+    Math.max(Date.now(), Date.parse(active.registeredAt) + 1)
+  ).toISOString();
+  const cleanupProof = {
+    processIdentity: active.identity,
+    processGroupGone: true,
+    providerGuardAbsent: true,
+    observedAt: cleanupPendingAt
+  };
+  const retained = retainWriteProvisioningCleanupPending({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    processIdentity: active.identity,
+    cleanupProof,
+    cleanupPendingAt,
+    env: fixture.env
+  });
+
+  assert.equal(retained.retained, true);
+  assert.equal(retained.job.provisioning.state, "cleanup_pending");
+  assert.equal(retained.job.provisioningRuntime.officialReceipt, null);
+  assert.equal(retained.job.provisioningRuntime.intent.status, "registered");
+  assert.equal(retained.job.provisioning.cleanedAt, null);
+  assert.equal(retained.job.request.spawn.providerLaunchOutcome, "not-ready");
+  assert.equal(Object.hasOwn(retained.job.request.spawn, "dispatch"), false);
+  assert.equal(fs.existsSync(fixture.binding.expectedExecutionRoot), false);
+  const serialized = JSON.stringify(retained.job);
+  for (const unsupportedClaim of [
+    "\"worktreeAbsent\"",
+    "\"worktreeRemoved\"",
+    "\"worktreeCleaned\"",
+    "\"cleanedAt\":\""
+  ]) {
+    assert.equal(serialized.includes(unsupportedClaim), false);
+  }
+  assert.doesNotThrow(() => assertWriteExecutionJob(retained.job, fixture.env));
+
+  const replay = retainWriteProvisioningCleanupPending({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    processIdentity: active.identity,
+    cleanupProof,
+    env: fixture.env
+  });
+  assert.equal(replay.retained, false);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.job.provisioning.journalDigest, retained.job.provisioning.journalDigest);
+
+  const corrupted = structuredClone(retained.job);
+  corrupted.provisioningRuntime.cleanupProof.processIdentity.startToken =
+    `${active.identity.startToken}-forged`;
+  assert.throws(
+    () => assertWriteExecutionJob(corrupted, fixture.env),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+});
+
+test("official worktree receipt and cleanup proof promote only verified-worktree-ready with zero dispatch authority", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = plannedWriteProvisioningFixture("official-ready");
+  const prepared = prepareProvisioningIntent(fixture);
+  const { child, identity } = await detachedProvisioner(t, fixture.workerId);
+  const provisioningAt = new Date(
+    Math.max(Date.now(), Date.parse(prepared.intent.preparedAt) + 1)
+  ).toISOString();
+  const leaseExpiresAt = new Date(Date.parse(provisioningAt) + 60_000).toISOString();
+  const activated = activateWriteProvisioningAttempt({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: fixture.journal.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: prepared.intent.intentId,
+    processIdentity: identity,
+    provisioningAt,
+    leaseExpiresAt,
+    env: fixture.env
+  });
+  const registeredAt = new Date(
+    Math.max(Date.now(), Date.parse(provisioningAt) + 1)
+  ).toISOString();
+  updateJob(fixture.root, fixture.workerId, (job) => ({
+    ...job,
+    provisioningRuntime: {
+      ...job.provisioningRuntime,
+      intent: {
+        ...job.provisioningRuntime.intent,
+        status: "registered",
+        registeredAt,
+        updatedAt: registeredAt
+      }
+    }
+  }), fixture.env);
+  const registered = tryReadJob(fixture.root, fixture.workerId, fixture.env);
+  assert.doesNotThrow(() => assertWriteExecutionJob(registered, fixture.env));
+
+  const official = createWorkerWorktree({
+    controlRoot: fixture.root,
+    baseCommit: fixture.binding.baseCommit,
+    workerId: fixture.workerId,
+    env: fixture.env
+  });
+  t.after(() => {
+    try { git(fixture.root, "worktree", "remove", "--force", official.executionRoot); }
+    catch {}
+  });
+  const officialReceipt = {
+    status: "created",
+    sessionId: prepared.intent.operationId,
+    worktreePath: official.executionRoot,
+    sourceGitRoot: fixture.binding.controlRoot,
+    commit: fixture.binding.baseCommit
+  };
+  const afterLeaseExpiry = new Date(
+    Date.parse(activated.job.provisioning.leaseExpiresAt) + 1
+  ).toISOString();
+  assert.throws(
+    () => recordOfficialWorktreeReceipt({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      executionBindingDigest: fixture.binding.bindingDigest,
+      expectedJournalDigest: activated.job.provisioning.journalDigest,
+      ...fixture.actor,
+      providerSpawnIntentId: prepared.intent.intentId,
+      officialReceipt,
+      receivedAt: afterLeaseExpiry,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_STATE"
+  );
+  for (const tamper of [
+    { sessionId: "foreign-operation" },
+    { worktreePath: path.join(fixture.root, "foreign") },
+    { sourceGitRoot: path.dirname(fixture.root) },
+    { commit: "0".repeat(fixture.binding.baseCommit.length) },
+    { status: "creating" }
+  ]) {
+    assert.throws(
+      () => recordOfficialWorktreeReceipt({
+        root: fixture.root,
+        principal: principal(fixture.root),
+        workerId: fixture.workerId,
+        executionBindingDigest: fixture.binding.bindingDigest,
+        expectedJournalDigest: activated.job.provisioning.journalDigest,
+        ...fixture.actor,
+        providerSpawnIntentId: prepared.intent.intentId,
+        officialReceipt: { ...officialReceipt, ...tamper },
+        env: fixture.env
+      }),
+      (error) => ["E_STATE", "E_WORKTREE"].includes(error?.code)
+    );
+  }
+  assert.throws(
+    () => recordOfficialWorktreeReceipt({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      executionBindingDigest: fixture.binding.bindingDigest,
+      expectedJournalDigest: activated.job.provisioning.journalDigest,
+      ...fixture.actor,
+      executableIdentity: {
+        ...fixture.actor.executableIdentity,
+        version: "0.2.111"
+      },
+      providerSpawnIntentId: prepared.intent.intentId,
+      officialReceipt,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+
+  const receivedAt = new Date(
+    Math.max(Date.now(), Date.parse(registeredAt) + 1)
+  ).toISOString();
+  const recorded = recordOfficialWorktreeReceipt({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: prepared.intent.intentId,
+    officialReceipt,
+    receivedAt,
+    env: fixture.env
+  });
+  assert.equal(recorded.recorded, true);
+  assert.equal(recorded.replayed, false);
+  assert.equal(recorded.receipt.operationId, prepared.intent.operationId);
+  assert.equal(recorded.receipt.officialSessionId, prepared.intent.operationId);
+  assert.equal(recorded.receipt.worktreePath, fixture.binding.expectedExecutionRoot);
+  assert.deepEqual(
+    recorded.receipt.executableIdentity,
+    fixture.actor.executableIdentity
+  );
+  assert.equal(recorded.receipt.hostVerification.baseCommit, fixture.binding.baseCommit);
+  assert.match(recorded.receipt.receiptDigest, /^[a-f0-9]{64}$/);
+
+  const receiptReplay = recordOfficialWorktreeReceipt({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: prepared.intent.intentId,
+    officialReceipt,
+    receivedAt,
+    env: fixture.env
+  });
+  assert.equal(receiptReplay.recorded, false);
+  assert.equal(receiptReplay.replayed, true);
+  assert.equal(receiptReplay.receipt.receiptDigest, recorded.receipt.receiptDigest);
+
+  const liveProofAt = new Date(
+    Math.max(Date.now(), Date.parse(receivedAt) + 1)
+  ).toISOString();
+  assert.throws(
+    () => promoteWriteWorkerReady({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      executionBindingDigest: fixture.binding.bindingDigest,
+      expectedJournalDigest: activated.job.provisioning.journalDigest,
+      ...fixture.actor,
+      providerSpawnIntentId: prepared.intent.intentId,
+      executionContextManifest: captureContextManifest(official.executionRoot),
+      cleanupProof: {
+        processIdentity: identity,
+        processGroupGone: true,
+        providerGuardAbsent: true,
+        observedAt: liveProofAt
+      },
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+
+  process.kill(-child.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(identity), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  const executionContextManifest = captureContextManifest(official.executionRoot);
+  const observedAt = new Date(
+    Math.max(Date.now(), Date.parse(receivedAt) + 1)
+  ).toISOString();
+  const cleanupProof = {
+    processIdentity: identity,
+    processGroupGone: true,
+    providerGuardAbsent: true,
+    observedAt
+  };
+
+  for (const incomplete of [
+    { executionContextManifest: null, cleanupProof },
+    { executionContextManifest, cleanupProof: null }
+  ]) {
+    assert.throws(
+      () => promoteWriteWorkerReady({
+        root: fixture.root,
+        principal: principal(fixture.root),
+        workerId: fixture.workerId,
+        executionBindingDigest: fixture.binding.bindingDigest,
+        expectedJournalDigest: activated.job.provisioning.journalDigest,
+        ...fixture.actor,
+        providerSpawnIntentId: prepared.intent.intentId,
+        ...incomplete,
+        env: fixture.env
+      }),
+      (error) => ["E_STATE", "E_CONTEXT_DRIFT", "E_PROCESS_IDENTITY"].includes(error?.code)
+    );
+  }
+  assert.throws(
+    () => promoteWriteWorkerReady({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      executionBindingDigest: fixture.binding.bindingDigest,
+      expectedJournalDigest: activated.job.provisioning.journalDigest,
+      ...fixture.actor,
+      providerSpawnIntentId: prepared.intent.intentId,
+      executionContextManifest,
+      cleanupProof,
+      readyAt: provisioningAt,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_STATE"
+  );
+
+  const guardFile = providerGuardFile(fixture.root, fixture.workerId);
+  fs.mkdirSync(path.dirname(guardFile), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(guardFile, "{ambiguous", { mode: 0o600 });
+  assert.throws(
+    () => promoteWriteWorkerReady({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      executionBindingDigest: fixture.binding.bindingDigest,
+      expectedJournalDigest: activated.job.provisioning.journalDigest,
+      ...fixture.actor,
+      providerSpawnIntentId: prepared.intent.intentId,
+      executionContextManifest,
+      cleanupProof,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+  fs.unlinkSync(guardFile);
+
+  git(fixture.root, "update-index", "--assume-unchanged", "tracked.txt");
+  assert.throws(
+    () => promoteWriteWorkerReady({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      executionBindingDigest: fixture.binding.bindingDigest,
+      expectedJournalDigest: activated.job.provisioning.journalDigest,
+      ...fixture.actor,
+      providerSpawnIntentId: prepared.intent.intentId,
+      executionContextManifest,
+      cleanupProof,
+      env: fixture.env
+    }),
+    (error) => ["E_SCOPE_VIOLATION", "E_INTEGRATION"].includes(error?.code)
+  );
+  git(fixture.root, "update-index", "--no-assume-unchanged", "tracked.txt");
+
+  const parentTracked = path.join(fixture.root, "tracked.txt");
+  const parentContents = fs.readFileSync(parentTracked, "utf8");
+  fs.writeFileSync(parentTracked, "parent drift\n");
+  assert.throws(
+    () => promoteWriteWorkerReady({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      executionBindingDigest: fixture.binding.bindingDigest,
+      expectedJournalDigest: activated.job.provisioning.journalDigest,
+      ...fixture.actor,
+      providerSpawnIntentId: prepared.intent.intentId,
+      executionContextManifest,
+      cleanupProof,
+      env: fixture.env
+    }),
+    (error) => ["E_CONTEXT_DRIFT", "E_INTEGRATION"].includes(error?.code)
+  );
+  fs.writeFileSync(parentTracked, parentContents);
+
+  const readyAt = new Date(Math.max(
+    Date.now(),
+    Date.parse(recorded.receipt.hostVerification.verifiedAt) + 1,
+    Date.parse(executionContextManifest.capturedAt) + 1,
+    Date.parse(observedAt) + 1
+  )).toISOString();
+  assert.throws(
+    () => promoteWriteWorkerReady({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      executionBindingDigest: fixture.binding.bindingDigest,
+      expectedJournalDigest: activated.job.provisioning.journalDigest,
+      ...fixture.actor,
+      providerSpawnIntentId: prepared.intent.intentId,
+      executionContextManifest,
+      cleanupProof,
+      readyAt: afterLeaseExpiry,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_STATE"
+  );
+  const promoted = promoteWriteWorkerReady({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: prepared.intent.intentId,
+    executionContextManifest,
+    cleanupProof,
+    readyAt,
+    env: fixture.env
+  });
+  assert.equal(promoted.promoted, true);
+  assert.equal(promoted.replayed, false);
+  assert.equal(promoted.job.status, "queued");
+  assert.equal(promoted.job.phase, "worktree-ready");
+  assert.equal(promoted.job.provisioning.state, "ready");
+  assert.equal(promoted.job.request.spawn.providerLaunchOutcome, "worktree-ready-no-dispatch");
+  assert.equal(promoted.job.request.spawn.providerLaunchPending, false);
+  assert.equal(promoted.job.request.spawn.providerLaunchInFlight, false);
+  for (const field of [
+    "dispatch",
+    "executionRoot",
+    "providerSpawnIntent",
+    "contextBindingDigest",
+    "requestDigest"
+  ]) assert.equal(Object.hasOwn(promoted.job.request.spawn, field), false, field);
+  for (const field of [
+    "workerAuthorization",
+    "controllerProcess",
+    "workerProcess",
+    "providerProcess",
+    "grokSessionId"
+  ]) assert.equal(Object.hasOwn(promoted.job, field), false, field);
+  for (const field of [
+    "contextPacket",
+    "contextReceipt",
+    "contextManifest",
+    "providerPrompt",
+    "providerPromptDigest",
+    "resumeSessionId"
+  ]) assert.equal(Object.hasOwn(promoted.job.request, field), false, field);
+  assert.doesNotThrow(() => assertWriteExecutionJob(promoted.job, fixture.env));
+
+  const replay = promoteWriteWorkerReady({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: prepared.intent.intentId,
+    executionContextManifest,
+    cleanupProof,
+    readyAt,
+    env: fixture.env
+  });
+  assert.equal(replay.promoted, false);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.job.provisioning.journalDigest, promoted.job.provisioning.journalDigest);
+
+  for (const corrupt of [
+    (job) => { job.provisioningRuntime.officialReceipt.receiptDigest = "0".repeat(64); },
+    (job) => { job.provisioningRuntime.cleanupProof = null; },
+    (job) => { job.provisioningRuntime.executionContextManifest = null; },
+    (job) => { job.workerAuthorization = "forged"; }
+  ]) {
+    const forged = structuredClone(promoted.job);
+    corrupt(forged);
+    assert.throws(
+      () => assertWriteExecutionJob(forged, fixture.env),
+      (error) => error?.code === "E_STATE"
+    );
+  }
+});
+
 test("write admission durably binds one planned journal without creating launch authority", () => {
   const root = initRepo();
   const { env } = envFor(root);
@@ -1510,17 +2737,17 @@ test("write admission schema-v5 records and pre-ready jobs fail closed on tamper
       executionContextManifestDigest: "f".repeat(64)
     }
   );
-  const unsupportedReadyJob = structuredClone(originalJob);
-  unsupportedReadyJob.provisioning = ready;
+  const forgedPartialReadyJob = structuredClone(originalJob);
+  forgedPartialReadyJob.provisioning = ready;
   fs.writeFileSync(
     jobFile,
-    `${JSON.stringify(unsupportedReadyJob)}\n`,
+    `${JSON.stringify(forgedPartialReadyJob)}\n`,
     { mode: 0o600 }
   );
   assert.throws(
     () => spawnReadOnlyWorker(request),
     (error) => error?.code === "E_STATE"
-      && /atomic launch-authority promotion/i.test(String(error.message))
+      && /launch or provider authority|ready write provisioning runtime/i.test(String(error.message))
   );
   fs.writeFileSync(jobFile, `${JSON.stringify(originalJob)}\n`, { mode: 0o600 });
   assert.equal(spawnReadOnlyWorker(request).handle.id, admitted.handle.id);

@@ -7,20 +7,58 @@ import process from "node:process";
 import test from "node:test";
 import { spawn } from "node:child_process";
 
-import { processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
+import {
+  processGroupGone,
+  processStartToken
+} from "../plugins/grok/scripts/lib/process-control.mjs";
+import { createExecutableAttestation } from "../plugins/grok/scripts/lib/executable-identity.mjs";
 import {
   assertProviderGuardForJob,
+  assertWorktreeProvisioningGuardForJob,
   authenticateProviderBootstrapGuard,
+  authenticateWorktreeProvisioningBootstrapGuard,
   hasForeignActiveProvider,
   loadProviderGuard,
   registerProviderGuard,
+  registerWorktreeProvisioningGuard,
   unregisterProviderGuard
 } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
-import { withWorkspaceStateTransaction, writeJob } from "../plugins/grok/scripts/lib/state.mjs";
+import {
+  activateWriteProvisioningAttempt,
+  admitWriteWorkerPlan,
+  prepareWriteProvisionerIntent
+} from "../plugins/grok/scripts/lib/worker-mutation.mjs";
+import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
+import {
+  tryReadJob,
+  withWorkspaceStateTransaction,
+  writeJob
+} from "../plugins/grok/scripts/lib/state.mjs";
 import { resolveControlWorkspace } from "../plugins/grok/scripts/lib/workspace.mjs";
 import { git, initRepo, tempDir, waitFor } from "./helpers.mjs";
 
 const GUARD_MODULE_URL = new URL("../plugins/grok/scripts/lib/recursion-guard.mjs", import.meta.url).href;
+const TEST_EXECUTABLE_IDENTITY = createExecutableAttestation({
+  canonicalPath: "/private/test/grok",
+  device: "1",
+  inode: "2",
+  mode: 0o100755,
+  size: 4096,
+  executableDigest: "1".repeat(64)
+}, {
+  releaseSource: "official-package-pin-v1",
+  packageName: "@xai-official/grok",
+  packageVersion: "0.2.112",
+  packageGitHead: "9".repeat(40),
+  packageIntegrityDigest: "3".repeat(64),
+  platform: process.platform,
+  arch: process.arch,
+  version: "0.2.112",
+  buildCommit: "9bbd559437aa",
+  channel: "stable",
+  size: 4096,
+  executableDigest: "1".repeat(64)
+});
 
 function waitForFileSync(file, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
@@ -588,6 +626,292 @@ test("write provider guard is schema-4 bound and rejects missing, mismatch, down
     );
     assert.deepEqual(loadProviderGuard(root, workerId), record);
   }
+  assert.equal(unregisterProviderGuard(root, workerId, record, env), true);
+  assert.equal(loadProviderGuard(root, workerId), null);
+});
+
+test("worktree provisioning guard authenticates only canonical admitted and activated state", async (t) => {
+  const root = initRepo();
+  const scratch = tempDir("grok-guard-worktree-provisioning-");
+  const env = {
+    ...process.env,
+    HOME: scratch,
+    GROK_COMPANION_HOST: "codex",
+    GROK_COMPANION_PLUGIN_DATA: path.join(scratch, "plugin-data")
+  };
+  const owner = "worktree-provisioning-owner";
+  const principal = {
+    hostKind: "codex",
+    threadId: owner,
+    turnId: "worktree-provisioning-guard-turn",
+    source: "codex-mcp-stdio",
+    pluginId: "grok@grok-companion",
+    root,
+    mutationCapable: true
+  };
+  const admitted = admitWriteWorkerPlan({
+    root,
+    principal,
+    envelope: buildTaskEnvelope({
+      userRequest: "Provision a bounded worker for tracked.txt",
+      mode: "write",
+      scope: { include: ["tracked.txt"], exclude: [] }
+    }),
+    idempotencyKey: "guard-canonical-worktree-provisioning-0001",
+    roleId: "implementer",
+    allowWriteSpawn: true,
+    writeLifecycleCapabilityDigest: "8".repeat(64),
+    env
+  });
+  const workerId = admitted.handle.id;
+  const planned = tryReadJob(root, workerId, env);
+  const actor = {
+    attemptId: "9".repeat(32),
+    fence: 1,
+    holderId: "a".repeat(32),
+    executableIdentity: TEST_EXECUTABLE_IDENTITY
+  };
+  const prepared = prepareWriteProvisionerIntent({
+    root,
+    principal,
+    workerId,
+    executionBindingDigest: planned.executionBinding.bindingDigest,
+    expectedJournalDigest: planned.provisioning.journalDigest,
+    ...actor,
+    env
+  });
+  const child = spawn(
+    process.execPath,
+    ["-e", "setInterval(() => {}, 1000)", workerId, "worktree-provisioning"],
+    { detached: true, stdio: "ignore" }
+  );
+  const startToken = await waitFor(() => processStartToken(child.pid), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  const providerProcess = {
+    pid: child.pid,
+    startToken,
+    processGroupId: process.platform === "win32" ? null : child.pid
+  };
+  const provisioningAt = new Date(
+    Math.max(Date.now(), Date.parse(prepared.intent.preparedAt) + 1)
+  ).toISOString();
+  const activated = activateWriteProvisioningAttempt({
+    root,
+    principal,
+    workerId,
+    executionBindingDigest: planned.executionBinding.bindingDigest,
+    expectedJournalDigest: planned.provisioning.journalDigest,
+    ...actor,
+    providerSpawnIntentId: prepared.intent.providerSpawnIntentId,
+    processIdentity: providerProcess,
+    provisioningAt,
+    leaseExpiresAt: new Date(Date.parse(provisioningAt) + 60_000).toISOString(),
+    env
+  });
+  const control = resolveControlWorkspace(root, env);
+  const expectedExecutionRoot = activated.job.executionBinding.expectedExecutionRoot;
+  const binding = {
+    purpose: "worktree-provisioning",
+    controlWorkspaceId: control.controlWorkspaceId,
+    controlRoot: control.controlRoot,
+    expectedExecutionRoot,
+    executionBindingDigest: activated.job.executionBinding.bindingDigest,
+    provisioningAttemptId: actor.attemptId,
+    provisioningFence: actor.fence,
+    holderId: actor.holderId,
+    providerSpawnIntentId: prepared.intent.providerSpawnIntentId
+  };
+  t.after(async () => {
+    try { unregisterProviderGuard(root, workerId, null, env); } catch {}
+    try {
+      process.kill(process.platform === "win32" ? child.pid : -child.pid, "SIGKILL");
+    } catch {}
+    try {
+      await waitFor(() => processGroupGone(providerProcess), {
+        timeoutMs: 5_000,
+        intervalMs: 25
+      });
+    } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(scratch, { recursive: true, force: true });
+  });
+
+  const record = registerWorktreeProvisioningGuard(
+    root,
+    workerId,
+    providerProcess,
+    owner,
+    binding,
+    env
+  );
+  assert.equal(record.schemaVersion, 5);
+  assert.equal(record.purpose, "worktree-provisioning");
+  assert.equal(record.controlRoot, control.controlRoot);
+  assert.equal(record.expectedExecutionRoot, expectedExecutionRoot);
+  assert.equal(record.executionBindingDigest, binding.executionBindingDigest);
+  assert.equal(record.provisioningAttemptId, binding.provisioningAttemptId);
+  assert.equal(record.provisioningFence, binding.provisioningFence);
+  assert.equal(record.holderId, binding.holderId);
+  assert.equal(record.providerSpawnIntentId, binding.providerSpawnIntentId);
+  const job = withWorkspaceStateTransaction(
+    root,
+    (transaction) => transaction.tryReadJob(workerId),
+    env
+  );
+  assert.equal(job.request?.spawn?.dispatch, undefined, "provisioning guard must not synthesize dispatch");
+  assert.equal(job.provisioningRuntime.intent.status, "registered");
+  assert.equal(
+    assertWorktreeProvisioningGuardForJob(
+      root,
+      job,
+      record,
+      { expectedBinding: binding, env }
+    ),
+    record
+  );
+  assert.deepEqual(
+    authenticateWorktreeProvisioningBootstrapGuard(
+      root,
+      workerId,
+      providerProcess,
+      binding,
+      env
+    ),
+    record
+  );
+  assert.deepEqual(
+    registerWorktreeProvisioningGuard(
+      root,
+      workerId,
+      providerProcess,
+      owner,
+      binding,
+      env
+    ),
+    record,
+    "exact registration replay must preserve the original guard"
+  );
+
+  const corruptions = [
+    ["execution binding digest", (candidate) => {
+      candidate.executionBinding.bindingDigest = "d".repeat(64);
+    }],
+    ["provisioning journal digest", (candidate) => {
+      candidate.provisioning.journalDigest = "d".repeat(64);
+    }],
+    ["runtime extra field", (candidate) => {
+      candidate.provisioningRuntime.extra = true;
+    }],
+    ["intent extra field", (candidate) => {
+      candidate.provisioningRuntime.intent.extra = true;
+    }],
+    ["process extra field", (candidate) => {
+      candidate.provisioningRuntime.intent.processIdentity.extra = true;
+    }],
+    ["intent digest", (candidate) => {
+      candidate.provisioningRuntime.intent.intentDigest = "d".repeat(64);
+    }],
+    ["activation digest", (candidate) => {
+      candidate.provisioningRuntime.activationDigest = "d".repeat(64);
+    }],
+    ["premature official receipt", (candidate) => {
+      candidate.provisioningRuntime.officialReceipt = {};
+    }],
+    ["premature execution context", (candidate) => {
+      candidate.provisioningRuntime.executionContextManifest = {};
+    }],
+    ["premature execution context digest", (candidate) => {
+      candidate.provisioningRuntime.executionContextManifestRecordDigest = "d".repeat(64);
+    }],
+    ["premature cleanup proof", (candidate) => {
+      candidate.provisioningRuntime.cleanupProof = {};
+    }],
+    ["dispatch authority", (candidate) => {
+      candidate.request.spawn.dispatch = {};
+    }],
+    ["provider launch flag", (candidate) => {
+      candidate.request.spawn.providerLaunchInFlight = true;
+    }],
+    ["wrong lifecycle phase", (candidate) => {
+      candidate.phase = "worktree-ready";
+    }]
+  ];
+  for (const [label, corrupt] of corruptions) {
+    const candidate = structuredClone(job);
+    corrupt(candidate);
+    assert.throws(
+      () => assertWorktreeProvisioningGuardForJob(
+        root,
+        candidate,
+        record,
+        { expectedBinding: binding, env }
+      ),
+      (error) => error?.code === "E_PROCESS_IDENTITY",
+      label
+    );
+  }
+
+  const bindingDrifts = [
+    ["purpose", "provider-execution"],
+    ["controlWorkspaceId", `cws-${"c".repeat(32)}`],
+    ["controlRoot", `${control.controlRoot}-other`],
+    ["expectedExecutionRoot", `${expectedExecutionRoot}-other`],
+    ["executionBindingDigest", "d".repeat(64)],
+    ["provisioningAttemptId", "e".repeat(32)],
+    ["provisioningFence", 2],
+    ["holderId", "f".repeat(32)],
+    ["providerSpawnIntentId", "0".repeat(32)]
+  ];
+  for (const [field, value] of bindingDrifts) {
+    assert.throws(
+      () => authenticateWorktreeProvisioningBootstrapGuard(
+        root,
+        workerId,
+        providerProcess,
+        { ...binding, [field]: value },
+        env
+      ),
+      (error) => error?.code === "E_PROCESS_IDENTITY",
+      field
+    );
+  }
+  const missingHolder = { ...binding };
+  delete missingHolder.holderId;
+  assert.throws(
+    () => authenticateWorktreeProvisioningBootstrapGuard(
+      root,
+      workerId,
+      providerProcess,
+      missingHolder,
+      env
+    ),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+  const missingPurposeRecord = { ...record };
+  delete missingPurposeRecord.purpose;
+  assert.throws(
+    () => assertWorktreeProvisioningGuardForJob(root, job, missingPurposeRecord, { env }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+  const competingProcess = {
+    ...providerProcess,
+    pid: providerProcess.pid + 1,
+    processGroupId: process.platform === "win32" ? null : providerProcess.pid + 1
+  };
+  assert.throws(
+    () => registerWorktreeProvisioningGuard(
+      root,
+      workerId,
+      competingProcess,
+      owner,
+      binding,
+      env
+    ),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+  assert.deepEqual(loadProviderGuard(root, workerId), record);
   assert.equal(unregisterProviderGuard(root, workerId, record, env), true);
   assert.equal(loadProviderGuard(root, workerId), null);
 });

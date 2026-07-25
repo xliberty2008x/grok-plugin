@@ -4,12 +4,15 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { Readable } from "node:stream";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 import {
+  activateWriteProvisioningAttempt,
+  admitWriteWorkerPlan,
   assertDispatchContract,
   claimWorkerDispatch,
+  prepareWriteProvisionerIntent,
   prepareDispatchProcessSpawn,
   prepareWorkerProviderSpawn,
   spawnReadOnlyWorker,
@@ -17,12 +20,13 @@ import {
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import { reconcileBrokerWorkers } from "../plugins/grok/scripts/lib/worker-recovery.mjs";
 import { processGroupGone, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
+import { createExecutableAttestation } from "../plugins/grok/scripts/lib/executable-identity.mjs";
 import {
   loadProviderGuard,
   registerProviderGuard,
   unregisterProviderGuard
 } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
-import { tryReadJob, updateJob } from "../plugins/grok/scripts/lib/state.mjs";
+import { tryReadJob, updateJob, writeJob } from "../plugins/grok/scripts/lib/state.mjs";
 import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
 import {
   providerChildEnvironment,
@@ -30,11 +34,16 @@ import {
   runProviderBootstrap
 } from "../plugins/grok/scripts/lib/provider-bootstrap.mjs";
 import {
+  assertProviderBootstrapPromotionMessage,
+  assertProviderBootstrapReadyMessage,
   cleanupBoundBootstrapStart,
   createProviderBootstrapLaunch,
   publishProviderBootstrapSpec,
-  promoteProviderBootstrap
+  promoteProviderBootstrap,
+  recordBoundBootstrapNoChild,
+  settleWorktreeBootstrapRegistrationFailure
 } from "../plugins/grok/scripts/lib/grok-provider.mjs";
+import { resolveControlWorkspace } from "../plugins/grok/scripts/lib/workspace.mjs";
 
 import { initRepo, tempDir, waitFor } from "./helpers.mjs";
 
@@ -44,6 +53,27 @@ const BOOTSTRAP = fileURLToPath(new URL(
   import.meta.url
 ));
 let sequence = 0;
+const TEST_EXECUTABLE_IDENTITY = createExecutableAttestation({
+  canonicalPath: "/private/test/grok",
+  device: "1",
+  inode: "2",
+  mode: 0o100755,
+  size: 4096,
+  executableDigest: "1".repeat(64)
+}, {
+  releaseSource: "official-package-pin-v1",
+  packageName: "@xai-official/grok",
+  packageVersion: "0.2.112",
+  packageGitHead: "9".repeat(40),
+  packageIntegrityDigest: "3".repeat(64),
+  platform: process.platform,
+  arch: process.arch,
+  version: "0.2.112",
+  buildCommit: "9bbd559437aa",
+  channel: "stable",
+  size: 4096,
+  executableDigest: "1".repeat(64)
+});
 
 function ownerEnvironment(pluginData) {
   return {
@@ -89,11 +119,26 @@ async function providerIdentityFor(child) {
   };
 }
 
-function waitForClose(child) {
+function waitForClose(child, timeoutMs = 10_000) {
   if (child.exitCode !== null || child.signalCode !== null) {
     return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
   }
-  return new Promise((resolve) => child.once("close", (code, signal) => resolve({ code, signal })));
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      try { process.kill(-child.pid, "SIGKILL"); } catch {}
+      reject(new Error(`child ${child.pid} did not close within ${timeoutMs}ms`));
+    }, timeoutMs);
+    const onClose = (code, signal) => {
+      cleanup();
+      resolve({ code, signal });
+    };
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.off("close", onClose);
+    };
+    child.once("close", onClose);
+  });
 }
 
 async function killAndWait(child, identity) {
@@ -212,18 +257,39 @@ function bootstrapBinding(fixture, intent) {
   };
 }
 
-function readiness(child) {
+function readiness(child, timeoutMs = 10_000) {
   return new Promise((resolve, reject) => {
     let buffer = "";
-    child.stdio[3].on("data", (chunk) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      try { process.kill(-child.pid, "SIGKILL"); } catch {}
+      reject(new Error(`bootstrap ${child.pid} did not publish readiness within ${timeoutMs}ms`));
+    }, timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.stdio[3].off("data", onData);
+      child.off("error", onError);
+      child.off("exit", onExit);
+    };
+    const finish = (callback, value) => {
+      cleanup();
+      callback(value);
+    };
+    const onData = (chunk) => {
       buffer += String(chunk);
       const newline = buffer.indexOf("\n");
       if (newline < 0) return;
-      try { resolve(JSON.parse(buffer.slice(0, newline))); }
-      catch (error) { reject(error); }
-    });
-    child.once("error", reject);
-    child.once("exit", (code, signal) => reject(new Error(`bootstrap exited ${code ?? signal}`)));
+      try { finish(resolve, JSON.parse(buffer.slice(0, newline))); }
+      catch (error) { finish(reject, error); }
+    };
+    const onError = (error) => finish(reject, error);
+    const onExit = (code, signal) => finish(
+      reject,
+      new Error(`bootstrap exited ${code ?? signal}`)
+    );
+    child.stdio[3].on("data", onData);
+    child.once("error", onError);
+    child.once("exit", onExit);
   });
 }
 
@@ -302,6 +368,507 @@ test("bootstrap argv contains only opaque dispatch coordinates while the private
     }),
     (error) => error?.code === "E_USAGE"
   );
+});
+
+test("worktree provisioning bootstrap is separately bound and acknowledgements fail closed on identity drift", async () => {
+  const root = "/private/control-root-that-must-not-enter-provisioning-argv";
+  const controllerCwd = "/private/controller-cwd-that-must-not-enter-provisioning-argv";
+  const expectedExecutionRoot = "/private/worker-root-that-does-not-exist-yet";
+  const marker = "task-aabbccddeeff0011";
+  const binding = {
+    purpose: "worktree-provisioning",
+    controlWorkspaceId: `cws-${"b".repeat(32)}`,
+    controlRoot: root,
+    expectedExecutionRoot,
+    executionBindingDigest: "c".repeat(64),
+    provisioningAttemptId: "d".repeat(32),
+    provisioningFence: 2,
+    holderId: "e".repeat(32),
+    providerSpawnIntentId: "f".repeat(32)
+  };
+  const launch = createProviderBootstrapLaunch({
+    root: controllerCwd,
+    marker,
+    owner: THREAD_ID,
+    binding,
+    binary: "/private/provider/binary-that-must-not-enter-argv",
+    executableIdentity: TEST_EXECUTABLE_IDENTITY,
+    args: ["agent", "stdio", "--private-argument"]
+  });
+  assert.deepEqual(launch.argv, [
+    BOOTSTRAP,
+    "--job-marker", marker,
+    "--bootstrap-purpose", binding.purpose,
+    "--provisioning-attempt-id", binding.provisioningAttemptId,
+    "--provisioning-fence", String(binding.provisioningFence),
+    "--holder-id", binding.holderId,
+    "--spawn-intent-id", binding.providerSpawnIntentId
+  ]);
+  const renderedArgv = launch.argv.join(" ");
+  for (const privateValue of [
+    root,
+    controllerCwd,
+    expectedExecutionRoot,
+    binding.executionBindingDigest,
+    THREAD_ID,
+    "binary-that-must-not-enter-argv",
+    "private-argument"
+  ]) {
+    assert.equal(renderedArgv.includes(privateValue), false);
+  }
+
+  const parsed = await readProviderBootstrapSpec(
+    Readable.from([launch.specPayload]),
+    {
+      marker,
+      purpose: binding.purpose,
+      provisioningAttemptId: binding.provisioningAttemptId,
+      provisioningFence: binding.provisioningFence,
+      holderId: binding.holderId,
+      intentId: binding.providerSpawnIntentId
+    }
+  );
+  assert.deepEqual(parsed.binding, binding);
+  assert.equal(parsed.root, controllerCwd);
+
+  const ready = {
+    type: "provider-ready",
+    grokPid: 1234,
+    version: "0.3.0",
+    purpose: binding.purpose,
+    executionBindingDigest: binding.executionBindingDigest,
+    provisioningAttemptId: binding.provisioningAttemptId,
+    provisioningFence: binding.provisioningFence,
+    holderId: binding.holderId,
+    providerSpawnIntentId: binding.providerSpawnIntentId,
+    executableIdentity: TEST_EXECUTABLE_IDENTITY
+  };
+  const promotion = {
+    type: "provider-promoted",
+    marker,
+    purpose: binding.purpose,
+    executionBindingDigest: binding.executionBindingDigest,
+    provisioningAttemptId: binding.provisioningAttemptId,
+    provisioningFence: binding.provisioningFence,
+    holderId: binding.holderId,
+    providerSpawnIntentId: binding.providerSpawnIntentId
+  };
+  assert.equal(
+    assertProviderBootstrapReadyMessage(
+      ready,
+      binding,
+      TEST_EXECUTABLE_IDENTITY
+    ),
+    ready
+  );
+  assert.equal(
+    assertProviderBootstrapPromotionMessage(promotion, { marker, ...binding }),
+    promotion
+  );
+
+  const drifts = [
+    ["purpose", "provider-execution"],
+    ["executionBindingDigest", "0".repeat(64)],
+    ["provisioningAttemptId", "1".repeat(32)],
+    ["provisioningFence", binding.provisioningFence + 1],
+    ["holderId", "2".repeat(32)],
+    ["providerSpawnIntentId", "3".repeat(32)],
+    ["executableIdentity", {
+      ...TEST_EXECUTABLE_IDENTITY,
+      identityDigest: "4".repeat(64)
+    }]
+  ];
+  for (const [field, value] of drifts) {
+    assert.throws(
+      () => assertProviderBootstrapReadyMessage(
+        { ...ready, [field]: value },
+        binding,
+        TEST_EXECUTABLE_IDENTITY
+      ),
+      (error) => error?.code === "E_PROCESS_IDENTITY",
+      `ready ${field}`
+    );
+    assert.throws(
+      () => assertProviderBootstrapPromotionMessage(
+        { ...promotion, [field]: value },
+        { marker, ...binding }
+      ),
+      (error) => error?.code === "E_PROCESS_IDENTITY",
+      `promotion ${field}`
+    );
+  }
+  for (const [label, malformedReady, malformedPromotion] of [
+    ["missing", (({ holderId, ...rest }) => rest)(ready), (({ holderId, ...rest }) => rest)(promotion)],
+    ["extra", { ...ready, providerGeneration: 1 }, { ...promotion, providerGeneration: 1 }]
+  ]) {
+    assert.throws(
+      () => assertProviderBootstrapReadyMessage(
+        malformedReady,
+        binding,
+        TEST_EXECUTABLE_IDENTITY
+      ),
+      (error) => error?.code === "E_PROCESS_IDENTITY",
+      `ready ${label}`
+    );
+    assert.throws(
+      () => assertProviderBootstrapPromotionMessage(
+        malformedPromotion,
+        { marker, ...binding }
+      ),
+      (error) => error?.code === "E_PROCESS_IDENTITY",
+      `promotion ${label}`
+    );
+  }
+});
+
+test("activated worktree bootstrap no-child callback is awaited and requires durable cleanup proof", async () => {
+  const intentId = "8".repeat(32);
+  const processIdentity = {
+    pid: 1234,
+    startToken: "provisioning-bootstrap-start-token",
+    processGroupId: 1234
+  };
+  let callbackCompleted = false;
+  let captured = null;
+  const settlement = await recordBoundBootstrapNoChild({
+    providerLaunch: {
+      async noChild(details) {
+        captured = details;
+        await Promise.resolve();
+        callbackCompleted = true;
+        return {
+          settled: true,
+          replayed: false,
+          job: {
+            status: "failed",
+            provisioning: { state: "failed" },
+            provisioningRuntime: {
+              intent: {
+                intentId,
+                providerSpawnIntentId: intentId,
+                status: "no-child",
+                resolution: "cleanup-proven"
+              },
+              cleanupProof: {
+                processIdentity,
+                processGroupGone: true,
+                providerGuardAbsent: true
+              }
+            }
+          }
+        };
+      }
+    },
+    preparedLaunch: { intent: { intentId } },
+    worktreeProvisioning: true,
+    resolution: "cleanup-proven",
+    processIdentity,
+    expectedJournalDigest: "9".repeat(64)
+  });
+  assert.equal(callbackCompleted, true);
+  assert.equal(settlement.settled, true);
+  assert.equal(captured.expectedJournalDigest, "9".repeat(64));
+  assert.equal(captured.processIdentity, processIdentity);
+  assert.equal(captured.cleanupProof.processIdentity, processIdentity);
+  assert.equal(captured.cleanupProof.processGroupGone, true);
+  assert.equal(captured.cleanupProof.providerGuardAbsent, true);
+  assert.equal(typeof captured.cleanupProof.observedAt, "string");
+
+  const retained = await recordBoundBootstrapNoChild({
+    providerLaunch: {
+      noChild: async () => ({
+        retained: true,
+        replayed: false,
+        job: {
+          status: "queued",
+          provisioning: {
+            state: "cleanup_pending",
+            previousJournalDigest: "9".repeat(64)
+          },
+          provisioningRuntime: {
+            intent: {
+              intentId,
+              providerSpawnIntentId: intentId,
+              status: "registered",
+              resolution: null
+            },
+            cleanupProof: {
+              processIdentity,
+              processGroupGone: true,
+              providerGuardAbsent: true
+            }
+          }
+        }
+      })
+    },
+    preparedLaunch: { intent: { intentId } },
+    worktreeProvisioning: true,
+    resolution: "cleanup-proven",
+    processIdentity,
+    expectedJournalDigest: "9".repeat(64)
+  });
+  assert.equal(retained.retained, true);
+
+  await assert.rejects(
+    () => recordBoundBootstrapNoChild({
+      providerLaunch: {
+        noChild: async () => ({
+          settled: true,
+          replayed: false,
+          job: {
+            status: "failed",
+            provisioning: { state: "failed" },
+            provisioningRuntime: {
+              intent: {
+                intentId,
+                providerSpawnIntentId: intentId,
+                status: "no-child",
+                resolution: "cleanup-proven"
+              },
+              cleanupProof: null
+            }
+          }
+        })
+      },
+      preparedLaunch: { intent: { intentId } },
+      worktreeProvisioning: true,
+      resolution: "cleanup-proven",
+      processIdentity,
+      expectedJournalDigest: "9".repeat(64)
+    }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+});
+
+test("registration failure retains the prepared intent without calling planned noChild with process proof", async () => {
+  let noChildCalls = 0;
+  const outcome = await settleWorktreeBootstrapRegistrationFailure({
+    providerLaunch: {
+      noChild() {
+        noChildCalls += 1;
+      }
+    },
+    preparedLaunch: {
+      intent: {
+        intentId: "a".repeat(32),
+        expectedPlannedJournalDigest: "b".repeat(64)
+      }
+    },
+    processIdentity: {
+      pid: 1234,
+      startToken: "registration-failure-token",
+      processGroupId: 1234
+    },
+    cleanupProof: {
+      processIdentity: {
+        pid: 1234,
+        startToken: "registration-failure-token",
+        processGroupId: 1234
+      },
+      processGroupGone: true,
+      providerGuardAbsent: true,
+      observedAt: new Date().toISOString()
+    }
+  });
+  assert.deepEqual(outcome, {
+    reconciled: false,
+    retainedPreparedIntent: true
+  });
+  assert.equal(noChildCalls, 0);
+});
+
+test("actual worktree provisioning bootstrap registers the exact fenced process before ready", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const root = initRepo();
+  const controllerCwd = tempDir("provider-bootstrap-controller-cwd-");
+  const providerCwdEvidence = path.join(
+    tempDir("provider-bootstrap-controller-evidence-"),
+    "cwd.txt"
+  );
+  const pluginData = tempDir("provider-bootstrap-worktree-provisioning-data-");
+  const bootstrapWrapperDirectory = tempDir(
+    "provider-bootstrap-worktree-wrapper-"
+  );
+  const bootstrapWrapper = path.join(
+    bootstrapWrapperDirectory,
+    "provider-bootstrap.mjs"
+  );
+  fs.writeFileSync(bootstrapWrapper, [
+    "import fs from \"node:fs\";",
+    `import { runProviderBootstrap } from ${JSON.stringify(
+      pathToFileURL(BOOTSTRAP).href
+    )};`,
+    `const executableIdentity = ${JSON.stringify(TEST_EXECUTABLE_IDENTITY)};`,
+    "const privateIdentity = {",
+    "  canonicalPath: process.execPath,",
+    "  device: \"1\",",
+    "  inode: \"2\",",
+    "  mode: 33261,",
+    "  size: 4096,",
+    "  mtimeMs: 1,",
+    "  executableDigest: \"1\".repeat(64),",
+    "  attestation: executableIdentity",
+    "};",
+    "try {",
+    "  const controlInput = fs.createReadStream(null, { fd: 4, autoClose: false });",
+    "  const specInput = fs.createReadStream(null, { fd: 6, autoClose: true });",
+    "  const outcome = await runProviderBootstrap({",
+    "    controlInput,",
+    "    specInput,",
+    "    captureExecutableIdentity: () => privateIdentity,",
+    "    attestExecutable: () => executableIdentity",
+    "  });",
+    "  process.exitCode = outcome?.code ?? 0;",
+    "} catch (error) {",
+    "  process.stderr.write(`${error?.code || \"E_STATE\"}: ${error?.message || error}\\n`);",
+    "  process.exitCode = 1;",
+    "}",
+    ""
+  ].join("\n"));
+  const env = ownerEnvironment(pluginData);
+  const principal = { hostKind: "codex", threadId: THREAD_ID };
+  const control = resolveControlWorkspace(root, env);
+  const admitted = admitWriteWorkerPlan({
+    root,
+    principal,
+    envelope: buildTaskEnvelope({
+      userRequest: "Exercise the exact worktree provisioning bootstrap",
+      mode: "write",
+      scope: { include: ["tracked.txt"], exclude: [] }
+    }),
+    idempotencyKey: "provider-bootstrap-canonical-worktree-provisioning-0001",
+    roleId: "implementer",
+    allowWriteSpawn: true,
+    writeLifecycleCapabilityDigest: "4".repeat(64),
+    env
+  });
+  const marker = admitted.handle.id;
+  const planned = tryReadJob(root, marker, env);
+  const actor = {
+    attemptId: "5".repeat(32),
+    fence: 1,
+    holderId: "6".repeat(32),
+    executableIdentity: TEST_EXECUTABLE_IDENTITY
+  };
+  const prepared = prepareWriteProvisionerIntent({
+    root,
+    principal,
+    workerId: marker,
+    executionBindingDigest: planned.executionBinding.bindingDigest,
+    expectedJournalDigest: planned.provisioning.journalDigest,
+    ...actor,
+    env
+  });
+  const expectedExecutionRoot = planned.executionBinding.expectedExecutionRoot;
+  const binding = {
+    purpose: "worktree-provisioning",
+    controlWorkspaceId: control.controlWorkspaceId,
+    controlRoot: control.controlRoot,
+    expectedExecutionRoot,
+    executionBindingDigest: planned.executionBinding.bindingDigest,
+    provisioningAttemptId: actor.attemptId,
+    provisioningFence: actor.fence,
+    holderId: actor.holderId,
+    providerSpawnIntentId: prepared.intent.providerSpawnIntentId
+  };
+  t.after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(pluginData, { recursive: true, force: true });
+    fs.rmSync(expectedExecutionRoot, { recursive: true, force: true });
+    fs.rmSync(controllerCwd, { recursive: true, force: true });
+    fs.rmSync(path.dirname(providerCwdEvidence), { recursive: true, force: true });
+    fs.rmSync(bootstrapWrapperDirectory, { recursive: true, force: true });
+  });
+
+  const providerSource = `require("node:fs").writeFileSync(${JSON.stringify(providerCwdEvidence)}, process.cwd()); process.stdin.resume(); setInterval(() => {}, 1000);`;
+  const launch = createProviderBootstrapLaunch({
+    root: controllerCwd,
+    marker,
+    owner: THREAD_ID,
+    binding,
+    binary: process.execPath,
+    executableIdentity: TEST_EXECUTABLE_IDENTITY,
+    args: ["-e", providerSource, marker, "agent", "stdio"]
+  });
+  const child = spawn(process.execPath, [
+    bootstrapWrapper,
+    ...launch.argv.slice(1)
+  ], {
+    cwd: controllerCwd,
+    env: {
+      ...env,
+      GROK_COMPANION_JOB_MARKER: marker,
+      GROK_COMPANION_BOOTSTRAP_PLUGIN_DATA: pluginData
+    },
+    detached: true,
+    stdio: ["pipe", "pipe", "pipe", "pipe", "pipe", "pipe", "pipe"]
+  });
+  t.after(() => {
+    try { process.kill(-child.pid, "SIGKILL"); } catch {}
+  });
+  const bootstrapStartToken = await waitFor(() => processStartToken(child.pid));
+  const provisioningAt = new Date(
+    Math.max(Date.now(), Date.parse(prepared.intent.preparedAt) + 1)
+  ).toISOString();
+  const activated = activateWriteProvisioningAttempt({
+    root,
+    principal,
+    workerId: marker,
+    executionBindingDigest: planned.executionBinding.bindingDigest,
+    expectedJournalDigest: planned.provisioning.journalDigest,
+    ...actor,
+    providerSpawnIntentId: prepared.intent.providerSpawnIntentId,
+    processIdentity: {
+      pid: child.pid,
+      startToken: bootstrapStartToken,
+      processGroupId: child.pid
+    },
+    provisioningAt,
+    leaseExpiresAt: new Date(Date.parse(provisioningAt) + 60_000).toISOString(),
+    env
+  });
+  assert.equal(activated.job.phase, "worktree-provisioning");
+  assert.equal(Object.hasOwn(activated.job.request.spawn, "dispatch"), false);
+
+  await publishProviderBootstrapSpec(child, launch.specPayload);
+  const ready = await readiness(child);
+  assert.equal(ready.type, "provider-ready", JSON.stringify(ready));
+  assert.equal(
+    assertProviderBootstrapReadyMessage(
+      ready,
+      binding,
+      TEST_EXECUTABLE_IDENTITY
+    ),
+    ready
+  );
+  assert.equal(await waitFor(() => {
+    try { return fs.readFileSync(providerCwdEvidence, "utf8"); }
+    catch { return null; }
+  }), fs.realpathSync(controllerCwd));
+  const guard = loadProviderGuard(root, marker);
+  assert.equal(guard.schemaVersion, 5);
+  assert.equal(guard.providerProcess.pid, child.pid);
+  assert.equal(guard.providerProcess.startToken, bootstrapStartToken);
+  assert.equal(tryReadJob(root, marker, env).provisioningRuntime.intent.status, "registered");
+  assert.equal(fs.existsSync(expectedExecutionRoot), false);
+
+  const acknowledgement = await promoteProviderBootstrap(
+    child,
+    { marker, ...binding }
+  );
+  assert.equal(
+    assertProviderBootstrapPromotionMessage(
+      acknowledgement,
+      { marker, ...binding }
+    ),
+    acknowledgement
+  );
+  const closed = waitForClose(child);
+  child.stdin.end();
+  await closed;
+  assert.equal(loadProviderGuard(root, marker), null);
+  assert.equal(fs.existsSync(expectedExecutionRoot), false);
 });
 
 test("private bootstrap spec channel rejects missing, truncated, extra, malformed, and oversized input", async () => {
@@ -623,7 +1190,8 @@ test("write bootstrap retains its execution binding through spec, guard, readine
   const acknowledgement = await promoteProviderBootstrap(child, {
     marker: fixture.workerId,
     providerGeneration: binding.providerGeneration,
-    providerSpawnIntentId: binding.providerSpawnIntentId
+    providerSpawnIntentId: binding.providerSpawnIntentId,
+    executionBindingDigest
   });
   assert.equal(acknowledgement.type, "provider-promoted");
   assert.equal(acknowledgement.executionBindingDigest, executionBindingDigest);

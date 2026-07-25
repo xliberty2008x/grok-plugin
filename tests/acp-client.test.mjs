@@ -108,6 +108,77 @@ test("a clean single ACP response settles only after its stdout batch is complet
   assert.equal(client.transportError, null);
 });
 
+test("ACP outbound allowlist rejects session methods and notifications before writing bytes", async () => {
+  const child = new FakeChild();
+  const writes = [];
+  child.stdin.on("data", (chunk) => writes.push(Buffer.from(chunk)));
+  const client = new AcpClient(child, {
+    timeoutMs: 1000,
+    outboundAllowlist: {
+      requests: [
+        "initialize",
+        "_x.ai/git/worktree/create",
+        "_x.ai/session/close"
+      ],
+      notifications: []
+    }
+  });
+
+  await assert.rejects(
+    client.request("session/new", {}),
+    (error) => error?.code === "E_CAPABILITY"
+  );
+  await assert.rejects(
+    client.promptTurn({
+      sessionId: "forbidden-session",
+      prompt: [{ type: "text", text: "forbidden" }]
+    }),
+    (error) => error?.code === "E_CAPABILITY"
+  );
+  const reserved = client.reserveRequestId();
+  await assert.rejects(
+    client.dispatchReserved(reserved, "session/load", {}),
+    (error) => error?.code === "E_CAPABILITY"
+  );
+  assert.throws(
+    () => client.notify("session/cancel", { sessionId: "forbidden-session" }),
+    (error) => error?.code === "E_CAPABILITY"
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(Buffer.concat(writes).length, 0);
+});
+
+test("controller ACP mode always cancels permission requests", async () => {
+  const child = new FakeChild();
+  const writes = [];
+  child.stdin.on("data", (chunk) => writes.push(String(chunk)));
+  const client = new AcpClient(child, {
+    timeoutMs: 1000,
+    permissionPolicy: () => ({
+      outcome: { outcome: "selected", optionId: "allow-always" }
+    }),
+    cancelPermissions: true,
+    outboundAllowlist: {
+      requests: ["initialize"],
+      notifications: []
+    }
+  });
+  child.stdout.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: "controller-permission",
+    method: "session/request_permission",
+    params: {
+      options: [{ optionId: "allow-always", kind: "allow_always" }]
+    }
+  })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(JSON.parse(writes.join("").trim()), {
+    jsonrpc: "2.0",
+    id: "controller-permission",
+    result: { outcome: { outcome: "cancelled" } }
+  });
+});
+
 test("asynchronous ACP stdin EPIPE closes dispatch, notify, and close paths without an unhandled error", async (t) => {
   for (const operation of ["dispatch", "notify", "close"]) {
     await t.test(operation, async () => {

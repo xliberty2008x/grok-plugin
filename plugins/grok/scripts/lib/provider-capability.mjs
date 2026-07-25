@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { CompanionError } from "./errors.mjs";
+import { captureExecutableFileIdentity } from "./executable-identity.mjs";
 import { discoverGrok, grokVersion } from "./grok-provider.mjs";
 import { pluginDataRoot } from "./host.mjs";
 import { profileFor } from "./profiles.mjs";
@@ -117,27 +118,20 @@ function configuredProviderBinary(env) {
 }
 
 function providerFileIdentity(binary) {
-  const resolved = fs.realpathSync(binary);
-  let descriptor;
-  try {
-    descriptor = fs.openSync(resolved, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    const stat = fs.fstatSync(descriptor);
-    if (!stat.isFile() || stat.size < 1 || stat.size > MAX_PROVIDER_BINARY_BYTES) {
-      throw new CompanionError("E_CAPABILITY", "Grok provider binary identity is unsafe or unsupported.");
-    }
-    const contentDigest = crypto.createHash("sha256")
-      .update(fs.readFileSync(descriptor))
-      .digest("hex");
-    return Object.freeze({
-      device: String(stat.dev),
-      inode: String(stat.ino),
-      size: stat.size,
-      mtimeMs: Math.trunc(stat.mtimeMs),
-      contentDigest
-    });
-  } finally {
-    if (descriptor != null) fs.closeSync(descriptor);
+  const identity = captureExecutableFileIdentity(binary);
+  if (identity.size > MAX_PROVIDER_BINARY_BYTES) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Grok provider binary identity is unsafe or unsupported."
+    );
   }
+  return Object.freeze({
+    device: identity.device,
+    inode: identity.inode,
+    size: identity.size,
+    mtimeMs: identity.mtimeMs,
+    contentDigest: identity.executableDigest
+  });
 }
 
 function safeCapabilityDirectory(env, { create = false } = {}) {

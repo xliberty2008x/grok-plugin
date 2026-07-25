@@ -10,10 +10,17 @@ import {
   isSuccessfulPromptStopReason
 } from "./acp-client.mjs";
 import { CompanionError } from "./errors.mjs";
+import {
+  assertExecutableAttestation,
+  captureGrokExecutableIdentity,
+  materializePinnedGrokExecutable,
+  sameExecutableAttestation
+} from "./executable-identity.mjs";
 import { redact, redactText } from "./redact.mjs";
 import { processGroupAlive, processGroupGone, processStartToken } from "./process-control.mjs";
 import {
   authenticateProviderBootstrapGuard,
+  authenticateWorktreeProvisioningBootstrapGuard,
   loadProviderGuard,
   registerProviderGuard,
   unregisterProviderGuard
@@ -27,11 +34,72 @@ const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const PROVIDER_BOOTSTRAP = path.join(path.dirname(fileURLToPath(import.meta.url)), "provider-bootstrap.mjs");
 const PROVIDER_BOOTSTRAP_SPEC_FD = 6;
 const MAX_PROVIDER_BOOTSTRAP_SPEC_BYTES = 64 * 1024;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+const EXACT_NONCE_ID = /^[0-9a-f]{32}$/;
+const OPAQUE_ID = /^[0-9a-f]{32,64}$/;
+const WORKTREE_PROVISIONING_PURPOSE = "worktree-provisioning";
+const WORKTREE_CONTROLLER_PROFILE_ID = "worktree-controller-v1";
+const WORKTREE_CONTROLLER_REQUEST_ALLOWLIST = Object.freeze([
+  "initialize",
+  "_x.ai/git/worktree/create",
+  "_x.ai/session/close"
+]);
+const WORKTREE_PROVISIONING_BINDING_KEYS = new Set([
+  "purpose",
+  "controlWorkspaceId",
+  "controlRoot",
+  "expectedExecutionRoot",
+  "executionBindingDigest",
+  "provisioningAttemptId",
+  "provisioningFence",
+  "holderId",
+  "providerSpawnIntentId"
+]);
 // One canonical provider-compatible schema. The public verdict is derived after validation.
 export const REVIEW_SCHEMA = Object.freeze(JSON.parse(
   fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8")
 ));
 const ALLOW_ENV = new Set(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "COLORTERM", "NO_COLOR", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "SystemRoot", "ComSpec", "PATHEXT"]);
+
+function exactRecord(value, keys) {
+  return Boolean(
+    value
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value).length === keys.size
+    && Object.keys(value).every((key) => keys.has(key))
+  );
+}
+
+function isWorktreeProvisioningBinding(binding) {
+  return binding?.purpose === WORKTREE_PROVISIONING_PURPOSE;
+}
+
+function validWorktreeProvisioningBinding(binding, root = null) {
+  return exactRecord(binding, WORKTREE_PROVISIONING_BINDING_KEYS)
+    && binding.purpose === WORKTREE_PROVISIONING_PURPOSE
+    && /^cws-[0-9a-f]{32}$/.test(binding.controlWorkspaceId || "")
+    && typeof binding.controlRoot === "string"
+    && path.isAbsolute(binding.controlRoot)
+    && path.normalize(binding.controlRoot) === binding.controlRoot
+    && (root === null || (
+      typeof root === "string"
+      && path.isAbsolute(root)
+      && path.normalize(root) === root
+      && root !== binding.controlRoot
+      && root !== binding.expectedExecutionRoot
+    ))
+    && typeof binding.expectedExecutionRoot === "string"
+    && path.isAbsolute(binding.expectedExecutionRoot)
+    && path.normalize(binding.expectedExecutionRoot) === binding.expectedExecutionRoot
+    && binding.expectedExecutionRoot !== binding.controlRoot
+    && SHA256_HEX.test(binding.executionBindingDigest || "")
+    && EXACT_NONCE_ID.test(binding.provisioningAttemptId || "")
+    && Number.isSafeInteger(binding.provisioningFence)
+    && binding.provisioningFence > 0
+    && OPAQUE_ID.test(binding.holderId || "")
+    && EXACT_NONCE_ID.test(binding.providerSpawnIntentId || "");
+}
 
 /** Hard-gate for every provider execution entry. Prefer this over process-identity errors on unsupported platforms. */
 export function assertProviderPlatform(platform = process.platform) {
@@ -511,43 +579,830 @@ function atomicPrivateFile(file, contents) {
   }
 }
 
-export function taskEnvironment(stateDir, root, profile, homeMarker = "task") {
+function pathsOverlap(left, right) {
+  const a = path.resolve(left);
+  const b = path.resolve(right);
+  return a === b
+    || a.startsWith(`${b}${path.sep}`)
+    || b.startsWith(`${a}${path.sep}`);
+}
+
+function executableFromPath(name, pathValue = process.env.PATH) {
+  if (typeof name !== "string"
+    || !/^[a-zA-Z0-9._-]+$/.test(name)
+    || typeof pathValue !== "string") {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "A trusted provider executable could not be resolved."
+    );
+  }
+  for (const directory of pathValue.split(path.delimiter)) {
+    if (!directory || !path.isAbsolute(directory)) continue;
+    const candidate = path.join(directory, name);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      const executableDirectory = fs.realpathSync(directory);
+      const commandPath = path.join(executableDirectory, name);
+      const executable = fs.realpathSync(commandPath);
+      const stat = fs.lstatSync(executable);
+      const parentStat = fs.lstatSync(executableDirectory);
+      if (stat.isFile()
+        && !stat.isSymbolicLink()
+        && parentStat.isDirectory()
+        && !parentStat.isSymbolicLink()) {
+        return Object.freeze({
+          commandPath,
+          executable,
+          executableDirectory
+        });
+      }
+    } catch {
+      // Continue to the next canonical PATH entry.
+    }
+  }
+  throw new CompanionError(
+    "E_CAPABILITY",
+    `The ${name} executable is unavailable on the trusted host PATH.`
+  );
+}
+
+function trustedGitInstallation(root, pathValue = process.env.PATH) {
+  const located = executableFromPath("git", pathValue);
+  const { commandPath, executable, executableDirectory } = located;
+  const canonicalWorkspace = fs.realpathSync(root);
+  if (pathsOverlap(executable, canonicalWorkspace)
+    || pathsOverlap(executableDirectory, canonicalWorkspace)) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Refusing a repository-controlled Git executable for official provisioning."
+    );
+  }
+  const installationCandidates = [
+    "/opt/homebrew",
+    "/usr/local"
+  ];
+  const installationRoot = installationCandidates.find((candidate) => (
+    executable.startsWith(`${candidate}${path.sep}`)
+  )) || path.dirname(executable);
+  const canonicalInstallationRoot = fs.realpathSync(installationRoot);
+  if (canonicalInstallationRoot === path.parse(canonicalInstallationRoot).root
+    || pathsOverlap(canonicalInstallationRoot, canonicalWorkspace)) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "The Git installation root is too broad or repository-controlled."
+    );
+  }
+  const stat = fs.statSync(executable);
+  const parentStat = fs.statSync(executableDirectory);
+  return Object.freeze({
+    commandPath,
+    executable,
+    executableDirectory,
+    installationRoot: canonicalInstallationRoot,
+    executableDigest: crypto
+      .createHash("sha256")
+      .update(fs.readFileSync(executable))
+      .digest("hex"),
+    device: stat.dev,
+    inode: stat.ino,
+    size: stat.size,
+    parentDevice: parentStat.dev,
+    parentInode: parentStat.ino
+  });
+}
+
+function recaptureTrustedGitInstallation(identity) {
+  const executableDirectory = fs.realpathSync(path.dirname(identity.commandPath));
+  const executable = fs.realpathSync(identity.commandPath);
+  const installationRoot = fs.realpathSync(identity.installationRoot);
+  const stat = fs.statSync(executable);
+  const parentStat = fs.statSync(executableDirectory);
+  return Object.freeze({
+    commandPath: path.join(executableDirectory, path.basename(identity.commandPath)),
+    executable,
+    executableDirectory,
+    installationRoot,
+    executableDigest: crypto
+      .createHash("sha256")
+      .update(fs.readFileSync(executable))
+      .digest("hex"),
+    device: stat.dev,
+    inode: stat.ino,
+    size: stat.size,
+    parentDevice: parentStat.dev,
+    parentInode: parentStat.ino
+  });
+}
+
+function sameTrustedGitInstallation(left, right) {
+  return Boolean(
+    left
+    && right
+    && left.commandPath === right.commandPath
+    && left.executable === right.executable
+    && left.executableDirectory === right.executableDirectory
+    && left.installationRoot === right.installationRoot
+    && left.executableDigest === right.executableDigest
+    && left.device === right.device
+    && left.inode === right.inode
+    && left.size === right.size
+    && left.parentDevice === right.parentDevice
+    && left.parentInode === right.parentInode
+  );
+}
+
+function canonicalGitCommonDirectory(gitInstallation, workspaceRoot) {
+  const gitEnvironment = controllerGitEnvironment(gitInstallation);
+  const run = spawnSync(
+    gitInstallation.executable,
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    {
+      cwd: workspaceRoot,
+      encoding: "utf8",
+      shell: false,
+      timeout: 10_000,
+      env: gitEnvironment
+    }
+  );
+  const value = String(run.stdout || "").trim();
+  if (run.status !== 0
+    || run.error
+    || !value
+    || !path.isAbsolute(value)
+    || path.normalize(value) !== value) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "The exact Git common directory could not be resolved for official provisioning."
+    );
+  }
+  const resolved = fs.realpathSync(value);
+  const stat = fs.lstatSync(resolved);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "The exact Git common directory is unsafe."
+    );
+  }
+  return resolved;
+}
+
+function controllerGitEnvironment(gitInstallation) {
+  const overrides = [
+    ["core.hooksPath", "/dev/null"],
+    ["core.fsmonitor", "false"],
+    ["core.attributesFile", "/dev/null"],
+    ["submodule.recurse", "false"]
+  ];
+  return childEnvironment({
+    PATH: gitInstallation.executableDirectory,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_CONFIG_COUNT: String(overrides.length),
+    ...Object.fromEntries(overrides.flatMap(([key, value], index) => [
+      [`GIT_CONFIG_KEY_${index}`, key],
+      [`GIT_CONFIG_VALUE_${index}`, value]
+    ]))
+  });
+}
+
+function boundedGitRun(gitInstallation, workspaceRoot, args, {
+  input = undefined,
+  maxBuffer = 8 * 1024 * 1024
+} = {}) {
+  const run = spawnSync(gitInstallation.executable, args, {
+    cwd: workspaceRoot,
+    encoding: null,
+    shell: false,
+    timeout: 10_000,
+    maxBuffer,
+    env: controllerGitEnvironment(gitInstallation),
+    ...(input === undefined ? {} : { input })
+  });
+  if (run.status !== 0 || run.error || run.signal) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "The bounded Git checkout-safety inspection failed closed."
+    );
+  }
+  return Buffer.isBuffer(run.stdout) ? run.stdout : Buffer.from(run.stdout || "");
+}
+
+function splitNulRecords(buffer, label) {
+  if (buffer.length === 0) return [];
+  if (buffer.at(-1) !== 0) {
+    throw new CompanionError("E_CAPABILITY", `${label} output was truncated.`);
+  }
+  const records = [];
+  let start = 0;
+  for (let index = 0; index < buffer.length; index += 1) {
+    if (buffer[index] !== 0) continue;
+    const record = buffer.subarray(start, index);
+    if (record.length === 0) {
+      throw new CompanionError("E_CAPABILITY", `${label} output was malformed.`);
+    }
+    records.push(record);
+    start = index + 1;
+  }
+  return records;
+}
+
+export function assertControllerGitCheckoutSafe({
+  gitExecutable,
+  gitExecutableDirectory,
+  gitInstallationRoot,
+  workspaceRoot,
+  baseCommit
+}) {
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(baseCommit || "")) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Checkout-safety inspection requires one exact base commit."
+    );
+  }
+  const gitInstallation = recaptureTrustedGitInstallation({
+    commandPath: path.join(gitExecutableDirectory, "git"),
+    executable: gitExecutable,
+    executableDirectory: gitExecutableDirectory,
+    installationRoot: gitInstallationRoot
+  });
+  if (gitInstallation.executable !== gitExecutable) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "The trusted Git executable changed before checkout-safety inspection."
+    );
+  }
+  const tracked = splitNulRecords(
+    boundedGitRun(
+      gitInstallation,
+      workspaceRoot,
+      ["ls-tree", "-r", "-z", "--name-only", baseCommit]
+    ),
+    "git ls-tree"
+  );
+  if (tracked.length > 100_000) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "The checkout-safety file inventory exceeded its bound."
+    );
+  }
+  if (tracked.length === 0) return Object.freeze({ trackedFiles: 0 });
+  const input = Buffer.concat(
+    tracked.flatMap((record) => [record, Buffer.from([0])])
+  );
+  const attributes = splitNulRecords(
+    boundedGitRun(
+      gitInstallation,
+      workspaceRoot,
+      [
+        "check-attr",
+        `--source=${baseCommit}`,
+        "-z",
+        "--stdin",
+        "filter"
+      ],
+      { input }
+    ),
+    "git check-attr"
+  );
+  if (attributes.length !== tracked.length * 3) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Git filter attribute inspection returned an inexact record count."
+    );
+  }
+  for (let index = 0; index < tracked.length; index += 1) {
+    const [file, attribute, value] = attributes.slice(index * 3, index * 3 + 3);
+    if (!file.equals(tracked[index])
+      || attribute.toString("utf8") !== "filter"
+      || !["unspecified", "unset"].includes(value.toString("utf8"))) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        "Repository checkout attributes could execute an external Git filter."
+      );
+    }
+  }
+  return Object.freeze({ trackedFiles: tracked.length });
+}
+
+function captureGitInfoAttributesBinding(gitCommonDir) {
+  const attributesPath = path.join(gitCommonDir, "info", "attributes");
+  try {
+    const stat = fs.lstatSync(attributesPath);
+    if (!stat.isFile()
+      || stat.isSymbolicLink()
+      || stat.size > 1024 * 1024) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        "Git info attributes must be absent or one bounded regular file."
+      );
+    }
+    return Object.freeze({
+      path: attributesPath,
+      state: "present",
+      device: stat.dev,
+      inode: stat.ino,
+      size: stat.size,
+      digest: crypto
+        .createHash("sha256")
+        .update(fs.readFileSync(attributesPath))
+        .digest("hex")
+    });
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    return Object.freeze({
+      path: attributesPath,
+      state: "absent"
+    });
+  }
+}
+
+function assertNoGitObjectAlternates(gitCommonDir) {
+  if (typeof process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES === "string"
+    && process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES.length > 0) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Git alternate object directories are not authorized for official provisioning."
+    );
+  }
+  const alternatesPath = path.join(
+    gitCommonDir,
+    "objects",
+    "info",
+    "alternates"
+  );
+  try {
+    const stat = fs.lstatSync(alternatesPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 0) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        "Git object alternates are not authorized for official provisioning."
+      );
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+function sameGitInfoAttributesBinding(left, right) {
+  return Boolean(
+    left
+    && right
+    && left.path === right.path
+    && left.state === right.state
+    && (left.state === "absent"
+      || (
+        left.device === right.device
+        && left.inode === right.inode
+        && left.size === right.size
+        && left.digest === right.digest
+      ))
+  );
+}
+
+function ensureGitWorktreesMetadataRoot(gitCommonDir) {
+  const metadataRoot = path.join(gitCommonDir, "worktrees");
+  try {
+    fs.mkdirSync(metadataRoot, { mode: 0o700 });
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+  const resolved = fs.realpathSync(metadataRoot);
+  const stat = fs.lstatSync(resolved);
+  if (resolved !== metadataRoot
+    || !stat.isDirectory()
+    || stat.isSymbolicLink()) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "The exact Git worktree metadata directory is unsafe."
+    );
+  }
+  return resolved;
+}
+
+function canonicalProvisioningDestination({
+  parent,
+  expectedRoot,
+  stateDir
+}) {
+  if (typeof parent !== "string"
+    || typeof expectedRoot !== "string"
+    || !path.isAbsolute(parent)
+    || !path.isAbsolute(expectedRoot)
+    || path.normalize(parent) !== parent
+    || path.normalize(expectedRoot) !== expectedRoot) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Official provisioning requires one exact private destination parent and child."
+    );
+  }
+  const canonicalStateDir = fs.realpathSync(stateDir);
+  const canonicalParent = fs.realpathSync(parent);
+  const parentStat = fs.lstatSync(canonicalParent);
+  const resolvedRoot = path.resolve(expectedRoot);
+  const relativeParent = path.relative(canonicalStateDir, canonicalParent);
+  if (canonicalParent !== parent
+    || !relativeParent
+    || relativeParent.startsWith("..")
+    || path.isAbsolute(relativeParent)
+    || canonicalParent === path.resolve(stateDir, "worktrees")
+    || path.dirname(resolvedRoot) !== canonicalParent
+    || resolvedRoot === canonicalParent
+    || !parentStat.isDirectory()
+    || parentStat.isSymbolicLink()
+    || (parentStat.mode & 0o077) !== 0
+    || fs.readdirSync(canonicalParent).length !== 0) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Official provisioning destination parent is shared, aliased, nonempty, or not private."
+    );
+  }
+  try {
+    fs.lstatSync(resolvedRoot);
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Official provisioning destination child must not exist before create."
+    );
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return Object.freeze({
+    parent: canonicalParent,
+    expectedRoot: resolvedRoot
+  });
+}
+
+function canonicalExistingRoot(value) {
+  try { return fs.realpathSync(value); }
+  catch { return path.resolve(value); }
+}
+
+function broadTemporaryRoots() {
+  return [...new Set([
+    os.tmpdir(),
+    "/tmp",
+    "/private/tmp",
+    process.env.TMPDIR,
+    process.env.TMP,
+    process.env.TEMP
+  ]
+    .filter((value) => typeof value === "string" && path.isAbsolute(value))
+    .map(canonicalExistingRoot))];
+}
+
+function assertControllerAuthorityOutsideBroadTemp({
+  controlRoot,
+  gitCommonDir,
+  stateDir,
+  destinationParent
+}) {
+  const temporaryRoots = broadTemporaryRoots();
+  for (const [label, authorityRoot] of [
+    ["control source", controlRoot],
+    ["Git common directory", gitCommonDir],
+    ["shared controller state", stateDir],
+    ["destination parent", destinationParent]
+  ]) {
+    const canonical = canonicalExistingRoot(authorityRoot);
+    if (temporaryRoots.some((temporaryRoot) => (
+      canonical === temporaryRoot
+      || canonical.startsWith(`${temporaryRoot}${path.sep}`)
+    ))) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        `The ${label} overlaps a broad strict-sandbox temporary write grant.`
+      );
+    }
+  }
+}
+
+function assertControllerGitSeparation({
+  gitInstallation,
+  controlRoot,
+  stateDir,
+  home,
+  destinationRoot
+}) {
+  const temporaryRoots = [
+    os.tmpdir(),
+    process.env.TMPDIR,
+    process.env.TMP,
+    process.env.TEMP
+  ].filter((value) => typeof value === "string" && path.isAbsolute(value));
+  const forbidden = [
+    controlRoot,
+    stateDir,
+    home,
+    destinationRoot,
+    ...temporaryRoots
+  ].map(canonicalExistingRoot);
+  for (const trustedPath of [
+    gitInstallation.executable,
+    gitInstallation.executableDirectory,
+    gitInstallation.installationRoot
+  ]) {
+    if (forbidden.some((candidate) => pathsOverlap(trustedPath, candidate))) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        "The trusted Git installation overlaps controller-owned or temporary state."
+      );
+    }
+  }
+}
+
+export function taskEnvironment(
+  stateDir,
+  root,
+  profile,
+  homeMarker = "task",
+  {
+    worktreeProvisioningController = false,
+    worktreeProvisioningDestinationParent = null,
+    worktreeProvisioningExpectedRoot = null,
+    worktreeProvisioningGitCommonDir = null,
+    worktreeProvisioningBaseCommit = null
+  } = {}
+) {
   if (!profile?.id || !/^rescue-(read|write|report)-v3$/.test(profile.id)) throw new CompanionError("E_STATE", "A qualified isolated task profile is required.");
   const lineage = safeMarker(homeMarker);
   const home = path.join(stateDir, "task-homes", lineage), grokHome = path.join(home, ".grok");
-  privateDirectory(home);
-  privateDirectory(grokHome);
-  atomicPrivateFile(path.join(grokHome, "config.toml"), `[skills]\nignore = [${JSON.stringify(fs.realpathSync(root))}]\n\n[subagents]\nenabled = false\n\n[features]\nlsp_tools = false\n`);
-  const gitPaths = protectedGitPaths(root);
-  const sandboxProfile = `companion_${crypto.createHash("sha256").update(`${lineage}:${profile.id}`).digest("hex").slice(0, 20)}`;
-  atomicPrivateFile(path.join(grokHome, "sandbox.toml"), `[profiles.${sandboxProfile}]\nextends = "strict"\nrestrict_network = true\ndeny = [${gitPaths.map((item) => JSON.stringify(item)).join(", ")}]\n`);
-  const authPath = process.env.GROK_AUTH_PATH || path.join(os.homedir(), ".grok", "auth.json");
-  if (!fs.existsSync(authPath)) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication is unavailable. Run \`grok login\`, then ${hostCommand("setup")}.`);
-  ensureFreshCachedCredential(authPath);
-  const knownSecrets = [writeReviewCredential(authPath, path.join(grokHome, "auth.json"), { refresh: true })];
-  const env = childEnvironment({
-    HOME: home,
-    USERPROFILE: home,
-    GROK_HOME: grokHome,
-    GROK_FOLDER_TRUST: "1",
-    GROK_SUBAGENTS: "0",
-    GROK_MEMORY: "0",
-    GROK_WEB_FETCH: "0",
-    GROK_LSP_TOOLS: "0"
-  });
-  delete env.HOMEDRIVE;
-  delete env.HOMEPATH;
-  const authFile = path.join(grokHome, "auth.json");
-  return {
-    env,
-    home,
-    grokHome,
-    knownSecrets,
-    sandboxProfile,
-    revokeCredential() {
-      try { fs.unlinkSync(authFile); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  let stagedCredential = null;
+  let stagedCredentialRevoked = false;
+  let controllerHomeCreated = false;
+  try {
+    if (worktreeProvisioningController) {
+      privateDirectory(path.dirname(home));
+      try {
+        fs.mkdirSync(home, { mode: 0o700 });
+        controllerHomeCreated = true;
+      } catch (error) {
+        if (error?.code === "EEXIST") {
+          throw new CompanionError(
+            "E_STATE",
+            "A worktree controller home already exists; refusing ambiguous ownership."
+          );
+        }
+        throw error;
+      }
+      privateDirectory(home);
+    } else {
+      privateDirectory(home);
     }
-  };
+    privateDirectory(grokHome);
+    const controllerCwd = worktreeProvisioningController
+      ? path.join(home, "controller-cwd")
+      : null;
+    if (controllerCwd) privateDirectory(controllerCwd);
+    const controlRoot = fs.realpathSync(root);
+    atomicPrivateFile(path.join(grokHome, "config.toml"), `[skills]\nignore = [${JSON.stringify(controlRoot)}]\n\n[subagents]\nenabled = false\n\n[features]\nlsp_tools = false\n`);
+    const gitPaths = worktreeProvisioningController ? [] : protectedGitPaths(root);
+    const trustedPath = process.env.PATH;
+    const gitInstallation = worktreeProvisioningController
+      ? trustedGitInstallation(root, trustedPath)
+      : null;
+    const gitInstallationRoot = gitInstallation?.installationRoot || null;
+    const provisioningDestination = worktreeProvisioningController
+      ? canonicalProvisioningDestination({
+          parent: worktreeProvisioningDestinationParent,
+          expectedRoot: worktreeProvisioningExpectedRoot,
+          stateDir
+        })
+      : null;
+    const discoveredGitCommonDir = gitInstallation
+      ? canonicalGitCommonDirectory(gitInstallation, controlRoot)
+      : null;
+    const gitCommonDir = gitInstallation
+      ? (() => {
+          if (typeof worktreeProvisioningGitCommonDir !== "string"
+            || !path.isAbsolute(worktreeProvisioningGitCommonDir)
+            || path.normalize(worktreeProvisioningGitCommonDir)
+              !== worktreeProvisioningGitCommonDir
+            || fs.realpathSync(worktreeProvisioningGitCommonDir)
+              !== discoveredGitCommonDir) {
+            throw new CompanionError(
+              "E_CAPABILITY",
+              "The caller-supplied Git common directory does not match the exact source repository."
+            );
+          }
+          return discoveredGitCommonDir;
+        })()
+      : null;
+    if (worktreeProvisioningController
+      && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(
+        worktreeProvisioningBaseCommit || ""
+      )) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        "Official provisioning requires one exact base commit."
+      );
+    }
+    if (gitInstallation) {
+      assertControllerAuthorityOutsideBroadTemp({
+        controlRoot,
+        gitCommonDir,
+        stateDir,
+        destinationParent: provisioningDestination.parent
+      });
+      assertControllerGitSeparation({
+        gitInstallation,
+        controlRoot,
+        stateDir,
+        home,
+        destinationRoot: provisioningDestination.parent
+      });
+    }
+    if (gitCommonDir) assertNoGitObjectAlternates(gitCommonDir);
+    const gitWorktreesMetadataRoot = gitCommonDir
+      ? ensureGitWorktreesMetadataRoot(gitCommonDir)
+      : null;
+    const gitInfoAttributesBinding = gitCommonDir
+      ? captureGitInfoAttributesBinding(gitCommonDir)
+      : null;
+    const sandboxProfile = `companion_${crypto.createHash("sha256").update(
+      `${lineage}:${profile.id}:${worktreeProvisioningController ? "worktree-provisioning" : "task"}`
+    ).digest("hex").slice(0, 20)}`;
+    const readOnly = [
+      ...(gitInstallationRoot ? [controlRoot, gitCommonDir, gitInstallationRoot] : [])
+    ].filter((value, index, values) => value && values.indexOf(value) === index);
+    const readWrite = [
+      provisioningDestination?.parent,
+      gitWorktreesMetadataRoot
+    ].filter(Boolean);
+    atomicPrivateFile(
+      path.join(grokHome, "sandbox.toml"),
+      [
+        `[profiles.${sandboxProfile}]`,
+        'extends = "strict"',
+        "restrict_network = true",
+        ...(readOnly.length
+          ? [`read_only = [${readOnly.map((item) => JSON.stringify(item)).join(", ")}]`]
+          : []),
+        ...(readWrite.length
+          ? [`read_write = [${readWrite.map((item) => JSON.stringify(item)).join(", ")}]`]
+          : []),
+        `deny = [${gitPaths.map((item) => JSON.stringify(item)).join(", ")}]`,
+        ""
+      ].join("\n")
+    );
+    const authPath = process.env.GROK_AUTH_PATH || path.join(os.homedir(), ".grok", "auth.json");
+    if (!fs.existsSync(authPath)) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication is unavailable. Run \`grok login\`, then ${hostCommand("setup")}.`);
+    ensureFreshCachedCredential(authPath);
+    const authFile = path.join(grokHome, "auth.json");
+    const directoryIdentities = worktreeProvisioningController
+      ? [home, grokHome].map(existingPrivateDirectoryIdentity)
+      : null;
+    const knownSecrets = worktreeProvisioningController
+      ? (() => {
+          stagedCredential = stageRevocableTaskCredential(
+            authPath,
+            authFile,
+            directoryIdentities
+          );
+          return [stagedCredential.key];
+        })()
+      : [writeReviewCredential(authPath, authFile, { refresh: true })];
+    const gitEnv = gitInstallation
+      ? controllerGitEnvironment(gitInstallation)
+      : {};
+    if (gitInstallation) {
+      assertControllerGitCheckoutSafe({
+        gitExecutable: gitInstallation.executable,
+        gitExecutableDirectory: gitInstallation.executableDirectory,
+        gitInstallationRoot,
+        workspaceRoot: controlRoot,
+        baseCommit: worktreeProvisioningBaseCommit
+      });
+    }
+    const env = childEnvironment({
+      ...gitEnv,
+      HOME: home,
+      USERPROFILE: home,
+      GROK_HOME: grokHome,
+      GROK_FOLDER_TRUST: "1",
+      GROK_SUBAGENTS: "0",
+      GROK_MEMORY: "0",
+      GROK_WEB_FETCH: "0",
+      GROK_LSP_TOOLS: "0",
+      ...(gitInstallation
+        ? { PATH: gitInstallation.executableDirectory }
+        : {})
+    });
+    delete env.HOMEDRIVE;
+    delete env.HOMEPATH;
+    return {
+      env,
+      home,
+      grokHome,
+      knownSecrets,
+      sandboxProfile,
+      ...(controllerCwd ? {
+        controllerCwd,
+        controllerProfileId: WORKTREE_CONTROLLER_PROFILE_ID
+      } : {}),
+      ...(gitInstallationRoot ? { gitInstallationRoot } : {}),
+      ...(gitCommonDir ? { gitCommonDir, gitWorktreesMetadataRoot } : {}),
+      ...(worktreeProvisioningController ? {
+        worktreeProvisioningBaseCommit,
+        gitInfoAttributesState: gitInfoAttributesBinding.state,
+        ...(gitInfoAttributesBinding.state === "present"
+          ? { gitInfoAttributesDigest: gitInfoAttributesBinding.digest }
+          : {})
+      } : {}),
+      ...(gitInstallation ? {
+        gitExecutable: gitInstallation.executable,
+        gitExecutableDirectory: gitInstallation.executableDirectory,
+        gitExecutableDigest: gitInstallation.executableDigest,
+        verifyGitExecutable() {
+          const current = recaptureTrustedGitInstallation(gitInstallation);
+          if (!sameTrustedGitInstallation(gitInstallation, current)) {
+            throw new CompanionError(
+              "E_CAPABILITY",
+              "The trusted Git executable or its parent changed before official provisioning."
+            );
+          }
+          const currentInfoAttributes = captureGitInfoAttributesBinding(
+            gitCommonDir
+          );
+          assertNoGitObjectAlternates(gitCommonDir);
+          if (!sameGitInfoAttributesBinding(
+            gitInfoAttributesBinding,
+            currentInfoAttributes
+          )) {
+            throw new CompanionError(
+              "E_CAPABILITY",
+              "Git info attributes changed before official provisioning."
+            );
+          }
+          assertControllerGitCheckoutSafe({
+            gitExecutable: current.executable,
+            gitExecutableDirectory: current.executableDirectory,
+            gitInstallationRoot: current.installationRoot,
+            workspaceRoot: controlRoot,
+            baseCommit: worktreeProvisioningBaseCommit
+          });
+          return current;
+        }
+      } : {}),
+      ...(provisioningDestination ? {
+        provisioningDestinationParent: provisioningDestination.parent,
+        provisioningExpectedRoot: provisioningDestination.expectedRoot
+      } : {}),
+      revokeCredential() {
+        if (stagedCredential) {
+          if (stagedCredentialRevoked) return;
+          try {
+            // Grok may atomically refresh auth.json during initialize. Rebind
+            // the revocation handle to that exact private replacement before
+            // neutralizing and unlinking it.
+            stagedCredential.refresh();
+          } catch (error) {
+            if (error?.code !== "ENOENT") throw error;
+          }
+          stagedCredential.revoke();
+          stagedCredentialRevoked = true;
+          return;
+        }
+        try { fs.unlinkSync(authFile); } catch (error) { if (error.code !== "ENOENT") throw error; }
+      },
+      assertCredentialAbsent() {
+        if (!worktreeProvisioningController) return;
+        if (!directoryIdentities.every(directoryIdentityMatches)) {
+          throw new CompanionError(
+            "E_STATE",
+            "The controller credential parent changed before absence proof."
+          );
+        }
+        try {
+          fs.lstatSync(authFile);
+          throw new CompanionError(
+            "E_STATE",
+            "The controller credential remained after initialization."
+          );
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      }
+    };
+  } catch (error) {
+    if (worktreeProvisioningController) {
+      let cleanupFailure = null;
+      try { stagedCredential?.revoke(); }
+      catch (failure) { cleanupFailure = failure; }
+      try {
+        if (controllerHomeCreated) {
+          fs.rmSync(home, { recursive: true, force: true });
+        }
+      }
+      catch (failure) { cleanupFailure ||= failure; }
+      if (cleanupFailure) {
+        throw new CompanionError(
+          "E_STATE",
+          "The failed controller environment could not be removed transactionally."
+        );
+      }
+    }
+    throw error;
+  }
 }
 
 /**
@@ -823,7 +1678,16 @@ async function cleanupFailedProviderStart({ child, identity, root, marker, stage
 function spawnArgs({ root, profile, model, effort, leaderSocket, taskProfile = null }) {
   const readOnlyProfile = profile.id === "rescue-read-v3" || profile.id === "rescue-report-v3" || profile.id === "setup-probe-v2";
   const args = ["--cwd", root, "--sandbox", profile.sandbox, "--permission-mode", profile.permissionMode, "--deny", "WebFetch", "--deny", "MCPTool", "--disable-web-search", "--no-subagents", "--no-memory", "--no-plan"];
-  if (readOnlyProfile) args.push("--deny", "Bash", "--deny", "Edit", "--deny", "Write");
+  if (profile.id === WORKTREE_CONTROLLER_PROFILE_ID) {
+    args.push(
+      "--deny", "Bash",
+      "--deny", "Edit",
+      "--deny", "Write",
+      "--deny", "Read",
+      "--deny", "Grep",
+      "--deny", "WebSearch"
+    );
+  } else if (readOnlyProfile) args.push("--deny", "Bash", "--deny", "Edit", "--deny", "Write");
   else if (profile.id === "rescue-write-v3") args.push("--deny", "Bash");
   // Setup probe uses permissionMode dontAsk, so it never receives unattended --always-approve expansion.
   if (profile.permissionMode === "bypassPermissions") args.push("--always-approve");
@@ -1020,13 +1884,34 @@ export function selectAcpPermissionOption(options, { write = false } = {}) {
   return list.find((option) => isRejectOrDeny(option)) || null;
 }
 
-export function createProviderBootstrapLaunch({ root, marker, owner, binding, binary, args }) {
+export function createProviderBootstrapLaunch({
+  root,
+  marker,
+  owner,
+  binding,
+  binary,
+  executableIdentity = null,
+  args
+}) {
+  const worktreeProvisioning = isWorktreeProvisioningBinding(binding);
   if (!/^[a-zA-Z0-9._-]{1,80}$/.test(marker || "")
     || typeof owner !== "string"
     || !owner
-    || !Number.isSafeInteger(binding?.providerGeneration)
-    || binding.providerGeneration < 1
-    || !/^[0-9a-f]{32}$/.test(binding?.providerSpawnIntentId || "")) {
+    || (worktreeProvisioning
+      ? !validWorktreeProvisioningBinding(binding, root)
+      : (
+        !Number.isSafeInteger(binding?.providerGeneration)
+        || binding.providerGeneration < 1
+        || !EXACT_NONCE_ID.test(binding?.providerSpawnIntentId || "")
+      ))
+    || (worktreeProvisioning && (() => {
+      try {
+        assertExecutableAttestation(executableIdentity);
+        return false;
+      } catch {
+        return true;
+      }
+    })())) {
     throw new CompanionError("E_STATE", "Provider bootstrap launch binding is malformed.");
   }
   const specPayload = `${JSON.stringify({
@@ -1036,18 +1921,29 @@ export function createProviderBootstrapLaunch({ root, marker, owner, binding, bi
     owner,
     binding,
     binary,
+    ...(worktreeProvisioning ? { executableIdentity } : {}),
     args
   })}\n`;
   if (Buffer.byteLength(specPayload, "utf8") > MAX_PROVIDER_BOOTSTRAP_SPEC_BYTES) {
     throw new CompanionError("E_USAGE", "Provider bootstrap specification exceeds its private channel limit.");
   }
   return Object.freeze({
-    argv: Object.freeze([
-      PROVIDER_BOOTSTRAP,
-      "--job-marker", marker,
-      "--provider-generation", String(binding.providerGeneration),
-      "--spawn-intent-id", binding.providerSpawnIntentId
-    ]),
+    argv: Object.freeze(worktreeProvisioning
+      ? [
+          PROVIDER_BOOTSTRAP,
+          "--job-marker", marker,
+          "--bootstrap-purpose", binding.purpose,
+          "--provisioning-attempt-id", binding.provisioningAttemptId,
+          "--provisioning-fence", String(binding.provisioningFence),
+          "--holder-id", binding.holderId,
+          "--spawn-intent-id", binding.providerSpawnIntentId
+        ]
+      : [
+          PROVIDER_BOOTSTRAP,
+          "--job-marker", marker,
+          "--provider-generation", String(binding.providerGeneration),
+          "--spawn-intent-id", binding.providerSpawnIntentId
+        ]),
     specPayload
   });
 }
@@ -1123,10 +2019,131 @@ export function publishProviderBootstrapSpec(child, specPayload, { timeoutMs = 5
   });
 }
 
-function waitForProviderBootstrapReady(child, cancelRequested, {
+export function assertProviderBootstrapReadyMessage(
+  message,
+  binding,
+  expectedExecutableIdentity = null
+) {
+  const worktreeProvisioning = isWorktreeProvisioningBinding(binding);
+  const writeExecution = !worktreeProvisioning
+    && Object.hasOwn(binding || {}, "executionBindingDigest");
+  const keys = new Set([
+    "type",
+    "grokPid",
+    "version",
+    ...(worktreeProvisioning
+      ? [
+          "purpose",
+          "executionBindingDigest",
+          "provisioningAttemptId",
+          "provisioningFence",
+          "holderId",
+          "providerSpawnIntentId",
+          "executableIdentity"
+        ]
+      : (writeExecution ? ["executionBindingDigest"] : []))
+  ]);
+  const valid = exactRecord(message, keys)
+    && message.type === "provider-ready"
+    && Number.isInteger(message.grokPid)
+    && message.grokPid > 0
+    && /^\d+\.\d+\.\d+$/.test(message.version || "")
+    && (worktreeProvisioning
+      ? (
+        validWorktreeProvisioningBinding(binding)
+        && message.purpose === binding.purpose
+        && message.executionBindingDigest === binding.executionBindingDigest
+        && message.provisioningAttemptId === binding.provisioningAttemptId
+        && message.provisioningFence === binding.provisioningFence
+        && message.holderId === binding.holderId
+        && message.providerSpawnIntentId === binding.providerSpawnIntentId
+        && sameExecutableAttestation(
+          message.executableIdentity,
+          expectedExecutableIdentity
+        )
+      )
+      : (
+        !writeExecution
+        || (
+          SHA256_HEX.test(binding.executionBindingDigest || "")
+          && message.executionBindingDigest === binding.executionBindingDigest
+        )
+      ));
+  if (!valid) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Provider bootstrap readiness was not exactly bound."
+    );
+  }
+  return message;
+}
+
+export function assertProviderBootstrapPromotionMessage(message, binding) {
+  const worktreeProvisioning = isWorktreeProvisioningBinding(binding);
+  const writeExecution = !worktreeProvisioning
+    && Object.hasOwn(binding || {}, "executionBindingDigest");
+  const keys = new Set([
+    "type",
+    "marker",
+    ...(worktreeProvisioning
+      ? [
+          "purpose",
+          "executionBindingDigest",
+          "provisioningAttemptId",
+          "provisioningFence",
+          "holderId",
+          "providerSpawnIntentId"
+        ]
+      : [
+          "providerGeneration",
+          "providerSpawnIntentId",
+          ...(writeExecution ? ["executionBindingDigest"] : [])
+        ])
+  ]);
+  const valid = exactRecord(message, keys)
+    && message.type === "provider-promoted"
+    && message.marker === binding?.marker
+    && (worktreeProvisioning
+      ? (
+        validWorktreeProvisioningBinding(
+          Object.fromEntries(
+            Object.entries(binding).filter(([key]) => key !== "marker")
+          )
+        )
+        && message.purpose === binding.purpose
+        && message.executionBindingDigest === binding.executionBindingDigest
+        && message.provisioningAttemptId === binding.provisioningAttemptId
+        && message.provisioningFence === binding.provisioningFence
+        && message.holderId === binding.holderId
+        && message.providerSpawnIntentId === binding.providerSpawnIntentId
+      )
+      : (
+        message.providerGeneration === binding?.providerGeneration
+        && message.providerSpawnIntentId === binding?.providerSpawnIntentId
+        && (!writeExecution || (
+          SHA256_HEX.test(binding.executionBindingDigest || "")
+          && message.executionBindingDigest === binding.executionBindingDigest
+        ))
+      ));
+  if (!valid) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Provider bootstrap promotion acknowledgement was not exactly bound."
+    );
+  }
+  return message;
+}
+
+function waitForProviderBootstrapReady(
+  child,
+  cancelRequested,
+  binding,
+  expectedExecutableIdentity,
+  {
   timeoutMs = 10_000,
   pollMs = 50
-} = {}) {
+  } = {}
+) {
   const readiness = child?.stdio?.[3];
   if (!readiness) {
     return Promise.reject(new CompanionError("E_PROTOCOL", "Provider bootstrap readiness channel is unavailable."));
@@ -1165,6 +2182,10 @@ function waitForProviderBootstrapReady(child, cancelRequested, {
       }
       const newline = buffer.indexOf("\n");
       if (newline < 0) return;
+      if (buffer.slice(newline + 1).trim()) {
+        finish(reject, new CompanionError("E_PROTOCOL", "Provider bootstrap readiness contained extra data."));
+        return;
+      }
       let message;
       try { message = JSON.parse(buffer.slice(0, newline)); }
       catch {
@@ -1172,7 +2193,14 @@ function waitForProviderBootstrapReady(child, cancelRequested, {
         return;
       }
       if (message?.type === "provider-ready" && Number.isInteger(message.grokPid)) {
-        finish(resolve, message);
+        try {
+          finish(resolve, assertProviderBootstrapReadyMessage(
+            message,
+            binding,
+            expectedExecutableIdentity
+          ));
+        }
+        catch (error) { finish(reject, error); }
         return;
       }
       finish(reject, new CompanionError(
@@ -1264,20 +2292,21 @@ export function promoteProviderBootstrap(child, binding, { timeoutMs = 5_000 } =
       }
       const newline = buffer.indexOf("\n");
       if (newline < 0) return;
+      if (buffer.slice(newline + 1).trim()) {
+        finish(reject, new CompanionError(
+          "E_PROTOCOL",
+          "Provider bootstrap promotion acknowledgement contained extra data."
+        ));
+        return;
+      }
       let message;
       try { message = JSON.parse(buffer.slice(0, newline)); }
       catch {
         finish(reject, new CompanionError("E_PROTOCOL", "Provider bootstrap promotion acknowledgement was malformed."));
         return;
       }
-      if (message?.type !== "provider-promoted"
-        || message.marker !== binding?.marker
-        || message.providerGeneration !== binding?.providerGeneration
-        || message.providerSpawnIntentId !== binding?.providerSpawnIntentId) {
-        finish(reject, new CompanionError("E_PROCESS_IDENTITY", "Provider bootstrap promotion acknowledgement was not exactly bound."));
-        return;
-      }
-      finish(resolve, message);
+      try { finish(resolve, assertProviderBootstrapPromotionMessage(message, binding)); }
+      catch (error) { finish(reject, error); }
     };
     control.on("error", onControlError);
     acknowledgement.on("data", onData);
@@ -1299,6 +2328,127 @@ export function promoteProviderBootstrap(child, binding, { timeoutMs = 5_000 } =
   });
 }
 
+function authenticateBoundBootstrapGuard(
+  root,
+  marker,
+  identity,
+  binding,
+  env = process.env
+) {
+  return isWorktreeProvisioningBinding(binding)
+    ? authenticateWorktreeProvisioningBootstrapGuard(
+        root,
+        marker,
+        identity,
+        binding,
+        env
+      )
+    : authenticateProviderBootstrapGuard(root, marker, identity, binding, env);
+}
+
+export async function recordBoundBootstrapNoChild({
+  providerLaunch,
+  preparedLaunch,
+  worktreeProvisioning,
+  resolution,
+  processIdentity = null,
+  expectedJournalDigest = null
+}) {
+  const intentId = preparedLaunch?.intent?.intentId;
+  if (!worktreeProvisioning) {
+    return providerLaunch.noChild({ intentId, resolution });
+  }
+  const observedAt = new Date().toISOString();
+  const cleanupProof = processIdentity
+    ? {
+        processIdentity,
+        processGroupGone: true,
+        providerGuardAbsent: true,
+        observedAt
+      }
+    : null;
+  const settlement = await providerLaunch.noChild({
+    intentId,
+    providerSpawnIntentId: intentId,
+    expectedJournalDigest,
+    resolution,
+    processIdentity,
+    cleanupProof
+  });
+  const job = settlement?.job;
+  const durableIntent = job?.provisioningRuntime?.intent;
+  const durableProof = job?.provisioningRuntime?.cleanupProof;
+  const cleanupBound = processIdentity
+    ? (
+        durableProof?.processGroupGone === true
+        && durableProof?.providerGuardAbsent === true
+        && durableProof.processIdentity?.pid === processIdentity.pid
+        && durableProof.processIdentity?.startToken === processIdentity.startToken
+        && durableProof.processIdentity?.processGroupId === processIdentity.processGroupId
+      )
+    : durableProof === null;
+  const terminalSettled = typeof settlement?.settled === "boolean"
+    && typeof settlement?.replayed === "boolean"
+    && (settlement.settled || settlement.replayed)
+    && job?.status === "failed"
+    && job?.provisioning?.state === "failed"
+    && durableIntent?.intentId === intentId
+    && durableIntent?.providerSpawnIntentId === intentId
+    && durableIntent?.status === "no-child"
+    && durableIntent?.resolution === resolution
+    && cleanupBound;
+  const cleanupPendingSettled = Boolean(
+    processIdentity
+    && typeof settlement?.retained === "boolean"
+    && typeof settlement?.replayed === "boolean"
+    && (settlement.retained || settlement.replayed)
+    && job?.status === "queued"
+    && job?.provisioning?.state === "cleanup_pending"
+    && job.provisioning.previousJournalDigest === expectedJournalDigest
+    && durableIntent?.intentId === intentId
+    && durableIntent?.providerSpawnIntentId === intentId
+    && durableIntent?.status === "registered"
+    && durableIntent?.resolution === null
+    && cleanupBound
+  );
+  if (!terminalSettled && !cleanupPendingSettled) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Worktree provisioning no-child outcome was not durably cleanup-bound."
+    );
+  }
+  return settlement;
+}
+
+export async function settleWorktreeBootstrapRegistrationFailure({
+  providerLaunch,
+  preparedLaunch,
+  processIdentity,
+  cleanupProof
+}) {
+  if (typeof providerLaunch?.settleRegistrationFailure !== "function") {
+    return Object.freeze({
+      reconciled: false,
+      retainedPreparedIntent: true
+    });
+  }
+  const outcome = await providerLaunch.settleRegistrationFailure({
+    intentId: preparedLaunch.intent.intentId,
+    providerSpawnIntentId: preparedLaunch.intent.intentId,
+    expectedPlannedJournalDigest:
+      preparedLaunch.intent.expectedPlannedJournalDigest,
+    processIdentity,
+    cleanupProof
+  });
+  if (outcome?.reconciled !== true) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Worktree bootstrap registration failure was not durably reconciled."
+    );
+  }
+  return outcome;
+}
+
 export async function cleanupBoundBootstrapStart({
   child,
   identity,
@@ -1315,7 +2465,7 @@ export async function cleanupBoundBootstrapStart({
     try {
       const loaded = loadProviderGuard(root, marker);
       exactGuard = loaded
-        ? authenticateProviderBootstrapGuard(root, marker, identity, guardBinding, env)
+        ? authenticateBoundBootstrapGuard(root, marker, identity, guardBinding, env)
         : null;
     }
     catch (error) { throw attachProviderCleanupIdentity(error, identity); }
@@ -1330,35 +2480,150 @@ export async function cleanupBoundBootstrapStart({
 export async function openProvider({ root, profile, model = null, effort = null, stateDir, jobMarker = "probe", environment = null, knownSecrets = environment?.knownSecrets || [], cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, testHooks = null }) {
   assertProviderPlatform();
   const boundBootstrap = Boolean(guardBinding);
-  const binary = discoverGrok();
+  const worktreeProvisioningBootstrap = isWorktreeProvisioningBinding(guardBinding);
+  if (worktreeProvisioningBootstrap
+    && (
+      profile?.id !== "rescue-write-v3"
+      || environment?.controllerProfileId !== WORKTREE_CONTROLLER_PROFILE_ID
+      || typeof environment?.controllerCwd !== "string"
+      || !path.isAbsolute(environment.controllerCwd)
+      || fs.realpathSync(environment.controllerCwd)
+        !== environment.controllerCwd
+      || environment.controllerCwd === root
+      || model !== null
+      || effort !== null
+    )) {
+    throw new CompanionError(
+      "E_SECURITY_PROFILE",
+      "Worktree provisioning requires the private no-model controller profile."
+    );
+  }
+  const runtimeProfile = worktreeProvisioningBootstrap
+    ? Object.freeze({
+        ...profile,
+        id: WORKTREE_CONTROLLER_PROFILE_ID,
+        sandbox: environment.sandboxProfile,
+        permissionMode: "dontAsk",
+        agentProfileDigest: null
+      })
+    : profile;
+  const providerCwd = worktreeProvisioningBootstrap
+    ? environment.controllerCwd
+    : root;
+  const durableBootstrapCallbacksPresent = !boundBootstrap || (
+    typeof providerLaunch?.prepare === "function"
+    && typeof providerLaunch?.noChild === "function"
+    && (!worktreeProvisioningBootstrap || (
+      typeof providerLaunch.registerBootstrap === "function"
+      && typeof providerLaunch.settleRegistrationFailure === "function"
+    ))
+  );
+  if (!durableBootstrapCallbacksPresent) {
+    if (worktreeProvisioningBootstrap) {
+      try {
+        environment.revokeCredential();
+        environment.assertCredentialAbsent();
+      } catch (error) {
+        throw new CompanionError(
+          "E_STATE",
+          "Incomplete worktree bootstrap authority could not revoke its controller credential.",
+          { cleanupCode: error?.code || null }
+        );
+      }
+    }
+    throw new CompanionError(
+      "E_STATE",
+      worktreeProvisioningBootstrap
+        ? "Worktree provisioning startup requires durable bootstrap registration and reconciliation callbacks."
+        : "Bound provider startup requires durable spawn-intent callbacks."
+    );
+  }
+  const discoveredBinary = discoverGrok();
+  let binary = discoveredBinary;
+  const capturedExecutableIdentity = worktreeProvisioningBootstrap
+    ? materializePinnedGrokExecutable(discoveredBinary, {
+        directory: path.join(providerCwd, "provider-bin")
+      })
+    : null;
+  if (capturedExecutableIdentity) {
+    binary = capturedExecutableIdentity.canonicalPath;
+  }
   let version = boundBootstrap ? null : grokVersion(binary);
   const safeMarker = String(jobMarker).replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 80);
   const leaderSocket = path.join(stateDir, `leader-${safeMarker}-${process.pid}-${Date.now()}.sock`);
-  const stagedProfile = materializeAgentProfile(profile, environment);
-  if (boundBootstrap && (typeof providerLaunch?.prepare !== "function" || typeof providerLaunch?.noChild !== "function")) {
-    stagedProfile.cleanup();
-    throw new CompanionError("E_STATE", "Bound provider startup requires durable spawn-intent callbacks.");
+  const stagedProfile = materializeAgentProfile(runtimeProfile, environment);
+  if (worktreeProvisioningBootstrap) {
+    try {
+      environment.verifyGitExecutable();
+      inspectIsolation(binary, providerCwd, environment);
+      environment.verifyGitExecutable();
+    } catch (error) {
+      stagedProfile.cleanup();
+      try {
+        environment.revokeCredential();
+        environment.assertCredentialAbsent();
+      } catch (cleanupError) {
+        throw new CompanionError(
+          "E_STATE",
+          "Controller isolation failed and its credential could not be revoked.",
+          { causeCode: error?.code || null, cleanupCode: cleanupError?.code || null }
+        );
+      }
+      throw error;
+    }
   }
   let preparedLaunch = null;
   let resolvedGuardBinding = guardBinding;
   let bootstrapSpecPublication = null;
+  let deferredBootstrapSpec = null;
+  let provisioningActivation = null;
+  let attestedExecutableIdentity =
+    capturedExecutableIdentity?.attestation || null;
   let child;
   try {
     if (cancelRequested()) {
       throw new CompanionError("E_CANCELLED", "Grok job was cancelled before provider process creation.");
     }
-    const providerArgs = spawnArgs({ root, profile, model, effort, leaderSocket, taskProfile: stagedProfile.path });
+    const providerArgs = spawnArgs({
+      root: providerCwd,
+      profile: runtimeProfile,
+      model: worktreeProvisioningBootstrap ? null : model,
+      effort: worktreeProvisioningBootstrap ? null : effort,
+      leaderSocket,
+      taskProfile: stagedProfile.path
+    });
     const providerEnv = {
       ...(environment?.env || childEnvironment()),
       GROK_COMPANION_JOB_MARKER: safeMarker
     };
     if (boundBootstrap) {
-      const candidate = providerLaunch.prepare();
+      const candidate = providerLaunch.prepare(Object.freeze(
+        worktreeProvisioningBootstrap
+          ? { executableIdentity: capturedExecutableIdentity.attestation }
+          : {}
+      ));
       if (candidate?.prepared !== true
         || candidate?.intent?.status !== "pending"
-        || !/^[0-9a-f]{32}$/.test(candidate.intent.intentId || "")) {
+        || !EXACT_NONCE_ID.test(candidate.intent.intentId || "")
+        || (worktreeProvisioningBootstrap && (
+          candidate.intent.purpose !== WORKTREE_PROVISIONING_PURPOSE
+          || candidate.intent.providerSpawnIntentId !== candidate.intent.intentId
+          || candidate.intent.executionBindingDigest !== guardBinding.executionBindingDigest
+          || !SHA256_HEX.test(candidate.intent.expectedPlannedJournalDigest || "")
+          || candidate.intent.provisioningAttemptId !== guardBinding.provisioningAttemptId
+          || candidate.intent.provisioningFence !== guardBinding.provisioningFence
+          || candidate.intent.holderId !== guardBinding.holderId
+          || !sameExecutableAttestation(
+            candidate.intent.executableIdentity,
+            capturedExecutableIdentity.attestation
+          )
+          || candidate.intent.processIdentity !== null
+      ))) {
         throw new CompanionError("E_PROCESS_IDENTITY", "Provider spawn intent was not freshly authorized for this bootstrap.");
       }
+      // Only a freshly validated intent belongs to this launch attempt.
+      // A replayed, foreign, or malformed pending intent must never be
+      // consumed by this caller's no-child settlement path.
       preparedLaunch = candidate;
       resolvedGuardBinding = {
         ...guardBinding,
@@ -1366,15 +2631,17 @@ export async function openProvider({ root, profile, model = null, effort = null,
       };
       await testHooks?.afterProviderIntentCommitted?.(preparedLaunch);
       const bootstrapLaunch = createProviderBootstrapLaunch({
-        root,
+        root: providerCwd,
         marker: safeMarker,
         owner: hostContext().sessionId,
         binding: resolvedGuardBinding,
         binary,
+        executableIdentity:
+          capturedExecutableIdentity?.attestation || null,
         args: providerArgs
       });
       child = spawn(process.execPath, bootstrapLaunch.argv, {
-        cwd: root,
+        cwd: providerCwd,
         env: {
           ...providerEnv,
           GROK_COMPANION_BOOTSTRAP_PLUGIN_DATA: pluginDataRoot(process.env)
@@ -1383,14 +2650,26 @@ export async function openProvider({ root, profile, model = null, effort = null,
         detached: true,
         stdio: ["pipe", "pipe", "pipe", "pipe", "pipe", "pipe", "pipe"]
       });
-      bootstrapSpecPublication = publishProviderBootstrapSpec(child, bootstrapLaunch.specPayload).then(
-        () => ({ error: null }),
-        (error) => ({ error })
-      );
-      await testHooks?.afterBootstrapSpawned?.({ child, preparedLaunch });
+      if (worktreeProvisioningBootstrap) {
+        // Keep the child blocked on its private specification pipe until its
+        // exact kernel identity has been durably installed as the fenced
+        // provisioner. The bootstrap cannot register a guard or create Grok
+        // before this callback succeeds.
+        deferredBootstrapSpec = bootstrapLaunch.specPayload;
+      } else {
+        bootstrapSpecPublication = publishProviderBootstrapSpec(child, bootstrapLaunch.specPayload).then(
+          () => ({ error: null }),
+          (error) => ({ error })
+        );
+      }
+      await testHooks?.afterBootstrapSpawned?.({
+        child,
+        preparedLaunch,
+        providerCwd
+      });
     } else {
       child = spawn(binary, providerArgs, {
-        cwd: root,
+        cwd: providerCwd,
         env: providerEnv,
         shell: false,
         detached: process.platform !== "win32",
@@ -1400,11 +2679,19 @@ export async function openProvider({ root, profile, model = null, effort = null,
   } catch (error) {
     if (preparedLaunch && !child) {
       try {
-        providerLaunch.noChild({
-          intentId: preparedLaunch.intent.intentId,
-          resolution: "spawn-not-created"
+        await recordBoundBootstrapNoChild({
+          providerLaunch,
+          preparedLaunch,
+          worktreeProvisioning: worktreeProvisioningBootstrap,
+          resolution: "spawn-not-created",
+          expectedJournalDigest: preparedLaunch.intent.expectedPlannedJournalDigest || null
         });
-      } catch {}
+      } catch (settlementError) {
+        if (worktreeProvisioningBootstrap) {
+          stagedProfile.cleanup();
+          throw settlementError;
+        }
+      }
     }
     stagedProfile.cleanup();
     throw error;
@@ -1414,26 +2701,133 @@ export async function openProvider({ root, profile, model = null, effort = null,
   catch (error) {
     if (preparedLaunch && !providerCleanupIdentity(error)) {
       try {
-        providerLaunch.noChild({
-          intentId: preparedLaunch.intent.intentId,
-          resolution: "cleanup-proven"
+        await recordBoundBootstrapNoChild({
+          providerLaunch,
+          preparedLaunch,
+          worktreeProvisioning: worktreeProvisioningBootstrap,
+          resolution: worktreeProvisioningBootstrap
+            ? "spawn-not-created"
+            : "cleanup-proven",
+          expectedJournalDigest: worktreeProvisioningBootstrap
+            ? preparedLaunch.intent.expectedPlannedJournalDigest
+            : null
         });
-      } catch {}
+      } catch (settlementError) {
+        if (worktreeProvisioningBootstrap) {
+          stagedProfile.cleanup();
+          throw settlementError;
+        }
+      }
     }
     if (!providerCleanupIdentity(error)) stagedProfile.cleanup();
     throw error;
+  }
+  if (worktreeProvisioningBootstrap) {
+    try {
+      const activation = await providerLaunch.registerBootstrap({
+        intentId: preparedLaunch.intent.intentId,
+        providerSpawnIntentId: preparedLaunch.intent.intentId,
+        expectedJournalDigest: preparedLaunch.intent.expectedPlannedJournalDigest,
+        provisioningAttemptId: resolvedGuardBinding.provisioningAttemptId,
+        provisioningFence: resolvedGuardBinding.provisioningFence,
+        holderId: resolvedGuardBinding.holderId,
+        executionBindingDigest: resolvedGuardBinding.executionBindingDigest,
+        processIdentity
+      });
+      provisioningActivation = activation;
+      const activatedIntent = activation?.intent;
+      const activatedJournal = activation?.job?.provisioning;
+      const activatedProvisioner = activatedJournal?.provisioner;
+      if (activation?.activated !== true
+        || typeof activation.replayed !== "boolean"
+        || activatedIntent?.purpose !== WORKTREE_PROVISIONING_PURPOSE
+        || activatedIntent.intentId !== preparedLaunch.intent.intentId
+        || activatedIntent.providerSpawnIntentId !== preparedLaunch.intent.intentId
+        || activatedIntent.executionBindingDigest !== resolvedGuardBinding.executionBindingDigest
+        || activatedIntent.expectedPlannedJournalDigest
+          !== preparedLaunch.intent.expectedPlannedJournalDigest
+        || activatedIntent.provisioningAttemptId !== resolvedGuardBinding.provisioningAttemptId
+        || activatedIntent.provisioningFence !== resolvedGuardBinding.provisioningFence
+        || activatedIntent.holderId !== resolvedGuardBinding.holderId
+        || !["pending", "registered"].includes(activatedIntent.status)
+        || activatedIntent.processIdentity?.pid !== processIdentity.pid
+        || activatedIntent.processIdentity?.startToken !== processIdentity.startToken
+        || activatedIntent.processIdentity?.processGroupId !== processIdentity.processGroupId
+        || activatedJournal?.state !== "provisioning"
+        || activatedJournal.bindingDigest !== resolvedGuardBinding.executionBindingDigest
+        || activatedJournal.attemptId !== resolvedGuardBinding.provisioningAttemptId
+        || activatedJournal.fence !== resolvedGuardBinding.provisioningFence
+        || activatedProvisioner?.pid !== processIdentity.pid
+        || activatedProvisioner?.startToken !== processIdentity.startToken
+        || activatedProvisioner?.holderId !== resolvedGuardBinding.holderId) {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "Worktree provisioning bootstrap identity was not durably registered."
+        );
+      }
+      bootstrapSpecPublication = publishProviderBootstrapSpec(
+        child,
+        deferredBootstrapSpec
+      ).then(
+        () => ({ error: null }),
+        (error) => ({ error })
+      );
+    } catch (error) {
+      try {
+        await cleanupBoundBootstrapStart({
+          child,
+          identity: processIdentity,
+          root,
+          marker: safeMarker,
+          stagedProfile,
+          guardBinding: resolvedGuardBinding
+        });
+        const cleanupProof = Object.freeze({
+          processIdentity: Object.freeze({ ...processIdentity }),
+          processGroupGone: true,
+          providerGuardAbsent: true,
+          observedAt: new Date().toISOString()
+        });
+        const registrationSettlement =
+          await settleWorktreeBootstrapRegistrationFailure({
+          providerLaunch,
+          preparedLaunch,
+          processIdentity,
+          cleanupProof
+        });
+        if (!registrationSettlement.reconciled) {
+          const details = error?.details
+            && typeof error.details === "object"
+            && !Array.isArray(error.details)
+            ? { ...error.details }
+            : {};
+          details.registrationOutcome = "retained-for-durable-reconciliation";
+          details.preparedIntentRetained = true;
+          if (error && typeof error === "object") error.details = details;
+        }
+      } catch (cleanupError) {
+        throw attachProviderCleanupIdentity(cleanupError, processIdentity);
+      }
+      throw error;
+    }
   }
   let guardRecord;
   if (boundBootstrap) {
     try {
       const publication = await bootstrapSpecPublication;
       if (publication?.error) throw publication.error;
-      const ready = await waitForProviderBootstrapReady(child, cancelRequested);
-      if (!/^\d+\.\d+\.\d+$/.test(ready.version || "")) {
-        throw new CompanionError("E_GROK_VERSION", "Provider bootstrap returned no authenticated Grok version.");
-      }
+      const ready = await waitForProviderBootstrapReady(
+        child,
+        cancelRequested,
+        resolvedGuardBinding,
+        capturedExecutableIdentity?.attestation || null
+      );
       version = ready.version;
-      guardRecord = authenticateProviderBootstrapGuard(
+      if (worktreeProvisioningBootstrap) {
+        attestedExecutableIdentity = ready.executableIdentity
+          || capturedExecutableIdentity.attestation;
+      }
+      guardRecord = authenticateBoundBootstrapGuard(
         root,
         safeMarker,
         processIdentity,
@@ -1450,9 +2844,15 @@ export async function openProvider({ root, profile, model = null, effort = null,
           guardRecord,
           guardBinding: resolvedGuardBinding
         });
-        providerLaunch.noChild({
-          intentId: preparedLaunch.intent.intentId,
-          resolution: "cleanup-proven"
+        await recordBoundBootstrapNoChild({
+          providerLaunch,
+          preparedLaunch,
+          worktreeProvisioning: worktreeProvisioningBootstrap,
+          resolution: "cleanup-proven",
+          processIdentity: worktreeProvisioningBootstrap ? processIdentity : null,
+          expectedJournalDigest: worktreeProvisioningBootstrap
+            ? provisioningActivation?.job?.provisioning?.journalDigest || null
+            : null
         });
       } catch (cleanupError) {
         throw attachProviderCleanupIdentity(cleanupError, processIdentity);
@@ -1476,7 +2876,10 @@ export async function openProvider({ root, profile, model = null, effort = null,
     }
   }
   const permissionPolicy = (params) => {
-    const selected = selectAcpPermissionOption(params?.options, { write: profile.id === "rescue-write-v3" });
+    if (worktreeProvisioningBootstrap) {
+      return { outcome: { outcome: "cancelled" } };
+    }
+    const selected = selectAcpPermissionOption(params?.options, { write: runtimeProfile.id === "rescue-write-v3" });
     return selected?.optionId ? { outcome: { outcome: "selected", optionId: selected.optionId } } : { outcome: { outcome: "cancelled" } };
   };
   let eventError = null;
@@ -1509,11 +2912,21 @@ export async function openProvider({ root, profile, model = null, effort = null,
         guardBinding: resolvedGuardBinding
       });
       try {
-        providerLaunch.noChild({
-          intentId: preparedLaunch.intent.intentId,
-          resolution: "cleanup-proven"
+        await recordBoundBootstrapNoChild({
+          providerLaunch,
+          preparedLaunch,
+          worktreeProvisioning: worktreeProvisioningBootstrap,
+          resolution: "cleanup-proven",
+          processIdentity: worktreeProvisioningBootstrap ? processIdentity : null,
+          expectedJournalDigest: worktreeProvisioningBootstrap
+            ? provisioningActivation?.job?.provisioning?.journalDigest || null
+            : null
         });
-      } catch {}
+      } catch (settlementError) {
+        if (worktreeProvisioningBootstrap) {
+          throw attachProviderCleanupIdentity(settlementError, processIdentity);
+        }
+      }
     } else {
       await cleanupFailedProviderStart({
         child,
@@ -1530,8 +2943,7 @@ export async function openProvider({ root, profile, model = null, effort = null,
     try {
       await promoteProviderBootstrap(child, {
         marker: safeMarker,
-        providerGeneration: resolvedGuardBinding.providerGeneration,
-        providerSpawnIntentId: resolvedGuardBinding.providerSpawnIntentId
+        ...resolvedGuardBinding
       });
     } catch (error) {
       try {
@@ -1544,13 +2956,49 @@ export async function openProvider({ root, profile, model = null, effort = null,
           guardRecord,
           guardBinding: resolvedGuardBinding
         });
+        if (worktreeProvisioningBootstrap) {
+          await recordBoundBootstrapNoChild({
+            providerLaunch,
+            preparedLaunch,
+            worktreeProvisioning: true,
+            resolution: "cleanup-proven",
+            processIdentity,
+            expectedJournalDigest:
+              provisioningActivation?.job?.provisioning?.journalDigest || null
+          });
+        }
       } catch (cleanupError) {
         throw attachProviderCleanupIdentity(cleanupError, processIdentity);
       }
       throw error;
     }
   }
-  const client = new AcpClient(child, { timeoutMs: 30000, permissionPolicy, knownSecrets });
+  const settleWorktreeProvisioningStartupFailure = async () => {
+    if (!worktreeProvisioningBootstrap) return;
+    await recordBoundBootstrapNoChild({
+      providerLaunch,
+      preparedLaunch,
+      worktreeProvisioning: true,
+      resolution: "cleanup-proven",
+      processIdentity,
+      expectedJournalDigest:
+        provisioningActivation?.job?.provisioning?.journalDigest || null
+    });
+  };
+  const client = new AcpClient(child, {
+    timeoutMs: 30000,
+    permissionPolicy,
+    knownSecrets,
+    ...(worktreeProvisioningBootstrap
+      ? {
+          outboundAllowlist: {
+            requests: WORKTREE_CONTROLLER_REQUEST_ALLOWLIST,
+            notifications: []
+          },
+          cancelPermissions: true
+        }
+      : {})
+  });
   client.on("update", emitEvent);
   client.on("stderr", (text) => emitEvent({ type: "diagnostic", text: redactText(text, knownSecrets) }));
   let initialized;
@@ -1565,12 +3013,53 @@ export async function openProvider({ root, profile, model = null, effort = null,
     if (eventError) throw eventError;
   } catch (error) {
     await cleanupFailedProviderStart({ child, identity: processIdentity, root, marker: safeMarker, stagedProfile, client, guardRecord });
+    await settleWorktreeProvisioningStartupFailure();
     throw eventError || error;
   }
-  if (initialized?.protocolVersion !== 1 || !initialized?.agentCapabilities?.loadSession) {
+  if (worktreeProvisioningBootstrap) {
+    try {
+      environment.revokeCredential();
+      environment.assertCredentialAbsent();
+    } catch (error) {
+      await cleanupFailedProviderStart({
+        child,
+        identity: processIdentity,
+        root,
+        marker: safeMarker,
+        stagedProfile,
+        client,
+        guardRecord
+      });
+      await settleWorktreeProvisioningStartupFailure();
+      throw error;
+    }
+  }
+  if (initialized?.protocolVersion !== 1
+    || (!worktreeProvisioningBootstrap
+      && !initialized?.agentCapabilities?.loadSession)) {
     const error = new CompanionError("E_CAPABILITY", "Grok ACP v1 with session loading is required.");
     await cleanupFailedProviderStart({ child, identity: processIdentity, root, marker: safeMarker, stagedProfile, client, guardRecord });
+    await settleWorktreeProvisioningStartupFailure();
     throw error;
+  }
+  if (worktreeProvisioningBootstrap) {
+    return {
+      binary,
+      version,
+      child,
+      client,
+      initialized,
+      leaderSocket,
+      process: processIdentity,
+      marker: safeMarker,
+      guardRecord,
+      emitEvent,
+      eventError: () => eventError,
+      cleanupAgentProfile: stagedProfile.cleanup,
+      controllerCwd: providerCwd,
+      controllerProfileId: runtimeProfile.id,
+      executableIdentity: attestedExecutableIdentity
+    };
   }
   const availableModels = initialized?._meta?.modelState?.availableModels || [];
   const selectedModel = model
@@ -1579,15 +3068,30 @@ export async function openProvider({ root, profile, model = null, effort = null,
   if (model && !selectedModel) {
     const error = new CompanionError("E_CAPABILITY", `Model ${model} is not advertised by Grok.`, { available: availableModels.map((x) => x.modelId) });
     await cleanupFailedProviderStart({ child, identity: processIdentity, root, marker: safeMarker, stagedProfile, client, guardRecord });
+    await settleWorktreeProvisioningStartupFailure();
     throw error;
   }
   const efforts = (selectedModel?._meta?.reasoningEfforts || []).map((item) => item.id);
   if (effort && efforts.length && !efforts.includes(effort)) {
     const error = new CompanionError("E_CAPABILITY", `Reasoning effort ${effort} is not advertised for model ${selectedModel.modelId}.`, { available: efforts });
     await cleanupFailedProviderStart({ child, identity: processIdentity, root, marker: safeMarker, stagedProfile, client, guardRecord });
+    await settleWorktreeProvisioningStartupFailure();
     throw error;
   }
-  return { binary, version, child, client, initialized, leaderSocket, process: processIdentity, marker: safeMarker, guardRecord, emitEvent, eventError: () => eventError, cleanupAgentProfile: stagedProfile.cleanup };
+  return {
+    binary,
+    version,
+    child,
+    client,
+    initialized,
+    leaderSocket,
+    process: processIdentity,
+    marker: safeMarker,
+    guardRecord,
+    emitEvent,
+    eventError: () => eventError,
+    cleanupAgentProfile: stagedProfile.cleanup
+  };
 }
 
 export async function ensureChildExit(child, identity, { naturalExitMs = 750 } = {}) {
@@ -1792,11 +3296,12 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
   const boundProviderLaunch = providerLaunch
     && typeof providerLaunch.prepare === "function"
     && typeof providerLaunch.noChild === "function" ? {
-    prepare: () => providerLaunch.prepare(Object.freeze({
+    prepare: (details = {}) => providerLaunch.prepare(Object.freeze({
       promptDigest: crypto.createHash("sha256").update(String(prompt || "")).digest("hex"),
       profileId: effectiveProfile.id,
       profileContractVersion: effectiveProfile.contractVersion,
-      agentProfileDigest: effectiveProfile.agentProfileDigest
+      agentProfileDigest: effectiveProfile.agentProfileDigest,
+      ...details
     })),
     noChild: (details) => providerLaunch.noChild(details)
   } : providerLaunch;

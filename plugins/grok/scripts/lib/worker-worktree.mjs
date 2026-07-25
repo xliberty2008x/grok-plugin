@@ -141,6 +141,22 @@ export function workerWorktreeSlug(workerId) {
 }
 
 /**
+ * Return the one broker-owned private destination parent for a worker identity.
+ *
+ * The provider receives this unique parent instead of the shared worktree
+ * directory, so one worker can never select or collide with a sibling's
+ * checkout name.
+ */
+export function expectedWorkerWorktreeParent(controlRoot, workerId, env = process.env) {
+  if (!controlRoot || !workerId) {
+    throw new CompanionError("E_USAGE", "controlRoot and workerId are required.");
+  }
+  const control = resolveControlWorkspace(controlRoot, env);
+  const state = controlStateDir(control, env);
+  return path.join(state, "worktrees", workerWorktreeSlug(workerId));
+}
+
+/**
  * Return the one broker-owned detached-worktree path for a worker identity.
  *
  * The path is derived from the control-workspace state root and never from
@@ -148,12 +164,10 @@ export function workerWorktreeSlug(workerId) {
  * recovery can distinguish exact adoption from an unrelated directory.
  */
 export function expectedWorkerWorktreeRoot(controlRoot, workerId, env = process.env) {
-  if (!controlRoot || !workerId) {
-    throw new CompanionError("E_USAGE", "controlRoot and workerId are required.");
-  }
-  const control = resolveControlWorkspace(controlRoot, env);
-  const state = controlStateDir(control, env);
-  return path.join(state, "worktrees", workerWorktreeSlug(workerId));
+  return path.join(
+    expectedWorkerWorktreeParent(controlRoot, workerId, env),
+    "checkout"
+  );
 }
 
 function readSmallRegularFileNoFollow(file, label, maxBytes = 16 * 1024) {
@@ -556,14 +570,21 @@ export function createWorkerWorktree({
   catch (error) { if (error.code !== "EEXIST") throw error; }
   safePrivateDirectory(worktrees, "worktree directory");
 
-  const slug = workerWorktreeSlug(workerId);
-  const executionRoot = path.join(worktrees, slug);
-  if (fs.existsSync(executionRoot)) {
+  const exactBaseCommit = resolveExactCommit(control.controlRoot, baseCommit);
+  const workerParent = expectedWorkerWorktreeParent(control.controlRoot, workerId, env);
+  const executionRoot = expectedWorkerWorktreeRoot(control.controlRoot, workerId, env);
+  if (fs.existsSync(workerParent)) {
     throw new CompanionError("E_WORKTREE", `Worktree path already exists for ${workerId}.`);
   }
+  fs.mkdirSync(workerParent, { mode: 0o700 });
+  safePrivateDirectory(workerParent, "worker worktree parent");
 
-  const exactBaseCommit = resolveExactCommit(control.controlRoot, baseCommit);
-  git(control.controlRoot, ["worktree", "add", "--detach", executionRoot, exactBaseCommit]);
+  try {
+    git(control.controlRoot, ["worktree", "add", "--detach", executionRoot, exactBaseCommit]);
+  } catch (error) {
+    fs.rmdirSync(workerParent);
+    throw error;
+  }
   const resolvedExecutionRoot = fs.realpathSync(executionRoot);
   const actualHead = resolveExactCommit(resolvedExecutionRoot, "HEAD");
   const actualCommon = gitCommonDir(resolvedExecutionRoot);
@@ -582,6 +603,7 @@ export function createWorkerWorktree({
     if (removed.status !== 0 || fs.existsSync(resolvedExecutionRoot)) {
       throw new CompanionError("E_WORKTREE", "Unsafe worker worktree could not be removed after preflight failure.");
     }
+    fs.rmdirSync(workerParent);
     throw error;
   }
 
@@ -1011,7 +1033,11 @@ export function prepareIntegration(options = {}) {
     }
     throw error;
   }
-  const expectedExecutionRoot = path.join(managedRoot, workerWorktreeSlug(expectedWorkerId));
+  const expectedExecutionRoot = expectedWorkerWorktreeRoot(
+    control.controlRoot,
+    expectedWorkerId,
+    env
+  );
   if (
     !containedPath(managedRoot, canonicalExecutionRoot)
     || canonicalExecutionRoot !== expectedExecutionRoot
@@ -1082,7 +1108,11 @@ export function removeWorkerWorktree(executionRoot, controlRoot, expectedWorkerI
   if (!containedPath(managedRoot, candidate)) {
     throw new CompanionError("E_WORKTREE", "Refusing to remove a path outside the managed worktree directory.");
   }
-  const expectedExecutionRoot = path.join(managedRoot, workerWorktreeSlug(expectedWorkerId));
+  const expectedExecutionRoot = expectedWorkerWorktreeRoot(
+    control.controlRoot,
+    expectedWorkerId,
+    env
+  );
   if (candidate !== expectedExecutionRoot) {
     throw new CompanionError("E_WORKTREE", "Refusing to remove a worktree that does not match the expected worker identity.");
   }
@@ -1100,6 +1130,17 @@ export function removeWorkerWorktree(executionRoot, controlRoot, expectedWorkerI
   }
   if (fs.existsSync(candidate)) {
     throw new CompanionError("E_WORKTREE", "Git reported success but the managed worktree still exists.");
+  }
+  const workerParent = path.dirname(candidate);
+  try {
+    fs.rmdirSync(workerParent);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw new CompanionError(
+        "E_WORKTREE",
+        "Managed worker parent remained non-empty after worktree removal."
+      );
+    }
   }
   return true;
 }

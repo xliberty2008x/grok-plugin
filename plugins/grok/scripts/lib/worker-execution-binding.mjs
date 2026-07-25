@@ -838,6 +838,11 @@ function assertTransitionRequest(current, request) {
     stateError("Provisioning journal transition does not match the current durable revision.");
   }
   if (current.state === "provisioning") assertProvisioningActor(current, request);
+  if (edge === "provisioning:ready"
+    && timestampMs(request.readyAt, "readyAt")
+      > timestampMs(current.leaseExpiresAt, "leaseExpiresAt")) {
+    stateError("Provisioning readiness cannot be published after lease expiry.");
+  }
   return edge;
 }
 

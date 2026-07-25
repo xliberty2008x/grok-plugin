@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { normalizeUpdate } from "../plugins/grok/scripts/lib/acp-client.mjs";
@@ -23,6 +24,7 @@ import {
   runStructuredReview,
   REVIEW_SCHEMA,
   selectAcpPermissionOption,
+  taskEnvironment,
   validateReview
 } from "../plugins/grok/scripts/lib/grok-provider.mjs";
 import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
@@ -47,6 +49,53 @@ async function withFake(config, callback) {
   }
 }
 
+function nonTemporaryDirectory(prefix) {
+  return fs.mkdtempSync(path.join(os.homedir(), `.${prefix}`));
+}
+
+function gitValue(root, ...args) {
+  const run = spawnSync("git", args, {
+    cwd: root,
+    encoding: "utf8",
+    shell: false
+  });
+  assert.equal(run.status, 0, run.stderr);
+  return String(run.stdout).trim();
+}
+
+function initNonTemporaryRepo() {
+  const root = nonTemporaryDirectory("grok-controller-repo-");
+  gitValue(root, "init", "-b", "main");
+  gitValue(root, "config", "user.email", "tests@example.com");
+  gitValue(root, "config", "user.name", "Grok Plugin Tests");
+  fs.writeFileSync(path.join(root, "tracked.txt"), "original\n", "utf8");
+  gitValue(root, "add", "tracked.txt");
+  gitValue(root, "commit", "-m", "initial");
+  return root;
+}
+
+function controllerEnvironmentInput(root, stateDir, suffix = "checkout") {
+  const destinationParent = path.join(stateDir, "destinations", suffix);
+  fs.mkdirSync(destinationParent, { recursive: true, mode: 0o700 });
+  const canonicalDestinationParent = fs.realpathSync(destinationParent);
+  const gitCommonDir = gitValue(
+    root,
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-common-dir"
+  );
+  return {
+    worktreeProvisioningController: true,
+    worktreeProvisioningDestinationParent: canonicalDestinationParent,
+    worktreeProvisioningExpectedRoot: path.join(
+      canonicalDestinationParent,
+      "worktree"
+    ),
+    worktreeProvisioningGitCommonDir: fs.realpathSync(gitCommonDir),
+    worktreeProvisioningBaseCommit: gitValue(root, "rev-parse", "HEAD")
+  };
+}
+
 test("normalizeUpdate maps ACP message, tool, plan, usage, and unknown updates", () => {
   assert.deepEqual(
     normalizeUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "hello" } }),
@@ -69,6 +118,287 @@ test("Grok discovery honors GROK_BIN and enforces the minimum CLI version", asyn
 
   await withFake({ version: "0.2.92" }, async () => {
     assert.throws(() => grokVersion(), (error) => error.code === "E_GROK_VERSION");
+  });
+});
+
+test("worktree controller uses private cwd, exact grants, pinned Git PATH, and identity-bound credential", async () => {
+  await withFake({}, async () => {
+    const root = initNonTemporaryRepo();
+    const stateDir = nonTemporaryDirectory("grok-controller-state-");
+    const options = controllerEnvironmentInput(root, stateDir);
+    const poison = nonTemporaryDirectory("grok-controller-poison-");
+    fs.writeFileSync(path.join(poison, "git"), "#!/bin/sh\nexit 91\n", {
+      mode: 0o755
+    });
+    const previousPath = process.env.PATH;
+    const trustedGitDirectory = path.dirname(
+      String(spawnSync("sh", ["-c", "command -v git"], {
+        encoding: "utf8",
+        env: process.env
+      }).stdout).trim()
+    );
+    process.env.PATH = `${trustedGitDirectory}${path.delimiter}${poison}`;
+    const environment = taskEnvironment(
+      stateDir,
+      root,
+      profileFor("task", true),
+      "worktree-controller-test",
+      options
+    );
+    try {
+      const sandbox = fs.readFileSync(
+        path.join(environment.grokHome, "sandbox.toml"),
+        "utf8"
+      );
+      assert.match(sandbox, /extends = "strict"/);
+      assert.match(sandbox, /restrict_network = true/);
+      assert.equal(
+        sandbox.includes(JSON.stringify(fs.realpathSync(root))),
+        true
+      );
+      assert.equal(
+        sandbox.includes(JSON.stringify(options.worktreeProvisioningGitCommonDir)),
+        true
+      );
+      assert.equal(
+        sandbox.includes(JSON.stringify(
+          options.worktreeProvisioningDestinationParent
+        )),
+        true
+      );
+      assert.equal(
+        sandbox.includes(JSON.stringify(path.join(stateDir, "worktrees"))),
+        false,
+        "controller must never grant the shared worktree parent"
+      );
+      assert.equal(sandbox.includes('extends = "workspace"'), false);
+      assert.equal(sandbox.includes("deny = []"), true);
+      assert.notEqual(environment.controllerCwd, fs.realpathSync(root));
+      assert.equal(fs.realpathSync(environment.controllerCwd), environment.controllerCwd);
+      assert.equal(environment.controllerProfileId, "worktree-controller-v1");
+      assert.equal(environment.env.PATH, environment.gitExecutableDirectory);
+      assert.equal(environment.env.PATH.includes(poison), false);
+      assert.equal(environment.env.GIT_CONFIG_NOSYSTEM, "1");
+      assert.equal(environment.env.GIT_CONFIG_GLOBAL, "/dev/null");
+      assert.equal(environment.env.GIT_ATTR_NOSYSTEM, "1");
+      assert.equal(fs.existsSync(path.join(environment.grokHome, "auth.json")), true);
+      assert.equal(
+        fs.realpathSync(environment.gitInstallationRoot)
+          .startsWith(`${fs.realpathSync(root)}${path.sep}`),
+        false
+      );
+      assert.match(environment.gitExecutableDigest, /^[a-f0-9]{64}$/);
+      assert.equal(
+        environment.verifyGitExecutable().executableDigest,
+        environment.gitExecutableDigest
+      );
+      const authFile = path.join(environment.grokHome, "auth.json");
+      const originalAuth = fs.readFileSync(authFile);
+      const originalIdentity = fs.lstatSync(authFile);
+      const refreshedAuth = `${authFile}.refreshed`;
+      fs.writeFileSync(refreshedAuth, originalAuth, {
+        mode: 0o600,
+        flag: "wx"
+      });
+      fs.renameSync(refreshedAuth, authFile);
+      assert.notEqual(fs.lstatSync(authFile).ino, originalIdentity.ino);
+      environment.revokeCredential();
+      environment.assertCredentialAbsent();
+    } finally {
+      process.env.PATH = previousPath;
+      try { environment.revokeCredential(); } catch {}
+      fs.rmSync(stateDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(poison, { recursive: true, force: true });
+    }
+  });
+});
+
+test("worktree provisioning refuses a repository-controlled Git executable", async () => {
+  await withFake({}, async () => {
+    const root = initRepo();
+    const stateDir = tempDir("provider-worktree-controller-path-state-");
+    const options = controllerEnvironmentInput(root, stateDir);
+    const fakeGit = path.join(root, "git");
+    fs.writeFileSync(fakeGit, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${root}${path.delimiter}${previousPath || ""}`;
+    try {
+      assert.throws(
+        () => taskEnvironment(
+          stateDir,
+          root,
+          profileFor("task", true),
+          "worktree-controller-path-test",
+          options
+        ),
+        (error) => error?.code === "E_CAPABILITY"
+      );
+    } finally {
+      process.env.PATH = previousPath;
+      fs.rmSync(stateDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("controller construction rejects broad temporary authority and removes only its newly-created home", async () => {
+  await withFake({}, async () => {
+    const root = initRepo();
+    const stateDir = tempDir("provider-controller-temp-state-");
+    const marker = "controller-temp-rejection";
+    const home = path.join(stateDir, "task-homes", marker);
+    const options = controllerEnvironmentInput(root, stateDir);
+    assert.throws(
+      () => taskEnvironment(
+        stateDir,
+        root,
+        profileFor("task", true),
+        marker,
+        options
+      ),
+      (error) => error?.code === "E_CAPABILITY"
+        && /temporary write grant/.test(error.message)
+    );
+    assert.equal(fs.existsSync(home), false);
+    fs.rmSync(stateDir, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
+test("missing controller authentication cleans a newly-created home transactionally", async () => {
+  await withFake({}, async () => {
+    const root = initNonTemporaryRepo();
+    const stateDir = nonTemporaryDirectory("grok-controller-auth-state-");
+    const marker = "controller-missing-auth";
+    const home = path.join(stateDir, "task-homes", marker);
+    const options = controllerEnvironmentInput(root, stateDir);
+    const previousAuth = process.env.GROK_AUTH_PATH;
+    process.env.GROK_AUTH_PATH = path.join(stateDir, "missing-auth.json");
+    try {
+      assert.throws(
+        () => taskEnvironment(
+          stateDir,
+          root,
+          profileFor("task", true),
+          marker,
+          options
+        ),
+        (error) => error?.code === "E_AUTH_REQUIRED"
+      );
+      assert.equal(fs.existsSync(home), false);
+    } finally {
+      process.env.GROK_AUTH_PATH = previousAuth;
+      fs.rmSync(stateDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("controller Git policy overrides repository hooks and rejects effective checkout filters", async () => {
+  await withFake({}, async () => {
+    const safeRoot = initNonTemporaryRepo();
+    const safeState = nonTemporaryDirectory("grok-controller-safe-state-");
+    gitValue(safeRoot, "config", "core.hooksPath", path.join(safeRoot, "hooks"));
+    gitValue(safeRoot, "config", "core.fsmonitor", "malicious-fsmonitor");
+    const safeEnvironment = taskEnvironment(
+      safeState,
+      safeRoot,
+      profileFor("task", true),
+      "controller-safe-git-policy",
+      controllerEnvironmentInput(safeRoot, safeState)
+    );
+    try {
+      const effectiveHooks = spawnSync(
+        safeEnvironment.gitExecutable,
+        ["config", "--get", "core.hooksPath"],
+        {
+          cwd: safeRoot,
+          env: safeEnvironment.env,
+          encoding: "utf8",
+          shell: false
+        }
+      );
+      const effectiveFsmonitor = spawnSync(
+        safeEnvironment.gitExecutable,
+        ["config", "--get", "core.fsmonitor"],
+        {
+          cwd: safeRoot,
+          env: safeEnvironment.env,
+          encoding: "utf8",
+          shell: false
+        }
+      );
+      assert.equal(effectiveHooks.status, 0);
+      assert.equal(effectiveHooks.stdout.trim(), "/dev/null");
+      assert.equal(effectiveFsmonitor.status, 0);
+      assert.equal(effectiveFsmonitor.stdout.trim(), "false");
+      safeEnvironment.verifyGitExecutable();
+    } finally {
+      safeEnvironment.revokeCredential();
+      fs.rmSync(safeState, { recursive: true, force: true });
+      fs.rmSync(safeRoot, { recursive: true, force: true });
+    }
+
+    const filteredRoot = initNonTemporaryRepo();
+    const filteredState = nonTemporaryDirectory("grok-controller-filter-state-");
+    fs.writeFileSync(
+      path.join(filteredRoot, ".gitattributes"),
+      "*.txt filter=malicious\n",
+      "utf8"
+    );
+    gitValue(filteredRoot, "add", ".gitattributes");
+    gitValue(filteredRoot, "commit", "-m", "add executable filter attribute");
+    assert.throws(
+      () => taskEnvironment(
+        filteredState,
+        filteredRoot,
+        profileFor("task", true),
+        "controller-filter-rejection",
+        controllerEnvironmentInput(filteredRoot, filteredState)
+      ),
+      (error) => error?.code === "E_CAPABILITY"
+        && /external Git filter/.test(error.message)
+    );
+    assert.equal(
+      fs.existsSync(path.join(
+        filteredState,
+        "task-homes",
+        "controller-filter-rejection"
+      )),
+      false
+    );
+    fs.rmSync(filteredState, { recursive: true, force: true });
+    fs.rmSync(filteredRoot, { recursive: true, force: true });
+  });
+});
+
+test("controller rejects Git object alternates outside the bound common directory", async () => {
+  await withFake({}, async () => {
+    const root = initNonTemporaryRepo();
+    const stateDir = nonTemporaryDirectory("grok-controller-alternate-state-");
+    const commonDir = gitValue(
+      root,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir"
+    );
+    const alternate = path.join(commonDir, "objects", "info", "alternates");
+    fs.mkdirSync(path.dirname(alternate), { recursive: true });
+    fs.writeFileSync(alternate, "/outside/object-store\n", "utf8");
+    assert.throws(
+      () => taskEnvironment(
+        stateDir,
+        root,
+        profileFor("task", true),
+        "controller-alternate-rejection",
+        controllerEnvironmentInput(root, stateDir)
+      ),
+      (error) => error?.code === "E_CAPABILITY"
+        && /object alternates/.test(error.message)
+    );
+    fs.rmSync(stateDir, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
   });
 });
 

@@ -17,6 +17,36 @@ const PROMPT_STOP_REASON_CLASSES = new Map([
   ["Refusal", "refusal"]
 ]);
 
+function exactMethodAllowlist(value) {
+  if (value == null) return null;
+  if (!value
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || Object.keys(value).length !== 2
+    || !Object.hasOwn(value, "requests")
+    || !Object.hasOwn(value, "notifications")) {
+    throw new CompanionError(
+      "E_STATE",
+      "ACP outbound allowlist must contain exact request and notification method lists."
+    );
+  }
+  const normalize = (methods, label) => {
+    if (!Array.isArray(methods)
+      || methods.some((method) => typeof method !== "string" || !method)
+      || new Set(methods).size !== methods.length) {
+      throw new CompanionError(
+        "E_STATE",
+        `ACP outbound ${label} allowlist is malformed.`
+      );
+    }
+    return new Set(methods);
+  };
+  return Object.freeze({
+    requests: normalize(value.requests, "request"),
+    notifications: normalize(value.notifications, "notification")
+  });
+}
+
 /**
  * JSON-RPC ACP client with reserve-then-dispatch correlation.
  *
@@ -31,13 +61,17 @@ export class AcpClient extends EventEmitter {
   constructor(child, {
     timeoutMs = 30000,
     knownSecrets = [],
-    permissionPolicy = () => ({ outcome: { outcome: "cancelled" } })
+    permissionPolicy = () => ({ outcome: { outcome: "cancelled" } }),
+    outboundAllowlist = null,
+    cancelPermissions = false
   } = {}) {
     super();
     this.child = child;
     this.timeoutMs = timeoutMs;
     this.knownSecrets = knownSecrets;
     this.permissionPolicy = permissionPolicy;
+    this.outboundAllowlist = exactMethodAllowlist(outboundAllowlist);
+    this.cancelPermissions = cancelPermissions === true;
     this.nextId = 1;
     this.reserved = new Set();
     this.used = new Set();
@@ -92,6 +126,11 @@ export class AcpClient extends EventEmitter {
   dispatchReserved(id, method, params = {}, timeoutMs = this.timeoutMs, {
     validateResult = null
   } = {}) {
+    try {
+      this.#assertOutboundMethod("requests", method);
+    } catch (error) {
+      return Promise.reject(error);
+    }
     if (this.closed) {
       return Promise.reject(new CompanionError("E_PROTOCOL", "ACP transport is closed."));
     }
@@ -131,6 +170,11 @@ export class AcpClient extends EventEmitter {
   }
 
   request(method, params = {}, timeoutMs = this.timeoutMs) {
+    try {
+      this.#assertOutboundMethod("requests", method);
+    } catch (error) {
+      return Promise.reject(error);
+    }
     const id = this.reserveRequestId();
     return this.dispatchReserved(id, method, params, timeoutMs);
   }
@@ -161,6 +205,7 @@ export class AcpClient extends EventEmitter {
   }
 
   notify(method, params = {}) {
+    this.#assertOutboundMethod("notifications", method);
     if (!this.closed) {
       try {
         this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
@@ -170,6 +215,19 @@ export class AcpClient extends EventEmitter {
           `Failed to write ACP notification: ${error?.message || String(error)}`
         ));
       }
+    }
+  }
+
+  #assertOutboundMethod(kind, method) {
+    if (typeof method !== "string" || !method) {
+      throw new CompanionError("E_PROTOCOL", "ACP outbound method is invalid.");
+    }
+    const allowed = this.outboundAllowlist?.[kind] || null;
+    if (allowed && !allowed.has(method)) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        `ACP outbound ${kind === "requests" ? "request" : "notification"} method is not authorized.`
+      );
     }
   }
 
@@ -229,10 +287,14 @@ export class AcpClient extends EventEmitter {
       }
       if (message.method === "session/request_permission") {
         let result;
-        try {
-          result = this.permissionPolicy(redact(message.params, this.knownSecrets));
-        } catch {
+        if (this.cancelPermissions) {
           result = { outcome: { outcome: "cancelled" } };
+        } else {
+          try {
+            result = this.permissionPolicy(redact(message.params, this.knownSecrets));
+          } catch {
+            result = { outcome: { outcome: "cancelled" } };
+          }
         }
         try {
           this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: message.id, result })}\n`);
