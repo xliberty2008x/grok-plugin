@@ -145,6 +145,7 @@ const LEGAL_TRANSITIONS = new Set([
   "provisioning:ready",
   "provisioning:cleanup_pending",
   "ready:cleanup_pending",
+  "cleanup_pending:ready",
   "cleanup_pending:cleaned",
   "cleanup_pending:failed"
 ]);
@@ -192,6 +193,13 @@ const TRANSITION_EDGE_KEYS = new Map([
     "state",
     "expectedCurrentJournalDigest",
     "cleanupPendingAt"
+  ])],
+  ["cleanup_pending:ready", new Set([
+    "state",
+    "expectedCurrentJournalDigest",
+    "readyAt",
+    "executionContextManifestId",
+    "executionContextManifestDigest"
   ])],
   ["cleanup_pending:cleaned", new Set([
     "state",
@@ -843,6 +851,11 @@ function assertTransitionRequest(current, request) {
       > timestampMs(current.leaseExpiresAt, "leaseExpiresAt")) {
     stateError("Provisioning readiness cannot be published after lease expiry.");
   }
+  if (edge === "cleanup_pending:ready"
+    && timestampMs(request.readyAt, "readyAt")
+      < timestampMs(current.cleanupPendingAt, "cleanupPendingAt")) {
+    stateError("Adopted readiness cannot predate cleanup pending.");
+  }
   return edge;
 }
 
@@ -879,6 +892,12 @@ export function transitionProvisioningJournal(binding, journal, request) {
   } else if (edge === "provisioning:ready") {
     next.provisioner = null;
     next.leaseExpiresAt = null;
+    next.readyAt = request.readyAt;
+    next.executionContextManifestId = request.executionContextManifestId;
+    next.executionContextManifestDigest = request.executionContextManifestDigest;
+  } else if (edge === "cleanup_pending:ready") {
+    next.cleanupProvisioner = null;
+    next.cleanupPendingAt = null;
     next.readyAt = request.readyAt;
     next.executionContextManifestId = request.executionContextManifestId;
     next.executionContextManifestDigest = request.executionContextManifestDigest;

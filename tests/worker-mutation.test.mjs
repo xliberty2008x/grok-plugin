@@ -22,6 +22,7 @@ import {
   activateWriteProvisioningAttempt,
   assertDurableSpawnRequestBinding,
   assertWriteExecutionJob,
+  adoptWriteProvisioningEffect,
   cancelWorker,
   claimWorkerDispatch,
   assertDispatchContract,
@@ -79,6 +80,7 @@ import {
 import {
   createWorkerWorktree
 } from "../plugins/grok/scripts/lib/worker-worktree.mjs";
+import { provisionWriteWorkerWorktree } from "../plugins/grok/scripts/lib/worker-provisioner.mjs";
 import { git, initRepo, tempDir, waitFor } from "./helpers.mjs";
 
 const THREAD = "019f666a-6469-7cc1-9a8d-8c1adf61e103";
@@ -1829,7 +1831,7 @@ test("cleanup-pending retention preserves a known official receipt without launc
   }
 });
 
-test("cleanup-pending retention records unknown worktree effect without claiming absence or cleanup", {
+test("cleanup-pending unknown effect is host-adopted from exact worktree evidence without dispatch authority", {
   skip: process.platform === "win32"
 }, async (t) => {
   const fixture = plannedWriteProvisioningFixture("cleanup-pending-unknown");
@@ -1911,6 +1913,264 @@ test("cleanup-pending retention records unknown worktree effect without claiming
     () => assertWriteExecutionJob(corrupted, fixture.env),
     (error) => error?.code === "E_PROCESS_IDENTITY"
   );
+
+  const legacy = structuredClone(retained.job);
+  delete legacy.provisioningRuntime.hostAdoption;
+  assert.doesNotThrow(() => assertWriteExecutionJob(legacy, fixture.env));
+
+  const officialEffect = createWorkerWorktree({
+    controlRoot: fixture.root,
+    baseCommit: fixture.binding.baseCommit,
+    workerId: fixture.workerId,
+    env: fixture.env
+  });
+  t.after(() => {
+    try {
+      git(fixture.root, "worktree", "remove", "--force", officialEffect.executionRoot);
+    } catch {}
+  });
+  let adopted;
+  const staleCallerReplay = await provisionWriteWorkerWorktree({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    leaseMs: 1,
+    timeoutMs: 1,
+    env: fixture.env,
+    testHooks: {
+      beforeHostAdoption() {
+        adopted = adoptWriteProvisioningEffect({
+          root: fixture.root,
+          principal: principal(fixture.root),
+          workerId: fixture.workerId,
+          executionBindingDigest: fixture.binding.bindingDigest,
+          expectedJournalDigest: retained.job.provisioning.journalDigest,
+          providerSpawnIntentId: active.prepared.intent.intentId,
+          cleanupProofDigest:
+            retained.job.provisioningRuntime.cleanupProof.proofDigest,
+          env: fixture.env
+        });
+      }
+    }
+  });
+
+  assert.equal(adopted.adopted, true);
+  assert.equal(adopted.replayed, false);
+  assert.equal(staleCallerReplay.replayed, true);
+  assert.equal(staleCallerReplay.providerLaunched, false);
+  assert.equal(staleCallerReplay.workerDispatched, false);
+  assert.equal(
+    staleCallerReplay.hostAdoptionDigest,
+    adopted.adoption.adoptionDigest
+  );
+  assert.equal(adopted.job.status, "queued");
+  assert.equal(adopted.job.phase, "worktree-ready");
+  assert.equal(adopted.job.provisioning.state, "ready");
+  assert.equal(adopted.job.provisioningRuntime.officialReceipt, null);
+  assert.equal(
+    adopted.adoption.origin,
+    "unknown-official-response-host-adoption"
+  );
+  assert.equal(adopted.adoption.operationId, active.prepared.intent.operationId);
+  assert.equal(
+    adopted.adoption.providerSpawnIntentId,
+    active.prepared.intent.intentId
+  );
+  assert.equal(
+    adopted.adoption.provisioningIntentDigest,
+    active.prepared.intent.intentDigest
+  );
+  assert.equal(
+    adopted.adoption.requestedExecutableIdentityDigest,
+    fixture.actor.executableIdentity.identityDigest
+  );
+  assert.equal(
+    adopted.adoption.requestedReleaseIdentityDigest,
+    fixture.actor.executableIdentity.releaseIdentityDigest
+  );
+  assert.equal(adopted.adoption.cleanupPendingAt, cleanupPendingAt);
+  assert.equal(
+    adopted.adoption.cleanupProofDigest,
+    retained.job.provisioningRuntime.cleanupProof.proofDigest
+  );
+  assert.equal(
+    adopted.adoption.hostVerification.expectedExecutionRootDigest,
+    fixture.binding.expectedExecutionRootDigest
+  );
+  assert.equal(
+    adopted.adoption.hostVerification.baseCommit,
+    fixture.binding.baseCommit
+  );
+  assert.equal(
+    adopted.adoption.hostVerification.baseTree,
+    fixture.binding.baseTree
+  );
+  assert.match(
+    adopted.adoption.hostVerification.worktreeFingerprintDigest,
+    /^[a-f0-9]{64}$/
+  );
+  assert.match(adopted.adoption.adoptionDigest, /^[a-f0-9]{64}$/);
+  assert.equal(
+    adopted.job.request.spawn.providerLaunchOutcome,
+    "worktree-ready-no-dispatch"
+  );
+  assert.equal(adopted.job.request.spawn.providerLaunchPending, false);
+  assert.equal(adopted.job.request.spawn.providerLaunchInFlight, false);
+  assert.equal(Object.hasOwn(adopted.job.request.spawn, "dispatch"), false);
+  for (const forbidden of [
+    "workerAuthorization",
+    "controllerProcess",
+    "workerProcess",
+    "providerProcess",
+    "grokSessionId"
+  ]) {
+    assert.equal(Object.hasOwn(adopted.job, forbidden), false);
+  }
+  assert.doesNotThrow(() => assertWriteExecutionJob(adopted.job, fixture.env));
+
+  for (const corrupt of [
+    (job) => { job.provisioningRuntime.hostAdoption.origin = "official-created"; },
+    (job) => {
+      job.provisioningRuntime.hostAdoption.requestedExecutableIdentityDigest =
+        "0".repeat(64);
+    },
+    (job) => {
+      job.provisioningRuntime.hostAdoption.cleanupProofDigest = "0".repeat(64);
+    },
+    (job) => {
+      job.provisioningRuntime.hostAdoption.adoptionDigest = "0".repeat(64);
+    }
+  ]) {
+    const forged = structuredClone(adopted.job);
+    corrupt(forged);
+    assert.throws(
+      () => assertWriteExecutionJob(forged, fixture.env),
+      (error) => error?.code === "E_STATE"
+    );
+  }
+  const staleVerification = structuredClone(adopted.job);
+  const staleAdoption = staleVerification.provisioningRuntime.hostAdoption;
+  staleAdoption.hostVerification.verifiedAt = new Date(
+    Date.parse(cleanupPendingAt) - 1
+  ).toISOString();
+  const {
+    verificationDigest: _verificationDigest,
+    ...verificationBody
+  } = staleAdoption.hostVerification;
+  staleAdoption.hostVerification.verificationDigest =
+    stableDigest(verificationBody);
+  const {
+    adoptionDigest: _adoptionDigest,
+    ...adoptionBody
+  } = staleAdoption;
+  staleAdoption.adoptionDigest = stableDigest(adoptionBody);
+  assert.throws(
+    () => assertWriteExecutionJob(staleVerification, fixture.env),
+    (error) => error?.code === "E_STATE"
+  );
+
+  const adoptionReplay = adoptWriteProvisioningEffect({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: retained.job.provisioning.journalDigest,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    cleanupProofDigest: retained.job.provisioningRuntime.cleanupProof.proofDigest,
+    env: fixture.env
+  });
+  assert.equal(adoptionReplay.adopted, false);
+  assert.equal(adoptionReplay.replayed, true);
+  assert.deepEqual(adoptionReplay.adoption, adopted.adoption);
+  assert.deepEqual(adoptionReplay.job, adopted.job);
+});
+
+test("host adoption rejects mismatched evidence and a dirty worktree without mutating cleanup-pending", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = plannedWriteProvisioningFixture("host-adoption-reject");
+  const active = await activateRegisteredProvisioning(t, fixture);
+  process.kill(-active.child.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(active.identity), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  const cleanupPendingAt = new Date(
+    Math.max(Date.now(), Date.parse(active.registeredAt) + 1)
+  ).toISOString();
+  const retained = retainWriteProvisioningCleanupPending({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    processIdentity: active.identity,
+    cleanupProof: {
+      processIdentity: active.identity,
+      processGroupGone: true,
+      providerGuardAbsent: true,
+      observedAt: cleanupPendingAt
+    },
+    cleanupPendingAt,
+    env: fixture.env
+  });
+  const officialEffect = createWorkerWorktree({
+    controlRoot: fixture.root,
+    baseCommit: fixture.binding.baseCommit,
+    workerId: fixture.workerId,
+    env: fixture.env
+  });
+  t.after(() => {
+    try {
+      git(fixture.root, "worktree", "remove", "--force", officialEffect.executionRoot);
+    } catch {}
+  });
+
+  assert.throws(
+    () => adoptWriteProvisioningEffect({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      executionBindingDigest: fixture.binding.bindingDigest,
+      expectedJournalDigest: retained.job.provisioning.journalDigest,
+      providerSpawnIntentId: active.prepared.intent.intentId,
+      cleanupProofDigest: "0".repeat(64),
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+  assert.deepEqual(
+    tryReadJob(fixture.root, fixture.workerId, fixture.env),
+    retained.job
+  );
+
+  fs.appendFileSync(
+    path.join(officialEffect.executionRoot, "tracked.txt"),
+    "\ndirty host-adoption candidate\n"
+  );
+  assert.throws(
+    () => adoptWriteProvisioningEffect({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      executionBindingDigest: fixture.binding.bindingDigest,
+      expectedJournalDigest: retained.job.provisioning.journalDigest,
+      providerSpawnIntentId: active.prepared.intent.intentId,
+      cleanupProofDigest:
+        retained.job.provisioningRuntime.cleanupProof.proofDigest,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_WORKTREE"
+  );
+  const unchanged = tryReadJob(fixture.root, fixture.workerId, fixture.env);
+  assert.deepEqual(unchanged, retained.job);
+  assert.equal(unchanged.provisioning.state, "cleanup_pending");
+  assert.equal(unchanged.provisioningRuntime.officialReceipt, null);
+  assert.equal(unchanged.provisioningRuntime.hostAdoption, null);
+  assert.equal(unchanged.request.spawn.providerLaunchOutcome, "not-ready");
+  assert.equal(Object.hasOwn(unchanged.request.spawn, "dispatch"), false);
 });
 
 test("official worktree receipt and cleanup proof promote only verified-worktree-ready with zero dispatch authority", {

@@ -819,6 +819,9 @@ test("worktree provisioning guard authenticates only canonical admitted and acti
     ["premature official receipt", (candidate) => {
       candidate.provisioningRuntime.officialReceipt = {};
     }],
+    ["premature host adoption", (candidate) => {
+      candidate.provisioningRuntime.hostAdoption = {};
+    }],
     ["premature execution context", (candidate) => {
       candidate.provisioningRuntime.executionContextManifest = {};
     }],

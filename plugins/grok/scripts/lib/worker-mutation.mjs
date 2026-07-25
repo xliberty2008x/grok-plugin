@@ -709,10 +709,14 @@ const WRITE_PROVISIONING_RUNTIME_KEYS = new Set([
   "activatedJournalDigest",
   "activationDigest",
   "officialReceipt",
+  "hostAdoption",
   "executionContextManifest",
   "executionContextManifestRecordDigest",
   "cleanupProof"
 ]);
+const LEGACY_WRITE_PROVISIONING_RUNTIME_KEYS = new Set(
+  [...WRITE_PROVISIONING_RUNTIME_KEYS].filter((key) => key !== "hostAdoption")
+);
 const WRITE_PROVISIONING_INTENT_KEYS = new Set([
   "schemaVersion",
   "purpose",
@@ -761,6 +765,21 @@ const OFFICIAL_WORKTREE_RECEIPT_KEYS = new Set([
   "receivedAt",
   "hostVerification",
   "receiptDigest"
+]);
+const WORKTREE_HOST_ADOPTION_KEYS = new Set([
+  "schemaVersion",
+  "origin",
+  "operationId",
+  "providerSpawnIntentId",
+  "provisioningIntentDigest",
+  "requestedExecutableIdentityDigest",
+  "requestedReleaseIdentityDigest",
+  "cleanupPendingAt",
+  "cleanupPendingJournalDigest",
+  "cleanupProofDigest",
+  "hostVerification",
+  "observedAt",
+  "adoptionDigest"
 ]);
 const WORKTREE_HOST_VERIFICATION_KEYS = new Set([
   "schemaVersion",
@@ -811,6 +830,8 @@ const WRITE_PROVISIONING_NO_CHILD_RESOLUTIONS = new Set([
 ]);
 const WRITE_PREACTIVATION_CLEANUP_RESOLUTION = "preactivation-cleanup-proven";
 const WRITE_READY_LAUNCH_OUTCOME = "worktree-ready-no-dispatch";
+const WRITE_HOST_ADOPTION_ORIGIN =
+  "unknown-official-response-host-adoption";
 const EXACT_NONCE_HEX = /^[a-f0-9]{32}$/;
 const OPAQUE_HEX = /^[a-f0-9]{32,64}$/;
 const CANCELLATION_RECEIPT_STATUSES = new Set([
@@ -4959,6 +4980,67 @@ function assertOfficialWorktreeReceipt(receipt, binding, intent) {
   return receipt;
 }
 
+function worktreeHostAdoptionWithoutDigest(adoption) {
+  const { adoptionDigest: _adoptionDigest, ...body } = adoption;
+  return body;
+}
+
+function assertWorktreeHostAdoption(
+  adoption,
+  binding,
+  intent,
+  cleanupProof,
+  expectedCleanupPendingJournalDigest = null
+) {
+  if (!cleanupProof
+    || !SHA256_HEX.test(cleanupProof.proofDigest || "")) {
+    writeProvisioningStateError(
+      "Host-adoption evidence requires exact controller-cleanup proof."
+    );
+  }
+  if (!hasExactKeys(adoption, WORKTREE_HOST_ADOPTION_KEYS)
+    || adoption.schemaVersion !== WRITE_PROVISIONING_SCHEMA_VERSION
+    || adoption.origin !== WRITE_HOST_ADOPTION_ORIGIN
+    || adoption.operationId !== intent.operationId
+    || adoption.providerSpawnIntentId !== intent.providerSpawnIntentId
+    || adoption.provisioningIntentDigest !== intent.intentDigest
+    || adoption.requestedExecutableIdentityDigest
+      !== intent.executableIdentity.identityDigest
+    || adoption.requestedReleaseIdentityDigest
+      !== intent.executableIdentity.releaseIdentityDigest
+    || !SHA256_HEX.test(adoption.cleanupPendingJournalDigest || "")
+    || (expectedCleanupPendingJournalDigest !== null
+      && adoption.cleanupPendingJournalDigest
+        !== expectedCleanupPendingJournalDigest)
+    || adoption.cleanupProofDigest !== cleanupProof?.proofDigest
+    || adoption.adoptionDigest
+      !== stableDigest(worktreeHostAdoptionWithoutDigest(adoption))) {
+    writeProvisioningStateError(
+      "Host-adoption evidence is malformed or not bound to the unknown official effect."
+    );
+  }
+  assertCanonicalTimestamp(adoption.cleanupPendingAt, "hostAdoption.cleanupPendingAt");
+  assertCanonicalTimestamp(adoption.observedAt, "hostAdoption.observedAt");
+  if (Date.parse(adoption.cleanupPendingAt)
+      < Date.parse(cleanupProof.observedAt)
+    || Date.parse(adoption.observedAt)
+      < Date.parse(adoption.cleanupPendingAt)) {
+    writeProvisioningStateError(
+      "Host-adoption evidence predates controller cleanup or ambiguity retention."
+    );
+  }
+  assertWorktreeHostVerification(adoption.hostVerification, binding);
+  if (Date.parse(adoption.hostVerification.verifiedAt)
+      < Date.parse(adoption.cleanupPendingAt)
+    || Date.parse(adoption.hostVerification.verifiedAt)
+      > Date.parse(adoption.observedAt)) {
+    writeProvisioningStateError(
+      "Host-adoption verification is outside its retained observation window."
+    );
+  }
+  return adoption;
+}
+
 function writeCleanupProofWithoutDigest(proof) {
   const { proofDigest: _proofDigest, ...body } = proof;
   return body;
@@ -5006,7 +5088,12 @@ function assertWriteProvisioningCleanupProof(proof, intent, {
 }
 
 function assertWriteProvisioningRuntime(runtime, binding, journal) {
-  if (!hasExactKeys(runtime, WRITE_PROVISIONING_RUNTIME_KEYS)
+  const legacyWithoutHostAdoption = (
+    !Object.hasOwn(runtime || {}, "hostAdoption")
+    && hasExactKeys(runtime, LEGACY_WRITE_PROVISIONING_RUNTIME_KEYS)
+  );
+  if ((!hasExactKeys(runtime, WRITE_PROVISIONING_RUNTIME_KEYS)
+      && !legacyWithoutHostAdoption)
     || runtime.schemaVersion !== WRITE_PROVISIONING_SCHEMA_VERSION) {
     writeProvisioningStateError("Write provisioning runtime has an unsupported shape.");
   }
@@ -5022,12 +5109,21 @@ function assertWriteProvisioningRuntime(runtime, binding, journal) {
     writeProvisioningStateError("Write provisioning runtime exposes activation evidence without a process.");
   }
 
-  const receipt = runtime.officialReceipt === null
-    ? null
-    : assertOfficialWorktreeReceipt(runtime.officialReceipt, binding, intent);
   const cleanupProof = runtime.cleanupProof === null
     ? null
     : assertWriteProvisioningCleanupProof(runtime.cleanupProof, intent);
+  const receipt = runtime.officialReceipt === null
+    ? null
+    : assertOfficialWorktreeReceipt(runtime.officialReceipt, binding, intent);
+  const hostAdoption = legacyWithoutHostAdoption || runtime.hostAdoption === null
+    ? null
+    : assertWorktreeHostAdoption(
+        runtime.hostAdoption,
+        binding,
+        intent,
+        cleanupProof,
+        journal.state === "ready" ? journal.previousJournalDigest : null
+      );
   if (runtime.executionContextManifest === null) {
     if (runtime.executionContextManifestRecordDigest !== null) {
       writeProvisioningStateError("Execution ContextManifest digest exists without its record.");
@@ -5043,6 +5139,7 @@ function assertWriteProvisioningRuntime(runtime, binding, journal) {
       || active
       || intent.expectedPlannedJournalDigest !== journal.journalDigest
       || receipt !== null
+      || hostAdoption !== null
       || runtime.executionContextManifest !== null
       || cleanupProof !== null) {
       writeProvisioningStateError("Planned write provisioning runtime contains premature authority.");
@@ -5057,6 +5154,7 @@ function assertWriteProvisioningRuntime(runtime, binding, journal) {
       || intent.processIdentity.pid !== journal.provisioner?.pid
       || intent.processIdentity.startToken !== journal.provisioner?.startToken
       || runtime.activatedJournalDigest !== journal.journalDigest
+      || hostAdoption !== null
       || runtime.executionContextManifest !== null
       || cleanupProof !== null) {
       writeProvisioningStateError("Active write provisioning runtime is not journal-bound.");
@@ -5064,7 +5162,7 @@ function assertWriteProvisioningRuntime(runtime, binding, journal) {
   } else if (journal.state === "ready") {
     if (intent.status !== "settled"
       || !active
-      || !receipt
+      || (receipt === null) === (hostAdoption === null)
       || !runtime.executionContextManifest
       || !cleanupProof
       || intent.provisioningAttemptId !== journal.attemptId
@@ -5075,8 +5173,16 @@ function assertWriteProvisioningRuntime(runtime, binding, journal) {
       writeProvisioningStateError("Ready write provisioning runtime is incomplete.");
     }
     for (const [timestamp, label] of [
-      [receipt.receivedAt, "official receipt"],
-      [receipt.hostVerification.verifiedAt, "host verification"],
+      ...(receipt
+        ? [
+            [receipt.receivedAt, "official receipt"],
+            [receipt.hostVerification.verifiedAt, "official receipt host verification"]
+          ]
+        : [
+            [hostAdoption.cleanupPendingAt, "host-adoption ambiguity retention"],
+            [hostAdoption.hostVerification.verifiedAt, "host-adoption verification"],
+            [hostAdoption.observedAt, "host-adoption observation"]
+          ]),
       [cleanupProof.observedAt, "cleanup proof"],
       [runtime.executionContextManifest.capturedAt, "execution ContextManifest"]
     ]) {
@@ -5096,6 +5202,7 @@ function assertWriteProvisioningRuntime(runtime, binding, journal) {
       || intent.processIdentity.startToken !== cleanupProvisioner?.startToken
       || runtime.activatedJournalDigest !== journal.previousJournalDigest
       || intent.updatedAt !== journal.cleanupPendingAt
+      || hostAdoption !== null
       || runtime.executionContextManifest !== null
       || !cleanupProof) {
       writeProvisioningStateError(
@@ -5123,6 +5230,7 @@ function assertWriteProvisioningRuntime(runtime, binding, journal) {
     );
     if (intent.status !== "no-child"
       || intent.noChildAt !== journal.failedAt
+      || hostAdoption !== null
       || runtime.executionContextManifest !== null
       || (active
         ? cleanupProof === null
@@ -5149,7 +5257,13 @@ function assertWriteProvisioningRuntime(runtime, binding, journal) {
   } else {
     writeProvisioningStateError("Write provisioning journal state is unsupported by this source slice.");
   }
-  return Object.freeze({ runtime, intent, receipt, cleanupProof });
+  return Object.freeze({
+    runtime,
+    intent,
+    receipt,
+    hostAdoption,
+    cleanupProof
+  });
 }
 
 export function assertWriteExecutionJob(job, env = process.env) {
@@ -5706,6 +5820,7 @@ export function prepareWriteProvisionerIntent({
       activatedJournalDigest: null,
       activationDigest: null,
       officialReceipt: null,
+      hostAdoption: null,
       executionContextManifest: null,
       executionContextManifestRecordDigest: null,
       cleanupProof: null
@@ -6470,6 +6585,294 @@ export function retainWriteProvisioningCleanupPending({
     return Object.freeze({
       retained: true,
       replayed: false,
+      job
+    });
+  }, env);
+}
+
+/**
+ * Adopt one exact, clean worktree whose official create response was lost
+ * after the broker had durably retained the unknown effect. This records
+ * host-observed evidence, never fabricates an official Grok receipt, and
+ * grants no provider-dispatch authority.
+ */
+export function adoptWriteProvisioningEffect({
+  root,
+  principal,
+  workerId,
+  executionBindingDigest,
+  expectedJournalDigest,
+  providerSpawnIntentId,
+  cleanupProofDigest,
+  readyAt = null,
+  env = process.env
+} = {}) {
+  if (!root || !principal?.threadId || !workerId) {
+    throw new CompanionError(
+      principal?.threadId ? "E_USAGE" : "E_AUTH_REQUIRED",
+      principal?.threadId
+        ? "Write provisioning adoption requires a worker identity."
+        : "Trusted Codex task identity is unavailable."
+    );
+  }
+  if (!SHA256_HEX.test(executionBindingDigest || "")
+    || !SHA256_HEX.test(expectedJournalDigest || "")
+    || !EXACT_NONCE_HEX.test(providerSpawnIntentId || "")
+    || !SHA256_HEX.test(cleanupProofDigest || "")) {
+    throw new CompanionError(
+      "E_USAGE",
+      "Write provisioning adoption requires exact binding, journal, intent, and cleanup identities."
+    );
+  }
+  const requestedReadyAt = readyAt;
+  if (requestedReadyAt !== null) {
+    assertCanonicalTimestamp(requestedReadyAt, "readyAt");
+  }
+
+  return withWorkspaceStateTransaction(root, (transaction) => {
+    const current = transaction.tryReadJob(workerId);
+    if (!current) throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+    assertMutationOwnership(current, principal);
+    const verified = assertWriteExecutionJob(current, env);
+    const runtime = verified.provisioningRuntime;
+    const intent = runtime?.intent;
+    if (verified.binding.bindingDigest !== executionBindingDigest
+      || intent?.providerSpawnIntentId !== providerSpawnIntentId
+      || runtime?.cleanupProof?.proofDigest !== cleanupProofDigest) {
+      writeProvisioningStateError(
+        "Host adoption does not own the exact retained provisioning evidence.",
+        "E_PROCESS_IDENTITY"
+      );
+    }
+    assertActualWriteProvisionerCleanup(verified.binding, intent);
+
+    if (verified.journal.state === "ready") {
+      if (verified.journal.previousJournalDigest !== expectedJournalDigest
+        || runtime.receipt !== null
+        || !runtime.hostAdoption
+        || (requestedReadyAt !== null && intent.settledAt !== requestedReadyAt)) {
+        writeProvisioningStateError(
+          "Ready host-adoption replay changed durable recovery evidence."
+        );
+      }
+      const currentVerification = managedWorktreeVerification(verified.binding, env);
+      if (!sameWorktreeVerificationIdentity(
+        runtime.hostAdoption.hostVerification,
+        currentVerification
+      )) {
+        writeProvisioningStateError(
+          "Host-adopted worktree identity changed before replay.",
+          "E_WORKTREE"
+        );
+      }
+      const currentManifest = assertContextCompatible(
+        verified.binding.expectedExecutionRoot,
+        runtime.runtime.executionContextManifest,
+        { mode: "execute" }
+      );
+      if (currentManifest.manifestId
+          !== runtime.runtime.executionContextManifest.manifestId
+        || currentManifest.digest
+          !== runtime.runtime.executionContextManifest.digest) {
+        writeProvisioningStateError(
+          "Host-adopted execution context changed before replay.",
+          "E_CONTEXT_DRIFT"
+        );
+      }
+      return Object.freeze({
+        adopted: false,
+        replayed: true,
+        adoption: runtime.hostAdoption,
+        job: current
+      });
+    }
+
+    if (verified.journal.state !== "cleanup_pending"
+      || verified.journal.journalDigest !== expectedJournalDigest
+      || intent.status !== "registered"
+      || runtime.receipt !== null
+      || runtime.hostAdoption !== null
+      || runtime.runtime.executionContextManifest !== null) {
+      writeProvisioningStateError(
+        "Only one unknown official effect can be host-adopted from cleanup-pending."
+      );
+    }
+
+    const verification = managedWorktreeVerification(verified.binding, env);
+    const executionContextManifest = captureContextManifest(
+      verified.binding.expectedExecutionRoot
+    );
+    const currentManifest = assertContextCompatible(
+      verified.binding.expectedExecutionRoot,
+      executionContextManifest,
+      { mode: "execute" }
+    );
+    if (currentManifest.manifestId !== executionContextManifest.manifestId
+      || currentManifest.digest !== executionContextManifest.digest
+      || currentManifest.workspaceRoot !== verified.binding.expectedExecutionRoot
+      || currentManifest.git?.head !== verified.binding.baseCommit) {
+      writeProvisioningStateError(
+        "Host-adopted ContextManifest is not exact for the verified worktree.",
+        "E_CONTEXT_DRIFT"
+      );
+    }
+
+    const observedAt = new Date(Math.max(
+      Date.now(),
+      Date.parse(verified.journal.cleanupPendingAt),
+      Date.parse(runtime.cleanupProof.observedAt),
+      Date.parse(verification.verifiedAt)
+    )).toISOString();
+    const adoption = {
+      schemaVersion: WRITE_PROVISIONING_SCHEMA_VERSION,
+      origin: WRITE_HOST_ADOPTION_ORIGIN,
+      operationId: intent.operationId,
+      providerSpawnIntentId: intent.providerSpawnIntentId,
+      provisioningIntentDigest: intent.intentDigest,
+      requestedExecutableIdentityDigest: intent.executableIdentity.identityDigest,
+      requestedReleaseIdentityDigest:
+        intent.executableIdentity.releaseIdentityDigest,
+      cleanupPendingAt: verified.journal.cleanupPendingAt,
+      cleanupPendingJournalDigest: verified.journal.journalDigest,
+      cleanupProofDigest: runtime.cleanupProof.proofDigest,
+      hostVerification: verification,
+      observedAt,
+      adoptionDigest: null
+    };
+    adoption.adoptionDigest = stableDigest(
+      worktreeHostAdoptionWithoutDigest(adoption)
+    );
+    assertWorktreeHostAdoption(
+      adoption,
+      verified.binding,
+      intent,
+      runtime.cleanupProof,
+      verified.journal.journalDigest
+    );
+
+    const adoptedAt = requestedReadyAt ?? new Date(Math.max(
+      Date.now(),
+      Date.parse(observedAt),
+      Date.parse(executionContextManifest.capturedAt)
+    )).toISOString();
+    assertCanonicalTimestamp(adoptedAt, "readyAt");
+    for (const [timestamp, label] of [
+      [observedAt, "host-adoption observation"],
+      [executionContextManifest.capturedAt, "execution ContextManifest"]
+    ]) {
+      if (Date.parse(adoptedAt) < Date.parse(timestamp)) {
+        writeProvisioningStateError(`Host adoption cannot predate its ${label}.`);
+      }
+    }
+
+    const journal = transitionProvisioningJournal(
+      verified.binding,
+      verified.journal,
+      {
+        state: "ready",
+        expectedCurrentJournalDigest: expectedJournalDigest,
+        readyAt: adoptedAt,
+        executionContextManifestId: currentManifest.manifestId,
+        executionContextManifestDigest: currentManifest.digest
+      }
+    );
+    const nextIntent = {
+      ...intent,
+      status: "settled",
+      settledAt: adoptedAt,
+      updatedAt: adoptedAt
+    };
+    const nextRuntime = {
+      ...runtime.runtime,
+      intent: nextIntent,
+      hostAdoption: adoption,
+      executionContextManifest,
+      executionContextManifestRecordDigest:
+        stableDigest(executionContextManifest)
+    };
+    const job = transaction.updateJob(workerId, (latest) => {
+      assertMutationOwnership(latest, principal);
+      const latestVerified = assertWriteExecutionJob(latest, env);
+      if (latestVerified.journal.state !== "cleanup_pending"
+        || latestVerified.journal.journalDigest !== expectedJournalDigest
+        || latestVerified.provisioningRuntime?.intent.providerSpawnIntentId
+          !== providerSpawnIntentId
+        || latestVerified.provisioningRuntime.cleanupProof?.proofDigest
+          !== cleanupProofDigest
+        || latestVerified.provisioningRuntime.receipt !== null
+        || latestVerified.provisioningRuntime.hostAdoption !== null) {
+        writeProvisioningStateError(
+          "Write provisioning state changed before host adoption."
+        );
+      }
+      assertActualWriteProvisionerCleanup(latestVerified.binding, intent);
+      const commitVerification = managedWorktreeVerification(
+        latestVerified.binding,
+        env
+      );
+      if (!sameWorktreeVerificationIdentity(
+        verification,
+        commitVerification
+      )) {
+        writeProvisioningStateError(
+          "Host-adoption worktree identity changed before publication.",
+          "E_WORKTREE"
+        );
+      }
+      const commitManifest = assertContextCompatible(
+        latestVerified.binding.expectedExecutionRoot,
+        executionContextManifest,
+        { mode: "execute" }
+      );
+      if (commitManifest.manifestId !== executionContextManifest.manifestId
+        || commitManifest.digest !== executionContextManifest.digest) {
+        writeProvisioningStateError(
+          "Host-adoption context changed before publication.",
+          "E_CONTEXT_DRIFT"
+        );
+      }
+      const next = {
+        ...latest,
+        status: "queued",
+        phase: "worktree-ready",
+        summary: "Host-verified write worktree ready",
+        progress:
+          "Unknown official response reconciled by exact host adoption; provider dispatch is not yet authorized.",
+        updatedAt: adoptedAt,
+        heartbeatAt: adoptedAt,
+        provisioning: journal,
+        provisioningRuntime: nextRuntime,
+        request: {
+          ...latest.request,
+          spawn: {
+            ...latest.request.spawn,
+            providerLaunchPending: false,
+            providerLaunchInFlight: false,
+            providerLaunchOutcome: WRITE_READY_LAUNCH_OUTCOME
+          }
+        },
+        startedAt: null,
+        completedAt: null,
+        result: null,
+        error: null,
+        lifecycleEvents: appendLifecycleEvent(
+          latest.lifecycleEvents || [],
+          "activity.completed",
+          "Unknown official worktree effect adopted from exact host evidence.",
+          {
+            operationId: intent.operationId,
+            hostAdoptionDigest: adoption.adoptionDigest,
+            cleanupProofDigest: runtime.cleanupProof.proofDigest
+          }
+        )
+      };
+      assertWriteExecutionJob(next, env);
+      return next;
+    });
+    return Object.freeze({
+      adopted: true,
+      replayed: false,
+      adoption: job.provisioningRuntime.hostAdoption,
       job
     });
   }, env);

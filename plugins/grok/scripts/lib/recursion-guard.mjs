@@ -29,10 +29,16 @@ const WORKTREE_PROVISIONING_RUNTIME_KEYS = new Set([
   "activatedJournalDigest",
   "activationDigest",
   "officialReceipt",
+  "hostAdoption",
   "executionContextManifest",
   "executionContextManifestRecordDigest",
   "cleanupProof"
 ]);
+const LEGACY_WORKTREE_PROVISIONING_RUNTIME_KEYS = new Set(
+  [...WORKTREE_PROVISIONING_RUNTIME_KEYS].filter(
+    (key) => key !== "hostAdoption"
+  )
+);
 const WORKTREE_PROVISIONING_INTENT_KEYS = new Set([
   "schemaVersion",
   "purpose",
@@ -435,7 +441,10 @@ function assertCanonicalWorktreeProvisioningState(
     && journal.provisioner?.pid === guard.providerProcess.pid
     && journal.provisioner?.startToken === guard.providerProcess.startToken
     && journal.provisioner?.holderId === guard.holderId
-    && exactKeys(runtime, WORKTREE_PROVISIONING_RUNTIME_KEYS)
+    && (
+      exactKeys(runtime, WORKTREE_PROVISIONING_RUNTIME_KEYS)
+      || exactKeys(runtime, LEGACY_WORKTREE_PROVISIONING_RUNTIME_KEYS)
+    )
     && runtime.schemaVersion === 1
     && exactKeys(intent, WORKTREE_PROVISIONING_INTENT_KEYS)
     && intent.schemaVersion === 1
@@ -461,6 +470,8 @@ function assertCanonicalWorktreeProvisioningState(
     && runtime.activatedJournalDigest === journal.journalDigest
     && runtime.activationDigest === worktreeProvisioningActivationDigest(runtime)
     && runtime.officialReceipt === null
+    && (!Object.hasOwn(runtime, "hostAdoption")
+      || runtime.hostAdoption === null)
     && runtime.executionContextManifest === null
     && runtime.executionContextManifestRecordDigest === null
     && runtime.cleanupProof === null;

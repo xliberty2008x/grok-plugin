@@ -28,6 +28,7 @@ import { readJob } from "./state.mjs";
 import { captureContextManifest } from "./task-contract.mjs";
 import {
   activateWriteProvisioningAttempt,
+  adoptWriteProvisioningEffect,
   assertMutationOwnership,
   assertWriteExecutionJob,
   prepareWriteProvisionerIntent,
@@ -302,15 +303,17 @@ function officialProvisioningControllerProfile(profile, environment) {
 function projectReadyReplay({
   verified,
   workerId,
-  env
+  env,
+  replayed = true
 }) {
   if (verified.journal.state !== "ready") return null;
   const runtime = verified.provisioningRuntime;
   const intent = runtime?.intent;
   const receipt = runtime?.receipt;
+  const hostAdoption = runtime?.hostAdoption ?? null;
   const cleanupProof = runtime?.cleanupProof;
   if (!intent
-    || !receipt
+    || (receipt === null) === (hostAdoption === null)
     || !cleanupProof
     || intent.status !== "settled"
     || !processGroupGone(intent.processIdentity)
@@ -329,15 +332,23 @@ function projectReadyReplay({
   return Object.freeze({
     workerId,
     operationId: intent.operationId,
-    officialStatus: receipt.officialStatus,
+    officialStatus: receipt?.officialStatus ?? null,
     executionRoot: verified.binding.expectedExecutionRoot,
     bindingDigest: verified.binding.bindingDigest,
-    receiptDigest: receipt.receiptDigest,
+    receiptDigest: receipt?.receiptDigest ?? null,
+    hostAdoptionDigest: hostAdoption?.adoptionDigest ?? null,
+    recovery: hostAdoption
+      ? "host-adopted-unknown-official-response"
+      : null,
     cleanupProofDigest: cleanupProof.proofDigest,
     journalDigest: verified.journal.journalDigest,
-    executableIdentity: receipt.executableIdentity,
+    executableIdentity: receipt?.executableIdentity ?? null,
+    requestedExecutableIdentityDigest:
+      hostAdoption?.requestedExecutableIdentityDigest ?? null,
+    requestedReleaseIdentityDigest:
+      hostAdoption?.requestedReleaseIdentityDigest ?? null,
     ready: true,
-    replayed: true,
+    replayed,
     providerLaunched: false,
     workerDispatched: false
   });
@@ -353,10 +364,31 @@ export async function provisionWriteWorkerWorktree({
   workerId,
   env = process.env,
   leaseMs = DEFAULT_PROVISIONING_LEASE_MS,
-  timeoutMs = DEFAULT_OFFICIAL_TIMEOUT_MS
+  timeoutMs = DEFAULT_OFFICIAL_TIMEOUT_MS,
+  testHooks = null
 } = {}) {
   canonicalDuration(leaseMs, "leaseMs", MAX_PROVISIONING_LEASE_MS);
   canonicalDuration(timeoutMs, "timeoutMs", 15 * 60_000);
+  const testHookKeys = testHooks === null ? [] : Object.keys(testHooks);
+  const allowedTestHooks = new Set([
+    "beforeHostAdoption",
+    "afterOfficialCreateBeforeReceipt"
+  ]);
+  if (testHooks !== null
+    && (
+      typeof testHooks !== "object"
+      || testHooks === null
+      || ![Object.prototype, null].includes(Object.getPrototypeOf(testHooks))
+      || testHookKeys.length < 1
+      || testHookKeys.some((key) => (
+        !allowedTestHooks.has(key) || typeof testHooks[key] !== "function"
+      ))
+    )) {
+    throw new CompanionError(
+      "E_USAGE",
+      "Provisioner test hooks are malformed or unsupported."
+    );
+  }
   const durableJob = readJob(root, workerId, env);
   assertMutationOwnership(durableJob, principal);
   const initial = assertWriteExecutionJob(durableJob, env);
@@ -366,6 +398,49 @@ export async function provisionWriteWorkerWorktree({
     env
   });
   if (readyReplay) return readyReplay;
+  if (initial.journal.state === "cleanup_pending"
+    && initial.provisioningRuntime?.receipt === null
+    && (initial.provisioningRuntime?.hostAdoption ?? null) === null) {
+    if (testHooks?.beforeHostAdoption) {
+      await testHooks.beforeHostAdoption(Object.freeze({
+        workerId,
+        operationId: initial.provisioningRuntime.intent.operationId,
+        executionRoot: initial.binding.expectedExecutionRoot,
+        bindingDigest: initial.binding.bindingDigest,
+        cleanupPendingJournalDigest: initial.journal.journalDigest,
+        cleanupProofDigest:
+          initial.provisioningRuntime.cleanupProof.proofDigest
+      }));
+    }
+    const adopted = adoptWriteProvisioningEffect({
+      root: initial.binding.controlRoot,
+      principal,
+      workerId,
+      executionBindingDigest: initial.binding.bindingDigest,
+      expectedJournalDigest: initial.journal.journalDigest,
+      providerSpawnIntentId:
+        initial.provisioningRuntime.intent.providerSpawnIntentId,
+      cleanupProofDigest:
+        initial.provisioningRuntime.cleanupProof.proofDigest,
+      env
+    });
+    const adoptedJob = assertWriteExecutionJob(
+      readJob(initial.binding.controlRoot, workerId, env),
+      env
+    );
+    if (adopted.adopted === adopted.replayed
+      || adoptedJob.journal.state !== "ready"
+      || adoptedJob.provisioningRuntime.hostAdoption?.adoptionDigest
+        !== adopted.adoption.adoptionDigest) {
+      stateError("Host adoption did not publish exact ready evidence.");
+    }
+    return projectReadyReplay({
+      verified: adoptedJob,
+      workerId,
+      env,
+      replayed: adopted.replayed
+    });
+  }
   if (initial.journal.state !== "planned"
     || initial.provisioningRuntime !== null) {
     stateError(
@@ -651,6 +726,15 @@ export async function provisionWriteWorkerWorktree({
       label: workerId,
       timeoutMs: createTimeoutMs
     });
+    if (testHooks?.afterOfficialCreateBeforeReceipt) {
+      await testHooks.afterOfficialCreateBeforeReceipt(Object.freeze({
+        workerId,
+        operationId: prepared.intent.operationId,
+        executionRoot: initial.binding.expectedExecutionRoot,
+        bindingDigest: executionBindingDigest,
+        created: exactOfficialReceipt(created)
+      }));
+    }
     const receipt = recordOfficialWorktreeReceipt({
       ...mutationBase,
       expectedJournalDigest: activation.job.provisioning.journalDigest,

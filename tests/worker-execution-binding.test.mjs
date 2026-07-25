@@ -311,6 +311,66 @@ test("provisioning cancellation retains attempt evidence through cleanup", () =>
   assert.deepEqual(failed.cleanupProvisioner, provisioning.provisioner);
 });
 
+test("host adoption returns cleanup-pending provisioning to ready with durable context", () => {
+  const binding = bindingFixture();
+  const provisioning = provisioningFixture(binding);
+  const cleanupPending = transition(binding, provisioning, {
+    state: "cleanup_pending",
+    cleanupPendingAt: TIMES.cleanup
+  });
+  const ready = transition(binding, cleanupPending, {
+    ...readyPatch(),
+    readyAt: TIMES.cleanup
+  });
+
+  assert.equal(ready.state, "ready");
+  assert.equal(ready.cleanupProvisioner, null);
+  assert.equal(ready.cleanupPendingAt, null);
+  assert.equal(ready.readyAt, TIMES.cleanup);
+  assert.equal(ready.executionContextManifestId, readyPatch().executionContextManifestId);
+  assert.equal(
+    ready.executionContextManifestDigest,
+    readyPatch().executionContextManifestDigest
+  );
+  assert.equal(ready.attemptId, cleanupPending.attemptId);
+  assert.equal(ready.fence, cleanupPending.fence);
+  assert.equal(ready.provisioningAt, cleanupPending.provisioningAt);
+  assert.equal(ready.journalRevision, cleanupPending.journalRevision + 1);
+  assert.equal(ready.previousJournalDigest, cleanupPending.journalDigest);
+  assert.notEqual(ready.journalDigest, cleanupPending.journalDigest);
+  assert.equal(assertProvisioningJournal(binding, ready), ready);
+});
+
+test("host adoption rejects stale, pre-cleanup, and malformed ready transitions", () => {
+  const binding = bindingFixture();
+  const provisioning = provisioningFixture(binding);
+  const cleanupPending = transition(binding, provisioning, {
+    state: "cleanup_pending",
+    cleanupPendingAt: TIMES.cleanup
+  });
+  const valid = transitionRequest(cleanupPending, {
+    ...readyPatch(),
+    readyAt: TIMES.cleanup
+  });
+
+  assertStateError(() => transitionProvisioningJournal(binding, cleanupPending, {
+    ...valid,
+    expectedCurrentJournalDigest: sha256("stale-journal")
+  }));
+  assertStateError(() => transition(binding, cleanupPending, readyPatch()));
+
+  for (const request of [
+    { ...valid, actorAttemptId: cleanupPending.attemptId },
+    { ...valid, cleanupPendingAt: cleanupPending.cleanupPendingAt },
+    Object.fromEntries(Object.entries(valid).filter(([key]) => key !== "readyAt")),
+    Object.fromEntries(
+      Object.entries(valid).filter(([key]) => key !== "executionContextManifestDigest")
+    )
+  ]) {
+    assertStateError(() => transitionProvisioningJournal(binding, cleanupPending, request));
+  }
+});
+
 test("active provisioning cannot fail without first retaining its cleanup process identity", () => {
   const binding = bindingFixture();
   const provisioning = provisioningFixture(binding);
