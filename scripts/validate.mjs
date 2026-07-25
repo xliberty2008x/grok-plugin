@@ -794,8 +794,17 @@ if (!versionsOnly) {
       || JSON.stringify(staticImports) !== JSON.stringify(expectedStaticImports)
       || protectedReviewBootstrap.includes("api.")
       || protectedReviewBootstrap.includes("pathToFileURL")
-      || !protectedReviewBootstrap.includes("if (import.meta.main === true)")
-      || !protectedReviewBootstrap.includes("import.meta.main === undefined")
+      || !protectedReviewBootstrap.includes("function isDirectMainInvocation()")
+      || !protectedReviewBootstrap.includes(
+        'if (typeof import.meta.main === "boolean") return import.meta.main;'
+      )
+      || !protectedReviewBootstrap.includes(
+        "const modulePath = canonicalEntrypointPath(fileURLToPath(import.meta.url));"
+      )
+      || !protectedReviewBootstrap.includes(
+        "const invokedPath = canonicalEntrypointPath(process.argv[1]);"
+      )
+      || !protectedReviewBootstrap.includes("if (isDirectMainInvocation())")
       || !protectedReviewBootstrap.includes("function invokeProtectedOperation(")
       || !protectedReviewBootstrap.includes("spawnSync(")
       || !protectedReviewBootstrap.includes("OPERATION_RELATIVE_PATH")
