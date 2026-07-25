@@ -1,6 +1,6 @@
 # Grok Companion for Claude Code and Codex
 
-Grok Companion is a dual-host marketplace plugin that delegates code review, investigation, and implementation work from **Claude Code** or **OpenAI Codex** to the locally installed [official Grok Build CLI](https://docs.x.ai/build/overview). Host facades never solve the task themselves: they forward to a shared Node runtime that owns jobs, isolation, and Grok process lifecycle.
+Grok Companion is a dual-host marketplace plugin that delegates code review, investigation, and implementation work from **Claude Code** or **OpenAI Codex** to the locally installed [official Grok Build CLI](https://docs.x.ai/build/overview). Host facades never solve the task themselves: they forward to a shared Node runtime that owns job identity, isolation policy, durable evidence, and Grok process lifecycle. For the issue #25 write-worker path, official Grok ACP executes worktree mechanics while the broker independently binds and verifies them.
 
 | | |
 |---|---|

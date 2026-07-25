@@ -61,7 +61,7 @@ Parity means:
 ### Residual limitations (document honestly)
 
 1. **macOS child-network isolation** is not enforced by Grok; the plugin does not claim otherwise.
-2. **Writes are native-like inside broker-created detached execution worktrees** via `search_replace`. Scope violations are detected **after** mutation (`E_SCOPE_VIOLATION`), are not claimed as rolled back inside the worker tree, and can never make the artifact integration-ready. The control checkout remains unchanged until explicit host integration.
+2. **Worker Broker write spawn is not yet enabled or qualified.** The strict official ACP worktree protocol seam exists, but durable broker admission/provisioning, ready-only provider launch, artifact integration, restart/cancellation, and cleanup still have to pass P3-V. Direct adapter probes are supporting evidence only and must not be described as an isolated Worker Broker lifecycle.
 3. **Authenticated installed-Codex natural host-orchestration E2E** for this hardening slice remains outstanding; direct installed-wrapper execution has passed but is a different evidence boundary.
 4. Cross-platform authenticated provider qualification beyond historical macOS evidence remains open.
 
@@ -361,7 +361,7 @@ Using the fake provider and an opt-in real CLI test against this worktree:
 - Use atomic writes and a bounded lock with stale-lock recovery.
 - Use `0700` directories and `0600` sensitive files where supported.
 - Retain at most 50 jobs without evicting active jobs.
-- For the P3.1 cutover, reject dirty/unsafe control checkouts; atomically commit each write job, idempotency witness, immutable private `ExecutionBinding`, and `planned` journal before any filesystem effect; then use one fenced `planned → provisioning → ready` attempt to create and verify the exact detached worktree. Construct launch authorization/outbox only at `ready`, and require provider `cwd` plus every controller/provider authority digest to equal that binding before dispatch.
+- For the P3.1 cutover, reject dirty/unsafe control checkouts; atomically commit each write job, idempotency witness, immutable private `ExecutionBinding`, and `planned` journal before any filesystem effect; then use one fenced `planned → provisioning → ready` attempt to request exact worktree creation through the official Grok ACP extension and independently verify its registered path/base/common-directory identity. Construct launch authorization/outbox only at `ready`, and require provider `cwd` plus every controller/provider authority digest to equal that binding before dispatch.
 - Retain one control-workspace writer as a conservative transitional fence; P3.2 replaces it with durable managed-root leases so distinct execution roots may overlap while the same root/lineage remains exclusive.
 - Implement `queued`, `running`, `completed`, `failed`, and `cancelled` transitions with progress and heartbeat.
 - Persist workspace, host kind/session, Grok session, the complete effective security profile, model, effort, verified process identities, timestamps, TaskEnvelope/context manifests, completion manifests, lifecycle events, result (worker report, provider claims, runtime evidence, hostVerification), and stable error; read legacy schema-1/2 records compatibly.
