@@ -35,9 +35,11 @@ import {
   recordOfficialWorktreeReceipt,
   recordWriteProvisionerNoChild,
   retainWriteProvisioningCleanupPending,
+  settleProviderStartedWorkerFinalization,
   settleWriteArtifactAfterRuntimeCleanup,
   spawnReadOnlyWorker,
-  SPAWN_SUCCESS_DEFINITION
+  SPAWN_SUCCESS_DEFINITION,
+  transitionWorkerDispatch
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import {
   assertExecutionBinding,
@@ -3701,6 +3703,395 @@ test("verified target.txt worktree atomically gains one exact dispatch-v2 author
     (error) => error?.code === "E_INTEGRATION"
       && /Parent working tree changed/.test(error.message)
   );
+});
+
+test("exact write spawn replay returns the original handle after dispatch and terminal state", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = plannedWriteVerticalFixture("dispatched-spawn-replay");
+  const idempotencyKey = "write-vertical-dispatched-spawn-replay-0001";
+  const writeLifecycleCapabilityDigest = "c".repeat(64);
+  const spawnRequest = {
+    root: fixture.root,
+    principal: principal(fixture.root),
+    envelope: fixture.envelope,
+    idempotencyKey,
+    roleId: "implementer",
+    write: true,
+    allowWriteSpawn: true,
+    writeLifecycleCapabilityDigest,
+    env: fixture.env
+  };
+  const workerId = fixture.workerId;
+  const active = await activateRegisteredProvisioning(t, fixture);
+  const official = createWorkerWorktree({
+    controlRoot: fixture.root,
+    baseCommit: fixture.binding.baseCommit,
+    workerId,
+    env: fixture.env
+  });
+  t.after(() => {
+    try {
+      git(fixture.root, "worktree", "remove", "--force", official.executionRoot);
+    } catch {}
+  });
+  const receivedAt = new Date(
+    Math.max(Date.now(), Date.parse(active.registeredAt) + 1)
+  ).toISOString();
+  const recorded = recordOfficialWorktreeReceipt({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    officialReceipt: {
+      status: "created",
+      sessionId: active.prepared.intent.operationId,
+      worktreePath: official.executionRoot,
+      sourceGitRoot: fixture.binding.controlRoot,
+      commit: fixture.binding.baseCommit
+    },
+    receivedAt,
+    env: fixture.env
+  });
+  process.kill(-active.child.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(active.identity), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  const executionContextManifest = captureContextManifest(official.executionRoot);
+  const observedAt = new Date(
+    Math.max(Date.now(), Date.parse(receivedAt) + 1)
+  ).toISOString();
+  const readyAt = new Date(Math.max(
+    Date.now(),
+    Date.parse(recorded.receipt.hostVerification.verifiedAt) + 1,
+    Date.parse(executionContextManifest.capturedAt) + 1,
+    Date.parse(observedAt) + 1
+  )).toISOString();
+  promoteWriteWorkerReady({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    executionContextManifest,
+    cleanupProof: {
+      processIdentity: active.identity,
+      processGroupGone: true,
+      providerGuardAbsent: true,
+      observedAt
+    },
+    readyAt,
+    env: fixture.env
+  });
+
+  const authority = brokerPrincipal(fixture.root);
+  const authorized = authorizeReadyWriteWorkerDispatch({
+    root: fixture.root,
+    principal: authority,
+    workerId,
+    writeLifecycleCapabilityDigest,
+    validateWriteLifecycleCapability: () => writeLifecycleCapabilityDigest,
+    env: fixture.env
+  });
+  assert.equal(authorized.authorized, true);
+  assert.equal(authorized.job.request.spawn.dispatch.schemaVersion, 2);
+  assert.equal(authorized.job.request.spawn.dispatch.state, "pending");
+  const journalDigestBeforeReplay = authorized.job.provisioning.journalDigest;
+  const lifecycleBeforeReplay = authorized.job.lifecycleEvents.length;
+
+  // A pre-provider dispatch replay remains exact without changing launch state.
+  const dispatchedReplay = spawnReadOnlyWorker(spawnRequest);
+  assert.equal(dispatchedReplay.replayed, true);
+  assert.equal(dispatchedReplay.handle.id, workerId);
+  assert.equal(dispatchedReplay.providerLaunched, false);
+  const afterDispatchedReplay = tryReadJob(fixture.root, workerId, fixture.env);
+  assert.equal(afterDispatchedReplay.provisioning.journalDigest, journalDigestBeforeReplay);
+  assert.equal(afterDispatchedReplay.lifecycleEvents.length, lifecycleBeforeReplay);
+  assert.equal(listJobs(fixture.root, fixture.env).length, 1);
+  assert.equal(afterDispatchedReplay.request.spawn.dispatch.state, "pending");
+  assert.doesNotThrow(() => assertDispatchContract(afterDispatchedReplay));
+
+  const claim = claimWorkerDispatch({
+    root: fixture.root,
+    principal: authority,
+    workerId,
+    env: fixture.env
+  });
+  const dispatchChildren = [];
+  const startDispatchProcess = async (kind, extra = {}) => {
+    const child = spawnProcess(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)", workerId, kind],
+      { detached: true, stdio: "ignore" }
+    );
+    dispatchChildren.push(child);
+    return {
+      pid: child.pid,
+      startToken: await waitFor(() => processStartToken(child.pid), {
+        timeoutMs: 5_000,
+        intervalMs: 25
+      }),
+      processGroupId: child.pid,
+      nonce: claim.nonce,
+      commandMarker: workerId,
+      dispatchAttemptId: claim.attemptId,
+      dispatchFence: claim.fence,
+      ...extra
+    };
+  };
+  t.after(async () => {
+    for (const child of dispatchChildren) {
+      try { process.kill(-child.pid, "SIGKILL"); } catch {}
+    }
+  });
+  const controllerProcess = await startDispatchProcess("controller");
+  const workerProcess = await startDispatchProcess("worker");
+  const providerProcess = await startDispatchProcess("provider", {
+    providerGeneration: 1
+  });
+  const controllerIntent = prepareDispatchProcessSpawn({
+    root: fixture.root,
+    workerId,
+    attemptId: claim.attemptId,
+    fence: claim.fence,
+    processKind: "controller",
+    nonce: claim.nonce,
+    env: fixture.env
+  }).intent;
+  transitionWorkerDispatch({
+    root: fixture.root,
+    workerId,
+    attemptId: claim.attemptId,
+    fence: claim.fence,
+    state: "controller-started",
+    controllerProcess,
+    spawnIntentId: controllerIntent.intentId,
+    env: fixture.env
+  });
+  const workerIntent = prepareDispatchProcessSpawn({
+    root: fixture.root,
+    workerId,
+    attemptId: claim.attemptId,
+    fence: claim.fence,
+    processKind: "worker",
+    nonce: claim.nonce,
+    env: fixture.env
+  }).intent;
+  transitionWorkerDispatch({
+    root: fixture.root,
+    workerId,
+    attemptId: claim.attemptId,
+    fence: claim.fence,
+    state: "worker-started",
+    workerProcess,
+    spawnIntentId: workerIntent.intentId,
+    env: fixture.env
+  });
+  transitionWorkerDispatch({
+    root: fixture.root,
+    workerId,
+    attemptId: claim.attemptId,
+    fence: claim.fence,
+    state: "provider-started",
+    providerProcess,
+    env: fixture.env
+  });
+  const completedAt = new Date().toISOString();
+  updateJob(fixture.root, workerId, (job) => ({
+    ...job,
+    status: "running",
+    phase: "finalizing",
+    grokSessionId: "77777777-7777-4777-8777-777777777777",
+    workerAuthorization: null,
+    pendingTerminal: {
+      status: "completed",
+      phase: "done",
+      completedAt,
+      error: null,
+      summary: "Write vertical completed"
+    },
+    result: {
+      ...(job.result || {}),
+      hostVerification: "not_run",
+      taskRuntimeCleaned: false
+    },
+    request: {
+      ...job.request,
+      spawn: {
+        ...job.request.spawn,
+        consumedLaunchContractDigest:
+          job.workerAuthorization.launchContractDigest,
+        launchContractConsumedAt: new Date().toISOString()
+      }
+    }
+  }), fixture.env);
+  // From this point the live provider owns the scoped worktree. Its intended
+  // edit must not trigger acceptance-time context recomputation on replay.
+  fs.writeFileSync(
+    path.join(official.executionRoot, "target.txt"),
+    "after\n",
+    "utf8"
+  );
+  const activeProviderReplay = spawnReadOnlyWorker(spawnRequest);
+  assert.equal(activeProviderReplay.replayed, true);
+  assert.equal(activeProviderReplay.handle.id, workerId);
+  assert.equal(activeProviderReplay.handle.status, "running");
+  assert.equal(activeProviderReplay.providerLaunched, false);
+  process.kill(-dispatchChildren.at(-1).pid, "SIGKILL");
+  await waitFor(() => processGroupGone(providerProcess), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  const terminalJob = settleProviderStartedWorkerFinalization({
+    root: fixture.root,
+    workerId,
+    attemptId: claim.attemptId,
+    workerProcess,
+    providerProcess,
+    runtimeCleanup: () => ({ ok: true }),
+    env: fixture.env
+  });
+  assert.equal(terminalJob.status, "completed");
+  assert.equal(
+    terminalJob.request.spawn.dispatch.state,
+    "provider-started"
+  );
+  assert.equal(terminalJob.result.taskRuntimeCleaned, true);
+  assert.equal(
+    terminalJob.result.writeArtifact.contentDigest,
+    crypto.createHash("sha256").update("after\n").digest("hex")
+  );
+  assert.doesNotThrow(() => assertDispatchContract(terminalJob));
+
+  const terminalReplay = spawnReadOnlyWorker(spawnRequest);
+  assert.equal(terminalReplay.replayed, true);
+  assert.equal(terminalReplay.handle.id, workerId);
+  assert.equal(terminalReplay.handle.status, "completed");
+  assert.equal(terminalReplay.providerLaunched, false);
+  const afterTerminalReplay = tryReadJob(fixture.root, workerId, fixture.env);
+  assert.equal(afterTerminalReplay.status, "completed");
+  assert.equal(afterTerminalReplay.provisioning.journalDigest, journalDigestBeforeReplay);
+  assert.equal(listJobs(fixture.root, fixture.env).length, 1);
+
+  const recordFile = spawnIdempotencyFile(fixture.root, idempotencyKey, fixture.env);
+  fs.unlinkSync(recordFile);
+  const recovered = admitWriteWorkerPlan({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    envelope: fixture.envelope,
+    idempotencyKey,
+    roleId: "implementer",
+    allowWriteSpawn: true,
+    writeLifecycleCapabilityDigest,
+    env: fixture.env
+  });
+  assert.equal(recovered.replayed, true);
+  assert.equal(recovered.handle.id, workerId);
+  assert.equal(recovered.handle.status, "completed");
+  assert.equal(listJobs(fixture.root, fixture.env).length, 1);
+  assert.equal(fs.existsSync(recordFile), true);
+
+  const originalJob = structuredClone(tryReadJob(fixture.root, workerId, fixture.env));
+  const jobFile = path.join(
+    workspaceState(fixture.root, fixture.env),
+    "jobs",
+    `${workerId}.json`
+  );
+  const corruptions = [
+    {
+      name: "write identity",
+      mutate(job) {
+        job.write = false;
+        job.role = {
+          ...job.role,
+          id: "explorer",
+          write: false
+        };
+      }
+    },
+    {
+      name: "execution binding digest",
+      mutate(job) {
+        job.request.spawn.executionBindingDigest = "0".repeat(64);
+      }
+    },
+    {
+      name: "capability",
+      mutate(job) {
+        job.request.spawn.writeLifecycleCapabilityDigest = "e".repeat(64);
+        job.request.spawn.providerCapabilityDigest = "e".repeat(64);
+        job.executionBinding = {
+          ...job.executionBinding,
+          providerCapabilityDigest: "e".repeat(64)
+        };
+      }
+    },
+    {
+      name: "owner",
+      mutate(job) {
+        job.host = { ...job.host, sessionId: THREAD_B };
+        job.request.spawn.ownerThreadId = THREAD_B;
+      }
+    },
+    {
+      name: "execution root",
+      mutate(job) {
+        job.request.spawn.executionRoot = path.join(fixture.root, "foreign-execution");
+      }
+    },
+    {
+      name: "admission digest",
+      mutate(job) {
+        job.request.spawn.admissionRequestDigest = "0".repeat(64);
+      }
+    },
+    {
+      name: "dispatch state",
+      mutate(job) {
+        job.request.spawn.dispatch = {
+          ...job.request.spawn.dispatch,
+          state: "pending"
+        };
+      }
+    },
+    {
+      name: "provisioning journal",
+      mutate(job) {
+        job.provisioning = {
+          ...job.provisioning,
+          state: "planned"
+        };
+      }
+    },
+    {
+      name: "provisioning runtime",
+      mutate(job) {
+        job.provisioningRuntime = {
+          ...job.provisioningRuntime,
+          executionContextManifestRecordDigest: "0".repeat(64)
+        };
+      }
+    }
+  ];
+  for (const { name, mutate } of corruptions) {
+    const corrupted = structuredClone(originalJob);
+    mutate(corrupted);
+    fs.writeFileSync(jobFile, `${JSON.stringify(corrupted)}\n`, { mode: 0o600 });
+    assert.throws(
+      () => spawnReadOnlyWorker(spawnRequest),
+      (error) => error?.code !== undefined
+        && !String(error.message).includes(workerId),
+      name
+    );
+  }
+  fs.writeFileSync(jobFile, `${JSON.stringify(originalJob)}\n`, { mode: 0o600 });
+  assert.equal(spawnReadOnlyWorker(spawnRequest).handle.id, workerId);
 });
 
 test("write admission durably binds one planned journal without creating launch authority", () => {

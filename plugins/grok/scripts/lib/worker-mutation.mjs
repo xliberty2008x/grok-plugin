@@ -8359,13 +8359,104 @@ export function recordWriteProvisionerNoChild({
 
 function assertWriteAdmissionReplayMatches(binding, expected) {
   try {
-    assertExecutionBinding(binding, expected);
+    return assertExecutionBinding(binding, expected);
   } catch (error) {
     if (error instanceof CompanionError && error.code === "E_STATE") {
       idempotencyConflict("idempotencyKey was reused with a different write-spawn request.");
     }
     throw error;
   }
+}
+
+/**
+ * Validate one durable write job for exact spawn-admission replay.
+ *
+ * Pre-dispatch/provisioning jobs keep assertWriteExecutionJob. Once a
+ * dispatch-v2 outbox exists (including terminal provider outcomes), the
+ * immutable executionBinding and dispatch contract are fail-closed without
+ * recomputing dirty execution-worktree acceptance context.
+ */
+function assertWriteAdmissionReplayCandidate(job, expected, env = process.env) {
+  const expectedBinding = {
+    controlRoot: expected.controlRoot,
+    gitCommonDir: expected.gitCommonDir,
+    scope: expected.scope,
+    envelopeDigest: expected.envelopeDigest,
+    roleDigest: expected.roleDigest,
+    profileDigest: expected.profileDigest,
+    runtimeRolePolicyDigest: expected.runtimeRolePolicyDigest,
+    admissionContextManifestId: expected.admissionContextManifestId,
+    admissionContextManifestDigest: expected.admissionContextManifestDigest,
+    providerCapabilityDigest: expected.providerCapabilityDigest,
+    ownerDigest: expected.ownerDigest
+  };
+
+  if (isDispatchV2(job?.request?.spawn?.dispatch)) {
+    if (job?.write !== true
+      || !SHA256_HEX.test(job?.request?.spawn?.admissionRequestDigest || "")
+      || !SHA256_HEX.test(job?.request?.spawn?.idempotencyKeyDigest || "")
+      || !SHA256_HEX.test(job?.request?.spawn?.writeLifecycleCapabilityDigest || "")
+      || job?.request?.spawn?.ownerThreadId !== job?.host?.sessionId) {
+      throw new CompanionError("E_STATE", "Write worker execution binding is malformed.");
+    }
+    // Intentionally skip assertDurableSpawnRequestBinding: intended scoped
+    // provider edits make acceptance-time dirty digests invalid after dispatch.
+    assertDispatchContract(job);
+    const spawn = job.request.spawn;
+    const binding = assertWriteAdmissionReplayMatches(job.executionBinding, {
+      workerId: job.id,
+      controlWorkspaceId: job.controlWorkspaceId,
+      ...expectedBinding
+    });
+    const journal = assertProvisioningJournal(binding, job.provisioning);
+    if (journal.state !== "ready" || !job.provisioningRuntime) {
+      throw new CompanionError(
+        "E_STATE",
+        "Dispatched write worker lacks its exact verified-ready provisioning chain."
+      );
+    }
+    const provisioningRuntime = assertWriteProvisioningRuntime(
+      job.provisioningRuntime,
+      binding,
+      journal
+    );
+    if (spawn.executionBindingDigest !== binding.bindingDigest
+      || spawn.executionRoot !== binding.expectedExecutionRoot
+      || spawn.writeLifecycleCapabilityDigest !== binding.providerCapabilityDigest
+      || spawn.providerCapabilityDigest !== binding.providerCapabilityDigest
+      || binding.controlWorkspaceId !== job.controlWorkspaceId
+      || binding.workerId !== job.id
+      || provisioningRuntime.runtime.executionContextManifest?.manifestId
+        !== job.request?.contextManifest?.manifestId
+      || provisioningRuntime.runtime.executionContextManifest?.digest
+        !== job.request?.contextManifest?.digest) {
+      throw new CompanionError(
+        "E_STATE",
+        "Dispatched write worker identity or provisioning chain disagrees with its immutable execution binding."
+      );
+    }
+    const expectedAdmissionDigest = writeAdmissionRequestDigest({
+      binding,
+      idempotencyKeyDigest: spawn.idempotencyKeyDigest
+    });
+    if (spawn.admissionRequestDigest !== expectedAdmissionDigest) {
+      throw new CompanionError("E_STATE", "Write worker admission digest is inconsistent.");
+    }
+    return Object.freeze({
+      binding,
+      dispatched: true,
+      journal,
+      provisioningRuntime
+    });
+  }
+
+  const verified = assertWriteExecutionJob(job, env);
+  assertWriteAdmissionReplayMatches(verified.binding, expectedBinding);
+  return Object.freeze({
+    binding: verified.binding,
+    dispatched: false,
+    journal: verified.journal
+  });
 }
 
 /**
@@ -8443,6 +8534,19 @@ export function admitWriteWorkerPlan({
     sessionId: requestOwner.sessionId
   });
   const keyDigest = digestKey(idempotencyKey);
+  const replayExpected = Object.freeze({
+    controlRoot: control.controlRoot,
+    gitCommonDir: control.gitCommonDir,
+    scope: admissionEnvelope.scope,
+    envelopeDigest: admissionEnvelope.digest,
+    roleDigest: role.digest,
+    profileDigest: stableDigest(profile),
+    runtimeRolePolicyDigest: runtimeRolePolicy.digest,
+    admissionContextManifestId: admissionContextManifest.manifestId,
+    admissionContextManifestDigest: admissionContextManifest.digest,
+    providerCapabilityDigest: writeLifecycleCapabilityDigest,
+    ownerDigest
+  });
 
   const admitted = withWorkspaceStateTransaction(control.controlRoot, (transaction) => {
     const digestOwners = transaction.listJobs().filter((candidate) => (
@@ -8466,20 +8570,7 @@ export function admitWriteWorkerPlan({
       if (!committed || digestOwners.length !== 1 || digestOwners[0].id !== record.workerId) {
         spawnIdempotencyStateError("Write-spawn idempotency ownership is missing or ambiguous.");
       }
-      const verified = assertWriteExecutionJob(committed, env);
-      assertWriteAdmissionReplayMatches(verified.binding, {
-        controlRoot: control.controlRoot,
-        gitCommonDir: control.gitCommonDir,
-        scope: admissionEnvelope.scope,
-        envelopeDigest: admissionEnvelope.digest,
-        roleDigest: role.digest,
-        profileDigest: stableDigest(profile),
-        runtimeRolePolicyDigest: runtimeRolePolicy.digest,
-        admissionContextManifestId: admissionContextManifest.manifestId,
-        admissionContextManifestDigest: admissionContextManifest.digest,
-        providerCapabilityDigest: writeLifecycleCapabilityDigest,
-        ownerDigest
-      });
+      assertWriteAdmissionReplayCandidate(committed, replayExpected, env);
       if (record.admissionRequestDigest !== committed.request.spawn.admissionRequestDigest) {
         spawnIdempotencyStateError("Write-spawn idempotency record disagrees with its durable job.");
       }
@@ -8518,20 +8609,7 @@ export function admitWriteWorkerPlan({
         || orphan.controlWorkspaceId !== control.controlWorkspaceId) {
         idempotencyConflict("idempotencyKey was reused with a different write-spawn request.");
       }
-      const verified = assertWriteExecutionJob(orphan, env);
-      assertWriteAdmissionReplayMatches(verified.binding, {
-        controlRoot: control.controlRoot,
-        gitCommonDir: control.gitCommonDir,
-        scope: admissionEnvelope.scope,
-        envelopeDigest: admissionEnvelope.digest,
-        roleDigest: role.digest,
-        profileDigest: stableDigest(profile),
-        runtimeRolePolicyDigest: runtimeRolePolicy.digest,
-        admissionContextManifestId: admissionContextManifest.manifestId,
-        admissionContextManifestDigest: admissionContextManifest.digest,
-        providerCapabilityDigest: writeLifecycleCapabilityDigest,
-        ownerDigest
-      });
+      assertWriteAdmissionReplayCandidate(orphan, replayExpected, env);
       assertMutationOwnership(orphan, principal);
       const captured = captureSpawnResponse({
         job: orphan,
