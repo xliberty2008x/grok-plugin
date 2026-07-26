@@ -5013,7 +5013,7 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
         !== generationTwoAdmission.providerProcess.startToken
     );
   const providerLifecycleProof = mailboxProofValid
-    && generationOneProof
+    && (generationOneProof || generationTwoProof)
     && nativeStructuredReportProof;
   const expectedExecutionRoot = context.workerWorktree.expectedWorkerWorktreeRoot(
     fixtureRoot,

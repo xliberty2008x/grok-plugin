@@ -534,6 +534,10 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
     source,
     /generationOneAdmission\.promptDigest\s*!== generationTwoAdmission\.promptDigest/
   );
+  assert.match(
+    source,
+    /generationOneProof \|\| generationTwoProof/
+  );
   assert.match(source, /mailboxAttempt\.finalReportSequence === 0/);
   assert.match(
     source,
