@@ -20,6 +20,7 @@ import {
   WORKER_DISPATCH_OUTBOX_SCHEMA_VERSION,
   assertWorkerAuthorization,
   bindWorkerAuthorizationAttempt,
+  createProviderGuardBindingForJob,
   createWorkerAuthorization,
   executionBindingDigestForJob,
   launchContractDigest
@@ -512,6 +513,75 @@ test("exact write execution binding authorizes, survives attempt binding, and re
   drifted.request.spawn.executionBindingDigest = driftDigest;
   assert.throws(
     () => assertWorkerAuthorization(drifted, { allowLegacy: false }),
+    (error) => error?.code === "E_AUTH_REQUIRED"
+  );
+});
+
+test("provider guard bridge preserves only the exact write execution binding", () => {
+  const state = fixture("launch-contract-provider-guard-binding-0001");
+  const attemptId = "a".repeat(32);
+  const dispatchFence = 3;
+  const readJob = structuredClone(tryReadJob(
+    state.root,
+    state.workerId,
+    state.env
+  ));
+  readJob.request.spawn.dispatch = {
+    ...readJob.request.spawn.dispatch,
+    state: "worker-started",
+    attemptId,
+    fence: dispatchFence
+  };
+  const readBinding = createProviderGuardBindingForJob(readJob, {
+    dispatchAttemptId: attemptId,
+    dispatchFence,
+    providerGeneration: 1
+  });
+  assert.deepEqual(Object.keys(readBinding).sort(), [
+    "controlWorkspaceId",
+    "dispatchAttemptId",
+    "dispatchFence",
+    "executionRoot",
+    "providerGeneration"
+  ]);
+
+  const executionBindingDigest = "b".repeat(64);
+  const writeJob = {
+    ...structuredClone(readJob),
+    write: true,
+    executionBinding: { bindingDigest: executionBindingDigest },
+    request: {
+      ...structuredClone(readJob.request),
+      spawn: {
+        ...structuredClone(readJob.request.spawn),
+        executionBindingDigest
+      }
+    }
+  };
+  assert.deepEqual(
+    createProviderGuardBindingForJob(writeJob, {
+      dispatchAttemptId: attemptId,
+      dispatchFence,
+      providerGeneration: 1
+    }),
+    {
+      controlWorkspaceId: writeJob.controlWorkspaceId,
+      executionRoot: writeJob.request.spawn.executionRoot,
+      dispatchAttemptId: attemptId,
+      dispatchFence,
+      providerGeneration: 1,
+      executionBindingDigest
+    }
+  );
+
+  const drifted = structuredClone(writeJob);
+  drifted.request.spawn.executionBindingDigest = "c".repeat(64);
+  assert.throws(
+    () => createProviderGuardBindingForJob(drifted, {
+      dispatchAttemptId: attemptId,
+      dispatchFence,
+      providerGeneration: 1
+    }),
     (error) => error?.code === "E_AUTH_REQUIRED"
   );
 });

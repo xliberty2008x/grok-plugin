@@ -123,6 +123,48 @@ export function executionBindingDigestForJob(job) {
   return null;
 }
 
+/**
+ * Build the exact provider-guard binding consumed by the detached provider
+ * bootstrap. Write workers retain their already-verified execution binding;
+ * read workers must continue to omit that field.
+ */
+export function createProviderGuardBindingForJob(job, {
+  dispatchAttemptId,
+  dispatchFence,
+  providerGeneration
+} = {}) {
+  const dispatch = isPlainRecord(job?.request?.spawn?.dispatch)
+    ? job.request.spawn.dispatch
+    : {};
+  const executionRoot = job?.request?.spawn?.executionRoot;
+  if (
+    !/^cws-[0-9a-f]{32}$/.test(job?.controlWorkspaceId || "")
+    || typeof executionRoot !== "string"
+    || !executionRoot
+    || !ID_HEX.test(dispatchAttemptId || "")
+    || !Number.isSafeInteger(dispatchFence)
+    || dispatchFence < 1
+    || !Number.isSafeInteger(providerGeneration)
+    || providerGeneration < 1
+    || dispatch.attemptId !== dispatchAttemptId
+    || dispatch.fence !== dispatchFence
+  ) {
+    throw new CompanionError(
+      "E_AUTH_REQUIRED",
+      "Provider guard binding requires the exact active worker dispatch."
+    );
+  }
+  const executionBindingDigest = executionBindingDigestForJob(job);
+  return Object.freeze({
+    controlWorkspaceId: job.controlWorkspaceId,
+    executionRoot,
+    dispatchAttemptId,
+    dispatchFence,
+    providerGeneration,
+    ...(executionBindingDigest ? { executionBindingDigest } : {})
+  });
+}
+
 function stableRequestBinding(job) {
   const request = isPlainRecord(job?.request) ? job.request : {};
   const sourceEnvelope = isPlainRecord(request.envelope) ? request.envelope : {};

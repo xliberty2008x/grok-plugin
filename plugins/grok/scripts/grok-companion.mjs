@@ -89,6 +89,7 @@ import { reconcileBrokerWorkers, recoverLostProviderStartedWorker } from "./lib/
 import {
   assertWorkerAuthorization,
   createDispatchOutbox,
+  createProviderGuardBindingForJob,
   createWorkerAuthorization,
   isDispatchV2,
   isSupportedWorkerDispatch,
@@ -1703,13 +1704,11 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
       resumeSessionId: job.request?.resumeSessionId || null,
       cancelRequested: () => isCancelRequested(root, id, workerNonce),
       ...(dispatchAttemptId ? {
-        guardBinding: {
-          controlWorkspaceId: job.controlWorkspaceId,
-          executionRoot: job.request?.spawn?.executionRoot,
+        guardBinding: createProviderGuardBindingForJob(job, {
           dispatchAttemptId,
           dispatchFence,
           providerGeneration
-        },
+        }),
         providerLaunch: {
           prepare: (observedLaunchBinding) => {
             const latest = readJob(root, id);
