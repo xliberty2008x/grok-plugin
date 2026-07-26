@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { spawn, spawnSync } from "node:child_process";
-import { Readable } from "node:stream";
+import { spawn } from "node:child_process";
+import { Readable, Writable } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
@@ -944,39 +944,19 @@ test("private bootstrap spec channel rejects missing, truncated, extra, malforme
 });
 
 /**
- * Build a parent-side spec channel whose POSIX reader is already closed.
- * Hosted Linux runners do not reliably surface EPIPE from a live child that
- * closes fd 6 after spawn; a FIFO with the last reader dropped is exact.
+ * Build a parent-side spec channel that fails publication with a coded EPIPE.
+ * Hosted Linux does not reliably surface EPIPE from FIFO/closed-reader timing;
+ * a deterministic Writable write failure exercises the same publisher mapping
+ * (writable channel error -> E_PROVIDER_EXIT) without POSIX FIFO assumptions.
  */
-function publisherTargetWithClosedSpecReader(t) {
-  const directory = tempDir("provider-bootstrap-closed-spec-");
-  t.after(() => {
-    fs.rmSync(directory, { recursive: true, force: true });
+function publisherTargetWithEpipeSpecChannel() {
+  const channel = new Writable({
+    write(_chunk, _encoding, callback) {
+      const error = new Error("write EPIPE");
+      error.code = "EPIPE";
+      callback(error);
+    }
   });
-  const fifoPath = path.join(directory, "spec.fifo");
-  const made = spawnSync("mkfifo", ["-m", "0600", fifoPath], {
-    encoding: "utf8",
-    shell: false
-  });
-  assert.equal(made.status, 0, made.stderr || "mkfifo failed");
-
-  // Open a reader first so the writer open does not block, then drop it so the
-  // write end is a real pipe with no POSIX readers remaining.
-  const readerFd = fs.openSync(
-    fifoPath,
-    fs.constants.O_RDONLY | fs.constants.O_NONBLOCK
-  );
-  const writerFd = fs.openSync(fifoPath, fs.constants.O_WRONLY);
-  fs.closeSync(readerFd);
-
-  const channel = fs.createWriteStream(fifoPath, {
-    fd: writerFd,
-    autoClose: true
-  });
-  t.after(() => {
-    try { channel.destroy(); } catch { /* already closed */ }
-  });
-
   return {
     stdio: { 6: channel },
     exitCode: null,
@@ -1013,7 +993,7 @@ test("bootstrap process and parent publisher fail closed when the inherited spec
     (error) => error?.code === "E_PROTOCOL"
   );
 
-  const closed = publisherTargetWithClosedSpecReader(t);
+  const closed = publisherTargetWithEpipeSpecChannel();
   await assert.rejects(
     () => publishProviderBootstrapSpec(closed, "{}\n", { timeoutMs: 1_000 }),
     (error) => error?.code === "E_PROVIDER_EXIT"
