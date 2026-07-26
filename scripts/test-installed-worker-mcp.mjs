@@ -3694,7 +3694,11 @@ async function waitForTerminalProcessClosure(
   fail("E_CLEANUP");
 }
 
-async function waitForWriteSmokeProcessClosure(context, workerId) {
+async function waitForWriteSmokeProcessClosure(
+  context,
+  workerId,
+  retainedProviderIdentities = []
+) {
   const deadline = Date.now() + TERMINAL_PROCESS_CLOSURE_TIMEOUT_MS;
   let stableScans = 0;
   let latest = null;
@@ -3714,16 +3718,21 @@ async function waitForWriteSmokeProcessClosure(context, workerId) {
     const identities = [
       latest.controllerProcess,
       latest.workerProcess,
-      latest.providerProcess
+      latest.providerProcess,
+      ...retainedProviderIdentities
     ];
+    const distinctIdentities = [...new Map(identities.map((identity) => [
+      `${identity?.pid}:${identity?.startToken}`,
+      identity
+    ])).values()];
     try {
-      identities.forEach((identity) => (
+      distinctIdentities.forEach((identity) => (
         context.processControl.assertCompleteDetachedOwnedIdentity(identity)
       ));
     } catch {
       fail("E_CLEANUP");
     }
-    const allGone = identities.every((identity) => (
+    const allGone = distinctIdentities.every((identity) => (
       context.processControl.processGroupGone(identity)
     ));
     stableScans = allGone ? stableScans + 1 : 0;
@@ -3731,6 +3740,89 @@ async function waitForWriteSmokeProcessClosure(context, workerId) {
     await new Promise((resolve) => setTimeout(resolve, STATE_POLL_MS));
   }
   fail("E_CLEANUP");
+}
+
+const WRITE_SMOKE_PRIMARY_TURN_ADMISSION_KEYS = new Set([
+  "schemaVersion",
+  "status",
+  "admissionId",
+  "dispatchAttemptId",
+  "dispatchFence",
+  "providerGeneration",
+  "workerProcess",
+  "providerProcess",
+  "providerSessionId",
+  "promptDigest",
+  "admittedAt",
+  "consumedAt"
+]);
+
+function validWriteSmokePrimaryTurnAdmission(admission, {
+  generation,
+  dispatch,
+  workerId,
+  workerProcess,
+  providerSessionId,
+  expectedProviderProcess = null
+}) {
+  const expectedWorkerProcess = {
+    pid: workerProcess?.pid ?? null,
+    startToken: workerProcess?.startToken ?? null,
+    processGroupId: workerProcess?.processGroupId ?? null,
+    commandMarker: workerProcess?.commandMarker ?? null,
+    dispatchAttemptId: workerProcess?.dispatchAttemptId ?? null,
+    dispatchFence: workerProcess?.dispatchFence ?? null,
+    nonce: workerProcess?.nonce ?? null
+  };
+  const providerProcess = admission?.providerProcess;
+  const expectedProviderBinding = expectedProviderProcess
+    ? {
+        pid: expectedProviderProcess.pid,
+        startToken: expectedProviderProcess.startToken,
+        processGroupId: expectedProviderProcess.processGroupId,
+        commandMarker: expectedProviderProcess.commandMarker,
+        dispatchAttemptId: expectedProviderProcess.dispatchAttemptId,
+        dispatchFence: expectedProviderProcess.dispatchFence,
+        providerGeneration: expectedProviderProcess.providerGeneration
+      }
+    : null;
+  return (
+    hasExactKeys(admission, WRITE_SMOKE_PRIMARY_TURN_ADMISSION_KEYS)
+    && admission.schemaVersion === 1
+    && admission.status === "consumed"
+    && /^[0-9a-f]{32}$/.test(admission.admissionId || "")
+    && admission.dispatchAttemptId === dispatch?.attemptId
+    && admission.dispatchFence === dispatch?.fence
+    && admission.providerGeneration === generation
+    && sameJson(admission.workerProcess, expectedWorkerProcess)
+    && hasExactKeys(providerProcess, new Set([
+      "pid",
+      "startToken",
+      "processGroupId",
+      "commandMarker",
+      "dispatchAttemptId",
+      "dispatchFence",
+      "providerGeneration"
+    ]))
+    && Number.isSafeInteger(providerProcess.pid)
+    && providerProcess.pid > 0
+    && typeof providerProcess.startToken === "string"
+    && providerProcess.startToken.length > 0
+    && providerProcess.processGroupId === providerProcess.pid
+    && providerProcess.commandMarker === workerId
+    && providerProcess.dispatchAttemptId === dispatch?.attemptId
+    && providerProcess.dispatchFence === dispatch?.fence
+    && providerProcess.providerGeneration === generation
+    && (
+      expectedProviderBinding === null
+      || sameJson(providerProcess, expectedProviderBinding)
+    )
+    && admission.providerSessionId === providerSessionId
+    && /^[0-9a-f]{64}$/.test(admission.promptDigest || "")
+    && canonicalTimestamp(admission.admittedAt)
+    && canonicalTimestamp(admission.consumedAt)
+    && Date.parse(admission.consumedAt) >= Date.parse(admission.admittedAt)
+  );
 }
 
 function proveExactCancellationMarker(
@@ -4532,6 +4624,12 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
 
   enterQualificationStage("write-smoke-private");
   const terminalJob = context.state.readJob(fixtureRoot, workerId, context.env);
+  let terminalBindingValid = true;
+  try {
+    context.mutation.assertDispatchContract(terminalJob);
+  } catch {
+    terminalBindingValid = false;
+  }
   const terminalDispatch = terminalJob.request?.spawn?.dispatch;
   const providerGeneration = terminalDispatch?.providerGeneration;
   const providerProcess = terminalJob.providerProcess;
@@ -4540,7 +4638,26 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     terminalJob.request?.spawn?.providerRotationIntent;
   const primaryTurnAdmissions =
     terminalJob.request?.spawn?.primaryTurnAdmissions;
+  const primaryTurnAdmissionKeys = isPlainRecord(primaryTurnAdmissions)
+    ? Object.keys(primaryTurnAdmissions).sort()
+    : [];
+  const generationOneAdmission = primaryTurnAdmissions?.["1"];
+  const generationOneAdmissionValid = validWriteSmokePrimaryTurnAdmission(
+    generationOneAdmission,
+    {
+      generation: 1,
+      dispatch: terminalDispatch,
+      workerId,
+      workerProcess: terminalJob.workerProcess,
+      providerSessionId: terminalJob.grokSessionId,
+      ...(providerGeneration === 1
+        ? { expectedProviderProcess: providerProcess }
+        : {})
+    }
+  );
   let mailboxAttempt = null;
+  let mailboxMessages = null;
+  let mailboxBodiesAbsent = false;
   try {
     mailboxAttempt = context.mailboxState.readAttemptMailbox(
       fixtureRoot,
@@ -4548,22 +4665,75 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
       terminalDispatch?.attemptId,
       context.env
     );
+    mailboxMessages = context.mailboxState.listAttemptMessages(
+      fixtureRoot,
+      workerId,
+      terminalDispatch?.attemptId,
+      context.env
+    );
+    context.mailboxState.assertNoRetainedBodies(
+      fixtureRoot,
+      workerId,
+      terminalDispatch?.attemptId,
+      context.env
+    );
+    mailboxBodiesAbsent = true;
   } catch {
     mailboxAttempt = null;
+    mailboxMessages = null;
+    mailboxBodiesAbsent = false;
   }
   const mailboxProofValid = mailboxAttempt?.state === "closed"
     && mailboxAttempt.workerId === workerId
     && mailboxAttempt.dispatchAttemptId === terminalDispatch?.attemptId
     && mailboxAttempt.dispatchFence === terminalDispatch?.fence
     && mailboxAttempt.providerGeneration === 1
+    && generationOneAdmissionValid
+    && mailboxAttempt.workerProcessDigest
+      === context.mailboxState.stableDigest(
+        generationOneAdmission?.workerProcess
+      )
+    && mailboxAttempt.providerProcessDigest
+      === context.mailboxState.stableDigest(
+        generationOneAdmission?.providerProcess
+      )
     && mailboxAttempt.providerSessionDigest
       === context.mailboxState.stableDigest({
         providerSessionId: terminalJob.grokSessionId
       })
+    && mailboxAttempt.providerCapabilityDigest
+      === terminalJob.request?.spawn?.providerCapabilityDigest
+    && mailboxAttempt.providerCapabilityDigest
+      === context.writeLifecycleCapabilityDigest
+    && mailboxAttempt.contextReceiptDigest
+      === context.mailboxState.stableDigest(
+        terminalJob.request?.contextReceipt
+      )
+    && mailboxAttempt.rolePolicyDigest
+      === terminalJob.request?.runtimeRolePolicy?.digest
+    && mailboxAttempt.nextSequence === 1
+    && mailboxAttempt.acceptedCount === 0
+    && mailboxAttempt.acceptedBytes === 0
+    && mailboxAttempt.lastCompletedSequence === 0
+    && mailboxAttempt.finalReportSequence === 0
+    && mailboxAttempt.deliveryUnknownSequence === null
+    && mailboxAttempt.activeSequence === null
+    && Array.isArray(mailboxMessages)
+    && mailboxMessages.length === 0
+    && mailboxBodiesAbsent
+    && terminalJob.result?.mailboxEvidence?.selectedSequence === 0
+    && terminalJob.result?.mailboxEvidence?.lastCompletedSequence === 0
+    && terminalJob.result?.mailboxEvidence?.finalReportSequence === 0
+    && mailboxAttempt.communicationChainDigest
+      === terminalJob.result?.mailboxEvidence?.communicationChainDigest
+    && terminalJob.result?.mailboxEvidence?.deliveryUnknown === false
+    && terminalJob.result?.mailboxEvidence?.closed === true
+    && terminalJob.result?.mailboxEvidence?.bodiesRetained === false
     && mailboxAttempt.finalReportDigest === terminalJob.result?.textDigest
     && mailboxAttempt.finalReportDigest
       === terminalJob.result?.mailboxEvidence?.finalReportDigest;
   const generationOneProof = providerGeneration === 1
+    && sameJson(primaryTurnAdmissionKeys, ["1"])
     && terminalDispatch?.nextProviderGeneration === null
     && terminalDispatch?.providerRotationCount == null
     && terminalDispatch?.providerRotatedAt == null
@@ -4572,10 +4742,23 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     && providerProcess?.providerGeneration === 1
     && providerSpawnIntent?.status === "registered"
     && providerSpawnIntent.providerGeneration === 1
-    && primaryTurnAdmissions?.["1"]?.status === "consumed"
-    && primaryTurnAdmissions["1"].providerGeneration === 1;
+    && generationOneAdmissionValid
+    && generationOneAdmission.promptDigest
+      === terminalJob.request?.providerPromptDigest;
   const generationTwoAdmission = primaryTurnAdmissions?.["2"];
+  const generationTwoAdmissionValid = validWriteSmokePrimaryTurnAdmission(
+    generationTwoAdmission,
+    {
+      generation: 2,
+      dispatch: terminalDispatch,
+      workerId,
+      workerProcess: terminalJob.workerProcess,
+      providerSessionId: terminalJob.grokSessionId,
+      expectedProviderProcess: providerProcess
+    }
+  );
   const generationTwoProof = providerGeneration === 2
+    && sameJson(primaryTurnAdmissionKeys, ["1", "2"])
     && terminalDispatch?.nextProviderGeneration === null
     && terminalDispatch?.providerRotationCount === 1
     && typeof terminalDispatch?.providerRotatedAt === "string"
@@ -4591,12 +4774,20 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     && providerProcess.commandMarker === workerId
     && providerProcess.dispatchAttemptId === terminalDispatch?.attemptId
     && providerProcess.dispatchFence === terminalDispatch?.fence
-    && generationTwoAdmission?.status === "consumed"
-    && generationTwoAdmission.providerGeneration === 2
-    && generationTwoAdmission.providerSessionId === terminalJob.grokSessionId
-    && generationTwoAdmission.providerProcess?.pid === providerProcess.pid
-    && generationTwoAdmission.providerProcess?.startToken
-      === providerProcess.startToken;
+    && generationOneAdmissionValid
+    && generationTwoAdmissionValid
+    && generationOneAdmission.providerSessionId
+      === generationTwoAdmission.providerSessionId
+    && generationOneAdmission.promptDigest
+      === terminalJob.request?.providerPromptDigest
+    && generationOneAdmission.promptDigest
+      !== generationTwoAdmission.promptDigest
+    && (
+      generationOneAdmission.providerProcess.pid
+        !== generationTwoAdmission.providerProcess.pid
+      || generationOneAdmission.providerProcess.startToken
+        !== generationTwoAdmission.providerProcess.startToken
+    );
   const providerLifecycleProof = mailboxProofValid
     && (generationOneProof || generationTwoProof);
   const expectedExecutionRoot = context.workerWorktree.expectedWorkerWorktreeRoot(
@@ -4619,7 +4810,8 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     expectedManifestDigest: metadata.artifact.manifestDigest
   });
   if (
-    terminalJob.status !== "completed"
+    !terminalBindingValid
+    || terminalJob.status !== "completed"
     || terminalJob.write !== true
     || terminalJob.role?.id !== "implementer"
     || terminalJob.profile?.id !== "rescue-write-v3"
@@ -4628,6 +4820,26 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     || terminalJob.result?.taskRuntimeCleaned !== true
     || terminalJob.result?.workerReport?.valid !== true
     || terminalJob.result?.workerReport?.outcome !== "complete"
+    || !sameJson(
+      terminalJob.result?.workerReport?.acceptanceResults?.map(
+        ({ id, status }) => ({ id, status })
+      ),
+      [
+        { id: "AC-01", status: "met" },
+        { id: "AC-02", status: "met" }
+      ]
+    )
+    || terminalJob.result?.providerClaims?.success !== true
+    || terminalJob.result?.providerClaims?.observedFileAgreement !== true
+    || !sameJson(
+      terminalJob.result?.providerClaims?.changedFiles,
+      ["target.txt"]
+    )
+    || result.worker?.result?.providerClaims?.success !== true
+    || !sameJson(
+      result.worker?.result?.providerClaims,
+      terminalJob.result?.providerClaims
+    )
     || !sameJson(terminalJob.request?.envelope?.scope, {
       include: ["target.txt"],
       exclude: []
@@ -4643,12 +4855,153 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     || fs.readFileSync(path.join(expectedExecutionRoot, "target.txt"), "utf8")
       !== expectedContent
   ) {
+    process.stderr.write(
+      `Installed Worker MCP write-smoke diagnostic ${JSON.stringify({
+        schemaVersion: 1,
+        stage: "write-smoke-private",
+        terminalBindingValid,
+        mailboxProofValid,
+        generationOneProof,
+        generationTwoProof,
+        primaryTurnAdmissionKeys,
+        generationOneAdmissionValid,
+        generationTwoAdmissionValid,
+        providerClaimsSuccess:
+          terminalJob.result?.providerClaims?.success === true,
+        publicProviderClaimsSuccess:
+          result.worker?.result?.providerClaims?.success === true,
+        publicPrivateProviderClaimsEqual: sameJson(
+          result.worker?.result?.providerClaims,
+          terminalJob.result?.providerClaims
+        ),
+        acceptanceResultsExact: sameJson(
+          terminalJob.result?.workerReport?.acceptanceResults?.map(
+            ({ id, status }) => ({ id, status })
+          ),
+          [
+            { id: "AC-01", status: "met" },
+            { id: "AC-02", status: "met" }
+          ]
+        ),
+        providerChangedFilesExact: sameJson(
+          terminalJob.result?.providerClaims?.changedFiles,
+          ["target.txt"]
+        ),
+        envelopeScopeExact: sameJson(
+          terminalJob.request?.envelope?.scope,
+          { include: ["target.txt"], exclude: [] }
+        ),
+        writeArtifactContentBound:
+          terminalJob.result?.writeArtifact?.contentDigest
+            === expectedContentDigest,
+        managedExecutionRootBound:
+          managedIdentity.executionRoot === fs.realpathSync(expectedExecutionRoot),
+        storedArtifactContentBound: storedArtifact.content === expectedContent,
+        storedArtifactPatchBound:
+          storedArtifact.patch === patch.artifact.payload,
+        storedArtifactRecordBound:
+          storedArtifact.record.contentDigest === metadata.artifact.contentDigest
+          && storedArtifact.record.patchDigest === metadata.artifact.patchDigest,
+        spawnExecutionRootBound:
+          fs.realpathSync(terminalJob.request?.spawn?.executionRoot)
+            === fs.realpathSync(expectedExecutionRoot),
+        executionContentExact:
+          fs.readFileSync(
+            path.join(expectedExecutionRoot, "target.txt"),
+            "utf8"
+          ) === expectedContent,
+        mailboxAttemptState: /^[a-z][a-z0-9-]{0,31}$/.test(
+          String(mailboxAttempt?.state || "")
+        )
+          ? mailboxAttempt.state
+          : null,
+        mailboxFinalReportSequence: Number.isSafeInteger(
+          mailboxAttempt?.finalReportSequence
+        )
+          ? mailboxAttempt.finalReportSequence
+          : null,
+        mailboxLastCompletedSequence: Number.isSafeInteger(
+          mailboxAttempt?.lastCompletedSequence
+        )
+          ? mailboxAttempt.lastCompletedSequence
+          : null,
+        mailboxWorkerProcessBound:
+          mailboxAttempt?.workerProcessDigest
+            === context.mailboxState.stableDigest(
+              generationOneAdmission?.workerProcess
+            ),
+        mailboxProviderProcessBound:
+          mailboxAttempt?.providerProcessDigest
+            === context.mailboxState.stableDigest(
+              generationOneAdmission?.providerProcess
+            ),
+        mailboxProviderCapabilityBound:
+          mailboxAttempt?.providerCapabilityDigest
+            === terminalJob.request?.spawn?.providerCapabilityDigest
+          && mailboxAttempt?.providerCapabilityDigest
+            === context.writeLifecycleCapabilityDigest,
+        mailboxContextReceiptBound:
+          mailboxAttempt?.contextReceiptDigest
+            === context.mailboxState.stableDigest(
+              terminalJob.request?.contextReceipt
+            ),
+        mailboxRolePolicyBound:
+          mailboxAttempt?.rolePolicyDigest
+            === terminalJob.request?.runtimeRolePolicy?.digest,
+        mailboxNoMessages:
+          Array.isArray(mailboxMessages) && mailboxMessages.length === 0,
+        mailboxBodiesAbsent,
+        mailboxChainBound:
+          mailboxAttempt?.communicationChainDigest
+            === terminalJob.result?.mailboxEvidence?.communicationChainDigest,
+        mailboxFinalDigestBound:
+          mailboxAttempt?.finalReportDigest === terminalJob.result?.textDigest
+          && mailboxAttempt?.finalReportDigest
+            === terminalJob.result?.mailboxEvidence?.finalReportDigest,
+        resultSelectedSequence: Number.isSafeInteger(
+          terminalJob.result?.mailboxEvidence?.selectedSequence
+        )
+          ? terminalJob.result.mailboxEvidence.selectedSequence
+          : null,
+        resultLastCompletedSequence: Number.isSafeInteger(
+          terminalJob.result?.mailboxEvidence?.lastCompletedSequence
+        )
+          ? terminalJob.result.mailboxEvidence.lastCompletedSequence
+          : null,
+        resultFinalReportSequence: Number.isSafeInteger(
+          terminalJob.result?.mailboxEvidence?.finalReportSequence
+        )
+          ? terminalJob.result.mailboxEvidence.finalReportSequence
+          : null,
+        generationOnePromptMatchesCurrent:
+          generationOneAdmission?.promptDigest
+            === terminalJob.request?.providerPromptDigest,
+        generationTwoPromptDiffersFromCurrent:
+          generationTwoAdmission?.promptDigest
+            !== terminalJob.request?.providerPromptDigest,
+        admissionPromptDigestsDiffer: Boolean(
+          generationOneAdmission?.promptDigest
+          && generationTwoAdmission?.promptDigest
+          && generationOneAdmission.promptDigest
+            !== generationTwoAdmission.promptDigest
+        )
+      })}\n`
+    );
     fail("E_PRIVATE_STATE");
   }
 
   enterQualificationStage("write-smoke-cleanup");
   await closeMcp(context, client);
-  await waitForWriteSmokeProcessClosure(context, workerId);
+  await waitForWriteSmokeProcessClosure(
+    context,
+    workerId,
+    Object.values(primaryTurnAdmissions).map(
+      (admission) => structuredClone(admission.providerProcess)
+    )
+  );
+  if (context.guard.loadProviderGuard(fixtureRoot, workerId) !== null) {
+    fail("E_CLEANUP");
+  }
   context.workerWorktree.removeWorkerWorktree(
     expectedExecutionRoot,
     fixtureRoot,

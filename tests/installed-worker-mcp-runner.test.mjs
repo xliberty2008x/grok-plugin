@@ -522,6 +522,37 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /stream\.timedOut !== \(/);
   assert.match(source, /assertDispatchContract\(job\)/);
   assert.match(source, /assertDurableSpawnRequestBinding\(job, context\.env\)/);
+  assert.match(
+    source,
+    /terminalJob\.result\?\.providerClaims\?\.success !== true/
+  );
+  assert.match(
+    source,
+    /sameJson\(primaryTurnAdmissionKeys, \["1", "2"\]\)/
+  );
+  assert.match(
+    source,
+    /generationOneAdmission\.promptDigest\s*!== generationTwoAdmission\.promptDigest/
+  );
+  assert.match(source, /mailboxAttempt\.finalReportSequence === 0/);
+  assert.match(
+    source,
+    /terminalJob\.result\?\.mailboxEvidence\?\.selectedSequence === 0/
+  );
+  assert.match(source, /mailboxAttempt\.acceptedCount === 0/);
+  assert.match(source, /mailboxMessages\.length === 0/);
+  assert.match(
+    source,
+    /generationOneAdmission\?\.providerProcess/
+  );
+  assert.match(
+    source,
+    /result\.worker\?\.result\?\.providerClaims/
+  );
+  assert.match(
+    source,
+    /retainedProviderIdentities = \[\]/
+  );
   assert.match(source, /const setupJson = await runSetupJson\(/);
   assert.match(source, /captureSetupCommandIdentityWithPolling\(\{/);
   assert.match(source, /decideSetupScanObservationDisposition\(\{/);
