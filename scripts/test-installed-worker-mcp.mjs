@@ -4683,6 +4683,15 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     mailboxMessages = null;
     mailboxBodiesAbsent = false;
   }
+  const workerReport = terminalJob.result?.workerReport;
+  const nativeStructuredReportProof =
+    workerReport?.reportSource === "acp-structured"
+    && /^[a-f0-9]{64}$/.test(workerReport?.reportDigest || "")
+    && workerReport.valid === true
+    && workerReport.structured === true;
+  const expectedFinalReportDigest = nativeStructuredReportProof
+    ? workerReport.reportDigest
+    : terminalJob.result?.textDigest;
   const mailboxProofValid = mailboxAttempt?.state === "closed"
     && mailboxAttempt.workerId === workerId
     && mailboxAttempt.dispatchAttemptId === terminalDispatch?.attemptId
@@ -4729,7 +4738,7 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     && terminalJob.result?.mailboxEvidence?.deliveryUnknown === false
     && terminalJob.result?.mailboxEvidence?.closed === true
     && terminalJob.result?.mailboxEvidence?.bodiesRetained === false
-    && mailboxAttempt.finalReportDigest === terminalJob.result?.textDigest
+    && mailboxAttempt.finalReportDigest === expectedFinalReportDigest
     && mailboxAttempt.finalReportDigest
       === terminalJob.result?.mailboxEvidence?.finalReportDigest;
   const generationOneProof = providerGeneration === 1
@@ -4789,7 +4798,8 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
         !== generationTwoAdmission.providerProcess.startToken
     );
   const providerLifecycleProof = mailboxProofValid
-    && (generationOneProof || generationTwoProof);
+    && generationOneProof
+    && nativeStructuredReportProof;
   const expectedExecutionRoot = context.workerWorktree.expectedWorkerWorktreeRoot(
     fixtureRoot,
     workerId,
@@ -4863,6 +4873,9 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
         mailboxProofValid,
         generationOneProof,
         generationTwoProof,
+        nativeStructuredReportProof,
+        reportSource: workerReport?.reportSource || null,
+        reportDigest: workerReport?.reportDigest || null,
         primaryTurnAdmissionKeys,
         generationOneAdmissionValid,
         generationTwoAdmissionValid,
@@ -4955,7 +4968,7 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
           mailboxAttempt?.communicationChainDigest
             === terminalJob.result?.mailboxEvidence?.communicationChainDigest,
         mailboxFinalDigestBound:
-          mailboxAttempt?.finalReportDigest === terminalJob.result?.textDigest
+          mailboxAttempt?.finalReportDigest === expectedFinalReportDigest
           && mailboxAttempt?.finalReportDigest
             === terminalJob.result?.mailboxEvidence?.finalReportDigest,
         resultSelectedSequence: Number.isSafeInteger(
@@ -5028,6 +5041,9 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     workerId,
     status: result.worker.status,
     providerGeneration,
+    reportSource: workerReport.reportSource,
+    reportDigest: workerReport.reportDigest,
+    nativeStructuredOutput: nativeStructuredReportProof,
     targetPath: metadata.artifact.path,
     baseCommit: metadata.artifact.baseCommit,
     manifestDigest: metadata.artifact.manifestDigest,

@@ -57,6 +57,7 @@ import {
   buildRuntimeEvidence,
   buildTaskEnvelope,
   buildWorkerReport,
+  buildWorkerReportOutputSchema,
   captureContextManifest,
   composeProviderPrompt,
   composeWorkerReportRepairPrompt,
@@ -972,12 +973,27 @@ function eventUpdater(root, id, dispatchAttemptId = null, providerGeneration = n
   };
 }
 
-function providerLaunchBinding(profile, prompt) {
+function providerOutputSchemaDigest(outputSchema) {
+  if (outputSchema == null) return null;
+  let serialized;
+  try {
+    serialized = JSON.stringify(outputSchema);
+  } catch {
+    throw new CompanionError(
+      "E_PROTOCOL",
+      "Provider output schema is not serializable JSON."
+    );
+  }
+  return crypto.createHash("sha256").update(serialized).digest("hex");
+}
+
+function providerLaunchBinding(profile, prompt, outputSchema = null) {
   return Object.freeze({
     promptDigest: crypto.createHash("sha256").update(String(prompt || "")).digest("hex"),
     profileId: profile?.id || null,
     profileContractVersion: profile?.contractVersion ?? null,
-    agentProfileDigest: profile?.agentProfileDigest || null
+    agentProfileDigest: profile?.agentProfileDigest || null,
+    outputSchemaDigest: providerOutputSchemaDigest(outputSchema)
   });
 }
 
@@ -986,7 +1002,8 @@ function assertProviderLaunchBinding(observed, expected) {
     "promptDigest",
     "profileId",
     "profileContractVersion",
-    "agentProfileDigest"
+    "agentProfileDigest",
+    "outputSchemaDigest"
   ];
   if (!observed
     || typeof observed !== "object"
@@ -1216,7 +1233,15 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
     // Keep the corresponding handoff process-local and single-use so an
     // unrelated pre-existing pending intent can never admit another bootstrap.
     let providerLaunchAuthorization = null;
-    let expectedProviderLaunchBinding = providerLaunchBinding(job.profile, prompt);
+    const envelope = job.request?.envelope || null;
+    const workerReportOutputSchema = job.jobClass === "task"
+      ? buildWorkerReportOutputSchema(envelope?.acceptanceCriteria || [])
+      : null;
+    let expectedProviderLaunchBinding = providerLaunchBinding(
+      job.profile,
+      prompt,
+      workerReportOutputSchema
+    );
     const mailboxCapabilityDigest = job.request?.spawn?.providerCapabilityDigest;
     const mailboxEligible = Boolean(
       job.jobClass === "task"
@@ -1780,6 +1805,9 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
       } : {}),
       ...(primaryTurnController ? { primaryTurnController } : {}),
       ...(mailboxController ? { mailboxController } : {}),
+      ...(workerReportOutputSchema
+        ? { outputSchema: workerReportOutputSchema }
+        : {}),
       ...(primaryTurnTestHooks ? { testHooks: primaryTurnTestHooks } : {}),
       onEvent: eventUpdater(root, id, dispatchAttemptId, providerGeneration, dispatchFence)
     };
@@ -1787,18 +1815,25 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
       ? await runStructuredReview(common)
       : await runProvider(common);
     if (before) assertUnchanged(before, integritySnapshot(root));
-    const envelope = job.request?.envelope || null;
     let workerReport = null;
     let reportRepair = null;
     let reportRepairError = null;
     if (job.jobClass !== "review") {
       workerReport = buildWorkerReport({
         providerText: result.text || "",
+        ...(Object.hasOwn(result, "structuredOutput")
+          ? { nativeStructuredOutput: result.structuredOutput }
+          : {}),
+        ...(Object.hasOwn(result, "structuredOutputError")
+          ? { nativeStructuredOutputError: result.structuredOutputError }
+          : {}),
         acceptanceCriteria: envelope?.acceptanceCriteria || []
       });
       if (result.mailboxEvidence) {
         const reportDigest = workerReport.valid
-          ? boundedProviderText(result.text || "").textDigest
+          ? (workerReport.reportSource === "acp-structured"
+              ? workerReport.reportDigest
+              : boundedProviderText(result.text || "").textDigest)
           : null;
         const selected = mailboxController.selectReport({
           sequence: result.mailboxEvidence.selectedSequence,
@@ -1840,12 +1875,14 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
           const repairPrompt = composeWorkerReportRepairPrompt(envelope, workerReport);
           expectedProviderLaunchBinding = providerLaunchBinding(
             repairProfile,
-            repairPrompt
+            repairPrompt,
+            null
           );
           const repaired = await runProvider({
             ...common,
             profile: repairProfile,
             prompt: repairPrompt,
+            outputSchema: null,
             resumeSessionId: result.sessionId,
             mailboxController: null,
             ...(dispatchAttemptId ? {
@@ -1966,13 +2003,16 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
         && result.mailboxEvidence.closed === true
         && result.mailboxEvidence.bodiesRetained === false
       );
+      const selectedReportDigest = workerReport.reportSource === "acp-structured"
+        ? workerReport.reportDigest
+        : storedText.textDigest;
       const mailboxFinalReportBound = !result.mailboxEvidence || (
         Number.isSafeInteger(result.mailboxEvidence.selectedSequence)
         && result.mailboxEvidence.selectedSequence
           === result.mailboxEvidence.lastCompletedSequence
         && result.mailboxEvidence.finalReportSequence
           === result.mailboxEvidence.lastCompletedSequence
-        && result.mailboxEvidence.finalReportDigest === storedText.textDigest
+        && result.mailboxEvidence.finalReportDigest === selectedReportDigest
       );
       // Provider success is a claim only; hostVerification stays not_run.
       const safeResult = redact({

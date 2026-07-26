@@ -108,6 +108,125 @@ test("a clean single ACP response settles only after its stdout batch is complet
   assert.equal(client.transportError, null);
 });
 
+test("ACP native structured output is request-bound, validated, and downgrade-safe", async (t) => {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["outcome"],
+    properties: {
+      outcome: { type: "string", enum: ["complete"] }
+    }
+  };
+
+  await t.test("value", async () => {
+    const child = new FakeChild();
+    const writes = [];
+    child.stdin.on("data", (chunk) => writes.push(String(chunk)));
+    const client = new AcpClient(child, {
+      timeoutMs: 1000,
+      knownSecrets: ["secret-value"]
+    });
+    const pending = client.promptTurn({
+      sessionId: "session-native",
+      prompt: [{ type: "text", text: "one turn" }],
+      outputSchema: schema
+    });
+    assert.deepEqual(JSON.parse(writes.join("").trim()).params, {
+      sessionId: "session-native",
+      prompt: [{ type: "text", text: "one turn" }],
+      _meta: { outputSchema: schema }
+    });
+    child.stdout.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      result: {
+        stopReason: "end_turn",
+        _meta: {
+          structuredOutput: {
+            outcome: "complete",
+            note: "secret-value"
+          }
+        }
+      }
+    })}\n`);
+    const response = await pending;
+    assert.deepEqual(response.structuredOutput, {
+      outcome: "complete",
+      note: "[REDACTED]"
+    });
+  });
+
+  await t.test("explicit validation error blocks text fallback", async () => {
+    const child = new FakeChild();
+    const client = new AcpClient(child, { timeoutMs: 1000 });
+    const pending = client.promptTurn({
+      sessionId: "session-error",
+      prompt: [{ type: "text", text: "one turn" }],
+      outputSchema: schema
+    });
+    child.stdout.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      result: {
+        stopReason: "end_turn",
+        _meta: { structuredOutputError: "schema mismatch" }
+      }
+    })}\n`);
+    const response = await pending;
+    assert.equal(
+      response.structuredOutputError,
+      "Grok Build could not produce schema-valid structured output."
+    );
+    assert.equal(Object.hasOwn(response, "structuredOutput"), false);
+  });
+
+  await t.test("absent native keys preserve compatibility", async () => {
+    const child = new FakeChild();
+    const client = new AcpClient(child, { timeoutMs: 1000 });
+    const pending = client.promptTurn({
+      sessionId: "session-compat",
+      prompt: [{ type: "text", text: "one turn" }],
+      outputSchema: schema
+    });
+    child.stdout.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      result: { stopReason: "end_turn", _meta: { modelId: "grok-test" } }
+    })}\n`);
+    const response = await pending;
+    assert.equal(Object.hasOwn(response, "structuredOutput"), false);
+    assert.equal(Object.hasOwn(response, "structuredOutputError"), false);
+  });
+
+  await t.test("malformed or contradictory metadata fails closed", async () => {
+    for (const meta of [
+      null,
+      [],
+      {
+        structuredOutput: { outcome: "complete" },
+        structuredOutputError: "contradictory"
+      }
+    ]) {
+      const child = new FakeChild();
+      const client = new AcpClient(child, { timeoutMs: 1000 });
+      const pending = client.promptTurn({
+        sessionId: "session-malformed",
+        prompt: [{ type: "text", text: "one turn" }],
+        outputSchema: schema
+      });
+      child.stdout.write(`${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        result: { stopReason: "end_turn", _meta: meta }
+      })}\n`);
+      await assert.rejects(
+        pending,
+        (error) => error?.code === "E_PROTOCOL"
+      );
+    }
+  });
+});
+
 test("ACP outbound allowlist rejects session methods and notifications before writing bytes", async () => {
   const child = new FakeChild();
   const writes = [];

@@ -16,6 +16,111 @@ const PROMPT_STOP_REASON_CLASSES = new Map([
   ["Cancelled", "cancelled"],
   ["Refusal", "refusal"]
 ]);
+const MAX_OUTPUT_SCHEMA_BYTES = 64 * 1024;
+const MAX_STRUCTURED_OUTPUT_BYTES = 512 * 1024;
+const MAX_JSON_DEPTH = 32;
+const MAX_JSON_NODES = 4096;
+
+function isPlainRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function cloneBoundedJson(value, {
+  label,
+  maximumBytes,
+  requireObject = false
+}) {
+  let nodes = 0;
+  const visit = (item, depth) => {
+    nodes += 1;
+    if (nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) {
+      throw new CompanionError("E_PROTOCOL", `${label} exceeds bounded JSON complexity.`);
+    }
+    if (item === null
+      || typeof item === "string"
+      || typeof item === "boolean") return;
+    if (typeof item === "number" && Number.isFinite(item)) return;
+    if (Array.isArray(item)) {
+      for (const child of item) visit(child, depth + 1);
+      return;
+    }
+    if (!isPlainRecord(item)) {
+      throw new CompanionError("E_PROTOCOL", `${label} must contain only plain JSON values.`);
+    }
+    for (const [key, child] of Object.entries(item)) {
+      if (key === "__proto__" || key === "prototype" || key === "constructor") {
+        throw new CompanionError("E_PROTOCOL", `${label} contains an unsafe key.`);
+      }
+      visit(child, depth + 1);
+    }
+  };
+  if (requireObject && !isPlainRecord(value)) {
+    throw new CompanionError("E_PROTOCOL", `${label} must be a JSON object.`);
+  }
+  visit(value, 0);
+  let serialized;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new CompanionError("E_PROTOCOL", `${label} is not serializable JSON.`);
+  }
+  if (typeof serialized !== "string"
+    || Buffer.byteLength(serialized, "utf8") > maximumBytes) {
+    throw new CompanionError("E_PROTOCOL", `${label} exceeds ${maximumBytes} bytes.`);
+  }
+  return JSON.parse(serialized);
+}
+
+function normalizeOutputSchema(value) {
+  return cloneBoundedJson(value, {
+    label: "ACP output schema",
+    maximumBytes: MAX_OUTPUT_SCHEMA_BYTES,
+    requireObject: true
+  });
+}
+
+function structuredPromptResult(result, requested) {
+  if (!requested) return {};
+  if (!Object.hasOwn(result, "_meta")) return {};
+  const meta = result?._meta;
+  if (!isPlainRecord(meta)) {
+    throw new CompanionError(
+      "E_PROTOCOL",
+      "ACP PromptResponse._meta is malformed."
+    );
+  }
+  const hasOutput = Object.hasOwn(meta, "structuredOutput");
+  const hasError = Object.hasOwn(meta, "structuredOutputError");
+  if (hasOutput && hasError) {
+    throw new CompanionError(
+      "E_PROTOCOL",
+      "ACP PromptResponse returned both structuredOutput and structuredOutputError."
+    );
+  }
+  if (hasError) {
+    if (typeof meta.structuredOutputError !== "string"
+      || !meta.structuredOutputError
+      || Buffer.byteLength(meta.structuredOutputError, "utf8") > 8192) {
+      throw new CompanionError(
+        "E_PROTOCOL",
+        "ACP structuredOutputError is malformed."
+      );
+    }
+    return {
+      structuredOutputError: "Grok Build could not produce schema-valid structured output."
+    };
+  }
+  if (!hasOutput) return {};
+  return {
+    structuredOutput: cloneBoundedJson(meta.structuredOutput, {
+      label: "ACP structured output",
+      maximumBytes: MAX_STRUCTURED_OUTPUT_BYTES,
+      requireObject: true
+    })
+  };
+}
 
 function exactMethodAllowlist(value) {
   if (value == null) return null;
@@ -183,7 +288,13 @@ export class AcpClient extends EventEmitter {
    * Reserve then dispatch session/prompt with strict PromptResponse validation.
    * Returns { id, result } on success. Failures never report delivered.
    */
-  async promptTurn({ sessionId, prompt, timeoutMs = this.timeoutMs, reserveHook = null } = {}) {
+  async promptTurn({
+    sessionId,
+    prompt,
+    outputSchema = null,
+    timeoutMs = this.timeoutMs,
+    reserveHook = null
+  } = {}) {
     if (typeof sessionId !== "string" || !sessionId) {
       throw new CompanionError("E_PROTOCOL", "session/prompt requires a session id.");
     }
@@ -194,14 +305,41 @@ export class AcpClient extends EventEmitter {
     if (typeof reserveHook === "function") {
       await reserveHook(id);
     }
+    const normalizedSchema = outputSchema == null
+      ? null
+      : normalizeOutputSchema(outputSchema);
     const result = await this.dispatchReserved(
       id,
       "session/prompt",
-      { sessionId, prompt },
+      {
+        sessionId,
+        prompt,
+        ...(normalizedSchema
+          ? { _meta: { outputSchema: normalizedSchema } }
+          : {})
+      },
       timeoutMs,
       { validateResult: validatePromptResponse }
     );
-    return { id, result };
+    const structured = structuredPromptResult(
+      result,
+      normalizedSchema !== null
+    );
+    return {
+      id,
+      result,
+      ...(Object.hasOwn(structured, "structuredOutput")
+        ? {
+            structuredOutput: redact(
+              structured.structuredOutput,
+              this.knownSecrets
+            )
+          }
+        : {}),
+      ...(Object.hasOwn(structured, "structuredOutputError")
+        ? { structuredOutputError: structured.structuredOutputError }
+        : {})
+    };
   }
 
   notify(method, params = {}) {

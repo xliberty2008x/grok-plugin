@@ -10,6 +10,7 @@ import {
   buildRuntimeEvidence,
   buildTaskEnvelope,
   buildWorkerReport,
+  buildWorkerReportOutputSchema,
   captureContextManifest,
   composeProviderPrompt,
   composeWorkerReportRepairPrompt,
@@ -515,6 +516,68 @@ test("worker reports require the final marker and exact acceptance IDs", () => {
   assert.ok(invalid.validationIssues.some((item) => /Duplicate acceptance result AC-01/.test(item)));
   assert.ok(invalid.validationIssues.some((item) => /Unknown acceptance criterion AC-99/.test(item)));
   assert.ok(invalid.validationIssues.some((item) => /Missing acceptance result AC-02/.test(item)));
+});
+
+test("native Grok Build worker reports take precedence and bind a canonical digest", () => {
+  const criteria = [
+    { id: "AC-01", text: "First" },
+    { id: "AC-02", text: "Second" }
+  ];
+  const native = {
+    outcome: "complete",
+    summary: "native report",
+    changedFiles: ["target.txt"],
+    checksClaimed: ["checked target.txt"],
+    acceptanceResults: criteria.map(({ id }) => ({ id, status: "met" })),
+    risks: [],
+    questions: [],
+    hostActionRequest: null
+  };
+  const report = buildWorkerReport({
+    providerText: workerReport({ summary: "contradictory marker report" }),
+    nativeStructuredOutput: native,
+    acceptanceCriteria: criteria
+  });
+  assert.equal(report.valid, true);
+  assert.equal(report.structured, true);
+  assert.equal(report.summary, "native report");
+  assert.equal(report.reportSource, "acp-structured");
+  assert.match(report.reportDigest, /^[a-f0-9]{64}$/);
+  assert.equal(
+    buildWorkerReport({
+      nativeStructuredOutput: structuredClone(native),
+      acceptanceCriteria: criteria
+    }).reportDigest,
+    report.reportDigest
+  );
+
+  const failedNative = buildWorkerReport({
+    providerText: workerReport({
+      summary: "valid marker must not downgrade an explicit native error",
+      acceptanceResults: criteria.map(({ id }) => ({ id, status: "met" }))
+    }),
+    nativeStructuredOutputError: "schema mismatch",
+    acceptanceCriteria: criteria
+  });
+  assert.equal(failedNative.valid, false);
+  assert.equal(failedNative.reportSource, "acp-structured-error");
+  assert.equal(failedNative.reportDigest, null);
+
+  const schema = buildWorkerReportOutputSchema(criteria);
+  assert.deepEqual(schema.required, [
+    "outcome",
+    "summary",
+    "changedFiles",
+    "checksClaimed",
+    "acceptanceResults",
+    "risks",
+    "questions",
+    "hostActionRequest"
+  ]);
+  assert.deepEqual(
+    schema.properties.acceptanceResults.items.properties.id.enum,
+    ["AC-01", "AC-02"]
+  );
 });
 
 test("report repair prompt forbids tool use and is marker-bound and acceptance-complete", () => {

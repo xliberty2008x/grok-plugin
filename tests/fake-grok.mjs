@@ -70,6 +70,22 @@ function reviewJson(config) {
   return JSON.stringify(reviewValue(config));
 }
 
+function workerReportValue(text) {
+  const source = String(text || "").trim();
+  const marker = source.lastIndexOf("GROK_WORKER_REPORT:");
+  const candidate = marker >= 0
+    ? source.slice(marker + "GROK_WORKER_REPORT:".length).trim()
+    : source;
+  try {
+    const value = JSON.parse(candidate);
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
@@ -246,10 +262,37 @@ async function serveAcp(binary, config) {
         });
       }
 
+      const outputSchemaRequested = Boolean(
+        message.params?._meta?.outputSchema
+        && typeof message.params._meta.outputSchema === "object"
+        && !Array.isArray(message.params._meta.outputSchema)
+      );
+      const configuredStructuredOutput = Array.isArray(config.structuredOutputs)
+        ? config.structuredOutputs[promptNumber - 1]
+        : config.structuredOutput;
+      const configuredStructuredError = Array.isArray(config.structuredOutputErrors)
+        ? config.structuredOutputErrors[promptNumber - 1]
+        : config.structuredOutputError;
+      const structuredOutput = configuredStructuredOutput === undefined
+        ? workerReportValue(text)
+        : configuredStructuredOutput;
+      const structuredMeta = outputSchemaRequested
+        ? (typeof configuredStructuredError === "string" && configuredStructuredError
+            ? { structuredOutputError: configuredStructuredError }
+            : structuredOutput !== undefined
+              ? { structuredOutput }
+              : {
+                  structuredOutputError:
+                    "fake provider could not produce schema-valid structured output"
+                })
+        : null;
       const finish = () => send({
         jsonrpc: "2.0",
         id: message.id,
-        result: { stopReason: config.stopReason ?? "end_turn" }
+        result: {
+          stopReason: config.stopReason ?? "end_turn",
+          ...(structuredMeta ? { _meta: structuredMeta } : {})
+        }
       });
       const delayMs = Array.isArray(config.delayMsByPrompt)
         ? config.delayMsByPrompt[promptNumber - 1]

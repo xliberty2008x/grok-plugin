@@ -710,8 +710,12 @@ export function assertHostActionRequestStillBound(
     throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
   }
   const mailboxEvidence = job?.result?.mailboxEvidence || null;
+  const expectedFinalReportDigest =
+    job?.result?.workerReport?.reportSource === "acp-structured"
+      ? job.result.workerReport.reportDigest
+      : job?.result?.textDigest;
   if (mailboxEvidence
-    && mailboxEvidence.finalReportDigest !== job?.result?.textDigest) {
+    && mailboxEvidence.finalReportDigest !== expectedFinalReportDigest) {
     throw new CompanionError(
       "E_CONTEXT_DRIFT",
       "Host-action final report no longer matches mailbox evidence."

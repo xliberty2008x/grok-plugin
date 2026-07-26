@@ -689,7 +689,7 @@ export function composeEffectiveProviderPrompt({
         ? envelope.requiredVerification.map((item) => `- ${item}`).join("\n")
         : "(host will choose authoritative checks; claim only evidence your available tools actually produced)"
     }`,
-    `Expected return format:\n${envelope.expectedReturnFormat}\nThe GROK_WORKER_REPORT object must be the final content in your response. Do not put progress prose after it.`,
+    `Expected return format:\n${envelope.expectedReturnFormat}\nReturn the Worker Report object as the final response through the runtime's native structured-output channel. Do not prefix native JSON with GROK_WORKER_REPORT:. Only if native structured output is unavailable, use GROK_WORKER_REPORT: followed by the object. Do not put progress prose after the final object.`,
     `Context-manifest identity: ${envelope.contextManifestId || "unbound"}`,
     `Context-manifest summary: ${manifestSummary}`,
     [

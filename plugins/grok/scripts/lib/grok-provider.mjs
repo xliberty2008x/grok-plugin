@@ -164,6 +164,25 @@ export function childEnvironment(extra = {}) {
 
 function safeMarker(value) { return String(value).replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 80); }
 
+function outputSchemaDigest(outputSchema) {
+  if (outputSchema == null) return null;
+  if (!outputSchema
+    || typeof outputSchema !== "object"
+    || Array.isArray(outputSchema)) {
+    throw new CompanionError("E_PROTOCOL", "Provider output schema must be a JSON object.");
+  }
+  let serialized;
+  try {
+    serialized = JSON.stringify(outputSchema);
+  } catch {
+    throw new CompanionError("E_PROTOCOL", "Provider output schema is not serializable JSON.");
+  }
+  if (Buffer.byteLength(serialized, "utf8") > 64 * 1024) {
+    throw new CompanionError("E_PROTOCOL", "Provider output schema exceeds 65536 bytes.");
+  }
+  return crypto.createHash("sha256").update(serialized).digest("hex");
+}
+
 function authEntryExpiries(parsed) {
   return Object.values(parsed || {})
     .flatMap((entry) => (
@@ -3347,19 +3366,29 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
   return { sessionId, text: redactText(String(payload.text ?? "").trim(), isolation.knownSecrets), structuredOutput: redact(payload.structuredOutput, isolation.knownSecrets), stopReason: payload.stopReason || "EndTurn", provider: { version, process: identity, isolatedHome: isolation.home }, capabilities: { transport: "headless", agent: "explore", sandbox: isolation.sandboxProfile } };
 }
 
-export async function runProvider({ root, profile, prompt, model, effort, stateDir, jobMarker = "job", providerHomeId = null, resumeSessionId = null, cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, primaryTurnController = null, mailboxController = null, testHooks = null, timeoutMs = undefined }) {
-  if (profile.transport === "headless") return runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker, resumeSessionId, cancelRequested, onEvent, ...(timeoutMs == null ? {} : { timeoutMs }) });
+export async function runProvider({ root, profile, prompt, model, effort, stateDir, jobMarker = "job", providerHomeId = null, resumeSessionId = null, cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, primaryTurnController = null, mailboxController = null, outputSchema = null, testHooks = null, timeoutMs = undefined }) {
+  if (profile.transport === "headless") {
+    if (outputSchema != null) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        "Task structured output requires the ACP provider transport."
+      );
+    }
+    return runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker, resumeSessionId, cancelRequested, onEvent, ...(timeoutMs == null ? {} : { timeoutMs }) });
+  }
+  const boundOutputSchemaDigest = outputSchemaDigest(outputSchema);
   const environment = /^rescue-(read|write|report)-v3$/.test(profile.id || "") ? taskEnvironment(stateDir, root, profile, providerHomeId || jobMarker) : null;
   const effectiveProfile = environment?.sandboxProfile ? { ...profile, sandbox: environment.sandboxProfile } : profile;
   const boundProviderLaunch = providerLaunch
     && typeof providerLaunch.prepare === "function"
     && typeof providerLaunch.noChild === "function" ? {
     prepare: (details = {}) => providerLaunch.prepare(Object.freeze({
+      ...details,
       promptDigest: crypto.createHash("sha256").update(String(prompt || "")).digest("hex"),
       profileId: effectiveProfile.id,
       profileContractVersion: effectiveProfile.contractVersion,
       agentProfileDigest: effectiveProfile.agentProfileDigest,
-      ...details
+      outputSchemaDigest: boundOutputSchemaDigest
     })),
     noChild: (details) => providerLaunch.noChild(details)
   } : providerLaunch;
@@ -3549,6 +3578,8 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
     provider.client.on("update", listener);
     poll = setInterval(() => { if (!cancelled && cancelRequested()) { cancelled = true; provider.client.notify("session/cancel", { sessionId }); killTimer = setTimeout(() => { try { process.kill(provider.process.processGroupId ? -provider.process.processGroupId : provider.child.pid, "SIGTERM"); } catch {} }, 5000); } }, 100);
     let result;
+    let structuredOutput;
+    let structuredOutputError;
     const primaryCollector = beginTurn();
     try {
       if (primaryTurnController) {
@@ -3567,11 +3598,19 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
           );
         }
       }
-      ({ result } = await provider.client.promptTurn({
+      const promptResponse = await provider.client.promptTurn({
         sessionId,
         prompt: [{ type: "text", text: prompt }],
+        outputSchema,
         timeoutMs: timeoutMs ?? 30 * 60 * 1000
-      }));
+      });
+      result = promptResponse.result;
+      if (Object.hasOwn(promptResponse, "structuredOutput")) {
+        structuredOutput = promptResponse.structuredOutput;
+      }
+      if (Object.hasOwn(promptResponse, "structuredOutputError")) {
+        structuredOutputError = promptResponse.structuredOutputError;
+      }
     }
     catch (error) { if (outputError) throw outputError; if (cancelled) throw new CompanionError("E_CANCELLED", "Grok job was cancelled."); throw provider.eventError() || error; }
     if (provider.eventError()) throw provider.eventError();
@@ -3622,11 +3661,15 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
         resolvedFinal = "";
         resolvedInterim = "";
         selectedSequence = drained?.attempt?.lastCompletedSequence ?? selectedSequence;
+        structuredOutput = undefined;
+        structuredOutputError = undefined;
       } else if (deliveredTurns.length) {
         const selected = deliveredTurns.at(-1);
         selectedSequence = selected.sequence;
         resolvedFinal = String(selected.text || "").trim();
         resolvedInterim = "";
+        structuredOutput = undefined;
+        structuredOutputError = undefined;
       }
       mailboxEvidence = {
         schemaVersion: 1,
@@ -3649,6 +3692,8 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
       stopReason: result?.stopReason || "end_turn",
       provider: { version: provider.version, process: provider.process },
       capabilities: provider.initialized,
+      ...(structuredOutput !== undefined ? { structuredOutput } : {}),
+      ...(structuredOutputError !== undefined ? { structuredOutputError } : {}),
       ...(mailboxEvidence ? { mailboxEvidence } : {})
     };
   } catch (error) {

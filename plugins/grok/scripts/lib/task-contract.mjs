@@ -19,6 +19,19 @@ const timestamp = () => new Date().toISOString();
 export const TASK_ENVELOPE_VERSION = 1;
 export const CONTEXT_MANIFEST_VERSION = 1;
 export const WORKER_REPORT_VERSION = 1;
+const WORKER_REPORT_REQUIRED_FIELDS = Object.freeze([
+  "outcome",
+  "summary",
+  "changedFiles",
+  "checksClaimed",
+  "acceptanceResults",
+  "risks",
+  "questions"
+]);
+const WORKER_REPORT_ALLOWED_FIELDS = Object.freeze([
+  ...WORKER_REPORT_REQUIRED_FIELDS,
+  "hostActionRequest"
+]);
 export const LIFECYCLE_EVENT_TYPES = Object.freeze([
   "task.accepted",
   "plan.updated",
@@ -204,6 +217,96 @@ function canonicalJson(value) {
 }
 
 /**
+ * Code-owned JSON Schema passed through Grok Build's ACP `outputSchema`
+ * extension. Grok performs the first structural validation; the broker still
+ * owns semantic validation, exact acceptance-ID accounting, scope checks, and
+ * host verification.
+ */
+export function buildWorkerReportOutputSchema(acceptanceCriteria = []) {
+  const criteria = Array.isArray(acceptanceCriteria)
+    ? acceptanceCriteria.slice(0, MAX_LIST)
+    : [];
+  const acceptanceIds = criteria
+    .map((criterion) => criterion?.id)
+    .filter((id) => typeof id === "string" && id.length > 0);
+  const acceptanceItem = {
+    type: "object",
+    additionalProperties: false,
+    required: ["id", "status"],
+    properties: {
+      id: acceptanceIds.length
+        ? { type: "string", enum: acceptanceIds }
+        : { type: "string", minLength: 1, maxLength: 80 },
+      status: {
+        type: "string",
+        enum: ["met", "unmet", "unknown"]
+      },
+      note: { type: "string", maxLength: MAX_ITEM }
+    }
+  };
+  return Object.freeze({
+    type: "object",
+    additionalProperties: false,
+    required: [...WORKER_REPORT_REQUIRED_FIELDS, "hostActionRequest"],
+    properties: {
+      outcome: {
+        type: "string",
+        enum: ["complete", "partial", "blocked"]
+      },
+      summary: {
+        type: "string",
+        minLength: 1,
+        maxLength: 2000
+      },
+      changedFiles: {
+        type: "array",
+        maxItems: 200,
+        items: { type: "string", minLength: 1, maxLength: 1024 }
+      },
+      checksClaimed: {
+        type: "array",
+        maxItems: MAX_LIST,
+        items: { type: "string", maxLength: MAX_ITEM }
+      },
+      acceptanceResults: {
+        type: "array",
+        minItems: acceptanceIds.length,
+        maxItems: acceptanceIds.length || MAX_LIST,
+        items: acceptanceItem
+      },
+      risks: {
+        type: "array",
+        maxItems: MAX_LIST,
+        items: { type: "string", maxLength: MAX_ITEM }
+      },
+      questions: {
+        type: "array",
+        maxItems: MAX_LIST,
+        items: { type: "string", maxLength: MAX_ITEM }
+      },
+      hostActionRequest: {
+        anyOf: [
+          { type: "null" },
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["schemaVersion", "kind", "requestedRoleId"],
+            properties: {
+              schemaVersion: { const: 1 },
+              kind: { const: "role_admission" },
+              requestedRoleId: {
+                type: "string",
+                enum: ["reviewer", "security", "test", "implementer"]
+              }
+            }
+          }
+        ]
+      }
+    }
+  });
+}
+
+/**
  * Build TaskEnvelope v1 from structured fields or plain-text CLI task input.
  * Plain-text paths remain compatible by constructing a default envelope.
  */
@@ -289,7 +392,7 @@ export function buildTaskEnvelope({
     requiredVerification: asStringList(requiredVerification),
     expectedReturnFormat: clip(
       expectedReturnFormat
-        || "End with GROK_WORKER_REPORT: followed by one JSON object containing outcome, summary, changedFiles, checksClaimed, acceptanceResults, risks, and questions."
+        || "Return one Worker Report JSON object containing outcome, summary, changedFiles, checksClaimed, acceptanceResults, risks, questions, and hostActionRequest. The runtime requests native structured output; only when that channel is unavailable, prefix the fallback object with GROK_WORKER_REPORT:."
     ),
     contextManifestId: contextManifestId || null
   };
@@ -949,26 +1052,49 @@ function boundLifecycleDetail(detail) {
  * Build a structured final worker report from provider output.
  * Interim message text must not be passed here.
  */
-export function buildWorkerReport({
-  providerText = "",
-  outcome = null,
-  summary = null,
-  changedFiles = null,
-  checksClaimed = null,
-  acceptanceResults = null,
-  risks = null,
-  questions = null,
-  hostActionRequest = undefined,
-  acceptanceCriteria = []
-} = {}) {
-  const parsedReport = parseStructuredWorkerPayload(providerText);
+export function buildWorkerReport(options = {}) {
+  const {
+    providerText = "",
+    outcome = null,
+    summary = null,
+    changedFiles = null,
+    checksClaimed = null,
+    acceptanceResults = null,
+    risks = null,
+    questions = null,
+    hostActionRequest = undefined,
+    acceptanceCriteria = [],
+    nativeStructuredOutput = undefined,
+    nativeStructuredOutputError = undefined
+  } = options;
+  const nativeOutputPresent = Object.hasOwn(options, "nativeStructuredOutput");
+  const nativeErrorPresent = Object.hasOwn(options, "nativeStructuredOutputError");
+  const nativeOutputValidShape = nativeStructuredOutput
+    && typeof nativeStructuredOutput === "object"
+    && !Array.isArray(nativeStructuredOutput);
+  const nativeShapeIssues = [];
+  if (nativeOutputPresent && nativeErrorPresent) {
+    nativeShapeIssues.push("ACP returned both structured output and a structured-output error.");
+  } else if (nativeErrorPresent) {
+    nativeShapeIssues.push("Grok Build could not produce schema-valid structured output.");
+  } else if (nativeOutputPresent && !nativeOutputValidShape) {
+    nativeShapeIssues.push("ACP structured output must be a Worker Report object.");
+  }
+  const parsedReport = nativeOutputPresent && !nativeErrorPresent && nativeOutputValidShape
+    ? {
+        value: nativeStructuredOutput,
+        markerPresent: true,
+        source: "acp-structured"
+      }
+    : (!nativeOutputPresent && !nativeErrorPresent
+        ? parseStructuredWorkerPayload(providerText)
+        : null);
   const parsed = parsedReport?.value || null;
   const text = clip(String(providerText || "").trim());
-  const requiredFields = ["outcome", "summary", "changedFiles", "checksClaimed", "acceptanceResults", "risks", "questions"];
-  const allowedFields = new Set([...requiredFields, "hostActionRequest"]);
+  const allowedFields = new Set(WORKER_REPORT_ALLOWED_FIELDS);
   const shapeIssues = [];
   if (parsed) {
-    for (const field of requiredFields) if (!Object.hasOwn(parsed, field)) shapeIssues.push(`Structured worker report omitted ${field}.`);
+    for (const field of WORKER_REPORT_REQUIRED_FIELDS) if (!Object.hasOwn(parsed, field)) shapeIssues.push(`Structured worker report omitted ${field}.`);
     for (const field of Object.keys(parsed)) if (!allowedFields.has(field)) shapeIssues.push(`Structured worker report included unsupported field ${field}.`);
     if (typeof parsed.summary !== "string" || !parsed.summary.trim()) shapeIssues.push("Structured worker report summary must be a non-empty string.");
     for (const field of ["changedFiles", "checksClaimed", "acceptanceResults", "risks", "questions"]) {
@@ -1000,19 +1126,34 @@ export function buildWorkerReport({
       ? parsed.outcome
       : null;
   const validationIssues = [
+    ...nativeShapeIssues,
     ...shapeIssues,
     ...normalizedPaths.issues,
     ...normalizedAcceptance.issues,
     ...normalizedHostAction.issues
   ];
   if (parsed && !requestedOutcome) validationIssues.push("Structured worker report omitted a valid outcome.");
-  if (!parsed) validationIssues.push("Provider did not return a GROK_WORKER_REPORT JSON object.");
-  else if (!parsedReport.markerPresent) validationIssues.push("Provider returned JSON without the required GROK_WORKER_REPORT marker.");
+  if (!parsed && !nativeOutputPresent && !nativeErrorPresent) {
+    validationIssues.push("Provider did not return a GROK_WORKER_REPORT JSON object.");
+  } else if (parsed && parsedReport.source !== "acp-structured" && !parsedReport.markerPresent) {
+    validationIssues.push("Provider returned JSON without the required GROK_WORKER_REPORT marker.");
+  }
   const resolvedOutcome = requestedOutcome || "partial";
-  return {
+  const reportSource = parsedReport?.source === "acp-structured"
+    ? "acp-structured"
+    : nativeErrorPresent
+      ? "acp-structured-error"
+      : parsedReport?.markerPresent
+        ? "text-marker"
+        : "text-unmarked";
+  const report = {
     schemaVersion: WORKER_REPORT_VERSION,
-    structured: Boolean(parsedReport?.markerPresent),
-    valid: Boolean(parsedReport?.markerPresent) && validationIssues.length === 0,
+    structured: parsedReport?.source === "acp-structured"
+      || Boolean(parsedReport?.markerPresent),
+    valid: (
+      parsedReport?.source === "acp-structured"
+      || Boolean(parsedReport?.markerPresent)
+    ) && validationIssues.length === 0,
     outcome: resolvedOutcome,
     summary: resolvedSummary,
     changedFiles: files,
@@ -1023,8 +1164,26 @@ export function buildWorkerReport({
     ...(hostActionPresent && normalizedHostAction.ok
       ? { hostActionRequest: normalizedHostAction.value }
       : {}),
-    validationIssues
+    validationIssues,
+    reportSource,
+    reportDigest: null
   };
+  if (report.valid) {
+    report.reportDigest = sha(canonicalJson({
+      schemaVersion: report.schemaVersion,
+      outcome: report.outcome,
+      summary: report.summary,
+      changedFiles: report.changedFiles,
+      checksClaimed: report.checksClaimed,
+      acceptanceResults: report.acceptanceResults,
+      risks: report.risks,
+      questions: report.questions,
+      ...(Object.hasOwn(report, "hostActionRequest")
+        ? { hostActionRequest: report.hostActionRequest }
+        : {})
+    }));
+  }
+  return report;
 }
 
 /** Build one same-session, no-tool-use repair turn for a malformed final worker report. */
@@ -1434,7 +1593,7 @@ export function composeProviderPrompt(envelope, {
     `Non-goals:\n${envelope.nonGoals.length ? envelope.nonGoals.map((item) => `- ${item}`).join("\n") : "(none)"}`,
     `Acceptance criteria:\n${envelope.acceptanceCriteria.map((item) => `- ${item.id}: ${item.text}`).join("\n")}`,
     `Host-owned verification after your return:\n${envelope.requiredVerification.length ? envelope.requiredVerification.map((item) => `- ${item}`).join("\n") : "(host will choose authoritative checks; claim only evidence your available tools actually produced)"}`,
-    `Expected return format:\n${envelope.expectedReturnFormat}\nThe GROK_WORKER_REPORT object must be the final content in your response. Do not put progress prose after it.`,
+    `Expected return format:\n${envelope.expectedReturnFormat}\nReturn the Worker Report object as the final response through the runtime's native structured-output channel. Do not prefix native JSON with GROK_WORKER_REPORT:. Only if native structured output is unavailable, use GROK_WORKER_REPORT: followed by the object. Do not put progress prose after the final object.`,
     `Context-manifest identity: ${envelope.contextManifestId || "unbound"}`,
     `Context-manifest summary: ${manifestSummary}`
   ];
