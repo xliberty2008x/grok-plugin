@@ -5323,6 +5323,13 @@ function worktreeAbsenceProofWithoutDigest(proof) {
 }
 
 function assertWorktreeAbsenceProof(proof, binding) {
+  const workerParentStateValid = (
+    proof?.workerParentState === "private-empty"
+      && SHA256_HEX.test(proof?.workerParentIdentityDigest || "")
+  ) || (
+    proof?.workerParentState === "absent"
+      && proof?.workerParentIdentityDigest === null
+  );
   if (!hasExactKeys(proof, WORKTREE_ABSENCE_PROOF_KEYS)
     || proof.schemaVersion !== WRITE_PROVISIONING_SCHEMA_VERSION
     || proof.classification !== "absent"
@@ -5335,9 +5342,8 @@ function assertWorktreeAbsenceProof(proof, binding) {
       !== digestKey(path.dirname(binding.expectedExecutionRoot))
     || proof.baseCommitDigest !== digestKey(binding.baseCommit)
     || proof.filesystemPathState !== "absent"
-    || proof.workerParentState !== "private-empty"
+    || !workerParentStateValid
     || !SHA256_HEX.test(proof.managedRootIdentityDigest || "")
-    || !SHA256_HEX.test(proof.workerParentIdentityDigest || "")
     || !SHA256_HEX.test(proof.rawInventoryDigest || "")
     || !SHA256_HEX.test(proof.adminInventoryDigest || "")
     || proof.exactRegistrationCount !== 0

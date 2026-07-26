@@ -488,18 +488,31 @@ function captureWorkerWorktreeAbsenceProof({
       managedRoot,
       "Managed worktree root"
     );
-    const parentObservation = privateDirectoryObservation(
-      workerParent,
-      "Managed worker parent"
-    );
+    let workerParentPresent = false;
+    try {
+      fs.lstatSync(workerParent);
+      workerParentPresent = true;
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw new CompanionError(
+          "E_WORKTREE",
+          "Managed worker parent cannot be inspected safely.",
+          { classification: "inventory-ambiguous" }
+        );
+      }
+    }
+    const parentObservation = workerParentPresent
+      ? privateDirectoryObservation(workerParent, "Managed worker parent")
+      : null;
     assertPathAbsentNoFollow(executionRoot);
-    if (fs.readdirSync(workerParent).length !== 0) {
+    if (workerParentPresent && fs.readdirSync(workerParent).length !== 0) {
       throw new CompanionError(
         "E_WORKTREE",
         "Managed worker parent is not empty.",
         { classification: "occupied" }
       );
     }
+    if (!workerParentPresent) assertPathAbsentNoFollow(workerParent);
     const inventory = worktreePorcelainInventory(control.controlRoot);
     const paths = exactWorktreeInventoryPaths(inventory);
     const exactRegistrationCount = paths.filter(
@@ -511,13 +524,14 @@ function captureWorkerWorktreeAbsenceProof({
     )).length;
     const admin = adminBacklinkObservation(control, workerParent);
     assertPathAbsentNoFollow(executionRoot);
-    if (fs.readdirSync(workerParent).length !== 0) {
+    if (workerParentPresent && fs.readdirSync(workerParent).length !== 0) {
       throw new CompanionError(
         "E_WORKTREE",
         "Managed worker parent changed during absence verification.",
         { classification: "occupied" }
       );
     }
+    if (!workerParentPresent) assertPathAbsentNoFollow(workerParent);
     if (exactRegistrationCount !== 0
       || managedParentRegistrationCount !== 0
       || admin.managedParentMatchCount !== 0) {
@@ -529,7 +543,8 @@ function captureWorkerWorktreeAbsenceProof({
     }
     return Object.freeze({
       managedRootIdentityDigest: managedRootObservation.identityDigest,
-      workerParentIdentityDigest: parentObservation.identityDigest,
+      workerParentIdentityDigest: parentObservation?.identityDigest || null,
+      workerParentState: workerParentPresent ? "private-empty" : "absent",
       rawInventoryDigest: sha(inventory.raw),
       adminInventoryDigest: admin.inventoryDigest,
       exactRegistrationCount,
@@ -558,7 +573,7 @@ function captureWorkerWorktreeAbsenceProof({
     expectedWorkerParentDigest: sha(workerParent),
     baseCommitDigest: sha(baseCommit),
     filesystemPathState: "absent",
-    workerParentState: "private-empty",
+    workerParentState: second.workerParentState,
     ...second,
     observedAt: new Date().toISOString(),
     proofDigest: null

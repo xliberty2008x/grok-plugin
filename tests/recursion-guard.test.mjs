@@ -1131,6 +1131,21 @@ test("worktree provisioning guard authenticates only canonical admitted and acti
     reissueJob.provisioningRuntime.priorAttempts.length,
     1
   );
+  const absentParentArchiveJob = structuredClone(reissueJob);
+  absentParentArchiveJob.provisioningRuntime
+    .priorAttempts[0].absenceProof.workerParentState = "absent";
+  absentParentArchiveJob.provisioningRuntime
+    .priorAttempts[0].absenceProof.workerParentIdentityDigest = null;
+  resealArchivedAttemptJob(absentParentArchiveJob);
+  assert.equal(
+    assertWorktreeProvisioningGuardForJob(
+      root,
+      absentParentArchiveJob,
+      reissueRecord,
+      { expectedBinding: reissueBinding, env }
+    ),
+    reissueRecord
+  );
 
   const rehashedArchiveCorruptions = [
     ["archived intent purpose", (candidate) => {

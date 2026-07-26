@@ -418,9 +418,9 @@ async function cleanupPendingAbsentProvisioning(t, label) {
   });
   const workerParent = path.dirname(fixture.binding.expectedExecutionRoot);
   const managedRoot = path.dirname(workerParent);
-  fs.mkdirSync(workerParent, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
   fs.chmodSync(managedRoot, 0o700);
-  fs.chmodSync(workerParent, 0o700);
+  assert.equal(fs.existsSync(workerParent), false);
   return { fixture, active, retained };
 }
 
@@ -2554,6 +2554,8 @@ test("absence-proven reissue archives the prior attempt and activates only a fre
     tryReadJob(fixture.root, fixture.workerId, fixture.env),
     retained.job
   );
+  fs.rmdirSync(workerParent);
+  assert.equal(fs.existsSync(workerParent), false);
 
   const prepared = prepareWriteProvisioningReissue(request);
   assert.equal(prepared.prepared, true);
@@ -2590,6 +2592,8 @@ test("absence-proven reissue archives the prior attempt and activates only a fre
     retained.job.provisioningRuntime.cleanupProof.proofDigest
   );
   assert.equal(archive.absenceProof.classification, "absent");
+  assert.equal(archive.absenceProof.workerParentState, "absent");
+  assert.equal(archive.absenceProof.workerParentIdentityDigest, null);
   assert.equal(archive.absenceProof.exactRegistrationCount, 0);
   assert.equal(
     prepared.job.provisioning.priorAttemptArchiveDigest,

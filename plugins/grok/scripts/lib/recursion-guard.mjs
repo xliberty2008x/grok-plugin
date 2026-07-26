@@ -601,12 +601,17 @@ function validWorktreeProvisioningPriorAttempts(
           !== digest(path.dirname(binding.expectedExecutionRoot))
         || absenceProof.baseCommitDigest !== digest(binding.baseCommit)
         || absenceProof.filesystemPathState !== "absent"
-        || absenceProof.workerParentState !== "private-empty"
+        || !((
+          absenceProof.workerParentState === "private-empty"
+            && SHA256_HEX.test(
+              absenceProof.workerParentIdentityDigest || ""
+            )
+        ) || (
+          absenceProof.workerParentState === "absent"
+            && absenceProof.workerParentIdentityDigest === null
+        ))
         || !SHA256_HEX.test(
           absenceProof.managedRootIdentityDigest || ""
-        )
-        || !SHA256_HEX.test(
-          absenceProof.workerParentIdentityDigest || ""
         )
         || !SHA256_HEX.test(absenceProof.rawInventoryDigest || "")
         || !SHA256_HEX.test(absenceProof.adminInventoryDigest || "")

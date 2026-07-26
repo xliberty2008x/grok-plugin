@@ -1542,6 +1542,19 @@ test("worktree-effect classifier distinguishes exact, dirty, absent, occupied, a
     removeWorkerWorktree(worktree.executionRoot, root, exactWorkerId, env),
     true
   );
+  const removedAbsent = classifyWorkerWorktreeEffect({
+    controlRoot: root,
+    executionRoot: worktree.executionRoot,
+    baseCommit: base,
+    workerId: exactWorkerId,
+    env
+  });
+  assert.equal(removedAbsent.classification, "absent");
+  assert.equal(removedAbsent.evidence.workerParentState, "absent");
+  assert.equal(removedAbsent.evidence.workerParentIdentityDigest, null);
+  assert.equal(removedAbsent.evidence.exactRegistrationCount, 0);
+  assert.equal(removedAbsent.evidence.managedParentRegistrationCount, 0);
+  assert.equal(removedAbsent.evidence.adminBacklinkMatchCount, 0);
 
   const staleWorkerId = "task-effect-stale-000001";
   const stale = createWorkerWorktree({
