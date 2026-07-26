@@ -20,6 +20,9 @@ import {
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import { createWorkerAuthorization } from "../plugins/grok/scripts/lib/worker-launch-contract.mjs";
 import {
+  providerLaunchBindingDigest
+} from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
+import {
   jobFile,
   listBrokerRecoveryCandidates,
   readJob,
@@ -40,6 +43,16 @@ import { initRepo, tempDir } from "./helpers.mjs";
 
 const THREAD_ID = "019f8111-1a2b-7c3d-8e4f-1234567890ab";
 const CAPABILITY_DIGEST = "a".repeat(64);
+const PROVIDER_LAUNCH_BINDING = Object.freeze({
+  schemaVersion: 1,
+  pinRef: `gpin-${"1".repeat(32)}`,
+  pinRecordDigest: "2".repeat(64),
+  executableIdentityDigest: "3".repeat(64),
+  releaseIdentityDigest: "4".repeat(64)
+});
+const PROVIDER_LAUNCH_BINDING_DIGEST = providerLaunchBindingDigest(
+  PROVIDER_LAUNCH_BINDING
+);
 const SERVER = fileURLToPath(new URL("../plugins/grok/mcp/server.mjs", import.meta.url));
 let sequence = 0;
 
@@ -69,6 +82,8 @@ function fixture(t, label, { pluginId = "grok@grok-companion" } = {}) {
     }),
     idempotencyKey: `worker-supervisor-${label}-${sequence}`,
     providerCapabilityDigest: CAPABILITY_DIGEST,
+    providerLaunchBinding: PROVIDER_LAUNCH_BINDING,
+    providerLaunchBindingDigest: PROVIDER_LAUNCH_BINDING_DIGEST,
     env
   });
   const workerId = admitted.handle.id;
@@ -216,6 +231,8 @@ function pendingFollowupFixture(t, label) {
     message: "Recover this pending read-only follow-up",
     idempotencyKey: `supervisor-followup-child-${label}`,
     providerCapabilityDigest: CAPABILITY_DIGEST,
+    providerLaunchBinding: PROVIDER_LAUNCH_BINDING,
+    providerLaunchBindingDigest: PROVIDER_LAUNCH_BINDING_DIGEST,
     env: state.env
   });
   return {
@@ -227,7 +244,11 @@ function pendingFollowupFixture(t, label) {
 }
 
 function receipt(digest = CAPABILITY_DIGEST) {
-  return Object.freeze({ capabilityDigest: digest });
+  return Object.freeze({
+    capabilityDigest: digest,
+    providerLaunchBinding: PROVIDER_LAUNCH_BINDING,
+    providerLaunchBindingDigest: PROVIDER_LAUNCH_BINDING_DIGEST
+  });
 }
 
 function claimOnly(log) {

@@ -13,13 +13,42 @@ import {
   readValidProviderCapabilityReceipt,
   writeProviderCapabilityReceipt
 } from "../plugins/grok/scripts/lib/provider-capability.mjs";
+import {
+  captureExecutableFileIdentity
+} from "../plugins/grok/scripts/lib/executable-identity.mjs";
+import {
+  discoverManagedRawGrokExecutable,
+  providerLaunchBindingDigest,
+  publishProviderExecutablePin,
+  resolveProviderExecutablePin
+} from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
 import { installFakeGrok } from "./fake-grok.mjs";
 import { ROOT, tempDir } from "./helpers.mjs";
 
-const RECEIPT_RELATIVE_PATH = path.join("capabilities", "provider-capability-v1.json");
+const RECEIPT_RELATIVE_PATH = path.join(
+  "capabilities",
+  "provider-capability-v2.json"
+);
 
 function sha256(file) {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+function releaseFor(fileIdentity, version = "0.2.99") {
+  return Object.freeze({
+    releaseSource: "official-package-pin-v1",
+    packageName: "@xai-official/grok",
+    packageVersion: version,
+    packageGitHead: "9".repeat(40),
+    packageIntegrityDigest: "3".repeat(64),
+    platform: process.platform,
+    arch: process.arch,
+    version,
+    buildCommit: "9bbd559437aa",
+    channel: "stable",
+    size: fileIdentity.size,
+    executableDigest: fileIdentity.executableDigest
+  });
 }
 
 function fixture() {
@@ -27,55 +56,151 @@ function fixture() {
   const pluginData = tempDir("grok-provider-capability-data-");
   const env = {
     HOME: path.dirname(pluginData),
+    PATH: path.dirname(fake.binary),
     PLUGIN_DATA: pluginData,
-    GROK_BIN: fake.binary,
     GROK_COMPANION_HOST: "codex"
   };
+  const release = releaseFor(captureExecutableFileIdentity(fake.binary));
+  const pinned = publishProviderExecutablePin({
+    env,
+    releases: [release],
+    sourceBinary: fake.binary,
+    clock: () => Date.parse("2026-07-23T09:59:00.000Z")
+  });
   const runtime = {
-    binary: fake.binary,
-    version: "0.2.99",
+    binary: pinned.binary,
+    version: release.version,
     authenticated: true,
     protocolVersion: 1,
     loadSession: true,
     acpIsolation: {
       isolated: true,
       unattendedPrivilegeExpansion: false,
-      agentProfileDigest: sha256(path.join(ROOT, "plugins/grok/provider-agents/setup-probe.md"))
+      agentProfileDigest: sha256(
+        path.join(ROOT, "plugins/grok/provider-agents/setup-probe.md")
+      )
     }
   };
-  return { fake, pluginData, env, runtime, receiptFile: path.join(pluginData, RECEIPT_RELATIVE_PATH) };
+  return {
+    fake,
+    pluginData,
+    env,
+    release,
+    releases: [release],
+    pinned,
+    runtime,
+    receiptFile: path.join(pluginData, RECEIPT_RELATIVE_PATH)
+  };
 }
 
-test("provider capability receipt is private, body-free, tamper-evident, and durably clearable", (t) => {
-  const { env, runtime, receiptFile, fake } = fixture();
-  const issuedAt = Date.parse("2026-07-23T10:00:00.000Z");
-  const receipt = writeProviderCapabilityReceipt({ runtime, env, clock: () => issuedAt });
+function writeReceipt(state, options = {}) {
+  return writeProviderCapabilityReceipt({
+    runtime: state.runtime,
+    providerLaunchBinding: state.pinned.binding,
+    env: state.env,
+    releases: state.releases,
+    ...options
+  });
+}
 
+function readReceipt(state, options = {}) {
+  return readValidProviderCapabilityReceipt({
+    env: state.env,
+    releases: state.releases,
+    ...options
+  });
+}
+
+test("setup discovery resolves an npm trampoline to managed raw native bytes", () => {
+  const fake = installFakeGrok(tempDir("grok-provider-npm-raw-"));
+  const home = tempDir("grok-provider-npm-home-");
+  const grokHome = path.join(home, ".grok");
+  const managedDirectory = path.join(grokHome, "bin");
+  fs.mkdirSync(managedDirectory, { recursive: true, mode: 0o700 });
+  const managed = path.join(managedDirectory, "grok-0.2.99");
+  fs.copyFileSync(fake.binary, managed);
+  fs.chmodSync(managed, 0o700);
+  fs.symlinkSync("grok-0.2.99", path.join(managedDirectory, "grok"));
+
+  const packageRoot = path.join(
+    tempDir("grok-provider-npm-prefix-"),
+    "node_modules",
+    "@xai-official",
+    "grok"
+  );
+  fs.mkdirSync(path.join(packageRoot, "bin"), { recursive: true });
+  fs.writeFileSync(
+    path.join(packageRoot, "package.json"),
+    JSON.stringify({ name: "@xai-official/grok", version: "0.2.99" })
+  );
+  const trampoline = path.join(packageRoot, "bin", "grok");
+  fs.writeFileSync(trampoline, "#!/usr/bin/env node\nprocess.exit(91);\n", {
+    mode: 0o700
+  });
+  fs.chmodSync(trampoline, 0o700);
+
+  const release = releaseFor(captureExecutableFileIdentity(managed));
+  const discovered = discoverManagedRawGrokExecutable({
+    env: {
+      HOME: home,
+      GROK_HOME: grokHome,
+      GROK_BIN: trampoline,
+      PATH: ""
+    },
+    releases: [release]
+  });
+  assert.equal(discovered.canonicalPath, fs.realpathSync(managed));
+  assert.notEqual(discovered.canonicalPath, fs.realpathSync(trampoline));
+});
+
+test("provider capability v2 is path-free, pin-bound, tamper-evident, and durably clearable", (t) => {
+  const state = fixture();
+  const issuedAt = Date.parse("2026-07-23T10:00:00.000Z");
+  const receipt = writeReceipt(state, { clock: () => issuedAt });
+
+  assert.equal(receipt.schemaVersion, 2);
   assert.deepEqual(receipt.capabilities, [
     ROOT_READ_PROVIDER_CAPABILITY,
     SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
     ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
   ]);
-  assert.match(receipt.capabilityDigest, /^[a-f0-9]{64}$/);
+  assert.equal(
+    receipt.providerLaunchBindingDigest,
+    providerLaunchBindingDigest(receipt.providerLaunchBinding)
+  );
   assert.equal(receipt.mcpCapabilityContractVersion, MCP_CAPABILITY_CONTRACT_VERSION);
-  assert.equal(fs.lstatSync(receiptFile).mode & 0o077, 0);
-  const serialized = fs.readFileSync(receiptFile, "utf8");
-  for (const forbidden of [fake.binary, "auth", "credential", "prompt", "models"]) {
+  assert.equal(fs.lstatSync(state.receiptFile).mode & 0o077, 0);
+  const serialized = fs.readFileSync(state.receiptFile, "utf8");
+  for (const forbidden of [
+    state.fake.binary,
+    state.pinned.binary,
+    "binaryPath",
+    "auth",
+    "credential",
+    "prompt",
+    "models"
+  ]) {
     assert.equal(serialized.includes(forbidden), false, forbidden);
   }
+  assert.deepEqual(Object.keys(receipt.providerLaunchBinding).sort(), [
+    "executableIdentityDigest",
+    "pinRecordDigest",
+    "pinRef",
+    "releaseIdentityDigest",
+    "schemaVersion"
+  ]);
 
-  const observed = readValidProviderCapabilityReceipt({
-    env,
-    clock: () => issuedAt + 1000
-  });
-  assert.equal(observed?.capabilityDigest, receipt.capabilityDigest);
+  assert.equal(
+    readReceipt(state, { clock: () => issuedAt + 1000 })?.capabilityDigest,
+    receipt.capabilityDigest
+  );
 
   const stored = JSON.parse(serialized);
-  stored.providerVersion = "9.9.9";
-  fs.writeFileSync(receiptFile, `${JSON.stringify(stored)}\n`, { mode: 0o600 });
-  assert.equal(readValidProviderCapabilityReceipt({ env, clock: () => issuedAt + 1000 }), null);
+  stored.providerLaunchBindingDigest = "f".repeat(64);
+  fs.writeFileSync(state.receiptFile, `${JSON.stringify(stored)}\n`, { mode: 0o600 });
+  assert.equal(readReceipt(state, { clock: () => issuedAt + 1000 }), null);
 
-  writeProviderCapabilityReceipt({ runtime, env, clock: () => issuedAt });
+  writeReceipt(state, { clock: () => issuedAt });
   let directoryFsyncObserved = process.platform === "win32";
   const originalFsync = fs.fsyncSync;
   fs.fsyncSync = (descriptor) => {
@@ -83,19 +208,22 @@ test("provider capability receipt is private, body-free, tamper-evident, and dur
     return originalFsync(descriptor);
   };
   t.after(() => { fs.fsyncSync = originalFsync; });
-  assert.equal(clearProviderCapabilityReceipt({ env }), true);
-  assert.equal(fs.existsSync(receiptFile), false);
-  assert.equal(readValidProviderCapabilityReceipt({ env, clock: () => issuedAt + 1000 }), null);
+  assert.equal(clearProviderCapabilityReceipt({ env: state.env }), true);
+  assert.equal(fs.existsSync(state.receiptFile), false);
+  assert.equal(readReceipt(state, { clock: () => issuedAt + 1000 }), null);
   assert.equal(directoryFsyncObserved, true);
-  assert.equal(clearProviderCapabilityReceipt({ env }), false);
+  assert.equal(clearProviderCapabilityReceipt({ env: state.env }), false);
 });
 
-test("provider capability receipt fails closed on expiry and every bound identity drift", () => {
-  const { env, runtime } = fixture();
+test("provider capability v2 fails closed on expiry, v1, and bound identity drift", () => {
+  const state = fixture();
   const issuedAt = Date.parse("2026-07-23T10:00:00.000Z");
-  const receipt = writeProviderCapabilityReceipt({ runtime, env, clock: () => issuedAt, ttlMs: 60_000 });
-  const validOptions = { env, clock: () => issuedAt + 1000 };
-  assert.ok(readValidProviderCapabilityReceipt(validOptions));
+  const receipt = writeReceipt(state, {
+    clock: () => issuedAt,
+    ttlMs: 60_000
+  });
+  const validOptions = { clock: () => issuedAt + 1000 };
+  assert.ok(readReceipt(state, validOptions));
 
   const driftCases = [
     { clock: () => issuedAt + 60_000 },
@@ -105,26 +233,39 @@ test("provider capability receipt fails closed on expiry and every bound identit
     { architecture: `${process.arch}-drift` },
     { setupProfileDigest: "a".repeat(64) },
     { rootReadProfileDigest: "b".repeat(64) },
-    { resolveVersion: () => "9.9.9" }
+    {
+      resolvePin: (binding, options) => {
+        const resolved = resolveProviderExecutablePin(binding, options);
+        return {
+          ...resolved,
+          executableIdentity: {
+            ...resolved.executableIdentity,
+            version: "9.9.9"
+          }
+        };
+      }
+    }
   ];
   for (const drift of driftCases) {
     assert.equal(
-      readValidProviderCapabilityReceipt({ ...validOptions, ...drift }),
+      readReceipt(state, { ...validOptions, ...drift }),
       null,
       JSON.stringify(Object.keys(drift))
     );
   }
 
+  const stored = JSON.parse(fs.readFileSync(state.receiptFile, "utf8"));
+  stored.schemaVersion = 1;
+  fs.writeFileSync(state.receiptFile, `${JSON.stringify(stored)}\n`, { mode: 0o600 });
+  assert.equal(readReceipt(state, validOptions), null);
   assert.equal(receipt.mcpCapabilityContractVersion, MCP_CAPABILITY_CONTRACT_VERSION);
 });
 
-test("provider capability receipt rejects missing, reordered, duplicated, and extra capability entries", () => {
-  const { env, runtime, receiptFile } = fixture();
+test("provider capability rejects reordered, duplicated, and extra capability entries", () => {
+  const state = fixture();
   const issuedAt = Date.parse("2026-07-23T10:00:00.000Z");
   const cases = [
     [ROOT_READ_PROVIDER_CAPABILITY],
-    [SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY],
-    [ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY],
     [
       SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
       ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY,
@@ -144,23 +285,31 @@ test("provider capability receipt rejects missing, reordered, duplicated, and ex
     ]
   ];
   for (const capabilities of cases) {
-    writeProviderCapabilityReceipt({ runtime, env, clock: () => issuedAt });
-    const stored = JSON.parse(fs.readFileSync(receiptFile, "utf8"));
+    writeReceipt(state, { clock: () => issuedAt });
+    const stored = JSON.parse(fs.readFileSync(state.receiptFile, "utf8"));
     stored.capabilities = capabilities;
-    fs.writeFileSync(receiptFile, `${JSON.stringify(stored)}\n`, { mode: 0o600 });
+    fs.writeFileSync(state.receiptFile, `${JSON.stringify(stored)}\n`, { mode: 0o600 });
     assert.equal(
-      readValidProviderCapabilityReceipt({ env, clock: () => issuedAt + 1000 }),
+      readReceipt(state, { clock: () => issuedAt + 1000 }),
       null,
       JSON.stringify(capabilities)
     );
   }
 });
 
-test("provider file replacement invalidates the capability receipt", () => {
-  const { env, runtime, fake } = fixture();
+test("pinned file replacement invalidates both binding resolution and capability", () => {
+  const state = fixture();
   const observedAt = Date.now();
-  writeProviderCapabilityReceipt({ runtime, env, clock: () => observedAt });
-  assert.ok(readValidProviderCapabilityReceipt({ env, clock: () => observedAt + 1 }));
-  fs.appendFileSync(fake.binary, "\n// provider identity drift\n");
-  assert.equal(readValidProviderCapabilityReceipt({ env, clock: () => observedAt + 2 }), null);
+  writeReceipt(state, { clock: () => observedAt });
+  assert.ok(readReceipt(state, { clock: () => observedAt + 1 }));
+  fs.chmodSync(state.pinned.binary, 0o700);
+  fs.appendFileSync(state.pinned.binary, "\n// provider identity drift\n");
+  assert.equal(readReceipt(state, { clock: () => observedAt + 2 }), null);
+  assert.throws(
+    () => resolveProviderExecutablePin(state.pinned.binding, {
+      env: state.env,
+      releases: state.releases
+    }),
+    (error) => ["E_STATE", "E_PROCESS_IDENTITY", "E_GROK_VERSION"].includes(error?.code)
+  );
 });

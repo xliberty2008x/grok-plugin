@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test from "node:test";
 
-import { WORKER_TOOLS } from "../plugins/grok/mcp/broker.mjs";
+import {
+  createMcpBrokerRuntime,
+  handleMcpRequest,
+  WORKER_TOOLS
+} from "../plugins/grok/mcp/broker.mjs";
 import {
   CODEX_MCP_EXPERIMENTAL_CAPABILITIES,
   MCP_SANDBOX_STATE_META_CAPABILITY
@@ -104,7 +108,6 @@ function setupFixture() {
   return {
     ready: true,
     grok: {
-      binary: "/opt/grok/bin/grok",
       version: "0.2.99",
       authenticated: true,
       headlessReview: {
@@ -136,26 +139,28 @@ function setupFixture() {
   };
 }
 
-function providerIdentity() {
+function providerLaunchBinding() {
   return {
-    device: "1",
-    inode: "2",
-    size: 1234,
-    mtimeMs: 1_753_265_000_000,
-    contentDigest: DIGESTS.provider
+    schemaVersion: 1,
+    pinRef: `gpin-${"1".repeat(32)}`,
+    pinRecordDigest: "2".repeat(64),
+    executableIdentityDigest: DIGESTS.provider,
+    releaseIdentityDigest: "4".repeat(64)
   };
 }
 
 function capabilityFixture() {
+  const launchBinding = providerLaunchBinding();
   const stable = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     receiptType: "grok-provider-capability",
     pluginVersion: "0.3.0-dev.1",
     mcpCapabilityContractVersion: "1.3.0",
     platform: "darwin",
     architecture: "arm64",
     providerVersion: "0.2.99",
-    providerFileIdentity: providerIdentity(),
+    providerLaunchBinding: launchBinding,
+    providerLaunchBindingDigest: digest(launchBinding),
     acpProtocolVersion: 1,
     loadSession: true,
     setupProfileDigest: DIGESTS.setup,
@@ -176,13 +181,15 @@ function capabilityFixture() {
 }
 
 function capabilityExpectations() {
+  const launchBinding = providerLaunchBinding();
   return {
     setup: setupFixture(),
     pluginVersion: "0.3.0-dev.1",
     mcpCapabilityContractVersion: "1.3.0",
     platform: "darwin",
     architecture: "arm64",
-    providerFileIdentity: providerIdentity(),
+    providerLaunchBinding: launchBinding,
+    providerLaunchBindingDigest: digest(launchBinding),
     rootReadProfileDigest: DIGESTS.rootRead,
     observedAt: OBSERVED_AT
   };
@@ -200,6 +207,8 @@ function initializeFixture() {
     _meta: {
       "grok/capability-matrix": clone(EXPECTED_CAPABILITY_MATRIX),
       "grok/capabilityDigest": capabilityFixture().capabilityDigest,
+      "grok/providerLaunchBindingDigest":
+        capabilityFixture().providerLaunchBindingDigest,
       "grok/hostVerification": "suppressed",
       "grok/supportedProtocolVersions": ["2025-11-25", "2025-06-18", "2024-11-05"],
       "grok/externalWorkerLabel": "external-grok-worker"
@@ -211,6 +220,8 @@ function initializeExpectations() {
   return {
     serverVersion: "1.3.0",
     capabilityDigest: capabilityFixture().capabilityDigest,
+    providerLaunchBindingDigest:
+      capabilityFixture().providerLaunchBindingDigest,
     experimentalCapabilities: clone(CODEX_MCP_EXPERIMENTAL_CAPABILITIES),
     capabilityMatrix: clone(EXPECTED_CAPABILITY_MATRIX)
   };
@@ -801,7 +812,7 @@ test("installed setup requires semantic readiness, not a successful process exit
     (value) => { value.grok.acpIsolation.allowedTools = []; },
     (value) => { value.grok.acpIsolation.allowedTools = ["todo_write", "read_file"]; },
     (value) => { value.grok.acpIsolation.unattendedPrivilegeExpansion = true; },
-    (value) => { value.grok.binary = "relative/grok"; },
+    (value) => { value.grok.binary = "/opt/grok/bin/grok"; },
     (value) => { value.grok.version = "unbounded-version"; }
   ]) {
     const drift = setupFixture();
@@ -871,7 +882,10 @@ test("capability agreement fails on every identity, profile, protocol, and diges
     (receipt) => { receipt.loadSession = false; },
     (receipt) => { receipt.setupProfileDigest = "9".repeat(64); },
     (receipt) => { receipt.rootReadProfileDigest = "8".repeat(64); },
-    (receipt) => { receipt.providerFileIdentity.inode = "999"; },
+    (receipt) => {
+      receipt.providerLaunchBinding.executableIdentityDigest = "5".repeat(64);
+    },
+    (receipt) => { receipt.providerLaunchBindingDigest = "4".repeat(64); },
     (receipt) => { receipt.capabilityDigest = "7".repeat(64); },
     (receipt) => { receipt.receiptDigest = "6".repeat(64); }
   ];
@@ -890,6 +904,22 @@ test("capability agreement fails on every identity, profile, protocol, and diges
     () => validateProviderCapabilityAgreement(capabilityFixture(), expired),
     assertContractError("E_LIVE_CAPABILITY")
   );
+
+  const bindingDrift = capabilityExpectations();
+  bindingDrift.providerLaunchBinding = {
+    ...bindingDrift.providerLaunchBinding,
+    pinRef: `gpin-${"9".repeat(32)}`
+  };
+  bindingDrift.providerLaunchBindingDigest = digest(
+    bindingDrift.providerLaunchBinding
+  );
+  assert.throws(
+    () => validateProviderCapabilityAgreement(
+      capabilityFixture(),
+      bindingDrift
+    ),
+    assertContractError("E_LIVE_CAPABILITY")
+  );
 });
 
 test("initialize binds protocol, server identity, capability digest, and suppressed host authority", () => {
@@ -903,6 +933,9 @@ test("initialize binds protocol, server identity, capability digest, and suppres
     (value) => { value.serverInfo.name = "lookalike-broker"; },
     (value) => { value.serverInfo.version = "1.0.0"; },
     (value) => { value._meta["grok/capabilityDigest"] = "0".repeat(64); },
+    (value) => {
+      value._meta["grok/providerLaunchBindingDigest"] = "0".repeat(64);
+    },
     (value) => { value._meta["grok/hostVerification"] = "passed"; },
     (value) => { value.capabilities.tools.listChanged = true; },
     (value) => {
@@ -919,6 +952,28 @@ test("initialize binds protocol, server identity, capability digest, and suppres
       assertContractError("E_LIVE_INITIALIZE")
     );
   }
+});
+
+test("production initialize output satisfies the installed pin-bound validator", async () => {
+  const runtime = createMcpBrokerRuntime({
+    providerCapabilityReceipt: capabilityFixture()
+  });
+  const response = await handleMcpRequest({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-11-25",
+      capabilities: {
+        experimental: clone(CODEX_MCP_EXPERIMENTAL_CAPABILITIES)
+      },
+      _meta: clone(INITIALIZE_CLIENT_META)
+    }
+  }, { runtime });
+  assert.equal(
+    validateInstalledInitialize(response.result, initializeExpectations()),
+    true
+  );
 });
 
 test("tool inventory requires exact installed WORKER_TOOLS equality and fixed order", () => {

@@ -13,6 +13,10 @@ import {
   sameExecutableAttestation
 } from "./executable-identity.mjs";
 import {
+  assertProviderLaunchBinding,
+  providerLaunchBindingDigest
+} from "./provider-executable-pin.mjs";
+import {
   identityMatches,
   processCommand,
   processIsZombie,
@@ -42,7 +46,15 @@ const WORKTREE_PROVISIONING_SPEC_KEYS = new Set([
   ...SPEC_KEYS,
   "executableIdentity"
 ]);
-const WORKER_OWNER_CONTROLLER_SPEC_KEYS = WORKTREE_PROVISIONING_SPEC_KEYS;
+const PINNED_PROVIDER_SPEC_KEYS = new Set([
+  ...WORKTREE_PROVISIONING_SPEC_KEYS,
+  "providerLaunchBinding",
+  "providerLaunchBindingDigest"
+]);
+const WORKER_OWNER_CONTROLLER_SPEC_KEYS = new Set([
+  ...SPEC_KEYS,
+  "executableIdentity"
+]);
 const BINDING_KEYS = new Set([
   "controlWorkspaceId",
   "executionRoot",
@@ -53,6 +65,15 @@ const BINDING_KEYS = new Set([
 ]);
 const WRITE_BINDING_KEYS = new Set([
   ...BINDING_KEYS,
+  "executionBindingDigest"
+]);
+const PINNED_BINDING_KEYS = new Set([
+  ...BINDING_KEYS,
+  "providerLaunchBindingDigest",
+  "providerExecutableIdentityDigest"
+]);
+const PINNED_WRITE_BINDING_KEYS = new Set([
+  ...PINNED_BINDING_KEYS,
   "executionBindingDigest"
 ]);
 const WORKTREE_PROVISIONING_BINDING_KEYS = new Set([
@@ -210,6 +231,11 @@ function validateSpecification(spec, expected) {
   const readBinding = exactRecord(spec?.binding, BINDING_KEYS);
   const writeBinding = exactRecord(spec?.binding, WRITE_BINDING_KEYS)
     && SHA256_HEX.test(spec.binding.executionBindingDigest || "");
+  const pinnedReadBinding = exactRecord(spec?.binding, PINNED_BINDING_KEYS);
+  const pinnedWriteBinding = exactRecord(
+    spec?.binding,
+    PINNED_WRITE_BINDING_KEYS
+  ) && SHA256_HEX.test(spec.binding.executionBindingDigest || "");
   const provisioningBinding = exactRecord(spec?.binding, WORKTREE_PROVISIONING_BINDING_KEYS)
     && spec.binding.purpose === WORKTREE_PROVISIONING_PURPOSE
     && typeof spec.binding.controlRoot === "string"
@@ -239,20 +265,35 @@ function validateSpecification(spec, expected) {
     }
   })();
   const isolatedController = expectedProvisioning || expectedOwnerController;
+  const pinnedProvider = !expectedOwnerController
+    && exactRecord(spec, PINNED_PROVIDER_SPEC_KEYS);
+  let launchBinding = null;
+  if (pinnedProvider) {
+    try {
+      launchBinding = assertProviderLaunchBinding(spec?.providerLaunchBinding);
+    } catch {
+      launchBinding = null;
+    }
+  }
   if (!exactRecord(
     spec,
-    isolatedController
-      ? (expectedOwnerController
-          ? WORKER_OWNER_CONTROLLER_SPEC_KEYS
-          : WORKTREE_PROVISIONING_SPEC_KEYS)
-      : SPEC_KEYS
+    expectedOwnerController
+      ? WORKER_OWNER_CONTROLLER_SPEC_KEYS
+      : pinnedProvider
+        ? PINNED_PROVIDER_SPEC_KEYS
+        : expectedProvisioning
+          ? WORKTREE_PROVISIONING_SPEC_KEYS
+          : SPEC_KEYS
   )
     || spec.schemaVersion !== 1
     || (expectedProvisioning
       ? !provisioningBinding
       : expectedOwnerController
         ? !ownerControllerBinding
-        : (!readBinding && !writeBinding))
+        : (!readBinding
+          && !writeBinding
+          && !pinnedReadBinding
+          && !pinnedWriteBinding))
     || spec.marker !== expected.marker
     || (expectedProvisioning
       ? (
@@ -285,7 +326,7 @@ function validateSpecification(spec, expected) {
     || !path.isAbsolute(spec.binary)
     || path.normalize(spec.binary) !== spec.binary
     || spec.binary.length > 4_096
-    || (isolatedController && (() => {
+    || ((isolatedController || pinnedProvider) && (() => {
       try {
         assertExecutableAttestation(spec.executableIdentity);
         return false;
@@ -293,6 +334,19 @@ function validateSpecification(spec, expected) {
         return true;
       }
     })())
+    || (pinnedProvider && (
+      !launchBinding
+      || spec.providerLaunchBindingDigest
+        !== providerLaunchBindingDigest(launchBinding)
+      || launchBinding.executableIdentityDigest
+        !== spec.executableIdentity.identityDigest
+      || (!expectedProvisioning && (
+        spec.binding.providerLaunchBindingDigest
+          !== spec.providerLaunchBindingDigest
+        || spec.binding.providerExecutableIdentityDigest
+          !== launchBinding.executableIdentityDigest
+      ))
+    ))
     || !Array.isArray(spec.args)
     || spec.args.length > MAX_PROVIDER_ARGUMENTS
     || spec.args.some((arg) => (
@@ -377,6 +431,7 @@ export function providerChildEnvironment(env) {
   delete child.GROK_COMPANION_PLUGIN_DATA;
   delete child.NODE_CHANNEL_FD;
   delete child.NODE_CHANNEL_SERIALIZATION_MODE;
+  child.GROK_DISABLE_AUTOUPDATER = "1";
   return child;
 }
 
@@ -514,6 +569,8 @@ export async function runProviderBootstrap({
     spec.binding.purpose
   );
   const isolatedController = worktreeProvisioning || workerOwnerController;
+  const pinnedProvider = Object.hasOwn(spec, "providerLaunchBinding");
+  const executableAttestedLaunch = Object.hasOwn(spec, "executableIdentity");
   const controllerAcknowledgement = isolatedController
     ? {
         purpose: spec.binding.purpose,
@@ -616,6 +673,14 @@ export async function runProviderBootstrap({
               providerSpawnIntentId: spec.binding.providerSpawnIntentId,
               ...(executionBindingDigest
                 ? { executionBindingDigest }
+                : {}),
+              ...(pinnedProvider
+                ? {
+                    providerLaunchBindingDigest:
+                      spec.providerLaunchBindingDigest,
+                    providerExecutableIdentityDigest:
+                      spec.executableIdentity.identityDigest
+                  }
                 : {})
             })
       });
@@ -671,7 +736,7 @@ export async function runProviderBootstrap({
     const grokEnvironment = providerChildEnvironment(env);
     let capturedExecutableIdentity = null;
     let version;
-    if (isolatedController) {
+    if (executableAttestedLaunch) {
       await testHooks?.beforeExecutableRecapture?.({ spec, providerProcess });
       capturedExecutableIdentity = captureExecutableIdentity(spec.binary, {
         env: grokEnvironment
@@ -707,7 +772,7 @@ export async function runProviderBootstrap({
     );
     await waitForSpawn(child);
     let spawnedExecutableIdentity = null;
-    if (isolatedController) {
+    if (executableAttestedLaunch) {
       spawnedExecutableIdentity = attestExecutable(
         child.pid,
         capturedExecutableIdentity,
@@ -740,11 +805,29 @@ export async function runProviderBootstrap({
       ...(isolatedController
         ? {
             ...controllerAcknowledgement,
-            executableIdentity: spawnedExecutableIdentity
+            executableIdentity: spawnedExecutableIdentity,
+            ...(pinnedProvider
+              ? {
+                  providerLaunchBindingDigest:
+                    spec.providerLaunchBindingDigest,
+                  providerExecutableIdentityDigest:
+                    spawnedExecutableIdentity.identityDigest
+                }
+              : {})
           }
-        : (executionBindingDigest
-            ? { executionBindingDigest }
-            : {}))
+        : {
+            ...(executionBindingDigest
+              ? { executionBindingDigest }
+              : {}),
+            ...(pinnedProvider
+              ? {
+                  providerLaunchBindingDigest:
+                    spec.providerLaunchBindingDigest,
+                  providerExecutableIdentityDigest:
+                    spawnedExecutableIdentity.identityDigest
+                }
+              : {})
+          })
     });
     readyPublished = true;
 

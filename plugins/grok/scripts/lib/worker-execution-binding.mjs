@@ -39,6 +39,7 @@ const BINDING_INPUT_KEYS = new Set([
   "admissionContextManifestId",
   "admissionContextManifestDigest",
   "providerCapabilityDigest",
+  "providerLaunchBindingDigest",
   "ownerDigest",
   "cancellationNonce",
   "createdAt"
@@ -67,6 +68,7 @@ const BINDING_KEYS = new Set([
   "admissionContextManifestId",
   "admissionContextManifestDigest",
   "providerCapabilityDigest",
+  "providerLaunchBindingDigest",
   "ownerDigest",
   "cancellationNonceDigest",
   "createdAt",
@@ -507,6 +509,7 @@ export function assertExecutionBinding(binding, expected = undefined) {
   assertDigest(binding.runtimeRolePolicyDigest, "runtimeRolePolicyDigest");
   assertDigest(binding.admissionContextManifestDigest, "admissionContextManifestDigest");
   assertDigest(binding.providerCapabilityDigest, "providerCapabilityDigest", { nullable: true });
+  assertDigest(binding.providerLaunchBindingDigest, "providerLaunchBindingDigest", { nullable: true });
   assertDigest(binding.ownerDigest, "ownerDigest");
   assertDigest(binding.cancellationNonceDigest, "cancellationNonceDigest");
   assertDigest(binding.bindingDigest, "bindingDigest");
@@ -574,6 +577,7 @@ export function createExecutionBinding(input = {}) {
     admissionContextManifestId: input.admissionContextManifestId,
     admissionContextManifestDigest: input.admissionContextManifestDigest,
     providerCapabilityDigest: input.providerCapabilityDigest,
+    providerLaunchBindingDigest: input.providerLaunchBindingDigest,
     ownerDigest: input.ownerDigest,
     cancellationNonceDigest: sha256(input.cancellationNonce),
     createdAt: input.createdAt,

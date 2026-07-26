@@ -35,6 +35,11 @@ import {
   clearProviderCapabilityReceipt,
   writeProviderCapabilityReceipt
 } from "./lib/provider-capability.mjs";
+import {
+  assertProviderLaunchBinding as assertExecutableProviderLaunchBinding,
+  providerLaunchBindingDigest as digestProviderLaunchBinding,
+  publishProviderExecutablePin
+} from "./lib/provider-executable-pin.mjs";
 import { admitJob, appendJobLog, config, setConfig, generateId, writeJob, updateJob, listJobs, readJob, selectJob, requestCancel, isCancelRequested, terminal, now, retain, logFile, withWorkspaceAdmission, withWorkspaceStateTransaction } from "./lib/state.mjs";
 import { resolveControlWorkspace, workspaceRoot, workspaceState } from "./lib/workspace.mjs";
 import { redact, redactText, sanitizeDisplayText } from "./lib/redact.mjs";
@@ -400,7 +405,6 @@ function workerEnvironment(nonce, dispatchAttemptId = null, dispatchFence = null
   if (host.sessionId) env.GROK_COMPANION_HOST_SESSION_ID = host.sessionId;
   else if (process.env.GROK_COMPANION_HOST_SESSION_ID) env.GROK_COMPANION_HOST_SESSION_ID = process.env.GROK_COMPANION_HOST_SESSION_ID;
   env.GROK_COMPANION_PLUGIN_DATA = pluginDataRoot();
-  if (process.env.GROK_BIN) env.GROK_BIN = process.env.GROK_BIN;
   // The trusted detached worker must be able to locate a configured credential so it can
   // sanitize/copy it into the isolated task home. Provider children still receive only GROK_HOME.
   if (process.env.GROK_AUTH_PATH) env.GROK_AUTH_PATH = process.env.GROK_AUTH_PATH;
@@ -420,6 +424,7 @@ function workerEnvironment(nonce, dispatchAttemptId = null, dispatchFence = null
   if (Number.isSafeInteger(dispatchFence) && dispatchFence > 0) {
     env.GROK_COMPANION_DISPATCH_FENCE = String(dispatchFence);
   }
+  env.GROK_DISABLE_AUTOUPDATER = "1";
   return env;
 }
 
@@ -997,20 +1002,40 @@ function providerLaunchBinding(profile, prompt, outputSchema = null) {
   });
 }
 
-function assertProviderLaunchBinding(observed, expected) {
-  const keys = [
+function assertPromptProviderLaunchBinding(
+  observed,
+  expected,
+  expectedExecutableBinding = null
+) {
+  const promptKeys = [
     "promptDigest",
     "profileId",
     "profileContractVersion",
     "agentProfileDigest",
     "outputSchemaDigest"
   ];
+  const executableKeys = expectedExecutableBinding
+    ? [
+        "executableIdentity",
+        "providerLaunchBinding",
+        "providerLaunchBindingDigest"
+      ]
+    : [];
+  const keys = [...promptKeys, ...executableKeys];
   if (!observed
     || typeof observed !== "object"
     || Array.isArray(observed)
     || Object.keys(observed).length !== keys.length
     || Object.keys(observed).some((key) => !keys.includes(key))
-    || keys.some((key) => observed[key] !== expected?.[key])) {
+    || promptKeys.some((key) => observed[key] !== expected?.[key])
+    || (expectedExecutableBinding && (
+      digestProviderLaunchBinding(observed.providerLaunchBinding)
+        !== digestProviderLaunchBinding(expectedExecutableBinding)
+      || observed.providerLaunchBindingDigest
+        !== digestProviderLaunchBinding(expectedExecutableBinding)
+      || observed.executableIdentity?.identityDigest
+        !== expectedExecutableBinding.executableIdentityDigest
+    ))) {
     throw new CompanionError(
       "E_AUTH_REQUIRED",
       "Provider launch prompt or security profile changed before process preparation."
@@ -1074,6 +1099,23 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
     }
   }
   const receiptBacked = job.request?.contextBindingMode === CONTEXT_BINDING_MODE;
+  let providerExecutableBinding = null;
+  if (Object.hasOwn(job.request?.spawn || {}, "providerLaunchBinding")
+    || Object.hasOwn(
+      job.request?.spawn || {},
+      "providerLaunchBindingDigest"
+    )) {
+    providerExecutableBinding = assertExecutableProviderLaunchBinding(
+      job.request.spawn.providerLaunchBinding
+    );
+    if (job.request.spawn.providerLaunchBindingDigest
+      !== digestProviderLaunchBinding(providerExecutableBinding)) {
+      throw new CompanionError(
+        "E_AUTH_REQUIRED",
+        "Worker provider executable binding changed after admission."
+      );
+    }
+  }
   // Broker jobs carry a durable admission witness. Exact legacy CLI dispatches
   // do not; keep their existing dispatch contract while refusing any partial
   // or deleted broker context binding as a legacy downgrade.
@@ -1295,6 +1337,17 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
           "Primary turn authority changed before provider dispatch."
         );
       }
+      if (providerExecutableBinding
+        && (current.request?.spawn?.providerLaunchBindingDigest
+            !== job.request?.spawn?.providerLaunchBindingDigest
+          || current.request?.spawn?.providerLaunchBinding
+            ?.executableIdentityDigest
+            !== providerExecutableBinding.executableIdentityDigest)) {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "Primary turn provider executable binding changed before dispatch."
+        );
+      }
       const durableProvider = current.providerProcess;
       if (!durableProvider
         || durableProvider.commandMarker !== id
@@ -1368,6 +1421,14 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
                 providerProcess: authority.providerProcess,
                 providerSessionId,
                 promptDigest: authority.effectivePromptDigest,
+                ...(providerExecutableBinding
+                  ? {
+                      providerLaunchBindingDigest:
+                        job.request.spawn.providerLaunchBindingDigest,
+                      providerExecutableIdentityDigest:
+                        providerExecutableBinding.executableIdentityDigest
+                    }
+                  : {}),
                 admittedAt,
                 consumedAt: null
               };
@@ -1751,9 +1812,10 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
               dispatchFence,
               providerGeneration
             });
-            assertProviderLaunchBinding(
+            assertPromptProviderLaunchBinding(
               observedLaunchBinding,
-              expectedProviderLaunchBinding
+              expectedProviderLaunchBinding,
+              providerExecutableBinding
             );
             if (providerGeneration === 1
               && latest.request?.contextBindingMode === CONTEXT_BINDING_MODE) {
@@ -1804,6 +1866,12 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
           })
         }
       } : {}),
+      ...(providerExecutableBinding
+        ? {
+            providerExecutableBinding,
+            providerExecutableEnv: process.env
+          }
+        : {}),
       ...(primaryTurnController ? { primaryTurnController } : {}),
       ...(mailboxController ? { mailboxController } : {}),
       ...(workerReportOutputSchema
@@ -2491,9 +2559,19 @@ async function handleSetup(raw) {
     // A setup attempt revokes any older readiness assertion before probing.
     // A crash or failed probe therefore cannot leave stale spawn capability.
     clearProviderCapabilityReceipt();
-    runtime = await probe(root, stateDir(root));
-    writeProviderCapabilityReceipt({ runtime });
+    const pinned = publishProviderExecutablePin();
+    const probed = await probe(root, stateDir(root), {
+      providerExecutableBinding: pinned.binding
+    });
+    writeProviderCapabilityReceipt({
+      runtime: probed,
+      providerLaunchBinding: pinned.binding
+    });
+    // The setup response is public; the private pin path stays internal.
+    const { binary: _privatePinnedBinary, ...publicRuntime } = probed;
+    runtime = publicRuntime;
   } catch (error) {
+    try { clearProviderCapabilityReceipt(); } catch {}
     runtime = { ready: false, error: asErrorPayload(error) };
   }
   if (options["enable-review-gate"] && !runtime.error) setConfig(root, { stopReviewGate: true });

@@ -69,6 +69,9 @@ import {
 import { processGroupGone, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
 import { createExecutableAttestation } from "../plugins/grok/scripts/lib/executable-identity.mjs";
 import {
+  providerLaunchBindingDigest
+} from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
+import {
   assertWorktreeProvisioningGuardForJob,
   loadProviderGuard,
   registerProviderGuard,
@@ -5376,8 +5379,18 @@ test("MCP worker_spawn and worker_cancel drive real service functions", async ()
   const root = initRepo();
   const { env } = envFor(root);
   const auth = principal(root);
+  const providerLaunchBinding = {
+    schemaVersion: 1,
+    pinRef: `gpin-${"1".repeat(32)}`,
+    pinRecordDigest: "2".repeat(64),
+    executableIdentityDigest: "3".repeat(64),
+    releaseIdentityDigest: "4".repeat(64)
+  };
   const providerCapabilityReceipt = {
     capabilityDigest: "d".repeat(64),
+    providerLaunchBinding,
+    providerLaunchBindingDigest:
+      providerLaunchBindingDigest(providerLaunchBinding),
     capabilities: [
       ROOT_READ_PROVIDER_CAPABILITY,
       SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
@@ -5392,11 +5405,15 @@ test("MCP worker_spawn and worker_cancel drive real service functions", async ()
     readProviderCapabilityReceipt: () => providerCapabilityReceipt,
     resolveAuthority: () => auth,
     env,
-    createService: () => createWorkerService({
+    createService: (serviceOptions) => createWorkerService({
       root,
       principal: auth,
       env,
-      launchWorker: () => ({ providerLaunchState: "pending", providerLaunched: false })
+      launchWorker: () => ({ providerLaunchState: "pending", providerLaunched: false }),
+      providerCapabilityDigest: serviceOptions.providerCapabilityDigest,
+      providerLaunchBinding: serviceOptions.providerLaunchBinding,
+      providerLaunchBindingDigest:
+        serviceOptions.providerLaunchBindingDigest
     })
   };
   const spawned = await callWorkerTool({

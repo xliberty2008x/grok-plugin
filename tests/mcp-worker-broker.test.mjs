@@ -18,6 +18,9 @@ import {
   ROOT_READ_PROVIDER_CAPABILITY,
   SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
 } from "../plugins/grok/scripts/lib/provider-capability.mjs";
+import {
+  providerLaunchBindingDigest
+} from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
 import { MCP_SANDBOX_STATE_META_CAPABILITY } from "../plugins/grok/scripts/lib/worker-authority.mjs";
 import { ROOT, run, tempDir } from "./helpers.mjs";
 
@@ -29,8 +32,17 @@ const PRINCIPAL = Object.freeze({
   root: ROOT
 });
 const BASE_RUNTIME = createMcpBrokerRuntime({ providerCapabilityReceipt: null });
+const SPAWN_BINDING = Object.freeze({
+  schemaVersion: 1,
+  pinRef: `gpin-${"1".repeat(32)}`,
+  pinRecordDigest: "2".repeat(64),
+  executableIdentityDigest: "3".repeat(64),
+  releaseIdentityDigest: "4".repeat(64)
+});
 const SPAWN_RECEIPT = Object.freeze({
   capabilityDigest: "a".repeat(64),
+  providerLaunchBinding: SPAWN_BINDING,
+  providerLaunchBindingDigest: providerLaunchBindingDigest(SPAWN_BINDING),
   capabilities: [
     ROOT_READ_PROVIDER_CAPABILITY,
     SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
@@ -114,6 +126,9 @@ test("decision, follow-up, and send tools are advertised only by the exact combi
     const runtime = createMcpBrokerRuntime({
       providerCapabilityReceipt: {
         capabilityDigest: "f".repeat(64),
+        providerLaunchBinding: SPAWN_BINDING,
+        providerLaunchBindingDigest:
+          providerLaunchBindingDigest(SPAWN_BINDING),
         capabilities: fixture.capabilities
       }
     });

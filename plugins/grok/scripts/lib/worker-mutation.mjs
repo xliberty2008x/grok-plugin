@@ -18,6 +18,10 @@ import {
   assertExecutableAttestation,
   sameExecutableAttestation
 } from "./executable-identity.mjs";
+import {
+  assertProviderLaunchBinding,
+  providerLaunchBindingDigest as digestProviderLaunchBinding
+} from "./provider-executable-pin.mjs";
 import { cleanupTaskRuntimeArtifacts } from "./grok-provider.mjs";
 import { sameHostSession } from "./host.mjs";
 import {
@@ -100,7 +104,8 @@ import {
   dispatchLeaseExpired,
   isDispatchV2,
   isSupportedWorkerDispatch,
-  launchContractDigest
+  launchContractDigest,
+  providerLaunchBindingForJob
 } from "./worker-launch-contract.mjs";
 
 export const SPAWN_OWNERSHIP_MODE = "exact-thread-or-host-attested-parent";
@@ -111,6 +116,7 @@ export const WORKER_SPAWN_INTENT_SCHEMA_VERSION = 1;
 export const RECOVERY_CLEANUP_FENCE_SCHEMA_VERSION = 1;
 export const PROVIDER_ROTATION_INTENT_SCHEMA_VERSION = 1;
 export const PROVIDER_SPAWN_INTENT_SCHEMA_VERSION = 1;
+const BOUND_PROVIDER_SPAWN_INTENT_SCHEMA_VERSION = 2;
 export const CANCEL_METRIC_TIMESTAMPS = Object.freeze([
   "requestAcceptedAt",
   "processGroupGoneAt",
@@ -270,6 +276,49 @@ const PROVIDER_SPAWN_INTENT_KEYS = new Set([
   "noChildAt",
   "resolution"
 ]);
+const BOUND_PROVIDER_SPAWN_INTENT_KEYS = new Set([
+  ...PROVIDER_SPAWN_INTENT_KEYS,
+  "providerLaunchBinding",
+  "providerLaunchBindingDigest"
+]);
+
+function normalizeProviderLaunchBindingInput(
+  providerLaunchBinding,
+  providerLaunchBindingDigest,
+  { required = false } = {}
+) {
+  if (providerLaunchBinding == null && providerLaunchBindingDigest == null && !required) {
+    return null;
+  }
+  let binding;
+  try {
+    binding = assertProviderLaunchBinding(providerLaunchBinding);
+  } catch {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Provider executable launch binding is missing or malformed."
+    );
+  }
+  if (providerLaunchBindingDigest !== digestProviderLaunchBinding(binding)) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Provider executable launch binding digest is inconsistent."
+    );
+  }
+  return binding;
+}
+
+function providerSpawnIntentBindingFields(job) {
+  const binding = providerLaunchBindingForJob(job, { required: false });
+  return binding
+    ? {
+        schemaVersion: BOUND_PROVIDER_SPAWN_INTENT_SCHEMA_VERSION,
+        providerLaunchBinding: binding,
+        providerLaunchBindingDigest:
+          job.request.spawn.providerLaunchBindingDigest
+      }
+    : { schemaVersion: PROVIDER_SPAWN_INTENT_SCHEMA_VERSION };
+}
 
 function assertProviderSpawnIntentContract(job, dispatch, { allowMissing = true } = {}) {
   const intent = job?.request?.spawn?.providerSpawnIntent;
@@ -277,10 +326,21 @@ function assertProviderSpawnIntentContract(job, dispatch, { allowMissing = true 
     if (allowMissing) return null;
     throw new CompanionError("E_PROCESS_IDENTITY", "Provider spawn intent is missing.");
   }
+  const durableBinding = providerLaunchBindingForJob(job, { required: false });
+  const intentKeys = durableBinding
+    ? BOUND_PROVIDER_SPAWN_INTENT_KEYS
+    : PROVIDER_SPAWN_INTENT_KEYS;
   const exact = isPlainRecord(intent)
-    && Object.keys(intent).length === PROVIDER_SPAWN_INTENT_KEYS.size
-    && Object.keys(intent).every((key) => PROVIDER_SPAWN_INTENT_KEYS.has(key))
-    && intent.schemaVersion === PROVIDER_SPAWN_INTENT_SCHEMA_VERSION
+    && Object.keys(intent).length === intentKeys.size
+    && Object.keys(intent).every((key) => intentKeys.has(key))
+    && intent.schemaVersion === (durableBinding
+      ? BOUND_PROVIDER_SPAWN_INTENT_SCHEMA_VERSION
+      : PROVIDER_SPAWN_INTENT_SCHEMA_VERSION)
+    && (!durableBinding
+      || (intent.providerLaunchBindingDigest
+          === job.request.spawn.providerLaunchBindingDigest
+        && stableDigest(intent.providerLaunchBinding)
+          === stableDigest(durableBinding)))
     && /^[0-9a-f]{32}$/.test(intent.intentId || "")
     && intent.attemptId === dispatch.attemptId
     && intent.dispatchFence === dispatch.fence
@@ -679,6 +739,11 @@ const PRE_READY_WRITE_SPAWN_KEYS = new Set([
   "providerLaunchInFlight",
   "providerLaunchOutcome"
 ]);
+const BOUND_PRE_READY_WRITE_SPAWN_KEYS = new Set([
+  ...PRE_READY_WRITE_SPAWN_KEYS,
+  "providerLaunchBinding",
+  "providerLaunchBindingDigest"
+]);
 const WRITE_EXECUTION_JOB_KEYS = new Set([
   "schemaVersion",
   "id",
@@ -749,6 +814,11 @@ const WRITE_PROVISIONING_INTENT_KEYS = new Set([
   "resolution",
   "updatedAt",
   "intentDigest"
+]);
+const BOUND_WRITE_PROVISIONING_INTENT_KEYS = new Set([
+  ...WRITE_PROVISIONING_INTENT_KEYS,
+  "providerLaunchBinding",
+  "providerLaunchBindingDigest"
 ]);
 const WRITE_PROVISIONING_PROCESS_KEYS = new Set([
   "pid",
@@ -2334,7 +2404,7 @@ export function prepareWorkerProviderSpawn({
     }
     const preparedAt = now();
     const intent = Object.freeze({
-      schemaVersion: PROVIDER_SPAWN_INTENT_SCHEMA_VERSION,
+      ...providerSpawnIntentBindingFields(current),
       intentId: crypto.randomBytes(16).toString("hex"),
       attemptId,
       dispatchFence: fence,
@@ -3452,7 +3522,7 @@ export function authorizeWorkerProviderRotation({
       resolution: null
     });
     const providerSpawnIntent = Object.freeze({
-      schemaVersion: PROVIDER_SPAWN_INTENT_SCHEMA_VERSION,
+      ...providerSpawnIntentBindingFields(current),
       intentId: rotationIntent.intentId,
       attemptId,
       dispatchFence: dispatch.fence,
@@ -4689,7 +4759,9 @@ export function spawnGrantedFollowupWorker({
   message,
   idempotencyKey,
   env = process.env,
-  providerCapabilityDigest = null
+  providerCapabilityDigest = null,
+  providerLaunchBinding = null,
+  providerLaunchBindingDigest = null
 } = {}) {
   assertIdempotencyKey(idempotencyKey);
   if (typeof workerId !== "string" || !workerId) {
@@ -4704,6 +4776,10 @@ export function spawnGrantedFollowupWorker({
   if (providerCapabilityDigest !== null && !SHA256_HEX.test(providerCapabilityDigest)) {
     throw new CompanionError("E_CAPABILITY", "Provider capability binding is missing or malformed.");
   }
+  const requestedProviderBinding = normalizeProviderLaunchBindingInput(
+    providerLaunchBinding,
+    providerLaunchBindingDigest
+  );
   const keyDigest = digestKey(idempotencyKey);
   const messageDigest = digestKey(message);
   const ownerThreadDigest = digestKey(principal?.threadId || "");
@@ -4714,6 +4790,21 @@ export function spawnGrantedFollowupWorker({
   const admitted = withWorkspaceStateTransaction(root, (transaction) => {
     const parent = transaction.tryReadJob(workerId);
     if (!parent) throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+    const parentProviderBinding = providerLaunchBindingForJob(parent, {
+      required: false
+    });
+    const effectiveProviderBinding = parentProviderBinding || requestedProviderBinding;
+    const effectiveProviderBindingDigest = effectiveProviderBinding
+      ? digestProviderLaunchBinding(effectiveProviderBinding)
+      : null;
+    if (requestedProviderBinding
+      && parentProviderBinding
+      && effectiveProviderBindingDigest !== providerLaunchBindingDigest) {
+      throw new CompanionError(
+        "E_CONTEXT_DRIFT",
+        "Provider executable pin changed since the parent worker admission."
+      );
+    }
     const jobs = transaction.listJobs();
     const grantOwners = jobs.filter((candidate) => candidate.request?.followup?.grantId === grantId);
     const keyOwners = jobs.filter((candidate) => (
@@ -4766,6 +4857,14 @@ export function spawnGrantedFollowupWorker({
         throw new CompanionError(
           "E_CONTEXT_DRIFT",
           "Provider capability changed since durable follow-up admission."
+        );
+      }
+      if (effectiveProviderBinding
+        && existingChild.request?.spawn?.providerLaunchBindingDigest
+          !== effectiveProviderBindingDigest) {
+        throw new CompanionError(
+          "E_CONTEXT_DRIFT",
+          "Provider executable pin changed since durable follow-up admission."
         );
       }
       return { committed: existingChild, replayed: true };
@@ -4829,7 +4928,10 @@ export function spawnGrantedFollowupWorker({
       contextBinding: {
         mode: CONTEXT_BINDING_MODE,
         digest: contextBindingDigest
-      }
+      },
+      ...(effectiveProviderBindingDigest
+        ? { providerLaunchBindingDigest: effectiveProviderBindingDigest }
+        : {})
     });
     const id = generateId("task");
     const createdAt = now();
@@ -4896,6 +4998,12 @@ export function spawnGrantedFollowupWorker({
           successDefinition: SPAWN_SUCCESS_DEFINITION,
           ownershipMode: FOLLOWUP_SPAWN_OWNERSHIP_MODE,
           ...(providerCapabilityDigest !== null ? { providerCapabilityDigest } : {}),
+          ...(effectiveProviderBinding
+            ? {
+                providerLaunchBinding: effectiveProviderBinding,
+                providerLaunchBindingDigest: effectiveProviderBindingDigest
+              }
+            : {}),
           providerLaunchPending: true,
           providerLaunchInFlight: false,
           providerLaunchOutcome: "pending",
@@ -5042,12 +5150,22 @@ function writeProvisioningIntentDigestBody(intent) {
     provisioningFence: intent.provisioningFence,
     holderId: intent.holderId,
     executableIdentity: intent.executableIdentity,
+    ...(Object.hasOwn(intent, "providerLaunchBinding")
+      ? {
+          providerLaunchBinding: intent.providerLaunchBinding,
+          providerLaunchBindingDigest: intent.providerLaunchBindingDigest
+        }
+      : {}),
     preparedAt: intent.preparedAt
   };
 }
 
 function assertWriteProvisioningIntent(intent, binding) {
-  if (!hasExactKeys(intent, WRITE_PROVISIONING_INTENT_KEYS)
+  const boundProvider = binding.providerLaunchBindingDigest !== null;
+  const expectedKeys = boundProvider
+    ? BOUND_WRITE_PROVISIONING_INTENT_KEYS
+    : WRITE_PROVISIONING_INTENT_KEYS;
+  if (!hasExactKeys(intent, expectedKeys)
     || intent.schemaVersion !== WRITE_PROVISIONING_SCHEMA_VERSION
     || intent.purpose !== WRITE_PROVISIONING_PURPOSE
     || intent.workerId !== binding.workerId
@@ -5060,6 +5178,14 @@ function assertWriteProvisioningIntent(intent, binding) {
     || !Number.isSafeInteger(intent.provisioningFence)
     || intent.provisioningFence < 1
     || !OPAQUE_HEX.test(intent.holderId || "")
+    || (boundProvider && (
+      intent.providerLaunchBindingDigest
+        !== binding.providerLaunchBindingDigest
+      || digestProviderLaunchBinding(intent.providerLaunchBinding)
+        !== binding.providerLaunchBindingDigest
+      || intent.providerLaunchBinding.executableIdentityDigest
+        !== intent.executableIdentity?.identityDigest
+    ))
     || !WRITE_PROVISIONING_INTENT_STATUSES.has(intent.status)
     || intent.intentDigest !== stableDigest(writeProvisioningIntentDigestBody(intent))) {
     writeProvisioningStateError("Write provisioning intent is malformed or not binding-bound.");
@@ -5133,6 +5259,32 @@ function assertWriteProvisioningIntent(intent, binding) {
     writeProvisioningStateError("No-child write provisioning intent is incomplete.");
   }
   return intent;
+}
+
+function writeProvisioningProviderBindingFields(job, binding, executableIdentity) {
+  const providerBinding = providerLaunchBindingForJob(job, { required: false });
+  if (!providerBinding) {
+    if (binding.providerLaunchBindingDigest !== null) {
+      writeProvisioningStateError(
+        "Write execution binding lost its provider executable binding.",
+        "E_PROCESS_IDENTITY"
+      );
+    }
+    return {};
+  }
+  const digest = digestProviderLaunchBinding(providerBinding);
+  if (binding.providerLaunchBindingDigest !== digest
+    || providerBinding.executableIdentityDigest
+      !== executableIdentity?.identityDigest) {
+    writeProvisioningStateError(
+      "Write provisioner executable does not match the admitted provider pin.",
+      "E_PROCESS_IDENTITY"
+    );
+  }
+  return {
+    providerLaunchBinding: providerBinding,
+    providerLaunchBindingDigest: digest
+  };
 }
 
 function writeProvisioningActivationDigest(runtime) {
@@ -5805,6 +5957,9 @@ export function assertWriteExecutionJob(job, env = process.env) {
   const spawn = job.request.spawn;
   const requestKeys = Object.keys(job.request);
   const spawnKeys = Object.keys(spawn);
+  const expectedSpawnKeys = binding.providerLaunchBindingDigest === null
+    ? PRE_READY_WRITE_SPAWN_KEYS
+    : BOUND_PRE_READY_WRITE_SPAWN_KEYS;
   const hasRuntime = Object.hasOwn(job, "provisioningRuntime");
   const expectedJobKeys = hasRuntime
     ? new Set([...WRITE_EXECUTION_JOB_KEYS, "provisioningRuntime"])
@@ -5822,8 +5977,8 @@ export function assertWriteExecutionJob(job, env = process.env) {
   if (!hasExactKeys(job, expectedJobKeys)
     || requestKeys.length !== PRE_READY_WRITE_REQUEST_KEYS.size
     || requestKeys.some((field) => !PRE_READY_WRITE_REQUEST_KEYS.has(field))
-    || spawnKeys.length !== PRE_READY_WRITE_SPAWN_KEYS.size
-    || spawnKeys.some((field) => !PRE_READY_WRITE_SPAWN_KEYS.has(field))
+    || spawnKeys.length !== expectedSpawnKeys.size
+    || spawnKeys.some((field) => !expectedSpawnKeys.has(field))
     || job.request.providerHomeId !== job.id
     || job.request.publicObjective !== expectedPublicObjective
     || spawn.successDefinition !== SPAWN_SUCCESS_DEFINITION
@@ -5834,6 +5989,15 @@ export function assertWriteExecutionJob(job, env = process.env) {
     throw new CompanionError(
       "E_STATE",
       "Write worker contains launch or provider authority or an unsupported top-level field."
+    );
+  }
+  if (binding.providerLaunchBindingDigest !== null
+    && (spawn.providerLaunchBindingDigest !== binding.providerLaunchBindingDigest
+      || digestProviderLaunchBinding(spawn.providerLaunchBinding)
+        !== binding.providerLaunchBindingDigest)) {
+    throw new CompanionError(
+      "E_STATE",
+      "Write worker provider executable binding disagrees with its execution binding."
     );
   }
 
@@ -6120,7 +6284,13 @@ export function authorizeReadyWriteWorkerDispatch({
       contextBinding: {
         mode: CONTEXT_BINDING_MODE,
         digest: contextBindingDigest
-      }
+      },
+      ...(verified.binding.providerLaunchBindingDigest
+        ? {
+            providerLaunchBindingDigest:
+              verified.binding.providerLaunchBindingDigest
+          }
+        : {})
     });
     const authorizedAt = now();
     const contextReceipt = buildContextReceipt({
@@ -6537,6 +6707,11 @@ export function prepareWriteProvisionerIntent({
     if (!current) throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
     assertMutationOwnership(current, principal);
     const verified = assertWriteExecutionJob(current, env);
+    const providerBindingFields = writeProvisioningProviderBindingFields(
+      current,
+      verified.binding,
+      executableIdentity
+    );
     assertWriteProvisioningMutationBoundary(verified, {
       executionBindingDigest,
       attemptId,
@@ -6585,6 +6760,7 @@ export function prepareWriteProvisionerIntent({
       provisioningFence: fence,
       holderId,
       executableIdentity,
+      ...providerBindingFields,
       status: "pending",
       processIdentity: null,
       preparedAt,
@@ -6683,6 +6859,11 @@ export function prepareWriteProvisioningReissue({
     if (!current) throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
     assertMutationOwnership(current, principal);
     const verified = assertWriteExecutionJob(current, env);
+    const providerBindingFields = writeProvisioningProviderBindingFields(
+      current,
+      verified.binding,
+      executableIdentity
+    );
     if (verified.binding.bindingDigest !== executionBindingDigest) {
       writeProvisioningStateError(
         "Provisioning reissue execution binding changed before planning."
@@ -6760,6 +6941,7 @@ export function prepareWriteProvisioningReissue({
         provisioningFence: fence,
         holderId,
         executableIdentity,
+        ...providerBindingFields,
         status: "pending",
         processIdentity: null,
         preparedAt: journal.reissuePlannedAt,
@@ -6928,6 +7110,7 @@ export function prepareWriteProvisioningReissue({
       provisioningFence: fence,
       holderId,
       executableIdentity,
+      ...providerBindingFields,
       status: "pending",
       processIdentity: null,
       preparedAt: reissuePlannedAt,
@@ -8388,6 +8571,7 @@ function assertWriteAdmissionReplayCandidate(job, expected, env = process.env) {
     admissionContextManifestId: expected.admissionContextManifestId,
     admissionContextManifestDigest: expected.admissionContextManifestDigest,
     providerCapabilityDigest: expected.providerCapabilityDigest,
+    providerLaunchBindingDigest: expected.providerLaunchBindingDigest,
     ownerDigest: expected.ownerDigest
   };
 
@@ -8424,6 +8608,11 @@ function assertWriteAdmissionReplayCandidate(job, expected, env = process.env) {
       || spawn.executionRoot !== binding.expectedExecutionRoot
       || spawn.writeLifecycleCapabilityDigest !== binding.providerCapabilityDigest
       || spawn.providerCapabilityDigest !== binding.providerCapabilityDigest
+      || (binding.providerLaunchBindingDigest !== null
+        && (spawn.providerLaunchBindingDigest
+            !== binding.providerLaunchBindingDigest
+          || digestProviderLaunchBinding(spawn.providerLaunchBinding)
+            !== binding.providerLaunchBindingDigest))
       || binding.controlWorkspaceId !== job.controlWorkspaceId
       || binding.workerId !== job.id
       || provisioningRuntime.runtime.executionContextManifest?.manifestId
@@ -8473,7 +8662,9 @@ export function admitWriteWorkerPlan({
   roleId = "implementer",
   env = process.env,
   allowWriteSpawn = false,
-  writeLifecycleCapabilityDigest = null
+  writeLifecycleCapabilityDigest = null,
+  providerLaunchBinding = null,
+  providerLaunchBindingDigest = null
 } = {}) {
   assertIdempotencyKey(idempotencyKey);
   if (!allowWriteSpawn) {
@@ -8503,6 +8694,10 @@ export function admitWriteWorkerPlan({
       "A distinct composite write-lifecycle capability binding is required for admission."
     );
   }
+  const admittedProviderBinding = normalizeProviderLaunchBindingInput(
+    providerLaunchBinding,
+    providerLaunchBindingDigest
+  );
   const profile = profileFor("task", true);
   const runtimeRolePolicy = buildRuntimeRolePolicy({ role, profile });
   assertRuntimeRolePolicy(runtimeRolePolicy, { role, profile });
@@ -8545,6 +8740,9 @@ export function admitWriteWorkerPlan({
     admissionContextManifestId: admissionContextManifest.manifestId,
     admissionContextManifestDigest: admissionContextManifest.digest,
     providerCapabilityDigest: writeLifecycleCapabilityDigest,
+    providerLaunchBindingDigest: admittedProviderBinding
+      ? providerLaunchBindingDigest
+      : null,
     ownerDigest
   });
 
@@ -8668,6 +8866,9 @@ export function admitWriteWorkerPlan({
       admissionContextManifestId: admissionContextManifest.manifestId,
       admissionContextManifestDigest: admissionContextManifest.digest,
       providerCapabilityDigest: writeLifecycleCapabilityDigest,
+      providerLaunchBindingDigest: admittedProviderBinding
+        ? providerLaunchBindingDigest
+        : null,
       ownerDigest,
       cancellationNonce,
       createdAt
@@ -8723,6 +8924,12 @@ export function admitWriteWorkerPlan({
           successDefinition: SPAWN_SUCCESS_DEFINITION,
           ownershipMode: SPAWN_OWNERSHIP_MODE,
           writeLifecycleCapabilityDigest,
+          ...(admittedProviderBinding
+            ? {
+                providerLaunchBinding: admittedProviderBinding,
+                providerLaunchBindingDigest
+              }
+            : {}),
           providerLaunchPending: false,
           providerLaunchInFlight: false,
           providerLaunchOutcome: "not-ready"
@@ -8791,6 +8998,8 @@ export function spawnReadOnlyWorker({
   allowWriteSpawn = false,
   writeLifecycleCapabilityDigest = null,
   providerCapabilityDigest = null,
+  providerLaunchBinding = null,
+  providerLaunchBindingDigest = null,
   providerLaunch = undefined
 } = {}) {
   assertIdempotencyKey(idempotencyKey);
@@ -8815,6 +9024,10 @@ export function spawnReadOnlyWorker({
   if (providerCapabilityDigest !== null && !SHA256_HEX.test(providerCapabilityDigest)) {
     throw new CompanionError("E_CAPABILITY", "Provider capability binding is missing or malformed.");
   }
+  const admittedProviderBinding = normalizeProviderLaunchBindingInput(
+    providerLaunchBinding,
+    providerLaunchBindingDigest
+  );
   const validatedEnvelope = assertTaskEnvelope(envelope);
   if (validatedEnvelope.mode === "write" && !allowWriteSpawn) {
     throw new CompanionError(
@@ -8832,7 +9045,11 @@ export function spawnReadOnlyWorker({
       roleId,
       env,
       allowWriteSpawn,
-      writeLifecycleCapabilityDigest
+      writeLifecycleCapabilityDigest,
+      providerLaunchBinding: admittedProviderBinding,
+      providerLaunchBindingDigest: admittedProviderBinding
+        ? providerLaunchBindingDigest
+        : null
     });
   }
 
@@ -8911,7 +9128,10 @@ export function spawnReadOnlyWorker({
     contextBinding: {
       mode: CONTEXT_BINDING_MODE,
       digest: contextBindingDigest
-    }
+    },
+    ...(admittedProviderBinding
+      ? { providerLaunchBindingDigest }
+      : {})
   });
   const admitted = withWorkspaceStateTransaction(root, (transaction) => {
     const digestOwners = transaction.listJobs().filter((candidate) => (
@@ -8941,6 +9161,14 @@ export function spawnReadOnlyWorker({
       if (providerCapabilityDigest !== null
         && committed.request?.spawn?.providerCapabilityDigest !== providerCapabilityDigest) {
         throw new CompanionError("E_CONTEXT_DRIFT", "Provider capability changed since durable worker admission.");
+      }
+      if (admittedProviderBinding
+        && committed.request?.spawn?.providerLaunchBindingDigest
+          !== providerLaunchBindingDigest) {
+        throw new CompanionError(
+          "E_CONTEXT_DRIFT",
+          "Provider executable pin changed since durable worker admission."
+        );
       }
       if (record.schemaVersion === SPAWN_IDEMPOTENCY_SCHEMA_VERSION
         && record.responseWitness.responseSequence === Number.MAX_SAFE_INTEGER) {
@@ -8987,6 +9215,14 @@ export function spawnReadOnlyWorker({
       if (providerCapabilityDigest !== null
         && orphan.request?.spawn?.providerCapabilityDigest !== providerCapabilityDigest) {
         throw new CompanionError("E_CONTEXT_DRIFT", "Provider capability changed since durable worker admission.");
+      }
+      if (admittedProviderBinding
+        && orphan.request?.spawn?.providerLaunchBindingDigest
+          !== providerLaunchBindingDigest) {
+        throw new CompanionError(
+          "E_CONTEXT_DRIFT",
+          "Provider executable pin changed since durable worker admission."
+        );
       }
       const captured = captureSpawnResponse({
         job: orphan,
@@ -9053,6 +9289,12 @@ export function spawnReadOnlyWorker({
           successDefinition: SPAWN_SUCCESS_DEFINITION,
           ownershipMode: SPAWN_OWNERSHIP_MODE,
           ...(providerCapabilityDigest !== null ? { providerCapabilityDigest } : {}),
+          ...(admittedProviderBinding
+            ? {
+                providerLaunchBinding: admittedProviderBinding,
+                providerLaunchBindingDigest
+              }
+            : {}),
           providerLaunchPending: true,
           providerLaunchInFlight: false,
           providerLaunchOutcome: "pending",
@@ -9143,7 +9385,8 @@ function requestDigest({
   contextManifest,
   roleId,
   write,
-  contextBinding = undefined
+  contextBinding = undefined,
+  providerLaunchBindingDigest = undefined
 }) {
   return stableDigest({
     owner: spawnRequestOwner(principal),
@@ -9153,7 +9396,10 @@ function requestDigest({
     contextManifestDigest: contextManifest?.digest || null,
     roleId,
     write: Boolean(write),
-    ...(contextBinding === undefined ? {} : { contextBinding })
+    ...(contextBinding === undefined ? {} : { contextBinding }),
+    ...(providerLaunchBindingDigest === undefined
+      ? {}
+      : { providerLaunchBindingDigest })
   });
 }
 
@@ -9171,6 +9417,13 @@ export function assertDurableSpawnRequestBinding(job, env = process.env) {
       && !SHA256_HEX.test(spawn.contextBindingDigest || ""))
     || spawn?.ownerThreadId !== job?.host?.sessionId) {
     spawnIdempotencyStateError("Durable worker spawn provenance is malformed.");
+  }
+  try {
+    providerLaunchBindingForJob(job, { required: false });
+  } catch {
+    spawnIdempotencyStateError(
+      "Durable worker provider executable binding is malformed or partial."
+    );
   }
   let control;
   let acceptedContext;
@@ -9283,7 +9536,10 @@ export function assertDurableSpawnRequestBinding(job, env = process.env) {
     contextManifest: acceptedContext,
     roleId: job.request?.roleId,
     write: job.write,
-    ...(contextBinding ? { contextBinding } : {})
+    ...(contextBinding ? { contextBinding } : {}),
+    ...(Object.hasOwn(spawn, "providerLaunchBindingDigest")
+      ? { providerLaunchBindingDigest: spawn.providerLaunchBindingDigest }
+      : {})
   });
   if (spawn.requestDigest !== recomputedRequestDigest) {
     spawnIdempotencyStateError("Durable worker spawn request no longer matches its admitted binding.");

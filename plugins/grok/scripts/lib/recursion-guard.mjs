@@ -99,6 +99,11 @@ const WORKTREE_PROVISIONING_INTENT_KEYS = new Set([
   "updatedAt",
   "intentDigest"
 ]);
+const BOUND_WORKTREE_PROVISIONING_INTENT_KEYS = new Set([
+  ...WORKTREE_PROVISIONING_INTENT_KEYS,
+  "providerLaunchBinding",
+  "providerLaunchBindingDigest"
+]);
 const WORKTREE_PROVISIONING_PROCESS_KEYS = new Set([
   "pid",
   "startToken",
@@ -174,6 +179,11 @@ const PRE_READY_WRITE_SPAWN_KEYS = new Set([
   "providerLaunchPending",
   "providerLaunchInFlight",
   "providerLaunchOutcome"
+]);
+const BOUND_PRE_READY_WRITE_SPAWN_KEYS = new Set([
+  ...PRE_READY_WRITE_SPAWN_KEYS,
+  "providerLaunchBinding",
+  "providerLaunchBindingDigest"
 ]);
 const WORKTREE_PROVISIONING_JOB_KEYS = new Set([
   "schemaVersion",
@@ -342,10 +352,28 @@ function normalizeProviderGuardBinding(workspaceRoot, marker, binding, env) {
     ...intentBoundKeys,
     "executionBindingDigest"
   ]);
+  const executableIntentBoundKeys = new Set([
+    ...intentBoundKeys,
+    "providerLaunchBindingDigest",
+    "providerExecutableIdentityDigest"
+  ]);
+  const executableWriteIntentBoundKeys = new Set([
+    ...executableIntentBoundKeys,
+    "executionBindingDigest"
+  ]);
   const readLegacy = exactKeys(binding, legacyKeys);
   const readIntentBound = exactKeys(binding, intentBoundKeys);
   const writeIntentBound = exactKeys(binding, writeIntentBoundKeys);
-  if (!readLegacy && !readIntentBound && !writeIntentBound) {
+  const executableIntentBound = exactKeys(binding, executableIntentBoundKeys);
+  const executableWriteIntentBound = exactKeys(
+    binding,
+    executableWriteIntentBoundKeys
+  );
+  if (!readLegacy
+    && !readIntentBound
+    && !writeIntentBound
+    && !executableIntentBound
+    && !executableWriteIntentBound) {
     throw new CompanionError("E_PROCESS_IDENTITY", "Provider guard binding is malformed.");
   }
   const control = resolveControlWorkspace(workspaceRoot, env);
@@ -362,7 +390,11 @@ function normalizeProviderGuardBinding(workspaceRoot, marker, binding, env) {
     || binding.providerGeneration < 1
     || (Object.hasOwn(binding, "providerSpawnIntentId")
       && !/^[0-9a-f]{32}$/.test(binding.providerSpawnIntentId || ""))
-    || (writeIntentBound && !SHA256_HEX.test(binding.executionBindingDigest || ""))
+    || ((writeIntentBound || executableWriteIntentBound)
+      && !SHA256_HEX.test(binding.executionBindingDigest || ""))
+    || ((executableIntentBound || executableWriteIntentBound)
+      && (!SHA256_HEX.test(binding.providerLaunchBindingDigest || "")
+        || !SHA256_HEX.test(binding.providerExecutableIdentityDigest || "")))
     || !markerName(marker)) {
     throw new CompanionError("E_PROCESS_IDENTITY", "Provider guard is not bound to its execution root and dispatch.");
   }
@@ -370,7 +402,14 @@ function normalizeProviderGuardBinding(workspaceRoot, marker, binding, env) {
     ...binding,
     executionRoot,
     providerSpawnIntentId: binding.providerSpawnIntentId || null,
-    ...(writeIntentBound
+    ...((executableIntentBound || executableWriteIntentBound)
+      ? {
+          providerLaunchBindingDigest: binding.providerLaunchBindingDigest,
+          providerExecutableIdentityDigest:
+            binding.providerExecutableIdentityDigest
+        }
+      : {}),
+    ...((writeIntentBound || executableWriteIntentBound)
       ? { executionBindingDigest: binding.executionBindingDigest }
       : {})
   });
@@ -565,6 +604,12 @@ function worktreeProvisioningIntentDigestBody(intent) {
     provisioningFence: intent.provisioningFence,
     holderId: intent.holderId,
     executableIdentity: intent.executableIdentity,
+    ...(Object.hasOwn(intent, "providerLaunchBinding")
+      ? {
+          providerLaunchBinding: intent.providerLaunchBinding,
+          providerLaunchBindingDigest: intent.providerLaunchBindingDigest
+        }
+      : {}),
     preparedAt: intent.preparedAt
   };
 }
@@ -648,7 +693,10 @@ function validWorktreeProvisioningPriorAttempts(
       operationId ??= archivedIntent?.operationId;
       releaseIdentityDigest ??=
         archivedIntent?.executableIdentity?.releaseIdentityDigest;
-      if (!exactKeys(archivedIntent, WORKTREE_PROVISIONING_INTENT_KEYS)
+      const archivedIntentKeys = binding.providerLaunchBindingDigest === null
+        ? WORKTREE_PROVISIONING_INTENT_KEYS
+        : BOUND_WORKTREE_PROVISIONING_INTENT_KEYS;
+      if (!exactKeys(archivedIntent, archivedIntentKeys)
         || archivedIntent.schemaVersion !== 1
         || archivedIntent.purpose !== WORKTREE_PROVISIONING_PURPOSE
         || archivedIntent.workerId !== binding.workerId
@@ -826,6 +874,13 @@ function assertCanonicalWorktreeProvisioningState(
   const runtime = job?.provisioningRuntime;
   const intent = runtime?.intent;
   const processIdentity = intent?.processIdentity;
+  const providerBound = binding.providerLaunchBindingDigest !== null;
+  const spawnKeys = providerBound
+    ? BOUND_PRE_READY_WRITE_SPAWN_KEYS
+    : PRE_READY_WRITE_SPAWN_KEYS;
+  const intentKeys = providerBound
+    ? BOUND_WORKTREE_PROVISIONING_INTENT_KEYS
+    : WORKTREE_PROVISIONING_INTENT_KEYS;
   const operationIdValid = typeof intent?.operationId === "string"
     && intent.operationId.length > 0
     && intent.operationId.length <= 128
@@ -859,7 +914,7 @@ function assertCanonicalWorktreeProvisioningState(
     && exactKeys(job.request, PRE_READY_WRITE_REQUEST_KEYS)
     && job.request.providerHomeId === job.id
     && job.request.roleId === "implementer"
-    && exactKeys(job.request.spawn, PRE_READY_WRITE_SPAWN_KEYS)
+    && exactKeys(job.request.spawn, spawnKeys)
     && job.request.spawn.ownerThreadId === job.host?.sessionId
     && job.request.spawn.providerLaunchPending === false
     && job.request.spawn.providerLaunchInFlight === false
@@ -884,7 +939,7 @@ function assertCanonicalWorktreeProvisioningState(
       )
     )
     && runtime.schemaVersion === 1
-    && exactKeys(intent, WORKTREE_PROVISIONING_INTENT_KEYS)
+    && exactKeys(intent, intentKeys)
     && intent.schemaVersion === 1
     && intent.purpose === WORKTREE_PROVISIONING_PURPOSE
     && intent.workerId === job.id
@@ -896,6 +951,14 @@ function assertCanonicalWorktreeProvisioningState(
     && intent.provisioningFence === journal.fence
     && intent.holderId === journal.provisioner.holderId
     && validExecutableAttestation(intent.executableIdentity)
+    && (!providerBound || (
+      job.request.spawn.providerLaunchBindingDigest
+        === binding.providerLaunchBindingDigest
+      && intent.providerLaunchBindingDigest
+        === binding.providerLaunchBindingDigest
+      && intent.providerLaunchBinding?.executableIdentityDigest
+        === intent.executableIdentity.identityDigest
+    ))
     && allowedStatuses.includes(intent.status)
     && intent.settledAt === null
     && intent.noChildAt === null
@@ -1028,8 +1091,14 @@ export function registerProviderGuard(
   const normalized = normalizeProviderGuardBinding(workspaceRoot, marker, binding, env);
   const intentBound = Boolean(normalized.providerSpawnIntentId);
   const writeIntentBound = Object.hasOwn(normalized, "executionBindingDigest");
+  const executableIntentBound = Object.hasOwn(
+    normalized,
+    "providerLaunchBindingDigest"
+  );
   const record = {
-    schemaVersion: writeIntentBound ? 4 : intentBound ? 3 : 2,
+    schemaVersion: executableIntentBound
+      ? (writeIntentBound ? 7 : 6)
+      : writeIntentBound ? 4 : intentBound ? 3 : 2,
     marker: markerName(marker),
     owner: ownerDigest(owner),
     identityKind: "provider",
@@ -1041,6 +1110,14 @@ export function registerProviderGuard(
     dispatchFence: normalized.dispatchFence,
     providerGeneration: normalized.providerGeneration,
     ...(intentBound ? { providerSpawnIntentId: normalized.providerSpawnIntentId } : {}),
+    ...(executableIntentBound
+      ? {
+          providerLaunchBindingDigest:
+            normalized.providerLaunchBindingDigest,
+          providerExecutableIdentityDigest:
+            normalized.providerExecutableIdentityDigest
+        }
+      : {}),
     ...(writeIntentBound
       ? { executionBindingDigest: normalized.executionBindingDigest }
       : {}),
@@ -1082,6 +1159,18 @@ export function registerProviderGuard(
         && !hasJobBindingDigest
         && !hasSpawnBindingDigest
       );
+    const executableBindingMatches = executableIntentBound
+      ? (
+          jobSpawn.providerLaunchBindingDigest
+            === normalized.providerLaunchBindingDigest
+          && jobSpawn.providerLaunchBinding?.executableIdentityDigest
+            === normalized.providerExecutableIdentityDigest
+          && providerSpawnIntent?.providerLaunchBindingDigest
+            === normalized.providerLaunchBindingDigest
+          && providerSpawnIntent?.providerLaunchBinding?.executableIdentityDigest
+            === normalized.providerExecutableIdentityDigest
+        )
+      : !Object.hasOwn(jobSpawn, "providerLaunchBindingDigest");
     const rotationIntentMatches = dispatch?.state !== "provider-started" || Boolean(
       rotationIntent?.schemaVersion === 1
       && ["pending", "registered"].includes(rotationIntent.status)
@@ -1098,12 +1187,13 @@ export function registerProviderGuard(
       || job.controlWorkspaceId !== normalized.controlWorkspaceId
       || job.request?.spawn?.executionRoot !== normalized.executionRoot
       || !executionBindingMatches
+      || !executableBindingMatches
       || job.request?.spawn?.cleanupFence != null
       || dispatch?.attemptId !== normalized.dispatchAttemptId
       || dispatch?.fence !== normalized.dispatchFence
       || expectedGeneration !== normalized.providerGeneration
       || (intentBound && (
-        providerSpawnIntent?.schemaVersion !== 1
+        ![1, 2].includes(providerSpawnIntent?.schemaVersion)
         || providerSpawnIntent.intentId !== normalized.providerSpawnIntentId
         || providerSpawnIntent.attemptId !== normalized.dispatchAttemptId
         || providerSpawnIntent.dispatchFence !== normalized.dispatchFence
@@ -1545,6 +1635,15 @@ export function assertProviderGuardForJob(workspaceRoot, job, record, {
     ...guardKeys,
     "executionBindingDigest"
   ]);
+  const executableGuardKeys = new Set([
+    ...guardKeys,
+    "providerLaunchBindingDigest",
+    "providerExecutableIdentityDigest"
+  ]);
+  const executableWriteGuardKeys = new Set([
+    ...executableGuardKeys,
+    "executionBindingDigest"
+  ]);
   const dispatch = job?.request?.spawn?.dispatch;
   let executionControl;
   let callerControl;
@@ -1557,8 +1656,13 @@ export function assertProviderGuardForJob(workspaceRoot, job, record, {
   const schema2 = record?.schemaVersion === 2 && exactKeys(record, legacyGuardKeys);
   const schema3 = record?.schemaVersion === 3 && exactKeys(record, guardKeys);
   const schema4 = record?.schemaVersion === 4 && exactKeys(record, writeGuardKeys);
+  const schema6 = record?.schemaVersion === 6
+    && exactKeys(record, executableGuardKeys);
+  const schema7 = record?.schemaVersion === 7
+    && exactKeys(record, executableWriteGuardKeys);
   const providerSpawnIntent = job?.request?.spawn?.providerSpawnIntent;
-  const intentBoundSchema = schema3 || schema4;
+  const intentBoundSchema = schema3 || schema4 || schema6 || schema7;
+  const executableIntentBoundSchema = schema6 || schema7;
   const jobExecutionBinding = isPlainRecord(job?.executionBinding)
     ? job.executionBinding
     : {};
@@ -1567,9 +1671,16 @@ export function assertProviderGuardForJob(workspaceRoot, job, record, {
     : {};
   const hasJobBindingDigest = Object.hasOwn(jobExecutionBinding, "bindingDigest");
   const hasSpawnBindingDigest = Object.hasOwn(jobSpawn, "executionBindingDigest");
+  const hasProviderLaunchBinding = Object.hasOwn(
+    jobSpawn,
+    "providerLaunchBindingDigest"
+  );
+  const schemaMatchesProviderLaunch = hasProviderLaunchBinding
+    ? (job?.write === true ? schema7 : schema6)
+    : !executableIntentBoundSchema;
   const schemaMatchesWriteMode = job?.write === true
     ? (
-      schema4
+      (schema4 || schema7)
       && hasJobBindingDigest
       && hasSpawnBindingDigest
       && SHA256_HEX.test(record.executionBindingDigest || "")
@@ -1577,11 +1688,12 @@ export function assertProviderGuardForJob(workspaceRoot, job, record, {
       && jobExecutionBinding.bindingDigest === record.executionBindingDigest
     )
     : (
-      (schema2 || schema3)
+      (schema2 || schema3 || schema6)
       && !hasJobBindingDigest
       && !hasSpawnBindingDigest
     );
   const valid = schemaMatchesWriteMode
+    && schemaMatchesProviderLaunch
     && record.marker === markerName(job?.id)
     && record.owner === ownerDigest(job?.host?.sessionId)
     && record.identityKind === "provider"
@@ -1596,10 +1708,22 @@ export function assertProviderGuardForJob(workspaceRoot, job, record, {
     && Number.isSafeInteger(record.providerGeneration)
     && record.providerGeneration > 0
     && (expectedGeneration == null || record.providerGeneration === expectedGeneration)
+    && (!executableIntentBoundSchema || (
+      SHA256_HEX.test(record.providerLaunchBindingDigest || "")
+      && SHA256_HEX.test(record.providerExecutableIdentityDigest || "")
+      && record.providerLaunchBindingDigest
+        === jobSpawn.providerLaunchBindingDigest
+      && record.providerExecutableIdentityDigest
+        === jobSpawn.providerLaunchBinding?.executableIdentityDigest
+      && record.providerLaunchBindingDigest
+        === providerSpawnIntent?.providerLaunchBindingDigest
+      && record.providerExecutableIdentityDigest
+        === providerSpawnIntent?.providerLaunchBinding?.executableIdentityDigest
+    ))
     && (!intentBoundSchema || (
       record.launcherKind === "node-bootstrap-v1"
       && /^[0-9a-f]{32}$/.test(record.providerSpawnIntentId || "")
-      && providerSpawnIntent?.schemaVersion === 1
+      && [1, 2].includes(providerSpawnIntent?.schemaVersion)
       && providerSpawnIntent.intentId === record.providerSpawnIntentId
       && providerSpawnIntent.attemptId === record.dispatchAttemptId
       && providerSpawnIntent.dispatchFence === record.dispatchFence

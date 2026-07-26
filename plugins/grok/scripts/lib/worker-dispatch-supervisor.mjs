@@ -3,6 +3,10 @@ import path from "node:path";
 import { CompanionError } from "./errors.mjs";
 import { readValidProviderCapabilityReceipt } from "./provider-capability.mjs";
 import {
+  assertProviderLaunchBinding,
+  providerLaunchBindingDigest
+} from "./provider-executable-pin.mjs";
+import {
   isCancelRequested,
   listBrokerRecoveryCandidates
 } from "./state.mjs";
@@ -99,8 +103,26 @@ export function validateRecoveryCandidate(candidate, {
     throw new CompanionError("E_AUTH_REQUIRED", "Legacy worker dispatches are never launched autonomously.");
   }
   const capabilityDigest = capabilityReceipt?.capabilityDigest;
+  let capabilityLaunchBinding;
+  try {
+    capabilityLaunchBinding = assertProviderLaunchBinding(
+      capabilityReceipt?.providerLaunchBinding
+    );
+  } catch {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Worker recovery provider executable binding is missing or malformed."
+    );
+  }
+  const capabilityLaunchBindingDigest = providerLaunchBindingDigest(
+    capabilityLaunchBinding
+  );
   if (!SHA256_HEX.test(capabilityDigest || "")
-    || job.request?.spawn?.providerCapabilityDigest !== capabilityDigest) {
+    || capabilityReceipt?.providerLaunchBindingDigest !== capabilityLaunchBindingDigest
+    || job.request?.spawn?.providerCapabilityDigest !== capabilityDigest
+    || job.request?.spawn?.providerLaunchBindingDigest !== capabilityLaunchBindingDigest
+    || providerLaunchBindingDigest(job.request?.spawn?.providerLaunchBinding)
+      !== capabilityLaunchBindingDigest) {
     throw new CompanionError("E_CAPABILITY", "Worker recovery capability receipt is missing, stale, or mismatched.");
   }
   const spawn = job.request?.spawn;
@@ -197,7 +219,11 @@ export async function drainAuthorizedPendingDispatches({
       // replacement during a bounded scan cannot start a provider.
       const liveCapability = readCapability({ env });
       if (!SHA256_HEX.test(liveCapability?.capabilityDigest || "")
-        || liveCapability.capabilityDigest !== capabilityReceipt.capabilityDigest) {
+        || liveCapability.capabilityDigest !== capabilityReceipt.capabilityDigest
+        || liveCapability.providerLaunchBindingDigest
+          !== capabilityReceipt.providerLaunchBindingDigest
+        || providerLaunchBindingDigest(liveCapability.providerLaunchBinding)
+          !== capabilityReceipt.providerLaunchBindingDigest) {
         capabilityAvailable = false;
         break;
       }

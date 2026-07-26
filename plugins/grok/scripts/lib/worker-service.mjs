@@ -2,6 +2,10 @@ import { performance } from "node:perf_hooks";
 
 import { CompanionError } from "./errors.mjs";
 import { sameHostSession } from "./host.mjs";
+import {
+  assertProviderLaunchBinding,
+  providerLaunchBindingDigest as digestProviderLaunchBinding
+} from "./provider-executable-pin.mjs";
 import { listJobsReadonly, tryReadJob } from "./state.mjs";
 import {
   isWorkerTerminal,
@@ -92,6 +96,8 @@ export function createWorkerService({
   writeLifecycleCapabilityDigest = null,
   validateWriteLifecycleCapability = null,
   providerCapabilityDigest = null,
+  providerLaunchBinding = null,
+  providerLaunchBindingDigest = null,
   validateProviderCapability = null,
   allowUnboundDispatch = true,
   launchWorker = launchCommittedWorker,
@@ -112,6 +118,16 @@ export function createWorkerService({
   assertServicePrincipal(principal);
   if (typeof root !== "string" || !root) {
     throw new CompanionError("E_CAPABILITY", "Trusted Codex workspace metadata is unavailable.");
+  }
+  if (typeof providerCapabilityDigest === "string") {
+    assertProviderLaunchBinding(providerLaunchBinding);
+    if (providerLaunchBindingDigest
+      !== digestProviderLaunchBinding(providerLaunchBinding)) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        "The provider executable launch binding is missing or inconsistent."
+      );
+    }
   }
   const host = Object.freeze({ kind: "codex", sessionId: principal.threadId });
   let nextMaintenanceAt = -Infinity;
@@ -140,6 +156,19 @@ export function createWorkerService({
 
   const canDispatch = (job) => {
     const boundDigest = job?.request?.spawn?.providerCapabilityDigest;
+    if (typeof boundDigest === "string") {
+      try {
+        if (job?.request?.spawn?.providerLaunchBindingDigest
+            !== providerLaunchBindingDigest
+          || digestProviderLaunchBinding(
+            job?.request?.spawn?.providerLaunchBinding
+          ) !== providerLaunchBindingDigest) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
     if (typeof boundDigest === "string") {
       if (job?.write === true) {
         return enableWriteVerticalDispatch === true
@@ -472,7 +501,9 @@ export function createWorkerService({
         env,
         allowWriteSpawn,
         writeLifecycleCapabilityDigest,
-        providerCapabilityDigest
+        providerCapabilityDigest,
+        providerLaunchBinding,
+        providerLaunchBindingDigest
       });
       if (write) {
         return {
@@ -619,7 +650,9 @@ export function createWorkerService({
         message,
         idempotencyKey,
         env,
-        providerCapabilityDigest
+        providerCapabilityDigest,
+        providerLaunchBinding,
+        providerLaunchBindingDigest
       });
       const mayLaunch = typeof providerCapabilityDigest !== "string"
         || currentCapabilityDigest() === providerCapabilityDigest;

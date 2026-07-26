@@ -1,5 +1,4 @@
 import crypto from "node:crypto";
-import path from "node:path";
 
 const MAX_JSON_BYTES = 1024 * 1024;
 const MAX_JSON_DEPTH = 32;
@@ -20,6 +19,7 @@ const HOST_TASK_BINDING = /^host-task-[a-f0-9]{32}$/;
 const CONTROL_WORKSPACE_ID = /^cws-[a-f0-9]{32}$/;
 const RUNTIME_ID = /^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$/;
 const PROVIDER_VERSION = /^\d+\.\d+\.\d+$/;
+const PROVIDER_PIN_REF = /^gpin-[a-f0-9]{32}$/;
 
 const ERROR_MESSAGES = Object.freeze({
   E_LIVE_SETUP: "Installed Grok setup evidence is invalid.",
@@ -52,7 +52,6 @@ export const INSTALLED_WORKER_SCENARIO_IDS = Object.freeze([
 
 const SETUP_KEYS = new Set(["ready", "grok", "config", "disclosure", "nextSteps"]);
 const SETUP_RUNTIME_KEYS = new Set([
-  "binary",
   "version",
   "authenticated",
   "headlessReview",
@@ -88,7 +87,8 @@ const CAPABILITY_RECEIPT_KEYS = new Set([
   "platform",
   "architecture",
   "providerVersion",
-  "providerFileIdentity",
+  "providerLaunchBinding",
+  "providerLaunchBindingDigest",
   "acpProtocolVersion",
   "loadSession",
   "setupProfileDigest",
@@ -99,12 +99,12 @@ const CAPABILITY_RECEIPT_KEYS = new Set([
   "capabilityDigest",
   "receiptDigest"
 ]);
-const PROVIDER_IDENTITY_KEYS = new Set([
-  "device",
-  "inode",
-  "size",
-  "mtimeMs",
-  "contentDigest"
+const PROVIDER_LAUNCH_BINDING_KEYS = new Set([
+  "schemaVersion",
+  "pinRef",
+  "pinRecordDigest",
+  "executableIdentityDigest",
+  "releaseIdentityDigest"
 ]);
 const CAPABILITY_EXPECTATION_KEYS = new Set([
   "setup",
@@ -112,7 +112,8 @@ const CAPABILITY_EXPECTATION_KEYS = new Set([
   "mcpCapabilityContractVersion",
   "platform",
   "architecture",
-  "providerFileIdentity",
+  "providerLaunchBinding",
+  "providerLaunchBindingDigest",
   "rootReadProfileDigest",
   "observedAt"
 ]);
@@ -126,6 +127,7 @@ const INITIALIZE_KEYS = new Set([
 const INITIALIZE_META_KEYS = new Set([
   "grok/capability-matrix",
   "grok/capabilityDigest",
+  "grok/providerLaunchBindingDigest",
   "grok/hostVerification",
   "grok/supportedProtocolVersions",
   "grok/externalWorkerLabel"
@@ -133,6 +135,7 @@ const INITIALIZE_META_KEYS = new Set([
 const INITIALIZE_EXPECTATION_KEYS = new Set([
   "serverVersion",
   "capabilityDigest",
+  "providerLaunchBindingDigest",
   "experimentalCapabilities",
   "capabilityMatrix"
 ]);
@@ -946,19 +949,14 @@ function validRuntimeId(value) {
   return boundedString(value, 128) && RUNTIME_ID.test(value);
 }
 
-function validProviderIdentity(identity) {
+function validProviderLaunchBinding(binding) {
   return (
-    exactKeys(identity, PROVIDER_IDENTITY_KEYS)
-    && boundedString(identity.device, 128)
-    && identity.device.length > 0
-    && boundedString(identity.inode, 128)
-    && identity.inode.length > 0
-    && Number.isSafeInteger(identity.size)
-    && identity.size >= 1
-    && identity.size <= 128 * 1024 * 1024
-    && Number.isSafeInteger(identity.mtimeMs)
-    && identity.mtimeMs >= 0
-    && SHA256_HEX.test(identity.contentDigest || "")
+    exactKeys(binding, PROVIDER_LAUNCH_BINDING_KEYS)
+    && binding.schemaVersion === 1
+    && PROVIDER_PIN_REF.test(binding.pinRef || "")
+    && SHA256_HEX.test(binding.pinRecordDigest || "")
+    && SHA256_HEX.test(binding.executableIdentityDigest || "")
+    && SHA256_HEX.test(binding.releaseIdentityDigest || "")
   );
 }
 
@@ -982,18 +980,9 @@ function validTextArray(value, expected) {
   );
 }
 
-function validAbsoluteBinary(value) {
-  return (
-    boundedString(value, 4 * 1024)
-    && value.length > 0
-    && (path.posix.isAbsolute(value) || path.win32.isAbsolute(value))
-  );
-}
-
 function validSetupRuntime(runtime) {
   if (
     !exactKeys(runtime, SETUP_RUNTIME_KEYS)
-    || !validAbsoluteBinary(runtime.binary)
     || !boundedString(runtime.version, 64)
     || !PROVIDER_VERSION.test(runtime.version)
     || runtime.authenticated !== true
@@ -1072,7 +1061,8 @@ export function validateInstalledSetup(value) {
 
 /**
  * Validate and cross-bind the installed provider capability receipt.
- * The caller must independently supply current installed identity and time.
+ * The caller must independently supply the current path-free executable
+ * binding, its digest, and time.
  */
 export function validateProviderCapabilityAgreement(value, valueExpectations) {
   const receipt = boundedJson(value, "E_LIVE_CAPABILITY");
@@ -1082,7 +1072,7 @@ export function validateProviderCapabilityAgreement(value, valueExpectations) {
   const observedAt = expectations.observedAt;
   if (
     !exactKeys(receipt, CAPABILITY_RECEIPT_KEYS)
-    || receipt.schemaVersion !== 1
+    || receipt.schemaVersion !== 2
     || receipt.receiptType !== "grok-provider-capability"
     || !validRuntimeId(receipt.pluginVersion)
     || !validRuntimeId(receipt.mcpCapabilityContractVersion)
@@ -1090,7 +1080,8 @@ export function validateProviderCapabilityAgreement(value, valueExpectations) {
     || !validRuntimeId(receipt.architecture)
     || !boundedString(receipt.providerVersion, 64)
     || !PROVIDER_VERSION.test(receipt.providerVersion)
-    || !validProviderIdentity(receipt.providerFileIdentity)
+    || !validProviderLaunchBinding(receipt.providerLaunchBinding)
+    || !SHA256_HEX.test(receipt.providerLaunchBindingDigest || "")
     || receipt.acpProtocolVersion !== 1
     || receipt.loadSession !== true
     || !SHA256_HEX.test(receipt.setupProfileDigest || "")
@@ -1108,7 +1099,8 @@ export function validateProviderCapabilityAgreement(value, valueExpectations) {
     || !validRuntimeId(expectations.mcpCapabilityContractVersion)
     || !validRuntimeId(expectations.platform)
     || !validRuntimeId(expectations.architecture)
-    || !validProviderIdentity(expectations.providerFileIdentity)
+    || !validProviderLaunchBinding(expectations.providerLaunchBinding)
+    || !SHA256_HEX.test(expectations.providerLaunchBindingDigest || "")
     || !SHA256_HEX.test(expectations.rootReadProfileDigest || "")
     || !Number.isSafeInteger(observedAt)
     || observedAt < 0
@@ -1125,7 +1117,8 @@ export function validateProviderCapabilityAgreement(value, valueExpectations) {
     platform: receipt.platform,
     architecture: receipt.architecture,
     providerVersion: receipt.providerVersion,
-    providerFileIdentity: receipt.providerFileIdentity,
+    providerLaunchBinding: receipt.providerLaunchBinding,
+    providerLaunchBindingDigest: receipt.providerLaunchBindingDigest,
     acpProtocolVersion: receipt.acpProtocolVersion,
     loadSession: receipt.loadSession,
     setupProfileDigest: receipt.setupProfileDigest,
@@ -1151,7 +1144,14 @@ export function validateProviderCapabilityAgreement(value, valueExpectations) {
     || receipt.loadSession !== setup.grok.loadSession
     || receipt.setupProfileDigest !== setup.grok.acpIsolation.agentProfileDigest
     || receipt.rootReadProfileDigest !== expectations.rootReadProfileDigest
-    || !sameJson(receipt.providerFileIdentity, expectations.providerFileIdentity)
+    || !sameJson(
+      receipt.providerLaunchBinding,
+      expectations.providerLaunchBinding
+    )
+    || receipt.providerLaunchBindingDigest
+      !== expectations.providerLaunchBindingDigest
+    || receipt.providerLaunchBindingDigest
+      !== stableDigest(receipt.providerLaunchBinding)
     || receipt.capabilityDigest !== stableDigest(stable)
     || receipt.receiptDigest !== stableDigest(receiptBody)
   ) {
@@ -1172,6 +1172,7 @@ export function validateInstalledInitialize(value, valueExpectations) {
     !exactKeys(expectations, INITIALIZE_EXPECTATION_KEYS)
     || !validRuntimeId(expectations.serverVersion)
     || !SHA256_HEX.test(expectations.capabilityDigest || "")
+    || !SHA256_HEX.test(expectations.providerLaunchBindingDigest || "")
     || !isRecord(expectations.experimentalCapabilities)
     || !isRecord(expectations.capabilityMatrix)
     || !exactKeys(result, INITIALIZE_KEYS)
@@ -1196,6 +1197,8 @@ export function validateInstalledInitialize(value, valueExpectations) {
       expectations.capabilityMatrix
     )
     || result._meta["grok/capabilityDigest"] !== expectations.capabilityDigest
+    || result._meta["grok/providerLaunchBindingDigest"]
+      !== expectations.providerLaunchBindingDigest
     || result._meta["grok/hostVerification"] !== "suppressed"
     || !validTextArray(result._meta["grok/supportedProtocolVersions"], [
       "2025-11-25",

@@ -4,10 +4,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { CompanionError } from "./errors.mjs";
-import { captureExecutableFileIdentity } from "./executable-identity.mjs";
-import { discoverGrok, grokVersion } from "./grok-provider.mjs";
+import { assertExecutableAttestation } from "./executable-identity.mjs";
+import { grokVersion } from "./grok-provider.mjs";
 import { pluginDataRoot } from "./host.mjs";
 import { profileFor } from "./profiles.mjs";
+import {
+  assertProviderLaunchBinding,
+  providerLaunchBindingDigest,
+  resolveProviderExecutablePin
+} from "./provider-executable-pin.mjs";
 import { readPrivateJsonFile, writePrivateJsonFile } from "./state.mjs";
 
 export const ROOT_READ_PROVIDER_CAPABILITY = "root-read-spawn-v1";
@@ -15,18 +20,18 @@ export const SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY =
   "same-session-read-followup-v1";
 export const ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY =
   "ordered-turn-boundary-mailbox-v1";
-export const PROVIDER_CAPABILITY_SCHEMA_VERSION = 1;
+export const PROVIDER_CAPABILITY_SCHEMA_VERSION = 2;
 export const PROVIDER_CAPABILITY_TTL_MS = 12 * 60 * 60 * 1000;
 export const MCP_CAPABILITY_CONTRACT_VERSION = "1.3.0";
 
 const MAX_RECEIPT_TTL_MS = 24 * 60 * 60 * 1000;
-const MAX_PROVIDER_BINARY_BYTES = 128 * 1024 * 1024;
 const SHA256_HEX = /^[a-f0-9]{64}$/;
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const PLUGIN_MANIFEST = path.join(PLUGIN_ROOT, ".codex-plugin", "plugin.json");
 const SETUP_PROFILE = path.join(PLUGIN_ROOT, "provider-agents", "setup-probe.md");
 const RECEIPT_DIRECTORY = "capabilities";
-const RECEIPT_FILE = "provider-capability-v1.json";
+const RECEIPT_FILE = "provider-capability-v2.json";
+const LEGACY_RECEIPT_FILE = "provider-capability-v1.json";
 
 const RECEIPT_KEYS = new Set([
   "schemaVersion",
@@ -36,7 +41,8 @@ const RECEIPT_KEYS = new Set([
   "platform",
   "architecture",
   "providerVersion",
-  "providerFileIdentity",
+  "providerLaunchBinding",
+  "providerLaunchBindingDigest",
   "acpProtocolVersion",
   "loadSession",
   "setupProfileDigest",
@@ -47,7 +53,6 @@ const RECEIPT_KEYS = new Set([
   "capabilityDigest",
   "receiptDigest"
 ]);
-const FILE_IDENTITY_KEYS = new Set(["device", "inode", "size", "mtimeMs", "contentDigest"]);
 
 function canonicalize(value, stack = new Set()) {
   if (value === null || typeof value !== "object") return value;
@@ -108,32 +113,6 @@ function currentSetupProfileDigest() {
   }
 }
 
-function configuredProviderBinary(env) {
-  if (typeof env?.GROK_BIN === "string" && env.GROK_BIN) {
-    const binary = fs.realpathSync(path.resolve(env.GROK_BIN));
-    fs.accessSync(binary, fs.constants.X_OK);
-    return binary;
-  }
-  return discoverGrok();
-}
-
-function providerFileIdentity(binary) {
-  const identity = captureExecutableFileIdentity(binary);
-  if (identity.size > MAX_PROVIDER_BINARY_BYTES) {
-    throw new CompanionError(
-      "E_CAPABILITY",
-      "Grok provider binary identity is unsafe or unsupported."
-    );
-  }
-  return Object.freeze({
-    device: identity.device,
-    inode: identity.inode,
-    size: identity.size,
-    mtimeMs: identity.mtimeMs,
-    contentDigest: identity.executableDigest
-  });
-}
-
 function safeCapabilityDirectory(env, { create = false } = {}) {
   const configured = pluginDataRoot(env);
   if (create) fs.mkdirSync(configured, { recursive: true, mode: 0o700 });
@@ -180,7 +159,8 @@ function stableCapabilityBody({
   platform,
   architecture,
   providerVersion,
-  providerIdentity,
+  providerLaunchBinding,
+  providerLaunchBindingDigest: launchBindingDigest,
   acpProtocolVersion,
   loadSession,
   setupProfileDigest,
@@ -194,7 +174,8 @@ function stableCapabilityBody({
     platform,
     architecture,
     providerVersion,
-    providerFileIdentity: providerIdentity,
+    providerLaunchBinding: assertProviderLaunchBinding(providerLaunchBinding),
+    providerLaunchBindingDigest: launchBindingDigest,
     acpProtocolVersion,
     loadSession,
     setupProfileDigest,
@@ -221,13 +202,7 @@ function validateReceiptShape(receipt) {
     || typeof receipt.platform !== "string"
     || typeof receipt.architecture !== "string"
     || typeof receipt.providerVersion !== "string"
-    || !exactKeys(receipt.providerFileIdentity, FILE_IDENTITY_KEYS)
-    || typeof receipt.providerFileIdentity.device !== "string"
-    || typeof receipt.providerFileIdentity.inode !== "string"
-    || !Number.isSafeInteger(receipt.providerFileIdentity.size)
-    || receipt.providerFileIdentity.size < 1
-    || !Number.isSafeInteger(receipt.providerFileIdentity.mtimeMs)
-    || !SHA256_HEX.test(receipt.providerFileIdentity.contentDigest || "")
+    || !SHA256_HEX.test(receipt.providerLaunchBindingDigest || "")
     || receipt.acpProtocolVersion !== 1
     || receipt.loadSession !== true
     || !SHA256_HEX.test(receipt.setupProfileDigest || "")
@@ -243,17 +218,32 @@ function validateReceiptShape(receipt) {
     || !SHA256_HEX.test(receipt.receiptDigest || "")) {
     return false;
   }
+  try {
+    const binding = assertProviderLaunchBinding(receipt.providerLaunchBinding);
+    if (providerLaunchBindingDigest(binding) !== receipt.providerLaunchBindingDigest) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
   const issuedAt = Date.parse(receipt.issuedAt);
   const expiresAt = Date.parse(receipt.expiresAt);
   return expiresAt > issuedAt && expiresAt - issuedAt <= MAX_RECEIPT_TTL_MS;
 }
 
+/**
+ * Publish one schema-v2 capability receipt bound to a setup-owned opaque pin.
+ * The pin record must already be published; failed setup leaves no active receipt.
+ */
 export function writeProviderCapabilityReceipt({
   runtime,
+  providerLaunchBinding,
   env = process.env,
   clock = () => Date.now(),
-  ttlMs = PROVIDER_CAPABILITY_TTL_MS
+  ttlMs = PROVIDER_CAPABILITY_TTL_MS,
+  releases = undefined
 } = {}) {
+  const binding = assertProviderLaunchBinding(providerLaunchBinding);
   if (!runtime
     || runtime.authenticated !== true
     || runtime.protocolVersion !== 1
@@ -268,13 +258,28 @@ export function writeProviderCapabilityReceipt({
     || ttlMs > MAX_RECEIPT_TTL_MS) {
     throw new CompanionError("E_CAPABILITY", "Provider probe did not establish the required root-worker capability.");
   }
+  // Fail closed for ambient-path receipts: the probe binary must be the pinned one.
+  const resolved = resolveProviderExecutablePin(binding, {
+    env,
+    ...(releases === undefined ? {} : { releases })
+  });
+  if (resolved.binary !== fs.realpathSync(path.resolve(runtime.binary))
+    || !assertExecutableAttestation(resolved.executableIdentity)
+    || resolved.executableIdentity.identityDigest !== binding.executableIdentityDigest
+    || resolved.executableIdentity.releaseIdentityDigest !== binding.releaseIdentityDigest
+    || resolved.executableIdentity.version !== runtime.version) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Provider probe did not run through the setup-owned executable pin."
+    );
+  }
   const observedAt = clock();
   if (!Number.isFinite(observedAt)) throw new CompanionError("E_STATE", "Provider capability clock is invalid.");
-  const observedVersion = grokVersion(runtime.binary);
-  if (observedVersion !== runtime.version) {
+  const observedVersion = grokVersion(resolved.binary);
+  if (observedVersion !== runtime.version
+    || observedVersion !== resolved.executableIdentity.version) {
     throw new CompanionError("E_CAPABILITY", "Provider version changed before capability publication.");
   }
-  const providerIdentity = providerFileIdentity(runtime.binary);
   const rootReadProfileDigest = profileFor("task", false).agentProfileDigest;
   const setupProfileDigest = currentSetupProfileDigest();
   if (runtime.acpIsolation.agentProfileDigest !== setupProfileDigest) {
@@ -286,7 +291,8 @@ export function writeProviderCapabilityReceipt({
     platform: process.platform,
     architecture: process.arch,
     providerVersion: runtime.version,
-    providerIdentity,
+    providerLaunchBinding: binding,
+    providerLaunchBindingDigest: providerLaunchBindingDigest(binding),
     acpProtocolVersion: runtime.protocolVersion,
     loadSession: runtime.loadSession,
     setupProfileDigest,
@@ -308,9 +314,20 @@ export function writeProviderCapabilityReceipt({
 export function clearProviderCapabilityReceipt({ env = process.env } = {}) {
   const file = capabilityReceiptPath(env);
   if (!file) return false;
-  try {
-    fs.unlinkSync(file);
-    if (process.platform !== "win32") {
+  const legacyFile = path.join(path.dirname(file), LEGACY_RECEIPT_FILE);
+  let removed = false;
+  for (const candidate of [file, legacyFile]) {
+    try {
+      fs.unlinkSync(candidate);
+      removed = true;
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw new CompanionError("E_STATE", "Could not invalidate the provider capability receipt.");
+      }
+    }
+  }
+  if (removed && process.platform !== "win32") {
+    try {
       let directoryDescriptor;
       try {
         directoryDescriptor = fs.openSync(path.dirname(file), fs.constants.O_RDONLY);
@@ -318,29 +335,28 @@ export function clearProviderCapabilityReceipt({ env = process.env } = {}) {
       } finally {
         if (directoryDescriptor != null) fs.closeSync(directoryDescriptor);
       }
+    } catch (error) {
+      throw new CompanionError("E_STATE", "Could not durably invalidate the provider capability receipt.");
     }
-    return true;
-  } catch (error) {
-    if (error?.code === "ENOENT") return false;
-    throw new CompanionError("E_STATE", "Could not invalidate the provider capability receipt.");
   }
+  return removed;
 }
 
 /**
- * Read and revalidate one private provider capability receipt. Invalid, stale,
- * drifted, or unsafe records are observationally equivalent to no capability.
+ * Read and revalidate one private provider capability receipt. Schema v1 and
+ * any missing, tampered, mismatched, or non-official pin binding are rejected.
  */
 export function readValidProviderCapabilityReceipt({
   env = process.env,
   clock = () => Date.now(),
-  resolveBinary = configuredProviderBinary,
-  resolveVersion = grokVersion,
   pluginVersion = currentPluginVersion(),
   mcpCapabilityContractVersion = MCP_CAPABILITY_CONTRACT_VERSION,
   platform = process.platform,
   architecture = process.arch,
   setupProfileDigest = currentSetupProfileDigest(),
-  rootReadProfileDigest = profileFor("task", false).agentProfileDigest
+  rootReadProfileDigest = profileFor("task", false).agentProfileDigest,
+  resolvePin = resolveProviderExecutablePin,
+  releases = undefined
 } = {}) {
   try {
     const file = capabilityReceiptPath(env);
@@ -354,6 +370,8 @@ export function readValidProviderCapabilityReceipt({
       maxBytes: 64 * 1024,
       label: "provider capability receipt"
     });
+    // v1 receipts cannot authorize Worker Broker admission.
+    if (receipt?.schemaVersion !== PROVIDER_CAPABILITY_SCHEMA_VERSION) return null;
     if (!validateReceiptShape(receipt)
       || receipt.receiptDigest !== stableDigest(receiptWithoutDigest(receipt))
       || receipt.pluginVersion !== pluginVersion
@@ -365,23 +383,35 @@ export function readValidProviderCapabilityReceipt({
       || Date.parse(receipt.expiresAt) <= clock()) {
       return null;
     }
-    const binary = resolveBinary(env);
-    const providerIdentity = providerFileIdentity(binary);
-    const version = resolveVersion(binary);
+    const resolved = resolvePin(receipt.providerLaunchBinding, {
+      env,
+      platform,
+      arch: architecture,
+      ...(releases === undefined ? {} : { releases })
+    });
+    if (resolved.executableIdentity.identityDigest
+      !== receipt.providerLaunchBinding.executableIdentityDigest
+      || resolved.executableIdentity.releaseIdentityDigest
+        !== receipt.providerLaunchBinding.releaseIdentityDigest
+      || resolved.executableIdentity.version !== receipt.providerVersion) {
+      return null;
+    }
     const stable = stableCapabilityBody({
       pluginVersion,
       mcpCapabilityContractVersion,
       platform,
       architecture,
-      providerVersion: version,
-      providerIdentity,
+      providerVersion: receipt.providerVersion,
+      providerLaunchBinding: receipt.providerLaunchBinding,
+      providerLaunchBindingDigest: receipt.providerLaunchBindingDigest,
       acpProtocolVersion: receipt.acpProtocolVersion,
       loadSession: receipt.loadSession,
       setupProfileDigest: receipt.setupProfileDigest,
       rootReadProfileDigest
     });
-    if (receipt.providerVersion !== version
-      || stableDigest(stable) !== receipt.capabilityDigest) {
+    if (stableDigest(stable) !== receipt.capabilityDigest
+      || providerLaunchBindingDigest(receipt.providerLaunchBinding)
+        !== receipt.providerLaunchBindingDigest) {
       return null;
     }
     return Object.freeze(receipt);

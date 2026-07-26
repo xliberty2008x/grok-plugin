@@ -394,7 +394,9 @@ export function followupWorker(options = {}) {
     "message",
     "idempotencyKey",
     "env",
-    "providerCapabilityDigest"
+    "providerCapabilityDigest",
+    "providerLaunchBinding",
+    "providerLaunchBindingDigest"
   ]);
   if (!options || typeof options !== "object" || Array.isArray(options)
     || Object.keys(options).some((key) => !allowed.has(key))) {

@@ -13,6 +13,10 @@ import {
   SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
   readValidProviderCapabilityReceipt
 } from "../scripts/lib/provider-capability.mjs";
+import {
+  assertProviderLaunchBinding,
+  providerLaunchBindingDigest
+} from "../scripts/lib/provider-executable-pin.mjs";
 import { reconcileBrokerWorkers } from "../scripts/lib/worker-recovery.mjs";
 import { codexMetadataCapabilityMatrix } from "../scripts/lib/worker-presentation.mjs";
 import {
@@ -334,22 +338,30 @@ const MUTATION_AUTHORITY_TOOLS = new Set([
 const SHA256_HEX = /^[a-f0-9]{64}$/;
 
 function validProviderCapabilityReceipt(receipt) {
-  return Boolean(
-    SHA256_HEX.test(receipt?.capabilityDigest || "")
-    && Array.isArray(receipt?.capabilities)
-    && receipt.capabilities.length === 3
-    && receipt.capabilities[0] === ROOT_READ_PROVIDER_CAPABILITY
-    && receipt.capabilities[1] === SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
-    && receipt.capabilities[2] === ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
-  );
+  try {
+    const binding = assertProviderLaunchBinding(receipt?.providerLaunchBinding);
+    return Boolean(
+      SHA256_HEX.test(receipt?.capabilityDigest || "")
+      && receipt?.providerLaunchBindingDigest === providerLaunchBindingDigest(binding)
+      && Array.isArray(receipt?.capabilities)
+      && receipt.capabilities.length === 3
+      && receipt.capabilities[0] === ROOT_READ_PROVIDER_CAPABILITY
+      && receipt.capabilities[1] === SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
+      && receipt.capabilities[2] === ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
+    );
+  } catch {
+    return false;
+  }
 }
 
-function writeSmokeCapabilityDigest(providerCapabilityDigest) {
-  if (!SHA256_HEX.test(providerCapabilityDigest || "")) return null;
+function writeSmokeCapabilityDigest(providerCapabilityDigest, providerLaunchBindingDigestValue) {
+  if (!SHA256_HEX.test(providerCapabilityDigest || "")
+    || !SHA256_HEX.test(providerLaunchBindingDigestValue || "")) return null;
   return crypto.createHash("sha256").update(JSON.stringify({
     schemaVersion: 2,
     capability: WRITE_SMOKE_CAPABILITY,
     providerCapabilityDigest,
+    providerLaunchBindingDigest: providerLaunchBindingDigestValue,
     tools: [
       WORKER_SPAWN_WRITE_TOOL.name,
       WORKER_ARTIFACT_TOOL.name,
@@ -372,8 +384,14 @@ export function createMcpBrokerRuntime({
   const providerCapabilityDigest = validProviderCapabilityReceipt(receipt)
     ? receipt.capabilityDigest
     : null;
+  const providerLaunchBinding = providerCapabilityDigest
+    ? assertProviderLaunchBinding(receipt.providerLaunchBinding)
+    : null;
+  const providerLaunchBindingDigestValue = providerCapabilityDigest
+    ? receipt.providerLaunchBindingDigest
+    : null;
   const writeLifecycleCapabilityDigest = writeSmoke === true
-    ? writeSmokeCapabilityDigest(providerCapabilityDigest)
+    ? writeSmokeCapabilityDigest(providerCapabilityDigest, providerLaunchBindingDigestValue)
     : null;
   const tools = deepFreeze(providerCapabilityDigest
     ? [...(writeLifecycleCapabilityDigest
@@ -383,6 +401,8 @@ export function createMcpBrokerRuntime({
   return Object.freeze({
     tools,
     providerCapabilityDigest,
+    providerLaunchBinding,
+    providerLaunchBindingDigest: providerLaunchBindingDigestValue,
     writeLifecycleCapabilityDigest
   });
 }
@@ -404,6 +424,9 @@ function currentProviderCapabilityDigest(runtime, options) {
     const receipt = readReceipt({ env: options?.env || process.env });
     return validProviderCapabilityReceipt(receipt)
       && receipt.capabilityDigest === runtime.providerCapabilityDigest
+      && receipt.providerLaunchBindingDigest === runtime.providerLaunchBindingDigest
+      && providerLaunchBindingDigest(receipt.providerLaunchBinding)
+        === providerLaunchBindingDigest(runtime.providerLaunchBinding)
       ? receipt.capabilityDigest
       : null;
   } catch {
@@ -416,7 +439,10 @@ function currentWriteLifecycleCapabilityDigest(runtime, options) {
   const env = options?.env || process.env;
   if (env.GROK_COMPANION_WRITE_SMOKE !== WRITE_SMOKE_ENV_VALUE) return null;
   const providerDigest = currentProviderCapabilityDigest(runtime, options);
-  const current = writeSmokeCapabilityDigest(providerDigest);
+  const current = writeSmokeCapabilityDigest(
+    providerDigest,
+    runtime.providerLaunchBindingDigest
+  );
   return current === runtime.writeLifecycleCapabilityDigest ? current : null;
 }
 
@@ -588,6 +614,8 @@ export async function callWorkerTool(params, options = {}) {
         currentWriteLifecycleCapabilityDigest(runtime, options)
       ),
       providerCapabilityDigest: runtime.providerCapabilityDigest,
+      providerLaunchBinding: runtime.providerLaunchBinding,
+      providerLaunchBindingDigest: runtime.providerLaunchBindingDigest,
       validateProviderCapability: () => currentProviderCapabilityDigest(runtime, options),
       allowUnboundDispatch: false,
       maintain: () => reconcileWorkers({
@@ -761,6 +789,7 @@ export async function handleMcpRequest(message, options = {}) {
           _meta: {
             "grok/capability-matrix": capability,
             "grok/capabilityDigest": runtime.providerCapabilityDigest,
+            "grok/providerLaunchBindingDigest": runtime.providerLaunchBindingDigest,
             ...(runtime.writeLifecycleCapabilityDigest
               ? {
                   "grok/writeLifecycleCapabilityDigest":

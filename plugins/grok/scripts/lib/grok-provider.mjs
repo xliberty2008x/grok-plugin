@@ -11,11 +11,17 @@ import {
 } from "./acp-client.mjs";
 import { CompanionError } from "./errors.mjs";
 import {
+  attestSpawnedExecutable,
   assertExecutableAttestation,
   captureGrokExecutableIdentity,
   materializePinnedGrokExecutable,
   sameExecutableAttestation
 } from "./executable-identity.mjs";
+import {
+  assertProviderLaunchBinding as assertExecutableProviderLaunchBinding,
+  providerLaunchBindingDigest as digestProviderLaunchBinding,
+  resolveProviderExecutablePin
+} from "./provider-executable-pin.mjs";
 import { redact, redactText } from "./redact.mjs";
 import {
   assertCompleteDetachedOwnedIdentity,
@@ -200,7 +206,10 @@ export function childEnvironment(extra = {}) {
     GROK_MANAGED_MCPS_ENABLED: "false",
     GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED: "false",
     GROK_MCP_AUTO_RESTART: "false",
-    ...extra
+    ...extra,
+    // Official Grok treats this as the central managed-agent update gate.
+    // Keep it last so no caller-provided environment can re-enable updates.
+    GROK_DISABLE_AUTOUPDATER: "1"
   };
 }
 
@@ -2808,11 +2817,23 @@ export function createProviderBootstrapLaunch({
   binding,
   binary,
   executableIdentity = null,
+  providerLaunchBinding = null,
+  providerLaunchBindingDigest = null,
   args
 }) {
   const worktreeProvisioning = isWorktreeProvisioningBinding(binding);
   const workerOwnerController = isWorkerOwnerControllerBinding(binding);
   const isolatedController = worktreeProvisioning || workerOwnerController;
+  const pinnedProvider = providerLaunchBinding !== null;
+  let assertedProviderLaunchBinding = null;
+  if (pinnedProvider) {
+    try {
+      assertedProviderLaunchBinding =
+        assertExecutableProviderLaunchBinding(providerLaunchBinding);
+    } catch {
+      assertedProviderLaunchBinding = null;
+    }
+  }
   const validOwnerController = workerOwnerController && (() => {
     try {
       assertWorkerOwnerControllerBinding(binding);
@@ -2833,14 +2854,26 @@ export function createProviderBootstrapLaunch({
         || binding.providerGeneration < 1
         || !EXACT_NONCE_ID.test(binding?.providerSpawnIntentId || "")
       ))
-    || (isolatedController && (() => {
+    || ((isolatedController || pinnedProvider) && (() => {
       try {
         assertExecutableAttestation(executableIdentity);
         return false;
       } catch {
         return true;
       }
-    })())) {
+    })())
+    || (pinnedProvider && (
+      !assertedProviderLaunchBinding
+      || providerLaunchBindingDigest
+        !== digestProviderLaunchBinding(assertedProviderLaunchBinding)
+      || assertedProviderLaunchBinding.executableIdentityDigest
+        !== executableIdentity.identityDigest
+      || (!isolatedController && (
+        binding.providerLaunchBindingDigest !== providerLaunchBindingDigest
+        || binding.providerExecutableIdentityDigest
+          !== executableIdentity.identityDigest
+      ))
+    ))) {
     throw new CompanionError("E_STATE", "Provider bootstrap launch binding is malformed.");
   }
   const specPayload = `${JSON.stringify({
@@ -2850,7 +2883,13 @@ export function createProviderBootstrapLaunch({
     owner,
     binding,
     binary,
-    ...(isolatedController ? { executableIdentity } : {}),
+    ...((isolatedController || pinnedProvider) ? { executableIdentity } : {}),
+    ...(pinnedProvider
+      ? {
+          providerLaunchBinding: assertedProviderLaunchBinding,
+          providerLaunchBindingDigest
+        }
+      : {}),
     args
   })}\n`;
   if (Buffer.byteLength(specPayload, "utf8") > MAX_PROVIDER_BOOTSTRAP_SPEC_BYTES) {
@@ -2961,13 +3000,25 @@ export function publishProviderBootstrapSpec(child, specPayload, { timeoutMs = 5
 export function assertProviderBootstrapReadyMessage(
   message,
   binding,
-  expectedExecutableIdentity = null
+  expectedExecutableIdentity = null,
+  expectedProviderLaunchBinding = null
 ) {
   const worktreeProvisioning = isWorktreeProvisioningBinding(binding);
   const workerOwnerController = isWorkerOwnerControllerBinding(binding);
   const writeExecution = !worktreeProvisioning
     && !workerOwnerController
     && Object.hasOwn(binding || {}, "executionBindingDigest");
+  const pinnedProvider = expectedProviderLaunchBinding !== null;
+  let assertedProviderLaunchBinding = null;
+  if (pinnedProvider) {
+    try {
+      assertedProviderLaunchBinding = assertExecutableProviderLaunchBinding(
+        expectedProviderLaunchBinding
+      );
+    } catch {
+      assertedProviderLaunchBinding = null;
+    }
+  }
   const keys = new Set([
     "type",
     "grokPid",
@@ -2980,7 +3031,13 @@ export function assertProviderBootstrapReadyMessage(
           "provisioningFence",
           "holderId",
           "providerSpawnIntentId",
-          "executableIdentity"
+          "executableIdentity",
+          ...(pinnedProvider
+            ? [
+                "providerLaunchBindingDigest",
+                "providerExecutableIdentityDigest"
+              ]
+            : [])
         ]
       : workerOwnerController
         ? [
@@ -2993,13 +3050,34 @@ export function assertProviderBootstrapReadyMessage(
             "providerSpawnIntentId",
             "executableIdentity"
           ]
-      : (writeExecution ? ["executionBindingDigest"] : []))
+      : [
+          ...(writeExecution ? ["executionBindingDigest"] : []),
+          ...(pinnedProvider
+            ? [
+                "providerLaunchBindingDigest",
+                "providerExecutableIdentityDigest"
+              ]
+            : [])
+        ])
   ]);
   const valid = exactRecord(message, keys)
     && message.type === "provider-ready"
     && Number.isInteger(message.grokPid)
     && message.grokPid > 0
     && /^\d+\.\d+\.\d+$/.test(message.version || "")
+    && (!pinnedProvider || (
+      assertedProviderLaunchBinding
+      && sameExecutableAttestation(
+        message.executableIdentity || expectedExecutableIdentity,
+        expectedExecutableIdentity
+      )
+      && message.providerLaunchBindingDigest
+        === digestProviderLaunchBinding(assertedProviderLaunchBinding)
+      && message.providerExecutableIdentityDigest
+        === assertedProviderLaunchBinding.executableIdentityDigest
+      && message.providerExecutableIdentityDigest
+        === expectedExecutableIdentity?.identityDigest
+    ))
     && (worktreeProvisioning
       ? (
         validWorktreeProvisioningBinding(binding)
@@ -3055,6 +3133,9 @@ export function assertProviderBootstrapPromotionMessage(message, binding) {
   const writeExecution = !worktreeProvisioning
     && !workerOwnerController
     && Object.hasOwn(binding || {}, "executionBindingDigest");
+  const pinnedProvider = !worktreeProvisioning
+    && !workerOwnerController
+    && Object.hasOwn(binding || {}, "providerLaunchBindingDigest");
   const keys = new Set([
     "type",
     "marker",
@@ -3080,7 +3161,13 @@ export function assertProviderBootstrapPromotionMessage(message, binding) {
       : [
           "providerGeneration",
           "providerSpawnIntentId",
-          ...(writeExecution ? ["executionBindingDigest"] : [])
+          ...(writeExecution ? ["executionBindingDigest"] : []),
+          ...(pinnedProvider
+            ? [
+                "providerLaunchBindingDigest",
+                "providerExecutableIdentityDigest"
+              ]
+            : [])
         ])
   ]);
   const valid = exactRecord(message, keys)
@@ -3121,6 +3208,12 @@ export function assertProviderBootstrapPromotionMessage(message, binding) {
       : (
         message.providerGeneration === binding?.providerGeneration
         && message.providerSpawnIntentId === binding?.providerSpawnIntentId
+        && (!pinnedProvider || (
+          message.providerLaunchBindingDigest
+            === binding.providerLaunchBindingDigest
+          && message.providerExecutableIdentityDigest
+            === binding.providerExecutableIdentityDigest
+        ))
         && (!writeExecution || (
           SHA256_HEX.test(binding.executionBindingDigest || "")
           && message.executionBindingDigest === binding.executionBindingDigest
@@ -3142,7 +3235,8 @@ export function waitForProviderBootstrapReady(
   expectedExecutableIdentity,
   {
   timeoutMs = 10_000,
-  pollMs = 50
+  pollMs = 50,
+  expectedProviderLaunchBinding = null
   } = {}
 ) {
   const readiness = child?.stdio?.[3];
@@ -3198,7 +3292,8 @@ export function waitForProviderBootstrapReady(
           finish(resolve, assertProviderBootstrapReadyMessage(
             message,
             binding,
-            expectedExecutableIdentity
+            expectedExecutableIdentity,
+            expectedProviderLaunchBinding
           ));
         }
         catch (error) { finish(reject, error); }
@@ -3486,10 +3581,16 @@ export async function cleanupBoundBootstrapStart({
   stagedProfile.cleanup();
 }
 
-export async function openProvider({ root, profile, model = null, effort = null, stateDir, jobMarker = "probe", environment = null, knownSecrets = environment?.knownSecrets || [], cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, testHooks = null }) {
+export async function openProvider({ root, profile, model = null, effort = null, stateDir, jobMarker = "probe", environment = null, knownSecrets = environment?.knownSecrets || [], cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, providerExecutableBinding = null, providerExecutableEnv = process.env, testHooks = null }) {
   assertProviderPlatform();
   const boundBootstrap = Boolean(guardBinding);
   const worktreeProvisioningBootstrap = isWorktreeProvisioningBinding(guardBinding);
+  const setupOwnedExecutable = providerExecutableBinding == null
+    ? null
+    : resolveProviderExecutablePin(
+        assertExecutableProviderLaunchBinding(providerExecutableBinding),
+        { env: providerExecutableEnv }
+      );
   if (worktreeProvisioningBootstrap
     && (
       profile?.id !== "rescue-write-v3"
@@ -3549,13 +3650,14 @@ export async function openProvider({ root, profile, model = null, effort = null,
         : "Bound provider startup requires durable spawn-intent callbacks."
     );
   }
-  const discoveredBinary = discoverGrok();
+  const discoveredBinary = setupOwnedExecutable?.binary || discoverGrok();
   let binary = discoveredBinary;
-  const capturedExecutableIdentity = worktreeProvisioningBootstrap
-    ? materializePinnedGrokExecutable(discoveredBinary, {
+  const capturedExecutableIdentity = setupOwnedExecutable?.fileIdentity
+    || (worktreeProvisioningBootstrap
+      ? materializePinnedGrokExecutable(discoveredBinary, {
         directory: path.join(providerCwd, "provider-bin")
       })
-    : null;
+      : null);
   if (capturedExecutableIdentity) {
     binary = capturedExecutableIdentity.canonicalPath;
   }
@@ -3606,13 +3708,32 @@ export async function openProvider({ root, profile, model = null, effort = null,
     });
     const providerEnv = {
       ...(environment?.env || childEnvironment()),
-      GROK_COMPANION_JOB_MARKER: safeMarker
+      GROK_COMPANION_JOB_MARKER: safeMarker,
+      GROK_DISABLE_AUTOUPDATER: "1"
     };
     if (boundBootstrap) {
+      const launchIdentity = capturedExecutableIdentity?.attestation || null;
+      const launchBindingDigest = setupOwnedExecutable
+        ? digestProviderLaunchBinding(setupOwnedExecutable.binding)
+        : null;
       const candidate = providerLaunch.prepare(Object.freeze(
         worktreeProvisioningBootstrap
-          ? { executableIdentity: capturedExecutableIdentity.attestation }
-          : {}
+          ? {
+              executableIdentity: launchIdentity,
+              ...(setupOwnedExecutable
+                ? {
+                    providerLaunchBinding: setupOwnedExecutable.binding,
+                    providerLaunchBindingDigest: launchBindingDigest
+                  }
+                : {})
+            }
+          : (setupOwnedExecutable
+              ? {
+                  executableIdentity: launchIdentity,
+                  providerLaunchBinding: setupOwnedExecutable.binding,
+                  providerLaunchBindingDigest: launchBindingDigest
+                }
+              : {})
       ));
       if (candidate?.prepared !== true
         || candidate?.intent?.status !== "pending"
@@ -3629,8 +3750,21 @@ export async function openProvider({ root, profile, model = null, effort = null,
             candidate.intent.executableIdentity,
             capturedExecutableIdentity.attestation
           )
+          || (setupOwnedExecutable && (
+            candidate.intent.providerLaunchBindingDigest
+              !== launchBindingDigest
+            || digestProviderLaunchBinding(
+              candidate.intent.providerLaunchBinding
+            ) !== launchBindingDigest
+          ))
           || candidate.intent.processIdentity !== null
-      ))) {
+      ))
+        || (!worktreeProvisioningBootstrap && setupOwnedExecutable && (
+          candidate.intent.providerLaunchBindingDigest !== launchBindingDigest
+          || digestProviderLaunchBinding(
+            candidate.intent.providerLaunchBinding
+          ) !== launchBindingDigest
+        ))) {
         throw new CompanionError("E_PROCESS_IDENTITY", "Provider spawn intent was not freshly authorized for this bootstrap.");
       }
       // Only a freshly validated intent belongs to this launch attempt.
@@ -3650,6 +3784,10 @@ export async function openProvider({ root, profile, model = null, effort = null,
         binary,
         executableIdentity:
           capturedExecutableIdentity?.attestation || null,
+        providerLaunchBinding: setupOwnedExecutable?.binding || null,
+        providerLaunchBindingDigest: setupOwnedExecutable
+          ? digestProviderLaunchBinding(setupOwnedExecutable.binding)
+          : null,
         args: providerArgs
       });
       child = spawn(process.execPath, bootstrapLaunch.argv, {
@@ -3733,6 +3871,23 @@ export async function openProvider({ root, profile, model = null, effort = null,
     }
     if (!providerCleanupIdentity(error)) stagedProfile.cleanup();
     throw error;
+  }
+  if (!boundBootstrap && capturedExecutableIdentity) {
+    try {
+      attestedExecutableIdentity = attestSpawnedExecutable(
+        child.pid,
+        capturedExecutableIdentity
+      );
+    } catch (error) {
+      await cleanupFailedProviderStart({
+        child,
+        identity: processIdentity,
+        root,
+        marker: safeMarker,
+        stagedProfile
+      });
+      throw error;
+    }
   }
   if (worktreeProvisioningBootstrap) {
     try {
@@ -3837,10 +3992,14 @@ export async function openProvider({ root, profile, model = null, effort = null,
         child,
         cancelRequested,
         resolvedGuardBinding,
-        capturedExecutableIdentity?.attestation || null
+        capturedExecutableIdentity?.attestation || null,
+        {
+          expectedProviderLaunchBinding:
+            setupOwnedExecutable?.binding || null
+        }
       );
       version = ready.version;
-      if (worktreeProvisioningBootstrap) {
+      if (capturedExecutableIdentity) {
         attestedExecutableIdentity = ready.executableIdentity
           || capturedExecutableIdentity.attestation;
       }
@@ -4107,7 +4266,8 @@ export async function openProvider({ root, profile, model = null, effort = null,
     guardRecord,
     emitEvent,
     eventError: () => eventError,
-    cleanupAgentProfile: stagedProfile.cleanup
+    cleanupAgentProfile: stagedProfile.cleanup,
+    executableIdentity: attestedExecutableIdentity
   };
 }
 
@@ -4306,8 +4466,14 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
   return { sessionId, text: redactText(String(payload.text ?? "").trim(), isolation.knownSecrets), structuredOutput: redact(payload.structuredOutput, isolation.knownSecrets), stopReason: payload.stopReason || "EndTurn", provider: { version, process: identity, isolatedHome: isolation.home }, capabilities: { transport: "headless", agent: "explore", sandbox: isolation.sandboxProfile } };
 }
 
-export async function runProvider({ root, profile, prompt, model, effort, stateDir, jobMarker = "job", providerHomeId = null, resumeSessionId = null, cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, primaryTurnController = null, mailboxController = null, outputSchema = null, testHooks = null, timeoutMs = undefined }) {
+export async function runProvider({ root, profile, prompt, model, effort, stateDir, jobMarker = "job", providerHomeId = null, resumeSessionId = null, cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, providerExecutableBinding = null, providerExecutableEnv = process.env, primaryTurnController = null, mailboxController = null, outputSchema = null, testHooks = null, timeoutMs = undefined }) {
   if (profile.transport === "headless") {
+    if (providerExecutableBinding !== null) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        "Durably bound worker launches require the attested ACP bootstrap transport."
+      );
+    }
     if (outputSchema != null) {
       throw new CompanionError(
         "E_CAPABILITY",
@@ -4317,6 +4483,12 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
     return runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker, resumeSessionId, cancelRequested, onEvent, ...(timeoutMs == null ? {} : { timeoutMs }) });
   }
   const boundOutputSchemaDigest = outputSchemaDigest(outputSchema);
+  const resolvedExecutablePin = providerExecutableBinding === null
+    ? null
+    : resolveProviderExecutablePin(
+        assertExecutableProviderLaunchBinding(providerExecutableBinding),
+        { env: providerExecutableEnv }
+      );
   const environment = /^rescue-(read|write|report)-v3$/.test(profile.id || "") ? taskEnvironment(stateDir, root, profile, providerHomeId || jobMarker) : null;
   const effectiveProfile = environment?.sandboxProfile ? { ...profile, sandbox: environment.sandboxProfile } : profile;
   const boundProviderLaunch = providerLaunch
@@ -4333,7 +4505,13 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
     noChild: (details) => providerLaunch.noChild(details)
   } : providerLaunch;
   try {
-    if (environment) inspectIsolation(discoverGrok(), root, environment);
+    if (environment) {
+      inspectIsolation(
+        resolvedExecutablePin?.binary || discoverGrok(),
+        root,
+        environment
+      );
+    }
   } catch (error) {
     try { environment?.revokeCredential(); }
     catch (cleanupError) {
@@ -4357,6 +4535,9 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
       onEvent,
       guardBinding,
       providerLaunch: boundProviderLaunch,
+      providerExecutableBinding:
+        resolvedExecutablePin?.binding || providerExecutableBinding,
+      providerExecutableEnv,
       testHooks
     });
   } catch (error) {
@@ -5045,9 +5226,18 @@ export async function waitForImportedSession(sessionId, {
   }
 }
 
-export async function probe(root, stateDir) {
+export async function probe(root, stateDir, {
+  providerExecutableBinding = null,
+  providerExecutableEnv = process.env
+} = {}) {
   assertProviderPlatform();
-  const binary = discoverGrok();
+  const pinned = providerExecutableBinding == null
+    ? null
+    : resolveProviderExecutablePin(
+        assertExecutableProviderLaunchBinding(providerExecutableBinding),
+        { env: providerExecutableEnv }
+      );
+  const binary = pinned?.binary || discoverGrok();
   grokVersion(binary);
   const help = spawnSync(binary, ["--help"], { encoding: "utf8", shell: false, timeout: 15000, env: childEnvironment() });
   const helpText = `${help.stdout || ""}\n${help.stderr || ""}`;
@@ -5086,7 +5276,15 @@ export async function probe(root, stateDir) {
       allowedTools: ["todo_write"],
       deniedTools: ["WebSearch", "WebFetch", "Agent", "mcp__*", "Bash", "Edit", "Write"]
     };
-    provider = await openProvider({ root, profile, stateDir, jobMarker: marker, environment: isolation });
+    provider = await openProvider({
+      root,
+      profile,
+      stateDir,
+      jobMarker: marker,
+      environment: isolation,
+      providerExecutableBinding,
+      providerExecutableEnv
+    });
     return {
       binary: provider.binary,
       version: provider.version,

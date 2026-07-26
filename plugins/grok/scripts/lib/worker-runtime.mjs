@@ -57,7 +57,6 @@ const BASE_ENVIRONMENT_KEYS = new Set([
 ]);
 
 const GROK_CONFIGURATION_KEYS = Object.freeze([
-  "GROK_BIN",
   "GROK_AUTH_PATH",
   "GROK_COMPANION_PLUGIN_DATA",
   "GROK_HEADLESS_PROMPT_ON_DISK",
@@ -553,6 +552,7 @@ export function trustedWorkerEnvironment({
   if (Number.isSafeInteger(fence) && fence > 0) {
     childEnv.GROK_COMPANION_DISPATCH_FENCE = String(fence);
   }
+  childEnv.GROK_DISABLE_AUTOUPDATER = "1";
   return childEnv;
 }
 

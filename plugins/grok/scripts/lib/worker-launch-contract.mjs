@@ -1,6 +1,10 @@
 import crypto from "node:crypto";
 
 import { CompanionError } from "./errors.mjs";
+import {
+  assertProviderLaunchBinding,
+  providerLaunchBindingDigest
+} from "./provider-executable-pin.mjs";
 
 export const WORKER_AUTHORIZATION_SCHEMA_VERSION = 2;
 export const WORKER_DISPATCH_OUTBOX_SCHEMA_VERSION = 2;
@@ -123,6 +127,35 @@ export function executionBindingDigestForJob(job) {
   return null;
 }
 
+export function providerLaunchBindingForJob(job, { required = true } = {}) {
+  const spawn = isPlainRecord(job?.request?.spawn) ? job.request.spawn : {};
+  const hasBinding = Object.hasOwn(spawn, "providerLaunchBinding");
+  const hasDigest = Object.hasOwn(spawn, "providerLaunchBindingDigest");
+  if (!hasBinding && !hasDigest && required === false) return null;
+  if (!hasBinding || !hasDigest) {
+    throw new CompanionError(
+      "E_AUTH_REQUIRED",
+      "Worker launch requires one complete provider executable binding."
+    );
+  }
+  let binding;
+  try {
+    binding = assertProviderLaunchBinding(spawn.providerLaunchBinding);
+  } catch {
+    throw new CompanionError(
+      "E_AUTH_REQUIRED",
+      "Worker provider executable binding is malformed."
+    );
+  }
+  if (spawn.providerLaunchBindingDigest !== providerLaunchBindingDigest(binding)) {
+    throw new CompanionError(
+      "E_AUTH_REQUIRED",
+      "Worker provider executable binding digest is inconsistent."
+    );
+  }
+  return binding;
+}
+
 /**
  * Build the exact provider-guard binding consumed by the detached provider
  * bootstrap. Write workers retain their already-verified execution binding;
@@ -155,12 +188,23 @@ export function createProviderGuardBindingForJob(job, {
     );
   }
   const executionBindingDigest = executionBindingDigestForJob(job);
+  const providerBinding = providerLaunchBindingForJob(job, {
+    required: false
+  });
   return Object.freeze({
     controlWorkspaceId: job.controlWorkspaceId,
     executionRoot,
     dispatchAttemptId,
     dispatchFence,
     providerGeneration,
+    ...(providerBinding
+      ? {
+          providerLaunchBindingDigest:
+            job.request.spawn.providerLaunchBindingDigest,
+          providerExecutableIdentityDigest:
+            providerBinding.executableIdentityDigest
+        }
+      : {}),
     ...(executionBindingDigest ? { executionBindingDigest } : {})
   });
 }
@@ -229,6 +273,9 @@ function stableRequestBinding(job) {
     }
   }
   const spawn = isPlainRecord(request.spawn) ? request.spawn : {};
+  const providerBinding = providerLaunchBindingForJob(job, {
+    required: false
+  });
   stable.spawnContract = {
     idempotencyKeyDigest: spawn.idempotencyKeyDigest || null,
     ownerThreadId: spawn.ownerThreadId || null,
@@ -238,6 +285,12 @@ function stableRequestBinding(job) {
     executionRoot: spawn.executionRoot || null,
     ...(Object.hasOwn(spawn, "providerCapabilityDigest")
       ? { providerCapabilityDigest: spawn.providerCapabilityDigest }
+      : {}),
+    ...(providerBinding
+      ? {
+          providerLaunchBinding: providerBinding,
+          providerLaunchBindingDigest: spawn.providerLaunchBindingDigest
+        }
       : {}),
     ...(executionBindingDigest
       ? { executionBindingDigest }

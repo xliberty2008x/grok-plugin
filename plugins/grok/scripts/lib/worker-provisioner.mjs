@@ -900,6 +900,8 @@ export async function provisionWriteWorkerWorktree({
         provisioningFence: fence,
         holderId
       },
+      providerExecutableBinding:
+        durableJob.request?.spawn?.providerLaunchBinding || null,
       providerLaunch
     });
     if (!prepared?.intent || !activation?.job?.provisioning?.journalDigest) {

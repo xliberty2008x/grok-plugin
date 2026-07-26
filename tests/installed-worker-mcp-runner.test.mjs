@@ -733,6 +733,88 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /writeCancellation: cancellationEvidence/);
 });
 
+test("installed Worker MCP live gate poisons ambient Grok discovery and proves one pin", () => {
+  const source = fs.readFileSync(RUNNER, "utf8");
+  assert.ok(
+    source.includes('"scripts/lib/provider-executable-pin.mjs"'),
+    "runner must import the installed pin resolver"
+  );
+  const poison = source.slice(
+    source.indexOf("function poisonChildProviderDiscovery("),
+    source.indexOf("function initializeFixtureRepository(")
+  );
+  assert.match(poison, /mkdirPrivate\(poisonedHome\)/);
+  assert.match(poison, /fs\.readdirSync\(poisonedHome\)\.length !== 0/);
+  assert.match(poison, /const providerAuthPath = preserveProviderAuthPath\(env\)/);
+  assert.match(poison, /USERPROFILE: poisonedHome/);
+  assert.match(poison, /GROK_HOME: poisonedGrokHome/);
+  assert.match(poison, /GROK_BIN: missingGrokBinary/);
+  assert.match(poison, /PATH: filteredPath/);
+  assert.match(poison, /pathExecutableCandidates\("git", poisoned\)\.length < 1/);
+  assert.match(poison, /pathExecutableCandidates\("grok", poisoned\)\.length !== 0/);
+  assert.match(poison, /Object\.assign\(env, poisoned\)/);
+  assert.match(poison, /providerAuthPath,/);
+  assert.doesNotMatch(
+    poison,
+    /process\.env\s*(?:\[|\.)/,
+    "the poison must mutate only the dedicated child environment"
+  );
+
+  const setupValidation = source.indexOf(
+    "setup = validateInstalledSetup(setupJson);"
+  );
+  const poisonApplication = source.indexOf(
+    "const discoveryPoison = poisonChildProviderDiscovery("
+  );
+  const activeBindingRead = source.indexOf(
+    "providerExecutablePin.readActiveProviderLaunchBinding({ env })"
+  );
+  const capabilityRead = source.indexOf(
+    "providerCapability.readValidProviderCapabilityReceipt({ env })"
+  );
+  assert.ok(setupValidation >= 0 && setupValidation < poisonApplication);
+  assert.ok(poisonApplication < activeBindingRead);
+  assert.ok(activeBindingRead < capabilityRead);
+  assert.match(
+    source,
+    /providerExecutablePin\.resolveProviderExecutablePin\(\s*providerLaunchBinding,\s*\{ env \}/
+  );
+  assert.match(source, /Object\.hasOwn\(setup\.grok, "binary"\)/);
+  assert.match(source, /JSON\.stringify\(capability\)\.includes\(providerIdentity\.path\)/);
+  assert.match(source, /Object\.hasOwn\(capability, "providerFileIdentity"\)/);
+  assert.match(
+    source,
+    /providerLaunchBindingDigest:\s*context\.providerLaunchBindingDigest/
+  );
+  assert.match(
+    source,
+    /providerExecutableIdentityDigest:\s*context\.providerExecutableIdentityDigest/
+  );
+
+  const persistence = source.slice(
+    source.indexOf("function assertProviderPinPersistence("),
+    source.indexOf("function observeProviderDispatchEvidence(")
+  );
+  for (const required of [
+    "spawn?.providerLaunchBindingDigest",
+    "spawn?.providerLaunchBinding",
+    "currentIntent?.providerLaunchBindingDigest",
+    "currentIntent?.providerLaunchBinding",
+    "admission?.providerLaunchBindingDigest",
+    "admission?.providerExecutableIdentityDigest",
+    "job.executionBinding?.providerLaunchBindingDigest",
+    "worktreeIntent?.providerLaunchBindingDigest",
+    "worktreeIntent?.providerLaunchBinding",
+    "guard.providerLaunchBindingDigest",
+    "guard.providerExecutableIdentityDigest"
+  ]) {
+    assert.ok(persistence.includes(required), required);
+  }
+  assert.match(source, /recheckProviderExecutablePin\(baseContext, providerIdentity\)/);
+  assert.match(source, /providerPinRef: providerLaunchBinding\.pinRef/);
+  assert.match(source, /ambientProviderDiscoveryPoisoned: true/);
+});
+
 test("installed Worker MCP runner preserves original stages and lets cleanup failure override", () => {
   const allowedStages = new Set([
     "completion-spawn",

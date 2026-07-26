@@ -107,6 +107,7 @@ const QUALIFICATION_STAGES = new Set([
   "provider-setup-command",
   "provider-setup-cleanup",
   "provider-setup-contract",
+  "provider-discovery-poison",
   "provider-capability",
   "completion-mcp-surface",
   "completion-spawn",
@@ -1059,6 +1060,164 @@ function buildChildEnvironment({
   return env;
 }
 
+function pathExecutableCandidates(name, env) {
+  const pathValue = typeof env.PATH === "string" ? env.PATH : "";
+  const extensions = process.platform === "win32"
+    ? String(env.PATHEXT || ".EXE;.CMD;.BAT;.COM")
+        .split(";")
+        .filter(Boolean)
+    : [""];
+  const candidates = [];
+  for (const directory of pathValue.split(path.delimiter).filter(Boolean)) {
+    if (!path.isAbsolute(directory)) continue;
+    for (const extension of extensions) {
+      const candidate = path.join(directory, `${name}${extension}`);
+      try {
+        const resolved = fs.realpathSync(candidate);
+        const stat = fs.statSync(resolved);
+        fs.accessSync(resolved, fs.constants.X_OK);
+        if (stat.isFile() && !candidates.includes(resolved)) {
+          candidates.push(resolved);
+        }
+      } catch {
+        // A PATH entry that cannot resolve an executable is not launchable.
+      }
+    }
+  }
+  return candidates;
+}
+
+function preserveProviderAuthPath(env) {
+  const candidate = typeof env.GROK_AUTH_PATH === "string"
+    && env.GROK_AUTH_PATH !== ""
+    ? env.GROK_AUTH_PATH
+    : path.join(env.HOME, ".grok", "auth.json");
+  try {
+    const resolved = fs.realpathSync(path.resolve(candidate));
+    const stat = fs.lstatSync(resolved);
+    fs.accessSync(resolved, fs.constants.R_OK);
+    if (
+      !stat.isFile()
+      || stat.isSymbolicLink()
+      || stat.size < 1
+      || stat.size > 1024 * 1024
+    ) {
+      fail("E_CAPABILITY");
+    }
+    env.GROK_AUTH_PATH = resolved;
+    return resolved;
+  } catch (error) {
+    if (error instanceof QualificationError) throw error;
+    fail("E_CAPABILITY");
+  }
+}
+
+function poisonChildProviderDiscovery(env, temporaryRoot) {
+  const providerAuthPath = preserveProviderAuthPath(env);
+  const preserveKeys = [
+    "GROK_AUTH_PATH",
+    "GROK_COMPANION_PLUGIN_DATA",
+    "GROK_COMPANION_HOST",
+    "GROK_COMPANION_HOST_SESSION_ID",
+    "CODEX_HOME",
+    "CODEX_THREAD_ID",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR"
+  ];
+  const preserved = Object.freeze(Object.fromEntries(
+    preserveKeys
+      .filter((key) => Object.hasOwn(env, key))
+      .map((key) => [key, env[key]])
+  ));
+  const originalEntries = String(env.PATH || "")
+    .split(path.delimiter)
+    .filter((entry) => path.isAbsolute(entry));
+  const safeEntries = [...new Set(originalEntries)].filter((directory) => {
+    const candidateEnv = { ...env, PATH: directory };
+    return pathExecutableCandidates("grok", candidateEnv).length === 0;
+  });
+  const filteredPath = safeEntries.join(path.delimiter);
+  const poisonedHome = path.join(temporaryRoot, "provider-discovery-poison-home");
+  mkdirPrivate(poisonedHome);
+  if (fs.readdirSync(poisonedHome).length !== 0) fail("E_CAPABILITY");
+  const poisonedGrokHome = path.join(poisonedHome, ".grok");
+  const missingGrokBinary = path.join(poisonedHome, "missing-grok");
+  const poisoned = {
+    ...env,
+    HOME: poisonedHome,
+    USERPROFILE: poisonedHome,
+    GROK_HOME: poisonedGrokHome,
+    GROK_BIN: missingGrokBinary,
+    PATH: filteredPath
+  };
+  if (
+    pathExecutableCandidates("git", poisoned).length < 1
+    || pathExecutableCandidates("grok", poisoned).length !== 0
+    || fs.existsSync(missingGrokBinary)
+    || fs.existsSync(poisonedGrokHome)
+  ) {
+    fail("E_CAPABILITY");
+  }
+  for (const [key, value] of Object.entries(preserved)) {
+    if (poisoned[key] !== value) fail("E_CAPABILITY");
+  }
+  Object.assign(env, poisoned);
+  return Object.freeze({
+    home: poisonedHome,
+    userProfile: poisonedHome,
+    grokHome: poisonedGrokHome,
+    missingGrokBinary,
+    path: filteredPath,
+    gitBinary: pathExecutableCandidates("git", env)[0],
+    providerAuthPath,
+    preserved
+  });
+}
+
+function assertChildProviderDiscoveryPoison(context) {
+  const poison = context.discoveryPoison;
+  if (!poison) return true;
+  let stat;
+  try {
+    stat = fs.lstatSync(poison.home);
+  } catch {
+    fail("E_CAPABILITY");
+  }
+  // Runner-owned provider probes receive their exact task HOME explicitly.
+  // Any state created here proves an ambient-home fallback and must fail.
+  if (
+    context.env.HOME !== poison.home
+    || context.env.USERPROFILE !== poison.userProfile
+    || context.env.GROK_HOME !== poison.grokHome
+    || context.env.GROK_BIN !== poison.missingGrokBinary
+    || context.env.PATH !== poison.path
+    || !stat.isDirectory()
+    || stat.isSymbolicLink()
+    || (stat.mode & 0o077) !== 0
+    || fs.readdirSync(poison.home).length !== 0
+    || fs.existsSync(poison.grokHome)
+    || fs.existsSync(poison.missingGrokBinary)
+    || context.env.GROK_AUTH_PATH !== poison.providerAuthPath
+    || !fs.existsSync(poison.providerAuthPath)
+    || pathExecutableCandidates("grok", context.env).length !== 0
+    || !pathExecutableCandidates("git", context.env).includes(poison.gitBinary)
+  ) {
+    fail("E_CAPABILITY");
+  }
+  for (const [key, value] of Object.entries(poison.preserved)) {
+    if (context.env[key] !== value) fail("E_CAPABILITY");
+  }
+  return true;
+}
+
 function initializeFixtureRepository(root, env, {
   workloadFiles = 0,
   writeTarget = false
@@ -1165,6 +1324,53 @@ function captureProviderFileIdentity(file) {
   }
 }
 
+function recheckProviderExecutablePin(context, expectedProviderIdentity) {
+  assertChildProviderDiscoveryPoison(context);
+  let active;
+  let capability;
+  let resolved;
+  try {
+    active = context.providerExecutablePin.readActiveProviderLaunchBinding({
+      env: context.env
+    });
+    capability =
+      context.providerCapabilityModule.readValidProviderCapabilityReceipt({
+        env: context.env
+      });
+    resolved = context.providerExecutablePin.resolveProviderExecutablePin(
+      active,
+      { env: context.env }
+    );
+  } catch {
+    fail("E_CAPABILITY");
+  }
+  const currentIdentity = captureProviderFileIdentity(resolved.binary);
+  if (
+    !sameJson(active, context.providerLaunchBinding)
+    || context.providerExecutablePin.providerLaunchBindingDigest(active)
+      !== context.providerLaunchBindingDigest
+    || capability?.receiptDigest
+      !== context.providerCapability.receiptDigest
+    || !sameJson(
+      capability?.providerLaunchBinding,
+      context.providerLaunchBinding
+    )
+    || resolved.executableIdentity.identityDigest
+      !== context.providerExecutableIdentityDigest
+    || resolved.executableIdentity.releaseIdentityDigest
+      !== context.providerReleaseIdentityDigest
+    || !sameJson(currentIdentity, expectedProviderIdentity)
+  ) {
+    fail("E_CAPABILITY");
+  }
+  return Object.freeze({
+    active,
+    capability,
+    resolved,
+    currentIdentity
+  });
+}
+
 async function importInstalled(installedRoot, relative, code = "E_INSTALL") {
   const absolute = path.join(installedRoot, ...relative.split("/"));
   if (!isPathInside(installedRoot, absolute)) fail(code);
@@ -1219,11 +1425,14 @@ function validateWriteSmokeInitialize(result, context) {
     || !hasExactKeys(result._meta, new Set([
       "grok/capability-matrix",
       "grok/capabilityDigest",
+      "grok/providerLaunchBindingDigest",
       "grok/writeLifecycleCapabilityDigest",
       "grok/hostVerification",
       "grok/supportedProtocolVersions",
       "grok/externalWorkerLabel"
     ]))
+    || result._meta["grok/providerLaunchBindingDigest"]
+      !== context.providerCapability.providerLaunchBindingDigest
     || result._meta["grok/writeLifecycleCapabilityDigest"]
       !== context.writeLifecycleCapabilityDigest
   ) {
@@ -1237,12 +1446,15 @@ function validateWriteSmokeInitialize(result, context) {
   return validateInstalledInitialize(projected, {
     serverVersion: context.serverVersion,
     capabilityDigest: context.providerCapability.capabilityDigest,
+    providerLaunchBindingDigest:
+      context.providerCapability.providerLaunchBindingDigest,
     experimentalCapabilities: context.experimentalCapabilities,
     capabilityMatrix: expectedCapabilityMatrix()
   });
 }
 
 async function startInstalledMcp(context) {
+  assertChildProviderDiscoveryPoison(context);
   checkInterrupted(context.runner);
   const client = spawnMcpStdioClient({
     executable: process.execPath,
@@ -1274,6 +1486,8 @@ async function startInstalledMcp(context) {
       : validateInstalledInitialize(result, {
           serverVersion: context.serverVersion,
           capabilityDigest: context.providerCapability.capabilityDigest,
+          providerLaunchBindingDigest:
+            context.providerCapability.providerLaunchBindingDigest,
           experimentalCapabilities: context.experimentalCapabilities,
           capabilityMatrix: expectedCapabilityMatrix()
         }));
@@ -2137,7 +2351,11 @@ function immutablePrivateBinding(job) {
     ownerThreadId: job?.request?.spawn?.ownerThreadId,
     requestDigest: job?.request?.spawn?.requestDigest,
     idempotencyKeyDigest: job?.request?.spawn?.idempotencyKeyDigest,
-    providerCapabilityDigest: job?.request?.spawn?.providerCapabilityDigest
+    providerCapabilityDigest: job?.request?.spawn?.providerCapabilityDigest,
+    providerLaunchBindingDigest:
+      job?.request?.spawn?.providerLaunchBindingDigest,
+    providerExecutableIdentityDigest:
+      job?.request?.spawn?.providerLaunchBinding?.executableIdentityDigest
   };
 }
 
@@ -2166,6 +2384,83 @@ function canonicalTimestamp(value) {
   if (typeof value !== "string") return false;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+function assertProviderPinPersistence(context, job, {
+  guard = null,
+  requireCurrentIntent = false,
+  requirePrimaryTurnAdmissions = false,
+  requireWorktreeIntent = false
+} = {}) {
+  const binding = context.providerLaunchBinding;
+  const bindingDigest = context.providerLaunchBindingDigest;
+  const executableIdentityDigest = context.providerExecutableIdentityDigest;
+  const spawn = job?.request?.spawn;
+  if (
+    !binding
+    || binding.executableIdentityDigest !== executableIdentityDigest
+    || spawn?.providerLaunchBindingDigest !== bindingDigest
+    || !sameJson(spawn?.providerLaunchBinding, binding)
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+
+  const currentIntent = spawn.providerSpawnIntent;
+  if (requireCurrentIntent || currentIntent != null) {
+    if (
+      currentIntent?.providerLaunchBindingDigest !== bindingDigest
+      || !sameJson(currentIntent?.providerLaunchBinding, binding)
+    ) {
+      fail("E_PRIVATE_STATE");
+    }
+  }
+
+  const admissions = spawn.primaryTurnAdmissions;
+  if (requirePrimaryTurnAdmissions || admissions != null) {
+    if (
+      !isPlainRecord(admissions)
+      || Object.keys(admissions).length < 1
+      || Object.values(admissions).some((admission) => (
+        admission?.providerLaunchBindingDigest !== bindingDigest
+        || admission?.providerExecutableIdentityDigest
+          !== executableIdentityDigest
+      ))
+    ) {
+      fail("E_PRIVATE_STATE");
+    }
+  }
+
+  if (job.write === true) {
+    if (
+      job.executionBinding?.providerLaunchBindingDigest !== bindingDigest
+    ) {
+      fail("E_PRIVATE_STATE");
+    }
+    const worktreeIntent = job.provisioningRuntime?.intent;
+    if (requireWorktreeIntent || worktreeIntent != null) {
+      if (
+        worktreeIntent?.providerLaunchBindingDigest !== bindingDigest
+        || !sameJson(worktreeIntent?.providerLaunchBinding, binding)
+        || worktreeIntent?.executableIdentity?.identityDigest
+          !== executableIdentityDigest
+        || worktreeIntent?.executableIdentity?.releaseIdentityDigest
+          !== binding.releaseIdentityDigest
+      ) {
+        fail("E_PRIVATE_STATE");
+      }
+    }
+  }
+
+  if (
+    guard != null
+    && (
+      guard.providerLaunchBindingDigest !== bindingDigest
+      || guard.providerExecutableIdentityDigest !== executableIdentityDigest
+    )
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  return true;
 }
 
 function observeProviderDispatchEvidence(tracker, job) {
@@ -2250,6 +2545,10 @@ function observePrivateJob(context, tracker, job, {
   ) {
     fail("E_PRIVATE_STATE");
   }
+  assertProviderPinPersistence(context, job, {
+    requireCurrentIntent:
+      job.request?.spawn?.providerLaunchOutcome === "launched"
+  });
   const binding = immutablePrivateBinding(job);
   if (
     !canonicalTimestamp(binding.createdAt)
@@ -2327,6 +2626,10 @@ function observePrivateJob(context, tracker, job, {
     ) {
       fail("E_PRIVATE_STATE");
     }
+    assertProviderPinPersistence(context, job, {
+      guard,
+      requireCurrentIntent: true
+    });
     tracker.authenticatedGuard = structuredClone(guard);
   }
   return job;
@@ -4075,6 +4378,8 @@ const WRITE_SMOKE_PRIMARY_TURN_ADMISSION_KEYS = new Set([
   "workerProcess",
   "providerProcess",
   "providerSessionId",
+  "providerLaunchBindingDigest",
+  "providerExecutableIdentityDigest",
   "promptDigest",
   "admittedAt",
   "consumedAt"
@@ -4086,6 +4391,8 @@ function validWriteSmokePrimaryTurnAdmission(admission, {
   workerId,
   workerProcess,
   providerSessionId,
+  providerLaunchBindingDigest,
+  providerExecutableIdentityDigest,
   expectedProviderProcess = null
 }) {
   const expectedWorkerProcess = {
@@ -4141,6 +4448,9 @@ function validWriteSmokePrimaryTurnAdmission(admission, {
       || sameJson(providerProcess, expectedProviderBinding)
     )
     && admission.providerSessionId === providerSessionId
+    && admission.providerLaunchBindingDigest === providerLaunchBindingDigest
+    && admission.providerExecutableIdentityDigest
+      === providerExecutableIdentityDigest
     && /^[0-9a-f]{64}$/.test(admission.promptDigest || "")
     && canonicalTimestamp(admission.admittedAt)
     && canonicalTimestamp(admission.consumedAt)
@@ -4922,6 +5232,12 @@ function observeActiveWriteProvider(
   ) {
     fail("E_PRIVATE_STATE");
   }
+  assertProviderPinPersistence(context, job, {
+    guard,
+    requireCurrentIntent: true,
+    requirePrimaryTurnAdmissions: true,
+    requireWorktreeIntent: true
+  });
   return Object.freeze({
     job,
     guard,
@@ -5141,6 +5457,11 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
   } catch {
     terminalBindingValid = false;
   }
+  assertProviderPinPersistence(context, terminalJob, {
+    requireCurrentIntent: true,
+    requirePrimaryTurnAdmissions: true,
+    requireWorktreeIntent: true
+  });
   const terminalDispatch = terminalJob.request?.spawn?.dispatch;
   const providerGeneration = terminalDispatch?.providerGeneration;
   const providerProcess = terminalJob.providerProcess;
@@ -5161,6 +5482,9 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
       workerId,
       workerProcess: terminalJob.workerProcess,
       providerSessionId: terminalJob.grokSessionId,
+      providerLaunchBindingDigest: context.providerLaunchBindingDigest,
+      providerExecutableIdentityDigest:
+        context.providerExecutableIdentityDigest,
       ...(providerGeneration === 1
         ? { expectedProviderProcess: providerProcess }
         : {})
@@ -5274,6 +5598,9 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
       workerId,
       workerProcess: terminalJob.workerProcess,
       providerSessionId: terminalJob.grokSessionId,
+      providerLaunchBindingDigest: context.providerLaunchBindingDigest,
+      providerExecutableIdentityDigest:
+        context.providerExecutableIdentityDigest,
       expectedProviderProcess: providerProcess
     }
   );
@@ -6178,6 +6505,11 @@ async function runWriteCancellationScenario(baseContext, fixtureRoot) {
   let projectedTerminal;
   try {
     context.mutation.assertDispatchContract(terminalJob);
+    assertProviderPinPersistence(context, terminalJob, {
+      requireCurrentIntent: true,
+      requirePrimaryTurnAdmissions: true,
+      requireWorktreeIntent: true
+    });
     projectedTerminal = context.workerProtocol.projectWorkerSnapshot(
       terminalJob,
       {
@@ -7893,6 +8225,10 @@ async function qualify(runner, { writeSmoke = false } = {}) {
     installedRoot,
     "scripts/lib/provider-capability.mjs"
   );
+  const providerExecutablePin = await importInstalled(
+    installedRoot,
+    "scripts/lib/provider-executable-pin.mjs"
+  );
   const state = await importInstalled(installedRoot, "scripts/lib/state.mjs");
   const processControl = await importInstalled(
     installedRoot,
@@ -7993,28 +8329,55 @@ async function qualify(runner, { writeSmoke = false } = {}) {
     code: "E_SETUP"
   }).stdout;
   if (setupFixtureStatus !== "") fail("E_SETUP");
-  const providerIdentity = captureProviderFileIdentity(setup.grok.binary);
+
+  enterQualificationStage("provider-discovery-poison");
+  const discoveryPoison = poisonChildProviderDiscovery(env, runner.temporaryRoot);
   enterQualificationStage("provider-capability");
+  const providerLaunchBinding =
+    providerExecutablePin.readActiveProviderLaunchBinding({ env });
+  if (!providerLaunchBinding) fail("E_CAPABILITY");
+  const providerLaunchBindingDigest =
+    providerExecutablePin.providerLaunchBindingDigest(providerLaunchBinding);
   const capability = providerCapability.readValidProviderCapabilityReceipt({ env });
   if (!capability) fail("E_CAPABILITY");
+  let resolvedProviderPin;
+  try {
+    resolvedProviderPin = providerExecutablePin.resolveProviderExecutablePin(
+      providerLaunchBinding,
+      { env }
+    );
+  } catch {
+    fail("E_CAPABILITY");
+  }
+  const providerIdentity = captureProviderFileIdentity(
+    resolvedProviderPin.binary
+  );
   validateProviderCapabilityAgreement(capability, {
     setup,
     pluginVersion: packageJson.version,
     mcpCapabilityContractVersion: providerCapability.MCP_CAPABILITY_CONTRACT_VERSION,
     platform: process.platform,
     architecture: process.arch,
-    providerFileIdentity: {
-      device: providerIdentity.device,
-      inode: providerIdentity.inode,
-      size: providerIdentity.size,
-      mtimeMs: providerIdentity.mtimeMs,
-      contentDigest: providerIdentity.contentDigest
-    },
+    providerLaunchBinding,
+    providerLaunchBindingDigest,
     rootReadProfileDigest: profiles.profileFor("task", false).agentProfileDigest,
     observedAt: Date.now()
   });
   if (
-    capability.capabilities?.length !== 3
+    Object.hasOwn(setup.grok, "binary")
+    || JSON.stringify(setup).includes(providerIdentity.path)
+    || JSON.stringify(capability).includes(providerIdentity.path)
+    || Object.hasOwn(capability, "providerFileIdentity")
+    || setup.grok.version !== resolvedProviderPin.executableIdentity.version
+    || providerIdentity.contentDigest
+      !== resolvedProviderPin.executableIdentity.executableDigest
+    || providerLaunchBinding.executableIdentityDigest
+      !== resolvedProviderPin.executableIdentity.identityDigest
+    || providerLaunchBinding.releaseIdentityDigest
+      !== resolvedProviderPin.executableIdentity.releaseIdentityDigest
+    || capability.providerLaunchBindingDigest !== providerLaunchBindingDigest
+    || !sameJson(capability.providerLaunchBinding, providerLaunchBinding)
+    || capability.capabilities?.length !== 3
     || !sameJson(capability.capabilities, LIVE_RECEIPT_PROVIDER_CAPABILITIES)
     || capability.capabilities[0]
       !== providerCapability.ROOT_READ_PROVIDER_CAPABILITY
@@ -8039,9 +8402,18 @@ async function qualify(runner, { writeSmoke = false } = {}) {
   const baseContext = {
     runner,
     env,
+    discoveryPoison,
     threadId,
     installedRoot,
     providerCapability: capability,
+    providerCapabilityModule: providerCapability,
+    providerExecutablePin,
+    providerLaunchBinding,
+    providerLaunchBindingDigest,
+    providerExecutableIdentityDigest:
+      resolvedProviderPin.executableIdentity.identityDigest,
+    providerReleaseIdentityDigest:
+      resolvedProviderPin.executableIdentity.releaseIdentityDigest,
     providerBinary: providerIdentity.path,
     state,
     processControl,
@@ -8098,10 +8470,18 @@ async function qualify(runner, { writeSmoke = false } = {}) {
       providerVersion: capability.providerVersion,
       providerBinaryDigest: providerIdentity.contentDigest,
       providerCapabilityDigest: capability.capabilityDigest,
+      providerPinRef: providerLaunchBinding.pinRef,
+      providerLaunchBindingDigest,
+      providerExecutableIdentityDigest:
+        resolvedProviderPin.executableIdentity.identityDigest,
+      providerReleaseIdentityDigest:
+        resolvedProviderPin.executableIdentity.releaseIdentityDigest,
+      ambientProviderDiscoveryPoisoned: true,
       writeLifecycleCapabilityDigest:
         runtime.writeLifecycleCapabilityDigest
     });
     if (!(await terminateTrackedClients(runner))) fail("E_CLEANUP");
+    recheckProviderExecutablePin(baseContext, providerIdentity);
     const finalInstalledEntries = createPluginInventory(installedRoot);
     if (
       describeInventoryDifference(installedEntries, finalInstalledEntries).length
@@ -8109,10 +8489,6 @@ async function qualify(runner, { writeSmoke = false } = {}) {
       || digestInventory(finalInstalledEntries) !== installedPluginDigest
       || digestRegularFile(path.join(installedRoot, "mcp", "server.mjs"))
         !== installedEntrypointDigest
-      || !sameJson(
-        captureProviderFileIdentity(providerIdentity.path),
-        providerIdentity
-      )
     ) {
       fail("E_INSTALL");
     }
@@ -8156,9 +8532,10 @@ async function qualify(runner, { writeSmoke = false } = {}) {
   const finalInstalledEntrypointDigest = digestRegularFile(
     path.join(installedRoot, "mcp", "server.mjs")
   );
-  const finalProviderIdentity = captureProviderFileIdentity(
-    providerIdentity.path
-  );
+  const finalProviderIdentity = recheckProviderExecutablePin(
+    baseContext,
+    providerIdentity
+  ).currentIdentity;
   if (
     describeInventoryDifference(installedEntries, finalInstalledEntries).length
       !== 0

@@ -111,6 +111,7 @@ function bindingInput(overrides = {}) {
     admissionContextManifestId: `ctx-${"4".repeat(24)}`,
     admissionContextManifestDigest: sha256("admission-context"),
     providerCapabilityDigest: sha256("provider-capability"),
+    providerLaunchBindingDigest: sha256("provider-launch-binding"),
     ownerDigest: sha256("opaque-owner"),
     cancellationNonce: CANCELLATION_NONCE,
     createdAt: TIMES.binding,
@@ -823,6 +824,7 @@ test("all binding digest fields and derived identities fail closed on tamper", (
     "runtimeRolePolicyDigest",
     "admissionContextManifestDigest",
     "providerCapabilityDigest",
+    "providerLaunchBindingDigest",
     "ownerDigest",
     "cancellationNonceDigest",
     "bindingDigest"
@@ -906,6 +908,7 @@ test("nullable provider capability is accepted but malformed digests are rejecte
     "runtimeRolePolicyDigest",
     "admissionContextManifestDigest",
     "providerCapabilityDigest",
+    "providerLaunchBindingDigest",
     "ownerDigest"
   ]) {
     assertStateError(() => createExecutionBinding(bindingInput({ [field]: "A".repeat(64) })));
