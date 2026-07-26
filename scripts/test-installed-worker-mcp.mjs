@@ -1331,6 +1331,36 @@ async function callTool(context, client, name, argumentsValue, expectedPayloadKe
       const current = name === "worker_integrate"
         ? record?.integration
         : record?.cleanup;
+      const projectController = (intent) => {
+        if (!intent || typeof intent !== "object") return null;
+        const status = ["pending", "active", "settled"].includes(intent.status)
+          ? intent.status
+          : null;
+        const outcome = [
+          "completed",
+          "effect-failed",
+          "cancelled",
+          "startup-failed"
+        ].includes(intent.outcome)
+          ? intent.outcome
+          : null;
+        return {
+          status,
+          outcome,
+          controllerFence:
+            Number.isSafeInteger(intent.controllerFence)
+            && intent.controllerFence > 0
+              ? intent.controllerFence
+              : null,
+          processRecorded: Boolean(intent.processIdentity),
+          receiptsRecorded: /^[a-f0-9]{64}$/.test(
+            String(intent.receiptsDigest || "")
+          ),
+          cleanupProofRecorded: /^[a-f0-9]{64}$/.test(
+            String(intent.cleanupProofDigest || "")
+          )
+        };
+      };
       lifecycle = current
         ? {
             state: /^[a-z][a-z0-9-]{0,31}$/.test(
@@ -1361,6 +1391,15 @@ async function callTool(context, client, name, argumentsValue, expectedPayloadKe
                   .createHash("sha256")
                   .update(current.error.message)
                   .digest("hex")
+              : null,
+            controller: name === "worker_integrate"
+              ? projectController(current.controllerIntent)
+              : null,
+            closeController: name === "worker_cleanup"
+              ? projectController(current.closeControllerIntent)
+              : null,
+            removeController: name === "worker_cleanup"
+              ? projectController(current.removeControllerIntent)
               : null
           }
         : null;
