@@ -5575,6 +5575,34 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     || spawnReplay.providerLaunchState !== "worktree-ready-no-dispatch"
     || spawnReplay.providerLaunched !== false
   ) {
+    process.stderr.write(
+      `Installed Worker MCP write-smoke diagnostic ${JSON.stringify({
+        schemaVersion: 1,
+        stage: "write-smoke-spawn-replay",
+        replayed: spawnReplay.replayed === true,
+        workerIdBound: spawnReplay.worker?.id === workerId,
+        workerStatus: ["queued", "running", "completed", "cancelled", "failed"]
+          .includes(spawnReplay.worker?.status)
+          ? spawnReplay.worker.status
+          : null,
+        workerPhase: /^[a-z][a-z0-9-]{0,63}$/.test(
+          String(spawnReplay.worker?.phase || "")
+        )
+          ? spawnReplay.worker.phase
+          : null,
+        terminal: spawnReplay.worker?.terminal === true,
+        write: spawnReplay.worker?.write === true,
+        implementer: spawnReplay.worker?.roleId === "implementer",
+        durableCommit:
+          spawnReplay.spawnSuccessDefinition === "durable-job-commit",
+        providerLaunchState: /^[a-z][a-z0-9-]{0,63}$/.test(
+          String(spawnReplay.providerLaunchState || "")
+        )
+          ? spawnReplay.providerLaunchState
+          : null,
+        providerLaunched: spawnReplay.providerLaunched === true
+      })}\n`
+    );
     fail("E_SCENARIO");
   }
   const replayedTerminalJob = context.state.readJob(
