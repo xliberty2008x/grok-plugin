@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   SETUP_COMMAND_IDENTITY_INTERVAL_MS,
   SETUP_COMMAND_IDENTITY_TIMEOUT_MS,
+  SETUP_SCAN_DIAGNOSTIC_CODES,
+  boundedSetupScanDiagnosticCode,
   captureSetupCommandIdentityWithPolling,
   decideSetupScanObservationDisposition,
   evaluateSetupCommandIdentityObservation,
@@ -18,6 +20,24 @@ const COMMAND_TEXT = `${COMMAND_PATH} /plugin/grok-codex.mjs setup --json`;
 test("setup command identity defaults stay aligned with provider birth-token polling", () => {
   assert.equal(SETUP_COMMAND_IDENTITY_TIMEOUT_MS, 750);
   assert.equal(SETUP_COMMAND_IDENTITY_INTERVAL_MS, 25);
+});
+
+test("setup scan diagnostics expose only fixed non-sensitive classes", () => {
+  assert.equal(Object.isFrozen(SETUP_SCAN_DIAGNOSTIC_CODES), true);
+  assert.equal(new Set(SETUP_SCAN_DIAGNOSTIC_CODES).size, 13);
+  for (const code of SETUP_SCAN_DIAGNOSTIC_CODES) {
+    assert.match(code, /^[a-z][a-z-]+$/);
+    assert.equal(boundedSetupScanDiagnosticCode(code), code);
+  }
+  for (const value of [
+    null,
+    "",
+    "unknown",
+    "/private/provider/path",
+    "pid-1234"
+  ]) {
+    assert.equal(boundedSetupScanDiagnosticCode(value), null);
+  }
 });
 
 test("setup command identity polling admits initial-null then exact owned identity", async () => {

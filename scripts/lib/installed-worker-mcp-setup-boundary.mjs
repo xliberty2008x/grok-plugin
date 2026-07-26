@@ -6,6 +6,34 @@
 
 export const SETUP_COMMAND_IDENTITY_TIMEOUT_MS = 750;
 export const SETUP_COMMAND_IDENTITY_INTERVAL_MS = 25;
+export const SETUP_SCAN_DIAGNOSTIC_CODES = Object.freeze([
+  "guard-directory-read",
+  "guard-load",
+  "guard-validation",
+  "guard-record-drift",
+  "guard-identity-drift",
+  "process-list",
+  "leader-token-gone-proof",
+  "leader-token-live-or-ambiguous",
+  "identity-shape",
+  "identity-match-probe",
+  "identity-mismatch-gone-proof",
+  "identity-mismatch-live-or-ambiguous",
+  "process-identity-drift"
+]);
+const SETUP_SCAN_DIAGNOSTIC_CODE_SET =
+  new Set(SETUP_SCAN_DIAGNOSTIC_CODES);
+
+/**
+ * Project only a fixed, non-sensitive setup-scan failure class. Process
+ * identities, commands, paths, and provider output never cross this boundary.
+ */
+export function boundedSetupScanDiagnosticCode(value) {
+  return typeof value === "string"
+    && SETUP_SCAN_DIAGNOSTIC_CODE_SET.has(value)
+    ? value
+    : null;
+}
 
 function isPositiveSafeInteger(value) {
   return Number.isSafeInteger(value) && value > 0;

@@ -32,6 +32,7 @@ import {
 import {
   SETUP_COMMAND_IDENTITY_INTERVAL_MS,
   SETUP_COMMAND_IDENTITY_TIMEOUT_MS,
+  boundedSetupScanDiagnosticCode,
   captureSetupCommandIdentityWithPolling,
   decideSetupScanObservationDisposition,
   setupCleanupRequiresObservation,
@@ -304,6 +305,16 @@ function fail(code) {
   throw new QualificationError(code);
 }
 
+function failSetupScan(code) {
+  const setupScanCode = boundedSetupScanDiagnosticCode(code);
+  if (!setupScanCode) fail("E_CLEANUP");
+  throw new QualificationError(
+    "E_CLEANUP",
+    qualificationStage,
+    { setupScanCode }
+  );
+}
+
 function checkInterrupted(state) {
   if (state.interrupted) fail("E_INTERRUPTED");
 }
@@ -567,7 +578,7 @@ function scanSetupBoundary(boundary) {
       names = fs.readdirSync(directory);
     } catch (error) {
       if (error?.code === "ENOENT") continue;
-      fail("E_CLEANUP");
+      failSetupScan("guard-directory-read");
     }
     for (const name of names) {
       const match = name.match(/^setup-(\d+)-([0-9a-f]{12})\.json$/);
@@ -580,22 +591,28 @@ function scanSetupBoundary(boundary) {
           marker
         );
       } catch {
-        fail("E_CLEANUP");
+        failSetupScan("guard-load");
       }
       // The provider may remove its exact guard between readdir and load.
       // That observation is not evidence, but it is also not ambiguous live
       // state; successful setup still has to produce another validated guard
       // observation before cleanup can pass.
       if (!record) continue;
-      validateSetupGuard(boundary, marker, record);
+      try {
+        validateSetupGuard(boundary, marker, record);
+      } catch {
+        failSetupScan("guard-validation");
+      }
       const previous = boundary.guardRecords.get(marker);
-      if (previous && !sameJson(previous, record)) fail("E_CLEANUP");
+      if (previous && !sameJson(previous, record)) {
+        failSetupScan("guard-record-drift");
+      }
       const priorIdentity = boundary.identities.get(marker);
       if (
         priorIdentity
         && !sameJson(priorIdentity, record.providerProcess)
       ) {
-        fail("E_CLEANUP");
+        failSetupScan("guard-identity-drift");
       }
       boundary.guardRecords.set(marker, structuredClone(record));
       boundary.identities.set(
@@ -619,7 +636,7 @@ function scanSetupBoundary(boundary) {
     || Buffer.byteLength(String(listed.stdout || ""), "utf8")
       > MAX_COMMAND_OUTPUT_BYTES
   ) {
-    fail("E_CLEANUP");
+    failSetupScan("process-list");
   }
   const liveMarkers = new Set();
   for (const line of String(listed.stdout || "").split("\n")) {
@@ -646,7 +663,7 @@ function scanSetupBoundary(boundary) {
           incompleteIdentity
         );
       } catch {
-        fail("E_CLEANUP");
+        failSetupScan("leader-token-gone-proof");
       }
       if (decideSetupScanObservationDisposition({
         verifiedMatch: false,
@@ -655,13 +672,13 @@ function scanSetupBoundary(boundary) {
       }) === "ignore-stale") {
         continue;
       }
-      fail("E_CLEANUP");
+      failSetupScan("leader-token-live-or-ambiguous");
     }
     const identity = { pid, startToken, processGroupId: pid };
     try {
       boundary.processControl.assertCompleteDetachedOwnedIdentity(identity);
     } catch {
-      fail("E_CLEANUP");
+      failSetupScan("identity-shape");
     }
     let verifiedMatch = false;
     try {
@@ -671,7 +688,7 @@ function scanSetupBoundary(boundary) {
         "provider"
       );
     } catch {
-      fail("E_CLEANUP");
+      failSetupScan("identity-match-probe");
     }
     if (!verifiedMatch) {
       let firstProcessGroupGone = false;
@@ -684,7 +701,7 @@ function scanSetupBoundary(boundary) {
           identity
         );
       } catch {
-        fail("E_CLEANUP");
+        failSetupScan("identity-mismatch-gone-proof");
       }
       if (decideSetupScanObservationDisposition({
         verifiedMatch,
@@ -693,10 +710,12 @@ function scanSetupBoundary(boundary) {
       }) === "ignore-stale") {
         continue;
       }
-      fail("E_CLEANUP");
+      failSetupScan("identity-mismatch-live-or-ambiguous");
     }
     const previous = boundary.identities.get(marker);
-    if (previous && !sameJson(previous, identity)) fail("E_CLEANUP");
+    if (previous && !sameJson(previous, identity)) {
+      failSetupScan("process-identity-drift");
+    }
     boundary.identities.set(marker, identity);
     boundary.observedProvider = true;
     liveMarkers.add(marker);
@@ -856,10 +875,14 @@ function reportSetupBoundaryDiagnostic(phase, error = null) {
   const match = String(error?.stack || "").match(
     /test-installed-worker-mcp\.mjs:(\d+):\d+/
   );
+  const setupScanCode = boundedSetupScanDiagnosticCode(
+    error?.diagnostic?.setupScanCode
+  );
   process.stderr.write(
     `Installed Worker MCP setup-boundary diagnostic ${JSON.stringify({
       schemaVersion: 1,
       phase,
+      setupScanCode,
       sourceLine: match ? Number(match[1]) : null
     })}\n`
   );
