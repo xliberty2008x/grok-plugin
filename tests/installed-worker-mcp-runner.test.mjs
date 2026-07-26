@@ -664,6 +664,53 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /artifactReplayProven: true/);
   assert.match(source, /providerRelaunchDelta: 0/);
   assert.match(source, /worktreeCreateDelta: 0/);
+  assert.match(
+    source,
+    /async function runWriteCancellationScenario\(baseContext, fixtureRoot\)/
+  );
+  assert.match(
+    source,
+    /writeTarget: true,\s*workloadFiles: ACTIVE_WINDOW_WORKLOAD_FILES/
+  );
+  assert.match(
+    source,
+    /const activeBeforeReplay = await waitForActiveWriteProvider\(/
+  );
+  assert.match(
+    source,
+    /!sameJson\(activeAfterReplay\.identity, activeBeforeReplay\.identity\)/
+  );
+  assert.match(
+    source,
+    /"worker_cancel",\s*cancelArguments,\s*\["receipt", "replayed"\]/
+  );
+  assert.match(source, /cancelReplay\.replayed !== true/);
+  assert.match(
+    source,
+    /Object\.hasOwn\(terminalJob\.result \|\| \{\}, "writeArtifact"\)/
+  );
+  assert.match(
+    source,
+    /const cleanupArguments = \{\s*id: workerId,\s*idempotencyKey:/
+  );
+  const writeCancellationScenario = source.slice(
+    source.indexOf("async function runWriteCancellationScenario("),
+    source.indexOf("async function runCancellationScenario(")
+  );
+  const discardCleanupArguments = writeCancellationScenario.match(
+    /const cleanupArguments = \{[\s\S]*?\n  \};/
+  )?.[0] || "";
+  assert.doesNotMatch(
+    discardCleanupArguments,
+    /integrationReceiptDigest/
+  );
+  assert.match(source, /cleanupReceipt\?\.disposition !== "discarded"/);
+  assert.match(
+    source,
+    /cleanupReceipt\?\.integrationReceiptDigest !== null/
+  );
+  assert.match(source, /activeWriteCancellationProven: true/);
+  assert.match(source, /writeCancellation: cancellationEvidence/);
 });
 
 test("installed Worker MCP runner preserves original stages and lets cleanup failure override", () => {

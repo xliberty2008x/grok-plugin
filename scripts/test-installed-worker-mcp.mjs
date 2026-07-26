@@ -226,6 +226,21 @@ const QUALIFICATION_STAGES = new Set([
   "write-smoke-session-absence",
   "write-smoke-cleanup-reconnect",
   "write-smoke-cleanup",
+  "write-cancel-fixture",
+  "write-cancel-mcp-surface",
+  "write-cancel-spawn",
+  "write-cancel-dispatch",
+  "write-cancel-live-provider",
+  "write-cancel-reconnect",
+  "write-cancel-spawn-replay",
+  "write-cancel-request",
+  "write-cancel-wait",
+  "write-cancel-result",
+  "write-cancel-runtime-cleanup",
+  "write-cancel-production-cleanup",
+  "write-cancel-session-absence",
+  "write-cancel-cleanup-reconnect",
+  "write-cancel-cleanup",
   "emergency-cleanup"
 ]);
 let qualificationStage = "startup";
@@ -3332,7 +3347,7 @@ function validateWriteSpawnResponseWitness(
   publicWorker,
   job,
   spawnKey,
-  { replayed }
+  { replayed, expectCurrentProjection = replayed }
 ) {
   const keyDigest = crypto
     .createHash("sha256")
@@ -3384,7 +3399,7 @@ function validateWriteSpawnResponseWitness(
   ) {
     fail("E_PRIVATE_STATE");
   }
-  if (replayed) {
+  if (expectCurrentProjection) {
     let currentHandle;
     try {
       currentHandle = context.workerProtocol.projectWorkerHandle(job, {
@@ -4003,7 +4018,8 @@ async function waitForTerminalProcessClosure(
 async function waitForWriteSmokeProcessClosure(
   context,
   workerId,
-  retainedProviderIdentities = []
+  retainedProviderIdentities = [],
+  expectedStatus = "completed"
 ) {
   const deadline = Date.now() + TERMINAL_PROCESS_CLOSURE_TIMEOUT_MS;
   let stableScans = 0;
@@ -4016,7 +4032,7 @@ async function waitForWriteSmokeProcessClosure(
       context.env
     );
     if (
-      latest.status !== "completed"
+      latest.status !== expectedStatus
       || latest.result?.taskRuntimeCleaned !== true
     ) {
       fail("E_CLEANUP");
@@ -4778,6 +4794,189 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   enterQualificationStage("completion-contract");
   validateInstalledCompletionScenario(publicEvidence);
   return { context, tracker, publicEvidence };
+}
+
+function observeActiveWriteProvider(
+  context,
+  workerId,
+  parentBefore
+) {
+  const job = context.state.readJob(
+    context.fixtureRoot,
+    workerId,
+    context.env
+  );
+  try {
+    context.mutation.assertDispatchContract(job);
+  } catch {
+    fail("E_PRIVATE_STATE");
+  }
+  const dispatch = job.request?.spawn?.dispatch;
+  const expectedExecutionRoot =
+    context.workerWorktree.expectedWorkerWorktreeRoot(
+      context.fixtureRoot,
+      workerId,
+      context.env
+    );
+  if (
+    job.id !== workerId
+    || job.write !== true
+    || !["queued", "running"].includes(job.status)
+    || job.role?.id !== "implementer"
+    || job.profile?.id !== "rescue-write-v3"
+    || job.host?.kind !== "codex"
+    || job.host?.sessionId !== context.threadId
+    || job.request?.spawn?.ownerThreadId !== context.threadId
+    || job.provisioning?.state !== "ready"
+    || job.request?.spawn?.providerLaunchOutcome !== "launched"
+    || dispatch?.state !== "provider-started"
+    || dispatch.providerGeneration !== 1
+    || dispatch.nextProviderGeneration !== null
+    || job.providerProcess?.providerGeneration !== 1
+    || !CANONICAL_UUID.test(job.grokSessionId || "")
+    || !CANONICAL_UUID.test(
+      job.provisioningRuntime?.intent?.operationId || ""
+    )
+    || job.executionBinding?.expectedExecutionRoot !== expectedExecutionRoot
+    || job.request?.spawn?.executionRoot !== expectedExecutionRoot
+    || job.request?.spawn?.executionBindingDigest
+      !== job.executionBinding?.bindingDigest
+    || !sameJson(job.request?.envelope?.scope, {
+      include: ["target.txt"],
+      exclude: []
+    })
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  const processIdentities = {
+    controller: job.controllerProcess,
+    worker: job.workerProcess,
+    provider: job.providerProcess
+  };
+  for (const [kind, identity] of Object.entries(processIdentities)) {
+    try {
+      context.processControl.assertCompleteDetachedOwnedIdentity(identity);
+    } catch {
+      fail("E_PRIVATE_STATE");
+    }
+    if (
+      identity.commandMarker !== workerId
+      || identity.processGroupId !== identity.pid
+      || identity.dispatchAttemptId !== dispatch.attemptId
+      || identity.dispatchFence !== dispatch.fence
+      || (kind === "provider" && identity.providerGeneration !== 1)
+      || (
+        kind !== "controller"
+        && context.processControl.processGroupGone(identity)
+      )
+    ) {
+      fail("E_PRIVATE_STATE");
+    }
+  }
+  let guard;
+  try {
+    guard = context.guard.loadProviderGuard(context.fixtureRoot, workerId);
+    guard = context.guard.assertProviderGuardForJob(
+      context.fixtureRoot,
+      job,
+      guard,
+      { expectedGeneration: 1 }
+    );
+  } catch {
+    fail("E_PRIVATE_STATE");
+  }
+  if (
+    !guard
+    || !context.guard.sameGuardProcessIdentity(
+      guard.providerProcess,
+      job.providerProcess
+    )
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  const managedIdentity =
+    context.workerWorktree.assertRegisteredWorkerWorktreeIdentity({
+      controlRoot: context.fixtureRoot,
+      executionRoot: expectedExecutionRoot,
+      baseCommit: parentBefore.head,
+      workerId,
+      env: context.env
+    });
+  const executionRootStat = fs.lstatSync(expectedExecutionRoot);
+  if (
+    !executionRootStat.isDirectory()
+    || executionRootStat.isSymbolicLink()
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  context.workerWorktree.assertParentUnchanged(
+    parentBefore,
+    context.fixtureRoot
+  );
+  if (
+    fs.readFileSync(
+      path.join(context.fixtureRoot, "target.txt"),
+      "utf8"
+    ) !== "before\n"
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  return Object.freeze({
+    job,
+    guard,
+    identity: Object.freeze({
+      workerId,
+      controlWorkspaceId: job.controlWorkspaceId,
+      executionBindingDigest: job.executionBinding.bindingDigest,
+      provisioningOperationId:
+        job.provisioningRuntime.intent.operationId,
+      providerSessionId: job.grokSessionId,
+      dispatchAttemptId: dispatch.attemptId,
+      dispatchFence: dispatch.fence,
+      providerGeneration: dispatch.providerGeneration,
+      controllerProcess: structuredClone(job.controllerProcess),
+      workerProcess: structuredClone(job.workerProcess),
+      providerProcess: structuredClone(job.providerProcess),
+      providerSpawnIntentId:
+        job.request?.spawn?.providerSpawnIntent?.intentId,
+      managedWorktree: structuredClone(managedIdentity),
+      executionRootDevice: executionRootStat.dev,
+      executionRootInode: executionRootStat.ino
+    })
+  });
+}
+
+async function waitForActiveWriteProvider(
+  context,
+  workerId,
+  parentBefore
+) {
+  const deadline = Date.now() + 120_000;
+  while (Date.now() <= deadline) {
+    checkInterrupted(context.runner);
+    try {
+      const job = context.state.tryReadJob(
+        context.fixtureRoot,
+        workerId,
+        context.env
+      );
+      if (
+        job
+        && !["completed", "failed", "cancelled"].includes(job.status)
+        && job.request?.spawn?.dispatch?.state === "provider-started"
+        && job.providerProcess?.providerGeneration === 1
+        && CANONICAL_UUID.test(job.grokSessionId || "")
+      ) {
+        return observeActiveWriteProvider(
+          context,
+          workerId,
+          parentBefore
+        );
+      }
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, STATE_POLL_MS));
+  }
+  fail("E_PRIVATE_STATE");
 }
 
 async function runWriteSmokeScenario(baseContext, fixtureRoot) {
@@ -5636,6 +5835,409 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     integrationReplayProven: true,
     cleanupReplayProven: true,
     providerSessionAbsent: true
+  });
+}
+
+async function runWriteCancellationScenario(baseContext, fixtureRoot) {
+  const context = { ...baseContext, fixtureRoot, writeSmoke: true };
+  enterQualificationStage("write-cancel-fixture");
+  initializeFixtureRepository(
+    fixtureRoot,
+    context.env,
+    {
+      writeTarget: true,
+      workloadFiles: ACTIVE_WINDOW_WORKLOAD_FILES
+    }
+  );
+  const parentBefore =
+    context.workerWorktree.captureParentFingerprint(fixtureRoot);
+
+  enterQualificationStage("write-cancel-mcp-surface");
+  let client = await startInstalledMcp(context);
+  await verifyMcpSurface(context, client, { negative: true });
+
+  enterQualificationStage("write-cancel-spawn");
+  const spawnArguments = {
+    idempotencyKey:
+      `installed-write-cancel-spawn-${crypto.randomUUID()}`,
+    userRequest: [
+      "Edit only target.txt in the current isolated worktree.",
+      "Before editing target.txt, use read-only workspace tools to inspect every numbered file under qualification-workload in ascending order.",
+      `Account for all ${ACTIVE_WINDOW_WORKLOAD_FILES} markers before any edit.`,
+      "Only after that bounded inspection, replace target.txt with exactly the single line after followed by one newline.",
+      "Do not commit and do not modify any other path.",
+      "After editing, return the required structured worker report with only target.txt in changedFiles and AC-01 and AC-02 marked met."
+    ].join(" ")
+  };
+  const spawned = await callTool(
+    context,
+    client,
+    "worker_spawn_write",
+    spawnArguments,
+    [
+      "worker",
+      "replayed",
+      "spawnSuccessDefinition",
+      "providerLaunchState",
+      "providerLaunched"
+    ]
+  );
+  const workerId = spawned.worker?.id;
+  if (
+    typeof workerId !== "string"
+    || spawned.worker?.write !== true
+    || spawned.worker?.roleId !== "implementer"
+    || spawned.replayed !== false
+    || spawned.spawnSuccessDefinition !== "durable-job-commit"
+    || spawned.providerLaunchState !== "not-ready"
+    || spawned.providerLaunched !== false
+  ) {
+    fail("E_SCENARIO");
+  }
+  context.runner.writeSmoke = { context, workerId };
+
+  enterQualificationStage("write-cancel-dispatch");
+  const initialPage = await callWriteSmokeWait(
+    context,
+    client,
+    workerId,
+    null,
+    0
+  );
+  if (
+    !isPlainRecord(initialPage.stream)
+    || initialPage.stream.terminal !== false
+    || !isPlainRecord(initialPage.stream.nextCursor)
+    || initialPage.stream.nextCursor.workerId !== workerId
+  ) {
+    fail("E_SCENARIO");
+  }
+  let cursor = initialPage.stream.nextCursor;
+
+  enterQualificationStage("write-cancel-live-provider");
+  const activeBeforeReplay = await waitForActiveWriteProvider(
+    context,
+    workerId,
+    parentBefore
+  );
+  const writeSpawnWitnessBeforeReplay = validateWriteSpawnResponseWitness(
+    context,
+    spawned.worker,
+    activeBeforeReplay.job,
+    spawnArguments.idempotencyKey,
+    { replayed: false }
+  );
+
+  enterQualificationStage("write-cancel-reconnect");
+  await closeMcp(context, client);
+  client = await startInstalledMcp(context);
+  await verifyMcpSurface(context, client, { negative: true });
+
+  enterQualificationStage("write-cancel-spawn-replay");
+  const spawnReplay = await callTool(
+    context,
+    client,
+    "worker_spawn_write",
+    spawnArguments,
+    [
+      "worker",
+      "replayed",
+      "spawnSuccessDefinition",
+      "providerLaunchState",
+      "providerLaunched"
+    ]
+  );
+  if (
+    spawnReplay.replayed !== true
+    || spawnReplay.worker?.id !== workerId
+    || !["queued", "running"].includes(spawnReplay.worker?.status)
+    || spawnReplay.worker?.terminal !== false
+    || spawnReplay.worker?.write !== true
+    || spawnReplay.worker?.roleId !== "implementer"
+    || spawnReplay.spawnSuccessDefinition !== "durable-job-commit"
+    || spawnReplay.providerLaunchState !== "worktree-ready-no-dispatch"
+    || spawnReplay.providerLaunched !== false
+  ) {
+    fail("E_SCENARIO");
+  }
+  const activeAfterReplay = observeActiveWriteProvider(
+    context,
+    workerId,
+    parentBefore
+  );
+  const writeSpawnWitnessAfterReplay = validateWriteSpawnResponseWitness(
+    context,
+    spawnReplay.worker,
+    activeAfterReplay.job,
+    spawnArguments.idempotencyKey,
+    { replayed: true, expectCurrentProjection: false }
+  );
+  if (
+    !sameJson(activeAfterReplay.identity, activeBeforeReplay.identity)
+    || writeSpawnWitnessAfterReplay.witness.responseSequence
+      !== writeSpawnWitnessBeforeReplay.witness.responseSequence + 1
+    || writeSpawnWitnessAfterReplay.witness.requestDigest
+      !== writeSpawnWitnessBeforeReplay.witness.requestDigest
+    || writeSpawnWitnessAfterReplay.witness.idempotencyKeyDigest
+      !== writeSpawnWitnessBeforeReplay.witness.idempotencyKeyDigest
+    || Date.parse(writeSpawnWitnessAfterReplay.witness.recordedAt)
+      < Date.parse(writeSpawnWitnessBeforeReplay.witness.recordedAt)
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+
+  enterQualificationStage("write-cancel-request");
+  const cancelArguments = {
+    id: workerId,
+    idempotencyKey:
+      `installed-write-cancel-request-${crypto.randomUUID()}`
+  };
+  const cancelled = await callTool(
+    context,
+    client,
+    "worker_cancel",
+    cancelArguments,
+    ["receipt", "replayed"]
+  );
+  const cancelReplay = await callTool(
+    context,
+    client,
+    "worker_cancel",
+    cancelArguments,
+    ["receipt", "replayed"]
+  );
+  if (
+    cancelled.replayed !== false
+    || cancelReplay.replayed !== true
+    || !sameJson(cancelled.receipt, cancelReplay.receipt)
+    || cancelled.receipt?.workerId !== workerId
+    || cancelled.receipt?.idempotencyKeyDigest
+      !== crypto
+        .createHash("sha256")
+        .update(cancelArguments.idempotencyKey)
+        .digest("hex")
+  ) {
+    fail("E_SCENARIO");
+  }
+
+  enterQualificationStage("write-cancel-wait");
+  const deadline = Date.now() + SCENARIO_TIMEOUT_MS;
+  let terminal = false;
+  while (Date.now() < deadline) {
+    const page = await callWriteSmokeWait(
+      context,
+      client,
+      workerId,
+      cursor,
+      30_000
+    );
+    if (
+      !isPlainRecord(page.stream)
+      || typeof page.stream.terminal !== "boolean"
+      || !isPlainRecord(page.stream.nextCursor)
+      || page.stream.nextCursor.workerId !== workerId
+    ) {
+      fail("E_SCENARIO");
+    }
+    cursor = page.stream.nextCursor;
+    if (page.stream.terminal) {
+      terminal = true;
+      break;
+    }
+  }
+  if (!terminal) fail("E_SCENARIO");
+
+  enterQualificationStage("write-cancel-result");
+  const result = await callTool(
+    context,
+    client,
+    "worker_result",
+    { id: workerId },
+    ["worker"]
+  );
+  const terminalJob = context.state.readJob(
+    fixtureRoot,
+    workerId,
+    context.env
+  );
+  let projectedTerminal;
+  try {
+    context.mutation.assertDispatchContract(terminalJob);
+    projectedTerminal = context.workerProtocol.projectWorkerSnapshot(
+      terminalJob,
+      {
+        detail: true,
+        trustHostAuthority: false
+      }
+    );
+  } catch {
+    fail("E_PRIVATE_STATE");
+  }
+  const cancellationEvents = (terminalJob.lifecycleEvents || [])
+    .filter((event) => event?.type === "cancellation.requested");
+  if (
+    !sameJson(result.worker, projectedTerminal)
+    || result.worker?.id !== workerId
+    || result.worker?.write !== true
+    || result.worker?.roleId !== "implementer"
+    || result.worker?.status !== "cancelled"
+    || result.worker?.phase !== "cancelled"
+    || result.worker?.terminal !== true
+    || result.worker?.result?.stopReason !== "cancelled"
+    || result.worker?.result?.taskRuntimeCleaned !== true
+    || terminalJob.status !== "cancelled"
+    || terminalJob.result?.stopReason !== "cancelled"
+    || terminalJob.result?.taskRuntimeCleaned !== true
+    || terminalJob.result?.hostVerification !== "not_run"
+    || Object.hasOwn(terminalJob.result || {}, "writeArtifact")
+    || terminalJob.request?.spawn?.dispatch?.providerGeneration !== 1
+    || cancellationEvents.length !== 1
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+
+  enterQualificationStage("write-cancel-runtime-cleanup");
+  const retainedProviderIdentities = [
+    activeBeforeReplay.identity.providerProcess
+  ];
+  await waitForWriteSmokeProcessClosure(
+    context,
+    workerId,
+    retainedProviderIdentities,
+    "cancelled"
+  );
+  if (context.guard.loadProviderGuard(fixtureRoot, workerId) !== null) {
+    fail("E_CLEANUP");
+  }
+  context.workerWorktree.assertParentUnchanged(parentBefore, fixtureRoot);
+  if (
+    fs.readFileSync(path.join(fixtureRoot, "target.txt"), "utf8")
+      !== "before\n"
+  ) {
+    fail("E_CLEANUP");
+  }
+
+  enterQualificationStage("write-cancel-production-cleanup");
+  const cleanupArguments = {
+    id: workerId,
+    idempotencyKey:
+      `installed-write-discard-cleanup-${crypto.randomUUID()}`
+  };
+  const cleaned = await callTool(
+    context,
+    client,
+    "worker_cleanup",
+    cleanupArguments,
+    ["receipt", "replayed"]
+  );
+  const cleanupReceipt = cleaned.receipt;
+  if (
+    cleaned.replayed !== false
+    || cleanupReceipt?.workerId !== workerId
+    || cleanupReceipt?.operation !== "cleanup"
+    || cleanupReceipt?.status !== "absent"
+    || cleanupReceipt?.disposition !== "discarded"
+    || cleanupReceipt?.terminalStatus !== "cancelled"
+    || cleanupReceipt?.integrationReceiptDigest !== null
+    || cleanupReceipt?.parentFingerprintDigest
+      !== parentBefore.fingerprintDigest
+    || !/^[a-f0-9]{64}$/.test(
+      cleanupReceipt?.terminalEvidenceDigest || ""
+    )
+    || !/^[a-f0-9]{64}$/.test(cleanupReceipt?.receiptDigest || "")
+    || !/^[a-f0-9]{64}$/.test(
+      cleanupReceipt?.absenceProofDigest || ""
+    )
+  ) {
+    fail("E_SCENARIO");
+  }
+
+  enterQualificationStage("write-cancel-session-absence");
+  const sessionPrincipal = Object.freeze({
+    hostKind: "codex",
+    threadId: context.threadId
+  });
+  for (let observation = 0; observation < 2; observation += 1) {
+    const absent = await context.workerSessionLifecycle
+      .inspectOwnedProviderSession({
+        root: fixtureRoot,
+        principal: sessionPrincipal,
+        workerId,
+        providerSessionId: terminalJob.grokSessionId,
+        env: context.env
+      });
+    if (absent?.present !== false) fail("E_SESSION");
+  }
+
+  enterQualificationStage("write-cancel-cleanup-reconnect");
+  await closeMcp(context, client);
+  client = await startInstalledMcp(context);
+  await verifyMcpSurface(context, client, { negative: true });
+  const cleanupReplay = await callTool(
+    context,
+    client,
+    "worker_cleanup",
+    cleanupArguments,
+    ["receipt", "replayed"]
+  );
+  if (
+    cleanupReplay.replayed !== true
+    || !sameJson(cleanupReplay.receipt, cleanupReceipt)
+  ) {
+    fail("E_SCENARIO");
+  }
+
+  enterQualificationStage("write-cancel-cleanup");
+  await closeMcp(context, client);
+  await waitForWriteSmokeProcessClosure(
+    context,
+    workerId,
+    retainedProviderIdentities,
+    "cancelled"
+  );
+  if (context.guard.loadProviderGuard(fixtureRoot, workerId) !== null) {
+    fail("E_CLEANUP");
+  }
+  const expectedExecutionRoot =
+    context.workerWorktree.expectedWorkerWorktreeRoot(
+      fixtureRoot,
+      workerId,
+      context.env
+    );
+  const removed = context.workerWorktree.classifyWorkerWorktreeEffect({
+    controlRoot: fixtureRoot,
+    executionRoot: expectedExecutionRoot,
+    baseCommit: parentBefore.head,
+    workerId,
+    env: context.env
+  });
+  context.workerWorktree.assertParentUnchanged(parentBefore, fixtureRoot);
+  if (
+    removed.classification !== "absent"
+    || fs.existsSync(expectedExecutionRoot)
+    || fs.readFileSync(path.join(fixtureRoot, "target.txt"), "utf8")
+      !== "before\n"
+  ) {
+    fail("E_CLEANUP");
+  }
+  return Object.freeze({
+    workerId,
+    status: result.worker.status,
+    activeProviderObserved: true,
+    spawnReplayProven: true,
+    providerRelaunchDelta: 0,
+    worktreeCreateDelta: 0,
+    cancelReplayProven: true,
+    taskRuntimeCleaned: true,
+    parentUnchanged: true,
+    artifactAbsent: true,
+    cleanupDisposition: cleanupReceipt.disposition,
+    cleanupReceiptDigest: cleanupReceipt.receiptDigest,
+    terminalEvidenceDigest: cleanupReceipt.terminalEvidenceDigest,
+    absenceProofDigest: cleanupReceipt.absenceProofDigest,
+    cleanupReplayProven: true,
+    providerSessionAbsent: true,
+    worktreeAbsent: true
   });
 }
 
@@ -6614,6 +7216,7 @@ async function qualify(runner, { writeSmoke = false } = {}) {
   const completionFixture = path.join(runner.temporaryRoot, "completion-fixture");
   const cancellationFixture = path.join(runner.temporaryRoot, "cancellation-fixture");
   const writeSmokeFixture = path.join(runner.temporaryRoot, "write-smoke-fixture");
+  const writeCancelFixture = path.join(runner.temporaryRoot, "write-cancel-fixture");
   mkdirPrivate(codexHome);
   mkdirPrivate(pluginData);
   const threadId = crypto.randomUUID();
@@ -6886,8 +7489,14 @@ async function qualify(runner, { writeSmoke = false } = {}) {
       baseContext,
       writeSmokeFixture
     );
+    const cancellationEvidence = await runWriteCancellationScenario(
+      baseContext,
+      writeCancelFixture
+    );
     const pinnedEvidence = Object.freeze({
       ...evidence,
+      activeWriteCancellationProven: true,
+      writeCancellation: cancellationEvidence,
       sourceHeadCommit: sourceIdentity.headCommit,
       sourceHeadTree: sourceIdentity.headTree,
       sourceInventoryDigest: sourceDigest,
