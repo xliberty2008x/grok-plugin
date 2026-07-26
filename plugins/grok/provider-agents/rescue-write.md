@@ -1,7 +1,7 @@
 ---
 name: grok-companion-write
 description: Isolated workspace-write task agent for Grok Companion.
-prompt_mode: full
+prompt_mode: extend
 permission_mode: acceptEdits
 agents_md: false
 injectDefaultTools: false

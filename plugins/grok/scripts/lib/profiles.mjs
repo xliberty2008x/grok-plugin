@@ -7,10 +7,12 @@ const PROVIDER_AGENTS = path.resolve(path.dirname(fileURLToPath(import.meta.url)
 const base = { contractVersion: 3, webSearch: false, subagents: false, isolatedLeader: true };
 const AGENT_PROFILE_BINDINGS = Object.freeze({
   "report-repair.md": Object.freeze({
+    promptMode: "full",
     permissionMode: "dontAsk",
     providerToolIds: Object.freeze(["GrokBuild:todo_write"])
   }),
   "rescue-read.md": Object.freeze({
+    promptMode: "full",
     permissionMode: "dontAsk",
     providerToolIds: Object.freeze([
       "GrokBuild:read_file",
@@ -19,6 +21,7 @@ const AGENT_PROFILE_BINDINGS = Object.freeze({
     ])
   }),
   "rescue-write.md": Object.freeze({
+    promptMode: "extend",
     permissionMode: "acceptEdits",
     providerToolIds: Object.freeze([
       "GrokBuild:read_file",
@@ -49,6 +52,7 @@ export function assertProviderAgentProfileContract(contents, expected, name = "p
   const text = Buffer.isBuffer(contents) ? contents.toString("utf8") : String(contents);
   const frontmatter = leadingFrontmatter(text, name);
   if (!expected
+    || !["extend", "full"].includes(expected.promptMode)
     || typeof expected.permissionMode !== "string"
     || !Array.isArray(expected.providerToolIds)
     || expected.providerToolIds.length === 0
@@ -59,7 +63,7 @@ export function assertProviderAgentProfileContract(contents, expected, name = "p
   const prefix = [
     /^name: [a-z0-9][a-z0-9-]*$/,
     /^description: \S.*$/,
-    /^prompt_mode: full$/,
+    new RegExp(`^prompt_mode: ${expected.promptMode}$`),
     new RegExp(`^permission_mode: ${expected.permissionMode}$`),
     /^agents_md: false$/,
     /^injectDefaultTools: false$/,
@@ -92,6 +96,7 @@ function agentProfileBinding(name) {
   const toolIds = assertProviderAgentProfileContract(contents, expected, name);
   return {
     agentProfileDigest: crypto.createHash("sha256").update(contents).digest("hex"),
+    promptMode: expected.promptMode,
     providerToolIds: [...toolIds]
   };
 }
@@ -139,7 +144,7 @@ export function profileFor(kind, write = false) {
 }
 
 export function sameSecurityProfile(a, b) {
-  const keys = ["id", "contractVersion", "transport", "agent", "sandbox", "permissionMode", "webSearch", "subagents", "isolatedLeader", "agentProfileDigest"];
+  const keys = ["id", "contractVersion", "transport", "agent", "sandbox", "permissionMode", "promptMode", "webSearch", "subagents", "isolatedLeader", "agentProfileDigest"];
   return keys.every((key) => JSON.stringify(a?.[key]) === JSON.stringify(b?.[key]))
     && JSON.stringify(a?.allowedTools) === JSON.stringify(b?.allowedTools)
     && JSON.stringify(a?.deniedTools) === JSON.stringify(b?.deniedTools)

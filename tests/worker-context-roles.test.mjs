@@ -362,6 +362,7 @@ test("RuntimeRolePolicy binds the exact role, provider profile, agent bytes, and
 
 test("provider profile semantics come only from one exact leading frontmatter declaration", () => {
   const expected = {
+    promptMode: "full",
     permissionMode: "dontAsk",
     providerToolIds: [
       "GrokBuild:read_file",
