@@ -1384,6 +1384,20 @@ async function callWriteSmokeResult(context, client, workerId) {
     || status !== "completed"
     || !Object.hasOwn(structured || {}, "artifact")
   ) {
+    let privateJob = null;
+    try {
+      privateJob = context.state.tryReadJob(
+        context.fixtureRoot,
+        workerId,
+        context.env
+      );
+    } catch {
+      privateJob = null;
+    }
+    const privateDispatch = privateJob?.request?.spawn?.dispatch;
+    const privateErrorMessage = typeof privateJob?.error?.message === "string"
+      ? privateJob.error.message
+      : null;
     process.stderr.write(
       `Installed Worker MCP write-smoke diagnostic ${JSON.stringify({
         schemaVersion: 1,
@@ -1396,7 +1410,50 @@ async function callWriteSmokeResult(context, client, workerId) {
         workerStatus: status,
         workerPhase: phase,
         workerErrorCode,
-        artifactPresent: Object.hasOwn(structured || {}, "artifact")
+        artifactPresent: Object.hasOwn(structured || {}, "artifact"),
+        privateStateReadable: privateJob !== null,
+        providerLaunchOutcome: /^[a-z][a-z0-9-]{0,31}$/.test(
+          String(privateJob?.request?.spawn?.providerLaunchOutcome || "")
+        )
+          ? privateJob.request.spawn.providerLaunchOutcome
+          : null,
+        dispatchState: /^[a-z][a-z0-9-]{0,31}$/.test(
+          String(privateDispatch?.state || "")
+        )
+          ? privateDispatch.state
+          : null,
+        providerGeneration: Number.isSafeInteger(
+          privateDispatch?.providerGeneration
+        )
+          ? privateDispatch.providerGeneration
+          : null,
+        controllerProcessPresent: privateJob?.controllerProcess != null,
+        workerProcessPresent: privateJob?.workerProcess != null,
+        providerProcessPresent: privateJob?.providerProcess != null,
+        providerSessionPresent:
+          typeof privateJob?.grokSessionId === "string",
+        taskRuntimeCleaned:
+          privateJob?.result?.taskRuntimeCleaned === true,
+        stopReason: /^[a-z][a-z0-9-]{0,63}$/.test(
+          String(privateJob?.result?.stopReason || "")
+        )
+          ? privateJob.result.stopReason
+          : null,
+        workerReportValid:
+          privateJob?.result?.workerReport?.valid === true,
+        workerReportOutcome: ["complete", "partial", "blocked"].includes(
+          privateJob?.result?.workerReport?.outcome
+        )
+          ? privateJob.result.workerReport.outcome
+          : null,
+        privateErrorMessageDigest: privateErrorMessage
+          ? crypto.createHash("sha256").update(privateErrorMessage).digest("hex")
+          : null,
+        lifecycleEventTypes: Array.isArray(privateJob?.lifecycleEvents)
+          ? privateJob.lifecycleEvents
+              .slice(-8)
+              .map((event) => String(event?.type || "").slice(0, 64))
+          : []
       })}\n`
     );
     fail("E_SCENARIO");
