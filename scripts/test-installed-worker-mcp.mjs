@@ -4674,6 +4674,8 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
         "Edit only target.txt in the current isolated worktree.",
         "Replace its complete contents with exactly the single line: after",
         "The file must end with one newline.",
+        "You must perform the mutation with an actual workspace editing tool; a completion report without an observed file change is a failure.",
+        "After editing, read target.txt again and verify its complete contents are exactly after followed by one newline.",
         "Do not commit and do not modify any other path.",
         "Verify the edit, then return the required structured worker report.",
         "In that report, list only target.txt in changedFiles and mark AC-01 and AC-02 met only if the exact edit and one-file scope were verified."
