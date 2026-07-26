@@ -7091,7 +7091,10 @@ test("private signed review promotion is atomic, immutable, concurrent, and rest
   // Hosted macOS runners may need more than ten seconds to start both isolated
   // ESM children. This extends only readiness scheduling; both writers still
   // block on the same barrier before the concurrency assertion begins.
-  await waitFor(() => fs.existsSync(firstReady) && fs.existsSync(secondReady), 30_000);
+  await waitFor(
+    () => fs.existsSync(firstReady) && fs.existsSync(secondReady),
+    { timeoutMs: 30_000 }
+  );
   fs.writeFileSync(barrier, "go\n");
   const results = await Promise.all([first.completed, second.completed]);
   assert.deepEqual(
@@ -7295,7 +7298,7 @@ test("signed review promotion reports durable ambiguity and converges after ackn
       ready,
       barrier
     });
-    await waitFor(() => fs.existsSync(ready), 10_000);
+    await waitFor(() => fs.existsSync(ready), { timeoutMs: 10_000 });
     fs.writeFileSync(barrier, "go\n");
     const failed = await child.completed;
     assert.equal(failed.code, 1, failed.stderr);

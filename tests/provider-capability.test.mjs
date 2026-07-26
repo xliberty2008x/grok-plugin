@@ -29,12 +29,43 @@ const RECEIPT_RELATIVE_PATH = path.join(
   "capabilities",
   "provider-capability-v2.json"
 );
+const PINNED_PROVIDER_VERSION = "0.2.99";
 
 function sha256(file) {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
-function releaseFor(fileIdentity, version = "0.2.99") {
+/**
+ * Test-only POSIX executable for capability pin/lifecycle tests.
+ * Production grokVersion spawns the extensionless pin with shell:false; a
+ * tiny shell script remains executable after pin copying and avoids Node 18
+ * treating an extensionless JavaScript double as CommonJS.
+ */
+function installVersionCapableProvider(directory, version = PINNED_PROVIDER_VERSION) {
+  if (process.platform === "win32") {
+    throw new Error("Provider capability pin fixtures currently target POSIX runners.");
+  }
+  assert.equal(fs.existsSync("/bin/sh"), true, "version-capable provider requires /bin/sh");
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const binary = path.join(directory, "grok");
+  fs.writeFileSync(
+    binary,
+    [
+      "#!/bin/sh",
+      `if [ "$1" = "--version" ]; then`,
+      `  printf '%s\\n' "grok ${version}"`,
+      "  exit 0",
+      "fi",
+      "exit 1",
+      ""
+    ].join("\n"),
+    { encoding: "utf8", mode: 0o700 }
+  );
+  fs.chmodSync(binary, 0o700);
+  return { binary, version };
+}
+
+function releaseFor(fileIdentity, version = PINNED_PROVIDER_VERSION) {
   return Object.freeze({
     releaseSource: "official-package-pin-v1",
     packageName: "@xai-official/grok",
@@ -52,19 +83,21 @@ function releaseFor(fileIdentity, version = "0.2.99") {
 }
 
 function fixture() {
-  const fake = installFakeGrok(tempDir("grok-provider-capability-bin-"));
+  const provider = installVersionCapableProvider(
+    tempDir("grok-provider-capability-bin-")
+  );
   const pluginData = tempDir("grok-provider-capability-data-");
   const env = {
     HOME: path.dirname(pluginData),
-    PATH: path.dirname(fake.binary),
+    PATH: path.dirname(provider.binary),
     PLUGIN_DATA: pluginData,
     GROK_COMPANION_HOST: "codex"
   };
-  const release = releaseFor(captureExecutableFileIdentity(fake.binary));
+  const release = releaseFor(captureExecutableFileIdentity(provider.binary));
   const pinned = publishProviderExecutablePin({
     env,
     releases: [release],
-    sourceBinary: fake.binary,
+    sourceBinary: provider.binary,
     clock: () => Date.parse("2026-07-23T09:59:00.000Z")
   });
   const runtime = {
@@ -82,7 +115,7 @@ function fixture() {
     }
   };
   return {
-    fake,
+    provider,
     pluginData,
     env,
     release,
@@ -172,7 +205,7 @@ test("provider capability v2 is path-free, pin-bound, tamper-evident, and durabl
   assert.equal(fs.lstatSync(state.receiptFile).mode & 0o077, 0);
   const serialized = fs.readFileSync(state.receiptFile, "utf8");
   for (const forbidden of [
-    state.fake.binary,
+    state.provider.binary,
     state.pinned.binary,
     "binaryPath",
     "auth",
