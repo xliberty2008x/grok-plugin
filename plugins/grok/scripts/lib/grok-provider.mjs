@@ -252,6 +252,22 @@ function ensureFreshCachedCredential(source, minimumValidityMs = 45 * 60 * 1000)
   }
 }
 
+function freshCachedCredentialPayload(
+  source,
+  minimumValidityMs = 45 * 60 * 1000
+) {
+  const payload = isolatedCredentialPayload(source);
+  const expiry = Date.parse(payload.expiresAt);
+  if (Number.isFinite(expiry)
+    && expiry - Date.now() < minimumValidityMs) {
+    throw new CompanionError(
+      "E_AUTH_REQUIRED",
+      `Grok cached authentication expires too soon for an isolated job. Run \`grok login\`, then ${hostCommand("setup")}.`
+    );
+  }
+  return payload;
+}
+
 function isolatedCredentialPayload(source) {
   const stat = fs.statSync(source);
   if (!stat.isFile() || stat.size <= 0 || stat.size > 2 * 1024 * 1024) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication is unavailable. Run \`grok login\`, then ${hostCommand("setup")}.`);
@@ -265,6 +281,7 @@ function isolatedCredentialPayload(source) {
   const isolated = { key: entry.key, auth_mode: entry.auth_mode || "oauth", create_time: entry.create_time || new Date().toISOString(), user_id: "", email: "", first_name: "", last_name: "", profile_image_asset_id: "", principal_type: entry.principal_type || "", principal_id: entry.principal_id || "", team_id: entry.team_id || "", coding_data_retention_opt_out: Boolean(entry.coding_data_retention_opt_out), refresh_token: "", expires_at: entry.expires_at || "", oidc_issuer: entry.oidc_issuer || "", oidc_client_id: entry.oidc_client_id || "" };
   return {
     key: entry.key,
+    expiresAt: entry.expires_at || "",
     contents: `${JSON.stringify({ [account]: isolated })}\n`
   };
 }
@@ -422,8 +439,12 @@ function unlinkIdentityBoundCredential(authFile, directoryIdentities, identity) 
   }
 }
 
-function stageRevocableTaskCredential(source, authFile, directoryIdentities) {
-  const payload = isolatedCredentialPayload(source);
+function stageRevocableTaskCredential(
+  source,
+  authFile,
+  directoryIdentities,
+  payload = isolatedCredentialPayload(source)
+) {
   const temporary = `${authFile}.tmp-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
   let handle = null;
   let published = false;
@@ -1139,10 +1160,11 @@ export function taskEnvironment(
         if (error?.code === "EEXIST") {
           throw new CompanionError(
             "E_STATE",
-            "A worktree controller home already exists; refusing ambiguous ownership."
+            "A worktree controller claim home already exists; refusing ambiguous ownership."
           );
+        } else {
+          throw error;
         }
-        throw error;
       }
       privateDirectory(home);
     } else {
@@ -1246,21 +1268,19 @@ export function taskEnvironment(
     );
     const authPath = process.env.GROK_AUTH_PATH || path.join(os.homedir(), ".grok", "auth.json");
     if (!fs.existsSync(authPath)) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication is unavailable. Run \`grok login\`, then ${hostCommand("setup")}.`);
-    ensureFreshCachedCredential(authPath);
+    if (!worktreeProvisioningController) {
+      ensureFreshCachedCredential(authPath);
+    }
     const authFile = path.join(grokHome, "auth.json");
     const directoryIdentities = worktreeProvisioningController
       ? [home, grokHome].map(existingPrivateDirectoryIdentity)
       : null;
-    const knownSecrets = worktreeProvisioningController
-      ? (() => {
-          stagedCredential = stageRevocableTaskCredential(
-            authPath,
-            authFile,
-            directoryIdentities
-          );
-          return [stagedCredential.key];
-        })()
-      : [writeReviewCredential(authPath, authFile, { refresh: true })];
+    const knownSecrets = [];
+    if (!worktreeProvisioningController) {
+      knownSecrets.push(
+        writeReviewCredential(authPath, authFile, { refresh: true })
+      );
+    }
     const gitEnv = gitInstallation
       ? controllerGitEnvironment(gitInstallation)
       : {};
@@ -1347,6 +1367,24 @@ export function taskEnvironment(
         provisioningDestinationParent: provisioningDestination.parent,
         provisioningExpectedRoot: provisioningDestination.expectedRoot
       } : {}),
+      stageCredential() {
+        if (!worktreeProvisioningController) return;
+        if (stagedCredentialRevoked) {
+          throw new CompanionError(
+            "E_STATE",
+            "A revoked worktree controller credential cannot be restaged."
+          );
+        }
+        if (stagedCredential) return;
+        const payload = freshCachedCredentialPayload(authPath);
+        stagedCredential = stageRevocableTaskCredential(
+          authPath,
+          authFile,
+          directoryIdentities,
+          payload
+        );
+        knownSecrets.push(stagedCredential.key);
+      },
       revokeCredential() {
         if (stagedCredential) {
           if (stagedCredentialRevoked) return;
@@ -2490,6 +2528,8 @@ export async function openProvider({ root, profile, model = null, effort = null,
       || fs.realpathSync(environment.controllerCwd)
         !== environment.controllerCwd
       || environment.controllerCwd === root
+      || typeof environment.stageCredential !== "function"
+      || typeof environment.assertCredentialAbsent !== "function"
       || model !== null
       || effort !== null
     )) {
@@ -2557,6 +2597,7 @@ export async function openProvider({ root, profile, model = null, effort = null,
       environment.verifyGitExecutable();
       inspectIsolation(binary, providerCwd, environment);
       environment.verifyGitExecutable();
+      environment.assertCredentialAbsent();
     } catch (error) {
       stagedProfile.cleanup();
       try {
@@ -2765,6 +2806,11 @@ export async function openProvider({ root, profile, model = null, effort = null,
           "Worktree provisioning bootstrap identity was not durably registered."
         );
       }
+      // The bootstrap remains blocked on its private specification pipe until
+      // this exact PID/start-token is durable. Publishing credential bytes
+      // earlier would leave an ownerless secret if the host died between HOME
+      // construction and activation.
+      environment.stageCredential();
       bootstrapSpecPublication = publishProviderBootstrapSpec(
         child,
         deferredBootstrapSpec

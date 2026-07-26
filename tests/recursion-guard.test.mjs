@@ -26,7 +26,9 @@ import {
 import {
   activateWriteProvisioningAttempt,
   admitWriteWorkerPlan,
-  prepareWriteProvisionerIntent
+  prepareWriteProvisionerIntent,
+  prepareWriteProvisioningReissue,
+  retainWriteProvisioningCleanupPending
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
 import {
@@ -59,6 +61,88 @@ const TEST_EXECUTABLE_IDENTITY = createExecutableAttestation({
   size: 4096,
   executableDigest: "1".repeat(64)
 });
+
+function canonicalize(value) {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(canonicalize);
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .filter((key) => value[key] !== undefined)
+      .map((key) => [key, canonicalize(value[key])])
+  );
+}
+
+function stableDigest(value) {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(canonicalize(value)))
+    .digest("hex");
+}
+
+function withoutDigest(value, key) {
+  const { [key]: _digest, ...body } = value;
+  return body;
+}
+
+function worktreeIntentDigestBody(intent) {
+  return {
+    schemaVersion: intent.schemaVersion,
+    purpose: intent.purpose,
+    workerId: intent.workerId,
+    intentId: intent.intentId,
+    providerSpawnIntentId: intent.providerSpawnIntentId,
+    operationId: intent.operationId,
+    executionBindingDigest: intent.executionBindingDigest,
+    expectedPlannedJournalDigest: intent.expectedPlannedJournalDigest,
+    provisioningAttemptId: intent.provisioningAttemptId,
+    provisioningFence: intent.provisioningFence,
+    holderId: intent.holderId,
+    executableIdentity: intent.executableIdentity,
+    preparedAt: intent.preparedAt
+  };
+}
+
+function worktreeActivationDigest(runtime) {
+  return stableDigest({
+    schemaVersion: 1,
+    intentDigest: runtime.intent.intentDigest,
+    providerSpawnIntentId: runtime.intent.providerSpawnIntentId,
+    processIdentity: runtime.intent.processIdentity,
+    executableIdentityDigest: runtime.intent.executableIdentity.identityDigest,
+    activatedAt: runtime.intent.activatedAt,
+    activatedJournalDigest: runtime.activatedJournalDigest
+  });
+}
+
+function resealArchivedAttemptJob(candidate) {
+  const runtime = candidate.provisioningRuntime;
+  const archive = runtime.priorAttempts[0];
+  const archived = archive.attemptEvidence;
+  archived.intent.intentDigest = stableDigest(
+    worktreeIntentDigestBody(archived.intent)
+  );
+  archived.activationDigest = worktreeActivationDigest({
+    intent: archived.intent,
+    activatedJournalDigest: archived.activatedJournalDigest
+  });
+  archived.cleanupProof.proofDigest = stableDigest(
+    withoutDigest(archived.cleanupProof, "proofDigest")
+  );
+  archive.absenceProof.proofDigest = stableDigest(
+    withoutDigest(archive.absenceProof, "proofDigest")
+  );
+  archive.archiveDigest = stableDigest(
+    withoutDigest(archive, "archiveDigest")
+  );
+  candidate.provisioning.priorAttemptArchiveDigest = archive.archiveDigest;
+  candidate.provisioning.journalDigest = stableDigest(
+    withoutDigest(candidate.provisioning, "journalDigest")
+  );
+  runtime.activatedJournalDigest = candidate.provisioning.journalDigest;
+  runtime.activationDigest = worktreeActivationDigest(runtime);
+  return candidate;
+}
 
 function waitForFileSync(file, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
@@ -723,17 +807,30 @@ test("worktree provisioning guard authenticates only canonical admitted and acti
     holderId: actor.holderId,
     providerSpawnIntentId: prepared.intent.providerSpawnIntentId
   };
+  let reissueChild = null;
+  let reissueIdentity = null;
   t.after(async () => {
     try { unregisterProviderGuard(root, workerId, null, env); } catch {}
-    try {
-      process.kill(process.platform === "win32" ? child.pid : -child.pid, "SIGKILL");
-    } catch {}
-    try {
-      await waitFor(() => processGroupGone(providerProcess), {
-        timeoutMs: 5_000,
-        intervalMs: 25
-      });
-    } catch {}
+    for (const [ownedChild, identity] of [
+      [child, providerProcess],
+      [reissueChild, reissueIdentity]
+    ]) {
+      if (!ownedChild || !identity) continue;
+      try {
+        process.kill(
+          process.platform === "win32"
+            ? ownedChild.pid
+            : -ownedChild.pid,
+          "SIGKILL"
+        );
+      } catch {}
+      try {
+        await waitFor(() => processGroupGone(identity), {
+          timeoutMs: 5_000,
+          intervalMs: 25
+        });
+      } catch {}
+    }
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(scratch, { recursive: true, force: true });
   });
@@ -916,6 +1013,166 @@ test("worktree provisioning guard authenticates only canonical admitted and acti
   );
   assert.deepEqual(loadProviderGuard(root, workerId), record);
   assert.equal(unregisterProviderGuard(root, workerId, record, env), true);
+  assert.equal(loadProviderGuard(root, workerId), null);
+
+  process.kill(
+    process.platform === "win32" ? child.pid : -child.pid,
+    "SIGKILL"
+  );
+  await waitFor(() => processGroupGone(providerProcess), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  const cleanupPendingAt = new Date(
+    Math.max(
+      Date.now(),
+      Date.parse(job.provisioningRuntime.intent.registeredAt) + 1
+    )
+  ).toISOString();
+  const retained = retainWriteProvisioningCleanupPending({
+    root,
+    principal,
+    workerId,
+    executionBindingDigest: binding.executionBindingDigest,
+    expectedJournalDigest: job.provisioning.journalDigest,
+    ...actor,
+    providerSpawnIntentId: prepared.intent.providerSpawnIntentId,
+    processIdentity: providerProcess,
+    cleanupProof: {
+      processIdentity: providerProcess,
+      processGroupGone: true,
+      providerGuardAbsent: true,
+      observedAt: cleanupPendingAt
+    },
+    cleanupPendingAt,
+    env
+  });
+  const workerParent = path.dirname(expectedExecutionRoot);
+  const managedRoot = path.dirname(workerParent);
+  fs.mkdirSync(workerParent, { recursive: true, mode: 0o700 });
+  fs.chmodSync(managedRoot, 0o700);
+  fs.chmodSync(workerParent, 0o700);
+  const reissueActor = {
+    attemptId: "b".repeat(32),
+    fence: 2,
+    holderId: "c".repeat(32),
+    executableIdentity: TEST_EXECUTABLE_IDENTITY
+  };
+  const reissue = prepareWriteProvisioningReissue({
+    root,
+    principal,
+    workerId,
+    executionBindingDigest: binding.executionBindingDigest,
+    expectedJournalDigest: retained.job.provisioning.journalDigest,
+    ...reissueActor,
+    env
+  });
+  reissueChild = spawn(
+    process.execPath,
+    ["-e", "setInterval(() => {}, 1000)", workerId, "worktree-provisioning"],
+    { detached: true, stdio: "ignore" }
+  );
+  reissueIdentity = {
+    pid: reissueChild.pid,
+    startToken: await waitFor(() => processStartToken(reissueChild.pid), {
+      timeoutMs: 5_000,
+      intervalMs: 25
+    }),
+    processGroupId: process.platform === "win32" ? null : reissueChild.pid
+  };
+  const reissueProvisioningAt = new Date(
+    Math.max(Date.now(), Date.parse(reissue.intent.preparedAt) + 1)
+  ).toISOString();
+  const reissueActivated = activateWriteProvisioningAttempt({
+    root,
+    principal,
+    workerId,
+    executionBindingDigest: binding.executionBindingDigest,
+    expectedJournalDigest: reissue.job.provisioning.journalDigest,
+    ...reissueActor,
+    providerSpawnIntentId: reissue.intent.providerSpawnIntentId,
+    processIdentity: reissueIdentity,
+    provisioningAt: reissueProvisioningAt,
+    leaseExpiresAt: new Date(
+      Date.parse(reissueProvisioningAt) + 60_000
+    ).toISOString(),
+    env
+  });
+  const reissueBinding = {
+    ...binding,
+    provisioningAttemptId: reissueActor.attemptId,
+    provisioningFence: reissueActor.fence,
+    holderId: reissueActor.holderId,
+    providerSpawnIntentId: reissue.intent.providerSpawnIntentId
+  };
+  const reissueRecord = registerWorktreeProvisioningGuard(
+    root,
+    workerId,
+    reissueIdentity,
+    owner,
+    reissueBinding,
+    env
+  );
+  const reissueJob = withWorkspaceStateTransaction(
+    root,
+    (transaction) => transaction.tryReadJob(workerId),
+    env
+  );
+  assert.equal(
+    assertWorktreeProvisioningGuardForJob(
+      root,
+      reissueJob,
+      reissueRecord,
+      { expectedBinding: reissueBinding, env }
+    ),
+    reissueRecord
+  );
+  assert.equal(
+    reissueJob.provisioningRuntime.priorAttempts.length,
+    1
+  );
+
+  const rehashedArchiveCorruptions = [
+    ["archived intent purpose", (candidate) => {
+      candidate.provisioningRuntime
+        .priorAttempts[0].attemptEvidence.intent.purpose = "provider-execution";
+    }],
+    ["cleanup proof schema", (candidate) => {
+      candidate.provisioningRuntime
+        .priorAttempts[0].attemptEvidence.cleanupProof.schemaVersion = 2;
+    }],
+    ["absence inventory digest", (candidate) => {
+      candidate.provisioningRuntime
+        .priorAttempts[0].absenceProof.rawInventoryDigest = "not-sha256";
+    }],
+    ["archived cleanup timeline", (candidate) => {
+      const archive = candidate.provisioningRuntime.priorAttempts[0];
+      archive.attemptEvidence.intent.updatedAt = new Date(
+        Date.parse(
+          archive.sourceCleanupPendingJournal.cleanupPendingAt
+        ) + 1
+      ).toISOString();
+    }]
+  ];
+  for (const [label, corrupt] of rehashedArchiveCorruptions) {
+    const candidate = structuredClone(reissueJob);
+    corrupt(candidate);
+    resealArchivedAttemptJob(candidate);
+    assert.throws(
+      () => assertWorktreeProvisioningGuardForJob(
+        root,
+        candidate,
+        reissueRecord,
+        { expectedBinding: reissueBinding, env }
+      ),
+      (error) => error?.code === "E_PROCESS_IDENTITY",
+      label
+    );
+  }
+  assert.equal(
+    unregisterProviderGuard(root, workerId, reissueRecord, env),
+    true
+  );
   assert.equal(loadProviderGuard(root, workerId), null);
 });
 

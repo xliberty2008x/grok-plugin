@@ -30,15 +30,22 @@ const WORKTREE_PROVISIONING_RUNTIME_KEYS = new Set([
   "activationDigest",
   "officialReceipt",
   "hostAdoption",
+  "priorAttempts",
   "executionContextManifest",
   "executionContextManifestRecordDigest",
   "cleanupProof"
 ]);
-const LEGACY_WORKTREE_PROVISIONING_RUNTIME_KEYS = new Set(
-  [...WORKTREE_PROVISIONING_RUNTIME_KEYS].filter(
+const LEGACY_WORKTREE_PROVISIONING_RUNTIME_KEY_SETS = Object.freeze([
+  new Set([...WORKTREE_PROVISIONING_RUNTIME_KEYS].filter(
     (key) => key !== "hostAdoption"
-  )
-);
+  )),
+  new Set([...WORKTREE_PROVISIONING_RUNTIME_KEYS].filter(
+    (key) => key !== "priorAttempts"
+  )),
+  new Set([...WORKTREE_PROVISIONING_RUNTIME_KEYS].filter(
+    (key) => key !== "hostAdoption" && key !== "priorAttempts"
+  ))
+]);
 const WORKTREE_PROVISIONING_INTENT_KEYS = new Set([
   "schemaVersion",
   "purpose",
@@ -67,6 +74,58 @@ const WORKTREE_PROVISIONING_PROCESS_KEYS = new Set([
   "pid",
   "startToken",
   "processGroupId"
+]);
+const WORKTREE_PROVISIONING_ARCHIVE_KEYS = new Set([
+  "schemaVersion",
+  "ordinal",
+  "previousArchiveDigest",
+  "operationId",
+  "sourceCleanupPendingJournal",
+  "attemptEvidence",
+  "absenceProof",
+  "archivedAt",
+  "archiveDigest"
+]);
+const WORKTREE_PROVISIONING_ARCHIVE_EVIDENCE_KEYS = new Set([
+  "intent",
+  "activatedJournalDigest",
+  "activationDigest",
+  "officialReceipt",
+  "hostAdoption",
+  "executionContextManifest",
+  "executionContextManifestRecordDigest",
+  "cleanupProof"
+]);
+const WORKTREE_PROVISIONING_CLEANUP_PROOF_KEYS = new Set([
+  "schemaVersion",
+  "providerSpawnIntentId",
+  "processIdentity",
+  "processGroupGone",
+  "providerGuardAbsent",
+  "observedAt",
+  "proofDigest"
+]);
+const WORKTREE_ABSENCE_PROOF_KEYS = new Set([
+  "schemaVersion",
+  "classification",
+  "workerId",
+  "controlWorkspaceId",
+  "controlRootDigest",
+  "gitCommonDirDigest",
+  "expectedExecutionRootDigest",
+  "expectedWorkerParentDigest",
+  "baseCommitDigest",
+  "filesystemPathState",
+  "workerParentState",
+  "managedRootIdentityDigest",
+  "workerParentIdentityDigest",
+  "rawInventoryDigest",
+  "adminInventoryDigest",
+  "exactRegistrationCount",
+  "managedParentRegistrationCount",
+  "adminBacklinkMatchCount",
+  "observedAt",
+  "proofDigest"
 ]);
 const PRE_READY_WRITE_REQUEST_KEYS = new Set([
   "admissionContextManifest",
@@ -374,6 +433,221 @@ function worktreeProvisioningActivationDigest(runtime) {
   });
 }
 
+function withoutDigest(value, field) {
+  const body = { ...value };
+  delete body[field];
+  return body;
+}
+
+function validWorktreeProvisioningPriorAttempts(
+  runtime,
+  journal,
+  binding,
+  currentIntent
+) {
+  const journalArchiveDigest = journal.priorAttemptArchiveDigest ?? null;
+  const journalReissuePlannedAt = journal.reissuePlannedAt ?? null;
+  if (!Object.hasOwn(runtime, "priorAttempts")) {
+    return journalArchiveDigest === null && journalReissuePlannedAt === null;
+  }
+  const history = runtime.priorAttempts;
+  if (!Array.isArray(history) || history.length > 2) return false;
+  if (history.length === 0) {
+    return journalArchiveDigest === null && journalReissuePlannedAt === null;
+  }
+
+  let previousArchiveDigest = null;
+  let previousArchivedAt = null;
+  let operationId = null;
+  let releaseIdentityDigest = null;
+  let previousFence = 0;
+  const attemptIds = new Set();
+  const holderIds = new Set();
+  const spawnIntentIds = new Set();
+  try {
+    for (let index = 0; index < history.length; index += 1) {
+      const archive = history[index];
+      if (!exactKeys(archive, WORKTREE_PROVISIONING_ARCHIVE_KEYS)
+        || archive.schemaVersion !== 1
+        || archive.ordinal !== index + 1
+        || archive.previousArchiveDigest !== previousArchiveDigest
+        || !SHA256_HEX.test(archive.archiveDigest || "")
+        || archive.archiveDigest
+          !== stableDigest(withoutDigest(archive, "archiveDigest"))
+        || !canonicalTimestamp(archive.archivedAt)
+        || !exactKeys(
+          archive.attemptEvidence,
+          WORKTREE_PROVISIONING_ARCHIVE_EVIDENCE_KEYS
+        )) {
+        return false;
+      }
+      const sourceJournal = assertProvisioningJournal(
+        binding,
+        archive.sourceCleanupPendingJournal
+      );
+      const archivedIntent = archive.attemptEvidence.intent;
+      const cleanupProof = archive.attemptEvidence.cleanupProof;
+      const absenceProof = archive.absenceProof;
+      operationId ??= archivedIntent?.operationId;
+      releaseIdentityDigest ??=
+        archivedIntent?.executableIdentity?.releaseIdentityDigest;
+      if (!exactKeys(archivedIntent, WORKTREE_PROVISIONING_INTENT_KEYS)
+        || archivedIntent.schemaVersion !== 1
+        || archivedIntent.purpose !== WORKTREE_PROVISIONING_PURPOSE
+        || archivedIntent.workerId !== binding.workerId
+        || !EXACT_NONCE_ID.test(archivedIntent.intentId || "")
+        || archivedIntent.providerSpawnIntentId
+          !== archivedIntent.intentId
+        || !EXACT_NONCE_ID.test(
+          archivedIntent.providerSpawnIntentId || ""
+        )
+        || archivedIntent.executionBindingDigest !== binding.bindingDigest
+        || !SHA256_HEX.test(
+          archivedIntent.expectedPlannedJournalDigest || ""
+        )
+        || !EXACT_NONCE_ID.test(
+          archivedIntent.provisioningAttemptId || ""
+        )
+        || !Number.isSafeInteger(archivedIntent.provisioningFence)
+        || archivedIntent.provisioningFence < 1
+        || !OPAQUE_ID.test(archivedIntent.holderId || "")
+        || archivedIntent.intentDigest
+          !== stableDigest(worktreeProvisioningIntentDigestBody(archivedIntent))
+        || !validExecutableAttestation(archivedIntent.executableIdentity)
+        || archivedIntent.operationId !== operationId
+        || archive.operationId !== operationId
+        || archivedIntent.executableIdentity.releaseIdentityDigest
+          !== releaseIdentityDigest
+        || archivedIntent.provisioningFence !== previousFence + 1
+        || sourceJournal.state !== "cleanup_pending"
+        || (sourceJournal.priorAttemptArchiveDigest ?? null)
+          !== previousArchiveDigest
+        || sourceJournal.fence !== archivedIntent.provisioningFence
+        || sourceJournal.attemptId !== archivedIntent.provisioningAttemptId
+        || (index > 0
+          && sourceJournal.reissuePlannedAt !== previousArchivedAt)
+        || archivedIntent.status !== "registered"
+        || !canonicalTimestamp(archivedIntent.preparedAt)
+        || !canonicalTimestamp(archivedIntent.activatedAt)
+        || !canonicalTimestamp(archivedIntent.registeredAt)
+        || archivedIntent.settledAt !== null
+        || archivedIntent.noChildAt !== null
+        || archivedIntent.resolution !== null
+        || !canonicalTimestamp(archivedIntent.updatedAt)
+        || Date.parse(archivedIntent.preparedAt)
+          < Date.parse(binding.createdAt)
+        || Date.parse(archivedIntent.activatedAt)
+          < Date.parse(archivedIntent.preparedAt)
+        || Date.parse(archivedIntent.registeredAt)
+          < Date.parse(archivedIntent.activatedAt)
+        || Date.parse(archivedIntent.updatedAt)
+          < Date.parse(archivedIntent.registeredAt)
+        || archivedIntent.updatedAt !== sourceJournal.cleanupPendingAt
+        || !completeWorktreeProvisioningProcess(
+          archivedIntent.processIdentity
+        )
+        || sourceJournal.cleanupProvisioner?.pid
+          !== archivedIntent.processIdentity.pid
+        || sourceJournal.cleanupProvisioner?.startToken
+          !== archivedIntent.processIdentity.startToken
+        || sourceJournal.cleanupProvisioner?.holderId
+          !== archivedIntent.holderId
+        || sourceJournal.previousJournalDigest
+          !== archive.attemptEvidence.activatedJournalDigest
+        || !SHA256_HEX.test(
+          archive.attemptEvidence.activatedJournalDigest || ""
+        )
+        || archive.attemptEvidence.activationDigest
+          !== worktreeProvisioningActivationDigest({
+            intent: archivedIntent,
+            activatedJournalDigest:
+              archive.attemptEvidence.activatedJournalDigest
+          })
+        || archive.attemptEvidence.officialReceipt !== null
+        || archive.attemptEvidence.hostAdoption !== null
+        || archive.attemptEvidence.executionContextManifest !== null
+        || archive.attemptEvidence.executionContextManifestRecordDigest
+          !== null
+        || !exactKeys(
+          cleanupProof,
+          WORKTREE_PROVISIONING_CLEANUP_PROOF_KEYS
+        )
+        || cleanupProof.schemaVersion !== 1
+        || cleanupProof.providerSpawnIntentId
+          !== archivedIntent.providerSpawnIntentId
+        || !sameWorktreeProvisioningProcess(
+          cleanupProof.processIdentity,
+          archivedIntent.processIdentity
+        )
+        || cleanupProof.processGroupGone !== true
+        || cleanupProof.providerGuardAbsent !== true
+        || !canonicalTimestamp(cleanupProof.observedAt)
+        || Date.parse(cleanupProof.observedAt)
+          < Date.parse(archivedIntent.activatedAt)
+        || Date.parse(cleanupProof.observedAt)
+          > Date.parse(sourceJournal.cleanupPendingAt)
+        || cleanupProof.proofDigest
+          !== stableDigest(withoutDigest(cleanupProof, "proofDigest"))
+        || !exactKeys(absenceProof, WORKTREE_ABSENCE_PROOF_KEYS)
+        || absenceProof.schemaVersion !== 1
+        || absenceProof.classification !== "absent"
+        || absenceProof.workerId !== binding.workerId
+        || absenceProof.controlWorkspaceId !== binding.controlWorkspaceId
+        || absenceProof.controlRootDigest !== binding.controlRootDigest
+        || absenceProof.gitCommonDirDigest !== binding.gitCommonDirDigest
+        || absenceProof.expectedExecutionRootDigest
+          !== binding.expectedExecutionRootDigest
+        || absenceProof.expectedWorkerParentDigest
+          !== digest(path.dirname(binding.expectedExecutionRoot))
+        || absenceProof.baseCommitDigest !== digest(binding.baseCommit)
+        || absenceProof.filesystemPathState !== "absent"
+        || absenceProof.workerParentState !== "private-empty"
+        || !SHA256_HEX.test(
+          absenceProof.managedRootIdentityDigest || ""
+        )
+        || !SHA256_HEX.test(
+          absenceProof.workerParentIdentityDigest || ""
+        )
+        || !SHA256_HEX.test(absenceProof.rawInventoryDigest || "")
+        || !SHA256_HEX.test(absenceProof.adminInventoryDigest || "")
+        || absenceProof.exactRegistrationCount !== 0
+        || absenceProof.managedParentRegistrationCount !== 0
+        || absenceProof.adminBacklinkMatchCount !== 0
+        || !canonicalTimestamp(absenceProof.observedAt)
+        || Date.parse(absenceProof.observedAt)
+          < Date.parse(sourceJournal.cleanupPendingAt)
+        || absenceProof.proofDigest
+          !== stableDigest(withoutDigest(absenceProof, "proofDigest"))
+        || Date.parse(archive.archivedAt)
+          < Date.parse(absenceProof.observedAt)
+        || attemptIds.has(archivedIntent.provisioningAttemptId)
+        || holderIds.has(archivedIntent.holderId)
+        || spawnIntentIds.has(archivedIntent.providerSpawnIntentId)) {
+        return false;
+      }
+      attemptIds.add(archivedIntent.provisioningAttemptId);
+      holderIds.add(archivedIntent.holderId);
+      spawnIntentIds.add(archivedIntent.providerSpawnIntentId);
+      previousFence = archivedIntent.provisioningFence;
+      previousArchiveDigest = archive.archiveDigest;
+      previousArchivedAt = archive.archivedAt;
+    }
+  } catch {
+    return false;
+  }
+
+  return previousArchiveDigest === journalArchiveDigest
+    && previousArchivedAt === journalReissuePlannedAt
+    && currentIntent.operationId === operationId
+    && currentIntent.executableIdentity.releaseIdentityDigest
+      === releaseIdentityDigest
+    && currentIntent.provisioningFence === previousFence + 1
+    && currentIntent.preparedAt === journalReissuePlannedAt
+    && !attemptIds.has(currentIntent.provisioningAttemptId)
+    && !holderIds.has(currentIntent.holderId)
+    && !spawnIntentIds.has(currentIntent.providerSpawnIntentId);
+}
+
 function assertCanonicalWorktreeProvisioningState(
   job,
   guard,
@@ -443,7 +717,9 @@ function assertCanonicalWorktreeProvisioningState(
     && journal.provisioner?.holderId === guard.holderId
     && (
       exactKeys(runtime, WORKTREE_PROVISIONING_RUNTIME_KEYS)
-      || exactKeys(runtime, LEGACY_WORKTREE_PROVISIONING_RUNTIME_KEYS)
+      || LEGACY_WORKTREE_PROVISIONING_RUNTIME_KEY_SETS.some(
+        (keys) => exactKeys(runtime, keys)
+      )
     )
     && runtime.schemaVersion === 1
     && exactKeys(intent, WORKTREE_PROVISIONING_INTENT_KEYS)
@@ -472,6 +748,12 @@ function assertCanonicalWorktreeProvisioningState(
     && runtime.officialReceipt === null
     && (!Object.hasOwn(runtime, "hostAdoption")
       || runtime.hostAdoption === null)
+    && validWorktreeProvisioningPriorAttempts(
+      runtime,
+      journal,
+      binding,
+      intent
+    )
     && runtime.executionContextManifest === null
     && runtime.executionContextManifestRecordDigest === null
     && runtime.cleanupProof === null;

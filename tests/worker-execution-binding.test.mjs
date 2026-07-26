@@ -311,6 +311,108 @@ test("provisioning cancellation retains attempt evidence through cleanup", () =>
   assert.deepEqual(failed.cleanupProvisioner, provisioning.provisioner);
 });
 
+test("cleanup-pending reissue archives the prior attempt before a fresh fenced activation", () => {
+  const binding = bindingFixture();
+  const provisioning = provisioningFixture(binding);
+  const cleanupPending = transition(binding, provisioning, {
+    state: "cleanup_pending",
+    cleanupPendingAt: TIMES.cleanup
+  });
+  const nextAttemptId = "d".repeat(32);
+  const nextHolderId = "e".repeat(32);
+  const archiveDigest = sha256("prior-attempt-archive");
+  const reissuePlannedAt = "2026-07-24T12:00:04.500Z";
+  const reissue = transition(binding, cleanupPending, {
+    state: "reissue_planned",
+    attemptId: nextAttemptId,
+    fence: 2,
+    reissuePlannedAt,
+    priorAttemptArchiveDigest: archiveDigest
+  });
+
+  assert.equal(reissue.state, "reissue_planned");
+  assert.equal(reissue.previousJournalDigest, cleanupPending.journalDigest);
+  assert.equal(reissue.attemptId, nextAttemptId);
+  assert.equal(reissue.fence, 2);
+  assert.equal(reissue.provisioner, null);
+  assert.equal(reissue.cleanupProvisioner, null);
+  assert.equal(reissue.provisioningAt, null);
+  assert.equal(reissue.cleanupPendingAt, null);
+  assert.equal(reissue.reissuePlannedAt, reissuePlannedAt);
+  assert.equal(reissue.priorAttemptArchiveDigest, archiveDigest);
+  assert.equal(assertProvisioningJournal(binding, reissue), reissue);
+
+  const reauthorized = transition(binding, reissue, {
+    state: "reissue_planned",
+    expectedCurrentJournalDigest: reissue.journalDigest
+  });
+  assert.equal(reauthorized.state, "reissue_planned");
+  assert.equal(reauthorized.journalRevision, reissue.journalRevision + 1);
+  assert.equal(reauthorized.previousJournalDigest, reissue.journalDigest);
+  assert.equal(reauthorized.attemptId, reissue.attemptId);
+  assert.equal(reauthorized.fence, reissue.fence);
+  assert.equal(reauthorized.reissuePlannedAt, reissue.reissuePlannedAt);
+  assert.equal(
+    reauthorized.priorAttemptArchiveDigest,
+    reissue.priorAttemptArchiveDigest
+  );
+
+  const activated = transition(binding, reauthorized, {
+    state: "provisioning",
+    actorAttemptId: nextAttemptId,
+    actorFence: 2,
+    provisioner: {
+      pid: 84,
+      startToken: "fresh-process-birth-token",
+      holderId: nextHolderId
+    },
+    leaseExpiresAt: "2026-07-24T12:00:35.000Z",
+    provisioningAt: "2026-07-24T12:00:05.000Z"
+  });
+  assert.equal(activated.state, "provisioning");
+  assert.equal(activated.attemptId, nextAttemptId);
+  assert.equal(activated.fence, 2);
+  assert.equal(activated.previousJournalDigest, reauthorized.journalDigest);
+  assert.equal(activated.reissuePlannedAt, reissuePlannedAt);
+  assert.equal(activated.priorAttemptArchiveDigest, archiveDigest);
+  assert.equal(assertProvisioningJournal(binding, activated), activated);
+
+  for (const field of [
+    "reissuePlannedAt",
+    "priorAttemptArchiveDigest"
+  ]) {
+    const noncanonical = clone(activated);
+    noncanonical[field] = undefined;
+    redigestJournal(noncanonical);
+    assertStateError(() => assertProvisioningJournal(binding, noncanonical));
+  }
+
+  assertStateError(() => transition(binding, cleanupPending, {
+    state: "provisioning",
+    attemptId: nextAttemptId,
+    fence: 2,
+    provisioner: {
+      pid: 84,
+      startToken: "fresh-process-birth-token",
+      holderId: nextHolderId
+    },
+    leaseExpiresAt: "2026-07-24T12:00:35.000Z",
+    provisioningAt: "2026-07-24T12:00:05.000Z"
+  }));
+  assertStateError(() => transition(binding, reauthorized, {
+    state: "provisioning",
+    actorAttemptId: ATTEMPT_ID,
+    actorFence: 1,
+    provisioner: {
+      pid: 84,
+      startToken: "fresh-process-birth-token",
+      holderId: nextHolderId
+    },
+    leaseExpiresAt: "2026-07-24T12:00:35.000Z",
+    provisioningAt: "2026-07-24T12:00:05.000Z"
+  }));
+});
+
 test("host adoption returns cleanup-pending provisioning to ready with durable context", () => {
   const binding = bindingFixture();
   const provisioning = provisioningFixture(binding);

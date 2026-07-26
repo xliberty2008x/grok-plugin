@@ -207,7 +207,7 @@ function readSmallRegularFileNoFollow(file, label, maxBytes = 16 * 1024) {
   }
 }
 
-function worktreePorcelainRecords(controlRoot) {
+function worktreePorcelainInventory(controlRoot) {
   const raw = git(
     controlRoot,
     ["worktree", "list", "--porcelain", "-z"],
@@ -229,7 +229,14 @@ function worktreePorcelainRecords(controlRoot) {
   if (fields.length) {
     throw new CompanionError("E_WORKTREE", "Git worktree inventory is truncated.");
   }
-  return records;
+  return Object.freeze({
+    raw,
+    records: Object.freeze(records.map((record) => Object.freeze(record)))
+  });
+}
+
+function worktreePorcelainRecords(controlRoot) {
+  return worktreePorcelainInventory(controlRoot).records;
 }
 
 function exactDetachedWorktreeRecord(controlRoot, executionRoot, baseCommit) {
@@ -254,6 +261,297 @@ function exactDetachedWorktreeRecord(controlRoot, executionRoot, baseCommit) {
       "Managed worker worktree is not the exact detached base registration."
     );
   }
+}
+
+function canonicalizeInventoryPath(candidate, label) {
+  let existingAncestor = candidate;
+  const missingSuffix = [];
+  while (true) {
+    try {
+      const canonicalAncestor = fs.realpathSync(existingAncestor);
+      const canonical = path.join(canonicalAncestor, ...missingSuffix);
+      if (!path.isAbsolute(canonical)
+        || path.normalize(canonical) !== canonical) {
+        throw new Error("resolved inventory path is not canonical");
+      }
+      return canonical;
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        const parent = path.dirname(existingAncestor);
+        if (parent !== existingAncestor) {
+          missingSuffix.unshift(path.basename(existingAncestor));
+          existingAncestor = parent;
+          continue;
+        }
+      }
+      throw new CompanionError(
+        "E_WORKTREE",
+        `${label} cannot be resolved through one stable existing ancestor.`,
+        { classification: "inventory-ambiguous" }
+      );
+    }
+  }
+}
+
+function exactWorktreeInventoryPaths(inventory) {
+  return inventory.records.map((fields) => {
+    const worktreeFields = fields.filter((field) => field.startsWith("worktree "));
+    if (worktreeFields.length !== 1) {
+      throw new CompanionError(
+        "E_WORKTREE",
+        "Git worktree inventory contains an ambiguous path record.",
+        { classification: "inventory-ambiguous" }
+      );
+    }
+    const candidate = worktreeFields[0].slice("worktree ".length);
+    if (!path.isAbsolute(candidate)
+      || path.normalize(candidate) !== candidate
+      || candidate.includes("\0")) {
+      throw new CompanionError(
+        "E_WORKTREE",
+        "Git worktree inventory contains a non-canonical path.",
+        { classification: "inventory-ambiguous" }
+      );
+    }
+    return canonicalizeInventoryPath(candidate, "Git worktree inventory path");
+  });
+}
+
+function privateDirectoryObservation(directory, label) {
+  let stat;
+  try {
+    stat = fs.lstatSync(directory, { bigint: true });
+  } catch (error) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      `${label} is unavailable during worktree-effect reconciliation.`,
+      { classification: error?.code === "ENOENT" ? "unsafe" : "inventory-ambiguous" }
+    );
+  }
+  if (!stat.isDirectory()
+    || stat.isSymbolicLink()
+    || fs.realpathSync(directory) !== directory
+    || (stat.mode & 0o077n) !== 0n
+    || (typeof process.geteuid === "function"
+      && stat.uid !== BigInt(process.geteuid()))) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      `${label} is aliased or not private during worktree-effect reconciliation.`,
+      { classification: "unsafe" }
+    );
+  }
+  return Object.freeze({
+    identityDigest: sha(stableStringify({
+      device: String(stat.dev),
+      inode: String(stat.ino),
+      mode: String(stat.mode),
+      uid: String(stat.uid),
+      gid: String(stat.gid),
+      ctimeNs: String(stat.ctimeNs),
+      mtimeNs: String(stat.mtimeNs)
+    }))
+  });
+}
+
+function assertPathAbsentNoFollow(candidate) {
+  try {
+    fs.lstatSync(candidate);
+  } catch (error) {
+    if (error?.code === "ENOENT") return true;
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Managed worker destination cannot be inspected safely.",
+      { classification: "inventory-ambiguous" }
+    );
+  }
+  throw new CompanionError(
+    "E_WORKTREE",
+    "Managed worker destination is occupied.",
+    { classification: "occupied" }
+  );
+}
+
+function adminBacklinkObservation(control, workerParent) {
+  const adminRoot = path.join(control.gitCommonDir, "worktrees");
+  let adminRootStat;
+  try {
+    adminRootStat = fs.lstatSync(adminRoot);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return Object.freeze({
+        inventoryDigest: sha("absent"),
+        managedParentMatchCount: 0
+      });
+    }
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Git worktree administration inventory is unavailable.",
+      { classification: "inventory-ambiguous" }
+    );
+  }
+  if (!adminRootStat.isDirectory()
+    || adminRootStat.isSymbolicLink()
+    || fs.realpathSync(adminRoot) !== adminRoot) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Git worktree administration inventory is unsafe.",
+      { classification: "inventory-ambiguous" }
+    );
+  }
+
+  const records = [];
+  let managedParentMatchCount = 0;
+  const entries = fs.readdirSync(adminRoot, { withFileTypes: true })
+    .sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of entries) {
+    const adminDirectory = path.join(adminRoot, entry.name);
+    if (!entry.isDirectory()
+      || entry.isSymbolicLink()
+      || fs.realpathSync(adminDirectory) !== adminDirectory) {
+      throw new CompanionError(
+        "E_WORKTREE",
+        "Git worktree administration entry is unsafe.",
+        { classification: "inventory-ambiguous" }
+      );
+    }
+    const pointer = readSmallRegularFileNoFollow(
+      path.join(adminDirectory, "gitdir"),
+      "administration backlink"
+    );
+    const match = pointer.match(/^(.+)\n$/);
+    const dotGit = match?.[1] || "";
+    if (!path.isAbsolute(dotGit)
+      || path.normalize(dotGit) !== dotGit
+      || path.basename(dotGit) !== ".git") {
+      throw new CompanionError(
+        "E_WORKTREE",
+        "Git worktree administration backlink is malformed.",
+        { classification: "inventory-ambiguous" }
+      );
+    }
+    const canonicalDotGit = canonicalizeInventoryPath(
+      dotGit,
+      "Git worktree administration backlink"
+    );
+    const worktreeRoot = path.dirname(canonicalDotGit);
+    if (worktreeRoot === workerParent
+      || worktreeRoot.startsWith(`${workerParent}${path.sep}`)) {
+      managedParentMatchCount += 1;
+    }
+    records.push({
+      entryDigest: sha(entry.name),
+      backlinkDigest: sha(pointer),
+      canonicalBacklinkDigest: sha(canonicalDotGit)
+    });
+  }
+  return Object.freeze({
+    inventoryDigest: sha(stableStringify(records)),
+    managedParentMatchCount
+  });
+}
+
+function absenceProofWithoutDigest(proof) {
+  const { proofDigest: _proofDigest, ...body } = proof;
+  return body;
+}
+
+function captureWorkerWorktreeAbsenceProof({
+  control,
+  executionRoot,
+  baseCommit,
+  workerId,
+  env
+}) {
+  const managedRoot = path.dirname(
+    expectedWorkerWorktreeParent(control.controlRoot, workerId, env)
+  );
+  const workerParent = expectedWorkerWorktreeParent(
+    control.controlRoot,
+    workerId,
+    env
+  );
+  const capture = () => {
+    const managedRootObservation = privateDirectoryObservation(
+      managedRoot,
+      "Managed worktree root"
+    );
+    const parentObservation = privateDirectoryObservation(
+      workerParent,
+      "Managed worker parent"
+    );
+    assertPathAbsentNoFollow(executionRoot);
+    if (fs.readdirSync(workerParent).length !== 0) {
+      throw new CompanionError(
+        "E_WORKTREE",
+        "Managed worker parent is not empty.",
+        { classification: "occupied" }
+      );
+    }
+    const inventory = worktreePorcelainInventory(control.controlRoot);
+    const paths = exactWorktreeInventoryPaths(inventory);
+    const exactRegistrationCount = paths.filter(
+      (candidate) => candidate === executionRoot
+    ).length;
+    const managedParentRegistrationCount = paths.filter((candidate) => (
+      candidate === workerParent
+      || candidate.startsWith(`${workerParent}${path.sep}`)
+    )).length;
+    const admin = adminBacklinkObservation(control, workerParent);
+    assertPathAbsentNoFollow(executionRoot);
+    if (fs.readdirSync(workerParent).length !== 0) {
+      throw new CompanionError(
+        "E_WORKTREE",
+        "Managed worker parent changed during absence verification.",
+        { classification: "occupied" }
+      );
+    }
+    if (exactRegistrationCount !== 0
+      || managedParentRegistrationCount !== 0
+      || admin.managedParentMatchCount !== 0) {
+      throw new CompanionError(
+        "E_WORKTREE",
+        "A stale or foreign worktree registration still names the managed worker parent.",
+        { classification: "stale-registration" }
+      );
+    }
+    return Object.freeze({
+      managedRootIdentityDigest: managedRootObservation.identityDigest,
+      workerParentIdentityDigest: parentObservation.identityDigest,
+      rawInventoryDigest: sha(inventory.raw),
+      adminInventoryDigest: admin.inventoryDigest,
+      exactRegistrationCount,
+      managedParentRegistrationCount,
+      adminBacklinkMatchCount: admin.managedParentMatchCount
+    });
+  };
+
+  const first = capture();
+  const second = capture();
+  if (stableStringify(first) !== stableStringify(second)) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Worktree absence evidence changed during verification.",
+      { classification: "inventory-ambiguous" }
+    );
+  }
+  const proof = {
+    schemaVersion: 1,
+    classification: "absent",
+    workerId,
+    controlWorkspaceId: control.controlWorkspaceId,
+    controlRootDigest: sha(control.controlRoot),
+    gitCommonDirDigest: sha(control.gitCommonDir),
+    expectedExecutionRootDigest: sha(executionRoot),
+    expectedWorkerParentDigest: sha(workerParent),
+    baseCommitDigest: sha(baseCommit),
+    filesystemPathState: "absent",
+    workerParentState: "private-empty",
+    ...second,
+    observedAt: new Date().toISOString(),
+    proofDigest: null
+  };
+  proof.proofDigest = sha(stableStringify(absenceProofWithoutDigest(proof)));
+  return Object.freeze(proof);
 }
 
 function assertLinkedWorktreeMetadata(control, executionRoot) {
@@ -700,6 +998,162 @@ export function assertManagedWorkerWorktree(options = {}) {
     captureWorktreeEntries(identity.executionRoot, { rejectEscapingSymlink: true })
   ));
   return identity;
+}
+
+/**
+ * Observe one deterministic worker destination without mutating Git or the
+ * filesystem. Only the exact `absent` result is sufficient to authorize a
+ * provisioning reissue; every other result remains fail-closed.
+ */
+export function classifyWorkerWorktreeEffect({
+  controlRoot,
+  executionRoot,
+  baseCommit,
+  workerId,
+  env = process.env
+} = {}) {
+  if (!controlRoot || !executionRoot || !baseCommit || !workerId) {
+    throw new CompanionError(
+      "E_USAGE",
+      "Worktree-effect classification requires control, execution, base, and worker identities."
+    );
+  }
+  const control = resolveControlWorkspace(controlRoot, env);
+  const expectedRoot = expectedWorkerWorktreeRoot(
+    control.controlRoot,
+    workerId,
+    env
+  );
+  if (executionRoot !== expectedRoot
+    || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(baseCommit)) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Worktree-effect classification is not bound to the deterministic exact base.",
+      { classification: "foreign" }
+    );
+  }
+  let exactBaseCommit;
+  try {
+    exactBaseCommit = resolveExactCommit(control.controlRoot, baseCommit);
+  } catch {
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Worktree-effect classification base is not one existing exact commit.",
+      { classification: "foreign" }
+    );
+  }
+  if (exactBaseCommit !== baseCommit) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Worktree-effect classification base is not one canonical exact commit.",
+      { classification: "foreign" }
+    );
+  }
+
+  try {
+    const identity = assertManagedWorkerWorktree({
+      controlRoot: control.controlRoot,
+      executionRoot,
+      baseCommit,
+      workerId,
+      env
+    });
+    return Object.freeze({
+      classification: "exact-clean-registered",
+      evidence: identity
+    });
+  } catch {
+    // Positive adoption failed. Inspect the raw path and registration state
+    // rather than treating a positive-proof failure as absence.
+  }
+
+  let rootPresent = false;
+  try {
+    fs.lstatSync(executionRoot);
+    rootPresent = true;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      return Object.freeze({
+        classification: "inventory-ambiguous",
+        evidence: null
+      });
+    }
+  }
+
+  let inventory;
+  let paths;
+  try {
+    inventory = worktreePorcelainInventory(control.controlRoot);
+    paths = exactWorktreeInventoryPaths(inventory);
+  } catch {
+    return Object.freeze({
+      classification: "inventory-ambiguous",
+      evidence: null
+    });
+  }
+  const workerParent = expectedWorkerWorktreeParent(
+    control.controlRoot,
+    workerId,
+    env
+  );
+  const targetRegistrationCount = paths.filter(
+    (candidate) => candidate === executionRoot
+  ).length;
+  const managedParentRegistrationCount = paths.filter((candidate) => (
+    candidate === workerParent
+    || candidate.startsWith(`${workerParent}${path.sep}`)
+  )).length;
+
+  if (rootPresent) {
+    if (targetRegistrationCount === 1) {
+      try {
+        assertRegisteredWorkerWorktreeIdentity({
+          controlRoot: control.controlRoot,
+          executionRoot,
+          baseCommit,
+          workerId,
+          env
+        });
+        return Object.freeze({
+          classification: "dirty",
+          evidence: null
+        });
+      } catch {
+        return Object.freeze({
+          classification: "mismatched",
+          evidence: null
+        });
+      }
+    }
+    return Object.freeze({
+      classification: targetRegistrationCount > 0 ? "mismatched" : "occupied",
+      evidence: null
+    });
+  }
+  if (targetRegistrationCount > 0 || managedParentRegistrationCount > 0) {
+    return Object.freeze({
+      classification: "stale-registration",
+      evidence: null
+    });
+  }
+
+  try {
+    return Object.freeze({
+      classification: "absent",
+      evidence: captureWorkerWorktreeAbsenceProof({
+        control,
+        executionRoot,
+        baseCommit: exactBaseCommit,
+        workerId,
+        env
+      })
+    });
+  } catch (error) {
+    return Object.freeze({
+      classification: error?.details?.classification || "inventory-ambiguous",
+      evidence: null
+    });
+  }
 }
 
 export function captureParentFingerprint(root) {

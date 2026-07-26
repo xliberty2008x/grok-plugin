@@ -23,6 +23,7 @@ import {
   expectedWorkerWorktreeParent,
   expectedWorkerWorktreeRoot,
   assertManagedWorkerWorktree,
+  classifyWorkerWorktreeEffect,
   buildArtifactManifest,
   validateArtifactForIntegration,
   prepareIntegration,
@@ -995,6 +996,129 @@ test("managed worktree adoption requires one exact detached registration and imm
   );
 
   assert.equal(removeWorkerWorktree(worktree.executionRoot, root, workerId, env), true);
+});
+
+test("worktree-effect classifier distinguishes exact, dirty, absent, occupied, and stale registration", () => {
+  const root = initRepo();
+  const env = envFor();
+  const base = git(root, "rev-parse", "HEAD");
+
+  const absentWorkerId = "task-effect-absence-0001";
+  const absentParent = expectedWorkerWorktreeParent(root, absentWorkerId, env);
+  const absentRoot = expectedWorkerWorktreeRoot(root, absentWorkerId, env);
+  fs.mkdirSync(absentParent, { recursive: true, mode: 0o700 });
+  const absent = classifyWorkerWorktreeEffect({
+    controlRoot: root,
+    executionRoot: absentRoot,
+    baseCommit: base,
+    workerId: absentWorkerId,
+    env
+  });
+  assert.equal(absent.classification, "absent");
+  assert.equal(absent.evidence.filesystemPathState, "absent");
+  assert.equal(absent.evidence.exactRegistrationCount, 0);
+  assert.equal(absent.evidence.managedParentRegistrationCount, 0);
+  assert.equal(absent.evidence.adminBacklinkMatchCount, 0);
+  assert.equal(
+    absent.evidence.baseCommitDigest,
+    crypto.createHash("sha256").update(base).digest("hex")
+  );
+  assert.match(absent.evidence.proofDigest, /^[a-f0-9]{64}$/);
+
+  assert.throws(
+    () => classifyWorkerWorktreeEffect({
+      controlRoot: root,
+      executionRoot: absentRoot,
+      baseCommit: "0".repeat(40),
+      workerId: absentWorkerId,
+      env
+    }),
+    (error) => error?.code === "E_WORKTREE"
+      && error?.details?.classification === "foreign"
+  );
+
+  fs.symlinkSync("missing-checkout", absentRoot);
+  assert.equal(classifyWorkerWorktreeEffect({
+    controlRoot: root,
+    executionRoot: absentRoot,
+    baseCommit: base,
+    workerId: absentWorkerId,
+    env
+  }).classification, "occupied");
+  fs.unlinkSync(absentRoot);
+  fs.rmdirSync(absentParent);
+
+  const exactWorkerId = "task-effect-exact-000001";
+  const worktree = createWorkerWorktree({
+    controlRoot: root,
+    baseCommit: base,
+    workerId: exactWorkerId,
+    env
+  });
+  assert.equal(classifyWorkerWorktreeEffect({
+    controlRoot: root,
+    executionRoot: worktree.executionRoot,
+    baseCommit: base,
+    workerId: exactWorkerId,
+    env
+  }).classification, "exact-clean-registered");
+
+  fs.appendFileSync(path.join(worktree.executionRoot, "tracked.txt"), "dirty\n");
+  assert.equal(classifyWorkerWorktreeEffect({
+    controlRoot: root,
+    executionRoot: worktree.executionRoot,
+    baseCommit: base,
+    workerId: exactWorkerId,
+    env
+  }).classification, "dirty");
+  assert.equal(
+    removeWorkerWorktree(worktree.executionRoot, root, exactWorkerId, env),
+    true
+  );
+
+  const staleWorkerId = "task-effect-stale-000001";
+  const stale = createWorkerWorktree({
+    controlRoot: root,
+    baseCommit: base,
+    workerId: staleWorkerId,
+    env
+  });
+  fs.rmSync(stale.executionRoot, { recursive: true, force: true });
+  assert.equal(classifyWorkerWorktreeEffect({
+    controlRoot: root,
+    executionRoot: stale.executionRoot,
+    baseCommit: base,
+    workerId: staleWorkerId,
+    env
+  }).classification, "stale-registration");
+
+  const aliasedWorkerId = "task-effect-alias-stale01";
+  const aliased = createWorkerWorktree({
+    controlRoot: root,
+    baseCommit: base,
+    workerId: aliasedWorkerId,
+    env
+  });
+  const gitdirPointer = fs.readFileSync(
+    path.join(aliased.executionRoot, ".git"),
+    "utf8"
+  );
+  const adminDirectory = gitdirPointer.match(/^gitdir: (.+)\n$/)?.[1];
+  assert.ok(adminDirectory);
+  const alias = path.join(path.dirname(path.dirname(aliased.executionRoot)), "alias-parent");
+  fs.symlinkSync(path.dirname(aliased.executionRoot), alias);
+  fs.writeFileSync(
+    path.join(adminDirectory, "gitdir"),
+    `${path.join(alias, "checkout", ".git")}\n`
+  );
+  fs.rmSync(aliased.executionRoot, { recursive: true, force: true });
+  assert.equal(classifyWorkerWorktreeEffect({
+    controlRoot: root,
+    executionRoot: aliased.executionRoot,
+    baseCommit: base,
+    workerId: aliasedWorkerId,
+    env
+  }).classification, "stale-registration");
 });
 
 test("managed worktree adoption rejects branch attachment at the deterministic path", () => {

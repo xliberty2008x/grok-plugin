@@ -121,7 +121,7 @@ test("Grok discovery honors GROK_BIN and enforces the minimum CLI version", asyn
   });
 });
 
-test("worktree controller uses private cwd, exact grants, pinned Git PATH, and identity-bound credential", async () => {
+test("worktree controller delays its identity-bound credential until explicit activation staging", async () => {
   await withFake({}, async () => {
     const root = initNonTemporaryRepo();
     const stateDir = nonTemporaryDirectory("grok-controller-state-");
@@ -181,6 +181,9 @@ test("worktree controller uses private cwd, exact grants, pinned Git PATH, and i
       assert.equal(environment.env.GIT_CONFIG_NOSYSTEM, "1");
       assert.equal(environment.env.GIT_CONFIG_GLOBAL, "/dev/null");
       assert.equal(environment.env.GIT_ATTR_NOSYSTEM, "1");
+      assert.equal(fs.existsSync(path.join(environment.grokHome, "auth.json")), false);
+      environment.assertCredentialAbsent();
+      environment.stageCredential();
       assert.equal(fs.existsSync(path.join(environment.grokHome, "auth.json")), true);
       assert.equal(
         fs.realpathSync(environment.gitInstallationRoot)
@@ -210,6 +213,115 @@ test("worktree controller uses private cwd, exact grants, pinned Git PATH, and i
       fs.rmSync(stateDir, { recursive: true, force: true });
       fs.rmSync(root, { recursive: true, force: true });
       fs.rmSync(poison, { recursive: true, force: true });
+    }
+  });
+});
+
+test("worktree controller never replaces an existing claim home and distinct claims stay isolated", async () => {
+  await withFake({}, async () => {
+    const root = initNonTemporaryRepo();
+    const stateDir = nonTemporaryDirectory("grok-controller-recovery-state-");
+    const marker = "worktree-controller-recovery";
+    const options = controllerEnvironmentInput(root, stateDir);
+    const first = taskEnvironment(
+      stateDir,
+      root,
+      profileFor("task", true),
+      marker,
+      options
+    );
+    const firstHomeIdentity = fs.lstatSync(first.home);
+    fs.writeFileSync(path.join(first.home, "stale-sentinel"), "stale\n", {
+      mode: 0o600
+    });
+    assert.throws(
+      () => taskEnvironment(
+        stateDir,
+        root,
+        profileFor("task", true),
+        marker,
+        options
+      ),
+      (error) => error?.code === "E_STATE"
+        && /already exists/.test(error.message)
+    );
+
+    const distinct = taskEnvironment(
+      stateDir,
+      root,
+      profileFor("task", true),
+      `${marker}-distinct`,
+      options
+    );
+    try {
+      assert.notEqual(fs.lstatSync(distinct.home).ino, firstHomeIdentity.ino);
+      assert.equal(
+        fs.existsSync(path.join(distinct.home, "stale-sentinel")),
+        false
+      );
+      assert.equal(
+        fs.existsSync(path.join(distinct.grokHome, "auth.json")),
+        false
+      );
+      assert.equal(fs.existsSync(path.join(first.home, "stale-sentinel")), true);
+      distinct.stageCredential();
+      distinct.revokeCredential();
+      distinct.assertCredentialAbsent();
+    } finally {
+      try { first.revokeCredential(); } catch {}
+      try { distinct.revokeCredential(); } catch {}
+      fs.rmSync(stateDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("worktree controller never refreshes or stages expiring auth before durable activation", async () => {
+  await withFake({}, async (fake) => {
+    const root = initNonTemporaryRepo();
+    const stateDir = nonTemporaryDirectory(
+      "grok-controller-expiring-auth-state-"
+    );
+    fs.writeFileSync(
+      fake.authPath,
+      `${JSON.stringify({
+        test: {
+          key: "test-secret-value-1234567890",
+          auth_mode: "oauth",
+          expires_at: new Date(Date.now() + 60_000).toISOString()
+        }
+      })}\n`,
+      { mode: 0o600 }
+    );
+    const environment = taskEnvironment(
+      stateDir,
+      root,
+      profileFor("task", true),
+      "worktree-controller-expiring-auth",
+      controllerEnvironmentInput(root, stateDir)
+    );
+    try {
+      assert.equal(
+        fs.existsSync(path.join(environment.grokHome, "auth.json")),
+        false
+      );
+      assert.equal(
+        readFakeLog(fake.logFile).some((entry) => entry.event === "models"),
+        false
+      );
+      assert.throws(
+        () => environment.stageCredential(),
+        (error) => error?.code === "E_AUTH_REQUIRED"
+      );
+      environment.assertCredentialAbsent();
+      assert.equal(
+        readFakeLog(fake.logFile).some((entry) => entry.event === "models"),
+        false
+      );
+    } finally {
+      try { environment.revokeCredential(); } catch {}
+      fs.rmSync(stateDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });

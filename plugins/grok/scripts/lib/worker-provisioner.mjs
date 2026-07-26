@@ -24,7 +24,11 @@ import {
   loadProviderGuard,
   unregisterProviderGuard
 } from "./recursion-guard.mjs";
-import { readJob } from "./state.mjs";
+import {
+  acquireWorkspaceProcessLease,
+  readJob,
+  withWorkspaceStateTransaction
+} from "./state.mjs";
 import { captureContextManifest } from "./task-contract.mjs";
 import {
   activateWriteProvisioningAttempt,
@@ -32,12 +36,16 @@ import {
   assertMutationOwnership,
   assertWriteExecutionJob,
   prepareWriteProvisionerIntent,
+  prepareWriteProvisioningReissue,
   promoteWriteWorkerReady,
   recordOfficialWorktreeReceipt,
   recordWriteProvisionerNoChild,
   retainWriteProvisioningCleanupPending
 } from "./worker-mutation.mjs";
-import { assertManagedWorkerWorktree } from "./worker-worktree.mjs";
+import {
+  assertManagedWorkerWorktree,
+  classifyWorkerWorktreeEffect
+} from "./worker-worktree.mjs";
 import { workspaceState } from "./workspace.mjs";
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
@@ -45,6 +53,7 @@ const ERROR_CODE = /^E_[A-Z0-9_]{1,62}[A-Z0-9]$/;
 const MAX_PROVISIONING_LEASE_MS = 300_000;
 const DEFAULT_PROVISIONING_LEASE_MS = 240_000;
 const DEFAULT_OFFICIAL_TIMEOUT_MS = 120_000;
+const MAX_STALE_CONTROLLER_HOMES = 8;
 
 function stateError(message, details = undefined) {
   throw new CompanionError("E_STATE", message, details);
@@ -106,6 +115,10 @@ function currentProvisioningDigest({
     && verified.journal.journalDigest === plannedJournalDigest) {
     return verified.journal.journalDigest;
   }
+  if (verified.journal.state === "reissue_planned"
+    && intent.processIdentity === null) {
+    return verified.journal.journalDigest;
+  }
   if (verified.journal.state === "provisioning"
     && sameProcess(intent.processIdentity, processIdentity)) {
     return verified.journal.journalDigest;
@@ -157,6 +170,76 @@ function removeProvisioningHome(stateDir, environment) {
   fs.rmSync(home, { recursive: true, force: true });
   if (fs.existsSync(home)) {
     stateError("Provisioning home remained after verified provider cleanup.");
+  }
+}
+
+function cleanupStaleControllerHomes(stateDir, workerId) {
+  const parent = path.resolve(stateDir, "task-homes");
+  let parentStat;
+  try {
+    parentStat = fs.lstatSync(parent);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  if (!parentStat.isDirectory()
+    || parentStat.isSymbolicLink()
+    || fs.realpathSync(parent) !== parent
+    || (parentStat.mode & 0o077) !== 0
+    || (typeof process.getuid === "function"
+      && parentStat.uid !== process.getuid())) {
+    stateError("Private task-home root is aliased, shared, or foreign.");
+  }
+  const prefix = `${workerId}-provision-`;
+  const legacyName = `${workerId}-provision`;
+  const candidates = fs.readdirSync(parent)
+    .filter((name) => name === legacyName || name.startsWith(prefix));
+  if (candidates.length > MAX_STALE_CONTROLLER_HOMES) {
+    stateError("Stale controller-home recovery exceeded its bounded scan.");
+  }
+  for (const name of candidates) {
+    const home = path.join(parent, name);
+    const stat = fs.lstatSync(home);
+    if (!stat.isDirectory()
+      || stat.isSymbolicLink()
+      || fs.realpathSync(home) !== home
+      || (stat.mode & 0o077) !== 0
+      || (typeof process.getuid === "function"
+        && stat.uid !== process.getuid())) {
+      stateError("A stale controller claim root is aliased, shared, or foreign.");
+    }
+    const grokHome = path.join(home, ".grok");
+    try {
+      const grokStat = fs.lstatSync(grokHome);
+      if (!grokStat.isDirectory()
+        || grokStat.isSymbolicLink()
+        || fs.realpathSync(grokHome) !== grokHome
+        || (grokStat.mode & 0o077) !== 0
+        || (typeof process.getuid === "function"
+          && grokStat.uid !== process.getuid())) {
+        stateError("A stale controller Grok home is aliased, shared, or foreign.");
+      }
+      if (fs.readdirSync(grokHome).some((entry) => (
+        entry === "auth.json" || entry.startsWith("auth.json.")
+      ))) {
+        stateError(
+          "A stale controller claim still contains credential material; exact process cleanup is required."
+        );
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    const rebound = fs.lstatSync(home);
+    if (!rebound.isDirectory()
+      || rebound.isSymbolicLink()
+      || rebound.dev !== stat.dev
+      || rebound.ino !== stat.ino) {
+      stateError("A stale controller claim root changed before exact cleanup.");
+    }
+    fs.rmSync(home, { recursive: true, force: true });
+    if (fs.existsSync(home)) {
+      stateError("A stale non-secret controller claim root remained after cleanup.");
+    }
   }
 }
 
@@ -311,6 +394,7 @@ function projectReadyReplay({
   const intent = runtime?.intent;
   const receipt = runtime?.receipt;
   const hostAdoption = runtime?.hostAdoption ?? null;
+  const priorAttempt = runtime?.priorAttempts?.at(-1) ?? null;
   const cleanupProof = runtime?.cleanupProof;
   if (!intent
     || (receipt === null) === (hostAdoption === null)
@@ -337,6 +421,9 @@ function projectReadyReplay({
     bindingDigest: verified.binding.bindingDigest,
     receiptDigest: receipt?.receiptDigest ?? null,
     hostAdoptionDigest: hostAdoption?.adoptionDigest ?? null,
+    priorAttemptArchiveDigest: priorAttempt?.archiveDigest ?? null,
+    absenceProofDigest: priorAttempt?.absenceProof?.proofDigest ?? null,
+    provisioningAttemptCount: (runtime?.priorAttempts?.length ?? 0) + 1,
     recovery: hostAdoption
       ? "host-adopted-unknown-official-response"
       : null,
@@ -372,6 +459,9 @@ export async function provisionWriteWorkerWorktree({
   const testHookKeys = testHooks === null ? [] : Object.keys(testHooks);
   const allowedTestHooks = new Set([
     "beforeHostAdoption",
+    "afterControllerEnvironmentConstructedBeforeIntent",
+    "afterReissueIntentCommittedBeforeBootstrapSpawn",
+    "beforeOfficialCreate",
     "afterOfficialCreateBeforeReceipt"
   ]);
   if (testHooks !== null
@@ -391,78 +481,147 @@ export async function provisionWriteWorkerWorktree({
   }
   const durableJob = readJob(root, workerId, env);
   assertMutationOwnership(durableJob, principal);
-  const initial = assertWriteExecutionJob(durableJob, env);
+  let initial = assertWriteExecutionJob(durableJob, env);
   const readyReplay = projectReadyReplay({
     verified: initial,
     workerId,
     env
   });
   if (readyReplay) return readyReplay;
+  let reissueRequired = false;
   if (initial.journal.state === "cleanup_pending"
     && initial.provisioningRuntime?.receipt === null
     && (initial.provisioningRuntime?.hostAdoption ?? null) === null) {
-    if (testHooks?.beforeHostAdoption) {
-      await testHooks.beforeHostAdoption(Object.freeze({
+    const effect = classifyWorkerWorktreeEffect({
+      controlRoot: initial.binding.controlRoot,
+      executionRoot: initial.binding.expectedExecutionRoot,
+      baseCommit: initial.binding.baseCommit,
+      workerId,
+      env
+    });
+    if (effect.classification === "exact-clean-registered") {
+      if (testHooks?.beforeHostAdoption) {
+        await testHooks.beforeHostAdoption(Object.freeze({
+          workerId,
+          operationId: initial.provisioningRuntime.intent.operationId,
+          executionRoot: initial.binding.expectedExecutionRoot,
+          bindingDigest: initial.binding.bindingDigest,
+          cleanupPendingJournalDigest: initial.journal.journalDigest,
+          cleanupProofDigest:
+            initial.provisioningRuntime.cleanupProof.proofDigest
+        }));
+      }
+      const adopted = adoptWriteProvisioningEffect({
+        root: initial.binding.controlRoot,
+        principal,
         workerId,
-        operationId: initial.provisioningRuntime.intent.operationId,
-        executionRoot: initial.binding.expectedExecutionRoot,
-        bindingDigest: initial.binding.bindingDigest,
-        cleanupPendingJournalDigest: initial.journal.journalDigest,
+        executionBindingDigest: initial.binding.bindingDigest,
+        expectedJournalDigest: initial.journal.journalDigest,
+        providerSpawnIntentId:
+          initial.provisioningRuntime.intent.providerSpawnIntentId,
         cleanupProofDigest:
-          initial.provisioningRuntime.cleanupProof.proofDigest
-      }));
+          initial.provisioningRuntime.cleanupProof.proofDigest,
+        env
+      });
+      const adoptedJob = assertWriteExecutionJob(
+        readJob(initial.binding.controlRoot, workerId, env),
+        env
+      );
+      if (adopted.adopted === adopted.replayed
+        || adoptedJob.journal.state !== "ready"
+        || adoptedJob.provisioningRuntime.hostAdoption?.adoptionDigest
+          !== adopted.adoption.adoptionDigest) {
+        stateError("Host adoption did not publish exact ready evidence.");
+      }
+      return projectReadyReplay({
+        verified: adoptedJob,
+        workerId,
+        env,
+        replayed: adopted.replayed
+      });
     }
-    const adopted = adoptWriteProvisioningEffect({
-      root: initial.binding.controlRoot,
-      principal,
-      workerId,
-      executionBindingDigest: initial.binding.bindingDigest,
-      expectedJournalDigest: initial.journal.journalDigest,
-      providerSpawnIntentId:
-        initial.provisioningRuntime.intent.providerSpawnIntentId,
-      cleanupProofDigest:
-        initial.provisioningRuntime.cleanupProof.proofDigest,
-      env
-    });
-    const adoptedJob = assertWriteExecutionJob(
-      readJob(initial.binding.controlRoot, workerId, env),
-      env
-    );
-    if (adopted.adopted === adopted.replayed
-      || adoptedJob.journal.state !== "ready"
-      || adoptedJob.provisioningRuntime.hostAdoption?.adoptionDigest
-        !== adopted.adoption.adoptionDigest) {
-      stateError("Host adoption did not publish exact ready evidence.");
+    if (effect.classification !== "absent") {
+      throw new CompanionError(
+        "E_WORKTREE",
+        "Unknown official worktree effect is not safely adoptable or reissuable.",
+        { classification: effect.classification }
+      );
     }
-    return projectReadyReplay({
-      verified: adoptedJob,
-      workerId,
-      env,
-      replayed: adopted.replayed
-    });
+    reissueRequired = true;
   }
-  if (initial.journal.state !== "planned"
-    || initial.provisioningRuntime !== null) {
+  if (initial.journal.state === "reissue_planned") {
+    reissueRequired = true;
+  }
+  if (!reissueRequired
+    && (initial.journal.state !== "planned"
+      || initial.provisioningRuntime !== null)) {
     stateError(
-      "This provisioner slice requires one fresh planned write-worker intent."
+      "This provisioner slice requires a fresh plan or one absence-proven reissue."
+    );
+  }
+  if (initial.journal.state === "cleanup_pending"
+    && (initial.provisioningRuntime?.priorAttempts?.length ?? 0) >= 2) {
+    throw new CompanionError(
+      "E_RETRY_EXHAUSTED",
+      "Official worktree provisioning exhausted its bounded external attempts."
     );
   }
 
   const controlRoot = initial.binding.controlRoot;
   const executionBindingDigest = initial.binding.bindingDigest;
-  const plannedJournalDigest = initial.journal.journalDigest;
-  const attemptId = crypto.randomBytes(16).toString("hex");
+  const durableReissueRecovery =
+    initial.journal.state === "reissue_planned";
+  const durableReissueIntent = initial.journal.state === "reissue_planned"
+    ? initial.provisioningRuntime.intent
+    : null;
+  const attemptId = durableReissueIntent?.provisioningAttemptId
+    ?? crypto.randomBytes(16).toString("hex");
   const holderId = crypto.randomBytes(16).toString("hex");
-  const fence = initial.journal.fence + 1;
+  const fence = durableReissueIntent?.provisioningFence
+    ?? initial.journal.fence + 1;
   const stateDir = workspaceState(controlRoot, env);
-  const provisioningHomeId = `${workerId}-provision`;
+  const controllerLease = acquireWorkspaceProcessLease(
+    controlRoot,
+    `worktree-controller-${workerId}`,
+    env
+  );
+  let releaseControllerLease = true;
+  try {
+  cleanupStaleControllerHomes(stateDir, workerId);
+  if (durableReissueRecovery) {
+    const claim = prepareWriteProvisioningReissue({
+      root: controlRoot,
+      principal,
+      workerId,
+      executionBindingDigest,
+      expectedJournalDigest: initial.journal.journalDigest,
+      attemptId,
+      fence,
+      holderId,
+      executableIdentity: durableReissueIntent.executableIdentity,
+      env
+    });
+    if (!claim.prepared
+      || claim.replayed
+      || claim.reason !== "reissue-reauthorized"
+      || claim.intent.holderId !== holderId
+      || claim.intent.provisioningAttemptId !== attemptId
+      || claim.intent.provisioningFence !== fence) {
+      stateError(
+        "Durable inactive reissue plan was not atomically claimed for recovery."
+      );
+    }
+    initial = assertWriteExecutionJob(claim.job, env);
+  }
+  const plannedJournalDigest = initial.journal.journalDigest;
+  const provisioningHomeId = `${workerId}-provision-${holderId}`;
   const provisioningWorktreeParent = ensureProvisioningWorktreeParent(
     stateDir,
     initial.binding.expectedExecutionRoot
   );
   let environment;
   try {
-    environment = taskEnvironment(
+    const createEnvironment = () => taskEnvironment(
       stateDir,
       controlRoot,
       initial.profile,
@@ -476,6 +635,24 @@ export async function provisionWriteWorkerWorktree({
         worktreeProvisioningBaseCommit: initial.binding.baseCommit
       }
     );
+    environment = durableReissueRecovery
+      ? withWorkspaceStateTransaction(controlRoot, (transaction) => {
+          const current = assertWriteExecutionJob(
+            transaction.tryReadJob(workerId),
+            env
+          );
+          if (current.journal.state !== "reissue_planned"
+            || current.journal.journalDigest !== plannedJournalDigest
+            || current.provisioningRuntime.intent.holderId !== holderId
+            || current.provisioningRuntime.intent.processIdentity !== null
+            || loadProviderGuard(controlRoot, workerId) !== null) {
+            stateError(
+              "Inactive reissue claim changed before private controller-home recovery."
+            );
+          }
+          return createEnvironment();
+        }, env)
+      : createEnvironment();
   } catch (error) {
     try {
       removeUnusedProvisioningParent(
@@ -493,6 +670,19 @@ export async function provisionWriteWorkerWorktree({
       );
     }
     throw error;
+  }
+  if (testHooks?.afterControllerEnvironmentConstructedBeforeIntent) {
+    await testHooks.afterControllerEnvironmentConstructedBeforeIntent(
+      Object.freeze({
+        workerId,
+        executionRoot: initial.binding.expectedExecutionRoot,
+        bindingDigest: executionBindingDigest,
+        provisioningAttemptId: attemptId,
+        provisioningFence: fence,
+        holderId,
+        home: environment.home
+      })
+    );
   }
   const controllerProfile = officialProvisioningControllerProfile(
     initial.profile,
@@ -516,12 +706,36 @@ export async function provisionWriteWorkerWorktree({
 
   const providerLaunch = {
     prepare(details = {}) {
-      const result = prepareWriteProvisionerIntent({
-        ...mutationBase,
-        expectedJournalDigest: plannedJournalDigest,
-        executableIdentity: details.executableIdentity
-      });
-      if (result.prepared) prepared = result;
+      const result = reissueRequired
+        ? prepareWriteProvisioningReissue({
+            ...mutationBase,
+            expectedJournalDigest: plannedJournalDigest,
+            executableIdentity: details.executableIdentity
+          })
+        : prepareWriteProvisionerIntent({
+            ...mutationBase,
+            expectedJournalDigest: plannedJournalDigest,
+            executableIdentity: details.executableIdentity
+          });
+      if (result.prepared) {
+        prepared = result;
+        if (reissueRequired
+          && testHooks?.afterReissueIntentCommittedBeforeBootstrapSpawn) {
+          testHooks.afterReissueIntentCommittedBeforeBootstrapSpawn(
+            Object.freeze({
+              workerId,
+              operationId: result.intent.operationId,
+              providerSpawnIntentId: result.intent.providerSpawnIntentId,
+              provisioningAttemptId: result.intent.provisioningAttemptId,
+              provisioningFence: result.intent.provisioningFence,
+              journalDigest: result.job.provisioning.journalDigest,
+              priorAttemptArchiveDigest:
+                result.job.provisioning.priorAttemptArchiveDigest,
+              reason: result.reason
+            })
+          );
+        }
+      }
       return result;
     },
     registerBootstrap(details) {
@@ -544,7 +758,8 @@ export async function provisionWriteWorkerWorktree({
       if (!prepared?.intent
         || details?.intentId !== prepared.intent.intentId
         || details?.providerSpawnIntentId !== prepared.intent.intentId
-        || details?.expectedPlannedJournalDigest !== plannedJournalDigest) {
+        || details?.expectedPlannedJournalDigest
+          !== prepared.intent.expectedPlannedJournalDigest) {
         stateError(
           "Bootstrap registration cleanup no longer matches its prepared intent."
         );
@@ -566,14 +781,16 @@ export async function provisionWriteWorkerWorktree({
 
       let expectedJournalDigest;
       let resolution;
-      if (verified.journal.state === "planned"
-        && verified.journal.journalDigest === plannedJournalDigest
+      if (["planned", "reissue_planned"].includes(verified.journal.state)
+        && verified.journal.journalDigest
+          === prepared.intent.expectedPlannedJournalDigest
         && intent.status === "pending"
         && intent.processIdentity === null) {
-        expectedJournalDigest = plannedJournalDigest;
+        expectedJournalDigest = verified.journal.journalDigest;
         resolution = "preactivation-cleanup-proven";
       } else if (verified.journal.state === "provisioning"
-        && verified.journal.previousJournalDigest === plannedJournalDigest
+        && verified.journal.previousJournalDigest
+          === prepared.intent.expectedPlannedJournalDigest
         && intent.status === "pending"
         && sameProcess(intent.processIdentity, details.processIdentity)) {
         expectedJournalDigest = verified.journal.journalDigest;
@@ -718,6 +935,31 @@ export async function provisionWriteWorkerWorktree({
       timeoutMs,
       "official worktree create"
     );
+    if (reissueRequired) {
+      const effect = classifyWorkerWorktreeEffect({
+        controlRoot: beforeCreate.binding.controlRoot,
+        executionRoot: beforeCreate.binding.expectedExecutionRoot,
+        baseCommit: beforeCreate.binding.baseCommit,
+        workerId,
+        env
+      });
+      if (effect.classification !== "absent") {
+        throw new CompanionError(
+          "E_WORKTREE",
+          "Reissued official create lost its exact absence boundary.",
+          { classification: effect.classification }
+        );
+      }
+    }
+    if (testHooks?.beforeOfficialCreate) {
+      await testHooks.beforeOfficialCreate(Object.freeze({
+        workerId,
+        operationId: prepared.intent.operationId,
+        executionRoot: initial.binding.expectedExecutionRoot,
+        bindingDigest: executionBindingDigest,
+        reissue: reissueRequired
+      }));
+    }
     const created = await acp.create({
       operationId: prepared.intent.operationId,
       sourcePath: controlRoot,
@@ -778,6 +1020,8 @@ export async function provisionWriteWorkerWorktree({
       executionContextManifest,
       cleanupProof
     });
+    const latestPriorAttempt =
+      promoted.job.provisioningRuntime.priorAttempts?.at(-1) ?? null;
     return Object.freeze({
       workerId,
       operationId: prepared.intent.operationId,
@@ -785,6 +1029,11 @@ export async function provisionWriteWorkerWorktree({
       executionRoot: initial.binding.expectedExecutionRoot,
       bindingDigest: executionBindingDigest,
       receiptDigest: receipt.receipt.receiptDigest,
+      priorAttemptArchiveDigest: latestPriorAttempt?.archiveDigest ?? null,
+      absenceProofDigest:
+        latestPriorAttempt?.absenceProof?.proofDigest ?? null,
+      provisioningAttemptCount:
+        (promoted.job.provisioningRuntime.priorAttempts?.length ?? 0) + 1,
       cleanupProofDigest:
         promoted.job.provisioningRuntime.cleanupProof.proofDigest,
       journalDigest: promoted.job.provisioning.journalDigest,
@@ -817,6 +1066,11 @@ export async function provisionWriteWorkerWorktree({
           || null;
         if (!identity || processGroupGone(identity)) {
           try { removeProvisioningHome(stateDir, environment); } catch {}
+        } else {
+          // Keep the coordinator lease owned by this still-live host process.
+          // A competing call must not reclaim the claim root while an exact
+          // controller process group remains unverified.
+          releaseControllerLease = false;
         }
         throw cleanupError;
       }
@@ -861,9 +1115,14 @@ export async function provisionWriteWorkerWorktree({
       }
     } else if (!provider) {
       const retainedIdentity = providerCleanupIdentity(error);
+      const retainedProcessGone = !retainedIdentity
+        || processGroupGone(retainedIdentity);
+      if (!retainedProcessGone) {
+        releaseControllerLease = false;
+      }
       try {
         environment.revokeCredential();
-        if (!retainedIdentity || processGroupGone(retainedIdentity)) {
+        if (retainedProcessGone) {
           removeProvisioningHome(stateDir, environment);
         }
       } catch {
@@ -872,5 +1131,8 @@ export async function provisionWriteWorkerWorktree({
       }
     }
     throw error;
+  }
+  } finally {
+    if (releaseControllerLease) controllerLease.release();
   }
 }

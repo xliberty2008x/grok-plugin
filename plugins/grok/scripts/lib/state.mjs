@@ -557,7 +557,7 @@ function releaseLockGeneration(lock, generation, { allowMissingOwner = false } =
   }
 }
 
-function withLock(root, name, action, env = process.env) {
+function acquireLock(root, name, env = process.env) {
   const base = ensure(root, env), lock = path.join(base, "locks", `${name}.lock`), deadline = Date.now() + 5000;
   let generation = null;
   for (;;) {
@@ -604,7 +604,45 @@ function withLock(root, name, action, env = process.env) {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
     }
   }
+  return Object.freeze({ lock, generation });
+}
+
+function withLock(root, name, action, env = process.env) {
+  const { lock, generation } = acquireLock(root, name, env);
   try { return action(); } finally { releaseLockGeneration(lock, generation); }
+}
+
+/**
+ * Hold one crash-releasing, process-owned lease across an asynchronous host
+ * operation. The lock owner PID/start token is published by the same
+ * generation-safe mechanism used for state transactions, so a live competing
+ * coordinator cannot supersede the lease while a dead one is reclaimable.
+ */
+export function acquireWorkspaceProcessLease(
+  root,
+  name,
+  env = process.env
+) {
+  if (typeof name !== "string"
+    || !/^[A-Za-z0-9._-]{1,160}$/.test(name)
+    || name === "."
+    || name === "..") {
+    throw new CompanionError("E_USAGE", "Workspace process lease name is unsafe.");
+  }
+  const { lock, generation } = acquireLock(
+    root,
+    `process-${name}`,
+    env
+  );
+  let released = false;
+  return Object.freeze({
+    token: generation.ownerToken,
+    release() {
+      if (released) return;
+      releaseLockGeneration(lock, generation);
+      released = true;
+    }
+  });
 }
 
 /** Serialize host-side verification reconciliation with workspace job admission.

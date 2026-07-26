@@ -119,6 +119,8 @@ const JOURNAL_KEYS = new Set([
   "provisioningAt",
   "readyAt",
   "cleanupPendingAt",
+  "reissuePlannedAt",
+  "priorAttemptArchiveDigest",
   "cleanedAt",
   "failedAt",
   "executionContextManifestId",
@@ -126,6 +128,11 @@ const JOURNAL_KEYS = new Set([
   "error",
   "journalDigest"
 ]);
+const LEGACY_JOURNAL_KEYS = new Set(
+  [...JOURNAL_KEYS].filter((key) => (
+    key !== "reissuePlannedAt" && key !== "priorAttemptArchiveDigest"
+  ))
+);
 
 const PROVISIONER_KEYS = new Set(["pid", "startToken", "holderId"]);
 const ERROR_KEYS = new Set(["code", "message"]);
@@ -134,6 +141,7 @@ const JOURNAL_STATES = new Set([
   "provisioning",
   "ready",
   "cleanup_pending",
+  "reissue_planned",
   "cleaned",
   "failed"
 ]);
@@ -146,6 +154,10 @@ const LEGAL_TRANSITIONS = new Set([
   "provisioning:cleanup_pending",
   "ready:cleanup_pending",
   "cleanup_pending:ready",
+  "cleanup_pending:reissue_planned",
+  "reissue_planned:reissue_planned",
+  "reissue_planned:provisioning",
+  "reissue_planned:failed",
   "cleanup_pending:cleaned",
   "cleanup_pending:failed"
 ]);
@@ -200,6 +212,33 @@ const TRANSITION_EDGE_KEYS = new Map([
     "readyAt",
     "executionContextManifestId",
     "executionContextManifestDigest"
+  ])],
+  ["cleanup_pending:reissue_planned", new Set([
+    "state",
+    "expectedCurrentJournalDigest",
+    "attemptId",
+    "fence",
+    "reissuePlannedAt",
+    "priorAttemptArchiveDigest"
+  ])],
+  ["reissue_planned:reissue_planned", new Set([
+    "state",
+    "expectedCurrentJournalDigest"
+  ])],
+  ["reissue_planned:provisioning", new Set([
+    "state",
+    "expectedCurrentJournalDigest",
+    "actorAttemptId",
+    "actorFence",
+    "provisioner",
+    "leaseExpiresAt",
+    "provisioningAt"
+  ])],
+  ["reissue_planned:failed", new Set([
+    "state",
+    "expectedCurrentJournalDigest",
+    "failedAt",
+    "error"
   ])],
   ["cleanup_pending:cleaned", new Set([
     "state",
@@ -550,7 +589,9 @@ export function createExecutionBinding(input = {}) {
 function journalWithoutDigest(journal) {
   const unsigned = {};
   for (const key of JOURNAL_KEYS) {
-    if (key !== "journalDigest") unsigned[key] = journal[key];
+    if (key !== "journalDigest" && Object.hasOwn(journal, key)) {
+      unsigned[key] = journal[key];
+    }
   }
   return unsigned;
 }
@@ -635,6 +676,27 @@ function assertJournalStateShape(journal) {
     stateError("Provisioning journal retains a provisioner lease outside provisioning.");
   }
 
+  const reissuePlannedAtValue = journal.reissuePlannedAt ?? null;
+  const priorAttemptArchiveDigest = journal.priorAttemptArchiveDigest ?? null;
+  const hasPriorAttemptArchive = priorAttemptArchiveDigest !== null;
+  if (
+    hasPriorAttemptArchive
+      ? (
+          !SHA256_HEX.test(priorAttemptArchiveDigest)
+          || reissuePlannedAtValue === null
+          || journal.state === "planned"
+          || !hasAttempt
+          || journal.fence < 2
+        )
+      : reissuePlannedAtValue !== null
+  ) {
+    stateError("Provisioning journal reissue archive identity is inconsistent.");
+  }
+  if (journal.state === "reissue_planned"
+    && (!hasPriorAttemptArchive || !hasAttempt)) {
+    stateError("Reissue-planned journal lacks one fresh inactive fenced attempt.");
+  }
+
   const cleanupProvisionerRequired = (
     ["cleanup_pending", "cleaned", "failed"].includes(journal.state)
     && journal.cleanupPendingAt !== null
@@ -683,14 +745,25 @@ function assertJournalStateShape(journal) {
     cleanup_pending: {
       provisioningAt: hasAttempt, cleanupPendingAt: true, cleanedAt: false, failedAt: false
     },
+    reissue_planned: {
+      provisioningAt: false, cleanupPendingAt: false, cleanedAt: false, failedAt: false
+    },
     cleaned: {
       provisioningAt: hasAttempt, cleanupPendingAt: true, cleanedAt: true, failedAt: false
     }
   };
   if (journal.state === "failed") {
+    const failedBeforeReissueActivation = (
+      hasPriorAttemptArchive
+      && journal.provisioningAt === null
+      && journal.cleanupPendingAt === null
+    );
     if (
-      (journal.provisioningAt !== null) !== hasAttempt
-      || (hasAttempt && journal.cleanupPendingAt === null)
+      (!failedBeforeReissueActivation
+        && (journal.provisioningAt !== null) !== hasAttempt)
+      || (!failedBeforeReissueActivation
+        && hasAttempt
+        && journal.cleanupPendingAt === null)
       || journal.cleanedAt !== null
       || journal.failedAt === null
     ) {
@@ -714,6 +787,10 @@ function assertJournalTimeline(binding, journal) {
   const provisioningAt = nullableTimestampMs(journal.provisioningAt, "provisioningAt");
   const readyAt = nullableTimestampMs(journal.readyAt, "readyAt");
   const cleanupPendingAt = nullableTimestampMs(journal.cleanupPendingAt, "cleanupPendingAt");
+  const reissuePlannedAt = nullableTimestampMs(
+    journal.reissuePlannedAt ?? null,
+    "reissuePlannedAt"
+  );
   const cleanedAt = nullableTimestampMs(journal.cleanedAt, "cleanedAt");
   const failedAt = nullableTimestampMs(journal.failedAt, "failedAt");
   const leaseExpiresAt = nullableTimestampMs(journal.leaseExpiresAt, "leaseExpiresAt");
@@ -728,10 +805,25 @@ function assertJournalTimeline(binding, journal) {
   if (cleanupPendingAt !== null && cleanupPendingAt < latestBeforeCleanup) {
     stateError("Provisioning journal cleanup timestamp is not monotonic.");
   }
+  if (reissuePlannedAt !== null) {
+    if (journal.state === "reissue_planned") {
+      if (reissuePlannedAt < plannedAt) {
+        stateError("Provisioning journal reissue timestamp is not monotonic.");
+      }
+    } else if (provisioningAt !== null && provisioningAt < reissuePlannedAt) {
+      stateError("Provisioning journal reissued attempt predates its durable plan.");
+    }
+  }
   if (cleanedAt !== null && (cleanupPendingAt === null || cleanedAt < cleanupPendingAt)) {
     stateError("Provisioning journal cleaned timestamp is not monotonic.");
   }
-  const latestBeforeFailure = cleanupPendingAt ?? readyAt ?? provisioningAt ?? plannedAt;
+  const latestBeforeFailure = Math.max(
+    cleanupPendingAt ?? Number.NEGATIVE_INFINITY,
+    readyAt ?? Number.NEGATIVE_INFINITY,
+    provisioningAt ?? Number.NEGATIVE_INFINITY,
+    reissuePlannedAt ?? Number.NEGATIVE_INFINITY,
+    plannedAt
+  );
   if (failedAt !== null && failedAt < latestBeforeFailure) {
     stateError("Provisioning journal failure timestamp is not monotonic.");
   }
@@ -749,11 +841,25 @@ function assertJournalTimeline(binding, journal) {
 
 export function assertProvisioningJournal(binding, journal) {
   const trustedBinding = assertExecutionBinding(binding);
-  if (!hasExactKeys(journal, JOURNAL_KEYS)
+  const current = hasExactKeys(journal, JOURNAL_KEYS);
+  const legacy = hasExactKeys(journal, LEGACY_JOURNAL_KEYS);
+  if ((!current && !legacy)
     || journal.schemaVersion !== EXECUTION_PROVISIONING_SCHEMA_VERSION
     || journal.bindingDigest !== trustedBinding.bindingDigest
     || !JOURNAL_STATES.has(journal.state)
-    || !SHA256_HEX.test(journal.journalDigest || "")) {
+    || !SHA256_HEX.test(journal.journalDigest || "")
+    || (current && (
+      ![null, "string"].includes(
+        journal.reissuePlannedAt === null
+          ? null
+          : typeof journal.reissuePlannedAt
+      )
+      || ![null, "string"].includes(
+        journal.priorAttemptArchiveDigest === null
+          ? null
+          : typeof journal.priorAttemptArchiveDigest
+      )
+    ))) {
     stateError("Provisioning journal has an unsupported shape or binding.");
   }
   assertExactNonceId(journal.cancellationNonce, "cancellationNonce");
@@ -792,6 +898,8 @@ export function createProvisioningJournal({
     provisioningAt: null,
     readyAt: null,
     cleanupPendingAt: null,
+    reissuePlannedAt: null,
+    priorAttemptArchiveDigest: null,
     cleanedAt: null,
     failedAt: null,
     executionContextManifestId: null,
@@ -830,10 +938,12 @@ function assertTransitionRequest(current, request) {
     stateError("Provisioning journal transition request is malformed.");
   }
   if (request.state === current.state) {
-    if (!hasExactKeys(request, new Set(["state"]))) {
+    if (hasExactKeys(request, new Set(["state"]))) {
+      return null;
+    }
+    if (current.state !== "reissue_planned") {
       stateError("A same-state provisioning transition must be exactly idempotent.");
     }
-    return null;
   }
 
   const edge = `${current.state}:${request.state}`;
@@ -856,6 +966,28 @@ function assertTransitionRequest(current, request) {
       < timestampMs(current.cleanupPendingAt, "cleanupPendingAt")) {
     stateError("Adopted readiness cannot predate cleanup pending.");
   }
+  if (edge === "cleanup_pending:reissue_planned") {
+    if (current.readyAt !== null
+      || current.executionContextManifestId !== null
+      || current.executionContextManifestDigest !== null
+      || timestampMs(request.reissuePlannedAt, "reissuePlannedAt")
+        < timestampMs(current.cleanupPendingAt, "cleanupPendingAt")) {
+      stateError("Only a pre-ready cleanup-pending attempt may be reissued.");
+    }
+    assertExactNonceId(request.attemptId, "attemptId");
+    assertDigest(request.priorAttemptArchiveDigest, "priorAttemptArchiveDigest");
+    if (request.attemptId === current.attemptId
+      || request.fence !== current.fence + 1) {
+      stateError("Provisioning reissue requires a fresh monotonic fence.");
+    }
+  }
+  if (edge === "reissue_planned:provisioning") {
+    if (request.actorAttemptId !== current.attemptId
+      || request.actorFence !== current.fence) {
+      stateError("Provisioning activation does not own the durable reissue plan.");
+    }
+    assertProvisioner(request.provisioner);
+  }
   return edge;
 }
 
@@ -867,6 +999,8 @@ export function transitionProvisioningJournal(binding, journal, request) {
 
   const next = {
     ...current,
+    reissuePlannedAt: current.reissuePlannedAt ?? null,
+    priorAttemptArchiveDigest: current.priorAttemptArchiveDigest ?? null,
     state: request.state,
     journalRevision: nextJournalRevision(current),
     previousJournalDigest: current.journalDigest,
@@ -901,6 +1035,20 @@ export function transitionProvisioningJournal(binding, journal, request) {
     next.readyAt = request.readyAt;
     next.executionContextManifestId = request.executionContextManifestId;
     next.executionContextManifestDigest = request.executionContextManifestDigest;
+  } else if (edge === "cleanup_pending:reissue_planned") {
+    next.attemptId = request.attemptId;
+    next.fence = request.fence;
+    next.provisioner = null;
+    next.cleanupProvisioner = null;
+    next.leaseExpiresAt = null;
+    next.provisioningAt = null;
+    next.cleanupPendingAt = null;
+    next.reissuePlannedAt = request.reissuePlannedAt;
+    next.priorAttemptArchiveDigest = request.priorAttemptArchiveDigest;
+  } else if (edge === "reissue_planned:provisioning") {
+    next.provisioner = { ...request.provisioner };
+    next.leaseExpiresAt = request.leaseExpiresAt;
+    next.provisioningAt = request.provisioningAt;
   } else if (edge === "cleanup_pending:cleaned") {
     next.cleanedAt = request.cleanedAt;
   }

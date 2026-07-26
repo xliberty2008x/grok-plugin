@@ -24,7 +24,10 @@ import { processGroupGone } from "../plugins/grok/scripts/lib/process-control.mj
 import { loadProviderGuard } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
 import { provisionWriteWorkerWorktree } from "../plugins/grok/scripts/lib/worker-provisioner.mjs";
 import { readJob } from "../plugins/grok/scripts/lib/state.mjs";
-import { assertManagedWorkerWorktree } from "../plugins/grok/scripts/lib/worker-worktree.mjs";
+import {
+  assertManagedWorkerWorktree,
+  classifyWorkerWorktreeEffect
+} from "../plugins/grok/scripts/lib/worker-worktree.mjs";
 import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 
 function sha256File(file) {
@@ -76,6 +79,50 @@ function run(command, args, cwd) {
     );
   }
   return String(result.stdout || "").trim();
+}
+
+function worktreeInventoryRecords(inventory) {
+  if (typeof inventory !== "string" || !inventory) return [];
+  return inventory
+    .split(/\n\n+/)
+    .filter(Boolean)
+    .map((record) => record.split("\n").filter(Boolean));
+}
+
+function assertExactWorktreeInventoryAddition({
+  before,
+  after,
+  executionRoot,
+  baseCommit
+}) {
+  const beforeRecords = worktreeInventoryRecords(before);
+  const afterRecords = worktreeInventoryRecords(after);
+  const target = afterRecords.filter((fields) => (
+    fields.includes(`worktree ${executionRoot}`)
+  ));
+  const exactTarget = new Set([
+    `worktree ${executionRoot}`,
+    `HEAD ${baseCommit}`,
+    "detached"
+  ]);
+  if (beforeRecords.some((fields) => fields.includes(`worktree ${executionRoot}`))
+    || target.length !== 1
+    || target[0].length !== exactTarget.size
+    || target[0].some((field) => !exactTarget.has(field))) {
+    throw new Error(
+      "Official create did not add one exact detached worker registration."
+    );
+  }
+  const normalize = (records) => records
+    .map((fields) => fields.join("\n"))
+    .sort();
+  const remaining = afterRecords.filter((fields) => fields !== target[0]);
+  if (JSON.stringify(normalize(remaining))
+    !== JSON.stringify(normalize(beforeRecords))) {
+    throw new Error(
+      "Official create changed worktree registrations outside its exact worker addition."
+    );
+  }
 }
 
 function sourceIdentity() {
@@ -145,6 +192,33 @@ function recordDigest(value) {
     .createHash("sha256")
     .update(JSON.stringify(value))
     .digest("hex");
+}
+
+function controllerClaimHomes(root, workerId) {
+  const parent = path.join(workspaceState(root), "task-homes");
+  try {
+    return fs.readdirSync(parent)
+      .filter((name) => (
+        name === `${workerId}-provision`
+        || name.startsWith(`${workerId}-provision-`)
+      ))
+      .map((name) => path.join(parent, name));
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+function assertControllerClaimHasNoCredential(home) {
+  const grokHome = path.join(home, ".grok");
+  const entries = fs.readdirSync(grokHome);
+  if (entries.some((entry) => (
+    entry === "auth.json" || entry.startsWith("auth.json.")
+  ))) {
+    throw new Error(
+      "A pre-activation controller crash retained credential material."
+    );
+  }
 }
 
 function requiredReplayEnvironment(name, {
@@ -226,6 +300,7 @@ async function runReadyReplay() {
     "GROK_COMPANION_READY_REPLAY_SESSION_ID",
     { pattern: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/ }
   );
+  const discovery = assertGrokDiscoveryUnavailable();
   const result = await provisionWriteWorkerWorktree({
     root,
     principal: {
@@ -239,6 +314,7 @@ async function runReadyReplay() {
   console.log(JSON.stringify({
     schemaVersion: 1,
     outcome: "passed",
+    discovery,
     result
   }));
 }
@@ -275,7 +351,147 @@ async function runResponseLossAdoption() {
   }));
 }
 
-async function runFreshProbe({ responseLoss = false } = {}) {
+async function runAbsenceReissue() {
+  const root = requiredReplayEnvironment(
+    "GROK_COMPANION_READY_REPLAY_ROOT",
+    { absolutePath: true }
+  );
+  const workerId = requiredReplayEnvironment(
+    "GROK_COMPANION_READY_REPLAY_WORKER_ID",
+    { pattern: /^task-[a-zA-Z0-9._-]{1,120}$/ }
+  );
+  const sessionId = requiredReplayEnvironment(
+    "GROK_COMPANION_READY_REPLAY_SESSION_ID",
+    { pattern: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/ }
+  );
+  const result = await provisionWriteWorkerWorktree({
+    root,
+    principal: {
+      hostKind: "codex",
+      threadId: sessionId
+    },
+    workerId,
+    leaseMs: 240_000,
+    timeoutMs: 120_000
+  });
+  console.log(JSON.stringify({
+    schemaVersion: 1,
+    outcome: "passed",
+    processId: process.pid,
+    result
+  }));
+}
+
+async function runCrashAfterControllerEnvironment() {
+  const root = requiredReplayEnvironment(
+    "GROK_COMPANION_READY_REPLAY_ROOT",
+    { absolutePath: true }
+  );
+  const workerId = requiredReplayEnvironment(
+    "GROK_COMPANION_READY_REPLAY_WORKER_ID",
+    { pattern: /^task-[a-zA-Z0-9._-]{1,120}$/ }
+  );
+  const sessionId = requiredReplayEnvironment(
+    "GROK_COMPANION_READY_REPLAY_SESSION_ID",
+    { pattern: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/ }
+  );
+  const marker = requiredReplayEnvironment(
+    "GROK_COMPANION_REISSUE_CRASH_MARKER",
+    { absolutePath: true }
+  );
+  await provisionWriteWorkerWorktree({
+    root,
+    principal: {
+      hostKind: "codex",
+      threadId: sessionId
+    },
+    workerId,
+    leaseMs: 240_000,
+    timeoutMs: 120_000,
+    testHooks: {
+      afterControllerEnvironmentConstructedBeforeIntent(observation) {
+        const fd = fs.openSync(marker, "wx", 0o600);
+        try {
+          fs.writeFileSync(fd, `${JSON.stringify({
+            schemaVersion: 1,
+            processId: process.pid,
+            ...observation
+          })}\n`);
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
+        process.kill(process.pid, "SIGKILL");
+      }
+    }
+  });
+  throw new Error(
+    "Controller-environment crash subprocess returned instead of terminating."
+  );
+}
+
+async function runCrashAfterReissuePlan() {
+  const root = requiredReplayEnvironment(
+    "GROK_COMPANION_READY_REPLAY_ROOT",
+    { absolutePath: true }
+  );
+  const workerId = requiredReplayEnvironment(
+    "GROK_COMPANION_READY_REPLAY_WORKER_ID",
+    { pattern: /^task-[a-zA-Z0-9._-]{1,120}$/ }
+  );
+  const sessionId = requiredReplayEnvironment(
+    "GROK_COMPANION_READY_REPLAY_SESSION_ID",
+    { pattern: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/ }
+  );
+  const marker = requiredReplayEnvironment(
+    "GROK_COMPANION_REISSUE_CRASH_MARKER",
+    { absolutePath: true }
+  );
+  let environmentObservation = null;
+  await provisionWriteWorkerWorktree({
+    root,
+    principal: {
+      hostKind: "codex",
+      threadId: sessionId
+    },
+    workerId,
+    leaseMs: 240_000,
+    timeoutMs: 120_000,
+    testHooks: {
+      afterControllerEnvironmentConstructedBeforeIntent(observation) {
+        environmentObservation = observation;
+      },
+      afterReissueIntentCommittedBeforeBootstrapSpawn(observation) {
+        if (observation?.reason !== "reissue-prepared") {
+          throw new Error(
+            "Crash seam did not observe the first durable reissue plan."
+          );
+        }
+        const fd = fs.openSync(marker, "wx", 0o600);
+        try {
+          fs.writeFileSync(fd, `${JSON.stringify({
+            schemaVersion: 1,
+            processId: process.pid,
+            home: environmentObservation?.home ?? null,
+            ...observation
+          })}\n`);
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
+        process.kill(process.pid, "SIGKILL");
+      }
+    }
+  });
+  throw new Error(
+    "Reissue-plan crash subprocess returned instead of terminating."
+  );
+}
+
+async function runFreshProbe({
+  responseLoss = false,
+  absenceReissue = false
+} = {}) {
 const implementationSource = sourceIdentity();
 const configuredLeaseMs = process.env.GROK_COMPANION_LIVE_LEASE_MS
   ? Number(process.env.GROK_COMPANION_LIVE_LEASE_MS)
@@ -341,6 +557,547 @@ try {
     path.dirname(planned.binding.expectedExecutionRoot),
     "post-checkout-ran.txt"
   );
+  if (absenceReissue) {
+    let preCreateObservation = null;
+    let injectedFailure = null;
+    try {
+      await provisionWriteWorkerWorktree({
+        root,
+        principal,
+        workerId,
+        leaseMs: configuredLeaseMs,
+        timeoutMs: 120_000,
+        testHooks: {
+          beforeOfficialCreate(observation) {
+            if (observation?.reissue !== false
+              || observation.executionRoot
+                !== planned.binding.expectedExecutionRoot
+              || observation.bindingDigest !== planned.binding.bindingDigest) {
+              throw new Error(
+                "Pre-create fault seam did not observe the exact first attempt."
+              );
+            }
+            preCreateObservation = observation;
+            const fault = new Error(
+              "Injected live no-effect ambiguity before official create."
+            );
+            fault.code = "E_LIVE_NO_EFFECT";
+            throw fault;
+          }
+        }
+      });
+      throw new Error(
+        "Absence-reissue scenario unexpectedly returned its first result."
+      );
+    } catch (error) {
+      injectedFailure = error;
+    }
+    if (!preCreateObservation
+      || injectedFailure?.code !== "E_LIVE_NO_EFFECT") {
+      const failure = new Error(
+        `Real official controller did not reach the no-effect seam: ${
+          injectedFailure?.code || "untyped"
+        }: ${injectedFailure?.message || "unknown failure"}`
+      );
+      failure.details = injectedFailure?.details || null;
+      throw failure;
+    }
+
+    const retainedJob = readJob(root, workerId);
+    const retained = assertWriteExecutionJob(retainedJob);
+    const retainedIntent = retained.provisioningRuntime.intent;
+    const absentEffect = classifyWorkerWorktreeEffect({
+      controlRoot: retained.binding.controlRoot,
+      executionRoot: retained.binding.expectedExecutionRoot,
+      baseCommit: retained.binding.baseCommit,
+      workerId
+    });
+    if (retained.journal.state !== "cleanup_pending"
+      || retainedJob.phase !== "worktree-cleanup-pending"
+      || preCreateObservation.operationId !== retainedIntent.operationId
+      || retained.provisioningRuntime.receipt !== null
+      || retained.provisioningRuntime.hostAdoption !== null
+      || !retained.provisioningRuntime.cleanupProof
+      || absentEffect.classification !== "absent"
+      || !absentEffect.evidence
+      || !processGroupGone(retainedIntent.processIdentity)
+      || loadProviderGuard(root, workerId) !== null
+      || controllerClaimHomes(root, workerId).length !== 0) {
+      throw new Error(
+        "Pre-create ambiguity did not retain exact absent cleanup-pending evidence."
+      );
+    }
+
+    const retainedJobDigest = recordDigest(retainedJob);
+    const worktreeInventoryBeforeReissue = run(
+      "git",
+      ["worktree", "list", "--porcelain"],
+      root
+    );
+    const reissueHome = fs.mkdtempSync(
+      path.join(fixtureBase, "grok-worker-reissue-home-")
+    );
+    const reissueBin = fs.mkdtempSync(
+      path.join(fixtureBase, "grok-worker-reissue-bin-")
+    );
+    const ambientGit = run(
+      "which",
+      ["git"],
+      implementationSource.implementationRoot
+    );
+    const exactGit = fs.realpathSync(ambientGit);
+    fs.symlinkSync(exactGit, path.join(reissueBin, "git"));
+    const gitInstallationBin = path.dirname(ambientGit);
+    if (executableFile(path.join(gitInstallationBin, "grok"))) {
+      throw new Error(
+        "Trusted Git installation bin unexpectedly exposes Grok discovery."
+      );
+    }
+    const safePath = [
+      gitInstallationBin,
+      reissueBin,
+      "/usr/bin",
+      "/bin",
+      "/usr/sbin",
+      "/sbin"
+    ].join(path.delimiter);
+    const exactGrok = process.env.GROK_BIN;
+    if (!exactGrok || !path.isAbsolute(exactGrok) || !executableFile(exactGrok)) {
+      throw new Error(
+        "Absence-reissue live gate requires an explicit executable GROK_BIN."
+      );
+    }
+    const authPath = process.env.GROK_AUTH_PATH
+      || path.join(os.homedir(), ".grok", "auth.json");
+    if (!path.isAbsolute(authPath) || !fs.existsSync(authPath)) {
+      throw new Error(
+        "Absence-reissue live gate requires one explicit existing Grok auth file."
+      );
+    }
+    const childBaseEnv = {
+      ...process.env,
+      HOME: reissueHome,
+      PATH: safePath,
+      GROK_BIN: exactGrok,
+      GROK_AUTH_PATH: authPath,
+      GROK_COMPANION_PLUGIN_DATA: pluginData,
+      GROK_COMPANION_HOST: "codex",
+      GROK_COMPANION_HOST_SESSION_ID: sessionId,
+      CODEX_THREAD_ID: sessionId,
+      GROK_COMPANION_READY_REPLAY_ROOT: root,
+      GROK_COMPANION_READY_REPLAY_WORKER_ID: workerId,
+      GROK_COMPANION_READY_REPLAY_SESSION_ID: sessionId
+    };
+    for (const credentialName of [
+      "XAI_API_KEY",
+      "GROK_API_KEY",
+      "GROK_API_TOKEN",
+      "GROK_AUTH_JSON"
+    ]) {
+      delete childBaseEnv[credentialName];
+    }
+    const preIntentCrashMarker = path.join(
+      fixtureBase,
+      `reissue-environment-crash-${workerId}-${
+        crypto.randomBytes(8).toString("hex")
+      }.json`
+    );
+    const preIntentCrashRun = spawnSync(
+      process.execPath,
+      [
+        fileURLToPath(import.meta.url),
+        "--absence-reissue-crash-after-environment"
+      ],
+      {
+        cwd: implementationSource.implementationRoot,
+        env: {
+          ...childBaseEnv,
+          GROK_COMPANION_REISSUE_CRASH_MARKER: preIntentCrashMarker
+        },
+        encoding: "utf8",
+        shell: false,
+        timeout: 60_000,
+        maxBuffer: 1024 * 1024
+      }
+    );
+    if (preIntentCrashRun.signal !== "SIGKILL"
+      || preIntentCrashRun.status !== null
+      || preIntentCrashRun.error
+      || !fs.existsSync(preIntentCrashMarker)) {
+      throw new Error(
+        "Fresh reissue controller did not terminate at the pre-intent environment crash seam."
+      );
+    }
+    const preIntentCrashObservation = JSON.parse(
+      fs.readFileSync(preIntentCrashMarker, "utf8")
+    );
+    fs.unlinkSync(preIntentCrashMarker);
+    const jobAfterPreIntentCrash = readJob(root, workerId);
+    const homesAfterPreIntentCrash = controllerClaimHomes(root, workerId);
+    const inventoryAfterPreIntentCrash = run(
+      "git",
+      ["worktree", "list", "--porcelain"],
+      root
+    );
+    if (preIntentCrashObservation.schemaVersion !== 1
+      || preIntentCrashObservation.processId === process.pid
+      || preIntentCrashObservation.workerId !== workerId
+      || !homesAfterPreIntentCrash.includes(preIntentCrashObservation.home)
+      || homesAfterPreIntentCrash.length !== 1
+      || recordDigest(jobAfterPreIntentCrash) !== retainedJobDigest
+      || inventoryAfterPreIntentCrash !== worktreeInventoryBeforeReissue
+      || loadProviderGuard(root, workerId) !== null) {
+      throw new Error(
+        "Killed pre-intent controller changed durable state or lost its exact claim root."
+      );
+    }
+    assertControllerClaimHasNoCredential(preIntentCrashObservation.home);
+
+    const crashMarker = path.join(
+      fixtureBase,
+      `reissue-plan-crash-${workerId}-${crypto.randomBytes(8).toString("hex")}.json`
+    );
+    const crashRun = spawnSync(
+      process.execPath,
+      [fileURLToPath(import.meta.url), "--absence-reissue-crash-after-plan"],
+      {
+        cwd: implementationSource.implementationRoot,
+        env: {
+          ...childBaseEnv,
+          GROK_COMPANION_REISSUE_CRASH_MARKER: crashMarker
+        },
+        encoding: "utf8",
+        shell: false,
+        timeout: 60_000,
+        maxBuffer: 1024 * 1024
+      }
+    );
+    if (crashRun.signal !== "SIGKILL"
+      || crashRun.status !== null
+      || crashRun.error
+      || !fs.existsSync(crashMarker)) {
+      throw new Error(
+        "Fresh reissue planner did not terminate at the durable pre-spawn crash seam."
+      );
+    }
+    const crashObservation = JSON.parse(
+      fs.readFileSync(crashMarker, "utf8")
+    );
+    fs.unlinkSync(crashMarker);
+    const crashPlannedJob = readJob(root, workerId);
+    const crashPlanned = assertWriteExecutionJob(crashPlannedJob);
+    const crashIntent = crashPlanned.provisioningRuntime.intent;
+    const inventoryAfterPlannerCrash = run(
+      "git",
+      ["worktree", "list", "--porcelain"],
+      root
+    );
+    const homesAfterPlannerCrash = controllerClaimHomes(root, workerId);
+    if (crashObservation.schemaVersion !== 1
+      || crashObservation.processId === process.pid
+      || crashObservation.reason !== "reissue-prepared"
+      || typeof crashObservation.home !== "string"
+      || !homesAfterPlannerCrash.includes(crashObservation.home)
+      || homesAfterPlannerCrash.length !== 1
+      || crashObservation.operationId !== retainedIntent.operationId
+      || crashObservation.journalDigest
+        !== crashPlanned.journal.journalDigest
+      || crashObservation.providerSpawnIntentId
+        !== crashIntent.providerSpawnIntentId
+      || crashPlanned.journal.state !== "reissue_planned"
+      || crashPlanned.provisioningRuntime.priorAttempts.length !== 1
+      || crashIntent.status !== "pending"
+      || crashIntent.processIdentity !== null
+      || crashIntent.operationId !== retainedIntent.operationId
+      || crashIntent.provisioningFence
+        !== retainedIntent.provisioningFence + 1
+      || loadProviderGuard(root, workerId) !== null
+      || fs.existsSync(crashPlanned.binding.expectedExecutionRoot)
+      || inventoryAfterPlannerCrash !== worktreeInventoryBeforeReissue) {
+      throw new Error(
+        "Killed reissue planner did not leave one exact inactive durable plan."
+      );
+    }
+    assertControllerClaimHasNoCredential(crashObservation.home);
+    const reissueRun = spawnSync(
+      process.execPath,
+      [fileURLToPath(import.meta.url), "--absence-reissue-run"],
+      {
+        cwd: implementationSource.implementationRoot,
+        env: childBaseEnv,
+        encoding: "utf8",
+        shell: false,
+        timeout: 180_000,
+        maxBuffer: 1024 * 1024
+      }
+    );
+    if (reissueRun.status !== 0 || reissueRun.error) {
+      const failure = new Error(
+        "Fresh-process official reissue did not complete."
+      );
+      failure.details = { stderrPresent: Boolean(reissueRun.stderr) };
+      throw failure;
+    }
+    let reissueEnvelope;
+    try {
+      reissueEnvelope = JSON.parse(String(reissueRun.stdout || ""));
+    } catch {
+      throw new Error("Fresh-process official reissue did not return bounded JSON.");
+    }
+    const result = reissueEnvelope?.result;
+    const readyJob = readJob(root, workerId);
+    const ready = assertWriteExecutionJob(readyJob);
+    const currentIntent = ready.provisioningRuntime.intent;
+    const archive = ready.provisioningRuntime.priorAttempts?.at(-1);
+    assertManagedWorkerWorktree({
+      controlRoot: ready.binding.controlRoot,
+      executionRoot: ready.binding.expectedExecutionRoot,
+      baseCommit: ready.binding.baseCommit,
+      workerId
+    });
+    if (reissueEnvelope?.schemaVersion !== 1
+      || reissueEnvelope.outcome !== "passed"
+      || reissueEnvelope.processId === process.pid
+      || result?.officialStatus !== "created"
+      || result.operationId !== retainedIntent.operationId
+      || result.bindingDigest !== retained.binding.bindingDigest
+      || result.priorAttemptArchiveDigest !== archive?.archiveDigest
+      || result.absenceProofDigest !== archive?.absenceProof?.proofDigest
+      || result.provisioningAttemptCount !== 2
+      || result.providerLaunched !== true
+      || result.workerDispatched !== false
+      || ready.journal.state !== "ready"
+      || ready.provisioningRuntime.priorAttempts.length !== 1
+      || archive.sourceCleanupPendingJournal.journalDigest
+        !== retained.journal.journalDigest
+      || archive.attemptEvidence.intent.intentDigest !== retainedIntent.intentDigest
+      || archive.attemptEvidence.cleanupProof.proofDigest
+        !== retained.provisioningRuntime.cleanupProof.proofDigest
+      || archive.absenceProof.classification !== "absent"
+      || archive.absenceProof.exactRegistrationCount !== 0
+      || archive.absenceProof.managedParentRegistrationCount !== 0
+      || archive.absenceProof.adminBacklinkMatchCount !== 0
+      || currentIntent.operationId !== retainedIntent.operationId
+      || currentIntent.provisioningAttemptId
+        === retainedIntent.provisioningAttemptId
+      || currentIntent.provisioningFence !== retainedIntent.provisioningFence + 1
+      || currentIntent.holderId === retainedIntent.holderId
+      || currentIntent.providerSpawnIntentId
+        === retainedIntent.providerSpawnIntentId
+      || currentIntent.provisioningAttemptId
+        !== crashIntent.provisioningAttemptId
+      || currentIntent.provisioningFence
+        !== crashIntent.provisioningFence
+      || currentIntent.holderId === crashIntent.holderId
+      || currentIntent.providerSpawnIntentId
+        === crashIntent.providerSpawnIntentId
+      || currentIntent.executableIdentity.identityDigest
+        === crashIntent.executableIdentity.identityDigest
+      || currentIntent.executableIdentity.releaseIdentityDigest
+        !== crashIntent.executableIdentity.releaseIdentityDigest
+      || (
+        currentIntent.processIdentity.pid === retainedIntent.processIdentity.pid
+        && currentIntent.processIdentity.startToken
+          === retainedIntent.processIdentity.startToken
+        && currentIntent.processIdentity.processGroupId
+          === retainedIntent.processIdentity.processGroupId
+      )
+      || currentIntent.executableIdentity.identityDigest
+        === retainedIntent.executableIdentity.identityDigest
+      || currentIntent.executableIdentity.releaseIdentityDigest
+        !== retainedIntent.executableIdentity.releaseIdentityDigest
+      || retainedJobDigest === recordDigest(readyJob)
+      || !processGroupGone(currentIntent.processIdentity)
+      || loadProviderGuard(root, workerId) !== null
+      || controllerClaimHomes(root, workerId).length !== 0) {
+      throw new Error(
+        "Fresh-process reissue changed operation identity or lacked exact fenced evidence."
+      );
+    }
+
+    const readyJobDigest = recordDigest(readyJob);
+    const worktreeInventoryAfterReissue = run(
+      "git",
+      ["worktree", "list", "--porcelain"],
+      root
+    );
+    assertExactWorktreeInventoryAddition({
+      before: worktreeInventoryBeforeReissue,
+      after: worktreeInventoryAfterReissue,
+      executionRoot: ready.binding.expectedExecutionRoot,
+      baseCommit: ready.binding.baseCommit
+    });
+    const replayHome = fs.mkdtempSync(
+      path.join(fixtureBase, "grok-worker-reissue-replay-home-")
+    );
+    const replayEnv = {
+      ...childBaseEnv,
+      HOME: replayHome,
+      GROK_BIN: path.join(replayHome, "intentionally-absent-grok")
+    };
+    for (const credentialName of [
+      "XAI_API_KEY",
+      "GROK_API_KEY",
+      "GROK_API_TOKEN",
+      "GROK_AUTH_PATH",
+      "GROK_AUTH_JSON"
+    ]) {
+      delete replayEnv[credentialName];
+    }
+    const replayRun = spawnSync(
+      process.execPath,
+      [fileURLToPath(import.meta.url), "--ready-replay"],
+      {
+        cwd: implementationSource.implementationRoot,
+        env: replayEnv,
+        encoding: "utf8",
+        shell: false,
+        timeout: 30_000,
+        maxBuffer: 1024 * 1024
+      }
+    );
+    if (replayRun.status !== 0 || replayRun.error) {
+      throw new Error(
+        "Absence-reissue ready replay did not complete without provider discovery."
+      );
+    }
+    let replayEnvelope;
+    try {
+      replayEnvelope = JSON.parse(String(replayRun.stdout || ""));
+    } catch {
+      throw new Error("Absence-reissue replay did not return bounded JSON.");
+    }
+    const replay = replayEnvelope?.result;
+    const worktreeInventoryAfterReplay = run(
+      "git",
+      ["worktree", "list", "--porcelain"],
+      root
+    );
+    if (replayEnvelope?.schemaVersion !== 1
+      || replayEnvelope.outcome !== "passed"
+      || !replayEnvelope.discovery
+      || Object.values(replayEnvelope.discovery).some((value) => value !== true)
+      || replay?.operationId !== result.operationId
+      || replay.priorAttemptArchiveDigest !== result.priorAttemptArchiveDigest
+      || replay.absenceProofDigest !== result.absenceProofDigest
+      || replay.provisioningAttemptCount !== 2
+      || replay.receiptDigest !== result.receiptDigest
+      || replay.journalDigest !== result.journalDigest
+      || replay.ready !== true
+      || replay.replayed !== true
+      || replay.providerLaunched !== false
+      || replay.workerDispatched !== false
+      || recordDigest(readJob(root, workerId)) !== readyJobDigest
+      || worktreeInventoryAfterReplay !== worktreeInventoryAfterReissue) {
+      throw new Error(
+        "Absence-reissue replay changed durable evidence or relaunched a provider."
+      );
+    }
+    if (sha256File(path.join(root, "target.txt")) !== controlTargetDigest
+      || sha256File(siblingCanary) !== siblingCanaryDigest
+      || fs.existsSync(hookMarker)) {
+      throw new Error(
+        "Absence-reissue changed a control/sibling canary or executed a repository hook."
+      );
+    }
+    const finalImplementationSource = sourceIdentity();
+    if (recordDigest(finalImplementationSource)
+      !== recordDigest(implementationSource)) {
+      throw new Error(
+        "Implementation source identity changed during the live absence-reissue gate."
+      );
+    }
+    const archiveEvidence = {
+      ordinal: archive.ordinal,
+      archiveDigest: archive.archiveDigest,
+      previousArchiveDigest: archive.previousArchiveDigest,
+      sourceCleanupPendingJournalDigest:
+        archive.sourceCleanupPendingJournal.journalDigest,
+      priorIntentDigest: archive.attemptEvidence.intent.intentDigest,
+      cleanupProofDigest:
+        archive.attemptEvidence.cleanupProof.proofDigest,
+      absenceProofDigest: archive.absenceProof.proofDigest,
+      archivedAt: archive.archivedAt
+    };
+    console.log(JSON.stringify({
+      schemaVersion: 1,
+      outcome: "passed",
+      scenario: "official-no-effect-absence-proven-reissue",
+      implementationSource,
+      leaseMs: configuredLeaseMs,
+      root,
+      pluginData,
+      sessionId,
+      workerId,
+      executionRoot: ready.binding.expectedExecutionRoot,
+      baseCommit: ready.binding.baseCommit,
+      boundaryEvidence: {
+        firstOfficialControllerStarted: true,
+        firstAcpCreateNotInvoked: true,
+        firstControllerCleanupProven: true,
+        firstControllerHomeRemoved: true,
+        freshReissueProcessUsed: true,
+        preIntentControllerProcessKilled: true,
+        preIntentDurableJobUnchanged: true,
+        preIntentCredentialNeverPublished: true,
+        staleProcessLeaseReclaimed: true,
+        staleNonSecretClaimRootRemoved: true,
+        durableReissuePlanSurvivedHostProcessDeath: true,
+        inactiveReissuePlanAtomicallyReauthorized: true,
+        freshControllerIdentityVerified: true,
+        freshExecutableInstanceVerified: true,
+        rawGitAndFilesystemAbsenceProven: true,
+        sameOperationIdentityPreserved: true,
+        freshFenceAndSpawnIntentUsed: true,
+        secondRealOfficialCreateReturned: true,
+        secondOfficialStatusCreated: true,
+        secondControllerCleanupProven: true,
+        readyReplayProviderUnavailable: true,
+        durableJobUnchangedOnReplay: true,
+        worktreeInventoryUnchangedOnReplay: true,
+        exactWorktreeInventoryAdditionVerified: true,
+        implementationSourceStableThroughRun: true,
+        controlTargetUnchanged: true,
+        siblingCanaryUnchanged: true,
+        repositoryHookSuppressed: true
+      },
+      firstAttempt: {
+        code: injectedFailure.code,
+        operationId: retainedIntent.operationId,
+        providerSpawnIntentId: retainedIntent.providerSpawnIntentId,
+        provisioningAttemptId: retainedIntent.provisioningAttemptId,
+        provisioningFence: retainedIntent.provisioningFence,
+        cleanupPendingJournalDigest: retained.journal.journalDigest,
+        cleanupProofDigest:
+          retained.provisioningRuntime.cleanupProof.proofDigest,
+        initialAbsenceProofDigest: absentEffect.evidence.proofDigest,
+        worktreeInventoryDigest: crypto
+          .createHash("sha256")
+          .update(worktreeInventoryBeforeReissue)
+          .digest("hex")
+      },
+      restartEvidence: {
+        preIntentCrashedProcessId:
+          preIntentCrashObservation.processId,
+        preIntentClaimHomeDigest: crypto
+          .createHash("sha256")
+          .update(preIntentCrashObservation.home)
+          .digest("hex"),
+        crashedPlannerProcessId: crashObservation.processId,
+        durablePlanJournalDigest: crashPlanned.journal.journalDigest,
+        durablePlanIntentDigest: crashIntent.intentDigest,
+        reauthorizedIntentDigest: currentIntent.intentDigest,
+        provisioningAttemptId: currentIntent.provisioningAttemptId,
+        provisioningFence: currentIntent.provisioningFence,
+        priorAttemptArchiveDigest:
+          crashPlanned.journal.priorAttemptArchiveDigest
+      },
+      archiveEvidence,
+      result,
+      replay
+    }));
+    return;
+  }
   if (responseLoss) {
     let createObservation = null;
     let injectedFailure = null;
@@ -390,11 +1147,6 @@ try {
     const retainedJob = readJob(root, workerId);
     const retained = assertWriteExecutionJob(retainedJob);
     const retainedIntent = retained.provisioningRuntime.intent;
-    const controllerHome = path.join(
-      workspaceState(root),
-      "task-homes",
-      `${workerId}-provision`
-    );
     assertManagedWorkerWorktree({
       controlRoot: retained.binding.controlRoot,
       executionRoot: retained.binding.expectedExecutionRoot,
@@ -409,7 +1161,7 @@ try {
       || !retained.provisioningRuntime.cleanupProof
       || !processGroupGone(retainedIntent.processIdentity)
       || loadProviderGuard(root, workerId) !== null
-      || fs.existsSync(controllerHome)) {
+      || controllerClaimHomes(root, workerId).length !== 0) {
       throw new Error(
         "Response loss did not retain an exact, controller-clean cleanup-pending state."
       );
@@ -753,10 +1505,30 @@ if (process.argv.length === 3 && process.argv[2] === "--ready-replay") {
   && process.argv[2] === "--response-loss"
 ) {
   await runFreshProbe({ responseLoss: true });
+} else if (
+  process.argv.length === 3
+  && process.argv[2] === "--absence-reissue-run"
+) {
+  await runAbsenceReissue();
+} else if (
+  process.argv.length === 3
+  && process.argv[2] === "--absence-reissue-crash-after-environment"
+) {
+  await runCrashAfterControllerEnvironment();
+} else if (
+  process.argv.length === 3
+  && process.argv[2] === "--absence-reissue-crash-after-plan"
+) {
+  await runCrashAfterReissuePlan();
+} else if (
+  process.argv.length === 3
+  && process.argv[2] === "--absence-reissue"
+) {
+  await runFreshProbe({ absenceReissue: true });
 } else if (process.argv.length === 2) {
   await runFreshProbe();
 } else {
   throw new Error(
-    "Usage: live-worker-provisioner-probe.mjs [--ready-replay|--response-loss|--response-loss-adopt]"
+    "Usage: live-worker-provisioner-probe.mjs [--ready-replay|--response-loss|--response-loss-adopt|--absence-reissue|--absence-reissue-run|--absence-reissue-crash-after-environment|--absence-reissue-crash-after-plan]"
   );
 }

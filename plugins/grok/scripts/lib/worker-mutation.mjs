@@ -73,6 +73,7 @@ import { resolveControlWorkspace, workspaceState } from "./workspace.mjs";
 import {
   assertParentUnchanged,
   assertManagedWorkerWorktree,
+  classifyWorkerWorktreeEffect,
   captureParentFingerprint,
   expectedWorkerWorktreeRoot
 } from "./worker-worktree.mjs";
@@ -710,13 +711,18 @@ const WRITE_PROVISIONING_RUNTIME_KEYS = new Set([
   "activationDigest",
   "officialReceipt",
   "hostAdoption",
+  "priorAttempts",
   "executionContextManifest",
   "executionContextManifestRecordDigest",
   "cleanupProof"
 ]);
-const LEGACY_WRITE_PROVISIONING_RUNTIME_KEYS = new Set(
-  [...WRITE_PROVISIONING_RUNTIME_KEYS].filter((key) => key !== "hostAdoption")
-);
+const LEGACY_WRITE_PROVISIONING_RUNTIME_KEY_SETS = Object.freeze([
+  new Set([...WRITE_PROVISIONING_RUNTIME_KEYS].filter((key) => key !== "priorAttempts")),
+  new Set([...WRITE_PROVISIONING_RUNTIME_KEYS].filter((key) => key !== "hostAdoption")),
+  new Set([...WRITE_PROVISIONING_RUNTIME_KEYS].filter((key) => (
+    key !== "hostAdoption" && key !== "priorAttempts"
+  )))
+]);
 const WRITE_PROVISIONING_INTENT_KEYS = new Set([
   "schemaVersion",
   "purpose",
@@ -799,6 +805,49 @@ const WORKTREE_HOST_VERIFICATION_KEYS = new Set([
   "verifiedAt",
   "verificationDigest"
 ]);
+const WORKTREE_ABSENCE_PROOF_KEYS = new Set([
+  "schemaVersion",
+  "classification",
+  "workerId",
+  "controlWorkspaceId",
+  "controlRootDigest",
+  "gitCommonDirDigest",
+  "expectedExecutionRootDigest",
+  "expectedWorkerParentDigest",
+  "baseCommitDigest",
+  "filesystemPathState",
+  "workerParentState",
+  "managedRootIdentityDigest",
+  "workerParentIdentityDigest",
+  "rawInventoryDigest",
+  "adminInventoryDigest",
+  "exactRegistrationCount",
+  "managedParentRegistrationCount",
+  "adminBacklinkMatchCount",
+  "observedAt",
+  "proofDigest"
+]);
+const WRITE_PROVISIONING_ATTEMPT_ARCHIVE_KEYS = new Set([
+  "schemaVersion",
+  "ordinal",
+  "previousArchiveDigest",
+  "operationId",
+  "sourceCleanupPendingJournal",
+  "attemptEvidence",
+  "absenceProof",
+  "archivedAt",
+  "archiveDigest"
+]);
+const WRITE_PROVISIONING_ATTEMPT_EVIDENCE_KEYS = new Set([
+  "intent",
+  "activatedJournalDigest",
+  "activationDigest",
+  "officialReceipt",
+  "hostAdoption",
+  "executionContextManifest",
+  "executionContextManifestRecordDigest",
+  "cleanupProof"
+]);
 const WRITE_PROVISIONING_CLEANUP_INPUT_KEYS = new Set([
   "processIdentity",
   "processGroupGone",
@@ -832,6 +881,7 @@ const WRITE_PREACTIVATION_CLEANUP_RESOLUTION = "preactivation-cleanup-proven";
 const WRITE_READY_LAUNCH_OUTCOME = "worktree-ready-no-dispatch";
 const WRITE_HOST_ADOPTION_ORIGIN =
   "unknown-official-response-host-adoption";
+const MAX_WRITE_PROVISIONING_ATTEMPTS = 3;
 const EXACT_NONCE_HEX = /^[a-f0-9]{32}$/;
 const OPAQUE_HEX = /^[a-f0-9]{32,64}$/;
 const CANCELLATION_RECEIPT_STATUSES = new Set([
@@ -5087,17 +5137,222 @@ function assertWriteProvisioningCleanupProof(proof, intent, {
   return proof;
 }
 
+function worktreeAbsenceProofWithoutDigest(proof) {
+  const { proofDigest: _proofDigest, ...body } = proof;
+  return body;
+}
+
+function assertWorktreeAbsenceProof(proof, binding) {
+  if (!hasExactKeys(proof, WORKTREE_ABSENCE_PROOF_KEYS)
+    || proof.schemaVersion !== WRITE_PROVISIONING_SCHEMA_VERSION
+    || proof.classification !== "absent"
+    || proof.workerId !== binding.workerId
+    || proof.controlWorkspaceId !== binding.controlWorkspaceId
+    || proof.controlRootDigest !== binding.controlRootDigest
+    || proof.gitCommonDirDigest !== binding.gitCommonDirDigest
+    || proof.expectedExecutionRootDigest !== binding.expectedExecutionRootDigest
+    || proof.expectedWorkerParentDigest
+      !== digestKey(path.dirname(binding.expectedExecutionRoot))
+    || proof.baseCommitDigest !== digestKey(binding.baseCommit)
+    || proof.filesystemPathState !== "absent"
+    || proof.workerParentState !== "private-empty"
+    || !SHA256_HEX.test(proof.managedRootIdentityDigest || "")
+    || !SHA256_HEX.test(proof.workerParentIdentityDigest || "")
+    || !SHA256_HEX.test(proof.rawInventoryDigest || "")
+    || !SHA256_HEX.test(proof.adminInventoryDigest || "")
+    || proof.exactRegistrationCount !== 0
+    || proof.managedParentRegistrationCount !== 0
+    || proof.adminBacklinkMatchCount !== 0
+    || proof.proofDigest
+      !== stableDigest(worktreeAbsenceProofWithoutDigest(proof))) {
+    writeProvisioningStateError(
+      "Worktree absence proof is malformed or not binding-bound.",
+      "E_WORKTREE"
+    );
+  }
+  assertCanonicalTimestamp(proof.observedAt, "absenceProof.observedAt");
+  return proof;
+}
+
+function writeProvisioningAttemptArchiveWithoutDigest(archive) {
+  const { archiveDigest: _archiveDigest, ...body } = archive;
+  return body;
+}
+
+function assertWriteProvisioningAttemptArchive(
+  archive,
+  binding,
+  expectedOrdinal,
+  expectedPreviousArchiveDigest
+) {
+  if (!hasExactKeys(archive, WRITE_PROVISIONING_ATTEMPT_ARCHIVE_KEYS)
+    || archive.schemaVersion !== WRITE_PROVISIONING_SCHEMA_VERSION
+    || archive.ordinal !== expectedOrdinal
+    || archive.previousArchiveDigest !== expectedPreviousArchiveDigest
+    || archive.archiveDigest
+      !== stableDigest(writeProvisioningAttemptArchiveWithoutDigest(archive))
+    || archive.operationId !== archive.attemptEvidence?.intent?.operationId
+    || !hasExactKeys(
+      archive.attemptEvidence,
+      WRITE_PROVISIONING_ATTEMPT_EVIDENCE_KEYS
+    )) {
+    writeProvisioningStateError("Provisioning attempt archive is malformed.");
+  }
+  const sourceJournal = assertProvisioningJournal(
+    binding,
+    archive.sourceCleanupPendingJournal
+  );
+  const evidence = archive.attemptEvidence;
+  const intent = assertWriteProvisioningIntent(evidence.intent, binding);
+  const cleanupProof = assertWriteProvisioningCleanupProof(
+    evidence.cleanupProof,
+    intent
+  );
+  const absenceProof = assertWorktreeAbsenceProof(
+    archive.absenceProof,
+    binding
+  );
+  if (sourceJournal.state !== "cleanup_pending"
+    || (sourceJournal.priorAttemptArchiveDigest ?? null)
+      !== expectedPreviousArchiveDigest
+    || sourceJournal.attemptId !== intent.provisioningAttemptId
+    || sourceJournal.fence !== intent.provisioningFence
+    || sourceJournal.cleanupProvisioner?.holderId !== intent.holderId
+    || sourceJournal.cleanupProvisioner?.pid !== intent.processIdentity?.pid
+    || sourceJournal.cleanupProvisioner?.startToken
+      !== intent.processIdentity?.startToken
+    || sourceJournal.previousJournalDigest !== evidence.activatedJournalDigest
+    || intent.status !== "registered"
+    || intent.updatedAt !== sourceJournal.cleanupPendingAt
+    || evidence.activationDigest !== writeProvisioningActivationDigest({
+      intent,
+      activatedJournalDigest: evidence.activatedJournalDigest
+    })
+    || evidence.officialReceipt !== null
+    || evidence.hostAdoption !== null
+    || evidence.executionContextManifest !== null
+    || evidence.executionContextManifestRecordDigest !== null
+    || cleanupProof.proofDigest !== evidence.cleanupProof.proofDigest
+    || Date.parse(absenceProof.observedAt)
+      < Date.parse(sourceJournal.cleanupPendingAt)) {
+    writeProvisioningStateError(
+      "Provisioning attempt archive does not preserve one exact unknown-effect attempt."
+    );
+  }
+  assertTimestampNotBefore(
+    archive.archivedAt,
+    absenceProof.observedAt,
+    "attemptArchive.archivedAt"
+  );
+  return archive;
+}
+
+function assertWriteProvisioningAttemptHistory(history, binding, journal) {
+  if (!Array.isArray(history)
+    || history.length > MAX_WRITE_PROVISIONING_ATTEMPTS - 1) {
+    writeProvisioningStateError("Provisioning attempt history is malformed or exhausted.");
+  }
+  let previousArchiveDigest = null;
+  let operationId = null;
+  let releaseIdentityDigest = null;
+  let previousFence = 0;
+  const attemptIds = new Set();
+  const holderIds = new Set();
+  const spawnIntentIds = new Set();
+  for (let index = 0; index < history.length; index += 1) {
+    const archive = assertWriteProvisioningAttemptArchive(
+      history[index],
+      binding,
+      index + 1,
+      previousArchiveDigest
+    );
+    const sourceJournal = archive.sourceCleanupPendingJournal;
+    const archivedIntent = archive.attemptEvidence.intent;
+    operationId ??= archivedIntent.operationId;
+    releaseIdentityDigest ??=
+      archivedIntent.executableIdentity.releaseIdentityDigest;
+    if (archivedIntent.operationId !== operationId
+      || archive.operationId !== operationId
+      || archivedIntent.executableIdentity.releaseIdentityDigest
+        !== releaseIdentityDigest
+      || archivedIntent.provisioningFence !== previousFence + 1
+      || sourceJournal.fence !== archivedIntent.provisioningFence
+      || (index > 0
+        && sourceJournal.reissuePlannedAt
+          !== history[index - 1].archivedAt)
+      || attemptIds.has(archivedIntent.provisioningAttemptId)
+      || holderIds.has(archivedIntent.holderId)
+      || spawnIntentIds.has(archivedIntent.providerSpawnIntentId)) {
+      writeProvisioningStateError(
+        "Provisioning attempt archive chain forks immutable identity or reuses a fence actor."
+      );
+    }
+    attemptIds.add(archivedIntent.provisioningAttemptId);
+    holderIds.add(archivedIntent.holderId);
+    spawnIntentIds.add(archivedIntent.providerSpawnIntentId);
+    previousFence = archivedIntent.provisioningFence;
+    previousArchiveDigest = archive.archiveDigest;
+  }
+  if (previousArchiveDigest !== (journal.priorAttemptArchiveDigest ?? null)
+    || (history.length === 0) !== (journal.reissuePlannedAt == null)
+    || (history.length > 0
+      && history.at(-1).archivedAt !== journal.reissuePlannedAt)) {
+    writeProvisioningStateError(
+      "Provisioning attempt history is not journal-bound."
+    );
+  }
+  return history;
+}
+
 function assertWriteProvisioningRuntime(runtime, binding, journal) {
   const legacyWithoutHostAdoption = (
     !Object.hasOwn(runtime || {}, "hostAdoption")
-    && hasExactKeys(runtime, LEGACY_WRITE_PROVISIONING_RUNTIME_KEYS)
+    && LEGACY_WRITE_PROVISIONING_RUNTIME_KEY_SETS.some(
+      (keys) => hasExactKeys(runtime, keys)
+    )
+  );
+  const legacyWithoutPriorAttempts = (
+    !Object.hasOwn(runtime || {}, "priorAttempts")
+    && LEGACY_WRITE_PROVISIONING_RUNTIME_KEY_SETS.some(
+      (keys) => hasExactKeys(runtime, keys)
+    )
   );
   if ((!hasExactKeys(runtime, WRITE_PROVISIONING_RUNTIME_KEYS)
-      && !legacyWithoutHostAdoption)
+      && !LEGACY_WRITE_PROVISIONING_RUNTIME_KEY_SETS.some(
+        (keys) => hasExactKeys(runtime, keys)
+      ))
     || runtime.schemaVersion !== WRITE_PROVISIONING_SCHEMA_VERSION) {
     writeProvisioningStateError("Write provisioning runtime has an unsupported shape.");
   }
   const intent = assertWriteProvisioningIntent(runtime.intent, binding);
+  const priorAttempts = assertWriteProvisioningAttemptHistory(
+    legacyWithoutPriorAttempts ? [] : runtime.priorAttempts,
+    binding,
+    journal
+  );
+  if (priorAttempts.length > 0) {
+    const archivedIntents = priorAttempts.map(
+      (archive) => archive.attemptEvidence.intent
+    );
+    const latestArchivedIntent = archivedIntents.at(-1);
+    if (intent.operationId !== latestArchivedIntent.operationId
+      || intent.executableIdentity.releaseIdentityDigest
+        !== latestArchivedIntent.executableIdentity.releaseIdentityDigest
+      || intent.provisioningFence
+        !== latestArchivedIntent.provisioningFence + 1
+      || intent.preparedAt !== journal.reissuePlannedAt
+      || archivedIntents.some((archivedIntent) => (
+        intent.provisioningAttemptId
+          === archivedIntent.provisioningAttemptId
+        || intent.holderId === archivedIntent.holderId
+        || intent.providerSpawnIntentId
+          === archivedIntent.providerSpawnIntentId
+      ))) {
+      writeProvisioningStateError(
+        "Current provisioning intent is not the fresh continuation of its archived attempts."
+      );
+    }
+  }
   const active = intent.processIdentity !== null;
   if (active) {
     if (!SHA256_HEX.test(runtime.activatedJournalDigest || "")
@@ -5143,6 +5398,28 @@ function assertWriteProvisioningRuntime(runtime, binding, journal) {
       || runtime.executionContextManifest !== null
       || cleanupProof !== null) {
       writeProvisioningStateError("Planned write provisioning runtime contains premature authority.");
+    }
+  } else if (journal.state === "reissue_planned") {
+    const priorIntent = priorAttempts.at(-1)?.attemptEvidence?.intent || null;
+    if (intent.status !== "pending"
+      || active
+      || priorAttempts.length < 1
+      || intent.expectedPlannedJournalDigest !== journal.journalDigest
+      || intent.provisioningAttemptId !== journal.attemptId
+      || intent.provisioningFence !== journal.fence
+      || intent.operationId !== priorIntent?.operationId
+      || intent.providerSpawnIntentId === priorIntent?.providerSpawnIntentId
+      || intent.holderId === priorIntent?.holderId
+      || intent.executableIdentity.releaseIdentityDigest
+        !== priorIntent?.executableIdentity?.releaseIdentityDigest
+      || intent.preparedAt !== journal.reissuePlannedAt
+      || receipt !== null
+      || hostAdoption !== null
+      || runtime.executionContextManifest !== null
+      || cleanupProof !== null) {
+      writeProvisioningStateError(
+        "Reissue-planned runtime is not bound to one fresh inactive attempt."
+      );
     }
   } else if (journal.state === "provisioning") {
     if (!["pending", "registered"].includes(intent.status)
@@ -5262,7 +5539,8 @@ function assertWriteProvisioningRuntime(runtime, binding, journal) {
     intent,
     receipt,
     hostAdoption,
-    cleanupProof
+    cleanupProof,
+    priorAttempts
   });
 }
 
@@ -5397,6 +5675,19 @@ export function assertWriteExecutionJob(job, env = process.env) {
       || (job.phase === "provisioning-intent-prepared") !== Boolean(runtimeEvidence)) {
       writeProvisioningStateError("Planned write worker has an inconsistent exact state.");
     }
+  } else if (journal.state === "reissue_planned") {
+    if (job.status !== "queued"
+      || job.phase !== "provisioning-reissue-planned"
+      || spawn.providerLaunchOutcome !== "not-ready"
+      || !runtimeEvidence
+      || job.startedAt !== null
+      || job.completedAt !== null
+      || job.result !== null
+      || job.error !== null) {
+      writeProvisioningStateError(
+        "Reissue-planned write worker has an inconsistent exact state."
+      );
+    }
   } else if (journal.state === "provisioning") {
     if (job.status !== "queued"
       || job.phase !== "worktree-provisioning"
@@ -5462,7 +5753,7 @@ export function assertWriteExecutionJob(job, env = process.env) {
     }
   } else {
     writeProvisioningStateError(
-      "Write execution assertion accepts only planned, provisioning, ready, or exact failed provisioning states."
+      "Write execution assertion accepts only planned, reissue-planned, provisioning, ready, cleanup-pending, or exact failed provisioning states."
     );
   }
   return Object.freeze({
@@ -5719,6 +6010,37 @@ function assertActualWriteProvisionerCleanup(
   assertProvisioningGuardAbsent(binding.controlRoot, binding.workerId);
 }
 
+function sameWorktreeAbsenceIdentity(left, right) {
+  const identity = (proof) => {
+    const {
+      observedAt: _observedAt,
+      proofDigest: _proofDigest,
+      ...body
+    } = proof;
+    return body;
+  };
+  return stableDigest(identity(left)) === stableDigest(identity(right));
+}
+
+function exactAbsentWorktreeEffect(binding, env) {
+  assertParentUnchanged(binding.parentFingerprint, binding.controlRoot);
+  const effect = classifyWorkerWorktreeEffect({
+    controlRoot: binding.controlRoot,
+    executionRoot: binding.expectedExecutionRoot,
+    baseCommit: binding.baseCommit,
+    workerId: binding.workerId,
+    env
+  });
+  if (effect.classification !== "absent" || !effect.evidence) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Unknown worktree effect is not independently absent and cannot be reissued.",
+      { classification: effect.classification }
+    );
+  }
+  return assertWorktreeAbsenceProof(effect.evidence, binding);
+}
+
 /**
  * Commit one broker-owned, fenced worktree-provisioning intent. This grants
  * only permission to create the detached bootstrap process; it creates no
@@ -5821,6 +6143,7 @@ export function prepareWriteProvisionerIntent({
       activationDigest: null,
       officialReceipt: null,
       hostAdoption: null,
+      priorAttempts: [],
       executionContextManifest: null,
       executionContextManifestRecordDigest: null,
       cleanupProof: null
@@ -5859,6 +6182,391 @@ export function prepareWriteProvisionerIntent({
       reason: "prepared",
       replayed: false,
       intent: job.provisioningRuntime.intent,
+      job
+    });
+  }, env);
+}
+
+/**
+ * Archive one controller-clean unknown-effect attempt and publish a fresh
+ * inactive provisioning intent only after repeated filesystem plus raw-Git
+ * absence proof. The immutable official operation identity is preserved.
+ */
+export function prepareWriteProvisioningReissue({
+  root,
+  principal,
+  workerId,
+  executionBindingDigest,
+  expectedJournalDigest,
+  attemptId,
+  fence,
+  holderId,
+  executableIdentity,
+  env = process.env
+} = {}) {
+  assertWriteProvisioningMutationInput({
+    root,
+    principal,
+    workerId,
+    executionBindingDigest,
+    expectedJournalDigest,
+    attemptId,
+    fence,
+    holderId
+  });
+  assertExecutableAttestation(executableIdentity);
+
+  return withWorkspaceStateTransaction(root, (transaction) => {
+    const current = transaction.tryReadJob(workerId);
+    if (!current) throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+    assertMutationOwnership(current, principal);
+    const verified = assertWriteExecutionJob(current, env);
+    if (verified.binding.bindingDigest !== executionBindingDigest) {
+      writeProvisioningStateError(
+        "Provisioning reissue execution binding changed before planning."
+      );
+    }
+    if (verified.journal.state === "reissue_planned") {
+      const existing = verified.provisioningRuntime.intent;
+      const executableMatches = sameExecutableAttestation(
+        existing.executableIdentity,
+        executableIdentity
+      );
+      const exactReplay = (
+        verified.journal.journalDigest === expectedJournalDigest
+        && existing.provisioningAttemptId === attemptId
+        && existing.provisioningFence === fence
+        && existing.holderId === holderId
+        && executableMatches
+      );
+      if (exactReplay) {
+        return Object.freeze({
+          prepared: false,
+          reason: "already-reissue-planned",
+          replayed: true,
+          intent: existing,
+          job: current
+        });
+      }
+      const runtime = verified.provisioningRuntime.runtime;
+      if (verified.journal.journalDigest !== expectedJournalDigest
+        || existing.status !== "pending"
+        || existing.processIdentity !== null
+        || existing.provisioningAttemptId !== attemptId
+        || existing.provisioningFence !== fence
+        || (existing.holderId === holderId && executableMatches)
+        || (existing.holderId !== holderId
+          && runtime.priorAttempts.some((archive) => (
+            archive.attemptEvidence.intent.holderId === holderId
+          )))
+        || executableIdentity.releaseIdentityDigest
+          !== existing.executableIdentity.releaseIdentityDigest) {
+        writeProvisioningStateError(
+          "Durable reissue plan cannot be atomically reauthorized for this caller."
+        );
+      }
+      assertProvisioningGuardAbsent(verified.binding.controlRoot, workerId);
+      const reauthorizedAt = now();
+      const journal = transitionProvisioningJournal(
+        verified.binding,
+        verified.journal,
+        {
+          state: "reissue_planned",
+          expectedCurrentJournalDigest: expectedJournalDigest
+        }
+      );
+      const usedSpawnIntentIds = new Set([
+        existing.providerSpawnIntentId,
+        ...runtime.priorAttempts.map(
+          (archive) => archive.attemptEvidence.intent.providerSpawnIntentId
+        )
+      ]);
+      let providerSpawnIntentId;
+      do {
+        providerSpawnIntentId = crypto.randomBytes(16).toString("hex");
+      } while (usedSpawnIntentIds.has(providerSpawnIntentId));
+      const intent = {
+        schemaVersion: WRITE_PROVISIONING_SCHEMA_VERSION,
+        purpose: WRITE_PROVISIONING_PURPOSE,
+        workerId,
+        intentId: providerSpawnIntentId,
+        providerSpawnIntentId,
+        operationId: existing.operationId,
+        executionBindingDigest,
+        expectedPlannedJournalDigest: journal.journalDigest,
+        provisioningAttemptId: attemptId,
+        provisioningFence: fence,
+        holderId,
+        executableIdentity,
+        status: "pending",
+        processIdentity: null,
+        preparedAt: journal.reissuePlannedAt,
+        activatedAt: null,
+        registeredAt: null,
+        settledAt: null,
+        noChildAt: null,
+        resolution: null,
+        updatedAt: reauthorizedAt,
+        intentDigest: null
+      };
+      intent.intentDigest = stableDigest(
+        writeProvisioningIntentDigestBody(intent)
+      );
+      assertWriteProvisioningIntent(intent, verified.binding);
+      const provisioningRuntime = {
+        ...runtime,
+        intent,
+        activatedJournalDigest: null,
+        activationDigest: null,
+        officialReceipt: null,
+        hostAdoption: null,
+        executionContextManifest: null,
+        executionContextManifestRecordDigest: null,
+        cleanupProof: null
+      };
+      const job = transaction.updateJob(workerId, (latest) => {
+        assertMutationOwnership(latest, principal);
+        const latestVerified = assertWriteExecutionJob(latest, env);
+        if (latestVerified.journal.state !== "reissue_planned"
+          || latestVerified.journal.journalDigest !== expectedJournalDigest
+          || latestVerified.provisioningRuntime.intent.intentDigest
+            !== existing.intentDigest) {
+          writeProvisioningStateError(
+            "Durable reissue plan changed before atomic reauthorization."
+          );
+        }
+        assertProvisioningGuardAbsent(
+          latestVerified.binding.controlRoot,
+          workerId
+        );
+        const next = {
+          ...latest,
+          phase: "provisioning-reissue-planned",
+          summary: "Write worktree reissue controller reauthorized",
+          progress:
+            "Inactive durable reissue plan atomically rebound to one fresh controller claimant.",
+          updatedAt: reauthorizedAt,
+          heartbeatAt: reauthorizedAt,
+          provisioning: journal,
+          provisioningRuntime,
+          lifecycleEvents: appendLifecycleEvent(
+            latest.lifecycleEvents || [],
+            "checkpoint",
+            "Inactive worktree reissue intent atomically reauthorized.",
+            {
+              operationId: existing.operationId,
+              provisioningFence: fence,
+              priorProviderSpawnIntentId: existing.providerSpawnIntentId,
+              providerSpawnIntentId,
+              priorAttemptArchiveDigest:
+                journal.priorAttemptArchiveDigest
+            }
+          )
+        };
+        assertWriteExecutionJob(next, env);
+        return next;
+      });
+      return Object.freeze({
+        prepared: true,
+        reason: "reissue-reauthorized",
+        replayed: false,
+        intent: job.provisioningRuntime.intent,
+        archive: job.provisioningRuntime.priorAttempts.at(-1),
+        job
+      });
+    }
+
+    const runtime = verified.provisioningRuntime;
+    const priorIntent = runtime?.intent;
+    const priorAttempts = runtime?.priorAttempts || [];
+    if (verified.journal.state !== "cleanup_pending"
+      || verified.journal.journalDigest !== expectedJournalDigest
+      || !priorIntent
+      || priorIntent.status !== "registered"
+      || runtime.receipt !== null
+      || runtime.hostAdoption !== null
+      || runtime.runtime.executionContextManifest !== null
+      || !runtime.cleanupProof
+      || priorAttempts.length >= MAX_WRITE_PROVISIONING_ATTEMPTS - 1
+      || attemptId === priorIntent.provisioningAttemptId
+      || fence !== priorIntent.provisioningFence + 1
+      || holderId === priorIntent.holderId
+      || executableIdentity.releaseIdentityDigest
+        !== priorIntent.executableIdentity.releaseIdentityDigest) {
+      writeProvisioningStateError(
+        "Cleanup-pending attempt is not eligible for one bounded official reissue."
+      );
+    }
+    assertActualWriteProvisionerCleanup(
+      verified.binding,
+      priorIntent
+    );
+    const absenceProof = exactAbsentWorktreeEffect(verified.binding, env);
+    const reissuePlannedAt = new Date(Math.max(
+      Date.now(),
+      Date.parse(verified.journal.cleanupPendingAt),
+      Date.parse(absenceProof.observedAt)
+    )).toISOString();
+    const providerSpawnIntentId = crypto.randomBytes(16).toString("hex");
+    const previousArchiveDigest =
+      priorAttempts.at(-1)?.archiveDigest ?? null;
+    const attemptEvidence = {
+      intent: runtime.runtime.intent,
+      activatedJournalDigest: runtime.runtime.activatedJournalDigest,
+      activationDigest: runtime.runtime.activationDigest,
+      officialReceipt: null,
+      hostAdoption: null,
+      executionContextManifest: null,
+      executionContextManifestRecordDigest: null,
+      cleanupProof: runtime.runtime.cleanupProof
+    };
+    const archive = {
+      schemaVersion: WRITE_PROVISIONING_SCHEMA_VERSION,
+      ordinal: priorAttempts.length + 1,
+      previousArchiveDigest,
+      operationId: priorIntent.operationId,
+      sourceCleanupPendingJournal: verified.journal,
+      attemptEvidence,
+      absenceProof,
+      archivedAt: reissuePlannedAt,
+      archiveDigest: null
+    };
+    archive.archiveDigest = stableDigest(
+      writeProvisioningAttemptArchiveWithoutDigest(archive)
+    );
+    assertWriteProvisioningAttemptArchive(
+      archive,
+      verified.binding,
+      archive.ordinal,
+      previousArchiveDigest
+    );
+    const nextPriorAttempts = [...priorAttempts, archive];
+    const journal = transitionProvisioningJournal(
+      verified.binding,
+      verified.journal,
+      {
+        state: "reissue_planned",
+        expectedCurrentJournalDigest: expectedJournalDigest,
+        attemptId,
+        fence,
+        reissuePlannedAt,
+        priorAttemptArchiveDigest: archive.archiveDigest
+      }
+    );
+    const intent = {
+      schemaVersion: WRITE_PROVISIONING_SCHEMA_VERSION,
+      purpose: WRITE_PROVISIONING_PURPOSE,
+      workerId,
+      intentId: providerSpawnIntentId,
+      providerSpawnIntentId,
+      operationId: priorIntent.operationId,
+      executionBindingDigest,
+      expectedPlannedJournalDigest: journal.journalDigest,
+      provisioningAttemptId: attemptId,
+      provisioningFence: fence,
+      holderId,
+      executableIdentity,
+      status: "pending",
+      processIdentity: null,
+      preparedAt: reissuePlannedAt,
+      activatedAt: null,
+      registeredAt: null,
+      settledAt: null,
+      noChildAt: null,
+      resolution: null,
+      updatedAt: reissuePlannedAt,
+      intentDigest: null
+    };
+    intent.intentDigest = stableDigest(writeProvisioningIntentDigestBody(intent));
+    assertWriteProvisioningIntent(intent, verified.binding);
+    const provisioningRuntime = {
+      schemaVersion: WRITE_PROVISIONING_SCHEMA_VERSION,
+      intent,
+      activatedJournalDigest: null,
+      activationDigest: null,
+      officialReceipt: null,
+      hostAdoption: null,
+      priorAttempts: nextPriorAttempts,
+      executionContextManifest: null,
+      executionContextManifestRecordDigest: null,
+      cleanupProof: null
+    };
+
+    const job = transaction.updateJob(workerId, (latest) => {
+      assertMutationOwnership(latest, principal);
+      const latestVerified = assertWriteExecutionJob(latest, env);
+      if (latestVerified.journal.state !== "cleanup_pending"
+        || latestVerified.journal.journalDigest !== expectedJournalDigest
+        || latestVerified.provisioningRuntime?.intent.providerSpawnIntentId
+          !== priorIntent.providerSpawnIntentId
+        || latestVerified.provisioningRuntime.cleanupProof?.proofDigest
+          !== runtime.cleanupProof.proofDigest
+        || latestVerified.provisioningRuntime.receipt !== null
+        || latestVerified.provisioningRuntime.hostAdoption !== null) {
+        writeProvisioningStateError(
+          "Write provisioning state changed before reissue planning."
+        );
+      }
+      assertActualWriteProvisionerCleanup(
+        latestVerified.binding,
+        latestVerified.provisioningRuntime.intent
+      );
+      const commitAbsenceProof = exactAbsentWorktreeEffect(
+        latestVerified.binding,
+        env
+      );
+      if (!sameWorktreeAbsenceIdentity(absenceProof, commitAbsenceProof)) {
+        writeProvisioningStateError(
+          "Worktree absence identity changed before reissue publication.",
+          "E_WORKTREE"
+        );
+      }
+      const next = {
+        ...latest,
+        status: "queued",
+        phase: "provisioning-reissue-planned",
+        summary: "Write worktree reissue safely planned",
+        progress:
+          "Prior unknown effect archived after exact absence proof; fresh controller intent committed.",
+        updatedAt: reissuePlannedAt,
+        heartbeatAt: reissuePlannedAt,
+        provisioning: journal,
+        provisioningRuntime,
+        request: {
+          ...latest.request,
+          spawn: {
+            ...latest.request.spawn,
+            providerLaunchPending: false,
+            providerLaunchInFlight: false,
+            providerLaunchOutcome: "not-ready"
+          }
+        },
+        startedAt: null,
+        completedAt: null,
+        result: null,
+        error: null,
+        lifecycleEvents: appendLifecycleEvent(
+          latest.lifecycleEvents || [],
+          "checkpoint",
+          "Unknown worktree effect proven absent and reissue intent committed.",
+          {
+            operationId: priorIntent.operationId,
+            provisioningFence: fence,
+            providerSpawnIntentId,
+            priorAttemptArchiveDigest: archive.archiveDigest,
+            absenceProofDigest: absenceProof.proofDigest
+          }
+        )
+      };
+      assertWriteExecutionJob(next, env);
+      return next;
+    });
+    return Object.freeze({
+      prepared: true,
+      reason: "reissue-prepared",
+      replayed: false,
+      intent: job.provisioningRuntime.intent,
+      archive: job.provisioningRuntime.priorAttempts.at(-1),
       job
     });
   }, env);
@@ -5941,7 +6649,7 @@ export function activateWriteProvisioningAttempt({
         job: current
       });
     }
-    if (verified.journal.state !== "planned"
+    if (!["planned", "reissue_planned"].includes(verified.journal.state)
       || verified.journal.journalDigest !== expectedJournalDigest
       || intent.expectedPlannedJournalDigest !== expectedJournalDigest
       || intent.status !== "pending"
@@ -5961,19 +6669,33 @@ export function activateWriteProvisioningAttempt({
     const journal = transitionProvisioningJournal(
       verified.binding,
       verified.journal,
-      {
-        state: "provisioning",
-        expectedCurrentJournalDigest: expectedJournalDigest,
-        attemptId,
-        fence,
-        provisioner: {
-          pid: processIdentity.pid,
-          startToken: processIdentity.startToken,
-          holderId
-        },
-        leaseExpiresAt,
-        provisioningAt: activatedAt
-      }
+      verified.journal.state === "planned"
+        ? {
+            state: "provisioning",
+            expectedCurrentJournalDigest: expectedJournalDigest,
+            attemptId,
+            fence,
+            provisioner: {
+              pid: processIdentity.pid,
+              startToken: processIdentity.startToken,
+              holderId
+            },
+            leaseExpiresAt,
+            provisioningAt: activatedAt
+          }
+        : {
+            state: "provisioning",
+            expectedCurrentJournalDigest: expectedJournalDigest,
+            actorAttemptId: attemptId,
+            actorFence: fence,
+            provisioner: {
+              pid: processIdentity.pid,
+              startToken: processIdentity.startToken,
+              holderId
+            },
+            leaseExpiresAt,
+            provisioningAt: activatedAt
+          }
     );
     const nextIntent = {
       ...intent,
@@ -5993,7 +6715,7 @@ export function activateWriteProvisioningAttempt({
     const job = transaction.updateJob(workerId, (latest) => {
       assertMutationOwnership(latest, principal);
       const latestVerified = assertWriteExecutionJob(latest, env);
-      if (latestVerified.journal.state !== "planned"
+      if (!["planned", "reissue_planned"].includes(latestVerified.journal.state)
         || latestVerified.journal.journalDigest !== expectedJournalDigest
         || latestVerified.provisioningRuntime?.intent.providerSpawnIntentId
           !== providerSpawnIntentId
@@ -7007,7 +7729,7 @@ export function recordWriteProvisionerNoChild({
 
     let journal;
     let durableCleanup = null;
-    if (verified.journal.state === "planned") {
+    if (["planned", "reissue_planned"].includes(verified.journal.state)) {
       const preactivationCleanup = (
         resolution === WRITE_PREACTIVATION_CLEANUP_RESOLUTION
       );
