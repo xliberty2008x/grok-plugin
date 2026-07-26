@@ -1913,6 +1913,24 @@ async function callWriteSmokeResult(context, client, workerId) {
         )
           ? privateJob.request.spawn.providerLaunchOutcome
           : null,
+        providerLaunchBindingPresent:
+          privateJob?.request?.spawn?.providerLaunchBinding != null,
+        providerLaunchBindingDigest:
+          /^[a-f0-9]{64}$/.test(
+            String(
+              privateJob?.request?.spawn?.providerLaunchBindingDigest || ""
+            )
+          )
+            ? privateJob.request.spawn.providerLaunchBindingDigest
+            : null,
+        executionProviderLaunchBindingDigest:
+          /^[a-f0-9]{64}$/.test(
+            String(
+              privateJob?.executionBinding?.providerLaunchBindingDigest || ""
+            )
+          )
+            ? privateJob.executionBinding.providerLaunchBindingDigest
+            : null,
         dispatchState: /^[a-z][a-z0-9-]{0,31}$/.test(
           String(privateDispatch?.state || "")
         )
