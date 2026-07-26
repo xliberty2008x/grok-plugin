@@ -716,11 +716,15 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
     discardCleanupArguments,
     /integrationReceiptDigest/
   );
-  assert.match(source, /cleanupReceipt\?\.disposition !== "discarded"/);
   assert.match(
     source,
-    /cleanupReceipt\?\.integrationReceiptDigest !== null/
+    /discarded: cleanupReceipt\?\.disposition === "discarded"/
   );
+  assert.match(
+    source,
+    /noIntegration: cleanupReceipt\?\.integrationReceiptDigest === null/
+  );
+  assert.match(source, /stage: "write-cancel-production-cleanup"/);
   assert.match(source, /activeWriteCancellationProven: true/);
   assert.match(source, /writeCancellation: cancellationEvidence/);
 });

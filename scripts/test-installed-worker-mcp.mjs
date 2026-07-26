@@ -6246,24 +6246,35 @@ async function runWriteCancellationScenario(baseContext, fixtureRoot) {
     ["receipt", "replayed"]
   );
   const cleanupReceipt = cleaned.receipt;
-  if (
-    cleaned.replayed !== false
-    || cleanupReceipt?.workerId !== workerId
-    || cleanupReceipt?.operation !== "cleanup"
-    || cleanupReceipt?.status !== "absent"
-    || cleanupReceipt?.disposition !== "discarded"
-    || cleanupReceipt?.terminalStatus !== "cancelled"
-    || cleanupReceipt?.integrationReceiptDigest !== null
-    || cleanupReceipt?.parentFingerprintDigest
-      !== parentBefore.fingerprintDigest
-    || !/^[a-f0-9]{64}$/.test(
+  const cleanupReceiptChecks = {
+    firstResponse: cleaned.replayed === false,
+    workerBound: cleanupReceipt?.workerId === workerId,
+    cleanupOperation: cleanupReceipt?.operation === "cleanup",
+    absent: cleanupReceipt?.status === "absent",
+    discarded: cleanupReceipt?.disposition === "discarded",
+    cancelled: cleanupReceipt?.terminalStatus === "cancelled",
+    noIntegration: cleanupReceipt?.integrationReceiptDigest === null,
+    parentBound:
+      cleanupReceipt?.parentFingerprintDigest
+        === parentBefore.fingerprintDigest,
+    terminalEvidence: /^[a-f0-9]{64}$/.test(
       cleanupReceipt?.terminalEvidenceDigest || ""
-    )
-    || !/^[a-f0-9]{64}$/.test(cleanupReceipt?.receiptDigest || "")
-    || !/^[a-f0-9]{64}$/.test(
+    ),
+    receiptDigest: /^[a-f0-9]{64}$/.test(
+      cleanupReceipt?.receiptDigest || ""
+    ),
+    absenceProof: /^[a-f0-9]{64}$/.test(
       cleanupReceipt?.absenceProofDigest || ""
     )
-  ) {
+  };
+  if (Object.values(cleanupReceiptChecks).some((passed) => passed !== true)) {
+    process.stderr.write(
+      `Installed Worker MCP write-smoke diagnostic ${JSON.stringify({
+        schemaVersion: 1,
+        stage: "write-cancel-production-cleanup",
+        checks: cleanupReceiptChecks
+      })}\n`
+    );
     fail("E_SCENARIO");
   }
 
