@@ -17,7 +17,12 @@ import {
   sameExecutableAttestation
 } from "./executable-identity.mjs";
 import { redact, redactText } from "./redact.mjs";
-import { processGroupAlive, processGroupGone, processStartToken } from "./process-control.mjs";
+import {
+  assertCompleteDetachedOwnedIdentity,
+  processGroupAlive,
+  processGroupGone,
+  processStartToken
+} from "./process-control.mjs";
 import {
   assertWorkerOwnerControllerBinding,
   authenticateProviderBootstrapGuard,
@@ -467,6 +472,58 @@ function openPrivateCredentialHandle(authFile) {
   }
 }
 
+function privateCredentialTempIdentity(stat) {
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink?.()
+    || stat.size > 2 * 1024 * 1024
+    || stat.nlink !== 1
+    || (stat.mode & 0o077) !== 0
+    || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+  ) {
+    throw new CompanionError(
+      "E_STATE",
+      "The isolated provider credential temporary file is unsafe."
+    );
+  }
+  return Object.freeze({
+    device: String(stat.dev),
+    inode: String(stat.ino)
+  });
+}
+
+function openOptionalPrivateCredentialTempHandle(temporary) {
+  let descriptor = null;
+  try {
+    const before = fs.lstatSync(temporary);
+    const identity = privateCredentialTempIdentity(before);
+    descriptor = fs.openSync(
+      temporary,
+      fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0)
+    );
+    const openedIdentity = privateCredentialTempIdentity(
+      fs.fstatSync(descriptor)
+    );
+    const afterIdentity = privateCredentialTempIdentity(
+      fs.lstatSync(temporary)
+    );
+    if (!sameFileIdentity(identity, openedIdentity)
+      || !sameFileIdentity(identity, afterIdentity)) {
+      throw new CompanionError(
+        "E_STATE",
+        "The isolated provider credential temporary file changed during binding."
+      );
+    }
+    return { descriptor, identity };
+  } catch (error) {
+    if (descriptor != null) {
+      try { fs.closeSync(descriptor); } catch { /* best-effort */ }
+    }
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
 function neutralizeCredentialHandle(handle) {
   if (!handle || handle.descriptor == null) return;
   let failure = null;
@@ -478,6 +535,22 @@ function neutralizeCredentialHandle(handle) {
   catch (error) { failure ||= error; }
   handle.descriptor = null;
   if (failure) throw failure;
+}
+
+function neutralizeIdentityBoundCredential(
+  credentialFile,
+  directoryIdentities,
+  handle
+) {
+  if (!handle) return;
+  // If neutralization cannot be proven, retain the pathname for recovery
+  // instead of unlinking a credential that may still contain secret bytes.
+  neutralizeCredentialHandle(handle);
+  unlinkIdentityBoundCredential(
+    credentialFile,
+    directoryIdentities,
+    handle.identity
+  );
 }
 
 function unlinkIdentityBoundCredential(authFile, directoryIdentities, identity) {
@@ -1944,6 +2017,23 @@ export function workerSessionCloseControllerEnvironment(
     }
     return sessionHomeIdentityDigest;
   };
+  const assertNoForeignProviderAuthTemporaries = (
+    allowedProviderPid = null
+  ) => {
+    verifySessionHome();
+    const allowed = allowedProviderPid == null
+      ? null
+      : `auth.json.${allowedProviderPid}.tmp`;
+    const foreign = fs.readdirSync(grokHome).find((entry) => (
+      /^auth\.json\.[1-9]\d*\.tmp$/.test(entry) && entry !== allowed
+    ));
+    if (foreign) {
+      throw new CompanionError(
+        "E_STATE",
+        "Worker provider-session home contains a foreign credential temporary file."
+      );
+    }
+  };
   const assertCredentialAbsent = () => {
     verifySessionHome();
     try {
@@ -1955,6 +2045,7 @@ export function workerSessionCloseControllerEnvironment(
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
     }
+    assertNoForeignProviderAuthTemporaries();
     return true;
   };
 
@@ -1966,7 +2057,48 @@ export function workerSessionCloseControllerEnvironment(
   const ephemeralIdentities = [];
   let stagedCredential = null;
   let credentialRevoked = false;
+  let credentialWriterIdentity = null;
   const knownSecrets = [];
+  const bindCredentialWriterIdentity = (processIdentity) => {
+    assertCompleteDetachedOwnedIdentity(processIdentity);
+    if (!Number.isSafeInteger(processIdentity?.providerPid)
+      || processIdentity.providerPid <= 0
+      || !processGroupGone(processIdentity)) {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "Worker provider credential cannot be removed while its exact controller process group may live."
+      );
+    }
+    const candidate = Object.freeze({
+      pid: processIdentity.pid,
+      startToken: processIdentity.startToken,
+      processGroupId: processIdentity.processGroupId,
+      providerPid: processIdentity.providerPid
+    });
+    if (credentialWriterIdentity
+      && (credentialWriterIdentity.pid !== candidate.pid
+        || credentialWriterIdentity.startToken !== candidate.startToken
+        || credentialWriterIdentity.processGroupId !== candidate.processGroupId
+        || credentialWriterIdentity.providerPid !== candidate.providerPid)) {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "Worker provider credential writer identity changed during cleanup."
+      );
+    }
+    credentialWriterIdentity ||= candidate;
+    return credentialWriterIdentity;
+  };
+  const providerAuthTemporary = (processIdentity) => (
+    `${authFile}.${bindCredentialWriterIdentity(processIdentity).providerPid}.tmp`
+  );
+  const assertCredentialPathAbsent = (credentialFile, message) => {
+    try {
+      fs.lstatSync(credentialFile);
+      throw new CompanionError("E_STATE", message);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  };
   const assertHomeAbsent = () => {
     try {
       fs.lstatSync(home);
@@ -2067,21 +2199,63 @@ export function workerSessionCloseControllerEnvironment(
         );
         knownSecrets.push(stagedCredential.key);
       },
-      revokeCredential() {
+      revokeCredential(processIdentity) {
         verifySessionHome();
         if (!stagedCredential) {
           assertCredentialAbsent();
           return;
         }
+        const temporary = providerAuthTemporary(processIdentity);
+        assertNoForeignProviderAuthTemporaries(
+          credentialWriterIdentity.providerPid
+        );
         if (!credentialRevoked) {
-          try { stagedCredential.refresh(); }
-          catch (error) { if (error?.code !== "ENOENT") throw error; }
-          stagedCredential.revoke();
+          // Bind and validate the one upstream temp path before touching either
+          // credential. Never glob: auth.json.lock and unrelated files remain
+          // outside this controller's authority.
+          const temporaryHandle = openOptionalPrivateCredentialTempHandle(
+            temporary
+          );
+          try {
+            try { stagedCredential.refresh(); }
+            catch (error) { if (error?.code !== "ENOENT") throw error; }
+            neutralizeIdentityBoundCredential(
+              temporary,
+              sessionHomeIdentities,
+              temporaryHandle
+            );
+            stagedCredential.revoke();
+          } catch (error) {
+            if (temporaryHandle?.descriptor != null) {
+              try { fs.closeSync(temporaryHandle.descriptor); }
+              catch { /* retain artifacts and surface the primary failure */ }
+              temporaryHandle.descriptor = null;
+            }
+            throw error;
+          }
           credentialRevoked = true;
         }
-        assertCredentialAbsent();
+        assertCredentialAbsent(credentialWriterIdentity);
       },
-      assertCredentialAbsent,
+      assertCredentialAbsent(processIdentity = null) {
+        assertCredentialAbsent();
+        if (stagedCredential) {
+          const exactIdentity = processIdentity
+            ? bindCredentialWriterIdentity(processIdentity)
+            : credentialWriterIdentity;
+          if (!exactIdentity) {
+            throw new CompanionError(
+              "E_PROCESS_IDENTITY",
+              "Worker provider credential absence requires its exact writer identity."
+            );
+          }
+          assertCredentialPathAbsent(
+            `${authFile}.${exactIdentity.providerPid}.tmp`,
+            "Worker provider credential temporary file remained after authentication."
+          );
+        }
+        return true;
+      },
       assertHomeAbsent,
       cleanup(processIdentity) {
         if (processIdentity && !processGroupGone(processIdentity)) {
@@ -2090,7 +2264,7 @@ export function workerSessionCloseControllerEnvironment(
             "Worker session-close controller home cannot be removed while its process group may live."
           );
         }
-        assertCredentialAbsent();
+        this.assertCredentialAbsent(processIdentity);
         return removeEphemeralHome();
       }
     });

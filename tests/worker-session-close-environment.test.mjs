@@ -9,6 +9,15 @@ import {
 } from "../plugins/grok/scripts/lib/grok-provider.mjs";
 import { tempDir } from "./helpers.mjs";
 
+function goneWriterIdentity(providerPid = 2_147_483_646) {
+  return Object.freeze({
+    pid: 2_147_483_647,
+    startToken: "verified-gone-test-controller",
+    processGroupId: 2_147_483_647,
+    providerPid
+  });
+}
+
 function createFixture(t) {
   const stateDir = fs.realpathSync(tempDir("session-close-environment-"));
   fs.chmodSync(stateDir, 0o700);
@@ -129,7 +138,8 @@ test("session-close controller uses a fresh HOME and the exact preserved lineage
   fs.copyFileSync(authFile, rotated);
   fs.chmodSync(rotated, 0o600);
   fs.renameSync(rotated, authFile);
-  environment.revokeCredential();
+  const writerIdentity = goneWriterIdentity();
+  environment.revokeCredential(writerIdentity);
   environment.assertCredentialAbsent();
 
   assert.equal(fs.lstatSync(fixture.configFile).ino, configBefore.inode);
@@ -143,7 +153,7 @@ test("session-close controller uses a fresh HOME and the exact preserved lineage
     sandboxBefore.contents
   );
 
-  assert.equal(environment.cleanup(null), true);
+  assert.equal(environment.cleanup(writerIdentity), true);
   environment.assertHomeAbsent();
   assert.equal(fs.existsSync(environment.home), false);
   assert.equal(fs.existsSync(fixture.lineageHome), true);
@@ -157,6 +167,118 @@ test("session-close controller uses a fresh HOME and the exact preserved lineage
     environment.verifySessionHome(),
     environment.sessionHomeIdentityDigest
   );
+});
+
+test("session-close controller removes only the exact provider auth temp and preserves auth.json.lock", (t) => {
+  const fixture = createFixture(t);
+  const environment = workerSessionCloseControllerEnvironment(
+    fixture.stateDir,
+    fixture.providerHomeId,
+    { homeMarker: fixture.homeMarker }
+  );
+  const writerIdentity = goneWriterIdentity();
+  const authFile = path.join(fixture.grokHome, "auth.json");
+  const temporary = `${authFile}.${writerIdentity.providerPid}.tmp`;
+  const lockFile = `${authFile}.lock`;
+  environment.stageCredential();
+  fs.writeFileSync(temporary, "temporary-secret\n", { mode: 0o600 });
+  fs.writeFileSync(lockFile, "preserve-lock\n", { mode: 0o600 });
+  const observedTemporary = fs.openSync(temporary, "r");
+
+  environment.revokeCredential(writerIdentity);
+
+  assert.equal(fs.readFileSync(observedTemporary).length, 0);
+  fs.closeSync(observedTemporary);
+  assert.equal(fs.existsSync(authFile), false);
+  assert.equal(fs.existsSync(temporary), false);
+  assert.equal(fs.readFileSync(lockFile, "utf8"), "preserve-lock\n");
+  assert.equal(environment.cleanup(writerIdentity), true);
+});
+
+test("session-close controller fails closed on a symlinked provider auth temp", (t) => {
+  const fixture = createFixture(t);
+  const environment = workerSessionCloseControllerEnvironment(
+    fixture.stateDir,
+    fixture.providerHomeId,
+    { homeMarker: fixture.homeMarker }
+  );
+  const writerIdentity = goneWriterIdentity();
+  const authFile = path.join(fixture.grokHome, "auth.json");
+  const temporary = `${authFile}.${writerIdentity.providerPid}.tmp`;
+  const target = path.join(fixture.stateDir, "outside-secret");
+  environment.stageCredential();
+  fs.writeFileSync(target, "outside-secret\n", { mode: 0o600 });
+  fs.symlinkSync(target, temporary);
+
+  assert.throws(
+    () => environment.revokeCredential(writerIdentity),
+    (error) => error?.code === "E_STATE"
+      && /temporary file is unsafe/.test(error.message)
+  );
+  assert.equal(fs.existsSync(authFile), true);
+  assert.equal(fs.readFileSync(target, "utf8"), "outside-secret\n");
+  assert.equal(fs.lstatSync(temporary).isSymbolicLink(), true);
+
+  fs.unlinkSync(temporary);
+  environment.revokeCredential(writerIdentity);
+  assert.equal(environment.cleanup(writerIdentity), true);
+});
+
+test("session-close controller fails closed on a hard-linked replacement auth temp", (t) => {
+  const fixture = createFixture(t);
+  const environment = workerSessionCloseControllerEnvironment(
+    fixture.stateDir,
+    fixture.providerHomeId,
+    { homeMarker: fixture.homeMarker }
+  );
+  const writerIdentity = goneWriterIdentity();
+  const authFile = path.join(fixture.grokHome, "auth.json");
+  const temporary = `${authFile}.${writerIdentity.providerPid}.tmp`;
+  const replacement = path.join(fixture.stateDir, "replacement-secret");
+  environment.stageCredential();
+  fs.writeFileSync(replacement, "replacement-secret\n", { mode: 0o600 });
+  fs.linkSync(replacement, temporary);
+
+  assert.throws(
+    () => environment.revokeCredential(writerIdentity),
+    (error) => error?.code === "E_STATE"
+      && /temporary file is unsafe/.test(error.message)
+  );
+  assert.equal(fs.existsSync(authFile), true);
+  assert.equal(
+    fs.readFileSync(replacement, "utf8"),
+    "replacement-secret\n"
+  );
+
+  fs.unlinkSync(temporary);
+  environment.revokeCredential(writerIdentity);
+  assert.equal(environment.cleanup(writerIdentity), true);
+});
+
+test("session-close controller rejects a foreign provider auth temp without deleting it", (t) => {
+  const fixture = createFixture(t);
+  const environment = workerSessionCloseControllerEnvironment(
+    fixture.stateDir,
+    fixture.providerHomeId,
+    { homeMarker: fixture.homeMarker }
+  );
+  const writerIdentity = goneWriterIdentity();
+  const authFile = path.join(fixture.grokHome, "auth.json");
+  const foreign = `${authFile}.${writerIdentity.providerPid - 1}.tmp`;
+  environment.stageCredential();
+  fs.writeFileSync(foreign, "foreign-secret\n", { mode: 0o600 });
+
+  assert.throws(
+    () => environment.revokeCredential(writerIdentity),
+    (error) => error?.code === "E_STATE"
+      && /foreign credential temporary file/.test(error.message)
+  );
+  assert.equal(fs.existsSync(authFile), true);
+  assert.equal(fs.readFileSync(foreign, "utf8"), "foreign-secret\n");
+
+  fs.unlinkSync(foreign);
+  environment.revokeCredential(writerIdentity);
+  assert.equal(environment.cleanup(writerIdentity), true);
 });
 
 test("session-close controller rejects a pre-existing lineage credential without deleting it", (t) => {

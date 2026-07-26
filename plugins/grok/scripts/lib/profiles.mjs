@@ -5,6 +5,15 @@ import { fileURLToPath } from "node:url";
 
 const PROVIDER_AGENTS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../provider-agents");
 const base = { contractVersion: 3, webSearch: false, subagents: false, isolatedLeader: true };
+const WRITE_COMPLETION_REQUIREMENT = Object.freeze({
+  tool: "search_replace",
+  reminder: "A write task requires a real workspace edit. Continue the requested implementation and call search_replace before finishing.",
+  recovery: Object.freeze({
+    maxRetries: 1,
+    baseDelayMs: 100,
+    maxDelayMs: 100
+  })
+});
 const AGENT_PROFILE_BINDINGS = Object.freeze({
   "report-repair.md": Object.freeze({
     promptMode: "full",
@@ -23,6 +32,7 @@ const AGENT_PROFILE_BINDINGS = Object.freeze({
   "rescue-write.md": Object.freeze({
     promptMode: "extend",
     permissionMode: "acceptEdits",
+    completionRequirement: WRITE_COMPLETION_REQUIREMENT,
     providerToolIds: Object.freeze([
       "GrokBuild:read_file",
       "GrokBuild:list_dir",
@@ -54,29 +64,52 @@ export function assertProviderAgentProfileContract(contents, expected, name = "p
   if (!expected
     || !["extend", "full"].includes(expected.promptMode)
     || typeof expected.permissionMode !== "string"
+    || (expected.completionRequirement !== undefined
+      && (!expected.completionRequirement
+        || typeof expected.completionRequirement.tool !== "string"
+        || typeof expected.completionRequirement.reminder !== "string"
+        || !Number.isInteger(expected.completionRequirement.recovery?.maxRetries)
+        || !Number.isInteger(expected.completionRequirement.recovery?.baseDelayMs)
+        || !Number.isInteger(expected.completionRequirement.recovery?.maxDelayMs)))
     || !Array.isArray(expected.providerToolIds)
     || expected.providerToolIds.length === 0
     || new Set(expected.providerToolIds).size !== expected.providerToolIds.length) {
     throw new Error(`Provider agent profile ${name} has no exact code-owned tool contract.`);
   }
   const lines = frontmatter.split(/\r?\n/);
-  const prefix = [
+  const header = [
     /^name: [a-z0-9][a-z0-9-]*$/,
     /^description: \S.*$/,
     new RegExp(`^prompt_mode: ${expected.promptMode}$`),
     new RegExp(`^permission_mode: ${expected.permissionMode}$`),
     /^agents_md: false$/,
-    /^injectDefaultTools: false$/,
-    /^toolConfig:$/,
-    /^  tools:$/
+    /^injectDefaultTools: false$/
   ];
-  if (lines.length !== prefix.length + expected.providerToolIds.length
-    || prefix.some((pattern, index) => !pattern.test(lines[index] || ""))) {
+  const completion = expected.completionRequirement
+    ? [
+        "completionRequirement:",
+        `  tool: ${expected.completionRequirement.tool}`,
+        "  reminder: >-",
+        `    ${expected.completionRequirement.reminder}`,
+        "  recovery:",
+        `    maxRetries: ${expected.completionRequirement.recovery.maxRetries}`,
+        `    baseDelayMs: ${expected.completionRequirement.recovery.baseDelayMs}`,
+        `    maxDelayMs: ${expected.completionRequirement.recovery.maxDelayMs}`
+      ]
+    : [];
+  const toolConfig = ["toolConfig:", "  tools:"];
+  const prefixLength = header.length + completion.length + toolConfig.length;
+  if (lines.length !== prefixLength + expected.providerToolIds.length
+    || header.some((pattern, index) => !pattern.test(lines[index] || ""))
+    || completion.some((line, index) => lines[header.length + index] !== line)
+    || toolConfig.some(
+      (line, index) => lines[header.length + completion.length + index] !== line
+    )) {
     throw new Error(
       `Provider agent profile ${name} must use the exact canonical leading frontmatter layout.`
     );
   }
-  const toolIds = lines.slice(prefix.length).map((line, index) => {
+  const toolIds = lines.slice(prefixLength).map((line, index) => {
     const match = /^    - id: ([A-Za-z][A-Za-z0-9_.-]*:[A-Za-z0-9][A-Za-z0-9_.*-]*)$/.exec(line);
     if (!match || match[1] !== expected.providerToolIds[index]) {
       throw new Error(`Provider agent profile ${name} no longer matches its code-owned tool contract.`);
@@ -97,6 +130,9 @@ function agentProfileBinding(name) {
   return {
     agentProfileDigest: crypto.createHash("sha256").update(contents).digest("hex"),
     promptMode: expected.promptMode,
+    ...(expected.completionRequirement
+      ? { completionRequirement: expected.completionRequirement }
+      : {}),
     providerToolIds: [...toolIds]
   };
 }
@@ -144,7 +180,7 @@ export function profileFor(kind, write = false) {
 }
 
 export function sameSecurityProfile(a, b) {
-  const keys = ["id", "contractVersion", "transport", "agent", "sandbox", "permissionMode", "promptMode", "webSearch", "subagents", "isolatedLeader", "agentProfileDigest"];
+  const keys = ["id", "contractVersion", "transport", "agent", "sandbox", "permissionMode", "promptMode", "completionRequirement", "webSearch", "subagents", "isolatedLeader", "agentProfileDigest"];
   return keys.every((key) => JSON.stringify(a?.[key]) === JSON.stringify(b?.[key]))
     && JSON.stringify(a?.allowedTools) === JSON.stringify(b?.allowedTools)
     && JSON.stringify(a?.deniedTools) === JSON.stringify(b?.deniedTools)

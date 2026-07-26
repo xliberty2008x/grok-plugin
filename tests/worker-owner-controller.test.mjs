@@ -14,6 +14,7 @@ import {
   WORKTREE_INTEGRATION_REQUEST_ALLOWLIST
 } from "../plugins/grok/scripts/lib/grok-provider.mjs";
 import {
+  buildWorkerOwnerSessionLoadRequest,
   normalizeWorkerOwnerSessionLoadResult,
   WORKTREE_CLOSE_REQUEST_ALLOWLIST,
   WORKTREE_REMOVE_REQUEST_ALLOWLIST
@@ -45,6 +46,22 @@ test("owner session load accepts the upstream ACP response shape and rejects a c
     executionRoot: "/private/provider-worktree"
   };
   assert.deepEqual(
+    buildWorkerOwnerSessionLoadRequest(binding),
+    {
+      sessionId: binding.sessionId,
+      cwd: binding.executionRoot,
+      mcpServers: [],
+      _meta: {
+        noReplay: true,
+        "x.ai/skip_envrc": true,
+        "x.ai/restore_code": false,
+        codeNavEnabled: false,
+        autoMode: false,
+        yoloMode: false
+      }
+    }
+  );
+  assert.deepEqual(
     normalizeWorkerOwnerSessionLoadResult(
       {
         models: {
@@ -58,7 +75,13 @@ test("owner session load accepts the upstream ACP response shape and rejects a c
     {
       sessionId: binding.sessionId,
       cwd: binding.executionRoot,
-      noReplay: true
+      mcpServers: [],
+      noReplay: true,
+      skipEnvrc: true,
+      restoreCode: false,
+      codeNavEnabled: false,
+      autoMode: false,
+      yoloMode: false
     }
   );
   assert.throws(

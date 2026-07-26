@@ -463,6 +463,58 @@ toolConfig:
   }
 });
 
+test("write profile completion recovery is exact and cannot be weakened in frontmatter", () => {
+  const expected = {
+    promptMode: "extend",
+    permissionMode: "acceptEdits",
+    completionRequirement: {
+      tool: "search_replace",
+      reminder: "A write task requires a real workspace edit. Continue the requested implementation and call search_replace before finishing.",
+      recovery: {
+        maxRetries: 1,
+        baseDelayMs: 100,
+        maxDelayMs: 100
+      }
+    },
+    providerToolIds: ["GrokBuild:search_replace"]
+  };
+  const canonical = `---
+name: canonical-write
+description: Canonical bounded write profile.
+prompt_mode: extend
+permission_mode: acceptEdits
+agents_md: false
+injectDefaultTools: false
+completionRequirement:
+  tool: search_replace
+  reminder: >-
+    A write task requires a real workspace edit. Continue the requested implementation and call search_replace before finishing.
+  recovery:
+    maxRetries: 1
+    baseDelayMs: 100
+    maxDelayMs: 100
+toolConfig:
+  tools:
+    - id: GrokBuild:search_replace
+---
+`;
+  assert.deepEqual(
+    assertProviderAgentProfileContract(canonical, expected, "canonical-write.md"),
+    expected.providerToolIds
+  );
+  for (const tampered of [
+    canonical.replace("tool: search_replace", "tool: todo_write"),
+    canonical.replace("maxRetries: 1", "maxRetries: 5"),
+    canonical.replace("baseDelayMs: 100", "baseDelayMs: 5000"),
+    canonical.replace("A write task requires a real workspace edit.", "A write task may be skipped.")
+  ]) {
+    assert.throws(
+      () => assertProviderAgentProfileContract(tampered, expected, "tampered-write.md"),
+      /canonical leading frontmatter/
+    );
+  }
+});
+
 test("ContextReceipt is body-free and cross-checks packet, policy, manifest, lineage, and prompt", () => {
   const fixture = receiptFixture();
   assert.equal(assertContextReceiptShape(fixture.receipt), fixture.receipt);

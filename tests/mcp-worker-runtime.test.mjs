@@ -814,6 +814,10 @@ test("MCP spawn runs one fake provider, replays idempotently, waits, returns a p
   assert.equal(readFakeLog(poison.logFile).filter((entry) => entry.event === "prompt").length, 0);
 
   const privateJob = tryReadJob(root, workerId, env);
+  assert.equal(
+    privateJob.result.workerReport.reportSource,
+    "acp-structured"
+  );
   const dispatch = privateJob.request.spawn.dispatch;
   assert.equal(dispatch.state, "provider-started");
   assert.equal(dispatch.providerGeneration, 1);
@@ -1957,7 +1961,10 @@ test("broker report repair rotates provider identity once after the previous gro
   );
   const mailbox = readAttemptMailbox(root, workerId, dispatch.attemptId, env);
   assert.equal(mailbox.finalReportSequence, mailbox.lastCompletedSequence);
-  assert.equal(mailbox.finalReportDigest, privateJob.result.textDigest);
+  assert.equal(
+    mailbox.finalReportDigest,
+    privateJob.result.workerReport.reportDigest
+  );
   assert.equal(
     mailbox.finalReportDigest,
     privateJob.result.mailboxEvidence.finalReportDigest

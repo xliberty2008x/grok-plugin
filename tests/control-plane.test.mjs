@@ -944,6 +944,14 @@ test("integration: malformed task report gets one same-session format repair", {
   assert.equal(prompts.length, 2);
   assert.equal(prompts[1].sessionId, prompts[0].sessionId);
   assert.match(prompts[1].prompt, /Report-format repair only/);
+  const promptRequests = readFakeLog(fake.logFile).filter(
+    (entry) => entry.event === "rpc" && entry.message?.method === "session/prompt"
+  );
+  assert.equal(promptRequests.length, 2);
+  assert.equal(
+    typeof promptRequests[1].message.params?._meta?.outputSchema,
+    "object"
+  );
   const invocations = readFakeLog(fake.logFile).filter((entry) => entry.event === "argv" && entry.args.includes("agent"));
   assert.equal(invocations.length, 2);
   const repairProfileIndex = invocations[1].args.indexOf("--agent-profile");

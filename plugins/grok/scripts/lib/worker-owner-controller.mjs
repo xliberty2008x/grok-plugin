@@ -256,10 +256,36 @@ export function normalizeWorkerOwnerSessionLoadResult(result, binding) {
       "Cleanup controller loaded a different provider session."
     );
   }
+  const request = buildWorkerOwnerSessionLoadRequest(binding);
+  return Object.freeze({
+    sessionId: request.sessionId,
+    cwd: request.cwd,
+    mcpServers: request.mcpServers,
+    noReplay: request._meta.noReplay,
+    skipEnvrc: request._meta["x.ai/skip_envrc"],
+    restoreCode: request._meta["x.ai/restore_code"],
+    codeNavEnabled: request._meta.codeNavEnabled,
+    autoMode: request._meta.autoMode,
+    yoloMode: request._meta.yoloMode
+  });
+}
+
+export function buildWorkerOwnerSessionLoadRequest(binding) {
   return Object.freeze({
     sessionId: binding.sessionId,
+    // Grok Build keys its local session store by the supplied cwd. Keep the
+    // original execution root while disabling every upstream load-time
+    // restore/replay mode that ACP exposes.
     cwd: binding.executionRoot,
-    noReplay: true
+    mcpServers: Object.freeze([]),
+    _meta: Object.freeze({
+      noReplay: true,
+      "x.ai/skip_envrc": true,
+      "x.ai/restore_code": false,
+      codeNavEnabled: false,
+      autoMode: false,
+      yoloMode: false
+    })
   });
 }
 
@@ -350,6 +376,7 @@ export async function openWorkerOwnerController({
   let identity = null;
   let client = null;
   let initialized = null;
+  let providerPid = null;
   let shutdownResult = null;
   let shuttingDown = false;
 
@@ -378,6 +405,9 @@ export async function openWorkerOwnerController({
       );
     }
     const providerWriterGone = !identity || processGroupGone(identity);
+    const credentialWriterIdentity = identity && providerPid
+      ? Object.freeze({ ...identity, providerPid })
+      : identity;
     if (providerWriterGone && resolvedBinding) {
       try {
         const loaded = loadProviderGuard(controlRoot, marker);
@@ -399,13 +429,13 @@ export async function openWorkerOwnerController({
     // group is proven gone; otherwise retain both credential and controller
     // home for fail-closed recovery.
     if (providerWriterGone) {
-      try { environment.revokeCredential(); }
+      try { environment.revokeCredential(credentialWriterIdentity); }
       catch (error) { cleanupFailure ||= error; }
-      try { environment.assertCredentialAbsent(); }
+      try { environment.assertCredentialAbsent(credentialWriterIdentity); }
       catch (error) { cleanupFailure ||= error; }
     }
     if (!cleanupFailure && providerWriterGone) {
-      try { environment.cleanup(identity); }
+      try { environment.cleanup(credentialWriterIdentity); }
       catch (error) { cleanupFailure ||= error; }
     }
     if (cleanupFailure) {
@@ -562,6 +592,7 @@ export async function openWorkerOwnerController({
         "Worker owner-controller executable attestation changed at readiness."
       );
     }
+    providerPid = ready.grokPid;
     authenticateBoundBootstrapGuard(
       controlRoot,
       marker,
@@ -711,16 +742,8 @@ export async function openWorkerOwnerController({
       }
       effectStarted = true;
       environment.verifySessionHome();
-      const result = await client.request(
-        "session/load",
-        {
-          sessionId: baseBinding.sessionId,
-          cwd: baseBinding.executionRoot,
-          mcpServers: [],
-          _meta: { noReplay: true }
-        },
-        45_000
-      );
+      const request = buildWorkerOwnerSessionLoadRequest(baseBinding);
+      const result = await client.request("session/load", request, 45_000);
       const receipt = normalizeWorkerOwnerSessionLoadResult(
         result,
         baseBinding

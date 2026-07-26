@@ -1876,13 +1876,13 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
           expectedProviderLaunchBinding = providerLaunchBinding(
             repairProfile,
             repairPrompt,
-            null
+            workerReportOutputSchema
           );
           const repaired = await runProvider({
             ...common,
             profile: repairProfile,
             prompt: repairPrompt,
-            outputSchema: null,
+            outputSchema: workerReportOutputSchema,
             resumeSessionId: result.sessionId,
             mailboxController: null,
             ...(dispatchAttemptId ? {
@@ -1895,6 +1895,12 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
           });
           const repairedReport = buildWorkerReport({
             providerText: repaired.text || "",
+            ...(Object.hasOwn(repaired, "structuredOutput")
+              ? { nativeStructuredOutput: repaired.structuredOutput }
+              : {}),
+            ...(Object.hasOwn(repaired, "structuredOutputError")
+              ? { nativeStructuredOutputError: repaired.structuredOutputError }
+              : {}),
             acceptanceCriteria: envelope?.acceptanceCriteria || []
           });
           reportRepair = {
@@ -1907,10 +1913,12 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
             const priorMailboxEvidence = result.mailboxEvidence || null;
             const repairedMailboxSelection = priorMailboxEvidence
               ? mailboxController.selectRepairedReport({
-                sequence: priorMailboxEvidence.selectedSequence,
-                reportDigest: boundedProviderText(repaired.text || "").textDigest,
-                sessionId: repaired.sessionId
-              })
+                  sequence: priorMailboxEvidence.selectedSequence,
+                  reportDigest: repairedReport.reportSource === "acp-structured"
+                    ? repairedReport.reportDigest
+                    : boundedProviderText(repaired.text || "").textDigest,
+                  sessionId: repaired.sessionId
+                })
               : null;
             result = {
               ...repaired,
