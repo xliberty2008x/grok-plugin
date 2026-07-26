@@ -37,6 +37,7 @@ export const EVIDENCE_ONLY_PREFIXES = Object.freeze([
 export const PROOF_PRODUCER_ID = "worker-broker-gate-runner";
 export const PROOF_PRODUCER_VERSION = 4;
 export const PHASE_TWO_SLICE = "mailbox-context-roles";
+export const PHASE_THREE_SLICE = "execution-lease-artifact-integration";
 const PRIOR_PROOF_MANIFEST_DIGESTS = Object.freeze({
   1: Object.freeze({
     "0": "66426cce37e08f4041ed272bfe6c9400298b9f05e1494b5ebd47747e1f43de8a",
@@ -257,6 +258,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
   "0": [
     ".github/workflows/ci.yml",
     "plugins/grok/scripts/lib/redact.mjs",
+    "scripts/lib/worker-broker-phase3-evidence.mjs",
     "scripts/lib/worker-broker-evidence.mjs",
     "scripts/lib/static-esm-import-parser.mjs",
     "scripts/trusted/worker-broker-review-operation.cjs",
@@ -265,12 +267,14 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "scripts/check-deterministic.mjs",
     "scripts/test-deterministic.mjs",
     "scripts/worker-broker-evidence.mjs",
+    "scripts/worker-broker-phase3-evidence.mjs",
     "scripts/validate.mjs",
     "plugins/grok/schemas/worker-broker-evidence.schema.json",
     "plugins/grok/schemas/worker-broker-live-receipt.schema.json",
     "plugins/grok/schemas/worker-broker-review-request.schema.json",
     "plugins/grok/schemas/worker-broker-review-attestation.schema.json",
     "tests/worker-broker-evidence.test.mjs",
+    "tests/worker-broker-phase3-evidence.test.mjs",
     "tests/worker-broker-protected-review.test.mjs",
     "tests/helpers.mjs",
     "package.json"
@@ -424,15 +428,65 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "tests/helpers.mjs"
   ],
   "3": [
+    "plugins/grok/mcp/broker.mjs",
+    "plugins/grok/scripts/grok-companion.mjs",
+    "plugins/grok/scripts/lib/acp-client.mjs",
     "plugins/grok/scripts/lib/errors.mjs",
+    "plugins/grok/scripts/lib/executable-identity.mjs",
+    "plugins/grok/scripts/lib/grok-provider.mjs",
+    "plugins/grok/scripts/lib/grok-worktree-acp.mjs",
     "plugins/grok/scripts/lib/host.mjs",
+    "plugins/grok/scripts/lib/provider-bootstrap.mjs",
+    "plugins/grok/scripts/lib/provider-capability.mjs",
+    "plugins/grok/scripts/lib/provider-executable-pin.mjs",
+    "plugins/grok/scripts/lib/recursion-guard.mjs",
     "plugins/grok/scripts/lib/workspace.mjs",
-    "plugins/grok/scripts/lib/worker-worktree.mjs",
+    "plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs",
+    "plugins/grok/scripts/lib/worker-execution-binding.mjs",
+    "plugins/grok/scripts/lib/worker-launch-contract.mjs",
     "plugins/grok/scripts/lib/worker-mutation.mjs",
+    "plugins/grok/scripts/lib/worker-owner-controller.mjs",
+    "plugins/grok/scripts/lib/worker-owner-lifecycle.mjs",
+    "plugins/grok/scripts/lib/worker-provisioner.mjs",
+    "plugins/grok/scripts/lib/worker-recovery.mjs",
+    "plugins/grok/scripts/lib/worker-runtime.mjs",
+    "plugins/grok/scripts/lib/worker-service.mjs",
+    "plugins/grok/scripts/lib/worker-session-lifecycle.mjs",
+    "plugins/grok/scripts/lib/worker-worktree.mjs",
     "plugins/grok/scripts/lib/state.mjs",
     "plugins/grok/scripts/lib/task-contract.mjs",
     "plugins/grok/scripts/lib/worker-protocol.mjs",
+    "scripts/lib/installed-worker-mcp-contract.mjs",
+    "scripts/lib/worker-broker-phase3-evidence.mjs",
+    "scripts/live-worker-provisioner-probe.mjs",
+    "scripts/test-installed-worker-mcp.mjs",
+    "scripts/test-phase3-focused.mjs",
+    "scripts/trusted/worker-broker-review-operation.cjs",
+    "scripts/trusted/worker-broker-review.mjs",
+    "scripts/worker-broker-phase3-evidence.mjs",
+    "tests/acp-client.test.mjs",
+    "tests/grok-worktree-acp.test.mjs",
+    "tests/installed-worker-mcp-contract.test.mjs",
+    "tests/installed-worker-mcp-runner.test.mjs",
+    "tests/mcp-worker-broker.test.mjs",
+    "tests/mcp-worker-runtime.test.mjs",
+    "tests/provider-bootstrap-crash-window.test.mjs",
+    "tests/provider-capability.test.mjs",
+    "tests/provider.test.mjs",
+    "tests/recursion-guard.test.mjs",
     "tests/state.test.mjs",
+    "tests/worker-broker-evidence.test.mjs",
+    "tests/worker-broker-phase3-evidence.test.mjs",
+    "tests/worker-broker-protected-review.test.mjs",
+    "tests/worker-dispatch-supervisor.test.mjs",
+    "tests/worker-execution-binding.test.mjs",
+    "tests/worker-launch-outbox.test.mjs",
+    "tests/worker-mutation.test.mjs",
+    "tests/worker-owner-controller.test.mjs",
+    "tests/worker-owner-lifecycle.test.mjs",
+    "tests/worker-protocol.test.mjs",
+    "tests/worker-service.test.mjs",
+    "tests/worker-session-close-environment.test.mjs",
     "tests/worker-worktree.test.mjs",
     "tests/worker-safety-proofs.test.mjs",
     "tests/helpers.mjs"
@@ -877,15 +931,9 @@ export const PHASE_PROOF_GATE_MANIFEST = freezeGateManifest({
     },
     {
       gateId: "phase-3-focused-tests",
-      argv: [
-        "node",
-        "--test",
-        "--test-reporter=./scripts/lib/zero-skip-test-reporter.mjs",
-        "tests/worker-worktree.test.mjs",
-        "tests/worker-safety-proofs.test.mjs"
-      ],
+      argv: ["node", "scripts/test-phase3-focused.mjs"],
       boundary: "focused-source-provider-neutral",
-      timeoutMs: 5 * 60_000
+      timeoutMs: 15 * 60_000
     },
     {
       gateId: "git-diff-check",
@@ -1942,6 +1990,72 @@ function publishImmutableEvidenceFile(root, file, contents) {
     try { fs.unlinkSync(temporary); } catch {}
     throw error;
   }
+}
+
+/**
+ * Publish one bounded JSON artifact beneath the evidence root with the same
+ * no-follow, immutable, fsync-backed semantics used by evidence records.
+ *
+ * This is intentionally a narrow filesystem primitive: callers still own the
+ * artifact schema and digest validation before invoking it.
+ */
+export function publishImmutableEvidenceArtifact({
+  root = REPO_ROOT,
+  relative,
+  contents
+} = {}) {
+  if (typeof root !== "string"
+    || !root
+    || typeof relative !== "string"
+    || !relative
+    || typeof contents !== "string"
+    || Buffer.byteLength(contents, "utf8") > MAX_EVIDENCE_RECORD_BYTES
+    || !contents.endsWith("\n")
+    || path.posix.normalize(relative) !== relative
+    || relative.startsWith("/")
+    || relative.includes("\\")
+    || !relative.startsWith(`${EVIDENCE_ROOT}/`)) {
+    throw unsafeEvidenceFileError();
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(contents);
+  } catch {
+    throw unsafeEvidenceFileError();
+  }
+  if (!rawEvidenceValueIsSafe(parsed)
+    || `${JSON.stringify(parsed, null, 2)}\n` !== contents) {
+    throw unsafeEvidenceFileError();
+  }
+
+  const file = path.resolve(root, ...relative.split("/"));
+  const expected = path.join(path.resolve(root), ...relative.split("/"));
+  if (file !== expected) throw unsafeEvidenceFileError();
+  const directory = path.dirname(file);
+  ensureEvidenceDirectory(root, directory);
+
+  let existing;
+  try {
+    existing = readBoundedEvidenceFile(root, file);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw unsafeEvidenceFileError();
+  }
+  if (existing !== undefined) {
+    if (existing !== contents) throw unsafeEvidenceFileError();
+    return relative;
+  }
+
+  try {
+    publishImmutableEvidenceFile(root, file, contents);
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      try {
+        if (readBoundedEvidenceFile(root, file) === contents) return relative;
+      } catch {}
+    }
+    throw unsafeEvidenceFileError();
+  }
+  return relative;
 }
 
 function fsyncEvidenceDirectory(directory) {
@@ -5780,6 +5894,41 @@ export function validateEvidenceRecord(record, options = {}) {
         fail("Phase 2 proofProducer evidence is deterministic-only and cannot link live qualification.");
       }
     }
+    if (phase === "3") {
+      if (record.slice !== PHASE_THREE_SLICE
+        || record.status !== "verified_on_draft") {
+        fail(`Phase 3 proofProducer evidence requires fixed slice ${PHASE_THREE_SLICE} and verified_on_draft status.`);
+      }
+      if (JSON.stringify((record.verification || []).map((entry) => entry?.gateId))
+        !== JSON.stringify(PHASE_MANDATORY_GATE_IDS["3"])) {
+        fail("Phase 3 proofProducer evidence requires the exact ordered gate manifest.");
+      }
+      if (JSON.stringify((record.prerequisites || []).map((item) => ({
+        phase: String(item?.phase ?? ""),
+        gateIds: item?.gateIds
+      }))) !== JSON.stringify([
+        { phase: "0", gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]] },
+        { phase: "1", gateIds: [...PHASE_MANDATORY_GATE_IDS["1"]] }
+      ])) {
+        fail("Phase 3 proofProducer evidence requires exact ordered Phase 0 and signed Phase 1 prerequisites.");
+      }
+      if ((record.verification || []).some((entry) => (
+        (entry?.testsSkipped ?? 0) !== 0
+        || (entry?.testsFailed ?? 0) !== 0
+        || entry?.skipMeaning != null
+      ))) {
+        fail("Phase 3 proofProducer evidence requires a zero-skip, zero-failure gate record.");
+      }
+      if (qualification?.installedHost !== "not_run"
+        || qualification?.provider !== "not_run"
+        || qualification?.release !== "not_run"
+        || record.releaseQualification !== false
+        || record.provisionalSupportingRecord !== false
+        || Object.hasOwn(record, "liveQualificationReceipts")
+        || (record.liveScenarios || []).length !== 0) {
+        fail("Phase 3 proofProducer evidence is deterministic-only and cannot absorb live receipts or claim lifecycle qualification.");
+      }
+    }
   }
 
   if (VERIFIED_STATUS_SET.has(record.status)) {
@@ -7664,6 +7813,83 @@ function verifyPhaseTwoFromProtectedRuntime(options = {}) {
   });
 }
 
+/**
+ * Protected fixed Phase 3 producer. Live write receipts remain separate
+ * supporting artifacts; this record proves only the fixed zero-skip source
+ * gates and exact current Phase 0 plus signed Phase 1 predecessor chain.
+ */
+function provePhaseThreeFromProtectedRuntime(options = {}) {
+  if (!options
+    || typeof options !== "object"
+    || Array.isArray(options)
+    || unexpectedFields(options, new Set(["workspace"])).length) {
+    throw protectedReviewTrustError();
+  }
+  const protectedTrust = loadProtectedReviewTrust();
+  const root = protectedWorkspaceRoot(options.workspace, protectedTrust.runtimeRoot);
+  return withProtectedReviewGitBinding(protectedTrust.gitBinding, () => {
+    assertProtectedWorkspaceGitConfiguration(root);
+    const signedReviewTrust = protectedSignedReviewReplayTrust(protectedTrust);
+    let proofContext;
+    try {
+      proofContext = createProofExecutionContext();
+    } catch (error) {
+      return proofFailureForError(error, PROOF_TOOLCHAIN_ERROR);
+    }
+    let result;
+    try {
+      result = proveWorkerBrokerPhaseWithContext({
+        phase: "3",
+        slice: PHASE_THREE_SLICE,
+        root,
+        write: true
+      }, proofContext, signedReviewTrust);
+    } catch (error) {
+      result = proofFailureForError(error, "E_PROOF_SOURCE");
+    }
+    let cleaned;
+    try {
+      cleaned = proofContext.cleanup();
+    } catch {
+      cleaned = { ok: false };
+    }
+    if (!cleaned?.ok) return proofFailure("E_PROOF_CLEANUP");
+    return result;
+  });
+}
+
+/** Strict protected replay for the exact current fixed Phase 3 record. */
+function verifyPhaseThreeFromProtectedRuntime(options = {}) {
+  if (!options
+    || typeof options !== "object"
+    || Array.isArray(options)
+    || unexpectedFields(options, new Set(["workspace"])).length) {
+    throw protectedReviewTrustError();
+  }
+  const protectedTrust = loadProtectedReviewTrust();
+  const root = protectedWorkspaceRoot(options.workspace, protectedTrust.runtimeRoot);
+  return withProtectedReviewGitBinding(protectedTrust.gitBinding, () => {
+    assertProtectedWorkspaceGitConfiguration(root);
+    const signedReviewTrust = protectedSignedReviewReplayTrust(protectedTrust);
+    const result = verifyPhase("3", root, {
+      strict: true,
+      requireVerified: true,
+      signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
+      signedReviewTrust
+    });
+    if (!result.ok || result.slice === PHASE_THREE_SLICE) return result;
+    const error = `Protected Phase 3 verification requires slice ${PHASE_THREE_SLICE}.`;
+    return {
+      ...result,
+      ok: false,
+      integrityOk: false,
+      errors: [...result.errors, error],
+      readinessReady: false,
+      verified: false
+    };
+  });
+}
+
 function proofSignedReviewOptions(root, signedReviewTrust = null) {
   const options = {
     strict: true,
@@ -8011,7 +8237,7 @@ function publishDependentPhaseProofRecord(
   signedReviewTrust = null
 ) {
   const phase = String(record?.phase ?? "");
-  const expectedStatus = phase === "2" && signedReviewTrust
+  const expectedStatus = new Set(["2", "3"]).has(phase) && signedReviewTrust
     ? "verified_on_draft"
     : "implemented_unverified";
   if (phase === "0"
@@ -9008,7 +9234,13 @@ function parseProtectedOperationArguments(argv) {
   const mode = argv[0];
   const allowed = mode === "promote"
     ? new Set(["--workspace", "--request"])
-    : new Set(["verify", "prove-phase-2", "verify-phase-2"]).has(mode)
+    : new Set([
+      "verify",
+      "prove-phase-2",
+      "verify-phase-2",
+      "prove-phase-3",
+      "verify-phase-3"
+    ]).has(mode)
       ? new Set(["--workspace"])
       : null;
   if (!allowed || argv.length !== 1 + allowed.size * 2) {
@@ -9164,6 +9396,16 @@ async function runProtectedOperationMain() {
   }
   if (parsed.mode === "verify-phase-2") {
     return verifyPhaseTwoFromProtectedRuntime({
+      workspace: parsed.values["--workspace"]
+    });
+  }
+  if (parsed.mode === "prove-phase-3") {
+    return provePhaseThreeFromProtectedRuntime({
+      workspace: parsed.values["--workspace"]
+    });
+  }
+  if (parsed.mode === "verify-phase-3") {
+    return verifyPhaseThreeFromProtectedRuntime({
       workspace: parsed.values["--workspace"]
     });
   }

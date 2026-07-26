@@ -16,6 +16,7 @@
     "test:protected-review": "node --test tests/worker-broker-protected-review.test.mjs",
     "test:installed-worker-mcp": "node scripts/test-installed-worker-mcp.mjs",
     "test:installed-worker-mcp:two-writer": "node scripts/test-installed-worker-mcp.mjs --two-writer",
+    "test:phase3-focused": "node scripts/test-phase3-focused.mjs",
     "test:natural-codex": "node scripts/test-natural-codex.mjs",
     "codex:update-local": "node scripts/update-local-codex.mjs",
     "validate": "node scripts/validate.mjs",
@@ -24,6 +25,7 @@
     "check": "npm run validate && npm run test:deterministic",
     "worker:evidence": "node scripts/worker-broker-evidence.mjs",
     "worker:prove": "node scripts/worker-broker-evidence.mjs prove",
+    "worker:phase3:evidence": "node scripts/worker-broker-phase3-evidence.mjs",
     "worker:verify": "node scripts/worker-broker-evidence.mjs verify",
     "worker:qualify": "node scripts/worker-broker-evidence.mjs qualify"
   },

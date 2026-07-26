@@ -1129,7 +1129,7 @@ test("jobs admitted from controlRoot and linked worktree share one store", () =>
     updatedAt: now(),
     host: { kind: "codex", sessionId: thread },
     lifecycleEvents: [],
-    request: null,
+    request: { providerHomeId: "lineage-a" },
     result: null,
     error: null
   };
@@ -1146,13 +1146,11 @@ test("jobs admitted from controlRoot and linked worktree share one store", () =>
     ...parentJob,
     id: generateId("task"),
     summary: "from-worktree",
-    // parent job is still active read-only without lineage conflict
+    // parent job is still active read-only on a distinct lineage
     request: { providerHomeId: "lineage-b" }
   };
-  // First cancel parent activity for write rules - actually both read-only without same lineage OK.
-  // parent has request:null so no lineage; wt has different lineage - both can be active if neither write.
-  // Wait - admitJob: if neither write and no shared lineage, both can be active. Good.
-  // But parentJob still queued - listJobs finds it. wtJob has no write, parent no write - OK.
+  // Both are valid read-only jobs with distinct lineages, so neither acquires
+  // the fail-closed global-writer fence.
   admitJob(linked, wtJob, env);
 
   const fromParent = tryReadJob(root, wtJob.id, env);

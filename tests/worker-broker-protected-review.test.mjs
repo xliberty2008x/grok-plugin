@@ -9,6 +9,7 @@ import test from "node:test";
 import {
   PHASE_MANDATORY_GATE_IDS,
   PHASE_PROOF_GATE_MANIFEST,
+  PHASE_THREE_SLICE,
   PHASE_TWO_SLICE,
   PROOF_PRODUCER_ID,
   PROOF_PRODUCER_VERSION,
@@ -996,7 +997,7 @@ function inspectPositiveWorkspace(name, destination) {
   };
 }
 
-test("protected runtime owns the exact fixed Phase 2 modes", () => {
+test("protected runtime owns the exact fixed Phase 2 and Phase 3 modes", () => {
   const bootstrap = fs.readFileSync(
     path.join(ROOT, "scripts/trusted/worker-broker-review.mjs"),
     "utf8"
@@ -1010,6 +1011,7 @@ test("protected runtime owns the exact fixed Phase 2 modes", () => {
     "utf8"
   );
   assert.equal(PHASE_TWO_SLICE, "mailbox-context-roles");
+  assert.equal(PHASE_THREE_SLICE, "execution-lease-artifact-integration");
   assert.equal(PROOF_PRODUCER_VERSION, 4);
   assert.equal(
     computeProofManifestDigest("2"),
@@ -1018,6 +1020,8 @@ test("protected runtime owns the exact fixed Phase 2 modes", () => {
   for (const marker of [
     '"prove-phase-2"',
     '"verify-phase-2"',
+    '"prove-phase-3"',
+    '"verify-phase-3"',
     "invokeProtectedOperation(runtimeRoot, parsed, attestation)",
     "OPERATION_RELATIVE_PATH",
     "spawnSync"
@@ -1034,7 +1038,7 @@ test("protected runtime owns the exact fixed Phase 2 modes", () => {
     assert.equal(operation.includes(marker), true, marker);
   }
   assert.equal(
-    /export\s+(?:async\s+)?function\s+(?:promotePhaseOneFromProtectedRuntime|verifySignedLedgerFromProtectedRuntime|provePhaseTwoFromProtectedRuntime|verifyPhaseTwoFromProtectedRuntime)/u
+    /export\s+(?:async\s+)?function\s+(?:promotePhaseOneFromProtectedRuntime|verifySignedLedgerFromProtectedRuntime|provePhaseTwoFromProtectedRuntime|verifyPhaseTwoFromProtectedRuntime|provePhaseThreeFromProtectedRuntime|verifyPhaseThreeFromProtectedRuntime)/u
       .test(evidenceRuntime),
     false
   );
@@ -1042,6 +1046,10 @@ test("protected runtime owns the exact fixed Phase 2 modes", () => {
   assert.equal(
     PHASE_PROOF_GATE_MANIFEST["2"][1].argv.join("\0"),
     ["node", "scripts/test-phase2-focused.mjs"].join("\0")
+  );
+  assert.equal(
+    PHASE_PROOF_GATE_MANIFEST["3"][1].argv.join("\0"),
+    ["node", "scripts/test-phase3-focused.mjs"].join("\0")
   );
 });
 

@@ -11,6 +11,7 @@ import {
   PHASE_SCOPE,
   PHASE_MANDATORY_GATE_IDS,
   PHASE_PROOF_GATE_MANIFEST,
+  PHASE_THREE_SLICE,
   PHASE_TWO_SLICE,
   PROOF_PRODUCER_ID,
   PROOF_PRODUCER_VERSION,
@@ -94,6 +95,10 @@ import {
   PHASE2_FOCUSED_TEST_FILES,
   runPhaseTwoFocusedTests
 } from "../scripts/test-phase2-focused.mjs";
+import {
+  PHASE3_FOCUSED_TEST_FILES,
+  runPhaseThreeFocusedTests
+} from "../scripts/test-phase3-focused.mjs";
 import {
   createPluginInventory,
   digestInventory
@@ -314,6 +319,39 @@ test("Phase 1 focused runner executes its fixed inventory in exact serial order"
     violations: [],
     omittedViolations: 0
   });
+});
+
+test("Phase 3 focused runner is fixed, serial, and fails closed on TODO", () => {
+  const calls = [];
+  let output = "";
+  let diagnostic = "";
+  const status = runPhaseThreeFocusedTests({
+    run(_binary, args) {
+      calls.push(args.at(-1));
+      if (calls.length === 1) {
+        return {
+          status: 1,
+          signal: null,
+          stdout: zeroSkipSummary({
+            passed: 0,
+            todo: 1,
+            violations: [zeroSkipViolation({ outcome: "todo" })]
+          }),
+          stderr: ""
+        };
+      }
+      return { status: 0, signal: null, stdout: zeroSkipSummary(), stderr: "" };
+    },
+    stdout: { write(value) { output += value; } },
+    stderr: { write(value) { diagnostic += value; } }
+  });
+  assert.equal(status, 1);
+  assert.deepEqual(calls, PHASE3_FOCUSED_TEST_FILES);
+  assert.equal(new Set(calls).size, PHASE3_FOCUSED_TEST_FILES.length);
+  assert.match(diagnostic, /child 1 failed its zero-skip gate/i);
+  const summary = JSON.parse(output);
+  assert.equal(summary.todo, 1);
+  assert.equal(summary.skipped, 0);
 });
 
 test("deterministic runner fails closed on malformed, partial, or non-passing child results", () => {
@@ -1941,6 +1979,30 @@ export function __testPublishPhaseTwo(record, root, trust) {
     if (!cleaned?.ok) throw new Error("proof cleanup failed");
   }
 }
+export function __testPublishPhaseThree(record, root, trust) {
+  const signedReviewTrust = {
+    ...trust,
+    requireFresh: false
+  };
+  const proofContext = createProofExecutionContext();
+  try {
+    const source = captureProofSourceSnapshot("3", root, proofContext.toolchain);
+    const prerequisites = captureProofPrerequisites("3", root, signedReviewTrust);
+    if (prerequisites == null) throw new Error("missing protected prerequisites");
+    const relative = publishDependentPhaseProofRecord(
+      record,
+      root,
+      source,
+      prerequisites,
+      proofContext.toolchain,
+      signedReviewTrust
+    );
+    return { relative, prerequisites };
+  } finally {
+    const cleaned = proofContext.cleanup();
+    if (!cleaned?.ok) throw new Error("proof cleanup failed");
+  }
+}
 export function __testPublishPhaseZero(record, root) {
   const proofContext = createProofExecutionContext();
   try {
@@ -1958,6 +2020,17 @@ export function __testPublishPhaseZero(record, root) {
 }
 export function __testVerifyPhaseTwo(root, trust) {
   return verifyPhase("2", root, {
+    strict: true,
+    requireVerified: true,
+    signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
+    signedReviewTrust: {
+      ...trust,
+      requireFresh: false
+    }
+  });
+}
+export function __testVerifyPhaseThree(root, trust) {
+  return verifyPhase("3", root, {
     strict: true,
     requireVerified: true,
     signedReviewAuthority: SIGNED_REVIEW_VALIDATION_AUTHORITY,
@@ -5431,6 +5504,74 @@ test("Phase 2 protected manifest, scope, and serial inventory are exact", () => 
   assert.deepEqual(findMissingLocalStaticImportDependencies(PHASE_SCOPE["2"]), []);
 });
 
+test("Phase 3 protected manifest, scope, and zero-skip inventory are exact", () => {
+  assert.equal(PHASE_THREE_SLICE, "execution-lease-artifact-integration");
+  assert.deepEqual(PHASE_PROOF_GATE_MANIFEST["3"], [
+    {
+      gateId: "repository-check",
+      argv: ["node", "scripts/check-deterministic.mjs"],
+      boundary: "source-provider-neutral",
+      timeoutMs: 15 * 60_000
+    },
+    {
+      gateId: "phase-3-focused-tests",
+      argv: ["node", "scripts/test-phase3-focused.mjs"],
+      boundary: "focused-source-provider-neutral",
+      timeoutMs: 15 * 60_000
+    },
+    {
+      gateId: "git-diff-check",
+      argv: ["git", "show", "--check", "--format=", "HEAD"],
+      boundary: "source",
+      timeoutMs: 60_000
+    }
+  ]);
+  assert.deepEqual(PHASE3_FOCUSED_TEST_FILES, [
+    "tests/acp-client.test.mjs",
+    "tests/grok-worktree-acp.test.mjs",
+    "tests/provider-bootstrap-crash-window.test.mjs",
+    "tests/provider-capability.test.mjs",
+    "tests/provider.test.mjs",
+    "tests/recursion-guard.test.mjs",
+    "tests/state.test.mjs",
+    "tests/worker-dispatch-supervisor.test.mjs",
+    "tests/worker-execution-binding.test.mjs",
+    "tests/worker-launch-outbox.test.mjs",
+    "tests/worker-mutation.test.mjs",
+    "tests/worker-owner-controller.test.mjs",
+    "tests/worker-owner-lifecycle.test.mjs",
+    "tests/worker-protocol.test.mjs",
+    "tests/worker-service.test.mjs",
+    "tests/worker-session-close-environment.test.mjs",
+    "tests/worker-worktree.test.mjs",
+    "tests/mcp-worker-broker.test.mjs",
+    "tests/mcp-worker-runtime.test.mjs",
+    "tests/installed-worker-mcp-contract.test.mjs",
+    "tests/installed-worker-mcp-runner.test.mjs",
+    "tests/worker-broker-phase3-evidence.test.mjs"
+  ]);
+  assert.equal(typeof runPhaseThreeFocusedTests, "function");
+  for (const relative of [
+    "scripts/lib/worker-broker-phase3-evidence.mjs",
+    "scripts/lib/worker-broker-evidence.mjs",
+    "scripts/test-phase3-focused.mjs",
+    "scripts/worker-broker-phase3-evidence.mjs",
+    "scripts/trusted/worker-broker-review.mjs",
+    "scripts/trusted/worker-broker-review-operation.cjs",
+    "tests/worker-broker-evidence.test.mjs",
+    "tests/worker-broker-phase3-evidence.test.mjs",
+    "tests/worker-broker-protected-review.test.mjs",
+    ...PHASE3_FOCUSED_TEST_FILES
+  ]) {
+    assert.equal(
+      PHASE_SCOPE["3"].filter((candidate) => candidate === relative).length,
+      1,
+      `${relative} must occur exactly once in the Phase 3 source scope`
+    );
+  }
+  assert.deepEqual(findMissingLocalStaticImportDependencies(PHASE_SCOPE["3"]), []);
+});
+
 test("Phase 1 proof rejects unsupported slices and caller-supplied execution authority", () => {
   const legacyPhaseZeroEntrypoint = provePhaseZero({ phase: "1", slice: "worker-api" });
   assert.equal(legacyPhaseZeroEntrypoint.ok, false);
@@ -5489,11 +5630,20 @@ test("Phase 1 proof rejects unsupported slices and caller-supplied execution aut
   assert.equal(protectedOnlyCli.status, 1);
   assert.equal(protectedOnlyCli.stderr, "");
   assert.equal(JSON.parse(protectedOnlyCli.stdout).code, "E_PROOF_ARGUMENT");
+
+  const protectedOnlyPhaseThree = proveWorkerBrokerPhase({
+    phase: "3",
+    slice: PHASE_THREE_SLICE
+  });
+  assert.deepEqual(protectedOnlyPhaseThree, {
+    ok: false,
+    code: "E_PROOF_ARGUMENT"
+  });
 });
 
 test("numbered phases are draft-only and producer v4 preserves the signed Phase 1 barrier", () => {
   assert.equal(PROOF_PRODUCER_VERSION, 4);
-  for (const phase of ["0", "1", "3", "4", "5"]) {
+  for (const phase of ["0", "1", "4", "5"]) {
     let unverified = buildEvidenceRecord({
       phase,
       slice: `phase-${phase}-state`,
@@ -5618,6 +5768,81 @@ test("Phase 2 proof record is fixed, ordered, deterministic-only, and non-live",
     () => writeEvidenceRecord(record),
     /invalid/i,
     "the generic writer cannot publish the protected Phase 2 claim"
+  );
+});
+
+test("Phase 3 proof record is fixed, predecessor-bound, zero-skip, and non-live", () => {
+  let record = buildEvidenceRecord({
+    phase: "3",
+    slice: PHASE_THREE_SLICE,
+    status: "verified_on_draft",
+    verification: exactPhaseProof("3"),
+    qualification: deterministicQualification(),
+    evidenceSystemQualification: true,
+    prerequisites: [
+      {
+        phase: "0",
+        recordDigest: sha256Text("phase-3-prerequisite-0"),
+        gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]]
+      },
+      {
+        phase: "1",
+        recordDigest: sha256Text("phase-3-prerequisite-1"),
+        gateIds: [...PHASE_MANDATORY_GATE_IDS["1"]]
+      }
+    ]
+  });
+  record = attachRecordDigest({
+    ...record,
+    source: {
+      ...record.source,
+      cleanTreeAtVerification: true
+    },
+    proofProducer: proofProducer("3")
+  });
+  const accepted = validateEvidenceRecord(record);
+  assert.equal(accepted.ok, true, accepted.errors.join("; "));
+
+  const mutations = [
+    ["slice", (candidate) => { candidate.slice = "caller-selected"; }, /fixed slice/i],
+    ["gate order", (candidate) => {
+      candidate.verification = [
+        candidate.verification[1],
+        candidate.verification[0],
+        candidate.verification[2]
+      ];
+    }, /exact ordered gate/i],
+    ["prerequisite order", (candidate) => {
+      candidate.prerequisites.reverse();
+    }, /exact ordered Phase 0 and signed Phase 1/i],
+    ["wrong predecessor gates", (candidate) => {
+      candidate.prerequisites[1].gateIds = ["repository-check"];
+    }, /exact ordered Phase 0 and signed Phase 1/i],
+    ["skipped test", (candidate) => {
+      candidate.verification[1].testsSkipped = 1;
+      candidate.verification[1].skipMeaning = "not available";
+    }, /zero-skip/i],
+    ["TODO result", (candidate) => {
+      candidate.verification[1].todo = 1;
+    }, /forbidden fields/i],
+    ["live receipt absorption", (candidate) => {
+      candidate.liveQualificationReceipts = {
+        syntheticDirectMcp: null,
+        naturalCodexHost: null
+      };
+    }, /cannot absorb live receipts/i]
+  ];
+  for (const [label, mutate, expected] of mutations) {
+    const candidate = structuredClone(record);
+    mutate(candidate);
+    const result = validateEvidenceRecord(attachRecordDigest(candidate));
+    assert.equal(result.ok, false, label);
+    assert.ok(result.errors.some((message) => expected.test(message)), label);
+  }
+  assert.throws(
+    () => writeEvidenceRecord(record),
+    /invalid/i,
+    "the generic writer cannot publish the protected Phase 3 claim"
   );
 });
 
@@ -6216,6 +6441,16 @@ test("protected review entrypoints fail closed outside the fixed host runtime", 
       env: cleanEnvironment
     },
     {
+      label: "ordinary source checkout Phase 3 proof",
+      args: ["prove-phase-3", "--workspace", fixture.root],
+      env: cleanEnvironment
+    },
+    {
+      label: "ordinary source checkout Phase 3 replay",
+      args: ["verify-phase-3", "--workspace", fixture.root],
+      env: cleanEnvironment
+    },
+    {
       label: "caller PATH",
       args: ["verify", "--workspace", fixture.root],
       env: { PATH: `/caller-controlled${path.delimiter}/usr/bin:/bin` }
@@ -6293,7 +6528,9 @@ test("protected review entrypoints fail closed outside the fixed host runtime", 
     "promotePhaseOneFromProtectedRuntime",
     "verifySignedLedgerFromProtectedRuntime",
     "provePhaseTwoFromProtectedRuntime",
-    "verifyPhaseTwoFromProtectedRuntime"
+    "verifyPhaseTwoFromProtectedRuntime",
+    "provePhaseThreeFromProtectedRuntime",
+    "verifyPhaseThreeFromProtectedRuntime"
   ]) {
     assert.equal(Object.hasOwn(publicModule, privileged), false, privileged);
   }
@@ -6313,7 +6550,7 @@ childProcess.spawnSync = (command, args, options) => {
     args,
     protectedChild: options?.env?.GROK_PROTECTED_OPERATION_CHILD || null
   });
-  if (/worker-broker-review-operation|prove-phase-2|verify-phase-2|promote/u
+  if (/worker-broker-review-operation|prove-phase-[23]|verify-phase-[23]|promote/u
     .test(invocation)) {
     fs.writeFileSync(${JSON.stringify(forgedSpawnMarker)}, "privileged\\n");
   }
@@ -6332,7 +6569,9 @@ const forbidden = [
   "promotePhaseOneFromProtectedRuntime",
   "verifySignedLedgerFromProtectedRuntime",
   "provePhaseTwoFromProtectedRuntime",
-  "verifyPhaseTwoFromProtectedRuntime"
+  "verifyPhaseTwoFromProtectedRuntime",
+  "provePhaseThreeFromProtectedRuntime",
+  "verifyPhaseThreeFromProtectedRuntime"
 ];
 if (forbidden.some((name) => Object.hasOwn(api, name))) process.exitCode = 2;
 process.stdout.write(JSON.stringify({
@@ -6490,6 +6729,97 @@ test("protected Phase 2 publication requires the exact signed chain and replays 
   const afterRace = api.__testVerifyPhaseTwo(fixture.root, trust);
   assert.equal(afterRace.ok, true, afterRace.errors.join("; "));
   assert.equal(afterRace.recordDigest, record.recordDigest);
+});
+
+test("protected Phase 3 publication requires the signed chain and strictly replays", async () => {
+  const fixture = initPhaseOneSignedReviewFixture("protected-phase-three");
+  const requestResult = createReviewRequestFixture(fixture, { write: true });
+  const keyPair = crypto.generateKeyPairSync("ed25519");
+  const attestation = signedReviewAttestation(requestResult, keyPair);
+  const attestationPath = writeReviewAttestationFixture(fixture.root, attestation);
+  const now = new Date(Date.parse(attestation.endedAt) + 1_000).toISOString();
+  const trust = {
+    publicKey: keyPair.publicKey,
+    expectedIssuer: "test-protected-reviewer",
+    revokedKeyFingerprints: [],
+    now
+  };
+  const { api } = await loadPrivateReviewPromotionHarness(fixture.root);
+  const buildPhaseThreeRecord = (phaseOneDigest) => {
+    let record = buildEvidenceRecord({
+      root: fixture.root,
+      phase: "3",
+      slice: PHASE_THREE_SLICE,
+      status: "verified_on_draft",
+      verification: exactPhaseProof("3"),
+      qualification: deterministicQualification(),
+      evidenceSystemQualification: true,
+      prerequisites: [
+        {
+          phase: "0",
+          recordDigest: fixture.phaseZero.recordDigest,
+          gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]]
+        },
+        {
+          phase: "1",
+          recordDigest: phaseOneDigest,
+          gateIds: [...PHASE_MANDATORY_GATE_IDS["1"]]
+        }
+      ]
+    });
+    record = attachRecordDigest({
+      ...record,
+      proofProducer: proofProducer("3")
+    });
+    return record;
+  };
+
+  assert.throws(
+    () => api.__testPublishPhaseThree(
+      buildPhaseThreeRecord(fixture.phaseOne.recordDigest),
+      fixture.root,
+      trust
+    ),
+    /prerequisite/i,
+    "an unsigned current Phase 1 cannot authorize Phase 3 publication"
+  );
+
+  const promoted = api.__testPromoteSignedReview({
+    root: fixture.root,
+    requestPath: requestResult.path,
+    attestationPath,
+    trust,
+    now
+  });
+  assert.equal(promoted.ok, true);
+  const record = buildPhaseThreeRecord(promoted.recordDigest);
+  const publication = api.__testPublishPhaseThree(record, fixture.root, trust);
+  assert.deepEqual(publication.prerequisites, record.prerequisites);
+  assert.match(publication.relative, /^tests\/e2e-results\/worker-broker\/phase-3\//);
+
+  const replay = api.__testVerifyPhaseThree(fixture.root, trust);
+  assert.equal(replay.ok, true, replay.errors.join("; "));
+  assert.equal(replay.integrityOk, true);
+  assert.equal(replay.slice, PHASE_THREE_SLICE);
+  assert.equal(replay.status, "verified_on_draft");
+  assert.equal(replay.recordDigest, record.recordDigest);
+  assert.equal(replay.verified, true);
+
+  const recordPath = path.join(fixture.root, publication.relative);
+  const immutableRecord = fs.readFileSync(recordPath);
+  const tampered = JSON.parse(immutableRecord);
+  tampered.verification[1].testsSkipped = 1;
+  fs.writeFileSync(recordPath, `${JSON.stringify(tampered, null, 2)}\n`);
+  const rejectedReplay = api.__testVerifyPhaseThree(fixture.root, trust);
+  assert.equal(rejectedReplay.ok, false);
+  assert.ok(rejectedReplay.errors.some((message) => (
+    /record digest|zero-skip|immutable/i.test(message)
+  )), rejectedReplay.errors.join("; "));
+  fs.writeFileSync(recordPath, immutableRecord);
+
+  const restoredReplay = api.__testVerifyPhaseThree(fixture.root, trust);
+  assert.equal(restoredReplay.ok, true, restoredReplay.errors.join("; "));
+  assert.equal(restoredReplay.recordDigest, record.recordDigest);
 });
 
 test("Phase 0 reproof after source evolution demotes a signed v4 Phase 1 and Phase 2 chain", async () => {
@@ -6845,6 +7175,8 @@ test("private signed review promotion is atomic, immutable, concurrent, and rest
   assert.equal(typeof publicModule.verifySignedLedgerFromProtectedRuntime, "undefined");
   assert.equal(typeof publicModule.provePhaseTwoFromProtectedRuntime, "undefined");
   assert.equal(typeof publicModule.verifyPhaseTwoFromProtectedRuntime, "undefined");
+  assert.equal(typeof publicModule.provePhaseThreeFromProtectedRuntime, "undefined");
+  assert.equal(typeof publicModule.verifyPhaseThreeFromProtectedRuntime, "undefined");
   assert.equal(
     Object.keys(publicModule).some((name) => (
       /promote.*review/i.test(name)

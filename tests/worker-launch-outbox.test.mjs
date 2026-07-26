@@ -592,8 +592,10 @@ test("the Codex CLI task entrypoint uses the shared versioned launcher", {
   const root = initRepo();
   const pluginData = tempDir("worker-launch-cli-data-");
   const fake = installFakeGrok(tempDir("worker-launch-cli-provider-"), { taskText: taskReport() });
+  fs.symlinkSync(fake.binary, path.join(path.dirname(fake.binary), "grok"));
   const env = {
     ...testEnvironment({ fake, pluginData }),
+    PATH: `${path.dirname(fake.binary)}${path.delimiter}${process.env.PATH || ""}`,
     GROK_COMPANION_PLUGIN_DATA: pluginData,
     GROK_COMPANION_HOST: "codex",
     GROK_COMPANION_HOST_SESSION_ID: THREAD_ID,

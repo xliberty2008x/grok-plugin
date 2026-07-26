@@ -298,7 +298,13 @@ function parseArguments(argv) {
   const mode = argv[0];
   const allowed = mode === "promote"
     ? new Set(["--workspace", "--request"])
-    : new Set(["verify", "prove-phase-2", "verify-phase-2"]).has(mode)
+    : new Set([
+      "verify",
+      "prove-phase-2",
+      "verify-phase-2",
+      "prove-phase-3",
+      "verify-phase-3"
+    ]).has(mode)
       ? new Set(["--workspace"])
       : null;
   if (!allowed || argv.length !== 1 + allowed.size * 2) throw trustError();

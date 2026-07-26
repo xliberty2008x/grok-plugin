@@ -20,8 +20,12 @@ import {
   SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
 } from "../plugins/grok/scripts/lib/provider-capability.mjs";
 import {
-  providerLaunchBindingDigest
+  providerLaunchBindingDigest,
+  publishProviderExecutablePin
 } from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
+import {
+  captureExecutableFileIdentity
+} from "../plugins/grok/scripts/lib/executable-identity.mjs";
 import {
   assertDispatchContract,
   authorizeWorkerProviderRotation,
@@ -66,22 +70,11 @@ import {
 import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
-import { git, initRepo, tempDir, waitFor } from "./helpers.mjs";
+import { ROOT, git, initRepo, tempDir, waitFor } from "./helpers.mjs";
 
 const THREAD_ID = "019f666a-6469-7cc1-9a8d-8c1adf61e103";
 const TURN_ID = "019f666e-4084-7902-8447-249f72043a37";
 let requestId = 0;
-const TEST_PROVIDER_RECEIPT = Object.freeze({
-  capabilityDigest: "c".repeat(64),
-  capabilities: [
-    ROOT_READ_PROVIDER_CAPABILITY,
-    SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
-    ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
-  ]
-});
-const TEST_BROKER_RUNTIME = createMcpBrokerRuntime({
-  providerCapabilityReceipt: TEST_PROVIDER_RECEIPT
-});
 const TEST_PROVIDER_LAUNCH_BINDING = Object.freeze({
   schemaVersion: 1,
   pinRef: `gpin-${"1".repeat(32)}`,
@@ -92,6 +85,180 @@ const TEST_PROVIDER_LAUNCH_BINDING = Object.freeze({
 const TEST_PROVIDER_LAUNCH_BINDING_DIGEST = providerLaunchBindingDigest(
   TEST_PROVIDER_LAUNCH_BINDING
 );
+const TEST_PROVIDER_RECEIPT = Object.freeze({
+  capabilityDigest: "c".repeat(64),
+  providerLaunchBinding: TEST_PROVIDER_LAUNCH_BINDING,
+  providerLaunchBindingDigest: TEST_PROVIDER_LAUNCH_BINDING_DIGEST,
+  capabilities: [
+    ROOT_READ_PROVIDER_CAPABILITY,
+    SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY,
+    ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY
+  ]
+});
+const TEST_BROKER_RUNTIME = createMcpBrokerRuntime({
+  providerCapabilityReceipt: TEST_PROVIDER_RECEIPT
+});
+const FIXTURE_RUNTIME = new WeakMap();
+const FIXTURE_PLUGIN_COPIES = new Set();
+const OFFICIAL_RELEASE_LIST_MARKER =
+  "export const OFFICIAL_GROK_RELEASES = Object.freeze([\n";
+
+test.after(() => {
+  const failures = [];
+  for (const copyRoot of FIXTURE_PLUGIN_COPIES) {
+    try {
+      fs.rmSync(copyRoot, { recursive: true, force: true, maxRetries: 3 });
+    } catch (error) {
+      failures.push(`${path.basename(copyRoot)}:${error?.code || "unknown"}`);
+    }
+  }
+  FIXTURE_PLUGIN_COPIES.clear();
+  assert.deepEqual(failures, [], "temporary copied-plugin fixtures must be removed");
+});
+
+function fakeOfficialRelease(fileIdentity) {
+  return Object.freeze({
+    releaseSource: "official-package-pin-v1",
+    packageName: "@xai-official/grok",
+    packageVersion: "0.2.99",
+    packageGitHead: "9".repeat(40),
+    packageIntegrityDigest: "3".repeat(64),
+    platform: process.platform,
+    arch: process.arch,
+    version: "0.2.99",
+    buildCommit: "9bbd559437aa",
+    channel: "stable",
+    size: fileIdentity.size,
+    executableDigest: fileIdentity.executableDigest
+  });
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\"'\"'")}'`;
+}
+
+function installPinnedFakeControllerRuntime(fake, env) {
+  // /bin/sh is a trampoline on macOS and therefore changes its kernel text
+  // mapping to /bin/bash. Pin the native shell itself so bootstrap
+  // re-attestation observes the same broker-owned executable bytes.
+  assert.equal(
+    fs.existsSync("/bin/bash"),
+    true,
+    "pinned fake-provider fixtures require the native /bin/bash carrier"
+  );
+  const providerShell = fs.realpathSync("/bin/bash");
+  const wrapper = path.join(path.dirname(fake.binary), "fake-grok-provider.sh");
+  fs.writeFileSync(
+    wrapper,
+    [
+      "#!/bin/sh",
+      "child=",
+      "forward_term() {",
+      '  if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null || true; fi',
+      "}",
+      "trap forward_term TERM INT HUP",
+      `${shellQuote(process.execPath)} ${shellQuote(fake.binary)} "$@" <&0 >&1 2>&2 &`,
+      "child=$!",
+      'wait "$child"',
+      "status=$?",
+      'while kill -0 "$child" 2>/dev/null; do',
+      '  wait "$child"',
+      "  status=$?",
+      "done",
+      "trap - TERM INT HUP",
+      'exit "$status"',
+      ""
+    ].join("\n"),
+    { encoding: "utf8", mode: 0o700 }
+  );
+  const release = fakeOfficialRelease(captureExecutableFileIdentity(providerShell));
+  const pinned = publishProviderExecutablePin({
+    env,
+    releases: [release],
+    sourceBinary: providerShell
+  });
+  const copyRoot = tempDir("grok-mcp-runtime-plugin-");
+  FIXTURE_PLUGIN_COPIES.add(copyRoot);
+  const pluginRoot = path.join(copyRoot, "grok");
+  fs.cpSync(path.join(ROOT, "plugins", "grok"), pluginRoot, { recursive: true });
+  const executableIdentityFile = path.join(
+    pluginRoot,
+    "scripts",
+    "lib",
+    "executable-identity.mjs"
+  );
+  const source = fs.readFileSync(executableIdentityFile, "utf8");
+  assert.equal(
+    source.split(OFFICIAL_RELEASE_LIST_MARKER).length,
+    2,
+    "fixture must patch one exact official release list"
+  );
+  fs.writeFileSync(
+    executableIdentityFile,
+    source.replace(
+      OFFICIAL_RELEASE_LIST_MARKER,
+      `${OFFICIAL_RELEASE_LIST_MARKER}  Object.freeze(${JSON.stringify(release)}),\n`
+    ),
+    "utf8"
+  );
+  const providerFile = path.join(
+    pluginRoot,
+    "scripts",
+    "lib",
+    "grok-provider.mjs"
+  );
+  let providerSource = fs.readFileSync(providerFile, "utf8");
+  const fakeScript = JSON.stringify(wrapper);
+  const providerReplacements = [
+    [
+      'spawnSync(binary, ["--version"],',
+      `spawnSync(binary, [${fakeScript}, "--version"],`
+    ],
+    [
+      'spawnSync(binary, ["inspect", "--json"],',
+      `spawnSync(binary, [${fakeScript}, "inspect", "--json"],`
+    ],
+    [
+      'const args = ["--cwd", root,',
+      `const args = [${fakeScript}, "--cwd", root,`
+    ],
+    [
+      'spawnSync(binary, ["--help"],',
+      `spawnSync(binary, [${fakeScript}, "--help"],`
+    ],
+    [
+      'spawnSync(binary, ["agent", "--help"],',
+      `spawnSync(binary, [${fakeScript}, "agent", "--help"],`
+    ],
+    [
+      'spawnSync(binary, ["models"],',
+      `spawnSync(binary, [${fakeScript}, "models"],`
+    ]
+  ];
+  for (const [needle, replacement] of providerReplacements) {
+    const expectedOccurrences = needle === 'const args = ["--cwd", root,'
+      ? 2
+      : 1;
+    assert.equal(
+      providerSource.split(needle).length - 1,
+      expectedOccurrences,
+      `fixture must patch the exact provider command inventory: ${needle}`
+    );
+    providerSource = providerSource.replaceAll(needle, replacement);
+  }
+  fs.writeFileSync(providerFile, providerSource, "utf8");
+  const receipt = Object.freeze({
+    ...TEST_PROVIDER_RECEIPT,
+    providerLaunchBinding: pinned.binding,
+    providerLaunchBindingDigest: providerLaunchBindingDigest(pinned.binding)
+  });
+  return Object.freeze({
+    copyRoot,
+    companionScript: path.join(pluginRoot, "scripts", "grok-companion.mjs"),
+    receipt,
+    runtime: createMcpBrokerRuntime({ env, providerCapabilityReceipt: receipt })
+  });
+}
 
 function taskReport(summary = "Fake broker task completed", extra = {}) {
   return `GROK_WORKER_REPORT: ${JSON.stringify({
@@ -146,6 +313,8 @@ function fixture(config = {}) {
   delete env.GROK_COMPANION_JOB_MARKER;
   delete env.GROK_AGENT;
   delete env.GROK_LEADER_SOCKET;
+  const fixtureRuntime = installPinnedFakeControllerRuntime(fake, env);
+  FIXTURE_RUNTIME.set(env, fixtureRuntime);
   return { root, fake, pluginData, env };
 }
 
@@ -163,6 +332,24 @@ function launchWithPrimaryTurnBarrier(args, barrierDirectory) {
 }
 
 async function rawTool(root, name, args, options) {
+  const fixtureRuntime = options?.env
+    ? FIXTURE_RUNTIME.get(options.env)
+    : null;
+  const requestedLaunchWorker = options?.serviceOptions?.launchWorker;
+  const serviceOptions = fixtureRuntime
+    ? {
+        ...(options?.serviceOptions || {}),
+        launchWorker: (launchArgs) => {
+          const boundArgs = {
+            ...launchArgs,
+            companionScript: fixtureRuntime.companionScript
+          };
+          return requestedLaunchWorker
+            ? requestedLaunchWorker(boundArgs)
+            : launchCommittedWorker(boundArgs);
+        }
+      }
+    : options?.serviceOptions;
   const reply = await handleMcpRequest({
     jsonrpc: "2.0",
     id: ++requestId,
@@ -174,9 +361,10 @@ async function rawTool(root, name, args, options) {
     }
   }, {
     ...options,
-    runtime: options?.runtime || TEST_BROKER_RUNTIME,
+    serviceOptions,
+    runtime: options?.runtime || fixtureRuntime?.runtime || TEST_BROKER_RUNTIME,
     readProviderCapabilityReceipt: options?.readProviderCapabilityReceipt
-      || (() => TEST_PROVIDER_RECEIPT)
+      || (() => fixtureRuntime?.receipt || TEST_PROVIDER_RECEIPT)
   });
   return reply.result;
 }
@@ -971,7 +1159,10 @@ test("MCP mailbox vertical uses one provider session for two ordered sends and s
   assert.equal(attempt.lastCompletedSequence, 2);
   assert.equal(attempt.finalReportSequence, 2);
   assert.equal(attempt.finalReportDigest, privateJob.result.mailboxEvidence.finalReportDigest);
-  assert.equal(attempt.finalReportDigest, privateJob.result.textDigest);
+  assert.equal(
+    attempt.finalReportDigest,
+    privateJob.result.workerReport.reportDigest
+  );
   assert.deepEqual(messages.map((record) => record.state), ["delivered", "delivered"]);
   assert.equal(messages[0].idempotencyKeyDigest, publicDigestCanaries[0]);
   assert.equal(messages[1].idempotencyKeyDigest, publicDigestCanaries[1]);
@@ -3076,7 +3267,8 @@ test("trusted worker environment uses service state and rejects ambient identity
     }
   });
   assert.equal(child.GROK_COMPANION_PLUGIN_DATA, serviceData);
-  assert.equal(child.GROK_BIN, "/service/grok");
+  assert.equal(child.GROK_BIN, undefined);
+  assert.equal(child.GROK_AUTH_PATH, "/service/auth.json");
   assert.equal(child.GROK_COMPANION_HOST_SESSION_ID, THREAD_ID);
   assert.equal(child.CODEX_THREAD_ID, THREAD_ID);
   assert.equal(child.PRIVATE_AMBIENT_SENTINEL, undefined);
