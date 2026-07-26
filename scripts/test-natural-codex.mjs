@@ -7,6 +7,9 @@ import process from "node:process";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { readValidProviderCapabilityReceipt } from "../plugins/grok/scripts/lib/provider-capability.mjs";
+import { providerLaunchBindingDigest } from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CODEX_BIN = process.env.CODEX_BIN || "codex";
 const MODEL = process.env.CODEX_E2E_MODEL || "gpt-5.5";
@@ -95,9 +98,42 @@ function main() {
     if (job.profile?.id !== "rescue-read-v3") fail(`Natural task used unexpected profile ${job.profile?.id || "missing"}.`);
     if (!/^\d+\.\d+\.\d+/.test(String(job.profile?.grokVersion || ""))) fail("Persisted natural task did not record a real Grok version.");
     if (job.result?.workerReport?.outcome !== "complete") fail("Persisted worker report was not complete.");
+    if (job.result?.workerReport?.valid !== true
+      || job.result?.workerReport?.structured !== true
+      || job.result?.workerReport?.reportSource !== "acp-structured") {
+      fail("Persisted natural task did not use valid native ACP structured output.");
+    }
     if (job.result?.hostVerification !== "passed") fail("Persisted host verification was not passed.");
     if (job.result?.taskRuntimeCleaned !== true) fail("Persisted task did not prove transient runtime cleanup.");
     if (job.error) fail("Persisted natural task contains an error.", JSON.stringify(job.error));
+    const capability = readValidProviderCapabilityReceipt({
+      env: {
+        ...process.env,
+        GROK_COMPANION_HOST: "codex",
+        GROK_COMPANION_PLUGIN_DATA: DATA_ROOT
+      }
+    });
+    if (!capability) fail("The natural task did not leave one valid setup provider capability.");
+    const spawn = job.request?.spawn;
+    let observedProviderLaunchBindingDigest = null;
+    try {
+      observedProviderLaunchBindingDigest = providerLaunchBindingDigest(
+        spawn?.providerLaunchBinding
+      );
+    } catch {}
+    if (spawn?.providerCapabilityDigest !== capability.capabilityDigest
+      || spawn?.providerLaunchBindingDigest
+        !== capability.providerLaunchBindingDigest
+      || observedProviderLaunchBindingDigest
+        !== capability.providerLaunchBindingDigest
+      || JSON.stringify(spawn.providerLaunchBinding)
+        !== JSON.stringify(capability.providerLaunchBinding)) {
+      fail("Persisted natural task was not bound to the exact valid setup provider pin.");
+    }
+    if (spawn?.dispatch?.schemaVersion !== 2
+      || spawn?.dispatch?.providerGeneration !== 1) {
+      fail("Persisted natural task did not complete one exact dispatch-v2 provider generation.");
+    }
 
     const version = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
     const installedWrapper = path.join(CODEX_HOME, "plugins", "cache", "grok-companion", "grok", version, "scripts", "grok-codex.mjs");
@@ -122,6 +158,10 @@ function main() {
       hostVerification: job.result.hostVerification,
       taskRuntimeCleaned: job.result.taskRuntimeCleaned,
       profileId: job.profile.id,
+      reportSource: job.result.workerReport.reportSource,
+      providerGeneration: spawn.dispatch.providerGeneration,
+      providerCapabilityDigest: spawn.providerCapabilityDigest,
+      providerLaunchBindingDigest: spawn.providerLaunchBindingDigest,
       codexVersion,
       grokVersion: job.profile.grokVersion || null,
       model: MODEL
