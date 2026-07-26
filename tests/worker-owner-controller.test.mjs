@@ -16,6 +16,7 @@ import {
 import {
   buildWorkerOwnerSessionLoadRequest,
   normalizeWorkerOwnerSessionLoadResult,
+  openWorkerOwnerController,
   WORKTREE_CLOSE_REQUEST_ALLOWLIST,
   WORKTREE_REMOVE_REQUEST_ALLOWLIST
 } from "../plugins/grok/scripts/lib/worker-owner-controller.mjs";
@@ -91,6 +92,54 @@ test("owner session load accepts the upstream ACP response shape and rejects a c
     ),
     (error) => error?.code === "E_PROTOCOL"
   );
+});
+
+test("owner controller rejects a partial provider executable binding before durable callbacks", async () => {
+  const controlRoot = "/private/tmp/grok-owner-binding-control";
+  const executionRoot = "/private/tmp/grok-owner-binding-worker";
+  let callbackCalls = 0;
+  const callbacks = {
+    async prepare() { callbackCalls += 1; },
+    async activate() { callbackCalls += 1; },
+    async settle() { callbackCalls += 1; }
+  };
+  await assert.rejects(
+    openWorkerOwnerController({
+      stateDir: "/private/tmp/grok-owner-binding-state",
+      root: controlRoot,
+      executionRoot,
+      binding: {
+        purpose: WORKTREE_INTEGRATION_PURPOSE,
+        controlWorkspaceId: `cws-${"1".repeat(32)}`,
+        controlRoot,
+        executionRoot,
+        executionBindingDigest: "2".repeat(64),
+        effectBindingDigest: "3".repeat(64),
+        controllerAttemptId: "4".repeat(32),
+        controllerFence: 1,
+        holderId: "5".repeat(64),
+        targetPath: path.join(controlRoot, "target.txt"),
+        operationId: "official-worktree-operation"
+      },
+      marker: "worker-owner-binding",
+      homeMarker: "worker-owner-binding-home",
+      profile: null,
+      gitCommonDir: "/private/tmp/grok-owner-binding-control/.git",
+      baseCommit: "6".repeat(40),
+      effect: "apply",
+      callbacks,
+      providerLaunchBinding: {
+        schemaVersion: 1,
+        pinRef: `gpin-${"7".repeat(32)}`,
+        pinRecordDigest: "8".repeat(64),
+        executableIdentityDigest: "9".repeat(64),
+        releaseIdentityDigest: "a".repeat(64)
+      }
+    }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+      && /partial/.test(error.message)
+  );
+  assert.equal(callbackCalls, 0);
 });
 
 test("owner controllers keep integration and cleanup as distinct no-model authorities and remove their homes", () => {

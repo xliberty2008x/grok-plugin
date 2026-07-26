@@ -10,6 +10,10 @@ import crypto from "node:crypto";
 import path from "node:path";
 
 import { CompanionError } from "./errors.mjs";
+import {
+  assertProviderLaunchBinding,
+  providerLaunchBindingDigest as digestProviderLaunchBinding
+} from "./provider-executable-pin.mjs";
 import { assertBrokerMutationAuthority } from "./worker-authority.mjs";
 import { processGroupGone } from "./process-control.mjs";
 import { loadProviderGuard } from "./recursion-guard.mjs";
@@ -1186,6 +1190,52 @@ function sameControllerBinding(left, right) {
   return stableStringify(left) === stableStringify(right);
 }
 
+function originalProviderLaunchBinding(job) {
+  const spawn = job?.request?.spawn || {};
+  const executionBinding = job?.executionBinding || {};
+  const intent = job?.provisioningRuntime?.intent || {};
+  const brokerBound = SHA256_HEX.test(spawn.providerCapabilityDigest || "")
+    || SHA256_HEX.test(spawn.writeLifecycleCapabilityDigest || "")
+    || SHA256_HEX.test(
+      executionBinding.providerLaunchBindingDigest || ""
+    );
+  const hasBinding = Object.hasOwn(spawn, "providerLaunchBinding");
+  const hasDigest = Object.hasOwn(spawn, "providerLaunchBindingDigest");
+  if (!hasBinding && !hasDigest && !brokerBound) return null;
+  if (!hasBinding || !hasDigest) {
+    throw stateError(
+      "Owner-controller provider executable binding is missing or partial."
+    );
+  }
+  let binding;
+  try {
+    binding = assertProviderLaunchBinding(spawn.providerLaunchBinding);
+  } catch {
+    throw stateError(
+      "Owner-controller provider executable binding is malformed."
+    );
+  }
+  const bindingDigest = digestProviderLaunchBinding(binding);
+  if (spawn.providerLaunchBindingDigest !== bindingDigest
+    || (Object.hasOwn(executionBinding, "providerLaunchBindingDigest")
+      && executionBinding.providerLaunchBindingDigest !== bindingDigest)
+    || (brokerBound && (
+      intent.providerLaunchBindingDigest !== bindingDigest
+      || digestProviderLaunchBinding(intent.providerLaunchBinding)
+        !== bindingDigest
+      || intent.executableIdentity?.identityDigest
+        !== binding.executableIdentityDigest
+    ))) {
+    throw stateError(
+      "Owner-controller provider executable binding changed after admission."
+    );
+  }
+  return Object.freeze({
+    binding,
+    bindingDigest
+  });
+}
+
 function controllerIntentBody({
   binding,
   effect,
@@ -1416,6 +1466,7 @@ function ownerControllerInput({
       || !/^[a-zA-Z0-9._-]{1,80}$/.test(job.request.providerHomeId))) {
     throw stateError("Cleanup controller provider-session home binding is invalid.");
   }
+  const providerLaunch = originalProviderLaunchBinding(job);
   const effectBindingDigest = digest({
     operation,
     effect,
@@ -1441,6 +1492,9 @@ function ownerControllerInput({
       ? { providerHomeDigest: digest(job.request?.providerHomeId) }
       : {}),
     worktreeOperationDigest: digest(record.worktreeOperationId),
+    ...(providerLaunch
+      ? { providerLaunchBindingDigest: providerLaunch.bindingDigest }
+      : {}),
     controllerAttemptId,
     controllerFence: lifecycle.fence
   });
@@ -1485,6 +1539,13 @@ function ownerControllerInput({
     binding,
     gitCommonDir: job.executionBinding.gitCommonDir,
     baseCommit: record.baseBinding.baseCommit,
+    ...(providerLaunch
+      ? {
+          providerLaunchBinding: providerLaunch.binding,
+          providerLaunchBindingDigest: providerLaunch.bindingDigest,
+          providerExecutableEnv: env
+        }
+      : {}),
     callbacks: controllerCallbacks({
       root,
       workerId,

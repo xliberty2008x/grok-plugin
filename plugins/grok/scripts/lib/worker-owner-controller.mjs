@@ -9,6 +9,11 @@ import {
   sameExecutableAttestation
 } from "./executable-identity.mjs";
 import {
+  assertProviderLaunchBinding,
+  providerLaunchBindingDigest as digestProviderLaunchBinding,
+  resolveProviderExecutablePin
+} from "./provider-executable-pin.mjs";
+import {
   assertProviderPlatform,
   authenticateBoundBootstrapGuard,
   captureSpawnIdentity,
@@ -90,6 +95,56 @@ function exactKeys(value, keys) {
 
 function controllerError(message, details = undefined) {
   return new CompanionError("E_PROCESS_IDENTITY", message, details);
+}
+
+function resolveOwnerControllerExecutable({
+  providerLaunchBinding,
+  providerLaunchBindingDigest,
+  providerExecutableEnv
+}) {
+  const hasBinding = providerLaunchBinding != null;
+  const hasDigest = providerLaunchBindingDigest != null;
+  if (!hasBinding && !hasDigest) return null;
+  if (!hasBinding || !hasDigest) {
+    throw controllerError(
+      "Worker owner-controller provider executable binding is partial."
+    );
+  }
+  let binding;
+  try {
+    binding = assertProviderLaunchBinding(providerLaunchBinding);
+  } catch {
+    throw controllerError(
+      "Worker owner-controller provider executable binding is malformed."
+    );
+  }
+  if (providerLaunchBindingDigest !== digestProviderLaunchBinding(binding)) {
+    throw controllerError(
+      "Worker owner-controller provider executable binding digest is inconsistent."
+    );
+  }
+  let resolved;
+  try {
+    resolved = resolveProviderExecutablePin(binding, {
+      env: providerExecutableEnv
+    });
+  } catch (error) {
+    if (error instanceof CompanionError) throw error;
+    throw controllerError(
+      "Worker owner-controller provider executable pin could not be resolved."
+    );
+  }
+  if (resolved.binding.executableIdentityDigest
+      !== resolved.executableIdentity.identityDigest
+    || resolved.binding.executableIdentityDigest
+      !== binding.executableIdentityDigest
+    || digestProviderLaunchBinding(resolved.binding)
+      !== providerLaunchBindingDigest) {
+    throw controllerError(
+      "Worker owner-controller provider executable pin changed during resolution."
+    );
+  }
+  return resolved;
 }
 
 function validateBaseBinding(binding) {
@@ -330,12 +385,20 @@ export async function openWorkerOwnerController({
   baseCommit,
   effect,
   callbacks,
+  providerLaunchBinding = null,
+  providerLaunchBindingDigest = null,
+  providerExecutableEnv = process.env,
   cancelRequested = () => false,
   onEvent = () => {},
   testHooks = null
 } = {}) {
   assertProviderPlatform();
   const baseBinding = validateBaseBinding(binding);
+  const setupOwnedExecutable = resolveOwnerControllerExecutable({
+    providerLaunchBinding,
+    providerLaunchBindingDigest,
+    providerExecutableEnv
+  });
   const durable = assertCallbacks(callbacks);
   if (profile !== null && profile?.id !== "rescue-write-v3") {
     throw new CompanionError(
@@ -486,11 +549,11 @@ export async function openWorkerOwnerController({
         "Worker owner-controller was cancelled before preparation."
       );
     }
-    const discoveredBinary = discoverGrok();
-    const capturedExecutable = materializePinnedGrokExecutable(
-      discoveredBinary,
-      { directory: path.join(environment.controllerCwd, "provider-bin") }
-    );
+    const capturedExecutable = setupOwnedExecutable?.fileIdentity
+      || materializePinnedGrokExecutable(
+        discoverGrok(),
+        { directory: path.join(environment.controllerCwd, "provider-bin") }
+      );
     executableIdentity = capturedExecutable.attestation;
     if (effect === "close") environment.verifySessionHome();
     environment.verifyGitExecutable?.();
