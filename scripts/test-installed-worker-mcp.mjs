@@ -1267,6 +1267,49 @@ async function callTool(context, client, name, argumentsValue, expectedPayloadKe
   });
 }
 
+async function callWriteSmokeWait(
+  context,
+  client,
+  workerId,
+  cursor,
+  timeoutMs
+) {
+  checkInterrupted(context.runner);
+  let result;
+  try {
+    result = await client.request("tools/call", {
+      name: "worker_wait",
+      arguments: {
+        id: workerId,
+        ...(cursor ? { cursor } : {}),
+        timeoutMs
+      },
+      _meta: createMetadata(
+        context.threadId,
+        context.fixtureRoot,
+        context.runner.turnIds
+      )
+    });
+  } catch {
+    fail("E_MCP");
+  }
+  const publicErrorCode = result?.structuredContent?.error?.code;
+  if (/^E_[A-Z0-9_]{1,126}$/.test(String(publicErrorCode || ""))) {
+    process.stderr.write(
+      `Installed Worker MCP write-smoke diagnostic ${JSON.stringify({
+        schemaVersion: 1,
+        stage: "write-smoke-wait",
+        publicErrorCode
+      })}\n`
+    );
+    fail("E_SCENARIO");
+  }
+  return validateInstalledToolResult(result, {
+    outcome: "ok",
+    expectedPayloadKeys: ["stream"]
+  });
+}
+
 async function verifyMcpSurface(context, client, { negative = false } = {}) {
   if (negative) {
     let denied;
@@ -4208,16 +4251,12 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
   let terminal = false;
   let firstWait = true;
   while (Date.now() < deadline) {
-    const page = await callTool(
+    const page = await callWriteSmokeWait(
       context,
       client,
-      "worker_wait",
-      {
-        id: workerId,
-        ...(cursor ? { cursor } : {}),
-        timeoutMs: firstWait ? 0 : 30_000
-      },
-      ["stream"]
+      workerId,
+      cursor,
+      firstWait ? 0 : 30_000
     );
     firstWait = false;
     if (
