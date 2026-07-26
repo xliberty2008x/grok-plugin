@@ -1304,6 +1304,83 @@ async function callTool(context, client, name, argumentsValue, expectedPayloadKe
   } catch {
     fail("E_MCP");
   }
+  if (
+    context.writeSmoke
+    && ["worker_integrate", "worker_cleanup"].includes(name)
+    && result?.structuredContent?.ok !== true
+  ) {
+    let lifecycle = null;
+    try {
+      const workerId = argumentsValue?.id;
+      const jobFile = context.state.jobFileIfPresent(
+        context.fixtureRoot,
+        workerId,
+        context.env
+      );
+      const registryFile = jobFile
+        ? path.join(
+            path.dirname(path.dirname(jobFile)),
+            "owner-lifecycle",
+            "registry.json"
+          )
+        : null;
+      const registry = registryFile && fs.existsSync(registryFile)
+        ? safeParseJson(fs.readFileSync(registryFile, "utf8"), "E_SCENARIO")
+        : null;
+      const record = registry?.records?.[workerId];
+      const current = name === "worker_integrate"
+        ? record?.integration
+        : record?.cleanup;
+      lifecycle = current
+        ? {
+            state: /^[a-z][a-z0-9-]{0,31}$/.test(
+              String(current.state || "")
+            )
+              ? current.state
+              : null,
+            attempts: Number.isSafeInteger(current.attempts)
+              ? current.attempts
+              : null,
+            closeAttempts: Number.isSafeInteger(current.closeAttempts)
+              ? current.closeAttempts
+              : null,
+            sessionDeleteAttempts:
+              Number.isSafeInteger(current.sessionDeleteAttempts)
+                ? current.sessionDeleteAttempts
+                : null,
+            removeAttempts: Number.isSafeInteger(current.removeAttempts)
+              ? current.removeAttempts
+              : null,
+            errorClassification: /^[a-z][a-z0-9-]{0,63}$/.test(
+              String(current.error?.classification || "")
+            )
+              ? current.error.classification
+              : null,
+            errorMessageDigest: typeof current.error?.message === "string"
+              ? crypto
+                  .createHash("sha256")
+                  .update(current.error.message)
+                  .digest("hex")
+              : null
+          }
+        : null;
+    } catch {
+      lifecycle = { diagnosticFailed: true };
+    }
+    process.stderr.write(
+      `Installed Worker MCP owner-lifecycle diagnostic ${JSON.stringify({
+        schemaVersion: 1,
+        stage: qualificationStage,
+        tool: name,
+        publicErrorCode: /^E_[A-Z0-9_]{1,126}$/.test(
+          String(result?.structuredContent?.error?.code || "")
+        )
+          ? result.structuredContent.error.code
+          : null,
+        lifecycle
+      })}\n`
+    );
+  }
   return validateInstalledToolResult(result, {
     outcome: "ok",
     expectedPayloadKeys
