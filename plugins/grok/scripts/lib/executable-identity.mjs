@@ -406,6 +406,20 @@ export function sameExecutableAttestation(left, right) {
     && stableDigest(left) === stableDigest(right);
 }
 
+/**
+ * Compare the immutable official package release while allowing independent
+ * broker-owned materializations to have different path/inode attestations.
+ */
+export function sameExecutableRelease(left, right) {
+  try {
+    assertExecutableAttestation(left);
+    assertExecutableAttestation(right);
+  } catch {
+    return false;
+  }
+  return left.releaseIdentityDigest === right.releaseIdentityDigest;
+}
+
 /** Bind exact bytes to one code-owned official package release pin. */
 export function captureGrokExecutableIdentity(binary, {
   platform = process.platform,

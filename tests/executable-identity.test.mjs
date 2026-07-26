@@ -12,7 +12,8 @@ import {
   captureGrokExecutableIdentity,
   createExecutableAttestation,
   materializePinnedGrokExecutable,
-  sameExecutableAttestation
+  sameExecutableAttestation,
+  sameExecutableRelease
 } from "../plugins/grok/scripts/lib/executable-identity.mjs";
 
 function executableFixture(t, body = "#!/bin/sh\nexit 0\n") {
@@ -138,6 +139,19 @@ test("private materialization copies pinned bytes without executing the source",
   assert.equal(materialized.size, pinned.size);
   assert.equal(fs.statSync(launchDirectory).mode & 0o077, 0);
   assert.equal(fs.statSync(materialized.canonicalPath).mode & 0o777, 0o500);
+  const source = captureGrokExecutableIdentity(binary, {
+    releases: [releaseFor(pinned)]
+  });
+  assert.equal(
+    sameExecutableAttestation(source.attestation, materialized.attestation),
+    false,
+    "independent private copies must retain distinct file/path identity"
+  );
+  assert.equal(
+    sameExecutableRelease(source.attestation, materialized.attestation),
+    true,
+    "independent private copies of the same official package share a release identity"
+  );
 });
 
 test("private materialization removes its launch directory when pinning fails", (t) => {

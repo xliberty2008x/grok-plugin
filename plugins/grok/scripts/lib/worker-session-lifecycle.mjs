@@ -4,7 +4,7 @@ import path from "node:path";
 import { CompanionError } from "./errors.mjs";
 import {
   captureGrokExecutableIdentity,
-  sameExecutableAttestation
+  sameExecutableRelease
 } from "./executable-identity.mjs";
 import {
   deleteSession,
@@ -64,11 +64,14 @@ function bindOwnedProviderSession({
   const currentExecutable = captureGrokExecutableIdentity(binary);
   if (
     !expectedExecutable
-    || !sameExecutableAttestation(expectedExecutable, currentExecutable)
+    || !sameExecutableRelease(
+      expectedExecutable,
+      currentExecutable.attestation
+    )
   ) {
     throw new CompanionError(
       "E_CONTEXT_DRIFT",
-      "The installed Grok executable changed before provider-session cleanup."
+      "The installed Grok release changed before provider-session cleanup."
     );
   }
   const jobFile = jobFileIfPresent(root, workerId, env);
