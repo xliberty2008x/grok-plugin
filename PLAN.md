@@ -61,7 +61,7 @@ Parity means:
 ### Residual limitations (document honestly)
 
 1. **macOS child-network isolation** is not enforced by Grok; the plugin does not claim otherwise.
-2. **Worker Broker write spawn is not yet enabled or qualified.** The strict official ACP worktree protocol seam, durable write admission, exact-package executable attestation, promotion-gated create→verified-ready, and zero-create ready replay exist, but committed-source response-loss recovery/reissue, ready-only model-provider launch, artifact integration, cancellation, and cleanup still have to pass P3-V. Direct or moving-tree provisioner probes are supporting evidence only and must not be described as an installed Worker Broker lifecycle.
+2. **Worker Broker write spawn is not yet enabled or qualified.** The strict official ACP worktree protocol seam, durable write admission, exact-package executable attestation, promotion-gated create→verified-ready, committed-source response-loss recovery/absence-proven reissue, and zero-create ready replay exist. Ready-only model-provider launch, artifact retrieval/integration, cancellation, official remove, and end cleanup still have to pass P3-V. The clean direct provisioner proof at `afe8ea4` is supporting evidence only and must not be described as an installed Worker Broker lifecycle.
 3. **Authenticated installed-Codex natural host-orchestration E2E** for this hardening slice remains outstanding; direct installed-wrapper execution has passed but is a different evidence boundary.
 4. Cross-platform authenticated provider qualification beyond historical macOS evidence remains open.
 
