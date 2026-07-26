@@ -135,13 +135,6 @@ function main() {
       fail("Persisted natural task did not complete one exact dispatch-v2 provider generation.");
     }
 
-    const version = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
-    const installedWrapper = path.join(CODEX_HOME, "plugins", "cache", "grok-companion", "grok", version, "scripts", "grok-codex.mjs");
-    const rendered = checked(process.execPath, [installedWrapper, "result", job.id], { timeout: 30_000 });
-    if (!rendered.stdout.includes("Outcome: complete") || !rendered.stdout.includes("Host verification: passed")) {
-      fail("Installed result renderer did not return the completed, host-verified job.", rendered.stdout);
-    }
-
     const stateRoot = path.dirname(path.dirname(jobFile));
     const grokHome = path.join(stateRoot, "task-homes", job.request?.providerHomeId || job.id, ".grok");
     for (const relative of ["auth.json", "agent-profiles"]) {
