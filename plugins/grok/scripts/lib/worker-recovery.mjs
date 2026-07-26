@@ -45,6 +45,10 @@ import {
   settleInterruptedAttempt,
   stableDigest
 } from "./worker-mailbox-state.mjs";
+import {
+  assertProviderLaunchBinding,
+  providerLaunchBindingDigest
+} from "./provider-executable-pin.mjs";
 
 export const BROKER_RECOVERY_PRIVILEGE = "host-trusted-reconciler";
 export const BROKER_DISPATCH_RECOVERY_GRACE_MS = 5_000;
@@ -146,6 +150,59 @@ function sameBoundProviderIdentity(left, right) {
     && left.dispatchAttemptId === right.dispatchAttemptId
     && left.dispatchFence === right.dispatchFence
     && left.providerGeneration === right.providerGeneration;
+}
+
+function recoveryProviderGuardBinding(job, intent, authenticated) {
+  const spawn = job?.request?.spawn;
+  const executableBound = Boolean(
+    spawn
+    && (
+      Object.hasOwn(spawn, "providerLaunchBinding")
+      || Object.hasOwn(spawn, "providerLaunchBindingDigest")
+    )
+  );
+  const registrationFields = job?.write === true
+    ? { executionBindingDigest: authenticated.executionBindingDigest }
+    : {};
+  if (!executableBound) {
+    return {
+      expectedSchemaVersion: job?.write === true ? 4 : 3,
+      registrationFields
+    };
+  }
+
+  let admittedBinding;
+  let intentBinding;
+  try {
+    admittedBinding = assertProviderLaunchBinding(spawn.providerLaunchBinding);
+    intentBinding = assertProviderLaunchBinding(intent?.providerLaunchBinding);
+  } catch {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Provider recovery executable binding is malformed."
+    );
+  }
+  const admittedBindingDigest = providerLaunchBindingDigest(admittedBinding);
+  const executableIdentityDigest = admittedBinding.executableIdentityDigest;
+  if (spawn.providerLaunchBindingDigest !== admittedBindingDigest
+    || intent.providerLaunchBindingDigest !== admittedBindingDigest
+    || providerLaunchBindingDigest(intentBinding) !== admittedBindingDigest
+    || authenticated.providerLaunchBindingDigest !== admittedBindingDigest
+    || authenticated.providerExecutableIdentityDigest
+      !== executableIdentityDigest) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Provider recovery guard does not match the admitted executable binding."
+    );
+  }
+  return {
+    expectedSchemaVersion: job?.write === true ? 7 : 6,
+    registrationFields: {
+      ...registrationFields,
+      providerLaunchBindingDigest: admittedBindingDigest,
+      providerExecutableIdentityDigest: executableIdentityDigest
+    }
+  };
 }
 
 function settleMailboxAfterProviderLoss({
@@ -374,7 +431,12 @@ function reconcileProviderSpawnBoundary(root, job, providerGeneration, env) {
   const authenticated = assertProviderGuardForJob(root, job, guard, {
     expectedGeneration: providerGeneration
   });
-  if (authenticated.schemaVersion !== 3
+  const recoveryGuardBinding = recoveryProviderGuardBinding(
+    job,
+    intent,
+    authenticated
+  );
+  if (authenticated.schemaVersion !== recoveryGuardBinding.expectedSchemaVersion
     || authenticated.providerSpawnIntentId !== intent.intentId) {
     throw new CompanionError("E_PROCESS_IDENTITY", "Provider guard is not bound to the active spawn intent.");
   }
@@ -405,7 +467,8 @@ function reconcileProviderSpawnBoundary(root, job, providerGeneration, env) {
         dispatchAttemptId: dispatch.attemptId,
         dispatchFence: dispatch.fence,
         providerGeneration,
-        providerSpawnIntentId: intent.intentId
+        providerSpawnIntentId: intent.intentId,
+        ...recoveryGuardBinding.registrationFields
       },
       env
     );

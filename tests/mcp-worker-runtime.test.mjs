@@ -20,6 +20,9 @@ import {
   SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
 } from "../plugins/grok/scripts/lib/provider-capability.mjs";
 import {
+  providerLaunchBindingDigest
+} from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
+import {
   assertDispatchContract,
   authorizeWorkerProviderRotation,
   cancellationNonce,
@@ -79,6 +82,16 @@ const TEST_PROVIDER_RECEIPT = Object.freeze({
 const TEST_BROKER_RUNTIME = createMcpBrokerRuntime({
   providerCapabilityReceipt: TEST_PROVIDER_RECEIPT
 });
+const TEST_PROVIDER_LAUNCH_BINDING = Object.freeze({
+  schemaVersion: 1,
+  pinRef: `gpin-${"1".repeat(32)}`,
+  pinRecordDigest: "2".repeat(64),
+  executableIdentityDigest: "3".repeat(64),
+  releaseIdentityDigest: "4".repeat(64)
+});
+const TEST_PROVIDER_LAUNCH_BINDING_DIGEST = providerLaunchBindingDigest(
+  TEST_PROVIDER_LAUNCH_BINDING
+);
 
 function taskReport(summary = "Fake broker task completed", extra = {}) {
   return `GROK_WORKER_REPORT: ${JSON.stringify({
@@ -2148,6 +2161,150 @@ test("pending provider rotation is durably promoted before guard cleanup and los
 
   const replay = await reconcileBrokerWorkers({ root, principal, dispatchStartupGraceMs: 0, env });
   assert.equal(replay.results[0].reason, "terminal");
+});
+
+test("pinned provider recovery re-registers the exact executable-bound guard", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const { root, env } = fixture();
+  const principal = { hostKind: "codex", threadId: THREAD_ID };
+  const admitted = spawnReadOnlyWorker({
+    root,
+    principal,
+    envelope: buildTaskEnvelope({
+      userRequest: "Recover an executable-bound replacement provider",
+      mode: "read"
+    }),
+    idempotencyKey: "pinned-rotation-recovery-reregister-0001",
+    providerLaunchBinding: TEST_PROVIDER_LAUNCH_BINDING,
+    providerLaunchBindingDigest: TEST_PROVIDER_LAUNCH_BINDING_DIGEST,
+    env
+  });
+  const workerId = admitted.handle.id;
+  const claim = claimWorkerDispatch({ root, principal, workerId, env });
+  const controllerChild = spawnIdleProcess(t);
+  const workerChild = spawnIdleProcess(t);
+  const oldProviderChild = spawnIdleProcess(t);
+  const controllerProcess = await boundProcessIdentity(controllerChild, workerId, claim);
+  const workerProcess = await boundProcessIdentity(workerChild, workerId, claim);
+  const oldProvider = await boundProcessIdentity(oldProviderChild, workerId, claim, {
+    nonce: undefined,
+    providerGeneration: 1
+  });
+  installProviderStartedFixture({
+    root,
+    workerId,
+    claim,
+    controllerProcess,
+    workerProcess,
+    providerProcess: oldProvider,
+    env
+  });
+  process.kill(-oldProviderChild.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(oldProvider), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  authorizeWorkerProviderRotation({
+    root,
+    workerId,
+    attemptId: claim.attemptId,
+    workerProcess,
+    env
+  });
+  for (const child of [controllerChild, workerChild]) {
+    process.kill(-child.pid, "SIGKILL");
+  }
+  await waitFor(
+    () => [controllerProcess, workerProcess, oldProvider].every(
+      (identity) => processGroupGone(identity)
+    ),
+    { timeoutMs: 5_000, intervalMs: 25 }
+  );
+
+  const replacement = spawnProcess(process.execPath, [
+    "-e",
+    "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000);",
+    "agent",
+    "--leader-socket",
+    path.join(root, `leader-${workerId}.sock`),
+    "stdio"
+  ], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  t.after(() => {
+    try { process.kill(-replacement.pid, "SIGKILL"); } catch {}
+  });
+  await new Promise((resolve, reject) => {
+    replacement.once("error", reject);
+    replacement.stdout.once("data", resolve);
+  });
+  const replacementIdentity = {
+    pid: replacement.pid,
+    startToken: await waitFor(() => processStartToken(replacement.pid)),
+    processGroupId: replacement.pid
+  };
+  const rotationJob = tryReadJob(root, workerId, env);
+  registerProviderGuard(
+    root,
+    workerId,
+    replacementIdentity,
+    THREAD_ID,
+    "provider",
+    {
+      controlWorkspaceId: rotationJob.controlWorkspaceId,
+      executionRoot: rotationJob.request.spawn.executionRoot,
+      dispatchAttemptId: claim.attemptId,
+      dispatchFence: claim.fence,
+      providerGeneration: 2,
+      providerSpawnIntentId: rotationJob.request.spawn.providerSpawnIntent.intentId,
+      providerLaunchBindingDigest:
+        rotationJob.request.spawn.providerLaunchBindingDigest,
+      providerExecutableIdentityDigest:
+        rotationJob.request.spawn.providerLaunchBinding.executableIdentityDigest
+    },
+    env
+  );
+  assert.equal(loadProviderGuard(root, workerId).schemaVersion, 6);
+
+  // Simulate a crash after guard publication but before the adjacent durable
+  // intent update. Recovery must replay the exact schema-6 registration.
+  updateJob(root, workerId, (job) => ({
+    ...job,
+    request: {
+      ...job.request,
+      spawn: {
+        ...job.request.spawn,
+        providerSpawnIntent: {
+          ...job.request.spawn.providerSpawnIntent,
+          status: "pending",
+          registeredAt: null,
+          updatedAt: job.request.spawn.providerSpawnIntent.preparedAt
+        }
+      }
+    }
+  }), env);
+  assert.equal(
+    tryReadJob(root, workerId, env).request.spawn.providerSpawnIntent.status,
+    "pending"
+  );
+
+  const recovery = await reconcileBrokerWorkers({
+    root,
+    principal,
+    dispatchStartupGraceMs: 0,
+    env
+  });
+  assert.equal(recovery.results[0].action, "marked-lost");
+  const settled = tryReadJob(root, workerId, env);
+  assert.equal(settled.status, "failed");
+  assert.equal(settled.request.spawn.dispatch.providerGeneration, 2);
+  assert.equal(settled.request.spawn.providerSpawnIntent.status, "registered");
+  assert.equal(settled.providerProcess.pid, replacement.pid);
+  assert.equal(settled.result.taskRuntimeCleaned, true);
+  assert.equal(loadProviderGuard(root, workerId), null);
+  await waitFor(() => processGroupGone(settled.providerProcess), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
 });
 
 test("unsettled replacement provider supersedes stale generation and blocks cleanup until its group is observed gone", { skip: process.platform === "win32" }, async (t) => {
