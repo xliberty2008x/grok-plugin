@@ -1783,13 +1783,15 @@ export function assertWorkerProviderLaunchPreparation(job, {
   const spawn = job?.request?.spawn;
   const dispatch = spawn?.dispatch;
   const taskProfile = profileFor("task", true);
+  // binding.envelopeDigest intentionally names the pre-provisioning admission
+  // envelope. The durable dispatch envelope is separately covered by the
+  // consumed launch contract after its execution-context identity is added.
   assertExecutionBinding(job.executionBinding, {
     workerId: job.id,
     controlWorkspaceId: job.controlWorkspaceId,
     expectedExecutionRoot: spawn?.executionRoot,
     bindingDigest: spawn?.executionBindingDigest,
     scope: job.request?.envelope?.scope,
-    envelopeDigest: job.request?.envelope?.digest,
     roleDigest: job.role?.digest,
     profileDigest: stableDigest(taskProfile),
     runtimeRolePolicyDigest: job.request?.runtimeRolePolicy?.digest,
