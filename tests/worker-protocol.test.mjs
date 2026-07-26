@@ -35,7 +35,8 @@ import {
   projectWorkerHandle,
   projectWorkerLifecycleCursor,
   projectWorkerPublicText,
-  projectWorkerSnapshot
+  projectWorkerSnapshot,
+  projectWriteArtifactMetadata
 } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
 import { initRepo, runCompanion, tempDir } from "./helpers.mjs";
 
@@ -43,6 +44,44 @@ const PROTOCOL_SCHEMA = JSON.parse(fs.readFileSync(
   new URL("../plugins/grok/schemas/worker-protocol.schema.json", import.meta.url),
   "utf8"
 ));
+
+test("write artifact metadata projection is digest-only and fails closed", () => {
+  const source = {
+    schemaVersion: 1,
+    path: "target.txt",
+    baseCommit: "a".repeat(40),
+    manifestDigest: "b".repeat(64),
+    securityDigest: "c".repeat(64),
+    patchDigest: "d".repeat(64),
+    contentDigest: "e".repeat(64),
+    contentBytes: 6,
+    createdAt: "2026-07-26T00:00:00.000Z",
+    controlRoot: "/private/control",
+    executionRoot: "/private/worktree",
+    patch: "private patch",
+    content: "after\n",
+    providerSessionId: "private-session"
+  };
+  assert.deepEqual(projectWriteArtifactMetadata(source), {
+    schemaVersion: 1,
+    path: "target.txt",
+    baseCommit: source.baseCommit,
+    manifestDigest: source.manifestDigest,
+    securityDigest: source.securityDigest,
+    patchDigest: source.patchDigest,
+    contentDigest: source.contentDigest,
+    contentBytes: source.contentBytes,
+    createdAt: source.createdAt
+  });
+  assert.equal(
+    JSON.stringify(projectWriteArtifactMetadata(source)).includes("/private"),
+    false
+  );
+  assert.equal(projectWriteArtifactMetadata({
+    ...source,
+    contentDigest: "not-a-digest"
+  }), null);
+});
 
 function schemaTypeMatches(type, value) {
   if (type === "null") return value === null;

@@ -9,7 +9,10 @@ import { pathToFileURL } from "node:url";
 
 import {
   createMcpBrokerRuntime,
-  handleMcpRequest
+  handleMcpRequest,
+  WORKER_TOOLS,
+  WRITE_SMOKE_ENV_VALUE,
+  WRITE_SMOKE_WORKER_TOOLS
 } from "../plugins/grok/mcp/broker.mjs";
 import {
   ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY,
@@ -208,6 +211,127 @@ function emergencyStop(job) {
     } catch {}
   }
 }
+
+test("write-smoke MCP surface is exact, opt-in, and cannot accept caller scope", async () => {
+  const root = initRepo();
+  const env = {
+    ...process.env,
+    GROK_COMPANION_WRITE_SMOKE: WRITE_SMOKE_ENV_VALUE
+  };
+  const defaultRuntime = createMcpBrokerRuntime({
+    env,
+    providerCapabilityReceipt: TEST_PROVIDER_RECEIPT,
+    writeSmoke: false
+  });
+  const writeRuntime = createMcpBrokerRuntime({
+    env,
+    providerCapabilityReceipt: TEST_PROVIDER_RECEIPT,
+    writeSmoke: true
+  });
+  assert.deepEqual(
+    defaultRuntime.tools.map((tool) => tool.name),
+    WORKER_TOOLS.map((tool) => tool.name)
+  );
+  assert.deepEqual(
+    writeRuntime.tools.map((tool) => tool.name),
+    WRITE_SMOKE_WORKER_TOOLS.map((tool) => tool.name)
+  );
+  assert.match(writeRuntime.writeLifecycleCapabilityDigest, /^[a-f0-9]{64}$/);
+
+  let observed = null;
+  const reply = await handleMcpRequest({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: {
+      name: "worker_spawn_write",
+      arguments: {
+        idempotencyKey: "write-smoke-exact-0001",
+        userRequest: "Replace the target marker."
+      },
+      _meta: metadata(root)
+    }
+  }, {
+    runtime: writeRuntime,
+    env,
+    readProviderCapabilityReceipt: () => TEST_PROVIDER_RECEIPT,
+    createService(options) {
+      observed = options;
+      return {
+        spawnWriteVertical(args) {
+          assert.deepEqual(args, {
+            idempotencyKey: "write-smoke-exact-0001",
+            userRequest: "Replace the target marker.",
+            objective: undefined
+          });
+          return {
+            handle: {
+              id: "task-1111111111111111",
+              write: true
+            },
+            replayed: false,
+            spawnSuccessDefinition: "durable-job-commit",
+            providerLaunchState: "not-ready",
+            providerLaunched: false
+          };
+        }
+      };
+    },
+    reconcileWorkers: async () => {}
+  });
+  assert.equal(
+    reply.result.structuredContent.ok,
+    true,
+    JSON.stringify(reply.result.structuredContent)
+  );
+  assert.equal(observed.allowWriteSpawn, true);
+  assert.equal(observed.enableWriteVerticalDispatch, true);
+  assert.equal(
+    observed.writeLifecycleCapabilityDigest,
+    writeRuntime.writeLifecycleCapabilityDigest
+  );
+
+  const callerScope = await handleMcpRequest({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: {
+      name: "worker_spawn_write",
+      arguments: {
+        idempotencyKey: "write-smoke-exact-0002",
+        userRequest: "Try a wider scope.",
+        scope: { include: ["other.txt"], exclude: [] }
+      },
+      _meta: metadata(root)
+    }
+  }, {
+    runtime: writeRuntime,
+    env,
+    readProviderCapabilityReceipt: () => TEST_PROVIDER_RECEIPT
+  });
+  assert.equal(callerScope.result.structuredContent.ok, false);
+  assert.equal(callerScope.result.structuredContent.error.code, "E_USAGE");
+
+  const disabled = await handleMcpRequest({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "tools/call",
+    params: {
+      name: "worker_spawn_write",
+      arguments: {
+        idempotencyKey: "write-smoke-exact-0003",
+        userRequest: "No process opt-in."
+      },
+      _meta: metadata(root)
+    }
+  }, {
+    runtime: writeRuntime,
+    env: { ...env, GROK_COMPANION_WRITE_SMOKE: "disabled" },
+    readProviderCapabilityReceipt: () => TEST_PROVIDER_RECEIPT
+  });
+  assert.equal(disabled.result.structuredContent.ok, false);
+  assert.equal(disabled.result.structuredContent.error.code, "E_CAPABILITY");
+});
 
 function deleteAllContextBindingFields(job) {
   const tampered = structuredClone(job);

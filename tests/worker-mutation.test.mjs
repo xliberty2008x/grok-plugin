@@ -20,6 +20,7 @@ import { projectWorkerSnapshot } from "../plugins/grok/scripts/lib/worker-protoc
 import {
   admitWriteWorkerPlan,
   activateWriteProvisioningAttempt,
+  authorizeReadyWriteWorkerDispatch,
   assertDurableSpawnRequestBinding,
   assertWriteExecutionJob,
   adoptWriteProvisioningEffect,
@@ -29,10 +30,12 @@ import {
   prepareWriteProvisionerIntent,
   prepareWriteProvisioningReissue,
   prepareDispatchProcessSpawn,
+  persistCompletedWriteArtifact,
   promoteWriteWorkerReady,
   recordOfficialWorktreeReceipt,
   recordWriteProvisionerNoChild,
   retainWriteProvisioningCleanupPending,
+  settleWriteArtifactAfterRuntimeCleanup,
   spawnReadOnlyWorker,
   SPAWN_SUCCESS_DEFINITION
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
@@ -58,6 +61,9 @@ import {
   ROOT_READ_PROVIDER_CAPABILITY,
   SAME_SESSION_READ_FOLLOWUP_PROVIDER_CAPABILITY
 } from "../plugins/grok/scripts/lib/provider-capability.mjs";
+import {
+  resolveWorkerAuthority
+} from "../plugins/grok/scripts/lib/worker-authority.mjs";
 import { processGroupGone, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
 import { createExecutableAttestation } from "../plugins/grok/scripts/lib/executable-identity.mjs";
 import {
@@ -147,6 +153,21 @@ function principal(root, overrides = {}) {
   };
 }
 
+function brokerPrincipal(root) {
+  return resolveWorkerAuthority({
+    threadId: THREAD,
+    plugin_id: "grok@grok-companion",
+    "x-codex-turn-metadata": {
+      thread_id: THREAD,
+      turn_id: "019f666e-4084-7902-8447-249f72043a37",
+      plugin_id: "grok@grok-companion"
+    },
+    "codex/sandbox-state-meta": {
+      sandboxCwd: pathToFileURL(root).href
+    }
+  }, { mutation: true });
+}
+
 function envFor(root) {
   const pluginData = tempDir("grok-mutation-data-");
   return {
@@ -221,6 +242,44 @@ function plannedWriteProvisioningFixture(label) {
     principal: principal(root),
     envelope,
     idempotencyKey: `write-provisioning-${label}-0001`,
+    roleId: "implementer",
+    allowWriteSpawn: true,
+    writeLifecycleCapabilityDigest: "c".repeat(64),
+    env
+  });
+  const job = tryReadJob(root, admitted.handle.id, env);
+  return {
+    root,
+    env,
+    envelope,
+    workerId: job.id,
+    binding: job.executionBinding,
+    journal: job.provisioning,
+    actor: {
+      attemptId: "a".repeat(32),
+      fence: 1,
+      holderId: "b".repeat(32),
+      executableIdentity: TEST_EXECUTABLE_IDENTITY
+    }
+  };
+}
+
+function plannedWriteVerticalFixture(label) {
+  const root = initRepo();
+  fs.writeFileSync(path.join(root, "target.txt"), "before\n", "utf8");
+  git(root, "add", "target.txt");
+  git(root, "commit", "-m", "add write vertical target");
+  const { env } = envFor(root);
+  const envelope = buildTaskEnvelope({
+    userRequest: `Edit target.txt for ${label}`,
+    mode: "write",
+    scope: { include: ["target.txt"], exclude: [] }
+  });
+  const admitted = admitWriteWorkerPlan({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey: `write-vertical-${label}-0001`,
     roleId: "implementer",
     allowWriteSpawn: true,
     writeLifecycleCapabilityDigest: "c".repeat(64),
@@ -3427,6 +3486,217 @@ test("official worktree receipt and cleanup proof promote only verified-worktree
       (error) => error?.code === "E_STATE"
     );
   }
+});
+
+test("write artifact rejection runs cleanup first and becomes one bounded failure", () => {
+  const order = [];
+  const outcome = settleWriteArtifactAfterRuntimeCleanup({
+    job: { id: "task-artifact-rejection", write: true },
+    pending: {
+      status: "completed",
+      phase: "done",
+      completedAt: new Date().toISOString(),
+      error: null,
+      summary: "Provider claimed completion"
+    },
+    runtimeCleanup: () => {
+      order.push("cleanup");
+      return { ok: true };
+    },
+    persistArtifact: () => {
+      order.push("artifact");
+      throw new Error("private absolute path must never escape");
+    }
+  });
+  assert.deepEqual(order, ["cleanup", "artifact"]);
+  assert.equal(outcome.rejected, true);
+  assert.equal(outcome.artifact, null);
+  assert.equal(outcome.pending.status, "failed");
+  assert.equal(outcome.pending.phase, "artifact-rejected");
+  assert.deepEqual(outcome.pending.error, {
+    code: "E_INTEGRATION",
+    message: "Worker output failed bounded write-artifact validation."
+  });
+  assert.equal(JSON.stringify(outcome).includes("private absolute path"), false);
+
+  let persisted = false;
+  assert.throws(
+    () => settleWriteArtifactAfterRuntimeCleanup({
+      job: { id: "task-cleanup-blocked", write: true },
+      pending: {
+        status: "completed",
+        phase: "done",
+        completedAt: new Date().toISOString(),
+        error: null,
+        summary: "Provider claimed completion"
+      },
+      runtimeCleanup: { ok: false, warning: "still present" },
+      persistArtifact: () => {
+        persisted = true;
+        return null;
+      }
+    }),
+    (error) => error?.code === "E_RUNTIME_CLEANUP"
+  );
+  assert.equal(persisted, false);
+});
+
+test("verified target.txt worktree atomically gains one exact dispatch-v2 authorization", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = plannedWriteVerticalFixture("ready-dispatch");
+  const active = await activateRegisteredProvisioning(t, fixture);
+  const official = createWorkerWorktree({
+    controlRoot: fixture.root,
+    baseCommit: fixture.binding.baseCommit,
+    workerId: fixture.workerId,
+    env: fixture.env
+  });
+  t.after(() => {
+    try {
+      git(fixture.root, "worktree", "remove", "--force", official.executionRoot);
+    } catch {}
+  });
+  const receivedAt = new Date(
+    Math.max(Date.now(), Date.parse(active.registeredAt) + 1)
+  ).toISOString();
+  const recorded = recordOfficialWorktreeReceipt({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    officialReceipt: {
+      status: "created",
+      sessionId: active.prepared.intent.operationId,
+      worktreePath: official.executionRoot,
+      sourceGitRoot: fixture.binding.controlRoot,
+      commit: fixture.binding.baseCommit
+    },
+    receivedAt,
+    env: fixture.env
+  });
+  process.kill(-active.child.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(active.identity), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  const executionContextManifest = captureContextManifest(official.executionRoot);
+  const observedAt = new Date(
+    Math.max(Date.now(), Date.parse(receivedAt) + 1)
+  ).toISOString();
+  const readyAt = new Date(Math.max(
+    Date.now(),
+    Date.parse(recorded.receipt.hostVerification.verifiedAt) + 1,
+    Date.parse(executionContextManifest.capturedAt) + 1,
+    Date.parse(observedAt) + 1
+  )).toISOString();
+  promoteWriteWorkerReady({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    executionContextManifest,
+    cleanupProof: {
+      processIdentity: active.identity,
+      processGroupGone: true,
+      providerGuardAbsent: true,
+      observedAt
+    },
+    readyAt,
+    env: fixture.env
+  });
+
+  let capability = "c".repeat(64);
+  const authority = brokerPrincipal(fixture.root);
+  const authorized = authorizeReadyWriteWorkerDispatch({
+    root: fixture.root,
+    principal: authority,
+    workerId: fixture.workerId,
+    writeLifecycleCapabilityDigest: capability,
+    validateWriteLifecycleCapability: () => capability,
+    env: fixture.env
+  });
+  assert.equal(authorized.authorized, true);
+  assert.equal(authorized.replayed, false);
+  assert.equal(authorized.job.request.spawn.dispatch.schemaVersion, 2);
+  assert.equal(authorized.job.request.spawn.dispatch.state, "pending");
+  assert.equal(
+    authorized.job.request.spawn.executionRoot,
+    fixture.binding.expectedExecutionRoot
+  );
+  assert.equal(
+    authorized.job.request.spawn.executionBindingDigest,
+    fixture.binding.bindingDigest
+  );
+  assert.equal(
+    authorized.job.request.spawn.providerCapabilityDigest,
+    capability
+  );
+  assert.equal(authorized.job.profile.id, "rescue-write-v3");
+  assert.equal(authorized.job.request.envelope.mode, "write");
+  assert.deepEqual(authorized.job.request.envelope.scope, {
+    include: ["target.txt"],
+    exclude: []
+  });
+  assert.doesNotThrow(() => assertDispatchContract(authorized.job));
+  assert.doesNotThrow(() => (
+    assertDurableSpawnRequestBinding(authorized.job, fixture.env)
+  ));
+
+  const authorizationId = authorized.job.workerAuthorization.authorizationId;
+  const dispatchDigest = stableDigest(authorized.job.request.spawn.dispatch);
+  const replay = authorizeReadyWriteWorkerDispatch({
+    root: fixture.root,
+    principal: authority,
+    workerId: fixture.workerId,
+    writeLifecycleCapabilityDigest: capability,
+    validateWriteLifecycleCapability: () => capability,
+    env: fixture.env
+  });
+  assert.equal(replay.authorized, false);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.job.workerAuthorization.authorizationId, authorizationId);
+  assert.equal(stableDigest(replay.job.request.spawn.dispatch), dispatchDigest);
+
+  capability = null;
+  assert.throws(
+    () => authorizeReadyWriteWorkerDispatch({
+      root: fixture.root,
+      principal: authority,
+      workerId: fixture.workerId,
+      writeLifecycleCapabilityDigest: "c".repeat(64),
+      validateWriteLifecycleCapability: () => capability,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_CAPABILITY"
+  );
+
+  fs.writeFileSync(
+    path.join(fixture.root, "target.txt"),
+    "parent drift\n",
+    "utf8"
+  );
+  assert.throws(
+    () => persistCompletedWriteArtifact(
+      authorized.job,
+      {
+        status: "completed",
+        phase: "done",
+        completedAt: new Date().toISOString(),
+        error: null,
+        summary: "Provider claimed completion"
+      },
+      fixture.env
+    ),
+    (error) => error?.code === "E_INTEGRATION"
+      && /Parent working tree changed/.test(error.message)
+  );
 });
 
 test("write admission durably binds one planned journal without creating launch authority", () => {

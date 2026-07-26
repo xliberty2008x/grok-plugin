@@ -11,11 +11,24 @@ import { CompanionError } from "./errors.mjs";
 import { evaluateScope } from "./task-contract.mjs";
 import {
   controlStateDir,
+  controlStateSegment,
   resolveControlWorkspace,
   gitCommonDir
 } from "./workspace.mjs";
+import { pluginDataRoot } from "./host.mjs";
 
 export const ARTIFACT_MANIFEST_VERSION = 1;
+/** First write vertical permits exactly this one tracked text path. */
+export const WRITE_VERTICAL_TARGET_PATH = "target.txt";
+export const EXACT_WRITE_VERTICAL_SCOPE = Object.freeze({
+  include: Object.freeze([WRITE_VERTICAL_TARGET_PATH]),
+  exclude: Object.freeze([])
+});
+export const WRITE_ARTIFACT_RECORD_SCHEMA_VERSION = 1;
+const WRITE_ARTIFACT_MAX_CONTENT_BYTES = 256 * 1024;
+const WRITE_ARTIFACT_MAX_PATCH_BYTES = 512 * 1024;
+const WRITE_ARTIFACT_MAX_RECORD_BYTES = 2 * 1024 * 1024;
+const WRITE_ARTIFACT_MAX_DIRECTORY_ENTRIES = 4;
 const PARENT_FINGERPRINT_VERSION = 1;
 const PARENT_FINGERPRINT_FIELDS = Object.freeze([
   "clean",
@@ -1347,7 +1360,15 @@ export function buildArtifactManifest({
     });
     const changed = changedWorktreeEntries(canonicalExecutionRoot, exactBaseCommit);
     validateScope(changed, scope);
-    const patch = git(canonicalExecutionRoot, ["diff", "--binary", "--full-index", exactBaseCommit, "--"]).stdout || "";
+    const patch = git(canonicalExecutionRoot, [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--binary",
+      "--full-index",
+      exactBaseCommit,
+      "--"
+    ]).stdout || "";
     return { head, tree, worktreeEntries, changed, patch };
   });
   const { head, tree, worktreeEntries, changed, patch } = captured.value;
@@ -1543,6 +1564,757 @@ function listedWorktreeRoots(controlRoot) {
       try { return [fs.realpathSync(candidate)]; }
       catch { return []; }
     });
+}
+
+function sameScope(left, right) {
+  return stableStringify(left ?? null) === stableStringify(right ?? null);
+}
+
+function strictUtf8(buffer, label) {
+  if (!Buffer.isBuffer(buffer)
+    || buffer.length < 1
+    || buffer.length > WRITE_ARTIFACT_MAX_CONTENT_BYTES
+    || buffer.includes(0)) {
+    throw new CompanionError(
+      "E_SCOPE_VIOLATION",
+      `Write vertical ${label} must be bounded, non-empty UTF-8 text without NUL bytes.`
+    );
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+  } catch {
+    throw new CompanionError(
+      "E_SCOPE_VIOLATION",
+      `Write vertical ${label} must be bounded, non-empty UTF-8 text without NUL bytes.`
+    );
+  }
+}
+
+function readBoundedWriteTargetNoFollow(file, label) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(
+      file,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+    );
+    const before = fs.fstatSync(descriptor);
+    if (!before.isFile()
+      || (before.mode & 0o7777) !== 0o644
+      || before.size < 1
+      || before.size > WRITE_ARTIFACT_MAX_CONTENT_BYTES) {
+      throw new CompanionError(
+        "E_SCOPE_VIOLATION",
+        `Write vertical ${label} must be one bounded regular 100644 file.`
+      );
+    }
+    const buffer = fs.readFileSync(descriptor);
+    const after = fs.fstatSync(descriptor);
+    const pathStat = fs.lstatSync(file);
+    if (pathStat.isSymbolicLink()
+      || !pathStat.isFile()
+      || fs.realpathSync(file) !== file
+      || before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs
+      || after.dev !== pathStat.dev
+      || after.ino !== pathStat.ino) {
+      throw new CompanionError(
+        "E_SCOPE_VIOLATION",
+        `Write vertical ${label} changed during capture.`
+      );
+    }
+    return Object.freeze({
+      buffer,
+      text: strictUtf8(buffer, label),
+      stat: after
+    });
+  } catch (error) {
+    if (error instanceof CompanionError) throw error;
+    throw new CompanionError(
+      "E_SCOPE_VIOLATION",
+      `Write vertical ${label} is unavailable or unsafe.`
+    );
+  } finally {
+    if (descriptor != null) fs.closeSync(descriptor);
+  }
+}
+
+function exactFieldSet(value, fields) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...fields].sort();
+  return actual.length === expected.length
+    && actual.every((field, index) => field === expected[index]);
+}
+
+/**
+ * Fail closed unless scope is exactly the first-vertical one-file contract.
+ */
+export function assertExactWriteVerticalScope(scope) {
+  if (!sameScope(scope, EXACT_WRITE_VERTICAL_SCOPE)) {
+    throw new CompanionError(
+      "E_SCOPE_VIOLATION",
+      "P3-P4 write vertical permits only exact include:[target.txt] with empty exclude."
+    );
+  }
+  return EXACT_WRITE_VERTICAL_SCOPE;
+}
+
+function readExactBaseTarget(root, baseCommit) {
+  const exactBaseCommit = resolveExactCommit(root, baseCommit);
+  const listed = git(
+    root,
+    ["ls-tree", "-z", exactBaseCommit, "--", WRITE_VERTICAL_TARGET_PATH],
+    { encoding: null }
+  ).stdout || Buffer.alloc(0);
+  const header = listed.toString("utf8");
+  const match = header.match(
+    /^100644 blob ([a-f0-9]{40}|[a-f0-9]{64})\ttarget\.txt\0$/
+  );
+  if (!match) {
+    throw new CompanionError(
+      "E_SCOPE_VIOLATION",
+      "Write vertical base must contain one ordinary 100644 target.txt blob."
+    );
+  }
+  const sizeRun = git(root, ["cat-file", "-s", match[1]]);
+  const size = Number(String(sizeRun.stdout || "").trim());
+  if (!Number.isSafeInteger(size) || size < 1 || size > WRITE_ARTIFACT_MAX_CONTENT_BYTES) {
+    throw new CompanionError(
+      "E_SCOPE_VIOLATION",
+      "Write vertical base target.txt exceeds the bounded text contract."
+    );
+  }
+  const content = git(
+    root,
+    ["show", `${exactBaseCommit}:${WRITE_VERTICAL_TARGET_PATH}`],
+    { encoding: null }
+  ).stdout || Buffer.alloc(0);
+  strictUtf8(content, "base target.txt");
+  if (content.length !== size) {
+    throw new CompanionError("E_INTEGRATION", "Write vertical base target changed during capture.");
+  }
+  return Object.freeze({
+    baseCommit: exactBaseCommit,
+    contentDigest: sha(content),
+    size
+  });
+}
+
+/**
+ * Require one existing tracked regular non-symlink text file named target.txt
+ * at the control checkout before write admission/dispatch.
+ */
+export function assertTrackedWriteVerticalTarget(controlRoot) {
+  if (!controlRoot) {
+    throw new CompanionError("E_USAGE", "controlRoot is required for write-vertical target validation.");
+  }
+  const root = fs.realpathSync(controlRoot);
+  const absolute = path.join(root, WRITE_VERTICAL_TARGET_PATH);
+  let stat;
+  try {
+    stat = fs.lstatSync(absolute);
+  } catch {
+    throw new CompanionError(
+      "E_SCOPE_VIOLATION",
+      "Write vertical requires an existing tracked target.txt path."
+    );
+  }
+  if (stat.isSymbolicLink()
+    || !stat.isFile()
+    || (stat.mode & 0o7777) !== 0o644
+    || stat.size < 1
+    || stat.size > WRITE_ARTIFACT_MAX_CONTENT_BYTES) {
+    throw new CompanionError(
+      "E_SCOPE_VIOLATION",
+      "Write vertical target.txt must be one bounded regular non-symlink 100644 file."
+    );
+  }
+  const index = git(
+    root,
+    ["ls-files", "-s", "-z", "--", WRITE_VERTICAL_TARGET_PATH],
+    { encoding: null }
+  ).stdout || Buffer.alloc(0);
+  const match = index.toString("utf8").match(
+    /^100644 ([a-f0-9]{40}|[a-f0-9]{64}) 0\ttarget\.txt\0$/
+  );
+  if (!match) {
+    throw new CompanionError(
+      "E_SCOPE_VIOLATION",
+      "Write vertical target.txt must be one ordinary stage-0 100644 text blob."
+    );
+  }
+  const content = readBoundedWriteTargetNoFollow(
+    absolute,
+    "control target.txt"
+  ).buffer;
+  return Object.freeze({
+    path: WRITE_VERTICAL_TARGET_PATH,
+    mode: 0o100644,
+    size: content.length,
+    contentDigest: sha(content),
+    indexObjectId: match[1]
+  });
+}
+
+function assertExactTargetTxtArtifactManifest(manifest) {
+  if (!manifest || manifest.schemaVersion !== ARTIFACT_MANIFEST_VERSION) {
+    throw new CompanionError("E_INTEGRATION", "Invalid write-vertical artifact manifest.");
+  }
+  assertExactWriteVerticalScope(manifest.scope);
+  if (manifest.resultHead !== manifest.baseCommit
+    || !Array.isArray(manifest.changedPaths)
+    || manifest.changedPaths.length !== 1) {
+    throw new CompanionError(
+      "E_SCOPE_VIOLATION",
+      "Write vertical artifact must remain at its base and change exactly one path."
+    );
+  }
+  const entry = manifest.changedPaths[0];
+  if (!exactFieldSet(entry, ["status", "path", "identity"])
+    || entry.path !== WRITE_VERTICAL_TARGET_PATH
+    || entry.status !== "M"
+    || !exactFieldSet(entry.identity, ["kind", "mode", "size", "contentDigest"])
+    || entry.identity.kind !== "file"
+    || entry.identity.mode !== 0o644
+    || !Number.isSafeInteger(entry.identity.size)
+    || entry.identity.size < 1
+    || entry.identity.size > WRITE_ARTIFACT_MAX_CONTENT_BYTES
+    || !/^[a-f0-9]{64}$/.test(entry.identity.contentDigest || "")) {
+    throw new CompanionError(
+      "E_SCOPE_VIOLATION",
+      "Write vertical artifact must be one bounded ordinary target.txt content edit."
+    );
+  }
+  return entry;
+}
+
+function assertOnlyTargetChanged(executionRoot, baseCommit) {
+  const changed = git(
+    executionRoot,
+    ["diff", "--name-status", "-z", "--no-renames", baseCommit, "--"],
+    { encoding: null }
+  ).stdout || Buffer.alloc(0);
+  if (!changed.equals(Buffer.from(`M\0${WRITE_VERTICAL_TARGET_PATH}\0`))) {
+    throw new CompanionError(
+      "E_SCOPE_VIOLATION",
+      "Write vertical result must be exactly one target.txt modification."
+    );
+  }
+  for (const args of [
+    ["ls-files", "--others", "--exclude-standard", "-z"],
+    ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"]
+  ]) {
+    const untracked = git(executionRoot, args, { encoding: null }).stdout || Buffer.alloc(0);
+    if (untracked.length !== 0) {
+      throw new CompanionError(
+        "E_SCOPE_VIOLATION",
+        "Write vertical result contains an extra untracked or ignored path."
+      );
+    }
+  }
+}
+
+function currentOwner() {
+  return typeof process.geteuid === "function" ? process.geteuid() : null;
+}
+
+function assertPrivateOwnedDirectory(directory, label) {
+  let stat;
+  try {
+    stat = fs.lstatSync(directory);
+  } catch {
+    throw new CompanionError("E_STATE", `Write artifact ${label} is unavailable.`);
+  }
+  const owner = currentOwner();
+  if (!stat.isDirectory()
+    || stat.isSymbolicLink()
+    || fs.realpathSync(directory) !== directory
+    || (stat.mode & 0o777) !== 0o700
+    || (owner !== null && stat.uid !== owner)) {
+    throw new CompanionError("E_STATE", `Write artifact ${label} is unsafe.`);
+  }
+  return directory;
+}
+
+function createPrivateOwnedDirectory(directory, label) {
+  try {
+    fs.mkdirSync(directory, { mode: 0o700 });
+    fsyncDirectory(path.dirname(directory));
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+  return assertPrivateOwnedDirectory(directory, label);
+}
+
+function fsyncDirectory(directory) {
+  if (process.platform === "win32") return;
+  let descriptor;
+  try {
+    descriptor = fs.openSync(directory, fs.constants.O_RDONLY);
+    fs.fsyncSync(descriptor);
+  } finally {
+    if (descriptor != null) fs.closeSync(descriptor);
+  }
+}
+
+function artifactDirectoryForWrite(controlRoot, workerId, env) {
+  const control = resolveControlWorkspace(controlRoot, env);
+  const state = controlStateDir(control, env);
+  const pluginData = fs.realpathSync(pluginDataRoot(env));
+  const stateParent = path.join(pluginData, "state");
+  assertPrivateOwnedDirectory(pluginData, "plugin data root");
+  assertPrivateOwnedDirectory(stateParent, "state parent");
+  if (state !== path.join(stateParent, controlStateSegment(control.controlWorkspaceId))) {
+    throw new CompanionError("E_STATE", "Write artifact control state root is unsafe.");
+  }
+  assertPrivateOwnedDirectory(state, "control state root");
+  const artifacts = createPrivateOwnedDirectory(
+    path.join(state, "artifacts"),
+    "directory"
+  );
+  const workerDirectory = createPrivateOwnedDirectory(
+    path.join(artifacts, workerWorktreeSlug(workerId)),
+    "worker directory"
+  );
+  return Object.freeze({ control, workerDirectory });
+}
+
+function artifactDirectoryForRead(controlRoot, workerId, env) {
+  const control = resolveControlWorkspace(controlRoot, env);
+  const configured = pluginDataRoot(env);
+  let pluginData;
+  try {
+    pluginData = fs.realpathSync(configured);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw new CompanionError("E_STATE", "Write artifact private root is unsafe.");
+  }
+  // System ancestors such as macOS /var may themselves be symlinks. Bind all
+  // later paths to the canonical final plugin-data directory and validate the
+  // artifact-owned descendants individually rather than rejecting a safe
+  // canonicalization of an ancestor.
+  assertPrivateOwnedDirectory(pluginData, "plugin data root");
+  const stateParent = path.join(pluginData, "state");
+  const state = path.join(
+    stateParent,
+    controlStateSegment(control.controlWorkspaceId)
+  );
+  const artifacts = path.join(state, "artifacts");
+  const workerDirectory = path.join(artifacts, workerWorktreeSlug(workerId));
+  for (const [directory, label] of [
+    [stateParent, "state parent"],
+    [state, "control state root"],
+    [artifacts, "directory"],
+    [workerDirectory, "worker directory"]
+  ]) {
+    try {
+      assertPrivateOwnedDirectory(directory, label);
+    } catch (error) {
+      if (error?.code === "E_STATE") {
+        try {
+          fs.lstatSync(directory);
+        } catch (pathError) {
+          if (pathError?.code === "ENOENT") return null;
+        }
+      }
+      throw error;
+    }
+  }
+  return Object.freeze({ control, workerDirectory });
+}
+
+function recordWithoutDigest(record) {
+  const { recordDigest: _recordDigest, ...unsigned } = record;
+  return unsigned;
+}
+
+const WRITE_ARTIFACT_RECORD_FIELDS = Object.freeze([
+  "schemaVersion",
+  "artifactDigest",
+  "workerId",
+  "controlWorkspaceId",
+  "path",
+  "baseCommit",
+  "baseContentDigest",
+  "manifestDigest",
+  "securityDigest",
+  "patchDigest",
+  "contentDigest",
+  "patchBytes",
+  "contentBytes",
+  "createdAt",
+  "manifest",
+  "patch",
+  "content",
+  "recordDigest"
+]);
+
+function readPrivateArtifactRecord(file) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(
+      file,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+    );
+    const before = fs.fstatSync(descriptor);
+    const owner = currentOwner();
+    if (!before.isFile()
+      || before.size < 1
+      || before.size > WRITE_ARTIFACT_MAX_RECORD_BYTES
+      || (before.mode & 0o777) !== 0o600
+      || (owner !== null && before.uid !== owner)) {
+      throw new CompanionError("E_STATE", "Stored write artifact record is unsafe.");
+    }
+    const bytes = fs.readFileSync(descriptor);
+    const after = fs.fstatSync(descriptor);
+    const pathStat = fs.lstatSync(file);
+    if (pathStat.isSymbolicLink()
+      || !pathStat.isFile()
+      || fs.realpathSync(file) !== file
+      || before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs
+      || after.dev !== pathStat.dev
+      || after.ino !== pathStat.ino) {
+      throw new CompanionError("E_STATE", "Stored write artifact changed during retrieval.");
+    }
+    try {
+      return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    } catch {
+      throw new CompanionError("E_INTEGRATION", "Stored write artifact record is corrupt.");
+    }
+  } catch (error) {
+    if (error instanceof CompanionError) throw error;
+    throw new CompanionError("E_STATE", "Stored write artifact record is unavailable.");
+  } finally {
+    if (descriptor != null) fs.closeSync(descriptor);
+  }
+}
+
+function validateStoredWriteArtifact(record, {
+  controlRoot,
+  expectedWorkerId,
+  expectedControlWorkspaceId,
+  expectedManifestDigest = null
+}) {
+  if (!exactFieldSet(record, WRITE_ARTIFACT_RECORD_FIELDS)
+    || record.schemaVersion !== WRITE_ARTIFACT_RECORD_SCHEMA_VERSION
+    || record.artifactDigest !== record.securityDigest
+    || record.workerId !== expectedWorkerId
+    || record.controlWorkspaceId !== expectedControlWorkspaceId
+    || record.path !== WRITE_VERTICAL_TARGET_PATH
+    || !/^[a-f0-9]{40,64}$/.test(String(record.baseCommit || ""))
+    || !/^[a-f0-9]{64}$/.test(String(record.baseContentDigest || ""))
+    || !/^[a-f0-9]{64}$/.test(String(record.manifestDigest || ""))
+    || !/^[a-f0-9]{64}$/.test(String(record.securityDigest || ""))
+    || !/^[a-f0-9]{64}$/.test(String(record.patchDigest || ""))
+    || !/^[a-f0-9]{64}$/.test(String(record.contentDigest || ""))
+    || !Number.isSafeInteger(record.patchBytes)
+    || record.patchBytes < 1
+    || record.patchBytes > WRITE_ARTIFACT_MAX_PATCH_BYTES
+    || !Number.isSafeInteger(record.contentBytes)
+    || record.contentBytes < 1
+    || record.contentBytes > WRITE_ARTIFACT_MAX_CONTENT_BYTES
+    || record.createdAt !== record.manifest?.createdAt
+    || typeof record.patch !== "string"
+    || typeof record.content !== "string"
+    || record.recordDigest !== sha(stableStringify(recordWithoutDigest(record)))) {
+    throw new CompanionError("E_INTEGRATION", "Stored write artifact record is malformed or tampered.");
+  }
+  if (expectedManifestDigest && record.manifestDigest !== expectedManifestDigest) {
+    throw new CompanionError("E_INTEGRATION", "Write artifact digest does not match the job result.");
+  }
+  validateArtifactForIntegration(record.manifest, {
+    expectedBaseCommit: record.baseCommit,
+    expectedControlWorkspaceId,
+    expectedWorkerId,
+    expectedScope: EXACT_WRITE_VERTICAL_SCOPE,
+    expectedLineage: null,
+    expectedControlRoot: controlRoot
+  });
+  const entry = assertExactTargetTxtArtifactManifest(record.manifest);
+  const patch = Buffer.from(record.patch, "utf8");
+  const content = Buffer.from(record.content, "utf8");
+  strictUtf8(content, "stored target.txt");
+  const patchHeader = `diff --git a/${WRITE_VERTICAL_TARGET_PATH} b/${WRITE_VERTICAL_TARGET_PATH}\n`;
+  if (record.manifestDigest !== record.manifest.manifestDigest
+    || record.securityDigest !== record.manifest.securityDigest
+    || record.patchDigest !== record.manifest.patchDigest
+    || record.contentDigest !== entry.identity.contentDigest
+    || record.patchBytes !== patch.length
+    || record.contentBytes !== content.length
+    || sha(patch) !== record.patchDigest
+    || sha(content) !== record.contentDigest
+    || !record.patch.startsWith(patchHeader)
+    || record.patch.indexOf("\ndiff --git ", patchHeader.length) !== -1
+    || !record.patch.includes(`\n--- a/${WRITE_VERTICAL_TARGET_PATH}\n+++ b/${WRITE_VERTICAL_TARGET_PATH}\n`)
+    || record.patch.includes("GIT binary patch")
+    || record.patch.includes("Binary files ")
+    || record.patch.includes("\nold mode ")
+    || record.patch.includes("\nnew mode ")) {
+    throw new CompanionError("E_INTEGRATION", "Stored write artifact bytes disagree with their digests or contract.");
+  }
+  const base = readExactBaseTarget(controlRoot, record.baseCommit);
+  if (base.contentDigest !== record.baseContentDigest) {
+    throw new CompanionError("E_INTEGRATION", "Stored write artifact base content identity drifted.");
+  }
+  return Object.freeze({
+    record: Object.freeze(record),
+    manifest: Object.freeze(record.manifest),
+    patch: record.patch,
+    content: record.content
+  });
+}
+
+function sameArtifactGeneration(existing, proposed) {
+  return existing.artifactDigest === proposed.artifactDigest
+    && existing.workerId === proposed.workerId
+    && existing.controlWorkspaceId === proposed.controlWorkspaceId
+    && existing.baseCommit === proposed.baseCommit
+    && existing.baseContentDigest === proposed.baseContentDigest
+    && existing.patchDigest === proposed.patchDigest
+    && existing.contentDigest === proposed.contentDigest
+    && existing.patch === proposed.patch
+    && existing.content === proposed.content;
+}
+
+function artifactDirectoryEntries(directory) {
+  const entries = fs.readdirSync(directory);
+  if (entries.length > WRITE_ARTIFACT_MAX_DIRECTORY_ENTRIES) {
+    throw new CompanionError("E_STATE", "Write artifact directory exceeds its bounded inventory.");
+  }
+  return entries;
+}
+
+function atomicPublishArtifactRecord(file, temporary, record) {
+  const serialized = `${JSON.stringify(record)}\n`;
+  if (Buffer.byteLength(serialized, "utf8") > WRITE_ARTIFACT_MAX_RECORD_BYTES) {
+    throw new CompanionError("E_SCOPE_VIOLATION", "Write artifact record exceeds its bounded contract.");
+  }
+  let descriptor;
+  try {
+    descriptor = fs.openSync(temporary, "wx", 0o600);
+    fs.writeFileSync(descriptor, serialized);
+    fs.fchmodSync(descriptor, 0o600);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    fs.renameSync(temporary, file);
+    fsyncDirectory(path.dirname(file));
+  } catch (error) {
+    if (descriptor != null) {
+      try { fs.closeSync(descriptor); } catch {}
+    }
+    try { fs.unlinkSync(temporary); } catch {}
+    throw error;
+  }
+}
+
+/**
+ * Persist one content-addressed target.txt artifact after terminal provider
+ * success. One fsynced JSON record is the complete retrieval authority.
+ */
+export function persistWriteWorkerArtifact({
+  workerId,
+  controlWorkspaceId,
+  controlRoot,
+  executionRoot,
+  baseCommit,
+  env = process.env
+} = {}) {
+  if (!workerId || !controlWorkspaceId || !controlRoot || !executionRoot || !baseCommit) {
+    throw new CompanionError(
+      "E_USAGE",
+      "persistWriteWorkerArtifact requires worker, control, execution, and base identities."
+    );
+  }
+  const control = resolveControlWorkspace(controlRoot, env);
+  if (control.controlWorkspaceId !== controlWorkspaceId
+    || typeof workerId !== "string"
+    || workerId.length > 128) {
+    throw new CompanionError("E_INTEGRATION", "Write artifact control or worker identity is invalid.");
+  }
+  assertTrackedWriteVerticalTarget(control.controlRoot);
+  const identity = assertRegisteredWorkerWorktreeIdentity({
+    controlRoot: control.controlRoot,
+    executionRoot,
+    baseCommit,
+    workerId,
+    env
+  });
+  const base = readExactBaseTarget(identity.executionRoot, identity.baseCommit);
+  assertOnlyTargetChanged(identity.executionRoot, identity.baseCommit);
+  const resultPath = path.join(identity.executionRoot, WRITE_VERTICAL_TARGET_PATH);
+  const capturedContent = readBoundedWriteTargetNoFollow(
+    resultPath,
+    "result target.txt"
+  );
+  const contentBuffer = capturedContent.buffer;
+  const content = capturedContent.text;
+  const patchBuffer = git(
+    identity.executionRoot,
+    [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--binary",
+      "--full-index",
+      identity.baseCommit,
+      "--"
+    ],
+    { encoding: null }
+  ).stdout || Buffer.alloc(0);
+  if (patchBuffer.length < 1 || patchBuffer.length > WRITE_ARTIFACT_MAX_PATCH_BYTES) {
+    throw new CompanionError("E_SCOPE_VIOLATION", "Write vertical patch exceeds its bounded contract.");
+  }
+  let patch;
+  try {
+    patch = new TextDecoder("utf-8", { fatal: true }).decode(patchBuffer);
+  } catch {
+    throw new CompanionError("E_SCOPE_VIOLATION", "Write vertical patch is not strict UTF-8 text.");
+  }
+  const manifest = buildArtifactManifest({
+    workerId,
+    controlWorkspaceId,
+    controlRoot: control.controlRoot,
+    executionRoot: identity.executionRoot,
+    baseCommit: identity.baseCommit,
+    scope: EXACT_WRITE_VERTICAL_SCOPE,
+    lineage: null
+  });
+  const entry = assertExactTargetTxtArtifactManifest(manifest);
+  if (manifest.patchDigest !== sha(patchBuffer)
+    || entry.identity.size !== contentBuffer.length
+    || entry.identity.contentDigest !== sha(contentBuffer)) {
+    throw new CompanionError("E_INTEGRATION", "Write artifact recomputation disagrees with captured bytes.");
+  }
+  validateArtifactForIntegration(manifest, {
+    expectedBaseCommit: identity.baseCommit,
+    expectedControlWorkspaceId: controlWorkspaceId,
+    expectedWorkerId: workerId,
+    expectedScope: EXACT_WRITE_VERTICAL_SCOPE,
+    expectedLineage: null,
+    expectedControlRoot: control.controlRoot,
+    expectedExecutionRoot: identity.executionRoot,
+    recomputeFromExecutionRoot: {
+      controlRoot: control.controlRoot,
+      executionRoot: identity.executionRoot
+    }
+  });
+  const unsignedRecord = {
+    schemaVersion: WRITE_ARTIFACT_RECORD_SCHEMA_VERSION,
+    artifactDigest: manifest.securityDigest,
+    workerId,
+    controlWorkspaceId,
+    path: WRITE_VERTICAL_TARGET_PATH,
+    baseCommit: identity.baseCommit,
+    baseContentDigest: base.contentDigest,
+    manifestDigest: manifest.manifestDigest,
+    securityDigest: manifest.securityDigest,
+    patchDigest: manifest.patchDigest,
+    contentDigest: entry.identity.contentDigest,
+    patchBytes: patchBuffer.length,
+    contentBytes: contentBuffer.length,
+    createdAt: manifest.createdAt,
+    manifest,
+    patch,
+    content
+  };
+  const record = Object.freeze({
+    ...unsignedRecord,
+    recordDigest: sha(stableStringify(unsignedRecord))
+  });
+  validateStoredWriteArtifact(record, {
+    controlRoot: control.controlRoot,
+    expectedWorkerId: workerId,
+    expectedControlWorkspaceId: controlWorkspaceId,
+    expectedManifestDigest: manifest.manifestDigest
+  });
+  const { workerDirectory } = artifactDirectoryForWrite(
+    control.controlRoot,
+    workerId,
+    env
+  );
+  const recordName = `${record.artifactDigest}.json`;
+  const temporaryName = `.${record.artifactDigest}.publish.tmp`;
+  const recordPath = path.join(workerDirectory, recordName);
+  const temporaryPath = path.join(workerDirectory, temporaryName);
+  const entries = artifactDirectoryEntries(workerDirectory);
+  const unexpected = entries.filter((name) => name !== recordName && name !== temporaryName);
+  if (unexpected.length || (entries.includes(recordName) && entries.includes(temporaryName))) {
+    throw new CompanionError("E_STATE", "Write artifact directory contains an ambiguous publication.");
+  }
+  for (const candidate of [recordPath, temporaryPath]) {
+    if (!fs.existsSync(candidate)) continue;
+    const existing = readPrivateArtifactRecord(candidate);
+    const validated = validateStoredWriteArtifact(existing, {
+      controlRoot: control.controlRoot,
+      expectedWorkerId: workerId,
+      expectedControlWorkspaceId: controlWorkspaceId
+    });
+    if (!sameArtifactGeneration(existing, record)) {
+      throw new CompanionError("E_STATE", "Write artifact identity was reused for different bytes.");
+    }
+    if (candidate === temporaryPath) {
+      fs.renameSync(temporaryPath, recordPath);
+      fsyncDirectory(workerDirectory);
+    }
+    return Object.freeze({ ...validated, replayed: true });
+  }
+  atomicPublishArtifactRecord(recordPath, temporaryPath, record);
+  const validated = validateStoredWriteArtifact(
+    readPrivateArtifactRecord(recordPath),
+    {
+      controlRoot: control.controlRoot,
+      expectedWorkerId: workerId,
+      expectedControlWorkspaceId: controlWorkspaceId,
+      expectedManifestDigest: record.manifestDigest
+    }
+  );
+  return Object.freeze({ ...validated, replayed: false });
+}
+
+/** Read a previously published one-file write-vertical artifact without writes. */
+export function readWriteWorkerArtifact({
+  controlRoot,
+  workerId,
+  env = process.env,
+  expectedManifestDigest = null
+} = {}) {
+  if (!controlRoot || !workerId) {
+    throw new CompanionError("E_USAGE", "controlRoot and workerId are required for artifact retrieval.");
+  }
+  const resolved = artifactDirectoryForRead(controlRoot, workerId, env);
+  if (!resolved) {
+    throw new CompanionError("E_JOB_ACTIVE", "Write artifact is not available yet.");
+  }
+  const entries = artifactDirectoryEntries(resolved.workerDirectory);
+  if (entries.length === 0) {
+    throw new CompanionError("E_JOB_ACTIVE", "Write artifact is not available yet.");
+  }
+  if (entries.some((name) => name.endsWith(".tmp"))) {
+    throw new CompanionError("E_INTEGRATION", "Write artifact publication is incomplete.");
+  }
+  const records = entries.filter((name) => /^[a-f0-9]{64}\.json$/.test(name));
+  if (records.length !== 1 || records.length !== entries.length) {
+    throw new CompanionError("E_STATE", "Write artifact directory does not contain one canonical record.");
+  }
+  const recordPath = path.join(resolved.workerDirectory, records[0]);
+  const record = readPrivateArtifactRecord(recordPath);
+  if (`${record.artifactDigest}.json` !== records[0]) {
+    throw new CompanionError("E_INTEGRATION", "Write artifact filename does not match its content identity.");
+  }
+  return validateStoredWriteArtifact(record, {
+    controlRoot: resolved.control.controlRoot,
+    expectedWorkerId: workerId,
+    expectedControlWorkspaceId: resolved.control.controlWorkspaceId,
+    expectedManifestDigest
+  });
 }
 
 export function removeWorkerWorktree(executionRoot, controlRoot, expectedWorkerId, env = process.env) {

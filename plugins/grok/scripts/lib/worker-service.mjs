@@ -5,6 +5,7 @@ import { sameHostSession } from "./host.mjs";
 import { listJobsReadonly, tryReadJob } from "./state.mjs";
 import {
   isWorkerTerminal,
+  projectWriteArtifactMetadata,
   projectWorkerHandle,
   projectWorkerLifecycleCursor,
   projectWorkerSnapshot
@@ -15,11 +16,13 @@ import {
 } from "./worker-authority.mjs";
 import {
   cancelWorker,
+  authorizeReadyWriteWorkerDispatch,
   providerLaunchState,
   projectCancellationReceipt,
   spawnReadOnlyWorker
 } from "./worker-mutation.mjs";
 import { launchCommittedWorker } from "./worker-runtime.mjs";
+import { provisionWriteWorkerWorktree } from "./worker-provisioner.mjs";
 import {
   followupWorker,
   sendWorkerMessage
@@ -33,10 +36,17 @@ import {
   buildTaskEnvelope,
   captureContextManifest
 } from "./task-contract.mjs";
+import {
+  EXACT_WRITE_VERTICAL_SCOPE,
+  assertExactWriteVerticalScope,
+  assertTrackedWriteVerticalTarget,
+  readWriteWorkerArtifact
+} from "./worker-worktree.mjs";
 
 export const MAX_WORKER_WAIT_MS = 30_000;
 const DEFAULT_WORKER_WAIT_MS = 10_000;
 const WAIT_POLL_MS = 100;
+const MAX_WRITE_ARTIFACT_PAYLOAD_BYTES = 512 * 1024;
 
 function notFound() {
   return new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
@@ -65,6 +75,7 @@ export function createWorkerService({
   clock = () => performance.now(),
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   allowWriteSpawn = false,
+  enableWriteVerticalDispatch = false,
   writeLifecycleCapabilityDigest = null,
   validateWriteLifecycleCapability = null,
   providerCapabilityDigest = null,
@@ -72,6 +83,8 @@ export function createWorkerService({
   allowUnboundDispatch = true,
   launchWorker = launchCommittedWorker,
   dispatchWorker = launchWorker,
+  provisionWriteWorktree = provisionWriteWorkerWorktree,
+  authorizeWriteDispatch = authorizeReadyWriteWorkerDispatch,
   captureContext = captureContextManifest,
   maintain = null,
   maintenanceIntervalMs = 250
@@ -108,11 +121,55 @@ export function createWorkerService({
   const canDispatch = (job) => {
     const boundDigest = job?.request?.spawn?.providerCapabilityDigest;
     if (typeof boundDigest === "string") {
+      if (job?.write === true) {
+        return enableWriteVerticalDispatch === true
+          && typeof writeLifecycleCapabilityDigest === "string"
+          && writeLifecycleCapabilityDigest === boundDigest
+          && currentWriteLifecycleCapabilityDigest() === boundDigest;
+      }
       return typeof providerCapabilityDigest === "string"
         && providerCapabilityDigest === boundDigest
         && currentCapabilityDigest() === boundDigest;
     }
     return allowUnboundDispatch === true;
+  };
+
+  const driveWriteVertical = async (job) => {
+    if (enableWriteVerticalDispatch !== true || job?.write !== true) return job;
+    if (currentWriteLifecycleCapabilityDigest()
+      !== writeLifecycleCapabilityDigest) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        "The write-lifecycle capability changed before provisioning or dispatch."
+      );
+    }
+    let current = job;
+    if (!current.request?.spawn?.dispatch
+      && current.status === "queued"
+      && current.provisioning?.state !== "ready") {
+      await provisionWriteWorktree({
+        root,
+        principal,
+        workerId: current.id,
+        env
+      });
+      current = ownedJob(current.id);
+    }
+    if (!current.request?.spawn?.dispatch
+      && current.status === "queued"
+      && current.provisioning?.state === "ready") {
+      authorizeWriteDispatch({
+        root,
+        principal,
+        workerId: current.id,
+        writeLifecycleCapabilityDigest,
+        validateWriteLifecycleCapability:
+          currentWriteLifecycleCapabilityDigest,
+        env
+      });
+      current = ownedJob(current.id);
+    }
+    return current;
   };
 
   const maintainIfDue = async () => {
@@ -154,7 +211,7 @@ export function createWorkerService({
       // worker_wait is a mutation-authorized tool. Resolve exact ownership
       // before touching launch state, then drain only this authority-bound
       // worker's durable outbox. Generic read tools never dispatch work.
-      const admitted = ownedJob(id);
+      const admitted = await driveWriteVertical(ownedJob(id));
       const admittedDispatch = admitted.request?.spawn?.dispatch;
       if ([1, 2].includes(admittedDispatch?.schemaVersion)
         && ["pending", "claimed"].includes(admittedDispatch.state)
@@ -165,7 +222,7 @@ export function createWorkerService({
         // Demand-driven host maintenance settles only exact lost attempts and
         // never claims, launches, or replays work. Re-authorize every reread.
         await maintainIfDue();
-        const job = ownedJob(id);
+        const job = await driveWriteVertical(ownedJob(id));
         const dispatch = job.request?.spawn?.dispatch;
         if ([1, 2].includes(dispatch?.schemaVersion)
           && ["pending", "claimed"].includes(dispatch.state)
@@ -186,6 +243,55 @@ export function createWorkerService({
         throw new CompanionError("E_JOB_ACTIVE", "Worker result is not available yet.");
       }
       return projectWorkerSnapshot(job, { trustHostAuthority: false });
+    },
+
+    artifactMetadata(id) {
+      const job = ownedJob(id);
+      if (job.write !== true) return null;
+      return projectWriteArtifactMetadata(job.result?.writeArtifact);
+    },
+
+    artifact(id, { part = "metadata" } = {}) {
+      const job = ownedJob(id);
+      if (job.write !== true || !isWorkerTerminal(job) || job.status !== "completed") {
+        throw new CompanionError("E_JOB_ACTIVE", "Write-worker artifact is not available yet.");
+      }
+      const metadata = projectWriteArtifactMetadata(job.result?.writeArtifact);
+      if (!metadata) {
+        throw new CompanionError("E_STATE", "Completed write worker has no durable artifact metadata.");
+      }
+      if (part === "metadata") return metadata;
+      const artifact = readWriteWorkerArtifact({
+        controlRoot: root,
+        workerId: id,
+        env,
+        expectedManifestDigest: metadata.manifestDigest
+      });
+      const payload = part === "patch"
+        ? artifact.patch
+        : part === "content"
+          ? artifact.content
+          : null;
+      if (payload === null) {
+        throw new CompanionError("E_USAGE", "Unsupported write-worker artifact part.");
+      }
+      const payloadBytes = Buffer.byteLength(payload, "utf8");
+      if (payloadBytes > MAX_WRITE_ARTIFACT_PAYLOAD_BYTES) {
+        throw new CompanionError(
+          "E_OUTPUT_LIMIT",
+          "Write-worker artifact payload exceeds the bounded retrieval limit.",
+          { limitBytes: MAX_WRITE_ARTIFACT_PAYLOAD_BYTES }
+        );
+      }
+      return Object.freeze({
+        ...metadata,
+        part,
+        payload,
+        payloadBytes,
+        payloadDigest: part === "patch"
+          ? metadata.patchDigest
+          : metadata.contentDigest
+      });
     },
 
     /**
@@ -271,6 +377,31 @@ export function createWorkerService({
         providerLaunchState: launchState,
         providerLaunched: launch?.providerLaunched === true
       };
+    },
+
+    spawnWriteVertical({
+      userRequest,
+      objective = null,
+      idempotencyKey
+    } = {}) {
+      if (enableWriteVerticalDispatch !== true || !allowWriteSpawn) {
+        throw new CompanionError("E_CAPABILITY", "Write-smoke worker admission is disabled.");
+      }
+      assertExactWriteVerticalScope(EXACT_WRITE_VERTICAL_SCOPE);
+      assertTrackedWriteVerticalTarget(root);
+      return this.spawn({
+        userRequest,
+        objective,
+        envelope: buildTaskEnvelope({
+          userRequest: userRequest || objective || "Edit target.txt",
+          objective,
+          mode: "write",
+          scope: EXACT_WRITE_VERTICAL_SCOPE
+        }),
+        idempotencyKey,
+        roleId: "implementer",
+        write: true
+      });
     },
 
     cancel({ id, idempotencyKey } = {}) {

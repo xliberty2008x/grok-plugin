@@ -26,6 +26,12 @@ import {
   classifyWorkerWorktreeEffect,
   buildArtifactManifest,
   validateArtifactForIntegration,
+  WRITE_VERTICAL_TARGET_PATH,
+  EXACT_WRITE_VERTICAL_SCOPE,
+  assertExactWriteVerticalScope,
+  assertTrackedWriteVerticalTarget,
+  persistWriteWorkerArtifact,
+  readWriteWorkerArtifact,
   prepareIntegration,
   removeWorkerWorktree
 } from "../plugins/grok/scripts/lib/worker-worktree.mjs";
@@ -70,6 +76,74 @@ function scopeFor(...include) {
   return { include, exclude: [] };
 }
 
+function writeVerticalFixture({
+  baseContent = "base target\n",
+  resultContent = "model result\n",
+  workerId = "task-writevertical0001"
+} = {}) {
+  const root = initRepo();
+  const env = envFor();
+  fs.writeFileSync(path.join(root, WRITE_VERTICAL_TARGET_PATH), baseContent);
+  git(root, "add", WRITE_VERTICAL_TARGET_PATH);
+  git(root, "commit", "-m", "add write vertical target");
+  const parentFingerprint = captureParentFingerprint(root);
+  const baseCommit = git(root, "rev-parse", "HEAD");
+  const control = resolveControlWorkspace(root, env);
+  const worktree = createWorkerWorktree({
+    controlRoot: root,
+    baseCommit,
+    workerId,
+    env
+  });
+  if (resultContent !== null) {
+    fs.writeFileSync(
+      path.join(worktree.executionRoot, WRITE_VERTICAL_TARGET_PATH),
+      resultContent
+    );
+  }
+  return {
+    root,
+    env,
+    workerId,
+    control,
+    worktree,
+    baseCommit,
+    parentFingerprint
+  };
+}
+
+function persistVertical(fixture) {
+  return persistWriteWorkerArtifact({
+    workerId: fixture.workerId,
+    controlWorkspaceId: fixture.control.controlWorkspaceId,
+    controlRoot: fixture.root,
+    executionRoot: fixture.worktree.executionRoot,
+    baseCommit: fixture.baseCommit,
+    env: fixture.env
+  });
+}
+
+function artifactRecordLocation(fixture, artifact) {
+  const state = controlStateDir(fixture.control, fixture.env);
+  const directory = path.join(
+    state,
+    "artifacts",
+    path.basename(expectedWorkerWorktreeParent(
+      fixture.root,
+      fixture.workerId,
+      fixture.env
+    ))
+  );
+  return {
+    directory,
+    record: path.join(directory, `${artifact.record.artifactDigest}.json`),
+    temporary: path.join(
+      directory,
+      `.${artifact.record.artifactDigest}.publish.tmp`
+    )
+  };
+}
+
 test("worker worktree paths use unique private parents and a fixed checkout child", () => {
   const root = initRepo();
   const env = envFor();
@@ -90,6 +164,399 @@ test("worker worktree paths use unique private parents and a fixed checkout chil
   assert.equal(path.basename(firstRoot), "checkout");
   assert.equal(path.basename(secondRoot), "checkout");
   assert.notEqual(path.dirname(firstRoot), path.dirname(secondRoot));
+});
+
+test("one-file write artifact persists atomically, reads by digest, and replays exactly", () => {
+  const fixture = writeVerticalFixture();
+  assert.deepEqual(
+    assertExactWriteVerticalScope({
+      include: [WRITE_VERTICAL_TARGET_PATH],
+      exclude: []
+    }),
+    EXACT_WRITE_VERTICAL_SCOPE
+  );
+  assert.throws(
+    () => assertExactWriteVerticalScope(scopeFor("tracked.txt")),
+    (error) => error?.code === "E_SCOPE_VIOLATION"
+  );
+  const controlTarget = assertTrackedWriteVerticalTarget(fixture.root);
+  assert.equal(controlTarget.path, WRITE_VERTICAL_TARGET_PATH);
+  assert.equal(controlTarget.mode, 0o100644);
+  assert.match(controlTarget.contentDigest, /^[a-f0-9]{64}$/);
+
+  const first = persistVertical(fixture);
+  assert.equal(first.replayed, false);
+  assert.equal(first.content, "model result\n");
+  assert.match(first.record.artifactDigest, /^[a-f0-9]{64}$/);
+  assert.equal(first.record.artifactDigest, first.record.securityDigest);
+  assert.equal(first.record.manifestDigest, first.manifest.manifestDigest);
+  assert.equal(first.record.patchDigest, first.manifest.patchDigest);
+  assert.match(first.patch, /^diff --git a\/target\.txt b\/target\.txt\n/);
+
+  const location = artifactRecordLocation(fixture, first);
+  assert.deepEqual(fs.readdirSync(location.directory), [
+    `${first.record.artifactDigest}.json`
+  ]);
+  assert.equal(fs.lstatSync(location.record).mode & 0o777, 0o600);
+  const read = readWriteWorkerArtifact({
+    controlRoot: fixture.root,
+    workerId: fixture.workerId,
+    env: fixture.env,
+    expectedManifestDigest: first.manifest.manifestDigest
+  });
+  assert.equal(read.record.recordDigest, first.record.recordDigest);
+  assert.equal(read.patch, first.patch);
+  assert.equal(read.content, first.content);
+
+  const replay = persistVertical(fixture);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.record.recordDigest, first.record.recordDigest);
+  assert.equal(replay.manifest.manifestDigest, first.manifest.manifestDigest);
+  assert.deepEqual(fs.readdirSync(location.directory), [
+    `${first.record.artifactDigest}.json`
+  ]);
+  assertParentUnchanged(fixture.parentFingerprint, fixture.root);
+  assert.equal(removeWorkerWorktree(
+    fixture.worktree.executionRoot,
+    fixture.root,
+    fixture.workerId,
+    fixture.env
+  ), true);
+
+  // Retrieval is durable after the execution checkout is removed.
+  const afterCleanup = readWriteWorkerArtifact({
+    controlRoot: fixture.root,
+    workerId: fixture.workerId,
+    env: fixture.env,
+    expectedManifestDigest: first.manifest.manifestDigest
+  });
+  assert.equal(afterCleanup.content, "model result\n");
+});
+
+test("write artifact recovers one complete fsynced pre-rename record", () => {
+  const fixture = writeVerticalFixture({ workerId: "task-writevertical0002" });
+  const first = persistVertical(fixture);
+  const location = artifactRecordLocation(fixture, first);
+  const durableBytes = fs.readFileSync(location.record);
+
+  // This is the exact filesystem shape left by a process death after file
+  // fsync/close and before the final atomic rename.
+  fs.unlinkSync(location.record);
+  fs.writeFileSync(location.temporary, durableBytes, { mode: 0o600 });
+  assert.throws(
+    () => readWriteWorkerArtifact({
+      controlRoot: fixture.root,
+      workerId: fixture.workerId,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_INTEGRATION" && /incomplete/.test(error.message)
+  );
+
+  const recovered = persistVertical(fixture);
+  assert.equal(recovered.replayed, true);
+  assert.equal(recovered.record.recordDigest, first.record.recordDigest);
+  assert.equal(fs.existsSync(location.temporary), false);
+  assert.equal(fs.existsSync(location.record), true);
+  assert.equal(removeWorkerWorktree(
+    fixture.worktree.executionRoot,
+    fixture.root,
+    fixture.workerId,
+    fixture.env
+  ), true);
+});
+
+test("write artifact atomic failure publishes no partial retrieval authority", () => {
+  const fixture = writeVerticalFixture({ workerId: "task-writevertical0003" });
+  const originalRename = fs.renameSync;
+  fs.renameSync = (source, destination) => {
+    if (String(source).endsWith(".publish.tmp")
+      && String(destination).endsWith(".json")) {
+      const error = new Error("injected rename failure");
+      error.code = "EIO";
+      throw error;
+    }
+    return originalRename(source, destination);
+  };
+  try {
+    assert.throws(() => persistVertical(fixture), /injected rename failure/);
+  } finally {
+    fs.renameSync = originalRename;
+  }
+  assert.throws(
+    () => readWriteWorkerArtifact({
+      controlRoot: fixture.root,
+      workerId: fixture.workerId,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_JOB_ACTIVE"
+  );
+  assert.equal(removeWorkerWorktree(
+    fixture.worktree.executionRoot,
+    fixture.root,
+    fixture.workerId,
+    fixture.env
+  ), true);
+});
+
+test("write artifact read path never initializes missing state", () => {
+  const root = initRepo();
+  const dataParent = tempDir("grok-artifact-readonly-");
+  const missingData = path.join(dataParent, "missing-plugin-data");
+  const env = {
+    HOME: dataParent,
+    GROK_COMPANION_HOST: "codex",
+    GROK_COMPANION_PLUGIN_DATA: missingData
+  };
+  assert.equal(fs.existsSync(missingData), false);
+  assert.throws(
+    () => readWriteWorkerArtifact({
+      controlRoot: root,
+      workerId: "task-writevertical0004",
+      env
+    }),
+    (error) => error?.code === "E_JOB_ACTIVE"
+  );
+  assert.equal(fs.existsSync(missingData), false);
+});
+
+test("write vertical target admission rejects symlink, mode, empty, NUL, and invalid UTF-8", () => {
+  const fixtures = [
+    {
+      name: "symlink",
+      mutate(root) {
+        const target = path.join(root, WRITE_VERTICAL_TARGET_PATH);
+        fs.unlinkSync(target);
+        fs.symlinkSync("tracked.txt", target);
+      }
+    },
+    {
+      name: "mode",
+      mutate(root) {
+        fs.chmodSync(path.join(root, WRITE_VERTICAL_TARGET_PATH), 0o755);
+      }
+    },
+    {
+      name: "empty",
+      mutate(root) {
+        fs.writeFileSync(path.join(root, WRITE_VERTICAL_TARGET_PATH), "");
+      }
+    },
+    {
+      name: "NUL",
+      mutate(root) {
+        fs.writeFileSync(path.join(root, WRITE_VERTICAL_TARGET_PATH), Buffer.from([0x61, 0, 0x62]));
+      }
+    },
+    {
+      name: "invalid UTF-8",
+      mutate(root) {
+        fs.writeFileSync(path.join(root, WRITE_VERTICAL_TARGET_PATH), Buffer.from([0xc3, 0x28]));
+      }
+    }
+  ];
+  for (const item of fixtures) {
+    const fixture = writeVerticalFixture({
+      workerId: `task-target-${item.name.replace(/[^a-z]/gi, "").toLowerCase()}-0001`
+    });
+    item.mutate(fixture.root);
+    assert.throws(
+      () => assertTrackedWriteVerticalTarget(fixture.root),
+      (error) => error?.code === "E_SCOPE_VIOLATION",
+      item.name
+    );
+    assert.equal(removeWorkerWorktree(
+      fixture.worktree.executionRoot,
+      fixture.root,
+      fixture.workerId,
+      fixture.env
+    ), true);
+  }
+});
+
+test("write artifact rejects binary, mode, committed, extra-path, and oversized results", () => {
+  const cases = [
+    {
+      name: "binary",
+      mutate(fixture) {
+        fs.writeFileSync(
+          path.join(fixture.worktree.executionRoot, WRITE_VERTICAL_TARGET_PATH),
+          Buffer.from([0xc3, 0x28])
+        );
+      }
+    },
+    {
+      name: "mode",
+      mutate(fixture) {
+        fs.chmodSync(
+          path.join(fixture.worktree.executionRoot, WRITE_VERTICAL_TARGET_PATH),
+          0o755
+        );
+      }
+    },
+    {
+      name: "committed",
+      mutate(fixture) {
+        git(fixture.worktree.executionRoot, "add", WRITE_VERTICAL_TARGET_PATH);
+        git(fixture.worktree.executionRoot, "commit", "-m", "worker must not commit");
+      }
+    },
+    {
+      name: "extra-path",
+      mutate(fixture) {
+        fs.writeFileSync(
+          path.join(fixture.worktree.executionRoot, "extra.txt"),
+          "outside scope\n"
+        );
+      }
+    },
+    {
+      name: "oversized",
+      mutate(fixture) {
+        fs.writeFileSync(
+          path.join(fixture.worktree.executionRoot, WRITE_VERTICAL_TARGET_PATH),
+          "x".repeat(256 * 1024 + 1)
+        );
+      }
+    },
+    {
+      name: "oversized-patch",
+      fixtureOptions: {
+        baseContent: `${"a".repeat(256 * 1024 - 1)}\n`,
+        resultContent: `${"b".repeat(256 * 1024 - 1)}\n`
+      },
+      mutate() {}
+    }
+  ];
+  for (const item of cases) {
+    const fixture = writeVerticalFixture({
+      ...(item.fixtureOptions || {}),
+      workerId: `task-result-${item.name.replace(/[^a-z]/gi, "")}-0001`
+    });
+    item.mutate(fixture);
+    assert.throws(
+      () => persistVertical(fixture),
+      (error) => ["E_SCOPE_VIOLATION", "E_WORKTREE"].includes(error?.code),
+      item.name
+    );
+    git(fixture.worktree.executionRoot, "reset", "--hard", fixture.baseCommit);
+    fs.rmSync(path.join(fixture.worktree.executionRoot, "extra.txt"), { force: true });
+    assert.equal(removeWorkerWorktree(
+      fixture.worktree.executionRoot,
+      fixture.root,
+      fixture.workerId,
+      fixture.env
+    ), true);
+  }
+});
+
+test("write artifact retrieval rejects corruption, tampering, unsafe modes, and ambiguous files", () => {
+  const fixture = writeVerticalFixture({ workerId: "task-writevertical0005" });
+  const artifact = persistVertical(fixture);
+  const location = artifactRecordLocation(fixture, artifact);
+  const original = fs.readFileSync(location.record);
+
+  fs.writeFileSync(location.record, original.subarray(0, 17), { mode: 0o600 });
+  assert.throws(
+    () => readWriteWorkerArtifact({
+      controlRoot: fixture.root,
+      workerId: fixture.workerId,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_INTEGRATION"
+  );
+
+  fs.writeFileSync(location.record, original, { mode: 0o600 });
+  const tampered = JSON.parse(original.toString("utf8"));
+  tampered.content = "tampered\n";
+  fs.writeFileSync(location.record, `${JSON.stringify(tampered)}\n`, { mode: 0o600 });
+  assert.throws(
+    () => readWriteWorkerArtifact({
+      controlRoot: fixture.root,
+      workerId: fixture.workerId,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_INTEGRATION"
+  );
+
+  fs.writeFileSync(location.record, original);
+  fs.chmodSync(location.record, 0o644);
+  assert.throws(
+    () => readWriteWorkerArtifact({
+      controlRoot: fixture.root,
+      workerId: fixture.workerId,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_STATE"
+  );
+
+  fs.chmodSync(location.record, 0o600);
+  fs.writeFileSync(path.join(location.directory, "extra.json"), "{}\n", { mode: 0o600 });
+  assert.throws(
+    () => readWriteWorkerArtifact({
+      controlRoot: fixture.root,
+      workerId: fixture.workerId,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_STATE"
+  );
+  fs.unlinkSync(path.join(location.directory, "extra.json"));
+  assert.equal(readWriteWorkerArtifact({
+    controlRoot: fixture.root,
+    workerId: fixture.workerId,
+    env: fixture.env
+  }).record.recordDigest, artifact.record.recordDigest);
+  assert.equal(removeWorkerWorktree(
+    fixture.worktree.executionRoot,
+    fixture.root,
+    fixture.workerId,
+    fixture.env
+  ), true);
+});
+
+test("write artifact retrieval rejects symlinked and non-private storage", () => {
+  const fixture = writeVerticalFixture({ workerId: "task-writevertical0006" });
+  const artifact = persistVertical(fixture);
+  const location = artifactRecordLocation(fixture, artifact);
+  const originalDirectory = `${location.directory}.original`;
+  fs.renameSync(location.directory, originalDirectory);
+  fs.symlinkSync(originalDirectory, location.directory);
+  assert.throws(
+    () => readWriteWorkerArtifact({
+      controlRoot: fixture.root,
+      workerId: fixture.workerId,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_STATE"
+  );
+  fs.unlinkSync(location.directory);
+  fs.symlinkSync(`${originalDirectory}.missing`, location.directory);
+  assert.throws(
+    () => readWriteWorkerArtifact({
+      controlRoot: fixture.root,
+      workerId: fixture.workerId,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_STATE"
+  );
+  fs.unlinkSync(location.directory);
+  fs.renameSync(originalDirectory, location.directory);
+
+  fs.chmodSync(location.directory, 0o755);
+  assert.throws(
+    () => readWriteWorkerArtifact({
+      controlRoot: fixture.root,
+      workerId: fixture.workerId,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_STATE"
+  );
+  fs.chmodSync(location.directory, 0o700);
+  assert.equal(removeWorkerWorktree(
+    fixture.worktree.executionRoot,
+    fixture.root,
+    fixture.workerId,
+    fixture.env
+  ), true);
 });
 
 /**

@@ -369,6 +369,36 @@ function projectWorkerReport(value) {
   };
 }
 
+/**
+ * Project only content-addressed one-file artifact metadata. Absolute roots,
+ * provider/session identity, and stored payload bytes remain private.
+ */
+export function projectWriteArtifactMetadata(value) {
+  if (!isPlainObject(value)
+    || value.schemaVersion !== 1
+    || value.path !== "target.txt"
+    || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(value.baseCommit || "")
+    || ![value.manifestDigest, value.securityDigest, value.patchDigest, value.contentDigest]
+      .every((digest) => /^[a-f0-9]{64}$/.test(digest || ""))
+    || !Number.isSafeInteger(value.contentBytes)
+    || value.contentBytes < 1
+    || typeof value.createdAt !== "string"
+    || !Number.isFinite(Date.parse(value.createdAt))) {
+    return null;
+  }
+  return Object.freeze({
+    schemaVersion: 1,
+    path: "target.txt",
+    baseCommit: value.baseCommit,
+    manifestDigest: value.manifestDigest,
+    securityDigest: value.securityDigest,
+    patchDigest: value.patchDigest,
+    contentDigest: value.contentDigest,
+    contentBytes: value.contentBytes,
+    createdAt: value.createdAt
+  });
+}
+
 function projectNestedError(value) {
   if (!isPlainObject(value)) return null;
   const code = PUBLIC_WORKER_ERROR_CODE_SET.has(value.code) ? value.code : "E_BROKER";

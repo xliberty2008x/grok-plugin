@@ -71,11 +71,14 @@ import {
 } from "./recursion-guard.mjs";
 import { resolveControlWorkspace, workspaceState } from "./workspace.mjs";
 import {
+  assertExactWriteVerticalScope,
   assertParentUnchanged,
   assertManagedWorkerWorktree,
+  assertTrackedWriteVerticalTarget,
   classifyWorkerWorktreeEffect,
   captureParentFingerprint,
-  expectedWorkerWorktreeRoot
+  expectedWorkerWorktreeRoot,
+  persistWriteWorkerArtifact
 } from "./worker-worktree.mjs";
 import {
   assertExecutionBinding,
@@ -3805,6 +3808,79 @@ export function settlePreProviderWorkerFinalization({
  * held, so terminal publication and lineage re-admission cannot split around
  * credential/profile deletion.
  */
+export function persistCompletedWriteArtifact(job, pending, env) {
+  if (job?.write !== true || pending?.status !== "completed") return null;
+  assertDispatchContract(job);
+  assertExactWriteVerticalScope(job.request?.envelope?.scope);
+  const binding = job.executionBinding;
+  if (!binding
+    || binding.bindingDigest !== job.request?.spawn?.executionBindingDigest
+    || binding.expectedExecutionRoot !== job.request?.spawn?.executionRoot
+    || binding.controlWorkspaceId !== job.controlWorkspaceId) {
+    throw new CompanionError(
+      "E_INTEGRATION",
+      "Completed write worker lost its exact execution binding before artifact capture."
+    );
+  }
+  assertParentUnchanged(
+    binding.parentFingerprint,
+    binding.controlRoot
+  );
+  const persisted = persistWriteWorkerArtifact({
+    workerId: job.id,
+    controlWorkspaceId: binding.controlWorkspaceId,
+    controlRoot: binding.controlRoot,
+    executionRoot: binding.expectedExecutionRoot,
+    baseCommit: binding.baseCommit,
+    env
+  });
+  const record = persisted.record;
+  return Object.freeze({
+    schemaVersion: record.schemaVersion,
+    path: record.path,
+    baseCommit: record.baseCommit,
+    manifestDigest: record.manifestDigest,
+    securityDigest: record.securityDigest,
+    patchDigest: record.patchDigest,
+    contentDigest: record.contentDigest,
+    contentBytes: record.contentBytes,
+    createdAt: record.createdAt
+  });
+}
+
+export function settleWriteArtifactAfterRuntimeCleanup({
+  job,
+  pending,
+  runtimeCleanup,
+  env = process.env,
+  persistArtifact = persistCompletedWriteArtifact
+} = {}) {
+  runSuccessfulRuntimeCleanup(runtimeCleanup, job);
+  try {
+    return Object.freeze({
+      pending,
+      artifact: persistArtifact(job, pending, env),
+      rejected: false
+    });
+  } catch {
+    const completedAt = now();
+    return Object.freeze({
+      pending: Object.freeze({
+        status: "failed",
+        phase: "artifact-rejected",
+        completedAt,
+        error: Object.freeze({
+          code: "E_INTEGRATION",
+          message: "Worker output failed bounded write-artifact validation."
+        }),
+        summary: "Worker output failed bounded write-artifact validation."
+      }),
+      artifact: null,
+      rejected: true
+    });
+  }
+}
+
 export function settleProviderStartedWorkerFinalization({
   root,
   workerId,
@@ -3875,17 +3951,29 @@ export function settleProviderStartedWorkerFinalization({
           "Provider generation changed before cleanup and terminal publication."
         );
       }
-      runSuccessfulRuntimeCleanup(runtimeCleanup, latest);
+      const intended = pendingIntent(latest);
+      const artifactSettlement = settleWriteArtifactAfterRuntimeCleanup({
+        job: latest,
+        pending: intended,
+        runtimeCleanup,
+        env
+      });
+      const pending = artifactSettlement.pending;
+      const writeArtifact = artifactSettlement.artifact;
       const settledAt = now();
-      const pending = pendingIntent(latest);
       const result = {
         ...(latest.result || {}),
+        ...(writeArtifact ? { writeArtifact } : {}),
         hostVerification: latest.result?.hostVerification || "not_run",
         taskRuntimeCleaned: true,
         ...(pending.status === "cancelled" && !latest.result?.stopReason
           ? { stopReason: "cancelled" }
           : {})
       };
+      if (artifactSettlement.rejected) {
+        delete result.writeArtifact;
+        result.stopReason = "write-artifact-rejected";
+      }
       delete result.privacyWarning;
       const terminalized = {
         ...latest,
@@ -3920,7 +4008,9 @@ export function settleProviderStartedWorkerFinalization({
         lifecycleEvents: appendLifecycleEvent(
           latest.lifecycleEvents || [],
           pending.status === "completed" ? "checkpoint" : "blocked",
-          "Task runtime cleanup completed; durable terminal intent published.",
+          artifactSettlement.rejected
+            ? "Task runtime cleanup completed; write artifact validation failed closed."
+            : "Task runtime cleanup completed; durable terminal intent published.",
           { replayedPrompt: false }
         )
       };
@@ -4114,19 +4204,29 @@ export function settleStartedWorkerLoss({
         throw new CompanionError("E_PROCESS_IDENTITY", "Worker identity changed before loss settlement publication.");
       }
       assertDispatchContract(latest);
-      runSuccessfulRuntimeCleanup(runtimeCleanup, latest);
-      const settledAt = now();
       const latestDispatch = latest.request.spawn.dispatch;
       const intended = pendingIntent(latest);
-      const message = intended
-        ? "Task runtime cleanup completed; the durable terminal result was published."
+      const artifactSettlement = settleWriteArtifactAfterRuntimeCleanup({
+        job: latest,
+        pending: intended,
+        runtimeCleanup,
+        env
+      });
+      const effective = artifactSettlement.pending;
+      const writeArtifact = artifactSettlement.artifact;
+      const settledAt = now();
+      const message = artifactSettlement.rejected
+        ? "Task runtime cleanup completed; write artifact validation failed closed."
+        : effective
+          ? "Task runtime cleanup completed; the durable terminal result was published."
         : "Worker process exited before publishing a terminal result; the prompt was not replayed.";
-      const status = intended?.status || "failed";
+      const status = effective?.status || "failed";
       const result = {
         ...(latest.result || {}),
+        ...(writeArtifact ? { writeArtifact } : {}),
         hostVerification: latest.result?.hostVerification || "not_run",
         taskRuntimeCleaned: true,
-        ...(intended
+        ...(effective
           ? (status === "cancelled" && !latest.result?.stopReason ? { stopReason: "cancelled" } : {})
           : { stopReason: "worker-runtime-lost" }),
         ...(reconciler ? {
@@ -4140,16 +4240,20 @@ export function settleStartedWorkerLoss({
           }
         } : {})
       };
+      if (artifactSettlement.rejected) {
+        delete result.writeArtifact;
+        result.stopReason = "write-artifact-rejected";
+      }
       delete result.privacyWarning;
       const terminalized = {
         ...latest,
         status,
-        phase: intended?.phase || "lost",
-        summary: intended ? intended.summary : "Lost",
+        phase: effective?.phase || "lost",
+        summary: effective ? effective.summary : "Lost",
         progress: message,
-        completedAt: intended?.completedAt || settledAt,
+        completedAt: effective?.completedAt || settledAt,
         heartbeatAt: settledAt,
-        error: intended ? intended.error : { code: "E_WORKER_LOST", message },
+        error: effective ? effective.error : { code: "E_WORKER_LOST", message },
         workerAuthorization: null,
         request: {
           ...latest.request,
@@ -4159,7 +4263,7 @@ export function settleStartedWorkerLoss({
             dispatch: {
               ...latestDispatch,
               nextProviderGeneration: null,
-              ...(!intended ? { runtimeLostAt: settledAt } : {}),
+              ...(!effective ? { runtimeLostAt: settledAt } : {}),
               updatedAt: settledAt
             }
           }
@@ -5766,6 +5870,282 @@ export function assertWriteExecutionJob(job, env = process.env) {
     admissionContextManifest,
     provisioningRuntime: runtimeEvidence
   });
+}
+
+/**
+ * Convert one independently verified ready write worktree into the existing
+ * dispatch-v2 lifecycle. Provisioning and launch remain separate durable
+ * boundaries; this is the sole bridge that creates provider authority.
+ */
+export function authorizeReadyWriteWorkerDispatch({
+  root,
+  principal,
+  workerId,
+  writeLifecycleCapabilityDigest,
+  validateWriteLifecycleCapability = null,
+  env = process.env
+} = {}) {
+  if (!root || !principal?.threadId || !workerId) {
+    throw new CompanionError(
+      "E_USAGE",
+      "Ready write dispatch requires root, trusted principal, and worker identity."
+    );
+  }
+  if (!SHA256_HEX.test(writeLifecycleCapabilityDigest || "")) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Ready write dispatch requires its exact composite capability digest."
+    );
+  }
+  assertBrokerMutationAuthority(principal, { root });
+
+  const currentCapability = () => {
+    if (typeof validateWriteLifecycleCapability !== "function") {
+      return writeLifecycleCapabilityDigest;
+    }
+    try {
+      const observed = validateWriteLifecycleCapability();
+      return typeof observed === "string" ? observed : null;
+    } catch {
+      return null;
+    }
+  };
+
+  return withWorkspaceStateTransaction(root, (transaction) => {
+    const current = transaction.tryReadJob(workerId);
+    if (!current) {
+      throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+    }
+    assertMutationOwnership(current, principal);
+
+    const replay = current.request?.spawn?.dispatch;
+    if (isDispatchV2(replay)) {
+      assertDispatchContract(current);
+      assertDurableSpawnRequestBinding(current, env);
+      if (current.write !== true
+        || current.executionBinding?.bindingDigest
+          !== current.request.spawn.executionBindingDigest
+        || current.executionBinding?.providerCapabilityDigest
+          !== writeLifecycleCapabilityDigest
+        || current.request.spawn.providerCapabilityDigest
+          !== writeLifecycleCapabilityDigest
+        || currentCapability() !== writeLifecycleCapabilityDigest) {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "Replayed write dispatch no longer matches its exact capability or execution binding."
+        );
+      }
+      return Object.freeze({
+        authorized: false,
+        replayed: true,
+        job: current
+      });
+    }
+
+    const verified = assertWriteExecutionJob(current, env);
+    if (verified.journal.state !== "ready"
+      || current.status !== "queued"
+      || currentCapability() !== writeLifecycleCapabilityDigest
+      || current.request.spawn.writeLifecycleCapabilityDigest
+        !== writeLifecycleCapabilityDigest
+      || verified.binding.providerCapabilityDigest
+        !== writeLifecycleCapabilityDigest) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        "Write dispatch requires one currently capable verified-ready worktree."
+      );
+    }
+    assertExactWriteVerticalScope(verified.envelope.scope);
+    assertTrackedWriteVerticalTarget(verified.binding.controlRoot);
+    assertParentUnchanged(
+      verified.binding.parentFingerprint,
+      verified.binding.controlRoot
+    );
+    if (transaction.isCancelRequested(
+      workerId,
+      verified.binding.cancellationNonce
+    )) {
+      throw new CompanionError(
+        "E_CANCELLED",
+        "Write worker was cancelled before dispatch authorization."
+      );
+    }
+    assertManagedWorkerWorktree({
+      controlRoot: verified.binding.controlRoot,
+      executionRoot: verified.binding.expectedExecutionRoot,
+      baseCommit: verified.binding.baseCommit,
+      workerId,
+      env
+    });
+    const executionContextManifest = assertContextCompatible(
+      verified.binding.expectedExecutionRoot,
+      verified.provisioningRuntime.runtime.executionContextManifest,
+      { mode: "execute" }
+    );
+    if (executionContextManifest.git?.head !== verified.binding.baseCommit
+      || executionContextManifest.workspaceRoot
+        !== verified.binding.expectedExecutionRoot
+      || executionContextManifest.manifestId
+        !== verified.journal.executionContextManifestId
+      || executionContextManifest.digest
+        !== verified.journal.executionContextManifestDigest) {
+      throw new CompanionError(
+        "E_CONTEXT_DRIFT",
+        "Verified write execution context changed before dispatch authorization."
+      );
+    }
+    const dispatchEnvelope = bindTaskEnvelopeContext(
+      verified.envelope,
+      executionContextManifest.manifestId
+    );
+
+    const contextPacket = buildContextPacket({
+      mode: "explicit-envelope",
+      envelope: dispatchEnvelope,
+      facts: dispatchEnvelope.context.facts,
+      constraints: dispatchEnvelope.context.constraints
+    });
+    assertContextPacket(contextPacket, { envelope: dispatchEnvelope });
+    const runtimeRolePolicy = buildRuntimeRolePolicy({
+      role: verified.role,
+      profile: verified.profile
+    });
+    assertRuntimeRolePolicy(runtimeRolePolicy, {
+      role: verified.role,
+      profile: verified.profile
+    });
+    const providerPrompt = composeProviderPrompt(dispatchEnvelope, {
+      root: verified.binding.expectedExecutionRoot,
+      contextManifest: executionContextManifest,
+      contextPacket,
+      runtimeRolePolicy
+    });
+    const providerPromptDigest = digestKey(providerPrompt);
+    const contextBindingDigest = stableDigest({
+      mode: CONTEXT_BINDING_MODE,
+      packetDigest: contextPacket.digest,
+      runtimeRolePolicyDigest: runtimeRolePolicy.digest,
+      providerPromptDigest
+    });
+    const spawnDigest = requestDigest({
+      principal,
+      controlWorkspaceId: current.controlWorkspaceId,
+      executionRoot: verified.binding.expectedExecutionRoot,
+      envelope: dispatchEnvelope,
+      contextManifest: executionContextManifest,
+      roleId: verified.role.id,
+      write: true,
+      contextBinding: {
+        mode: CONTEXT_BINDING_MODE,
+        digest: contextBindingDigest
+      }
+    });
+    const authorizedAt = now();
+    const contextReceipt = buildContextReceipt({
+      contextPacket,
+      rolePolicy: runtimeRolePolicy,
+      contextManifest: executionContextManifest,
+      lineageWorkerId: workerId,
+      effectivePromptDigest: providerPromptDigest
+    });
+
+    const updated = transaction.updateJob(workerId, (latest) => {
+      assertMutationOwnership(latest, principal);
+      if (isDispatchV2(latest.request?.spawn?.dispatch)) {
+        assertDispatchContract(latest);
+        assertDurableSpawnRequestBinding(latest, env);
+        return latest;
+      }
+      const latestVerified = assertWriteExecutionJob(latest, env);
+      if (latestVerified.journal.journalDigest
+          !== verified.journal.journalDigest
+        || latestVerified.binding.bindingDigest
+          !== verified.binding.bindingDigest
+        || currentCapability() !== writeLifecycleCapabilityDigest
+        || transaction.isCancelRequested(
+          workerId,
+          latestVerified.binding.cancellationNonce
+        )) {
+        throw new CompanionError(
+          "E_STATE",
+          "Write ready state, capability, or cancellation boundary changed before dispatch commit."
+        );
+      }
+      assertParentUnchanged(
+        latestVerified.binding.parentFingerprint,
+        latestVerified.binding.controlRoot
+      );
+      assertManagedWorkerWorktree({
+        controlRoot: latestVerified.binding.controlRoot,
+        executionRoot: latestVerified.binding.expectedExecutionRoot,
+        baseCommit: latestVerified.binding.baseCommit,
+        workerId,
+        env
+      });
+      assertContextCompatible(
+        latestVerified.binding.expectedExecutionRoot,
+        executionContextManifest,
+        { mode: "execute" }
+      );
+      const next = {
+        ...latest,
+        phase: "accepted",
+        summary: "Verified write worker dispatch committed",
+        progress: "Durable launch authorization committed; provider not yet started.",
+        heartbeatAt: authorizedAt,
+        request: {
+          ...latest.request,
+          contextBindingMode: CONTEXT_BINDING_MODE,
+          contextPacket,
+          runtimeRolePolicy,
+          contextReceipt,
+          envelope: dispatchEnvelope,
+          contextManifest: executionContextManifest,
+          providerPromptDigest,
+          spawn: {
+            ...latest.request.spawn,
+            executionRoot: latestVerified.binding.expectedExecutionRoot,
+            executionBindingDigest: latestVerified.binding.bindingDigest,
+            requestDigest: spawnDigest,
+            contextBindingDigest,
+            providerCapabilityDigest: writeLifecycleCapabilityDigest,
+            providerLaunchPending: true,
+            providerLaunchInFlight: false,
+            providerLaunchOutcome: "pending",
+            dispatch: createDispatchOutbox({ createdAt: authorizedAt })
+          }
+        },
+        lifecycleEvents: appendLifecycleEvent(
+          latest.lifecycleEvents || [],
+          "activity.completed",
+          "Verified worktree atomically authorized for provider dispatch.",
+          {
+            mode: "write",
+            write: true
+          }
+        ),
+        workerAuthorization: null
+      };
+      next.workerAuthorization = createWorkerAuthorization({
+        job: next,
+        principal: {
+          ...principal,
+          hostKind: principal.hostKind || "codex"
+        },
+        issuedAt: authorizedAt
+      });
+      assertDispatchContract(next);
+      assertDurableSpawnRequestBinding(next, env);
+      return next;
+    });
+    assertDispatchContract(updated);
+    assertDurableSpawnRequestBinding(updated, env);
+    return Object.freeze({
+      authorized: true,
+      replayed: false,
+      job: updated
+    });
+  }, env);
 }
 
 function assertWriteProvisioningMutationInput({

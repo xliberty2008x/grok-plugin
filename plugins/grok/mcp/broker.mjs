@@ -1,3 +1,5 @@
+import crypto from "node:crypto";
+
 import { CompanionError } from "../scripts/lib/errors.mjs";
 import {
   CODEX_MCP_EXPERIMENTAL_CAPABILITIES,
@@ -13,6 +15,10 @@ import {
 } from "../scripts/lib/provider-capability.mjs";
 import { reconcileBrokerWorkers } from "../scripts/lib/worker-recovery.mjs";
 import { codexMetadataCapabilityMatrix } from "../scripts/lib/worker-presentation.mjs";
+import {
+  EXACT_WRITE_VERTICAL_SCOPE,
+  WRITE_VERTICAL_TARGET_PATH
+} from "../scripts/lib/worker-worktree.mjs";
 
 export const MCP_SERVER_NAME = "grok-worker-broker";
 export const MCP_SERVER_VERSION = MCP_CAPABILITY_CONTRACT_VERSION;
@@ -24,6 +30,8 @@ export const SUPPORTED_MCP_PROTOCOL_VERSIONS = Object.freeze([
   "2024-11-05"
 ]);
 export const DEFAULT_MCP_PROTOCOL_VERSION = "2025-11-25";
+export const WRITE_SMOKE_ENV_VALUE = "p3-p4-target-txt-v1";
+export const WRITE_SMOKE_CAPABILITY = "official-acp-target-txt-write-v1";
 
 const CURSOR_SCHEMA = {
   type: "object",
@@ -216,6 +224,42 @@ export const WORKER_SEND_TOOL = deepFreeze({
   annotations: MUTATION_ANNOTATIONS
 });
 
+export const WORKER_SPAWN_WRITE_TOOL = deepFreeze({
+  name: "worker_spawn_write",
+  title: "Spawn the target.txt Grok write smoke",
+  description: "Opt-in P3-P4 smoke only: idempotently commit one isolated implementer task scoped exactly to the existing tracked target.txt file.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["idempotencyKey", "userRequest"],
+    properties: {
+      idempotencyKey: { type: "string", minLength: 8, maxLength: 256 },
+      userRequest: { type: "string", minLength: 1, maxLength: 16000 },
+      objective: { type: "string", maxLength: 4000 }
+    }
+  },
+  annotations: MUTATION_ANNOTATIONS
+});
+
+export const WORKER_ARTIFACT_TOOL = deepFreeze({
+  name: "worker_artifact",
+  title: "Read a target.txt worker artifact",
+  description: "Read bounded content-addressed metadata, patch, or content for one completed owned write-smoke worker.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["id"],
+    properties: {
+      id: WORKER_ID_SCHEMA,
+      part: {
+        type: "string",
+        enum: ["metadata", "patch", "content"]
+      }
+    }
+  },
+  annotations: READ_ONLY_ANNOTATIONS
+});
+
 /** Complete root-read continuation + ordered mailbox inventory; advertised atomically. */
 export const WORKER_TOOLS = deepFreeze([
   ...BASE_WORKER_TOOLS.slice(0, -1),
@@ -226,9 +270,18 @@ export const WORKER_TOOLS = deepFreeze([
   BASE_WORKER_TOOLS.at(-1)
 ]);
 
+/** The opt-in smoke inventory is frozen independently from the default surface. */
+export const WRITE_SMOKE_WORKER_TOOLS = deepFreeze([
+  ...WORKER_TOOLS.slice(0, -1),
+  WORKER_SPAWN_WRITE_TOOL,
+  WORKER_ARTIFACT_TOOL,
+  WORKER_TOOLS.at(-1)
+]);
+
 const MUTATION_AUTHORITY_TOOLS = new Set([
   "worker_wait",
   "worker_spawn",
+  "worker_spawn_write",
   "worker_decide_host_action",
   "worker_followup",
   "worker_send",
@@ -248,9 +301,22 @@ function validProviderCapabilityReceipt(receipt) {
   );
 }
 
+function writeSmokeCapabilityDigest(providerCapabilityDigest) {
+  if (!SHA256_HEX.test(providerCapabilityDigest || "")) return null;
+  return crypto.createHash("sha256").update(JSON.stringify({
+    schemaVersion: 1,
+    capability: WRITE_SMOKE_CAPABILITY,
+    providerCapabilityDigest,
+    tool: WORKER_SPAWN_WRITE_TOOL.name,
+    targetPath: WRITE_VERTICAL_TARGET_PATH,
+    scope: EXACT_WRITE_VERTICAL_SCOPE
+  })).digest("hex");
+}
+
 export function createMcpBrokerRuntime({
   env = process.env,
-  providerCapabilityReceipt = undefined
+  providerCapabilityReceipt = undefined,
+  writeSmoke = env.GROK_COMPANION_WRITE_SMOKE === WRITE_SMOKE_ENV_VALUE
 } = {}) {
   const receipt = providerCapabilityReceipt === undefined
     ? readValidProviderCapabilityReceipt({ env })
@@ -258,12 +324,18 @@ export function createMcpBrokerRuntime({
   const providerCapabilityDigest = validProviderCapabilityReceipt(receipt)
     ? receipt.capabilityDigest
     : null;
+  const writeLifecycleCapabilityDigest = writeSmoke === true
+    ? writeSmokeCapabilityDigest(providerCapabilityDigest)
+    : null;
   const tools = deepFreeze(providerCapabilityDigest
-    ? [...WORKER_TOOLS]
+    ? [...(writeLifecycleCapabilityDigest
+        ? WRITE_SMOKE_WORKER_TOOLS
+        : WORKER_TOOLS)]
     : [...BASE_WORKER_TOOLS]);
   return Object.freeze({
     tools,
-    providerCapabilityDigest
+    providerCapabilityDigest,
+    writeLifecycleCapabilityDigest
   });
 }
 
@@ -289,6 +361,15 @@ function currentProviderCapabilityDigest(runtime, options) {
   } catch {
     return null;
   }
+}
+
+function currentWriteLifecycleCapabilityDigest(runtime, options) {
+  if (!SHA256_HEX.test(runtime?.writeLifecycleCapabilityDigest || "")) return null;
+  const env = options?.env || process.env;
+  if (env.GROK_COMPANION_WRITE_SMOKE !== WRITE_SMOKE_ENV_VALUE) return null;
+  const providerDigest = currentProviderCapabilityDigest(runtime, options);
+  const current = writeSmokeCapabilityDigest(providerDigest);
+  return current === runtime.writeLifecycleCapabilityDigest ? current : null;
 }
 
 function schemaAccepts(value, schema) {
@@ -359,6 +440,7 @@ function publicError(error) {
     "E_ROLE",
     "E_WORKTREE",
     "E_INTEGRATION",
+    "E_OUTPUT_LIMIT",
     "E_POLICY"
   ].includes(error?.code) ? error.code : "E_BROKER";
   const messages = {
@@ -375,6 +457,7 @@ function publicError(error) {
     E_ROLE: "Worker role error.",
     E_WORKTREE: "Worktree error.",
     E_INTEGRATION: "Integration validation failed.",
+    E_OUTPUT_LIMIT: "Worker artifact exceeds the bounded output limit.",
     E_POLICY: "Policy violation.",
     E_BROKER: "Worker broker request failed."
   };
@@ -409,7 +492,14 @@ export async function callWorkerTool(params, options = {}) {
   const name = params?.name;
   const runtime = brokerRuntime(options);
   if (!runtime.tools.some((tool) => tool.name === name)) {
-    return ["worker_spawn", "worker_decide_host_action", "worker_followup", "worker_send"].includes(name)
+    return [
+      "worker_spawn",
+      "worker_spawn_write",
+      "worker_artifact",
+      "worker_decide_host_action",
+      "worker_followup",
+      "worker_send"
+    ].includes(name)
       ? toolResult({ code: "E_CAPABILITY", message: "Required worker broker capability is unavailable." }, true)
       : toolResult({ code: "E_USAGE", message: "Invalid worker broker request." }, true);
   }
@@ -418,6 +508,13 @@ export async function callWorkerTool(params, options = {}) {
   // the service so expiry, setup revocation, or binary/profile drift fail closed.
   if (["worker_spawn", "worker_decide_host_action", "worker_followup", "worker_send"].includes(name)
     && currentProviderCapabilityDigest(runtime, options) === null) {
+    return toolResult({
+      code: "E_CAPABILITY",
+      message: "Required worker broker capability is unavailable."
+    }, true);
+  }
+  if (["worker_spawn_write", "worker_artifact"].includes(name)
+    && currentWriteLifecycleCapabilityDigest(runtime, options) === null) {
     return toolResult({
       code: "E_CAPABILITY",
       message: "Required worker broker capability is unavailable."
@@ -434,7 +531,12 @@ export async function callWorkerTool(params, options = {}) {
       principal: authority,
       env: options.env || process.env,
       ...(options.serviceOptions || {}),
-      allowWriteSpawn: false,
+      allowWriteSpawn: currentWriteLifecycleCapabilityDigest(runtime, options) !== null,
+      enableWriteVerticalDispatch: currentWriteLifecycleCapabilityDigest(runtime, options) !== null,
+      writeLifecycleCapabilityDigest: runtime.writeLifecycleCapabilityDigest,
+      validateWriteLifecycleCapability: () => (
+        currentWriteLifecycleCapabilityDigest(runtime, options)
+      ),
       providerCapabilityDigest: runtime.providerCapabilityDigest,
       validateProviderCapability: () => currentProviderCapabilityDigest(runtime, options),
       allowUnboundDispatch: false,
@@ -455,7 +557,19 @@ export async function callWorkerTool(params, options = {}) {
         timeoutMs: args.timeoutMs
       }) });
     }
-    if (name === "worker_result") return toolResult({ worker: service.result(args.id) });
+    if (name === "worker_result") {
+      const worker = service.result(args.id);
+      const artifact = service.artifactMetadata(args.id);
+      return toolResult({
+        worker,
+        ...(artifact ? { artifact } : {})
+      });
+    }
+    if (name === "worker_artifact") {
+      return toolResult({
+        artifact: service.artifact(args.id, { part: args.part || "metadata" })
+      });
+    }
     if (name === "worker_spawn") {
       const spawned = service.spawn({
         userRequest: args.userRequest,
@@ -463,6 +577,20 @@ export async function callWorkerTool(params, options = {}) {
         idempotencyKey: args.idempotencyKey,
         roleId: args.roleId || "explorer",
         write: false
+      });
+      return toolResult({
+        worker: spawned.handle,
+        replayed: spawned.replayed,
+        spawnSuccessDefinition: spawned.spawnSuccessDefinition,
+        providerLaunchState: spawned.providerLaunchState,
+        providerLaunched: spawned.providerLaunched
+      });
+    }
+    if (name === "worker_spawn_write") {
+      const spawned = service.spawnWriteVertical({
+        userRequest: args.userRequest,
+        objective: args.objective,
+        idempotencyKey: args.idempotencyKey
       });
       return toolResult({
         worker: spawned.handle,
@@ -561,6 +689,12 @@ export async function handleMcpRequest(message, options = {}) {
           _meta: {
             "grok/capability-matrix": capability,
             "grok/capabilityDigest": runtime.providerCapabilityDigest,
+            ...(runtime.writeLifecycleCapabilityDigest
+              ? {
+                  "grok/writeLifecycleCapabilityDigest":
+                    runtime.writeLifecycleCapabilityDigest
+                }
+              : {}),
             "grok/hostVerification": "suppressed",
             "grok/supportedProtocolVersions": SUPPORTED_MCP_PROTOCOL_VERSIONS,
             "grok/externalWorkerLabel": "external-grok-worker"

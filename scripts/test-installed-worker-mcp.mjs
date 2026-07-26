@@ -80,6 +80,7 @@ const EXPECTED_EXPERIMENTAL_CAPABILITIES = Object.freeze({
   "codex/sandbox-state-meta": Object.freeze({})
 });
 const HELP = "Usage: GROK_E2E=1 GROK_INSTALLED_WORKER_MCP_E2E=1 GROK_E2E_CANCEL=1 npm run test:installed-worker-mcp\n";
+const WRITE_SMOKE_HELP = "Usage: GROK_E2E=1 GROK_INSTALLED_WORKER_MCP_E2E=1 GROK_E2E_CANCEL=1 GROK_WORKER_WRITE_E2E=1 npm run test:installed-worker-mcp -- --write-smoke\n";
 const LIVE_GATES = Object.freeze([
   "GROK_E2E",
   "GROK_INSTALLED_WORKER_MCP_E2E",
@@ -207,6 +208,15 @@ const QUALIFICATION_STAGES = new Set([
   "installed-recheck",
   "evidence-binding",
   "receipt-publication",
+  "write-smoke-fixture",
+  "write-smoke-mcp-surface",
+  "write-smoke-spawn",
+  "write-smoke-wait",
+  "write-smoke-result",
+  "write-smoke-artifact",
+  "write-smoke-parent",
+  "write-smoke-private",
+  "write-smoke-cleanup",
   "emergency-cleanup"
 ]);
 let qualificationStage = "startup";
@@ -986,7 +996,10 @@ function buildChildEnvironment({
   return env;
 }
 
-function initializeFixtureRepository(root, env, { workloadFiles = 0 } = {}) {
+function initializeFixtureRepository(root, env, {
+  workloadFiles = 0,
+  writeTarget = false
+} = {}) {
   mkdirPrivate(root);
   runBounded("git", ["init", "--quiet"], {
     cwd: root,
@@ -999,6 +1012,11 @@ function initializeFixtureRepository(root, env, { workloadFiles = 0 } = {}) {
     "Installed Worker MCP qualification fixture.\n",
     { encoding: "utf8", mode: 0o600 }
   );
+  if (writeTarget) {
+    const target = path.join(root, "target.txt");
+    fs.writeFileSync(target, "before\n", { encoding: "utf8", mode: 0o644 });
+    fs.chmodSync(target, 0o644);
+  }
   if (workloadFiles > 0) {
     const workload = path.join(root, "qualification-workload");
     mkdirPrivate(workload);
@@ -1132,6 +1150,35 @@ function expectedCapabilityMatrix() {
   };
 }
 
+function validateWriteSmokeInitialize(result, context) {
+  if (
+    !isPlainRecord(result?._meta)
+    || !hasExactKeys(result._meta, new Set([
+      "grok/capability-matrix",
+      "grok/capabilityDigest",
+      "grok/writeLifecycleCapabilityDigest",
+      "grok/hostVerification",
+      "grok/supportedProtocolVersions",
+      "grok/externalWorkerLabel"
+    ]))
+    || result._meta["grok/writeLifecycleCapabilityDigest"]
+      !== context.writeLifecycleCapabilityDigest
+  ) {
+    fail("E_MCP");
+  }
+  const projected = {
+    ...result,
+    _meta: { ...result._meta }
+  };
+  delete projected._meta["grok/writeLifecycleCapabilityDigest"];
+  return validateInstalledInitialize(projected, {
+    serverVersion: context.serverVersion,
+    capabilityDigest: context.providerCapability.capabilityDigest,
+    experimentalCapabilities: context.experimentalCapabilities,
+    capabilityMatrix: expectedCapabilityMatrix()
+  });
+}
+
 async function startInstalledMcp(context) {
   checkInterrupted(context.runner);
   const client = spawnMcpStdioClient({
@@ -1139,7 +1186,7 @@ async function startInstalledMcp(context) {
     argv: [path.join(context.installedRoot, "mcp", "server.mjs")],
     cwd: context.installedRoot,
     env: context.env,
-    rpcTimeoutMs: RPC_TIMEOUT_MS,
+    rpcTimeoutMs: context.writeSmoke ? 180_000 : RPC_TIMEOUT_MS,
     shutdownTimeoutMs: MCP_SHUTDOWN_TIMEOUT_MS
   });
   context.runner.clients.add(client);
@@ -1159,12 +1206,14 @@ async function startInstalledMcp(context) {
         experimental: context.experimentalCapabilities
       },
       _meta: initializeMeta
-    }, (result) => validateInstalledInitialize(result, {
-      serverVersion: context.serverVersion,
-      capabilityDigest: context.providerCapability.capabilityDigest,
-      experimentalCapabilities: context.experimentalCapabilities,
-      capabilityMatrix: expectedCapabilityMatrix()
-    }));
+    }, (result) => context.writeSmoke
+      ? validateWriteSmokeInitialize(result, context)
+      : validateInstalledInitialize(result, {
+          serverVersion: context.serverVersion,
+          capabilityDigest: context.providerCapability.capabilityDigest,
+          experimentalCapabilities: context.experimentalCapabilities,
+          capabilityMatrix: expectedCapabilityMatrix()
+        }));
     return client;
   } catch {
     try { await client.terminate(); } catch {}
@@ -1245,6 +1294,28 @@ async function verifyMcpSurface(context, client, { negative = false } = {}) {
     });
   } catch {
     fail("E_MCP");
+  }
+  if (context.writeSmoke) {
+    if (
+      !isPlainRecord(listed)
+      || !hasExactKeys(listed, new Set(["tools"]))
+      || !Array.isArray(listed.tools)
+      || !sameJson(listed.tools, context.workerTools)
+      || !sameJson(
+        listed.tools.map((tool) => tool?.name),
+        context.workerTools.map((tool) => tool.name)
+      )
+    ) {
+      fail("E_MCP");
+    }
+    const projected = {
+      tools: listed.tools.filter((tool) => (
+        tool?.name !== "worker_spawn_write"
+        && tool?.name !== "worker_artifact"
+      ))
+    };
+    validateInstalledToolInventory(projected, context.defaultWorkerTools);
+    return;
   }
   validateInstalledToolInventory(listed, context.workerTools);
   if (
@@ -4071,6 +4142,257 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   return { context, tracker, publicEvidence };
 }
 
+async function runWriteSmokeScenario(baseContext, fixtureRoot) {
+  const context = { ...baseContext, fixtureRoot, writeSmoke: true };
+  enterQualificationStage("write-smoke-fixture");
+  initializeFixtureRepository(
+    fixtureRoot,
+    context.env,
+    { writeTarget: true }
+  );
+  const parentBefore = context.workerWorktree.captureParentFingerprint(fixtureRoot);
+  const expectedContent = "after\n";
+  const expectedContentDigest = crypto
+    .createHash("sha256")
+    .update(expectedContent)
+    .digest("hex");
+
+  enterQualificationStage("write-smoke-mcp-surface");
+  const client = await startInstalledMcp(context);
+  await verifyMcpSurface(context, client, { negative: true });
+
+  enterQualificationStage("write-smoke-spawn");
+  const spawned = await callTool(
+    context,
+    client,
+    "worker_spawn_write",
+    {
+      idempotencyKey: `installed-write-smoke-${crypto.randomUUID()}`,
+      userRequest: [
+        "Edit only target.txt in the current isolated worktree.",
+        "Replace its complete contents with exactly the single line: after",
+        "The file must end with one newline.",
+        "Do not commit and do not modify any other path.",
+        "Verify the edit, then return the required structured worker report.",
+        "In that report, list only target.txt in changedFiles and mark AC-01 and AC-02 met only if the exact edit and one-file scope were verified."
+      ].join(" ")
+    },
+    [
+      "worker",
+      "replayed",
+      "spawnSuccessDefinition",
+      "providerLaunchState",
+      "providerLaunched"
+    ]
+  );
+  const workerId = spawned.worker?.id;
+  if (
+    typeof workerId !== "string"
+    || spawned.worker?.write !== true
+    || spawned.worker?.roleId !== "implementer"
+    || spawned.replayed !== false
+    || spawned.spawnSuccessDefinition !== "durable-job-commit"
+    || spawned.providerLaunchState !== "not-ready"
+    || spawned.providerLaunched !== false
+  ) {
+    fail("E_SCENARIO");
+  }
+  context.runner.writeSmoke = {
+    context,
+    workerId
+  };
+
+  enterQualificationStage("write-smoke-wait");
+  const deadline = Date.now() + SCENARIO_TIMEOUT_MS;
+  let cursor = null;
+  let terminal = false;
+  let firstWait = true;
+  while (Date.now() < deadline) {
+    const page = await callTool(
+      context,
+      client,
+      "worker_wait",
+      {
+        id: workerId,
+        ...(cursor ? { cursor } : {}),
+        timeoutMs: firstWait ? 0 : 30_000
+      },
+      ["stream"]
+    );
+    firstWait = false;
+    if (
+      !isPlainRecord(page.stream)
+      || typeof page.stream.terminal !== "boolean"
+      || !isPlainRecord(page.stream.nextCursor)
+      || page.stream.nextCursor.workerId !== workerId
+    ) {
+      fail("E_SCENARIO");
+    }
+    cursor = page.stream.nextCursor;
+    if (page.stream.terminal) {
+      terminal = true;
+      break;
+    }
+  }
+  if (!terminal) fail("E_SCENARIO");
+
+  enterQualificationStage("write-smoke-result");
+  const result = await callTool(
+    context,
+    client,
+    "worker_result",
+    { id: workerId },
+    ["worker", "artifact"]
+  );
+  if (
+    result.worker?.id !== workerId
+    || result.worker?.status !== "completed"
+    || result.worker?.write !== true
+    || result.worker?.roleId !== "implementer"
+    || result.worker?.hostVerification !== "not_run"
+  ) {
+    fail("E_SCENARIO");
+  }
+
+  enterQualificationStage("write-smoke-artifact");
+  const metadata = await callTool(
+    context,
+    client,
+    "worker_artifact",
+    { id: workerId, part: "metadata" },
+    ["artifact"]
+  );
+  const content = await callTool(
+    context,
+    client,
+    "worker_artifact",
+    { id: workerId, part: "content" },
+    ["artifact"]
+  );
+  const patch = await callTool(
+    context,
+    client,
+    "worker_artifact",
+    { id: workerId, part: "patch" },
+    ["artifact"]
+  );
+  if (
+    !sameJson(result.artifact, metadata.artifact)
+    || metadata.artifact?.path !== "target.txt"
+    || metadata.artifact?.baseCommit !== parentBefore.head
+    || metadata.artifact?.contentDigest !== expectedContentDigest
+    || content.artifact?.part !== "content"
+    || content.artifact?.payload !== expectedContent
+    || content.artifact?.payloadDigest !== expectedContentDigest
+    || content.artifact?.payloadBytes !== Buffer.byteLength(expectedContent)
+    || patch.artifact?.part !== "patch"
+    || patch.artifact?.payloadDigest !== metadata.artifact.patchDigest
+    || !patch.artifact?.payload.includes("diff --git a/target.txt b/target.txt")
+    || !patch.artifact?.payload.includes("-before")
+    || !patch.artifact?.payload.includes("+after")
+  ) {
+    fail("E_SCENARIO");
+  }
+
+  enterQualificationStage("write-smoke-parent");
+  context.workerWorktree.assertParentUnchanged(parentBefore, fixtureRoot);
+  if (fs.readFileSync(path.join(fixtureRoot, "target.txt"), "utf8") !== "before\n") {
+    fail("E_SCENARIO");
+  }
+
+  enterQualificationStage("write-smoke-private");
+  const terminalJob = context.state.readJob(fixtureRoot, workerId, context.env);
+  const expectedExecutionRoot = context.workerWorktree.expectedWorkerWorktreeRoot(
+    fixtureRoot,
+    workerId,
+    context.env
+  );
+  const managedIdentity =
+    context.workerWorktree.assertRegisteredWorkerWorktreeIdentity({
+      controlRoot: fixtureRoot,
+      executionRoot: expectedExecutionRoot,
+      baseCommit: parentBefore.head,
+      workerId,
+      env: context.env
+    });
+  const storedArtifact = context.workerWorktree.readWriteWorkerArtifact({
+    controlRoot: fixtureRoot,
+    workerId,
+    env: context.env,
+    expectedManifestDigest: metadata.artifact.manifestDigest
+  });
+  if (
+    terminalJob.status !== "completed"
+    || terminalJob.write !== true
+    || terminalJob.role?.id !== "implementer"
+    || terminalJob.profile?.id !== "rescue-write-v3"
+    || terminalJob.request?.spawn?.dispatch?.providerGeneration !== 1
+    || terminalJob.request?.spawn?.providerLaunchOutcome !== "launched"
+    || terminalJob.result?.taskRuntimeCleaned !== true
+    || terminalJob.result?.workerReport?.valid !== true
+    || terminalJob.result?.workerReport?.outcome !== "complete"
+    || !sameJson(terminalJob.request?.envelope?.scope, {
+      include: ["target.txt"],
+      exclude: []
+    })
+    || terminalJob.result?.writeArtifact?.contentDigest !== expectedContentDigest
+    || managedIdentity.executionRoot !== fs.realpathSync(expectedExecutionRoot)
+    || storedArtifact.content !== expectedContent
+    || storedArtifact.patch !== patch.artifact.payload
+    || storedArtifact.record.contentDigest !== metadata.artifact.contentDigest
+    || storedArtifact.record.patchDigest !== metadata.artifact.patchDigest
+    || fs.realpathSync(terminalJob.request?.spawn?.executionRoot)
+      !== fs.realpathSync(expectedExecutionRoot)
+    || fs.readFileSync(path.join(expectedExecutionRoot, "target.txt"), "utf8")
+      !== expectedContent
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+
+  enterQualificationStage("write-smoke-cleanup");
+  await closeMcp(context, client);
+  context.workerWorktree.removeWorkerWorktree(
+    expectedExecutionRoot,
+    fixtureRoot,
+    workerId,
+    context.env
+  );
+  const removed = context.workerWorktree.classifyWorkerWorktreeEffect({
+    controlRoot: fixtureRoot,
+    executionRoot: expectedExecutionRoot,
+    baseCommit: parentBefore.head,
+    workerId,
+    env: context.env
+  });
+  if (
+    removed.classification !== "absent"
+    || fs.existsSync(expectedExecutionRoot)
+  ) {
+    fail("E_CLEANUP");
+  }
+  context.workerWorktree.assertParentUnchanged(parentBefore, fixtureRoot);
+  return Object.freeze({
+    schemaVersion: 1,
+    scenario: "official-grok-build-target-txt-write-smoke",
+    workerId,
+    status: result.worker.status,
+    providerGeneration: 1,
+    targetPath: metadata.artifact.path,
+    baseCommit: metadata.artifact.baseCommit,
+    manifestDigest: metadata.artifact.manifestDigest,
+    patchDigest: metadata.artifact.patchDigest,
+    contentDigest: metadata.artifact.contentDigest,
+    parentFingerprintDigest: parentBefore.fingerprintDigest,
+    parentUnchanged: true,
+    integrationApplied: false,
+    runnerDisposableWorktreeRemoved: true,
+    runnerWorktreeRegistrationAbsent: true,
+    productionIntegrationQualified: false,
+    productionCleanupQualified: false,
+    hostVerification: result.worker.hostVerification
+  });
+}
+
 async function runCancellationScenario(baseContext, fixtureRoot) {
   const context = { ...baseContext, fixtureRoot };
   const fixtureStatus = initializeFixtureRepository(
@@ -4383,6 +4705,66 @@ async function emergencyCleanup(runner) {
   }
   if (runner.temporaryRemoved === true) {
     return clean && runner.sessions.size === 0;
+  }
+  if (runner.writeSmoke?.workerId) {
+    const { context, workerId } = runner.writeSmoke;
+    let latest = null;
+    try {
+      latest = context.state.tryReadJob(
+        context.fixtureRoot,
+        workerId,
+        context.env
+      );
+    } catch {
+      clean = false;
+    }
+    for (const [kind, field] of [
+      ["controller", "controllerProcess"],
+      ["worker", "workerProcess"],
+      ["provider", "providerProcess"]
+    ]) {
+      const identity = latest?.[field];
+      if (!identity) continue;
+      try {
+        context.processControl.assertCompleteDetachedOwnedIdentity(identity);
+        if (!context.processControl.processGroupGone(identity)) {
+          await context.processControl.terminateOwnedProcess(
+            identity,
+            workerId,
+            kind
+          );
+        }
+        if (!context.processControl.processGroupGone(identity)) clean = false;
+      } catch {
+        clean = false;
+      }
+    }
+    try {
+      const guard = context.guard.loadProviderGuard(
+        context.fixtureRoot,
+        workerId
+      );
+      if (guard) {
+        const authenticated = context.guard.assertProviderGuardForJob(
+          context.fixtureRoot,
+          latest,
+          guard,
+          { expectedGeneration: guard.providerGeneration }
+        );
+        if (context.processControl.processGroupGone(authenticated.providerProcess)) {
+          context.guard.unregisterProviderGuard(
+            context.fixtureRoot,
+            workerId,
+            authenticated,
+            context.env
+          );
+        } else {
+          clean = false;
+        }
+      }
+    } catch {
+      clean = false;
+    }
   }
   for (const entry of [...runner.trackers].reverse()) {
     const { context, tracker } = entry;
@@ -4950,7 +5332,7 @@ function buildReceipt({
   return receipt;
 }
 
-async function qualify(runner) {
+async function qualify(runner, { writeSmoke = false } = {}) {
   enterQualificationStage("source-boundary");
   const startedAt = new Date().toISOString();
   if (!isNonEvidenceTreeClean(ROOT)) fail("E_SOURCE");
@@ -4984,6 +5366,7 @@ async function qualify(runner) {
   const setupFixture = path.join(runner.temporaryRoot, "setup-fixture");
   const completionFixture = path.join(runner.temporaryRoot, "completion-fixture");
   const cancellationFixture = path.join(runner.temporaryRoot, "cancellation-fixture");
+  const writeSmokeFixture = path.join(runner.temporaryRoot, "write-smoke-fixture");
   mkdirPrivate(codexHome);
   mkdirPrivate(pluginData);
   const threadId = crypto.randomUUID();
@@ -5101,6 +5484,10 @@ async function qualify(runner) {
     installedRoot,
     "scripts/lib/worker-protocol.mjs"
   );
+  const workerWorktree = await importInstalled(
+    installedRoot,
+    "scripts/lib/worker-worktree.mjs"
+  );
   if (
     workerProtocol.MAX_LIFECYCLE_EVENTS
       !== MAX_TERMINAL_LIFECYCLE_EVENTS
@@ -5217,11 +5604,82 @@ async function qualify(runner) {
     launchContract,
     provider,
     workerProtocol,
+    workerWorktree,
     mailboxState,
-    workerTools: broker.WORKER_TOOLS,
+    workerTools: writeSmoke
+      ? broker.WRITE_SMOKE_WORKER_TOOLS
+      : broker.WORKER_TOOLS,
+    defaultWorkerTools: broker.WORKER_TOOLS,
     serverVersion: broker.MCP_SERVER_VERSION,
     experimentalCapabilities: EXPECTED_EXPERIMENTAL_CAPABILITIES
   };
+  if (writeSmoke) {
+    env.GROK_COMPANION_WRITE_SMOKE = broker.WRITE_SMOKE_ENV_VALUE;
+    const runtime = broker.createMcpBrokerRuntime({
+      env,
+      providerCapabilityReceipt: capability
+    });
+    if (
+      runtime.writeLifecycleCapabilityDigest == null
+      || !/^[a-f0-9]{64}$/.test(runtime.writeLifecycleCapabilityDigest)
+      || !sameJson(runtime.tools, broker.WRITE_SMOKE_WORKER_TOOLS)
+    ) {
+      fail("E_CAPABILITY");
+    }
+    baseContext.writeSmoke = true;
+    baseContext.writeLifecycleCapabilityDigest =
+      runtime.writeLifecycleCapabilityDigest;
+    baseContext.pluginData = pluginData;
+    const evidence = await runWriteSmokeScenario(
+      baseContext,
+      writeSmokeFixture
+    );
+    const pinnedEvidence = Object.freeze({
+      ...evidence,
+      sourceHeadCommit: sourceIdentity.headCommit,
+      sourceHeadTree: sourceIdentity.headTree,
+      sourceInventoryDigest: sourceDigest,
+      sourcePluginInventoryDigest: sourcePluginDigest,
+      installedPluginInventoryDigest: installedPluginDigest,
+      installedEntrypointDigest,
+      providerVersion: capability.providerVersion,
+      providerBinaryDigest: providerIdentity.contentDigest,
+      providerCapabilityDigest: capability.capabilityDigest,
+      writeLifecycleCapabilityDigest:
+        runtime.writeLifecycleCapabilityDigest
+    });
+    if (!(await terminateTrackedClients(runner))) fail("E_CLEANUP");
+    const finalInstalledEntries = createPluginInventory(installedRoot);
+    if (
+      describeInventoryDifference(installedEntries, finalInstalledEntries).length
+        !== 0
+      || digestInventory(finalInstalledEntries) !== installedPluginDigest
+      || digestRegularFile(path.join(installedRoot, "mcp", "server.mjs"))
+        !== installedEntrypointDigest
+      || !sameJson(
+        captureProviderFileIdentity(providerIdentity.path),
+        providerIdentity
+      )
+    ) {
+      fail("E_INSTALL");
+    }
+    const finalSourceIdentity = gitIdentity(ROOT);
+    if (
+      !isNonEvidenceTreeClean(ROOT)
+      || finalSourceIdentity.cleanTreeAtVerification !== true
+      || finalSourceIdentity.headCommit !== sourceIdentity.headCommit
+      || finalSourceIdentity.headTree !== sourceIdentity.headTree
+      || computeInventoryDigest(ROOT, { includeEvidence: false }) !== sourceDigest
+      || digestInventory(createPluginInventory(SOURCE_PLUGIN))
+        !== sourcePluginDigest
+    ) {
+      fail("E_SOURCE");
+    }
+    fs.rmSync(runner.temporaryRoot, { recursive: true, force: true });
+    if (fs.existsSync(runner.temporaryRoot)) fail("E_CLEANUP");
+    runner.temporaryRemoved = true;
+    return pinnedEvidence;
+  }
   const completion = await runCompletionScenario(baseContext, completionFixture);
   const cancellation = await runCancellationScenario(
     baseContext,
@@ -5307,12 +5765,22 @@ async function qualify(runner) {
 
 async function main() {
   const argv = process.argv.slice(2);
+  if (
+    argv.length === 2
+    && argv[0] === "--write-smoke"
+    && (argv[1] === "--help" || argv[1] === "-h")
+  ) {
+    process.stdout.write(WRITE_SMOKE_HELP);
+    return;
+  }
   if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
     process.stdout.write(HELP);
     return;
   }
-  if (argv.length !== 0) fail("E_ARGUMENT");
+  const writeSmoke = argv.length === 1 && argv[0] === "--write-smoke";
+  if (argv.length !== 0 && !writeSmoke) fail("E_ARGUMENT");
   if (LIVE_GATES.some((name) => process.env[name] !== "1")) fail("E_GATE");
+  if (writeSmoke && process.env.GROK_WORKER_WRITE_E2E !== "1") fail("E_GATE");
   if (process.platform === "win32") fail("E_PLATFORM");
 
   const runner = {
@@ -5325,16 +5793,21 @@ async function main() {
     clients: new Set(),
     sessions: new Map(),
     turnIds: new Set(),
-    trackers: []
+    trackers: [],
+    writeSmoke: null
   };
   const interrupt = () => { runner.interrupted = true; };
   process.on("SIGINT", interrupt);
   process.on("SIGTERM", interrupt);
   try {
-    await qualify(runner);
-    process.stdout.write(
-      "Installed Worker MCP E2E passed; one provisional synthetic direct-MCP receipt was published.\n"
-    );
+    const evidence = await qualify(runner, { writeSmoke });
+    if (writeSmoke) {
+      process.stdout.write(`${JSON.stringify(evidence)}\n`);
+    } else {
+      process.stdout.write(
+        "Installed Worker MCP E2E passed; one provisional synthetic direct-MCP receipt was published.\n"
+      );
+    }
   } catch (error) {
     const originalCode = error instanceof QualificationError
       ? error.code
