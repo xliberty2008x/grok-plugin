@@ -6256,7 +6256,7 @@ async function runWriteCancellationScenario(baseContext, fixtureRoot) {
     noIntegration: cleanupReceipt?.integrationReceiptDigest === null,
     parentBound:
       cleanupReceipt?.parentFingerprintDigest
-        === parentBefore.fingerprintDigest,
+        === canonicalDigest(parentBefore),
     terminalEvidence: /^[a-f0-9]{64}$/.test(
       cleanupReceipt?.terminalEvidenceDigest || ""
     ),

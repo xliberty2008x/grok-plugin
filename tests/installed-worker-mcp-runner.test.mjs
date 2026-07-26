@@ -724,6 +724,10 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
     source,
     /noIntegration: cleanupReceipt\?\.integrationReceiptDigest === null/
   );
+  assert.match(
+    source,
+    /cleanupReceipt\?\.parentFingerprintDigest\s*=== canonicalDigest\(parentBefore\)/
+  );
   assert.match(source, /stage: "write-cancel-production-cleanup"/);
   assert.match(source, /activeWriteCancellationProven: true/);
   assert.match(source, /writeCancellation: cancellationEvidence/);
