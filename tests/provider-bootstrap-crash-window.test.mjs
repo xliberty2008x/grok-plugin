@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
-import { Readable, Writable } from "node:stream";
+import { Readable } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
@@ -944,19 +945,30 @@ test("private bootstrap spec channel rejects missing, truncated, extra, malforme
 });
 
 /**
- * Build a parent-side spec channel that fails publication with a coded EPIPE.
- * Hosted Linux does not reliably surface EPIPE from FIFO/closed-reader timing;
- * a deterministic Writable write failure exercises the same publisher mapping
- * (writable channel error -> E_PROVIDER_EXIT) without POSIX FIFO assumptions.
+ * Parent-side spec channel that queues one coded error from end().
+ * Uses a minimal EventEmitter surface (not Node Writable) so publisher error
+ * mapping is deterministic across platforms and does not depend on stream
+ * teardown ordering (close/finish/destroyed races on Node 22 vs 18).
+ * destroy() is inert state-only; production still maps the queued error to
+ * E_PROVIDER_EXIT before any teardown timing matters.
  */
-function publisherTargetWithEpipeSpecChannel() {
-  const channel = new Writable({
-    write(_chunk, _encoding, callback) {
+function publisherTargetWithCodedChannelError() {
+  const channel = new EventEmitter();
+  channel.destroyed = false;
+  channel.closed = false;
+  channel.writableEnded = false;
+  channel.writableFinished = false;
+  channel.end = function end(_payload) {
+    queueMicrotask(() => {
+      if (channel.destroyed) return;
       const error = new Error("write EPIPE");
       error.code = "EPIPE";
-      callback(error);
-    }
-  });
+      channel.emit("error", error);
+    });
+  };
+  channel.destroy = function destroy() {
+    channel.destroyed = true;
+  };
   return {
     stdio: { 6: channel },
     exitCode: null,
@@ -967,35 +979,60 @@ function publisherTargetWithEpipeSpecChannel() {
   };
 }
 
-test("bootstrap process and parent publisher fail closed when the inherited spec pipe is missing or closed", {
+test("bootstrap process fails closed when the inherited fd6 spec pipe ends with zero bytes", {
   skip: process.platform === "win32"
 }, async (t) => {
+  // Production-shaped proof: inherit a real pipe on fd6, then parent-end it
+  // with zero payload. stdio "ignore" is not a portable missing/non-pipe proof
+  // on all Node 22 hosts; empty-pipe EOF is the real bootstrap contract.
   const marker = "task-aabbccddeeff0011";
   const intentId = "a".repeat(32);
-  const missing = spawn(process.execPath, [
+  const child = spawn(process.execPath, [
     BOOTSTRAP,
     "--job-marker", marker,
     "--provider-generation", "1",
     "--spawn-intent-id", intentId
   ], {
     detached: true,
-    stdio: ["ignore", "ignore", "ignore", "pipe", "ignore", "ignore", "ignore"]
+    stdio: ["ignore", "ignore", "ignore", "pipe", "ignore", "ignore", "pipe"]
   });
-  t.after(() => { try { process.kill(-missing.pid, "SIGKILL"); } catch {} });
+  t.after(() => { try { process.kill(-child.pid, "SIGKILL"); } catch {} });
   let unexpectedReadiness = "";
-  missing.stdio[3].on("data", (chunk) => { unexpectedReadiness += String(chunk); });
-  const missingExit = await waitForClose(missing);
-  assert.equal(missingExit.code, 1);
-  assert.equal(unexpectedReadiness, "");
+  child.stdio[3].on("data", (chunk) => { unexpectedReadiness += String(chunk); });
 
+  const specPipe = child.stdio[6];
+  assert.ok(specPipe && typeof specPipe.end === "function", "fd6 must be a real parent-side pipe");
+  // Install error handling before ending so parent-side EPIPE cannot become
+  // an unhandled 'error' if the child closes its end during teardown.
+  let parentPipeError = null;
+  specPipe.on("error", (error) => {
+    parentPipeError = error;
+  });
+  // Zero-byte EOF: end without writing any specification payload.
+  specPipe.end();
+
+  const exit = await waitForClose(child);
+  assert.equal(exit.code, 1);
+  assert.equal(exit.signal, null);
+  assert.equal(unexpectedReadiness, "");
+  // Accept only EPIPE if the writer closed exceptionally; any other code is a
+  // real parent-side failure that must not be swallowed.
+  if (parentPipeError != null) {
+    assert.equal(parentPipeError.code, "EPIPE");
+  }
+});
+
+test("parent publisher rejects when the bootstrap specification channel is absent", async () => {
   await assert.rejects(
     () => publishProviderBootstrapSpec({ stdio: [] }, "{}\n"),
     (error) => error?.code === "E_PROTOCOL"
   );
+});
 
-  const closed = publisherTargetWithEpipeSpecChannel();
+test("parent publisher maps a coded channel error to E_PROVIDER_EXIT without Writable teardown timing", async () => {
+  const target = publisherTargetWithCodedChannelError();
   await assert.rejects(
-    () => publishProviderBootstrapSpec(closed, "{}\n", { timeoutMs: 1_000 }),
+    () => publishProviderBootstrapSpec(target, "{}\n", { timeoutMs: 1_000 }),
     (error) => error?.code === "E_PROVIDER_EXIT"
   );
 });
