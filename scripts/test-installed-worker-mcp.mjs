@@ -4982,6 +4982,7 @@ async function waitForActiveWriteProvider(
 
 async function runWriteSmokeScenario(baseContext, fixtureRoot) {
   const context = { ...baseContext, fixtureRoot, writeSmoke: true };
+  context.runner.writeSmoke = { context, workerId: null };
   enterQualificationStage("write-smoke-fixture");
   initializeFixtureRepository(
     fixtureRoot,
@@ -5038,10 +5039,7 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
   ) {
     fail("E_SCENARIO");
   }
-  context.runner.writeSmoke = {
-    context,
-    workerId
-  };
+  context.runner.writeSmoke.workerId = workerId;
 
   enterQualificationStage("write-smoke-wait");
   const deadline = Date.now() + SCENARIO_TIMEOUT_MS;
@@ -5933,6 +5931,7 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
 
 async function runWriteCancellationScenario(baseContext, fixtureRoot) {
   const context = { ...baseContext, fixtureRoot, writeSmoke: true };
+  context.runner.writeSmoke = { context, workerId: null };
   enterQualificationStage("write-cancel-fixture");
   initializeFixtureRepository(
     fixtureRoot,
@@ -5987,7 +5986,7 @@ async function runWriteCancellationScenario(baseContext, fixtureRoot) {
   ) {
     fail("E_SCENARIO");
   }
-  context.runner.writeSmoke = { context, workerId };
+  context.runner.writeSmoke.workerId = workerId;
 
   enterQualificationStage("write-cancel-dispatch");
   const initialPage = await callWriteSmokeWait(
@@ -6659,8 +6658,736 @@ async function terminateTrackedClients(runner) {
   return ok;
 }
 
+function writeEmergencyValidationMode(job) {
+  const spawn = job?.request?.spawn || {};
+  if (!Object.hasOwn(spawn, "dispatch")) return "pre-dispatch";
+  return spawn.dispatch?.schemaVersion === 2 ? "dispatch" : "invalid";
+}
+
+function writeEmergencyRequiredKinds(job) {
+  const spawn = job?.request?.spawn || {};
+  return [...new Set([
+    ["controller", job?.controllerProcess],
+    ["controller", spawn.controllerCleanupProcess],
+    ["worker", job?.workerProcess],
+    ["worker", spawn.unsettledWorkerProcess],
+    ["provider", job?.providerProcess]
+  ]
+    .filter(([, identity]) => identity?.startToken != null)
+    .map(([kind]) => kind))];
+}
+
+function emergencySessionAction({
+  deletionAcknowledged,
+  observedPresent
+}) {
+  if (deletionAcknowledged === true) return "prove-absent";
+  return observedPresent === false ? "adopt-absence" : "delete";
+}
+
+function emergencyCleanupSucceeded({
+  clean,
+  sessionCount,
+  temporaryRootExists
+}) {
+  return clean === true
+    && sessionCount === 0
+    && temporaryRootExists === false;
+}
+
+function durableSessionDeletionAcknowledged(context, tracker) {
+  let jobFile;
+  try {
+    jobFile = context.state.jobFileIfPresent(
+      context.fixtureRoot,
+      tracker.workerId,
+      context.env
+    );
+  } catch {
+    fail("E_CLEANUP");
+  }
+  if (!jobFile) return false;
+  const registryFile = path.join(
+    path.dirname(path.dirname(jobFile)),
+    "owner-lifecycle",
+    "registry.json"
+  );
+  let stat;
+  try {
+    stat = fs.lstatSync(registryFile);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    fail("E_CLEANUP");
+  }
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink()
+    || stat.size < 2
+    || stat.size > 2 * 1024 * 1024
+    || (stat.mode & 0o077) !== 0
+  ) {
+    fail("E_CLEANUP");
+  }
+  const registry = safeParseJson(
+    fs.readFileSync(registryFile, "utf8"),
+    "E_CLEANUP"
+  );
+  const {
+    registryDigest,
+    ...registryBody
+  } = registry || {};
+  if (
+    !hasExactKeys(registry, new Set([
+      "schemaVersion",
+      "records",
+      "keys",
+      "registryDigest"
+    ]))
+    || registry.schemaVersion !== 1
+    || !isPlainRecord(registry.records)
+    || !isPlainRecord(registry.keys)
+    || registryDigest !== canonicalDigest(registryBody)
+  ) {
+    fail("E_CLEANUP");
+  }
+  const record = registry.records[tracker.workerId];
+  if (!record) return false;
+  const { recordDigest, ...recordBody } = record;
+  const cleanup = record.cleanup;
+  if (
+    record.workerId !== tracker.workerId
+    || record.controlWorkspaceId
+      !== tracker.latestJob?.controlWorkspaceId
+    || record.executionBindingDigest
+      !== tracker.latestJob?.executionBinding?.bindingDigest
+    || record.providerSessionId !== tracker.sessionId
+    || recordDigest !== canonicalDigest(recordBody)
+  ) {
+    fail("E_CLEANUP");
+  }
+  if (cleanup === null) return false;
+  if (
+    !isPlainRecord(cleanup)
+    || !Number.isSafeInteger(cleanup.sessionDeleteAttempts)
+    || cleanup.sessionDeleteAttempts < 0
+    || cleanup.sessionDeleteAttempts > 2
+    || (
+      cleanup.sessionDeletionDigest !== null
+      && !/^[a-f0-9]{64}$/.test(cleanup.sessionDeletionDigest || "")
+    )
+    || (
+      cleanup.receipt != null
+      && cleanup.receipt.sessionDeletionDigest
+        !== cleanup.sessionDeletionDigest
+    )
+  ) {
+    fail("E_CLEANUP");
+  }
+  return /^[a-f0-9]{64}$/.test(cleanup.sessionDeletionDigest || "");
+}
+
+async function cleanupExactWorkerBoundary(
+  runner,
+  context,
+  tracker,
+  { write = false } = {}
+) {
+  let clean = true;
+  let latest = null;
+  const owned = new Map();
+  const unsettled = new Map();
+  const addOwned = (
+    kind,
+    identity,
+    { durableProvisioningGuard = false } = {}
+  ) => {
+    if (!identity) return;
+    try {
+      context.processControl.assertCompleteDetachedOwnedIdentity(identity);
+      if (
+        identity.commandMarker !== tracker.workerId
+        && !durableProvisioningGuard
+      ) {
+        clean = false;
+        return;
+      }
+      owned.set(`${kind}:${identity.pid}:${identity.startToken}`, {
+        kind,
+        identity: structuredClone(identity)
+      });
+    } catch {
+      clean = false;
+    }
+  };
+  for (const [kind, identity] of tracker.processIdentities) {
+    addOwned(kind, identity);
+  }
+  const addDurableDispatchWitness = (kind, identity) => {
+    if (!identity) return;
+    if (identity.startToken !== null) {
+      addOwned(kind, identity);
+      return;
+    }
+    unsettled.set(`${kind}:${identity.pid}:${identity.processGroupId}`, {
+      kind,
+      identity: structuredClone(identity)
+    });
+  };
+
+  const bindObservedWriteSession = () => {
+    if (!write || latest?.grokSessionId == null) return;
+    if (
+      !CANONICAL_UUID.test(latest.grokSessionId)
+      || latest.request?.providerHomeId !== tracker.workerId
+      || (
+        tracker.sessionId
+        && tracker.sessionId !== latest.grokSessionId
+      )
+    ) {
+      clean = false;
+      return;
+    }
+    tracker.sessionId = latest.grokSessionId;
+    tracker.latestJob = latest;
+    tracker.privateBinding ||= {
+      lineageWorkerId: latest.request.providerHomeId
+    };
+    if (
+      tracker.privateBinding.lineageWorkerId
+        !== latest.request.providerHomeId
+    ) {
+      clean = false;
+      return;
+    }
+    if (!runner.sessions.has(tracker.sessionId)) {
+      runner.sessions.set(tracker.sessionId, null);
+    }
+    try {
+      bindSessionBoundary(context, tracker);
+      if (
+        tracker.sessionDeleteAcknowledged !== true
+        && durableSessionDeletionAcknowledged(context, tracker)
+      ) {
+        tracker.sessionDeleteAcknowledged = true;
+      }
+    } catch {
+      clean = false;
+    }
+  };
+
+  const collectLatest = () => {
+    try {
+      latest = context.state.tryReadJob(
+        context.fixtureRoot,
+        tracker.workerId,
+        context.env
+      );
+    } catch {
+      clean = false;
+      return;
+    }
+    if (!latest) return;
+    if (write) {
+      const validationMode = writeEmergencyValidationMode(latest);
+      let writeVerification;
+      try {
+        if (validationMode === "invalid") fail("E_CLEANUP");
+        writeVerification = (
+          validationMode === "dispatch"
+            ? context.mutation.assertDispatchContract(latest)
+            : context.mutation.assertWriteExecutionJob(
+                latest,
+                context.env
+              )
+        );
+      } catch {
+        latest = null;
+        clean = false;
+        return;
+      }
+      if (
+        latest.id !== tracker.workerId
+        || latest.write !== true
+        || latest.host?.kind !== "codex"
+        || latest.host?.sessionId !== context.threadId
+        || latest.request?.spawn?.ownerThreadId !== context.threadId
+      ) {
+        latest = null;
+        clean = false;
+        return;
+      }
+      tracker.emergencyWriteValidationMode = validationMode;
+      tracker.emergencyWriteVerification = writeVerification;
+      tracker.latestJob = latest;
+      bindObservedWriteSession();
+    } else {
+      try {
+        latest = observePrivateJob(context, tracker, latest);
+      } catch {
+        latest = null;
+        clean = false;
+        return;
+      }
+    }
+    for (const [kind, identity] of [
+      ["controller", latest.controllerProcess],
+      ["controller", latest.request?.spawn?.controllerCleanupProcess],
+      ["worker", latest.workerProcess],
+      ["worker", latest.request?.spawn?.unsettledWorkerProcess],
+      ["provider", latest.providerProcess]
+    ]) {
+      addDurableDispatchWitness(kind, identity);
+    }
+    const admissions = latest.request?.spawn?.primaryTurnAdmissions;
+    if (admissions != null && !isPlainRecord(admissions)) {
+      clean = false;
+      return;
+    }
+    for (const admission of Object.values(admissions || {})) {
+      addOwned("worker", admission?.workerProcess);
+      addOwned("provider", admission?.providerProcess);
+    }
+  };
+
+  const discoverDetachedWorkerProcesses = () => {
+    let listed;
+    try {
+      listed = context.processControl.runSystemPs([
+        "-axo",
+        "pid=,command="
+      ]);
+    } catch {
+      clean = false;
+      return;
+    }
+    if (
+      listed?.status !== 0
+      || listed?.signal
+      || listed?.error
+      || Buffer.byteLength(String(listed.stdout || ""), "utf8")
+        > MAX_COMMAND_OUTPUT_BYTES
+    ) {
+      clean = false;
+      return;
+    }
+    for (const line of String(listed.stdout || "").split("\n")) {
+      const match = line.match(/^\s*(\d+)\s+([\s\S]+)$/);
+      if (!match || !match[2].includes(tracker.workerId)) continue;
+      const pid = Number(match[1]);
+      const startToken = context.processControl.processStartToken(pid);
+      if (!startToken) {
+        clean = false;
+        continue;
+      }
+      const identity = { pid, startToken, processGroupId: pid };
+      let kind = null;
+      try {
+        context.processControl.assertCompleteDetachedOwnedIdentity(identity);
+        for (const candidate of [
+          "controller",
+          "worker",
+          "provider-bootstrap",
+          "provider"
+        ]) {
+          if (
+            context.processControl.identityMatches(
+              identity,
+              tracker.workerId,
+              candidate
+            )
+          ) {
+            kind = candidate;
+            break;
+          }
+        }
+      } catch {
+        clean = false;
+        continue;
+      }
+      if (!kind) {
+        clean = false;
+        continue;
+      }
+      addOwned(kind, identity);
+    }
+  };
+
+  const collectAuthenticatedGuard = () => {
+    let record;
+    try {
+      record = context.guard.loadProviderGuard(
+        context.fixtureRoot,
+        tracker.workerId
+      );
+    } catch {
+      clean = false;
+      return null;
+    }
+    if (!record) return null;
+    if (!latest) {
+      clean = false;
+      return null;
+    }
+    let authenticated;
+    try {
+      authenticated = (
+        write
+        && tracker.emergencyWriteValidationMode === "pre-dispatch"
+      )
+        ? context.guard.assertWorktreeProvisioningGuardForJob(
+            context.fixtureRoot,
+            latest,
+            record,
+            { env: context.env }
+          )
+        : context.guard.assertProviderGuardForJob(
+            context.fixtureRoot,
+            latest,
+            record,
+            { expectedGeneration: record.providerGeneration }
+          );
+      context.processControl.assertCompleteDetachedOwnedIdentity(
+        authenticated.providerProcess
+      );
+    } catch {
+      clean = false;
+      return null;
+    }
+    if (
+      tracker.authenticatedGuard
+      && !sameJson(tracker.authenticatedGuard, authenticated)
+    ) {
+      clean = false;
+      return null;
+    }
+    tracker.authenticatedGuard ||= structuredClone(authenticated);
+    addOwned(
+      "provider",
+      authenticated.providerProcess,
+      {
+        durableProvisioningGuard: Boolean(
+          write
+          && tracker.emergencyWriteValidationMode === "pre-dispatch"
+        )
+      }
+    );
+    return authenticated;
+  };
+
+  const terminateCollected = async () => {
+    for (const markerKind of [
+      "controller",
+      "worker",
+      "provider-bootstrap",
+      "provider"
+    ]) {
+      for (const ownedProcess of owned.values()) {
+        if (ownedProcess.kind !== markerKind) continue;
+        const { identity } = ownedProcess;
+        try {
+          if (!context.processControl.processGroupGone(identity)) {
+            await context.processControl.terminateOwnedProcess(
+              identity,
+              tracker.workerId,
+              markerKind
+            );
+          }
+          if (!context.processControl.processGroupGone(identity)) clean = false;
+        } catch {
+          clean = false;
+        }
+      }
+    }
+  };
+
+  let stableClosureScans = 0;
+  let previousClosureSignature = null;
+  let provisioningGroupGone = true;
+  let unsettledGroupsGone = true;
+  for (let pass = 0; pass < 20; pass += 1) {
+    collectLatest();
+    discoverDetachedWorkerProcesses();
+    collectAuthenticatedGuard();
+    await terminateCollected();
+    collectLatest();
+    discoverDetachedWorkerProcesses();
+    let authenticated = collectAuthenticatedGuard();
+    await terminateCollected();
+
+    const producerGroupsGone = [...owned.values()]
+      .filter(({ kind }) => kind === "controller" || kind === "worker")
+      .every(({ identity }) => (
+        context.processControl.processGroupGone(identity)
+      ));
+    const allGroupsGone = [...owned.values()].every(({ identity }) => (
+      context.processControl.processGroupGone(identity)
+    ));
+    try {
+      unsettledGroupsGone = [...unsettled.values()].every(
+        ({ identity }) => context.processControl.processGroupGone(identity)
+      );
+    } catch {
+      unsettledGroupsGone = false;
+      clean = false;
+    }
+    const provisioningProcess = (
+      write
+      && tracker.emergencyWriteValidationMode === "pre-dispatch"
+    )
+      ? tracker.emergencyWriteVerification
+          ?.provisioningRuntime
+          ?.intent
+          ?.processIdentity
+      : null;
+    try {
+      provisioningGroupGone = !provisioningProcess
+        || context.processControl.processGroupGone(provisioningProcess);
+    } catch {
+      provisioningGroupGone = false;
+      clean = false;
+    }
+    if (
+      authenticated
+      && producerGroupsGone
+      && allGroupsGone
+      && provisioningGroupGone
+    ) {
+      try {
+        const current = context.guard.loadProviderGuard(
+          context.fixtureRoot,
+          tracker.workerId
+        );
+        if (!current || !sameJson(current, authenticated)) {
+          clean = false;
+        } else {
+          context.guard.unregisterProviderGuard(
+            context.fixtureRoot,
+            tracker.workerId,
+            authenticated,
+            context.env
+          );
+          authenticated = null;
+        }
+      } catch {
+        clean = false;
+      }
+    }
+    let residualGuard = null;
+    try {
+      residualGuard = context.guard.loadProviderGuard(
+        context.fixtureRoot,
+        tracker.workerId
+      );
+    } catch {
+      clean = false;
+    }
+    const closureSignature = JSON.stringify(canonicalJson({
+      jobProcesses: {
+        controller: latest?.controllerProcess || null,
+        worker: latest?.workerProcess || null,
+        provider: latest?.providerProcess || null
+      },
+      sessionId: latest?.grokSessionId || null,
+      provisioningProcess,
+      provisioningGroupGone,
+      unsettled: [...unsettled.values()]
+        .map(({ kind, identity }) => ({ kind, identity }))
+        .sort((left, right) => (
+          JSON.stringify(left).localeCompare(JSON.stringify(right))
+        )),
+      unsettledGroupsGone,
+      residualGuard,
+      owned: [...owned.values()]
+        .map(({ kind, identity }) => ({ kind, identity }))
+        .sort((left, right) => (
+          JSON.stringify(left).localeCompare(JSON.stringify(right))
+        ))
+    }));
+    if (
+      producerGroupsGone
+      && allGroupsGone
+      && unsettledGroupsGone
+      && provisioningGroupGone
+      && residualGuard === null
+    ) {
+      stableClosureScans = closureSignature === previousClosureSignature
+        ? stableClosureScans + 1
+        : 1;
+    } else {
+      stableClosureScans = 0;
+    }
+    previousClosureSignature = closureSignature;
+    if (stableClosureScans >= 2) break;
+    await new Promise((resolve) => setTimeout(resolve, STATE_POLL_MS));
+  }
+  if (
+    stableClosureScans < 2
+    || !unsettledGroupsGone
+    || !provisioningGroupGone
+    || [...owned.values()].some(
+      ({ identity }) => !context.processControl.processGroupGone(identity)
+    )
+  ) {
+    clean = false;
+  }
+  const observedKinds = new Set(
+    [...owned.values()].map(({ kind }) => kind)
+  );
+  const requiredKinds = write
+    ? (
+        tracker.emergencyWriteValidationMode === "pre-dispatch"
+          ? []
+          : writeEmergencyRequiredKinds(latest)
+      )
+    : ["controller", "worker", "provider"];
+  tracker.emergencySessionCleanupReady = (
+    stableClosureScans >= 2
+    && requiredKinds.every((kind) => observedKinds.has(kind))
+    && [...unsettled.values()].every(
+      ({ identity }) => context.processControl.processGroupGone(identity)
+    )
+    && [...owned.values()].every(
+      ({ identity }) => context.processControl.processGroupGone(identity)
+    )
+  );
+  tracker.emergencyLatestJob = latest;
+  return clean;
+}
+
+function proveEmergencyWriteWorktreeAbsent(context, tracker) {
+  const job = tracker.emergencyLatestJob;
+  const baseCommit = job?.executionBinding?.baseCommit;
+  if (
+    !job
+    || job.id !== tracker.workerId
+    || job.write !== true
+    || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(baseCommit || "")
+  ) {
+    return false;
+  }
+  let executionRoot;
+  let effect;
+  try {
+    executionRoot = context.workerWorktree.expectedWorkerWorktreeRoot(
+      context.fixtureRoot,
+      tracker.workerId,
+      context.env
+    );
+    if (job.executionBinding.expectedExecutionRoot !== executionRoot) {
+      return false;
+    }
+    effect = context.workerWorktree.classifyWorkerWorktreeEffect({
+      controlRoot: context.fixtureRoot,
+      executionRoot,
+      baseCommit,
+      workerId: tracker.workerId,
+      env: context.env
+    });
+    if (
+      effect.classification === "exact-clean-registered"
+      || effect.classification === "dirty"
+    ) {
+      context.workerWorktree.removeWorkerWorktree(
+        executionRoot,
+        context.fixtureRoot,
+        tracker.workerId,
+        context.env
+      );
+      effect = context.workerWorktree.classifyWorkerWorktreeEffect({
+        controlRoot: context.fixtureRoot,
+        executionRoot,
+        baseCommit,
+        workerId: tracker.workerId,
+        env: context.env
+      });
+    }
+  } catch {
+    return false;
+  }
+  return (
+    effect?.classification === "absent"
+    && !fs.existsSync(executionRoot)
+  );
+}
+
+async function observeEmergencySessionAbsence(
+  context,
+  tracker,
+  timeoutMs
+) {
+  let absent = false;
+  await runSessionCredentialTransaction(context, tracker, {
+    mode: "observe",
+    provePresent: async (environment) => {
+      const binding = bindSessionBoundary(context, tracker);
+      if (!exactPrivateAuthFile(binding)) fail("E_CLEANUP");
+      let observed;
+      try {
+        observed = context.provider.inspectImportedSessionPresence(
+          tracker.sessionId,
+          context.providerBinary,
+          binding.env,
+          context.fixtureRoot
+        );
+      } finally {
+        refreshSessionCredentialHandle(environment);
+      }
+      if (observed?.ok !== true) fail("E_SESSION");
+      if (observed.present === true) return true;
+      if (observed.present !== false) fail("E_SESSION");
+      await proveSessionAbsentWithCredential(
+        context,
+        tracker,
+        environment,
+        timeoutMs
+      );
+      absent = true;
+      return true;
+    }
+  });
+  return absent;
+}
+
+async function deleteOrAdoptEmergencySessionAbsence(
+  context,
+  tracker
+) {
+  let action = emergencySessionAction({
+    deletionAcknowledged: tracker.sessionDeleteAcknowledged,
+    observedPresent: null
+  });
+  if (action !== "prove-absent") {
+    const absent = await observeEmergencySessionAbsence(
+      context,
+      tracker,
+      30_000
+    );
+    action = emergencySessionAction({
+      deletionAcknowledged: false,
+      observedPresent: !absent
+    });
+    if (action === "adopt-absence") {
+      tracker.sessionDeleteAcknowledged = true;
+      tracker.sessionDeleted = true;
+      context.runner.sessions.delete(tracker.sessionId);
+      return;
+    }
+  }
+  await deleteAndProveSessionAbsent(context, tracker, {
+    updateStage: false,
+    timeoutMs: 30_000
+  });
+}
+
 async function emergencyCleanup(runner) {
   let clean = await terminateTrackedClients(runner);
+  if (runner.temporaryRemoved === true) {
+    return emergencyCleanupSucceeded({
+      clean,
+      sessionCount: runner.sessions.size,
+      temporaryRootExists: false
+    });
+  }
   if (
     runner.setupBoundary
     && !await cleanupSetupBoundary(
@@ -6670,72 +7397,55 @@ async function emergencyCleanup(runner) {
   ) {
     clean = false;
   }
-  if (runner.temporaryRemoved === true) {
-    return clean && runner.sessions.size === 0;
-  }
-  if (runner.writeSmoke?.workerId) {
-    const { context, workerId } = runner.writeSmoke;
-    let latest = null;
-    try {
-      latest = context.state.tryReadJob(
-        context.fixtureRoot,
-        workerId,
-        context.env
-      );
-    } catch {
-      clean = false;
-    }
-    for (const [kind, field] of [
-      ["controller", "controllerProcess"],
-      ["worker", "workerProcess"],
-      ["provider", "providerProcess"]
-    ]) {
-      const identity = latest?.[field];
-      if (!identity) continue;
+  if (runner.writeSmoke?.context) {
+    const { context } = runner.writeSmoke;
+    let { workerId } = runner.writeSmoke;
+    if (typeof workerId !== "string") {
       try {
-        context.processControl.assertCompleteDetachedOwnedIdentity(identity);
-        if (!context.processControl.processGroupGone(identity)) {
-          await context.processControl.terminateOwnedProcess(
-            identity,
-            workerId,
-            kind
-          );
+        const candidates = context.state.listJobsReadonly(
+          context.fixtureRoot,
+          context.env
+        ).filter((job) => (
+          job?.write === true
+          && job?.host?.kind === "codex"
+          && job?.host?.sessionId === context.threadId
+        ));
+        if (candidates.length === 1) {
+          workerId = candidates[0].id;
+          runner.writeSmoke.workerId = workerId;
+        } else {
+          clean = false;
         }
-        if (!context.processControl.processGroupGone(identity)) clean = false;
       } catch {
         clean = false;
       }
     }
-    try {
-      const guard = context.guard.loadProviderGuard(
-        context.fixtureRoot,
-        workerId
-      );
-      if (guard) {
-        const authenticated = context.guard.assertProviderGuardForJob(
-          context.fixtureRoot,
-          latest,
-          guard,
-          { expectedGeneration: guard.providerGeneration }
-        );
-        if (context.processControl.processGroupGone(authenticated.providerProcess)) {
-          context.guard.unregisterProviderGuard(
-            context.fixtureRoot,
-            workerId,
-            authenticated,
-            context.env
-          );
-        } else {
-          clean = false;
-        }
+    if (typeof workerId === "string") {
+      const tracker = {
+        workerId,
+        processIdentities: new Map(),
+        authenticatedGuard: null,
+        latestJob: null,
+        privateBinding: null,
+        sessionId: null,
+        sessionBoundary: null,
+        sessionDeleteAcknowledged: false,
+        sessionDeleted: false,
+        emergencySessionCleanupReady: false
+      };
+      runner.writeSmoke.emergencyTracker = tracker;
+      if (!await cleanupExactWorkerBoundary(
+        runner,
+        context,
+        tracker,
+        { write: true }
+      )) {
+        clean = false;
       }
-    } catch {
-      clean = false;
     }
   }
   for (const entry of [...runner.trackers].reverse()) {
     const { context, tracker } = entry;
-    let latest = null;
     if (typeof tracker.workerId !== "string") {
       try {
         const candidates = context.state.listJobsReadonly(
@@ -6752,296 +7462,24 @@ async function emergencyCleanup(runner) {
       }
     }
     if (typeof tracker.workerId !== "string") continue;
-
-    const owned = new Map();
-    for (const [kind, identity] of tracker.processIdentities) {
-      owned.set(`${kind}:${identity.pid}:${identity.startToken}`, {
-        kind,
-        identity: structuredClone(identity)
-      });
-    }
-    const collectLatest = () => {
-      try {
-        latest = context.state.tryReadJob(
-          context.fixtureRoot,
-          tracker.workerId,
-          context.env
-        );
-      } catch {
-        clean = false;
-        return;
-      }
-      if (!latest) return;
-      try {
-        latest = observePrivateJob(context, tracker, latest);
-      } catch {
-        latest = null;
-        clean = false;
-        return;
-      }
-      for (const [kind, field] of [
-        ["controller", "controllerProcess"],
-        ["worker", "workerProcess"],
-        ["provider", "providerProcess"]
-      ]) {
-        const identity = latest[field];
-        if (!identity) continue;
-        try {
-          context.processControl.assertCompleteDetachedOwnedIdentity(identity);
-          if (identity.commandMarker !== tracker.workerId) {
-            clean = false;
-            continue;
-          }
-          owned.set(`${kind}:${identity.pid}:${identity.startToken}`, {
-            kind,
-            identity: structuredClone(identity)
-          });
-        } catch {
-          clean = false;
-        }
-      }
-    };
-    const discoverDetachedWorkerProcesses = () => {
-      let listed;
-      try {
-        listed = context.processControl.runSystemPs([
-          "-axo",
-          "pid=,command="
-        ]);
-      } catch {
-        clean = false;
-        return;
-      }
-      if (
-        listed?.status !== 0
-        || listed?.signal
-        || listed?.error
-        || Buffer.byteLength(String(listed.stdout || ""), "utf8")
-          > MAX_COMMAND_OUTPUT_BYTES
-      ) {
-        clean = false;
-        return;
-      }
-      for (const line of String(listed.stdout || "").split("\n")) {
-        const match = line.match(/^\s*(\d+)\s+([\s\S]+)$/);
-        if (!match || !match[2].includes(tracker.workerId)) continue;
-        const pid = Number(match[1]);
-        const startToken = context.processControl.processStartToken(pid);
-        if (!startToken) continue;
-        const identity = { pid, startToken, processGroupId: pid };
-        let kind = null;
-        try {
-          context.processControl.assertCompleteDetachedOwnedIdentity(identity);
-          if (
-            context.processControl.identityMatches(
-              identity,
-              tracker.workerId,
-              "controller"
-            )
-          ) {
-            kind = "controller";
-          } else if (
-            context.processControl.identityMatches(
-              identity,
-              tracker.workerId,
-              "worker"
-            )
-          ) {
-            kind = "worker";
-          } else if (
-            context.processControl.identityMatches(
-              identity,
-              tracker.workerId,
-              "provider-bootstrap"
-            )
-          ) {
-            kind = "provider-bootstrap";
-          } else if (
-            context.processControl.identityMatches(
-              identity,
-              tracker.workerId,
-              "provider"
-            )
-          ) {
-            kind = "provider";
-          }
-        } catch {
-          clean = false;
-          continue;
-        }
-        if (!kind) continue;
-        owned.set(`${kind}:${identity.pid}:${identity.startToken}`, {
-          kind,
-          identity
-        });
-      }
-    };
-    const collectAuthenticatedGuard = () => {
-      let record;
-      try {
-        record = context.guard.loadProviderGuard(
-          context.fixtureRoot,
-          tracker.workerId
-        );
-      } catch {
-        clean = false;
-        return null;
-      }
-      if (!record) return null;
-      if (!latest) {
-        clean = false;
-        return null;
-      }
-      let authenticated;
-      try {
-        authenticated = context.guard.assertProviderGuardForJob(
-          context.fixtureRoot,
-          latest,
-          record,
-          { expectedGeneration: record.providerGeneration }
-        );
-        context.processControl.assertCompleteDetachedOwnedIdentity(
-          authenticated.providerProcess
-        );
-      } catch {
-        clean = false;
-        return null;
-      }
-      if (
-        tracker.authenticatedGuard
-        && !sameJson(tracker.authenticatedGuard, authenticated)
-      ) {
-        clean = false;
-        return null;
-      }
-      const identity = structuredClone(authenticated.providerProcess);
-      owned.set(`provider:${identity.pid}:${identity.startToken}`, {
-        kind: "provider",
-        identity
-      });
-      return authenticated;
-    };
-    const terminateCollected = async () => {
-      for (const markerKind of [
-        "controller",
-        "worker",
-        "provider-bootstrap",
-        "provider"
-      ]) {
-        for (const ownedProcess of owned.values()) {
-          if (ownedProcess.kind !== markerKind) continue;
-          const { identity } = ownedProcess;
-          try {
-            if (!context.processControl.processGroupGone(identity)) {
-              await context.processControl.terminateOwnedProcess(
-                identity,
-                tracker.workerId,
-                markerKind
-              );
-            }
-            if (!context.processControl.processGroupGone(identity)) clean = false;
-          } catch {
-            clean = false;
-          }
-        }
-      }
-    };
-    let stableClosureScans = 0;
-    let previousClosureSignature = null;
-    for (let pass = 0; pass < 20; pass += 1) {
-      collectLatest();
-      discoverDetachedWorkerProcesses();
-      collectAuthenticatedGuard();
-      await terminateCollected();
-      collectLatest();
-      discoverDetachedWorkerProcesses();
-      let authenticated = collectAuthenticatedGuard();
-      await terminateCollected();
-
-      const producerGroupsGone = [...owned.values()]
-        .filter(({ kind }) => kind === "controller" || kind === "worker")
-        .every(({ identity }) => (
-          context.processControl.processGroupGone(identity)
-        ));
-      const allGroupsGone = [...owned.values()].every(({ identity }) => (
-        context.processControl.processGroupGone(identity)
-      ));
-      if (authenticated && producerGroupsGone && allGroupsGone) {
-        try {
-          const current = context.guard.loadProviderGuard(
-            context.fixtureRoot,
-            tracker.workerId
-          );
-          if (!current || !sameJson(current, authenticated)) {
-            clean = false;
-          } else {
-            context.guard.unregisterProviderGuard(
-              context.fixtureRoot,
-              tracker.workerId,
-              authenticated,
-              context.env
-            );
-            authenticated = null;
-          }
-        } catch {
-          clean = false;
-        }
-      }
-      let residualGuard = null;
-      try {
-        residualGuard = context.guard.loadProviderGuard(
-          context.fixtureRoot,
-          tracker.workerId
-        );
-      } catch {
-        clean = false;
-      }
-      const closureSignature = JSON.stringify(canonicalJson({
-        jobProcesses: {
-          controller: latest?.controllerProcess || null,
-          worker: latest?.workerProcess || null,
-          provider: latest?.providerProcess || null
-        },
-        sessionId: latest?.grokSessionId || null,
-        residualGuard,
-        owned: [...owned.values()]
-          .map(({ kind, identity }) => ({ kind, identity }))
-          .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))
-      }));
-      if (producerGroupsGone && allGroupsGone && residualGuard === null) {
-        stableClosureScans = closureSignature === previousClosureSignature
-          ? stableClosureScans + 1
-          : 1;
-      } else {
-        stableClosureScans = 0;
-      }
-      previousClosureSignature = closureSignature;
-      if (stableClosureScans >= 2) break;
-      await new Promise((resolve) => setTimeout(resolve, STATE_POLL_MS));
-    }
-    if (
-      stableClosureScans < 2
-      || [...owned.values()].some(
-        ({ identity }) => !context.processControl.processGroupGone(identity)
-      )
-    ) {
+    if (!await cleanupExactWorkerBoundary(
+      runner,
+      context,
+      tracker
+    )) {
       clean = false;
     }
-    const observedKinds = new Set(
-      [...owned.values()].map(({ kind }) => kind)
-    );
-    tracker.emergencySessionCleanupReady = (
-      stableClosureScans >= 2
-      && ["controller", "worker", "provider"]
-        .every((kind) => observedKinds.has(kind))
-      && [...owned.values()].every(
-        ({ identity }) => context.processControl.processGroupGone(identity)
-      )
-    );
+  }
+  const emergencyEntries = [...runner.trackers];
+  if (runner.writeSmoke?.emergencyTracker) {
+    emergencyEntries.push({
+      context: runner.writeSmoke.context,
+      tracker: runner.writeSmoke.emergencyTracker
+    });
   }
   if (runner.provider && runner.providerBinary) {
     for (const [sessionId] of [...runner.sessions]) {
-      const entry = runner.trackers.find(
+      const entry = emergencyEntries.find(
         ({ tracker }) => tracker.sessionId === sessionId
       );
       if (!entry || entry.tracker.emergencySessionCleanupReady !== true) {
@@ -7050,10 +7488,10 @@ async function emergencyCleanup(runner) {
       }
       const { context, tracker } = entry;
       try {
-        await deleteAndProveSessionAbsent(context, tracker, {
-          updateStage: false,
-          timeoutMs: 30_000
-        });
+        await deleteOrAdoptEmergencySessionAbsence(
+          context,
+          tracker
+        );
       } catch {
         clean = false;
       }
@@ -7061,16 +7499,40 @@ async function emergencyCleanup(runner) {
   } else if (runner.sessions.size > 0) {
     clean = false;
   }
+  if (runner.writeSmoke?.emergencyTracker) {
+    const { context, emergencyTracker } = runner.writeSmoke;
+    if (
+      emergencyTracker.emergencySessionCleanupReady !== true
+      || !proveEmergencyWriteWorktreeAbsent(
+        context,
+        emergencyTracker
+      )
+    ) {
+      clean = false;
+    }
+  }
   if (runner.temporaryRoot && fs.existsSync(runner.temporaryRoot)) {
     if (clean) {
       try {
         fs.rmSync(runner.temporaryRoot, { recursive: true, force: true });
+        if (!fs.existsSync(runner.temporaryRoot)) {
+          runner.temporaryRemoved = true;
+        } else {
+          clean = false;
+        }
       } catch {
         clean = false;
       }
     }
   }
-  return clean && (!runner.temporaryRoot || !fs.existsSync(runner.temporaryRoot));
+  return emergencyCleanupSucceeded({
+    clean,
+    sessionCount: runner.sessions.size,
+    temporaryRootExists: Boolean(
+      runner.temporaryRoot
+      && fs.existsSync(runner.temporaryRoot)
+    )
+  });
 }
 
 function ensurePublicationDirectory(relativeDirectory, created) {

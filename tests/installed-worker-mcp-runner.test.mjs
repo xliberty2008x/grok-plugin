@@ -1114,6 +1114,211 @@ test("installed Worker MCP cleanup waits for exact process closure and proves du
   );
 });
 
+test("write-smoke emergency cleanup is exact, session-bound, and cannot hide a managed worktree", () => {
+  const source = fs.readFileSync(RUNNER, "utf8");
+  const evaluatePureRunnerFunction = (name, nextName) => {
+    const start = source.indexOf(`function ${name}(`);
+    const end = source.indexOf(`function ${nextName}(`, start + 1);
+    assert.ok(start >= 0 && end > start, `missing pure helper ${name}`);
+    return Function(`"use strict"; return (${source.slice(start, end).trim()});`)();
+  };
+  const validationMode = evaluatePureRunnerFunction(
+    "writeEmergencyValidationMode",
+    "writeEmergencyRequiredKinds"
+  );
+  const requiredKinds = evaluatePureRunnerFunction(
+    "writeEmergencyRequiredKinds",
+    "emergencySessionAction"
+  );
+  const sessionAction = evaluatePureRunnerFunction(
+    "emergencySessionAction",
+    "emergencyCleanupSucceeded"
+  );
+  const cleanupSucceeded = evaluatePureRunnerFunction(
+    "emergencyCleanupSucceeded",
+    "durableSessionDeletionAcknowledged"
+  );
+  const helper = source.slice(
+    source.indexOf("async function cleanupExactWorkerBoundary("),
+    source.indexOf("function proveEmergencyWriteWorktreeAbsent(")
+  );
+  const worktreeProof = source.slice(
+    source.indexOf("function proveEmergencyWriteWorktreeAbsent("),
+    source.indexOf("async function emergencyCleanup(")
+  );
+  const emergency = source.slice(
+    source.indexOf("async function emergencyCleanup("),
+    source.indexOf("function ensurePublicationDirectory(")
+  );
+
+  assert.equal(validationMode({ request: { spawn: {} } }), "pre-dispatch");
+  assert.equal(
+    validationMode({ request: { spawn: { dispatch: { schemaVersion: 2 } } } }),
+    "dispatch"
+  );
+  assert.equal(
+    validationMode({ request: { spawn: { dispatch: null } } }),
+    "invalid"
+  );
+  assert.deepEqual(requiredKinds({
+    request: { spawn: { dispatch: { schemaVersion: 2, state: "pending" } } }
+  }), []);
+  assert.deepEqual(requiredKinds({
+    controllerProcess: { pid: 101, startToken: "controller-start" },
+    request: {
+      spawn: { dispatch: { schemaVersion: 2, state: "controller-started" } }
+    }
+  }), ["controller"]);
+  assert.deepEqual(requiredKinds({
+    controllerProcess: { pid: 101, startToken: "controller-start" },
+    workerProcess: { pid: 102, startToken: "worker-start" },
+    providerProcess: { pid: 103, startToken: "provider-start" },
+    request: {
+      spawn: {
+        dispatch: { schemaVersion: 2, state: "failed" },
+        controllerCleanupProcess: {
+          pid: 101,
+          startToken: "controller-start"
+        },
+        unsettledWorkerProcess: { pid: 104, startToken: null }
+      }
+    }
+  }), ["controller", "worker", "provider"]);
+  assert.deepEqual(requiredKinds({
+    request: {
+      spawn: {
+        dispatch: { schemaVersion: 2, state: "failed" },
+        controllerCleanupProcess: { pid: 105, startToken: null },
+        unsettledWorkerProcess: { pid: 106, startToken: null }
+      }
+    }
+  }), []);
+  assert.equal(sessionAction({
+    deletionAcknowledged: true,
+    observedPresent: true
+  }), "prove-absent");
+  assert.equal(sessionAction({
+    deletionAcknowledged: false,
+    observedPresent: false
+  }), "adopt-absence");
+  assert.equal(sessionAction({
+    deletionAcknowledged: false,
+    observedPresent: true
+  }), "delete");
+  assert.equal(cleanupSucceeded({
+    clean: true,
+    sessionCount: 0,
+    temporaryRootExists: false
+  }), true);
+  assert.equal(cleanupSucceeded({
+    clean: true,
+    sessionCount: 0,
+    temporaryRootExists: true
+  }), false);
+
+  assert.match(
+    emergency,
+    /cleanupExactWorkerBoundary\(\s*runner,\s*context,\s*tracker,\s*\{ write: true \}\s*\)/
+  );
+  assert.match(
+    helper,
+    /context\.mutation\.assertDispatchContract\(latest\)/
+  );
+  assert.match(
+    helper,
+    /context\.mutation\.assertWriteExecutionJob\(\s*latest,\s*context\.env\s*\)/
+  );
+  assert.match(
+    helper,
+    /latest\.id !== tracker\.workerId[\s\S]*?latest\.write !== true[\s\S]*?latest\.request\?\.spawn\?\.ownerThreadId !== context\.threadId/
+  );
+  assert.match(
+    helper,
+    /const admissions = latest\.request\?\.spawn\?\.primaryTurnAdmissions;[\s\S]*?addOwned\("worker", admission\?\.workerProcess\);[\s\S]*?addOwned\("provider", admission\?\.providerProcess\);/
+  );
+  for (const kind of [
+    "controller",
+    "worker",
+    "provider-bootstrap",
+    "provider"
+  ]) {
+    assert.ok(
+      helper.includes(`"${kind}"`),
+      `missing exact emergency process kind ${kind}`
+    );
+  }
+  assert.match(
+    helper,
+    /identityMatches\(\s*identity,\s*tracker\.workerId,\s*candidate\s*\)/
+  );
+  assert.match(
+    helper,
+    /if \(!kind\) \{\s*clean = false;\s*continue;\s*\}/
+  );
+  assert.match(
+    helper,
+    /assertProviderGuardForJob\([\s\S]*?expectedGeneration: record\.providerGeneration/
+  );
+  assert.match(
+    helper,
+    /assertWorktreeProvisioningGuardForJob\([\s\S]*?\{ env: context\.env \}/
+  );
+  assert.match(
+    helper,
+    /durableProvisioningGuard: Boolean\([\s\S]*?emergencyWriteValidationMode === "pre-dispatch"/
+  );
+  assert.doesNotMatch(
+    helper,
+    /addOwned\([\s\S]{0,120}emergencyWriteVerification/
+  );
+  assert.match(
+    helper,
+    /stableClosureScans >= 2/
+  );
+  assert.match(
+    helper,
+    /producerGroupsGone[\s\S]*?allGroupsGone[\s\S]*?provisioningGroupGone[\s\S]*?residualGuard === null/
+  );
+  assert.match(
+    helper,
+    /runner\.sessions\.set\(tracker\.sessionId, null\);[\s\S]*?bindSessionBoundary\(context, tracker\);/
+  );
+  assert.match(
+    worktreeProof,
+    /deleteAndProveSessionAbsent\(context, tracker, \{\s*updateStage: false,\s*timeoutMs: 30_000\s*\}\)/
+  );
+  assert.match(
+    worktreeProof,
+    /proveSessionAbsentWithCredential\([\s\S]*?action === "adopt-absence"/
+  );
+  assert.match(
+    worktreeProof,
+    /classifyWorkerWorktreeEffect\([\s\S]*?removeWorkerWorktree\([\s\S]*?classifyWorkerWorktreeEffect\(/
+  );
+  assert.match(
+    worktreeProof,
+    /effect\?\.classification === "absent"[\s\S]*?!fs\.existsSync\(executionRoot\)/
+  );
+  assert.ok(
+    emergency.indexOf("proveEmergencyWriteWorktreeAbsent(")
+      < emergency.indexOf("fs.rmSync(runner.temporaryRoot"),
+    "official write-worktree absence proof must precede recursive root removal"
+  );
+  assert.match(
+    emergency,
+    /runner\.temporaryRemoved = true;/
+  );
+  assert.ok(
+    emergency.indexOf("if (runner.temporaryRemoved === true)")
+      < emergency.indexOf("runner.setupBoundary"),
+    "second emergency cleanup must return before touching removed setup roots"
+  );
+  assert.match(
+    emergency,
+    /return emergencyCleanupSucceeded\(\{\s*clean,\s*sessionCount: runner\.sessions\.size/
+  );
+});
+
 test("package and repository validator pin the installed Worker MCP runner wiring", () => {
   const packageJson = JSON.parse(
     fs.readFileSync(path.join(ROOT, "package.json"), "utf8")
