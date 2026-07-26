@@ -49,11 +49,13 @@ const SHA256_HEX = /^[a-f0-9]{64}$/;
 const EXACT_COMMIT = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
 const INTEGRATION_STATES = new Set(["planned", "applying", "verified", "blocked"]);
 const CLEANUP_STATES = new Set(["planned", "closing", "removing", "absent", "blocked"]);
-const CLEANUP_DISPOSITIONS = new Set(["integrated", "discarded"]);
+const CLEANUP_DISPOSITIONS = new Set(["integrated", "discarded", "abandoned"]);
 const CANONICAL_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const WORKTREE_INTEGRATION_PURPOSE = "worktree-integration";
 const WORKTREE_CLEANUP_PURPOSE = "worktree-cleanup";
+const PARENT_INTEGRATION_LEASE = "owner-parent-integration";
+const parentIntegrationQueueTails = new Map();
 
 function canonicalize(value) {
   if (value === null || typeof value !== "object") return value;
@@ -78,6 +80,34 @@ function digest(value) {
 
 function now() {
   return new Date().toISOString();
+}
+
+/**
+ * Keep same-process parent operations asynchronous and ordered before entering
+ * the existing cross-process lease. Without this queue a second MCP request can
+ * synchronously spin in acquireWorkspaceProcessLease while the first request is
+ * awaiting its controller, blocking the event loop that must settle the first.
+ */
+async function withParentIntegrationQueue(root, env, action) {
+  const controlRoot = resolveControlWorkspace(root, env).controlRoot;
+  const previous = parentIntegrationQueueTails.get(controlRoot)
+    || Promise.resolve();
+  let releaseTurn;
+  const turn = new Promise((resolve) => {
+    releaseTurn = resolve;
+  });
+  const tail = previous.catch(() => {}).then(() => turn);
+  parentIntegrationQueueTails.set(controlRoot, tail);
+
+  await previous.catch(() => {});
+  try {
+    return await action();
+  } finally {
+    releaseTurn();
+    if (parentIntegrationQueueTails.get(controlRoot) === tail) {
+      parentIntegrationQueueTails.delete(controlRoot);
+    }
+  }
 }
 
 function exactKeys(value, fields) {
@@ -241,14 +271,24 @@ function assertPublicCleanupReceipt(receipt, record) {
     "terminalEvidenceDigest",
     "parentFingerprintDigest"
   ]);
+  const abandonedFields = new Set([
+    ...discardedFields,
+    "manifestDigest",
+    "artifactDigest",
+    "patchDigest",
+    "contentDigest",
+    "artifactRecordDigest"
+  ]);
   const cleanup = record.cleanup;
   const disposition = cleanup?.disposition ?? "integrated";
-  const exactReceiptFields = disposition === "discarded"
-    ? discardedFields
-    : integratedFields;
+  const exactReceiptFields = disposition === "abandoned"
+    ? abandonedFields
+    : disposition === "discarded"
+      ? discardedFields
+      : integratedFields;
   if (!exactKeys(receipt, exactReceiptFields)
     || receipt.schemaVersion !== OWNER_LIFECYCLE_SCHEMA_VERSION
-    || receipt.operation !== "cleanup"
+    || receipt.operation !== (disposition === "abandoned" ? "abandon" : "cleanup")
     || receipt.workerId !== record.workerId
     || receipt.status !== "absent"
     || (disposition === "integrated"
@@ -276,6 +316,28 @@ function assertPublicCleanupReceipt(receipt, record) {
           !== record.baseBinding.parentFingerprintDigest
         || !SHA256_HEX.test(receipt.terminalEvidenceDigest || "")
         || !SHA256_HEX.test(receipt.parentFingerprintDigest || "")))
+    || (disposition === "abandoned"
+      && (receipt.disposition !== "abandoned"
+        || receipt.terminalStatus !== "completed"
+        || receipt.terminalStatus !== cleanup?.terminalStatus
+        || receipt.terminalEvidenceDigest !== cleanup?.terminalEvidenceDigest
+        || receipt.parentFingerprintDigest !== cleanup?.parentFingerprintDigest
+        || receipt.parentFingerprintDigest
+          !== record.baseBinding.parentFingerprintDigest
+        || receipt.manifestDigest !== record.artifactBinding?.manifestDigest
+        || receipt.artifactDigest !== record.artifactBinding?.artifactDigest
+        || receipt.patchDigest !== record.artifactBinding?.patchDigest
+        || receipt.contentDigest !== record.artifactBinding?.contentDigest
+        || receipt.artifactRecordDigest !== record.artifactBinding?.recordDigest
+        || [
+          "terminalEvidenceDigest",
+          "parentFingerprintDigest",
+          "manifestDigest",
+          "artifactDigest",
+          "patchDigest",
+          "contentDigest",
+          "artifactRecordDigest"
+        ].some((field) => !SHA256_HEX.test(receipt[field] || ""))))
     || receipt.receiptDigest !== digest(withoutDigest(receipt, "receiptDigest"))) {
     throw stateError("Stored write-cleanup receipt is malformed.");
   }
@@ -415,7 +477,7 @@ function assertLifecycleRecord(record) {
     throw stateError("Stored write artifact binding is malformed.");
   }
   const integration = record.integration;
-  if ((record.artifactBinding === null) !== (integration === null)) {
+  if (record.artifactBinding === null && integration !== null) {
     throw stateError("Artifact and integration lifecycle bindings disagree.");
   }
   if (integration !== null) {
@@ -503,7 +565,7 @@ function assertLifecycleRecord(record) {
       ? cleanup.disposition
       : "integrated";
     if (!exactKeys(cleanup, hasTerminalBinding ? boundFields : legacyFields)
-      || cleanup.operation !== "cleanup"
+      || cleanup.operation !== (disposition === "abandoned" ? "abandon" : "cleanup")
       || !CLEANUP_STATES.has(cleanup.state)
       || !CLEANUP_DISPOSITIONS.has(disposition)
       || (disposition === "integrated"
@@ -545,6 +607,20 @@ function assertLifecycleRecord(record) {
         || integration !== null) {
         throw stateError("Discard cleanup is not bound to one cancelled non-integrated worker.");
       }
+    } else if (disposition === "abandoned") {
+      if (!hasTerminalBinding
+        || cleanup.terminalStatus !== "completed"
+        || record.artifactBinding === null
+        || (integration !== null
+          && (integration.state === "verified"
+            || integration.state === "applying"
+            || integration.attempts !== 0
+            || integration.officialReceiptDigest !== null
+            || integration.hostVerification !== null
+            || integration.controllerIntent !== null
+            || integration.receipt !== null))) {
+        throw stateError("Abandon cleanup is not bound to one non-applied completed worker.");
+      }
     } else if (record.artifactBinding === null
       || integration === null
       || (hasTerminalBinding && cleanup.terminalStatus !== "completed")) {
@@ -571,7 +647,7 @@ function assertLifecycleRecord(record) {
       effect: "remove",
       executionBindingDigest: record.executionBindingDigest
     });
-  } else if (integration === null) {
+  } else if (integration === null || record.artifactBinding === null) {
     throw stateError("Owner lifecycle record has no integration or cleanup operation.");
   }
   return record;
@@ -601,7 +677,7 @@ function assertRegistry(registry) {
   for (const [keyDigest, binding] of Object.entries(registry.keys)) {
     if (!SHA256_HEX.test(keyDigest)
       || !exactKeys(binding, new Set(["operation", "workerId", "requestDigest"]))
-      || !["integrate", "cleanup"].includes(binding.operation)
+      || !["integrate", "cleanup", "abandon"].includes(binding.operation)
       || !SHA256_HEX.test(binding.requestDigest || "")
       || registry.records[binding.workerId]?.[binding.operation === "integrate"
         ? "integration"
@@ -954,10 +1030,11 @@ function cleanupRequestDigest(
   principal,
   keyDigest,
   integrationReceiptDigest,
-  terminalBinding = null
+  terminalBinding = null,
+  operation = "cleanup"
 ) {
   const request = {
-    operation: "cleanup",
+    operation,
     workerId: record.workerId,
     owner: ownerProjection(principal),
     executionBindingDigest: record.executionBindingDigest,
@@ -1030,6 +1107,13 @@ function initialDiscardLifecycleRecord(context, principal, cleanup) {
     integration: null,
     cleanup,
     recordDigest: null
+  };
+}
+
+function initialAbandonLifecycleRecord(context, principal, cleanup) {
+  return {
+    ...initialLifecycleRecord(context, principal, null),
+    cleanup
   };
 }
 
@@ -1696,10 +1780,181 @@ function publishVerifiedIntegration({
   return receipt;
 }
 
+function publicIntegrationObservation(
+  context,
+  operation,
+  observed,
+  integrationReceiptDigest = null
+) {
+  const observedAt = now();
+  const status = operation === "preview"
+    ? observed.classification === "unchanged"
+      ? "ready"
+      : observed.classification === "exact-effect"
+        ? "already-applied"
+        : "conflict"
+    : observed.classification === "exact-effect"
+      ? "verified"
+      : observed.classification === "unchanged"
+        ? "not-applied"
+        : "conflict";
+  const body = {
+    schemaVersion: OWNER_LIFECYCLE_SCHEMA_VERSION,
+    operation,
+    workerId: context.job.id,
+    status,
+    classification: observed.classification,
+    baseCommit: context.binding.baseCommit,
+    manifestDigest: context.artifact.record.manifestDigest,
+    artifactDigest: context.artifact.record.artifactDigest,
+    patchDigest: context.artifact.record.patchDigest,
+    contentDigest: context.artifact.record.contentDigest,
+    parentFingerprintDigest: context.binding.parentFingerprintDigest,
+    ...(operation === "verify-integration"
+      ? { integrationReceiptDigest }
+      : {}),
+    hostEvidenceDigest: observed.evidence
+      ? boundedEffectDigest(observed.evidence, "Host integration observation")
+      : null,
+    autoApplied: false,
+    requiresExplicitIntegration: observed.classification === "unchanged",
+    observedAt
+  };
+  return Object.freeze({
+    ...body,
+    observationDigest: digest(body)
+  });
+}
+
+function previewOwnedWriteWorker({
+  root,
+  principal,
+  workerId,
+  manifestDigest,
+  env
+}) {
+  const lease = acquireWorkspaceProcessLease(
+    root,
+    PARENT_INTEGRATION_LEASE,
+    env
+  );
+  try {
+    const context = terminalWriteContext({
+      root,
+      principal,
+      workerId,
+      manifestDigest,
+      env
+    });
+    const observed = inspectWriteVerticalIntegration({
+      controlRoot: context.binding.controlRoot,
+      artifact: context.artifact,
+      parentFingerprint: context.binding.parentFingerprint,
+      expectedWorkerId: workerId
+    });
+    if (observed.classification === "unchanged") {
+      prepareIntegration({
+        controlRoot: context.binding.controlRoot,
+        executionRoot: context.binding.expectedExecutionRoot,
+        manifest: context.artifact.manifest,
+        parentFingerprint: context.binding.parentFingerprint,
+        expectedWorkerId: workerId,
+        expectedScope: EXACT_WRITE_VERTICAL_SCOPE,
+        expectedLineage: null,
+        env
+      });
+    }
+    return publicIntegrationObservation(context, "preview", observed);
+  } finally {
+    lease.release();
+  }
+}
+
+/** Recompute a safe, owner-authorized preview without applying parent effects. */
+export async function previewWriteWorker(options = {}) {
+  const env = options.env || process.env;
+  return withParentIntegrationQueue(options.root, env, () => (
+    previewOwnedWriteWorker({
+      ...options,
+      env
+    })
+  ));
+}
+
+/** Recompute the current parent integration classification independently. */
+function verifyWriteWorkerIntegrationWithLease({
+  root,
+  principal,
+  workerId,
+  manifestDigest,
+  integrationReceiptDigest,
+  env = process.env
+} = {}) {
+  if (!SHA256_HEX.test(integrationReceiptDigest || "")) {
+    throw new CompanionError(
+      "E_USAGE",
+      "Current integration verification requires integrationReceiptDigest."
+    );
+  }
+  const lease = acquireWorkspaceProcessLease(
+    root,
+    PARENT_INTEGRATION_LEASE,
+    env
+  );
+  try {
+    const context = terminalWriteContext({
+      root,
+      principal,
+      workerId,
+      manifestDigest,
+      env
+    });
+    const record = readCurrentRecord(root, workerId, env);
+    if (!record) {
+      throw integrationError(
+        "Current integration verification requires a durable integration receipt."
+      );
+    }
+    assertRecordContext(record, context, principal);
+    if (record.integration?.state !== "verified"
+      || record.integration.receipt?.receiptDigest
+        !== integrationReceiptDigest
+      || record.integration.receipt?.manifestDigest !== manifestDigest) {
+      throw integrationError(
+        "Current integration verification receipt does not match the exact durable integration."
+      );
+    }
+    const observed = inspectWriteVerticalIntegration({
+      controlRoot: context.binding.controlRoot,
+      artifact: context.artifact,
+      parentFingerprint: record.parentFingerprint,
+      expectedWorkerId: workerId
+    });
+    return publicIntegrationObservation(
+      context,
+      "verify-integration",
+      observed,
+      integrationReceiptDigest
+    );
+  } finally {
+    lease.release();
+  }
+}
+
+export async function verifyWriteWorkerIntegration(options = {}) {
+  const env = options.env || process.env;
+  return withParentIntegrationQueue(options.root, env, () => (
+    verifyWriteWorkerIntegrationWithLease({
+      ...options,
+      env
+    })
+  ));
+}
+
 /**
  * Apply and independently verify one completed target.txt write artifact.
  */
-export async function integrateWriteWorker({
+async function integrateWriteWorkerWithLease({
   root,
   principal,
   workerId,
@@ -1716,7 +1971,7 @@ export async function integrateWriteWorker({
   }
   const lease = acquireWorkspaceProcessLease(
     root,
-    `owner-integrate-${workerWorktreeSlug(workerId)}`,
+    PARENT_INTEGRATION_LEASE,
     env
   );
   const leaseTokenDigest = digest(lease.token);
@@ -1741,26 +1996,29 @@ export async function integrateWriteWorker({
         parentFingerprint: context.binding.parentFingerprint,
         expectedWorkerId: workerId
       });
-      if (observed.classification !== "unchanged") {
-        throw integrationError(
-          "A new write integration requires its exact unchanged parent.",
-          observed.classification
-        );
+      if (observed.classification === "unchanged") {
+        prepareIntegration({
+          controlRoot: context.binding.controlRoot,
+          executionRoot: context.binding.expectedExecutionRoot,
+          manifest: context.artifact.manifest,
+          parentFingerprint: context.binding.parentFingerprint,
+          expectedWorkerId: workerId,
+          expectedScope: EXACT_WRITE_VERTICAL_SCOPE,
+          expectedLineage: null,
+          env
+        });
       }
-      prepareIntegration({
-        controlRoot: context.binding.controlRoot,
-        executionRoot: context.binding.expectedExecutionRoot,
-        manifest: context.artifact.manifest,
-        parentFingerprint: context.binding.parentFingerprint,
-        expectedWorkerId: workerId,
-        expectedScope: EXACT_WRITE_VERTICAL_SCOPE,
-        expectedLineage: null,
-        env
-      });
       const createdAt = now();
+      const initialConflict = observed.classification === "drift"
+        ? {
+            code: "E_INTEGRATION",
+            classification: observed.classification,
+            message: "A new write integration requires its exact unchanged parent."
+          }
+        : null;
       const integration = {
         operation: "integrate",
-        state: "planned",
+        state: initialConflict ? "blocked" : "planned",
         idempotencyKeyDigest: keyDigest,
         requestDigest,
         fence: 1,
@@ -1772,7 +2030,7 @@ export async function integrateWriteWorker({
         hostVerification: null,
         controllerIntent: null,
         receipt: null,
-        error: null
+        error: initialConflict
       };
       withRegistry(root, env, (registry) => {
         assertGlobalKey(registry, keyDigest, "integrate", workerId, requestDigest);
@@ -1793,6 +2051,12 @@ export async function integrateWriteWorker({
         );
       });
       record = readCurrentRecord(root, workerId, env);
+      if (initialConflict) {
+        throw integrationError(
+          initialConflict.message,
+          initialConflict.classification
+        );
+      }
     }
 
     const alreadyApplied = inspectWriteVerticalIntegration({
@@ -1941,6 +2205,16 @@ export async function integrateWriteWorker({
   }
 }
 
+export async function integrateWriteWorker(options = {}) {
+  const env = options.env || process.env;
+  return withParentIntegrationQueue(options.root, env, () => (
+    integrateWriteWorkerWithLease({
+      ...options,
+      env
+    })
+  ));
+}
+
 function sessionObservationPresent(value) {
   if (!exactKeys(value, new Set(["present"]))
     || typeof value.present !== "boolean") {
@@ -2019,10 +2293,22 @@ function publishAbsentCleanup(root, workerId, env, absenceProof) {
       || !SHA256_HEX.test(absenceProof.proofDigest || "")) {
       throw stateError("Write cleanup lacks exact close, session, remove, or absence evidence.");
     }
+    if (cleanup.operation === "abandon") {
+      const retainedArtifact = readWriteWorkerArtifact({
+        controlRoot: root,
+        workerId,
+        expectedManifestDigest: record.artifactBinding?.manifestDigest,
+        env
+      });
+      if (retainedArtifact.record.recordDigest
+        !== record.artifactBinding?.recordDigest) {
+        throw stateError("Abandon lost its exact immutable artifact binding.");
+      }
+    }
     const cleanedAt = now();
     const unsignedReceipt = {
       schemaVersion: OWNER_LIFECYCLE_SCHEMA_VERSION,
-      operation: "cleanup",
+      operation: cleanup.operation,
       workerId,
       status: "absent",
       integrationReceiptDigest: cleanup.integrationReceiptDigest,
@@ -2032,12 +2318,21 @@ function publishAbsentCleanup(root, workerId, env, absenceProof) {
       absenceProofDigest: absenceProof.proofDigest,
       cleanedAt
     };
-    if (cleanup.disposition === "discarded") {
+    if (["discarded", "abandoned"].includes(cleanup.disposition)) {
       Object.assign(unsignedReceipt, {
-        disposition: "discarded",
+        disposition: cleanup.disposition,
         terminalStatus: cleanup.terminalStatus,
         terminalEvidenceDigest: cleanup.terminalEvidenceDigest,
         parentFingerprintDigest: cleanup.parentFingerprintDigest
+      });
+    }
+    if (cleanup.disposition === "abandoned") {
+      Object.assign(unsignedReceipt, {
+        manifestDigest: record.artifactBinding.manifestDigest,
+        artifactDigest: record.artifactBinding.artifactDigest,
+        patchDigest: record.artifactBinding.patchDigest,
+        contentDigest: record.artifactBinding.contentDigest,
+        artifactRecordDigest: record.artifactBinding.recordDigest
       });
     }
     receipt = Object.freeze({
@@ -2063,18 +2358,24 @@ function publishAbsentCleanup(root, workerId, env, absenceProof) {
  * Close the exact provider session, delete only that session's credential
  * record, invoke official worktree removal, and independently prove absence.
  */
-export async function cleanupWriteWorker({
+async function disposeWriteWorker({
   root,
   principal,
   workerId,
   integrationReceiptDigest,
+  manifestDigest,
   idempotencyKey,
+  lifecycleOperation = "cleanup",
   env = process.env,
   runCloseEffect,
   deleteProviderSession,
   inspectProviderSession,
   runRemoveEffect
 } = {}) {
+  if (!["cleanup", "abandon"].includes(lifecycleOperation)) {
+    throw stateError("Unknown terminal write disposition.");
+  }
+  const abandoning = lifecycleOperation === "abandon";
   // Owner resolution intentionally precedes idempotency validation/lookup.
   const owned = readExactlyOwnedJob(root, principal, workerId, env);
   const keyDigest = assertIdempotencyKey(idempotencyKey);
@@ -2088,18 +2389,61 @@ export async function cleanupWriteWorker({
       throw new CompanionError("E_CAPABILITY", `${label} capability is unavailable.`);
     }
   }
-  const lease = acquireWorkspaceProcessLease(
-    root,
-    `owner-cleanup-${workerWorktreeSlug(workerId)}`,
-    env
-  );
-  const leaseTokenDigest = digest(lease.token);
+  const parentLease = abandoning
+    ? acquireWorkspaceProcessLease(root, PARENT_INTEGRATION_LEASE, env)
+    : null;
+  let lease = null;
   try {
+    lease = acquireWorkspaceProcessLease(
+      root,
+      `owner-cleanup-${workerWorktreeSlug(workerId)}`,
+      env
+    );
+    const leaseTokenDigest = digest(lease.token);
     let record = readCurrentRecord(root, workerId, env);
     let disposition;
     let terminalBinding;
     let discardedContext = null;
-    if (owned.status === "completed") {
+    let abandonContext = null;
+    if (abandoning) {
+      if (owned.status !== "completed") {
+        throw cleanupError(
+          "Only one terminal completed write worker can be abandoned.",
+          "ineligible-terminal"
+        );
+      }
+      if (integrationReceiptDigest !== undefined
+        && integrationReceiptDigest !== null) {
+        throw integrationError("Write abandon forbids an integration receipt.");
+      }
+      abandonContext = terminalWriteContext({
+        root,
+        principal,
+        workerId,
+        manifestDigest,
+        env
+      });
+      if (record) {
+        assertRecordContext(record, abandonContext, principal);
+        if (record.cleanup?.operation !== undefined
+          && record.cleanup.operation !== "abandon") {
+          throw integrationError(
+            "Worker already has a different terminal cleanup lifecycle."
+          );
+        }
+      }
+      disposition = "abandoned";
+      terminalBinding = record?.cleanup
+        ? cleanupTerminalBinding(record.cleanup)
+        : {
+            disposition,
+            terminalStatus: "completed",
+            terminalEvidenceDigest: abandonContext.terminalEvidenceDigest,
+            parentFingerprintDigest:
+              abandonContext.binding.parentFingerprintDigest
+          };
+      integrationReceiptDigest = null;
+    } else if (owned.status === "completed") {
       disposition = "integrated";
       if (!record
         || record.integration?.state !== "verified"
@@ -2173,26 +2517,61 @@ export async function cleanupWriteWorker({
       record || {
         workerId,
         executionBindingDigest:
-          discardedContext.binding.bindingDigest
+          (discardedContext || abandonContext).binding.bindingDigest
       },
       principal,
       keyDigest,
       integrationReceiptDigest,
       record?.cleanup && !Object.hasOwn(record.cleanup, "disposition")
         ? null
-        : terminalBinding
+        : terminalBinding,
+      lifecycleOperation
     );
     const replay = cleanupReplay(record, keyDigest, requestDigest);
     if (replay) return replay;
 
-    if (disposition === "discarded" && record === null) {
+    if (abandoning) {
+      const integration = record?.integration;
+      if (integration?.state === "verified") {
+        throw integrationError(
+          "Cannot abandon an exact integrated worker effect.",
+          "exact-effect"
+        );
+      }
+      if (integration
+        && (integration.state === "applying"
+          || integration.attempts > 0
+          || integration.officialReceiptDigest !== null
+          || integration.hostVerification !== null
+          || integration.controllerIntent !== null
+          || integration.receipt !== null)) {
+        throw integrationError(
+          "Cannot abandon a worker with an ambiguous or attempted apply.",
+          "apply-ambiguous"
+        );
+      }
+      const observed = inspectWriteVerticalIntegration({
+        controlRoot: abandonContext.binding.controlRoot,
+        artifact: abandonContext.artifact,
+        parentFingerprint: abandonContext.binding.parentFingerprint,
+        expectedWorkerId: workerId
+      });
+      if (observed.classification === "exact-effect") {
+        throw integrationError(
+          "Cannot abandon an exact adoptable parent effect.",
+          "exact-effect"
+        );
+      }
+    }
+
+    if (["discarded", "abandoned"].includes(disposition) && record === null) {
       const createdAt = now();
       const cleanup = {
-        operation: "cleanup",
+        operation: lifecycleOperation,
         state: "planned",
         integrationReceiptDigest: null,
-        disposition: "discarded",
-        terminalStatus: "cancelled",
+        disposition,
+        terminalStatus: terminalBinding.terminalStatus,
         terminalEvidenceDigest: terminalBinding.terminalEvidenceDigest,
         parentFingerprintDigest: terminalBinding.parentFingerprintDigest,
         idempotencyKeyDigest: keyDigest,
@@ -2214,23 +2593,35 @@ export async function cleanupWriteWorker({
         error: null
       };
       withRegistry(root, env, (registry) => {
-        assertGlobalKey(registry, keyDigest, "cleanup", workerId, requestDigest);
+        assertGlobalKey(
+          registry,
+          keyDigest,
+          lifecycleOperation,
+          workerId,
+          requestDigest
+        );
         if (registry.records[workerId]) {
-          throw stateError("Worker discard lifecycle was concurrently created.");
+          throw stateError("Worker terminal disposition was concurrently created.");
         }
         if (Object.keys(registry.records).length >= MAX_LIFECYCLE_RECORDS) {
           throw stateError("Worker owner-lifecycle registry reached its bounded capacity.");
         }
         return replaceRecord(
           registry,
-          initialDiscardLifecycleRecord(
-            discardedContext,
-            principal,
-            cleanup
-          ),
+          disposition === "discarded"
+            ? initialDiscardLifecycleRecord(
+                discardedContext,
+                principal,
+                cleanup
+              )
+            : initialAbandonLifecycleRecord(
+                abandonContext,
+                principal,
+                cleanup
+              ),
           {
             keyDigest,
-            operation: "cleanup",
+            operation: lifecycleOperation,
             requestDigest
           }
         );
@@ -2247,11 +2638,11 @@ export async function cleanupWriteWorker({
         const next = {
           ...current,
           cleanup: {
-            operation: "cleanup",
+            operation: lifecycleOperation,
             state: "planned",
             integrationReceiptDigest,
-            disposition: "integrated",
-            terminalStatus: "completed",
+            disposition,
+            terminalStatus: terminalBinding.terminalStatus,
             terminalEvidenceDigest: terminalBinding.terminalEvidenceDigest,
             parentFingerprintDigest: terminalBinding.parentFingerprintDigest,
             idempotencyKeyDigest: keyDigest,
@@ -2275,7 +2666,7 @@ export async function cleanupWriteWorker({
         };
         return replaceRecord(registry, next, {
           keyDigest,
-          operation: "cleanup",
+          operation: lifecycleOperation,
           requestDigest
         });
       });
@@ -2290,7 +2681,7 @@ export async function cleanupWriteWorker({
       }
     }
 
-    if (record.cleanup.disposition === "discarded"
+    if (["discarded", "abandoned"].includes(record.cleanup.disposition)
       && record.cleanup.closeAttempts === 0
       && !record.cleanup.closeReceiptDigest) {
       const observed = classifyWorkerWorktreeEffect({
@@ -2657,6 +3048,25 @@ export async function cleanupWriteWorker({
     );
     return Object.freeze({ receipt, replayed: false });
   } finally {
-    lease.release();
+    lease?.release();
+    parentLease?.release();
   }
+}
+
+export async function cleanupWriteWorker(options = {}) {
+  return disposeWriteWorker({
+    ...options,
+    lifecycleOperation: "cleanup"
+  });
+}
+
+export async function abandonWriteWorker(options = {}) {
+  const env = options.env || process.env;
+  return withParentIntegrationQueue(options.root, env, () => (
+    disposeWriteWorker({
+      ...options,
+      lifecycleOperation: "abandon",
+      env
+    })
+  ));
 }

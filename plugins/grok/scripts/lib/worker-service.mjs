@@ -47,8 +47,11 @@ import {
   readWriteWorkerArtifact
 } from "./worker-worktree.mjs";
 import {
+  abandonWriteWorker as abandonOwnedWriteWorker,
   cleanupWriteWorker as cleanupOwnedWriteWorker,
-  integrateWriteWorker as integrateOwnedWriteWorker
+  integrateWriteWorker as integrateOwnedWriteWorker,
+  previewWriteWorker as previewOwnedWriteWorker,
+  verifyWriteWorkerIntegration as verifyOwnedWriteWorkerIntegration
 } from "./worker-owner-lifecycle.mjs";
 import {
   runCloseEffect as runOfficialCloseEffect,
@@ -104,7 +107,10 @@ export function createWorkerService({
   dispatchWorker = launchWorker,
   provisionWriteWorktree = provisionWriteWorkerWorktree,
   authorizeWriteDispatch = authorizeReadyWriteWorkerDispatch,
+  previewWriteArtifact = previewOwnedWriteWorker,
   integrateWriteArtifact = integrateOwnedWriteWorker,
+  verifyWriteIntegration = verifyOwnedWriteWorkerIntegration,
+  abandonWriteArtifact = abandonOwnedWriteWorker,
   cleanupWriteWorker = cleanupOwnedWriteWorker,
   runIntegrationEffect = runOfficialIntegrationEffect,
   runCloseEffect = runOfficialCloseEffect,
@@ -343,6 +349,43 @@ export function createWorkerService({
       });
     },
 
+    async preview({ id, manifestDigest } = {}) {
+      if (!id || !manifestDigest) {
+        throw new CompanionError(
+          "E_USAGE",
+          "id and manifestDigest are required for preview."
+        );
+      }
+      assertBrokerMutationAuthority(principal, { root });
+      const job = ownedJob(id);
+      if (job.write !== true || !isWorkerTerminal(job) || job.status !== "completed") {
+        throw new CompanionError(
+          "E_JOB_ACTIVE",
+          "Write worker is not ready for preview."
+        );
+      }
+      if (currentWriteLifecycleCapabilityDigest()
+        !== writeLifecycleCapabilityDigest) {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "The write-lifecycle capability changed before preview."
+        );
+      }
+      if (typeof previewWriteArtifact !== "function") {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "The production integration preview is unavailable."
+        );
+      }
+      return previewWriteArtifact({
+        root,
+        principal,
+        workerId: id,
+        manifestDigest,
+        env
+      });
+    },
+
     async integrate({ id, manifestDigest, idempotencyKey } = {}) {
       if (!id || !manifestDigest || !idempotencyKey) {
         throw new CompanionError(
@@ -380,6 +423,114 @@ export function createWorkerService({
         idempotencyKey,
         env,
         runIntegrationEffect
+      });
+    },
+
+    async verifyIntegration({
+      id,
+      manifestDigest,
+      integrationReceiptDigest
+    } = {}) {
+      if (!id || !manifestDigest
+        || !/^[a-f0-9]{64}$/.test(integrationReceiptDigest || "")) {
+        throw new CompanionError(
+          "E_USAGE",
+          "id, manifestDigest, and integrationReceiptDigest are required for verification."
+        );
+      }
+      assertBrokerMutationAuthority(principal, { root });
+      const job = ownedJob(id);
+      if (job.write !== true || !isWorkerTerminal(job) || job.status !== "completed") {
+        throw new CompanionError(
+          "E_JOB_ACTIVE",
+          "Write worker is not ready for integration verification."
+        );
+      }
+      if (currentWriteLifecycleCapabilityDigest()
+        !== writeLifecycleCapabilityDigest) {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "The write-lifecycle capability changed before integration verification."
+        );
+      }
+      if (typeof verifyWriteIntegration !== "function") {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "The production integration verifier is unavailable."
+        );
+      }
+      return verifyWriteIntegration({
+        root,
+        principal,
+        workerId: id,
+        manifestDigest,
+        integrationReceiptDigest,
+        env
+      });
+    },
+
+    async abandon({
+      id,
+      manifestDigest,
+      integrationReceiptDigest,
+      idempotencyKey
+    } = {}) {
+      if (!id || !manifestDigest || !idempotencyKey) {
+        throw new CompanionError(
+          "E_USAGE",
+          "id, manifestDigest, and idempotencyKey are required for abandon."
+        );
+      }
+      if (integrationReceiptDigest !== undefined
+        && integrationReceiptDigest !== null) {
+        throw new CompanionError(
+          "E_USAGE",
+          "Write abandon forbids integrationReceiptDigest."
+        );
+      }
+      assertBrokerMutationAuthority(principal, { root });
+      const job = ownedJob(id);
+      if (job.write !== true || !isWorkerTerminal(job) || job.status !== "completed") {
+        throw new CompanionError(
+          "E_JOB_ACTIVE",
+          "Write worker is not ready for abandon."
+        );
+      }
+      if (typeof abandonWriteArtifact !== "function"
+        || typeof runCloseEffect !== "function"
+        || typeof runRemoveEffect !== "function") {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "The production abandon controller is unavailable."
+        );
+      }
+      return abandonWriteArtifact({
+        root,
+        principal,
+        workerId: id,
+        manifestDigest,
+        idempotencyKey,
+        env,
+        runCloseEffect,
+        deleteProviderSession: deleteProviderSession || (({
+          providerSessionId
+        }) => deleteOwnedProviderSession({
+          root,
+          principal,
+          workerId: id,
+          providerSessionId,
+          env
+        })),
+        inspectProviderSession: inspectProviderSession || (({
+          providerSessionId
+        }) => inspectOwnedProviderSession({
+          root,
+          principal,
+          workerId: id,
+          providerSessionId,
+          env
+        })),
+        runRemoveEffect
       });
     },
 

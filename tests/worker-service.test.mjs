@@ -462,6 +462,87 @@ test("worker service derives integrated versus discarded cleanup only from the e
   assert.equal(cleanupCalls, 2);
 });
 
+test("worker service binds preview, current verification, and abandon to one completed write artifact", async () => {
+  const root = initRepo();
+  const principal = resolveWorkerAuthority(metadata(root), { mutation: true });
+  const job = record("task-acacacacacacacac", THREAD_A, {
+    write: true,
+    status: "completed",
+    phase: "done",
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: true
+    }
+  });
+  const manifestDigest = "a".repeat(64);
+  const integrationReceiptDigest = "b".repeat(64);
+  const captured = [];
+  const service = createWorkerService({
+    root,
+    principal,
+    readJob: () => job,
+    listJobs: () => [job],
+    writeLifecycleCapabilityDigest: "c".repeat(64),
+    previewWriteArtifact(args) {
+      captured.push(["preview", args]);
+      return { operation: "preview", classification: "unchanged" };
+    },
+    verifyWriteIntegration(args) {
+      captured.push(["verify", args]);
+      return { operation: "verify-integration", classification: "exact-effect" };
+    },
+    abandonWriteArtifact: async (args) => {
+      captured.push(["abandon", args]);
+      return {
+        receipt: { operation: "abandon", status: "absent" },
+        replayed: false
+      };
+    },
+    runCloseEffect: async () => {},
+    deleteProviderSession: async () => {},
+    inspectProviderSession: async () => ({ present: false }),
+    runRemoveEffect: async () => {}
+  });
+
+  assert.equal((await service.preview({
+    id: job.id,
+    manifestDigest
+  })).classification, "unchanged");
+  assert.equal((await service.verifyIntegration({
+    id: job.id,
+    manifestDigest,
+    integrationReceiptDigest
+  })).classification, "exact-effect");
+  const abandoned = await service.abandon({
+    id: job.id,
+    manifestDigest,
+    idempotencyKey: "service-abandon-0001"
+  });
+  assert.equal(abandoned.receipt.operation, "abandon");
+  assert.equal(captured[0][1].workerId, job.id);
+  assert.equal(captured[0][1].manifestDigest, manifestDigest);
+  assert.equal(
+    captured[1][1].integrationReceiptDigest,
+    integrationReceiptDigest
+  );
+  assert.equal(captured[2][1].workerId, job.id);
+  assert.equal(captured[2][1].manifestDigest, manifestDigest);
+  assert.equal(
+    Object.hasOwn(captured[2][1], "integrationReceiptDigest"),
+    false
+  );
+
+  await assert.rejects(
+    service.abandon({
+      id: job.id,
+      manifestDigest,
+      integrationReceiptDigest,
+      idempotencyKey: "service-abandon-confused"
+    }),
+    (error) => error?.code === "E_USAGE"
+  );
+});
+
 test("worker wait never starts a capability-bound job without the exact current receipt", async () => {
   const root = initRepo();
   const capabilityDigest = "a".repeat(64);

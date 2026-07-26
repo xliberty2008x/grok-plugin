@@ -36,7 +36,7 @@ export const SUPPORTED_MCP_PROTOCOL_VERSIONS = Object.freeze([
 export const DEFAULT_MCP_PROTOCOL_VERSION = "2025-11-25";
 export const WRITE_SMOKE_ENV_VALUE = "p3-p4-target-txt-v1";
 export const WRITE_SMOKE_CAPABILITY =
-  "official-acp-target-txt-owner-lifecycle-v2";
+  "official-acp-target-txt-owner-lifecycle-v3";
 
 const CURSOR_SCHEMA = {
   type: "object",
@@ -265,10 +265,64 @@ export const WORKER_ARTIFACT_TOOL = deepFreeze({
   annotations: READ_ONLY_ANNOTATIONS
 });
 
+export const WORKER_PREVIEW_TOOL = deepFreeze({
+  name: "worker_preview",
+  title: "Preview a target.txt worker integration",
+  description: "Recompute an owner-authorized, non-applying preview of one exact completed target.txt artifact against the current parent checkout.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["id", "manifestDigest"],
+    properties: {
+      id: WORKER_ID_SCHEMA,
+      manifestDigest: { type: "string", minLength: 64, maxLength: 64 }
+    }
+  },
+  annotations: READ_ONLY_ANNOTATIONS
+});
+
 export const WORKER_INTEGRATE_TOOL = deepFreeze({
   name: "worker_integrate",
   title: "Integrate a target.txt worker artifact",
   description: "Apply one exact owned target.txt artifact through the official Grok Build worktree API, then independently verify the parent checkout.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["id", "manifestDigest", "idempotencyKey"],
+    properties: {
+      id: WORKER_ID_SCHEMA,
+      manifestDigest: { type: "string", minLength: 64, maxLength: 64 },
+      idempotencyKey: { type: "string", minLength: 8, maxLength: 256 }
+    }
+  },
+  annotations: CANCEL_ANNOTATIONS
+});
+
+export const WORKER_VERIFY_INTEGRATION_TOOL = deepFreeze({
+  name: "worker_verify_integration",
+  title: "Verify a target.txt worker integration",
+  description: "Recompute the current exact parent effect for one owner-authorized durable integration receipt.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["id", "manifestDigest", "integrationReceiptDigest"],
+    properties: {
+      id: WORKER_ID_SCHEMA,
+      manifestDigest: { type: "string", minLength: 64, maxLength: 64 },
+      integrationReceiptDigest: {
+        type: "string",
+        minLength: 64,
+        maxLength: 64
+      }
+    }
+  },
+  annotations: READ_ONLY_ANNOTATIONS
+});
+
+export const WORKER_ABANDON_TOOL = deepFreeze({
+  name: "worker_abandon",
+  title: "Abandon a completed target.txt worker",
+  description: "Idempotently retain the immutable artifact while closing and deleting the exact session and officially removing only a proven non-applied managed worktree.",
   inputSchema: {
     type: "object",
     additionalProperties: false,
@@ -318,7 +372,10 @@ export const WRITE_SMOKE_WORKER_TOOLS = deepFreeze([
   ...WORKER_TOOLS.slice(0, -1),
   WORKER_SPAWN_WRITE_TOOL,
   WORKER_ARTIFACT_TOOL,
+  WORKER_PREVIEW_TOOL,
   WORKER_INTEGRATE_TOOL,
+  WORKER_VERIFY_INTEGRATION_TOOL,
+  WORKER_ABANDON_TOOL,
   WORKER_CLEANUP_TOOL,
   WORKER_TOOLS.at(-1)
 ]);
@@ -327,7 +384,10 @@ const MUTATION_AUTHORITY_TOOLS = new Set([
   "worker_wait",
   "worker_spawn",
   "worker_spawn_write",
+  "worker_preview",
   "worker_integrate",
+  "worker_verify_integration",
+  "worker_abandon",
   "worker_cleanup",
   "worker_decide_host_action",
   "worker_followup",
@@ -365,7 +425,10 @@ function writeSmokeCapabilityDigest(providerCapabilityDigest, providerLaunchBind
     tools: [
       WORKER_SPAWN_WRITE_TOOL.name,
       WORKER_ARTIFACT_TOOL.name,
+      WORKER_PREVIEW_TOOL.name,
       WORKER_INTEGRATE_TOOL.name,
+      WORKER_VERIFY_INTEGRATION_TOOL.name,
+      WORKER_ABANDON_TOOL.name,
       WORKER_CLEANUP_TOOL.name
     ],
     targetPath: WRITE_VERTICAL_TARGET_PATH,
@@ -535,7 +598,21 @@ function publicError(error) {
     E_POLICY: "Policy violation.",
     E_BROKER: "Worker broker request failed."
   };
-  return { code, message: messages[code] };
+  const projected = { code, message: messages[code] };
+  const integrationClassifications = new Set([
+    "unchanged",
+    "exact-effect",
+    "drift",
+    "blocked",
+    "apply-ambiguous"
+  ]);
+  if (code === "E_INTEGRATION"
+    && integrationClassifications.has(error?.details?.classification)) {
+    projected.details = {
+      classification: error.details.classification
+    };
+  }
+  return projected;
 }
 
 function toolResult(payload, isError = false) {
@@ -570,7 +647,10 @@ export async function callWorkerTool(params, options = {}) {
       "worker_spawn",
       "worker_spawn_write",
       "worker_artifact",
+      "worker_preview",
       "worker_integrate",
+      "worker_verify_integration",
+      "worker_abandon",
       "worker_cleanup",
       "worker_decide_host_action",
       "worker_followup",
@@ -589,7 +669,13 @@ export async function callWorkerTool(params, options = {}) {
       message: "Required worker broker capability is unavailable."
     }, true);
   }
-  if (["worker_spawn_write", "worker_artifact", "worker_integrate"].includes(name)
+  if ([
+    "worker_spawn_write",
+    "worker_artifact",
+    "worker_preview",
+    "worker_integrate",
+    "worker_verify_integration"
+  ].includes(name)
     && currentWriteLifecycleCapabilityDigest(runtime, options) === null) {
     return toolResult({
       code: "E_CAPABILITY",
@@ -648,6 +734,14 @@ export async function callWorkerTool(params, options = {}) {
         artifact: service.artifact(args.id, { part: args.part || "metadata" })
       });
     }
+    if (name === "worker_preview") {
+      return toolResult({
+        preview: await service.preview({
+          id: args.id,
+          manifestDigest: args.manifestDigest
+        })
+      });
+    }
     if (name === "worker_integrate") {
       const integrated = await service.integrate({
         id: args.id,
@@ -657,6 +751,26 @@ export async function callWorkerTool(params, options = {}) {
       return toolResult({
         receipt: integrated.receipt,
         replayed: integrated.replayed
+      });
+    }
+    if (name === "worker_verify_integration") {
+      return toolResult({
+        verification: await service.verifyIntegration({
+          id: args.id,
+          manifestDigest: args.manifestDigest,
+          integrationReceiptDigest: args.integrationReceiptDigest
+        })
+      });
+    }
+    if (name === "worker_abandon") {
+      const abandoned = await service.abandon({
+        id: args.id,
+        manifestDigest: args.manifestDigest,
+        idempotencyKey: args.idempotencyKey
+      });
+      return toolResult({
+        receipt: abandoned.receipt,
+        replayed: abandoned.replayed
       });
     }
     if (name === "worker_cleanup") {

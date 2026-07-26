@@ -204,7 +204,7 @@ test("MCP broker advertises sandbox metadata, pins protocol versions, and lists 
   assert.match(wait.description, /recovery maintenance/);
 });
 
-test("write-smoke owner lifecycle exposes only digest-bound integrate and cleanup mutations", () => {
+test("write-smoke owner lifecycle exposes bounded preview, integrate, verify, abandon, and cleanup operations", () => {
   assert.deepEqual(
     WRITE_SMOKE_RUNTIME.tools.map((tool) => tool.name),
     [
@@ -219,13 +219,16 @@ test("write-smoke owner lifecycle exposes only digest-bound integrate and cleanu
       "worker_send",
       "worker_spawn_write",
       "worker_artifact",
+      "worker_preview",
       "worker_integrate",
+      "worker_verify_integration",
+      "worker_abandon",
       "worker_cleanup",
       "worker_cancel"
     ]
   );
   assert.deepEqual(WRITE_SMOKE_RUNTIME.tools, WRITE_SMOKE_WORKER_TOOLS);
-  for (const name of ["worker_integrate", "worker_cleanup"]) {
+  for (const name of ["worker_integrate", "worker_abandon", "worker_cleanup"]) {
     const tool = WRITE_SMOKE_RUNTIME.tools.find((entry) => entry.name === name);
     assert.equal(tool.annotations.readOnlyHint, false);
     assert.equal(tool.annotations.destructiveHint, true);
@@ -243,6 +246,31 @@ test("write-smoke owner lifecycle exposes only digest-bound integrate and cleanu
       assert.equal(schema.includes(`\"${forbidden}\"`), false);
     }
   }
+  for (const name of ["worker_preview", "worker_verify_integration"]) {
+    const tool = WRITE_SMOKE_RUNTIME.tools.find((entry) => entry.name === name);
+    assert.equal(tool.annotations.readOnlyHint, true);
+    assert.equal(tool.annotations.destructiveHint, false);
+    assert.equal(tool.annotations.idempotentHint, true);
+    assert.equal(tool.annotations.openWorldHint, false);
+  }
+  const verification = WRITE_SMOKE_RUNTIME.tools.find(
+    (entry) => entry.name === "worker_verify_integration"
+  );
+  assert.deepEqual(
+    verification.inputSchema.required,
+    ["id", "manifestDigest", "integrationReceiptDigest"]
+  );
+  const abandon = WRITE_SMOKE_RUNTIME.tools.find(
+    (entry) => entry.name === "worker_abandon"
+  );
+  assert.deepEqual(
+    abandon.inputSchema.required,
+    ["id", "manifestDigest", "idempotencyKey"]
+  );
+  assert.equal(
+    Object.hasOwn(abandon.inputSchema.properties, "integrationReceiptDigest"),
+    false
+  );
   const cleanup = WRITE_SMOKE_RUNTIME.tools.find(
     (entry) => entry.name === "worker_cleanup"
   );
@@ -298,7 +326,10 @@ test("frozen broker runtime cannot be widened and hidden operations never reach 
   for (const [name, runtime, expectedCode] of [
     ["worker_send", BASE_RUNTIME, "E_CAPABILITY"],
     ["worker_spawn", BASE_RUNTIME, "E_CAPABILITY"],
+    ["worker_preview", SPAWN_RUNTIME, "E_CAPABILITY"],
     ["worker_integrate", SPAWN_RUNTIME, "E_CAPABILITY"],
+    ["worker_verify_integration", SPAWN_RUNTIME, "E_CAPABILITY"],
+    ["worker_abandon", SPAWN_RUNTIME, "E_CAPABILITY"],
     ["worker_cleanup", SPAWN_RUNTIME, "E_CAPABILITY"],
     ["worker_decide_host_action", BASE_RUNTIME, "E_CAPABILITY"],
     ["worker_followup", BASE_RUNTIME, "E_CAPABILITY"]
@@ -711,6 +742,119 @@ test("MCP exposes only bounded host-action decisions and grant-bound follow-up h
     acceptedAt: "2026-07-23T00:00:00.000Z"
   });
   assert.equal(JSON.stringify(sent).includes("Check the second condition"), false);
+});
+
+test("MCP routes preview, receipt-bound verify, and abandon without public private state", async () => {
+  const calls = [];
+  const options = {
+    runtime: WRITE_SMOKE_RUNTIME,
+    env: {
+      ...process.env,
+      GROK_COMPANION_WRITE_SMOKE: WRITE_SMOKE_ENV_VALUE
+    },
+    readProviderCapabilityReceipt: () => SPAWN_RECEIPT,
+    resolveAuthority: () => PRINCIPAL,
+    createService: () => ({
+      preview(args) {
+        calls.push(["preview", args]);
+        return { operation: "preview", classification: "unchanged" };
+      },
+      verifyIntegration(args) {
+        calls.push(["verify", args]);
+        return { operation: "verify-integration", classification: "exact-effect" };
+      },
+      async abandon(args) {
+        calls.push(["abandon", args]);
+        return {
+          receipt: { operation: "abandon", status: "absent" },
+          replayed: false
+        };
+      }
+    })
+  };
+  const id = "task-aaaaaaaaaaaaaaaa";
+  const manifestDigest = "b".repeat(64);
+  const integrationReceiptDigest = "c".repeat(64);
+  const previewed = await callWorkerTool({
+    name: "worker_preview",
+    arguments: { id, manifestDigest }
+  }, options);
+  const verified = await callWorkerTool({
+    name: "worker_verify_integration",
+    arguments: { id, manifestDigest, integrationReceiptDigest }
+  }, options);
+  const abandoned = await callWorkerTool({
+    name: "worker_abandon",
+    arguments: {
+      id,
+      manifestDigest,
+      idempotencyKey: "mcp-abandon-0001"
+    }
+  }, options);
+  assert.deepEqual(calls, [
+    ["preview", { id, manifestDigest }],
+    ["verify", { id, manifestDigest, integrationReceiptDigest }],
+    ["abandon", {
+      id,
+      manifestDigest,
+      idempotencyKey: "mcp-abandon-0001"
+    }]
+  ]);
+  assert.equal(previewed.structuredContent.preview.classification, "unchanged");
+  assert.equal(
+    verified.structuredContent.verification.classification,
+    "exact-effect"
+  );
+  assert.equal(abandoned.structuredContent.receipt.operation, "abandon");
+  assert.equal(JSON.stringify([previewed, verified, abandoned]).includes("sessionId"), false);
+});
+
+test("MCP exposes only an allowlisted integration classification", async () => {
+  let classification = "drift";
+  const options = {
+    runtime: WRITE_SMOKE_RUNTIME,
+    env: {
+      ...process.env,
+      GROK_COMPANION_WRITE_SMOKE: WRITE_SMOKE_ENV_VALUE
+    },
+    readProviderCapabilityReceipt: () => SPAWN_RECEIPT,
+    resolveAuthority: () => PRINCIPAL,
+    createService: () => ({
+      async integrate() {
+        const error = new Error("Leaked /private/repository xai-secret");
+        error.code = "E_INTEGRATION";
+        error.details = {
+          classification,
+          path: "/private/repository",
+          sessionId: "xai-secret"
+        };
+        throw error;
+      }
+    })
+  };
+  const request = {
+    name: "worker_integrate",
+    arguments: {
+      id: "task-aaaaaaaaaaaaaaaa",
+      manifestDigest: "b".repeat(64),
+      idempotencyKey: "typed-conflict-0001"
+    }
+  };
+  const typed = await callWorkerTool(request, options);
+  assert.deepEqual(typed.structuredContent.error, {
+    code: "E_INTEGRATION",
+    message: "Integration validation failed.",
+    details: { classification: "drift" }
+  });
+  assert.equal(JSON.stringify(typed).includes("/private/repository"), false);
+  assert.equal(JSON.stringify(typed).includes("xai-secret"), false);
+
+  classification = "private/path";
+  const bounded = await callWorkerTool(request, options);
+  assert.deepEqual(bounded.structuredContent.error, {
+    code: "E_INTEGRATION",
+    message: "Integration validation failed."
+  });
 });
 
 test("MCP broker routes owned reads and allowlists errors without private details", async () => {

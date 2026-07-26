@@ -7,8 +7,11 @@ import { pathToFileURL } from "node:url";
 
 import { resolveWorkerAuthority } from "../plugins/grok/scripts/lib/worker-authority.mjs";
 import {
+  abandonWriteWorker,
   cleanupWriteWorker,
-  integrateWriteWorker
+  integrateWriteWorker,
+  previewWriteWorker,
+  verifyWriteWorkerIntegration
 } from "../plugins/grok/scripts/lib/worker-owner-lifecycle.mjs";
 import { writeJob } from "../plugins/grok/scripts/lib/state.mjs";
 import {
@@ -21,7 +24,8 @@ import {
   createWorkerWorktree,
   expectedWorkerWorktreeRoot,
   inspectWriteVerticalIntegration,
-  persistWriteWorkerArtifact
+  persistWriteWorkerArtifact,
+  readWriteWorkerArtifact
 } from "../plugins/grok/scripts/lib/worker-worktree.mjs";
 import { git, initRepo, tempDir } from "./helpers.mjs";
 
@@ -454,6 +458,15 @@ function discardCleanupArguments(fixture, overrides = {}) {
   };
 }
 
+function abandonArguments(fixture, overrides = {}) {
+  return {
+    ...discardCleanupArguments(fixture),
+    manifestDigest: fixture.artifact.record.manifestDigest,
+    idempotencyKey: `abandon-${fixture.workerId}`,
+    ...overrides
+  };
+}
+
 test("host integration observer distinguishes unchanged, exact effect, and drift", () => {
   const root = initRepo();
   fs.writeFileSync(path.join(root, "target.txt"), "before\n");
@@ -535,6 +548,119 @@ test("integration persists exact host proof and same-key replay keeps receipt by
   assert.equal(fs.lstatSync(registry).mode & 0o777, 0o600);
 });
 
+test("same-process parent operations queue without blocking the event loop", async (t) => {
+  const fixture = terminalWriteFixture(t, "async-parent-queue");
+  let markEffectEntered;
+  let releaseEffect;
+  const effectEntered = new Promise((resolve) => {
+    markEffectEntered = resolve;
+  });
+  const effectRelease = new Promise((resolve) => {
+    releaseEffect = resolve;
+  });
+  const order = [];
+  const integration = integrateWriteWorker(integrationArguments(fixture, {
+    runIntegrationEffect: async () => {
+      order.push("integration-entered");
+      markEffectEntered();
+      await effectRelease;
+      fs.writeFileSync(
+        path.join(fixture.root, "target.txt"),
+        fixture.artifact.content
+      );
+      order.push("integration-released");
+      return { status: "applied" };
+    }
+  }));
+  await effectEntered;
+
+  let previewSettled = false;
+  const preview = previewWriteWorker({
+    root: fixture.root,
+    principal: fixture.principal,
+    workerId: fixture.workerId,
+    manifestDigest: fixture.artifact.record.manifestDigest,
+    env: fixture.env
+  }).then((value) => {
+    previewSettled = true;
+    order.push("preview-settled");
+    return value;
+  });
+
+  let eventLoopAdvanced = false;
+  await new Promise((resolve) => {
+    setImmediate(() => {
+      eventLoopAdvanced = true;
+      resolve();
+    });
+  });
+  assert.equal(eventLoopAdvanced, true);
+  assert.equal(previewSettled, false);
+
+  releaseEffect();
+  const [integrated, observed] = await Promise.all([integration, preview]);
+  assert.equal(integrated.receipt.status, "verified");
+  assert.equal(observed.status, "already-applied");
+  assert.equal(observed.classification, "exact-effect");
+  assert.deepEqual(order, [
+    "integration-entered",
+    "integration-released",
+    "preview-settled"
+  ]);
+});
+
+test("preview is non-applying and current verification is bound to the durable integration receipt", async (t) => {
+  const fixture = terminalWriteFixture(t, "preview-verify");
+  const preview = await previewWriteWorker({
+    root: fixture.root,
+    principal: fixture.principal,
+    workerId: fixture.workerId,
+    manifestDigest: fixture.artifact.record.manifestDigest,
+    env: fixture.env
+  });
+  assert.equal(preview.operation, "preview");
+  assert.equal(preview.status, "ready");
+  assert.equal(preview.classification, "unchanged");
+  assert.equal(preview.autoApplied, false);
+  assert.equal(
+    fs.readFileSync(path.join(fixture.root, "target.txt"), "utf8"),
+    "before\n"
+  );
+  assert.equal(JSON.stringify(preview).includes(fixture.root), false);
+  assert.equal(JSON.stringify(preview).includes(fixture.job.grokSessionId), false);
+
+  const integrated = await integrateWriteWorker(integrationArguments(fixture));
+  const verified = await verifyWriteWorkerIntegration({
+    root: fixture.root,
+    principal: fixture.principal,
+    workerId: fixture.workerId,
+    manifestDigest: fixture.artifact.record.manifestDigest,
+    integrationReceiptDigest: integrated.receipt.receiptDigest,
+    env: fixture.env
+  });
+  assert.equal(verified.operation, "verify-integration");
+  assert.equal(verified.status, "verified");
+  assert.equal(verified.classification, "exact-effect");
+  assert.equal(
+    verified.integrationReceiptDigest,
+    integrated.receipt.receiptDigest
+  );
+  assert.equal(JSON.stringify(verified).includes(fixture.root), false);
+  assert.equal(JSON.stringify(verified).includes(fixture.job.grokSessionId), false);
+
+  await assert.rejects(
+    verifyWriteWorkerIntegration({
+      root: fixture.root,
+      principal: fixture.principal,
+      workerId: fixture.workerId,
+      manifestDigest: fixture.artifact.record.manifestDigest,
+      integrationReceiptDigest: "a".repeat(64),
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_INTEGRATION"
+  );
+});
+
 test("integration adopts exact effect after provider response loss and blocks parent drift", async (t) => {
   const adopted = terminalWriteFixture(t, "response-loss");
   const result = await integrateWriteWorker(integrationArguments(adopted, {
@@ -556,6 +682,137 @@ test("integration adopts exact effect after provider response loss and blocks pa
     (error) => error?.code === "E_INTEGRATION"
       && error?.details?.classification === "drift"
   );
+  const registry = JSON.parse(fs.readFileSync(path.join(
+    workspaceState(drifted.root, drifted.env),
+    "owner-lifecycle",
+    "registry.json"
+  ), "utf8"));
+  assert.equal(registry.records[drifted.workerId].integration.state, "blocked");
+  assert.equal(registry.records[drifted.workerId].integration.attempts, 0);
+  assert.equal(
+    registry.records[drifted.workerId].integration.error.classification,
+    "drift"
+  );
+});
+
+test("completed abandon retains the immutable artifact after a durable non-applied conflict and replays", async (t) => {
+  const fixture = terminalWriteFixture(t, "abandon-conflict");
+  fs.writeFileSync(path.join(fixture.root, "tracked.txt"), "foreign\n");
+  await assert.rejects(
+    integrateWriteWorker(integrationArguments(fixture)),
+    (error) => error?.code === "E_INTEGRATION"
+      && error?.details?.classification === "drift"
+  );
+
+  let sessionPresent = true;
+  let closeCalls = 0;
+  let deleteCalls = 0;
+  let removeCalls = 0;
+  const args = abandonArguments(fixture, {
+    runCloseEffect: async () => {
+      closeCalls += 1;
+      return { status: "closed" };
+    },
+    inspectProviderSession: async () => ({ present: sessionPresent }),
+    deleteProviderSession: async () => {
+      deleteCalls += 1;
+      sessionPresent = false;
+      return { deleted: true };
+    },
+    runRemoveEffect: async () => {
+      removeCalls += 1;
+      git(
+        fixture.root,
+        "worktree",
+        "remove",
+        "--force",
+        fixture.worktree.executionRoot
+      );
+      return { status: "removed" };
+    }
+  });
+  const abandoned = await abandonWriteWorker(args);
+  fixture.markRemoved();
+  assert.equal(abandoned.replayed, false);
+  assert.equal(abandoned.receipt.operation, "abandon");
+  assert.equal(abandoned.receipt.status, "absent");
+  assert.equal(abandoned.receipt.disposition, "abandoned");
+  assert.equal(abandoned.receipt.integrationReceiptDigest, null);
+  assert.equal(
+    abandoned.receipt.artifactRecordDigest,
+    fixture.artifact.record.recordDigest
+  );
+  assert.equal(closeCalls, 1);
+  assert.equal(deleteCalls, 1);
+  assert.equal(removeCalls, 1);
+  assert.equal(
+    fs.readFileSync(path.join(fixture.root, "tracked.txt"), "utf8"),
+    "foreign\n"
+  );
+  const retained = readWriteWorkerArtifact({
+    controlRoot: fixture.root,
+    workerId: fixture.workerId,
+    expectedManifestDigest: fixture.artifact.record.manifestDigest,
+    env: fixture.env
+  });
+  assert.equal(retained.record.recordDigest, fixture.artifact.record.recordDigest);
+  assert.equal(JSON.stringify(abandoned.receipt).includes(fixture.root), false);
+  assert.equal(
+    JSON.stringify(abandoned.receipt).includes(fixture.job.grokSessionId),
+    false
+  );
+
+  const replay = await abandonWriteWorker({
+    ...args,
+    runCloseEffect: async () => { throw new Error("must not close"); },
+    deleteProviderSession: async () => { throw new Error("must not delete"); },
+    inspectProviderSession: async () => { throw new Error("must not inspect"); },
+    runRemoveEffect: async () => { throw new Error("must not remove"); }
+  });
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.receipt, abandoned.receipt);
+});
+
+test("completed abandon rejects exact effects and every attempted apply before cleanup effects", async (t) => {
+  let effects = 0;
+  const effect = async () => {
+    effects += 1;
+    throw new Error("cleanup effect must not run");
+  };
+
+  const exact = terminalWriteFixture(t, "abandon-exact");
+  fs.writeFileSync(path.join(exact.root, "target.txt"), exact.artifact.content);
+  await assert.rejects(
+    abandonWriteWorker(abandonArguments(exact, {
+      runCloseEffect: effect,
+      deleteProviderSession: effect,
+      inspectProviderSession: effect,
+      runRemoveEffect: effect
+    })),
+    (error) => error?.code === "E_INTEGRATION"
+      && error?.details?.classification === "exact-effect"
+  );
+
+  const attempted = terminalWriteFixture(t, "abandon-attempted");
+  await assert.rejects(
+    integrateWriteWorker(integrationArguments(attempted, {
+      runIntegrationEffect: async () => {
+        throw new Error("apply response lost before observable effect");
+      }
+    })),
+    (error) => error?.code === "E_INTEGRATION"
+  );
+  await assert.rejects(
+    abandonWriteWorker(abandonArguments(attempted, {
+      runCloseEffect: effect,
+      deleteProviderSession: effect,
+      inspectProviderSession: effect,
+      runRemoveEffect: effect
+    })),
+    (error) => error?.code === "E_INTEGRATION"
+      && error?.details?.classification === "apply-ambiguous"
+  );
+  assert.equal(effects, 0);
 });
 
 test("foreign owner is rejected before malformed idempotency is examined", async (t) => {
