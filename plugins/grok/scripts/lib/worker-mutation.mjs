@@ -1758,6 +1758,80 @@ export function assertDispatchContract(job) {
   return role;
 }
 
+/**
+ * Revalidate the durable worker/provider boundary immediately before the
+ * detached provider bootstrap is prepared.
+ *
+ * The first provider generation (and every read worker) must still match the
+ * live accepted workspace context. A write worker's single report-format
+ * repair is different: generation 1 has already made the authorized scoped
+ * edit, so recomputing the acceptance-time dirty digest would reject the
+ * intended write. In that one exact state, retain the immutable consumed
+ * launch/execution binding and the attempt-bound rotation authorities instead.
+ */
+export function assertWorkerProviderLaunchPreparation(job, {
+  dispatchAttemptId = null,
+  dispatchFence = null,
+  providerGeneration = null,
+  env = process.env
+} = {}) {
+  if (job?.write !== true || providerGeneration !== 2) {
+    return assertDurableSpawnRequestBinding(job, env);
+  }
+
+  assertDispatchContract(job);
+  const spawn = job?.request?.spawn;
+  const dispatch = spawn?.dispatch;
+  const taskProfile = profileFor("task", true);
+  assertExecutionBinding(job.executionBinding, {
+    workerId: job.id,
+    controlWorkspaceId: job.controlWorkspaceId,
+    expectedExecutionRoot: spawn?.executionRoot,
+    bindingDigest: spawn?.executionBindingDigest,
+    scope: job.request?.envelope?.scope,
+    envelopeDigest: job.request?.envelope?.digest,
+    roleDigest: job.role?.digest,
+    profileDigest: stableDigest(taskProfile),
+    runtimeRolePolicyDigest: job.request?.runtimeRolePolicy?.digest,
+    admissionContextManifestId:
+      job.request?.admissionContextManifest?.manifestId,
+    admissionContextManifestDigest:
+      job.request?.admissionContextManifest?.digest,
+    providerCapabilityDigest: spawn?.writeLifecycleCapabilityDigest,
+    ownerDigest: writeAdmissionOwnerDigest(job.host)
+  });
+  const rotationIntent = assertProviderRotationIntentContract(job, dispatch);
+  const providerSpawnIntent = assertProviderSpawnIntentContract(
+    job,
+    dispatch,
+    { allowMissing: false }
+  );
+  const exactAuthorizedRepair = !terminalJob(job)
+    && isDispatchV2(dispatch)
+    && dispatch.state === "provider-started"
+    && dispatch.attemptId === dispatchAttemptId
+    && dispatch.fence === dispatchFence
+    && dispatch.providerGeneration === 1
+    && dispatch.nextProviderGeneration === 2
+    && rotationIntent?.status === "pending"
+    && rotationIntent.attemptId === dispatchAttemptId
+    && rotationIntent.dispatchFence === dispatchFence
+    && rotationIntent.baseProviderGeneration === 1
+    && rotationIntent.targetProviderGeneration === 2
+    && providerSpawnIntent.status === "pending"
+    && providerSpawnIntent.intentId === rotationIntent.intentId
+    && providerSpawnIntent.attemptId === dispatchAttemptId
+    && providerSpawnIntent.dispatchFence === dispatchFence
+    && providerSpawnIntent.providerGeneration === 2;
+  if (!exactAuthorizedRepair) {
+    throw new CompanionError(
+      "E_AUTH_REQUIRED",
+      "Write report-repair launch no longer matches its exact durable provider rotation."
+    );
+  }
+  return job;
+}
+
 export function assertNoRecoveryCleanupFence(job, operation = "advance worker dispatch") {
   if (job?.request?.spawn?.cleanupFence != null) {
     throw new CompanionError(

@@ -68,8 +68,8 @@ import {
 import { projectWorkerSnapshot } from "./lib/worker-protocol.mjs";
 import { CONTEXT_BINDING_MODE, verifyJobEffectivePrompt } from "./lib/worker-context.mjs";
 import {
-  assertDurableSpawnRequestBinding,
   assertDispatchContract,
+  assertWorkerProviderLaunchPreparation,
   authorizeWorkerProviderRotation,
   cancelWorker,
   cancellationNonce,
@@ -1002,7 +1002,11 @@ function assertProviderLaunchBinding(observed, expected) {
   return observed;
 }
 
-function assertExecutableWorkerBinding(job, { dispatchAttemptId = null } = {}) {
+function assertExecutableWorkerBinding(job, {
+  dispatchAttemptId = null,
+  dispatchFence = null,
+  providerGeneration = null
+} = {}) {
   const spawn = job?.request?.spawn;
   const hasBrokerBindingWitness = (
     job?.request?.contextBindingMode === CONTEXT_BINDING_MODE
@@ -1010,7 +1014,11 @@ function assertExecutableWorkerBinding(job, { dispatchAttemptId = null } = {}) {
     || Object.prototype.hasOwnProperty.call(spawn || {}, "idempotencyKeyDigest")
   );
   if (hasBrokerBindingWitness) {
-    return assertDurableSpawnRequestBinding(job);
+    return assertWorkerProviderLaunchPreparation(job, {
+      dispatchAttemptId,
+      dispatchFence,
+      providerGeneration
+    });
   }
   if (dispatchAttemptId) {
     return assertDispatchContract(job);
@@ -1712,7 +1720,11 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
         providerLaunch: {
           prepare: (observedLaunchBinding) => {
             const latest = readJob(root, id);
-            assertExecutableWorkerBinding(latest, { dispatchAttemptId });
+            assertExecutableWorkerBinding(latest, {
+              dispatchAttemptId,
+              dispatchFence,
+              providerGeneration
+            });
             assertProviderLaunchBinding(
               observedLaunchBinding,
               expectedProviderLaunchBinding
