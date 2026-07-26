@@ -15,6 +15,7 @@
     "test:installed-codex": "node --test tests/installed-codex.test.mjs",
     "test:protected-review": "node --test tests/worker-broker-protected-review.test.mjs",
     "test:installed-worker-mcp": "node scripts/test-installed-worker-mcp.mjs",
+    "test:installed-worker-mcp:two-writer": "node scripts/test-installed-worker-mcp.mjs --two-writer",
     "test:natural-codex": "node scripts/test-natural-codex.mjs",
     "codex:update-local": "node scripts/update-local-codex.mjs",
     "validate": "node scripts/validate.mjs",
