@@ -12,6 +12,7 @@ import {
 } from "./workspace.mjs";
 import { pluginDataRoot, sameHostSession } from "./host.mjs";
 import { assertExecutionBinding } from "./worker-execution-binding.mjs";
+import { expectedWorkerWorktreeRoot } from "./worker-worktree.mjs";
 
 const JOB_ID_PATTERN = /^(review|adversarial-review|task|stop-review)-[a-f0-9]{16,64}$/;
 const JOB_STATUSES = new Set(["queued", "running", "completed", "failed", "cancelled"]);
@@ -86,22 +87,38 @@ function activeJobIsWriter(job) {
   return ACTIVE.has(job.status);
 }
 
-function validProviderLineage(job) {
-  const lineage = job?.jobClass === "task"
-    ? job.request?.providerHomeId
-    : null;
-  return typeof lineage === "string"
+function providerLineage(job) {
+  if (job?.jobClass !== "task") {
+    return Object.freeze({ lineage: null, invalid: false });
+  }
+  const lineage = job.request?.providerHomeId;
+  const valid = typeof lineage === "string"
     && /^[a-zA-Z0-9._-]{1,80}$/.test(lineage)
-    ? lineage
-    : null;
+    && lineage !== "."
+    && lineage !== "..";
+  return Object.freeze({
+    lineage: valid ? lineage : null,
+    invalid: !valid
+  });
 }
 
-function admissionLease(job, control) {
-  const lineage = validProviderLineage(job);
+function admissionLease(job, control, env = process.env) {
+  const provider = providerLineage(job);
+  const lineage = provider.lineage;
+  if (provider.invalid) {
+    return Object.freeze({
+      kind: "global-writer",
+      lineage,
+      invalidLineage: true,
+      executionRoot: null,
+      executionRootDigest: null
+    });
+  }
   if (job?.write !== true) {
     return Object.freeze({
       kind: activeJobIsWriter(job) ? "global-writer" : "reader",
       lineage,
+      invalidLineage: false,
       executionRoot: null,
       executionRootDigest: null
     });
@@ -113,6 +130,7 @@ function admissionLease(job, control) {
     return Object.freeze({
       kind: "global-writer",
       lineage,
+      invalidLineage: false,
       executionRoot: null,
       executionRootDigest: null
     });
@@ -124,9 +142,18 @@ function admissionLease(job, control) {
       controlRoot: control.controlRoot,
       gitCommonDir: control.gitCommonDir
     });
+    const expectedExecutionRoot = expectedWorkerWorktreeRoot(
+      control.controlRoot,
+      job.id,
+      env
+    );
+    if (binding.expectedExecutionRoot !== expectedExecutionRoot) {
+      throw authoritativeJobStateError();
+    }
     return Object.freeze({
       kind: "managed-writer",
       lineage,
+      invalidLineage: false,
       executionRoot: binding.expectedExecutionRoot,
       executionRootDigest: binding.expectedExecutionRootDigest
     });
@@ -136,6 +163,7 @@ function admissionLease(job, control) {
     return Object.freeze({
       kind: "global-writer",
       lineage,
+      invalidLineage: false,
       executionRoot: null,
       executionRootDigest: null
     });
@@ -1074,15 +1102,21 @@ export function admitJob(root, job, env = process.env) {
 function admitJobUnlocked(root, job, env = process.env) {
   job = validateAuthoritativeJobCore(job, { expectedId: job?.id ?? null });
   const control = resolveControlWorkspace(root, env);
-  const requestedLease = admissionLease(job, control);
+  const requestedLease = admissionLease(job, control, env);
   const requestedLineage = requestedLease.lineage;
   let conflict = null;
   for (const candidate of listJobs(root, env)) {
-    const candidateLease = admissionLease(candidate, control);
+    const candidateLease = admissionLease(candidate, control, env);
     const candidateLineage = candidateLease.lineage;
     if (terminal(candidate)) {
       // A terminal task can still own transient credentials/profile files. Do
       // not admit a continuation that would share and race that cleanup.
+      if (candidate.schemaVersion === 3
+        && candidateLease.invalidLineage
+        && candidate.result?.taskRuntimeCleaned !== true) {
+        conflict = { candidate, candidateLease, kind: "global-writer" };
+        break;
+      }
       if (
         requestedLineage
         && candidateLineage === requestedLineage

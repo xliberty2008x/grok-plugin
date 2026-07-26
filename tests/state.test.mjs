@@ -28,10 +28,13 @@ import {
   createExecutionBinding
 } from "../plugins/grok/scripts/lib/worker-execution-binding.mjs";
 import {
+  expectedWorkerWorktreeRoot
+} from "../plugins/grok/scripts/lib/worker-worktree.mjs";
+import {
   resolveControlWorkspace,
   workspaceState
 } from "../plugins/grok/scripts/lib/workspace.mjs";
-import { initRepo, tempDir } from "./helpers.mjs";
+import { git, initRepo, tempDir } from "./helpers.mjs";
 
 const STATE_MODULE_URL = new URL("../plugins/grok/scripts/lib/state.mjs", import.meta.url).href;
 
@@ -125,10 +128,15 @@ function parentFingerprint() {
 
 function managedWriter(root, id, {
   env = process.env,
-  executionRoot = path.join(workspaceState(root, env), "lease-fixtures", id),
+  executionRoot = null,
   lineage = id
 } = {}) {
   const control = resolveControlWorkspace(root, env);
+  const boundExecutionRoot = executionRoot || expectedWorkerWorktreeRoot(
+    control.controlRoot,
+    id,
+    env
+  );
   const executionBinding = createExecutionBinding({
     workerId: id,
     controlWorkspaceId: control.controlWorkspaceId,
@@ -137,7 +145,7 @@ function managedWriter(root, id, {
     baseCommit: "1".repeat(40),
     baseTree: "2".repeat(40),
     parentFingerprint: parentFingerprint(),
-    expectedExecutionRoot: executionRoot,
+    expectedExecutionRoot: boundExecutionRoot,
     scope: { include: ["target.txt"], exclude: [] },
     envelopeDigest: sha256(`envelope:${id}`),
     roleDigest: sha256("role"),
@@ -159,6 +167,22 @@ function managedWriter(root, id, {
     controlWorkspaceId: control.controlWorkspaceId,
     executionBinding,
     request: { providerHomeId: lineage }
+  });
+}
+
+function taskReader(id, {
+  lineage = id,
+  omitLineage = false,
+  status = "running",
+  result = null
+} = {}) {
+  return job(id, {
+    schemaVersion: 3,
+    jobClass: "task",
+    write: false,
+    status,
+    request: omitLineage ? {} : { providerHomeId: lineage },
+    result
   });
 }
 
@@ -928,14 +952,8 @@ test("admission advances updatedAt without moving the creation heartbeat", () =>
 test("managed execution-root leases admit active writers on distinct roots and lineages", () => {
   const env = { ...process.env, CLAUDE_PLUGIN_DATA: tempDir("grok-state-data-") };
   const root = initRepo();
-  const first = managedWriter(root, generateId("task"), {
-    env,
-    lineage: "managed-lineage-a"
-  });
-  const second = managedWriter(root, generateId("task"), {
-    env,
-    lineage: "managed-lineage-b"
-  });
+  const first = managedWriter(root, generateId("task"), { env });
+  const second = managedWriter(root, generateId("task"), { env });
 
   assert.doesNotThrow(() => admitJob(root, first, env));
   assert.doesNotThrow(() => admitJob(root, second, env));
@@ -945,37 +963,102 @@ test("managed execution-root leases admit active writers on distinct roots and l
   );
 });
 
-test("managed execution-root leases reject same-root writers without exposing paths", () => {
+test("managed execution-root leases retain one control identity across linked worktree callers", (t) => {
   const env = { ...process.env, CLAUDE_PLUGIN_DATA: tempDir("grok-state-data-") };
   const root = initRepo();
-  const sharedRoot = path.join(workspaceState(root, env), "lease-fixtures", "shared-root");
-  const first = managedWriter(root, generateId("task"), {
-    env,
-    executionRoot: sharedRoot,
-    lineage: "managed-root-lineage-a"
+  const linkedPath = path.join(
+    path.dirname(root),
+    `${path.basename(root)}-linked-admission`
+  );
+  git(root, "worktree", "add", "--detach", linkedPath, "HEAD");
+  const linked = fs.realpathSync(linkedPath);
+  t.after(() => {
+    try { git(root, "worktree", "remove", "--force", linked); }
+    catch { fs.rmSync(linked, { recursive: true, force: true }); }
   });
-  const second = managedWriter(root, generateId("task"), {
+  const fromControl = managedWriter(root, generateId("task"), { env });
+  const fromLinked = managedWriter(linked, generateId("task"), { env });
+
+  assert.equal(
+    fromLinked.executionBinding.controlRoot,
+    fromControl.executionBinding.controlRoot
+  );
+  assert.equal(
+    fromLinked.executionBinding.expectedExecutionRoot,
+    expectedWorkerWorktreeRoot(root, fromLinked.id, env)
+  );
+  assert.doesNotThrow(() => admitJob(root, fromControl, env));
+  assert.doesNotThrow(() => admitJob(linked, fromLinked, env));
+  assert.deepEqual(
+    new Set(listJobs(linked, env).map((candidate) => candidate.id)),
+    new Set([fromControl.id, fromLinked.id])
+  );
+});
+
+test("self-consistent arbitrary execution roots retain the global writer fence", () => {
+  for (const corruptFirst of [true, false]) {
+    const env = { ...process.env, CLAUDE_PLUGIN_DATA: tempDir("grok-state-data-") };
+    const root = initRepo();
+    const corruptId = generateId("task");
+    const corruptRoot = path.join(
+      workspaceState(root, env),
+      "lease-fixtures",
+      corruptId
+    );
+    const corrupt = managedWriter(root, corruptId, {
+      env,
+      executionRoot: corruptRoot
+    });
+    const canonical = managedWriter(root, generateId("task"), { env });
+    const admitted = corruptFirst ? corrupt : canonical;
+    const blocked = corruptFirst ? canonical : corrupt;
+    admitJob(root, admitted, env);
+
+    assert.throws(
+      () => admitJob(root, blocked, env),
+      (error) => {
+        const publicConflict = JSON.stringify({
+          message: error?.message,
+          details: error?.details
+        });
+        return error?.code === "E_JOB_ACTIVE"
+          && error.details?.conflictKind === "global-writer"
+          && error.details?.conflictingJobId === admitted.id
+          && error.details?.conflictingExecutionRootDigest === null
+          && !publicConflict.includes(corruptRoot);
+      },
+      `corruptFirst=${corruptFirst}`
+    );
+  }
+});
+
+test("lexical aliases cannot claim a canonical managed execution-root lease", () => {
+  const env = { ...process.env, CLAUDE_PLUGIN_DATA: tempDir("grok-state-data-") };
+  const root = initRepo();
+  const stateRoot = workspaceState(root, env);
+  const aliasContainer = tempDir("grok-state-alias-");
+  const aliasStateRoot = path.join(aliasContainer, "control-state-link");
+  fs.symlinkSync(stateRoot, aliasStateRoot, "dir");
+  const aliasedId = generateId("task");
+  const canonicalRoot = expectedWorkerWorktreeRoot(root, aliasedId, env);
+  const aliasedRoot = path.join(
+    aliasStateRoot,
+    path.relative(stateRoot, canonicalRoot)
+  );
+  const aliased = managedWriter(root, aliasedId, {
     env,
-    executionRoot: sharedRoot,
-    lineage: "managed-root-lineage-b"
+    executionRoot: aliasedRoot
   });
-  admitJob(root, first, env);
+  const canonical = managedWriter(root, generateId("task"), { env });
+  assert.notEqual(aliasedRoot, canonicalRoot);
+  assert.equal(fs.realpathSync(aliasStateRoot), stateRoot);
+  admitJob(root, canonical, env);
 
   assert.throws(
-    () => admitJob(root, second, env),
-    (error) => {
-      const publicConflict = JSON.stringify({
-        message: error?.message,
-        details: error?.details
-      });
-      return error?.code === "E_JOB_ACTIVE"
-        && error.details?.conflictKind === "execution-root"
-        && error.details?.conflictingJobId === first.id
-        && error.details?.conflictingExecutionRootDigest
-          === first.executionBinding.expectedExecutionRootDigest
-        && error.details?.conflictingProviderHomeId === null
-        && !publicConflict.includes(sharedRoot);
-    }
+    () => admitJob(root, aliased, env),
+    (error) => error?.code === "E_JOB_ACTIVE"
+      && error.details?.conflictKind === "global-writer"
+      && error.details?.conflictingJobId === canonical.id
   );
 });
 
@@ -1081,6 +1164,91 @@ test("managed execution-root leases still serialize a shared provider lineage", 
       && error.details?.conflictingJobId === first.id
       && error.details?.conflictingProviderHomeId === "shared-managed-lineage"
   );
+});
+
+test("invalid or missing active task lineages retain the global fence in either order", () => {
+  const variants = [
+    {
+      name: "invalid",
+      create(id, status) {
+        return taskReader(id, { lineage: "same/invalid", status });
+      }
+    },
+    {
+      name: "missing",
+      create(id, status) {
+        return taskReader(id, { omitLineage: true, status });
+      }
+    }
+  ];
+
+  for (const variant of variants) {
+    for (const ambiguousFirst of [true, false]) {
+      const env = { ...process.env, CLAUDE_PLUGIN_DATA: tempDir("grok-state-data-") };
+      const root = initRepo();
+      const ambiguous = variant.create(generateId("task"), "running");
+      const ordinary = taskReader(generateId("task"), { status: "queued" });
+      const admitted = ambiguousFirst ? ambiguous : ordinary;
+      const blocked = ambiguousFirst ? ordinary : ambiguous;
+      admitJob(root, admitted, env);
+
+      assert.throws(
+        () => admitJob(root, blocked, env),
+        (error) => error?.code === "E_JOB_ACTIVE"
+          && error.details?.conflictKind === "global-writer"
+          && error.details?.conflictingJobId === admitted.id,
+        `${variant.name}:ambiguousFirst=${ambiguousFirst}`
+      );
+    }
+  }
+});
+
+test("terminal schema-3 tasks with ambiguous lineages fence until cleanup completes", () => {
+  const variants = [
+    {
+      name: "invalid",
+      create(id) {
+        return taskReader(id, {
+          lineage: "terminal/invalid",
+          status: "completed",
+          result: { taskRuntimeCleaned: false }
+        });
+      }
+    },
+    {
+      name: "missing",
+      create(id) {
+        return taskReader(id, {
+          omitLineage: true,
+          status: "completed",
+          result: { taskRuntimeCleaned: false }
+        });
+      }
+    }
+  ];
+
+  for (const variant of variants) {
+    const env = { ...process.env, CLAUDE_PLUGIN_DATA: tempDir("grok-state-data-") };
+    const root = initRepo();
+    const terminalJob = variant.create(generateId("task"));
+    writeJob(root, terminalJob, env);
+    const blocked = taskReader(generateId("task"), { status: "queued" });
+    assert.throws(
+      () => admitJob(root, blocked, env),
+      (error) => error?.code === "E_JOB_ACTIVE"
+        && error.details?.conflictKind === "global-writer"
+        && error.details?.conflictingJobId === terminalJob.id,
+      variant.name
+    );
+    updateJob(root, terminalJob.id, (current) => ({
+      ...current,
+      result: { ...current.result, taskRuntimeCleaned: true }
+    }), env);
+    assert.doesNotThrow(
+      () => admitJob(root, blocked, env),
+      `${variant.name}:cleaned`
+    );
+  }
 });
 
 test("workspace admission gives write jobs an exclusive lease", () => {
