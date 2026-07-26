@@ -46,6 +46,17 @@ function commonBindings() {
   };
 }
 
+function twoWriterBindings() {
+  return {
+    ...commonBindings(),
+    providerCapabilityDigest: digest("b"),
+    providerPinRef: `gpin-${"c".repeat(32)}`,
+    providerLaunchBindingDigest: digest("d"),
+    providerExecutableIdentityDigest: digest("e"),
+    writeLifecycleCapabilityDigest: digest("f")
+  };
+}
+
 function completionEvidence() {
   return {
     schemaVersion: 1,
@@ -138,7 +149,7 @@ function twoWriterEvidence() {
         contentDigest: digest("a"),
         readyObservationDigest: digest("b"),
         conflictObservationDigest: digest("c"),
-        conflictClassification: "parent-drift",
+        conflictClassification: "drift",
         rejectedIntegrationCode: "E_INTEGRATION",
         rejectedIntegrationMessageDigest: digest("d"),
         abandonReceiptDigest: digest("e")
@@ -146,7 +157,7 @@ function twoWriterEvidence() {
     },
     providerOverlap: {
       proven: true,
-      observedAt: 1_790_000_000_000,
+      observedAt: "2026-07-26T09:59:00.000Z",
       observationDigest: digest("f"),
       rootsDistinct: true
     },
@@ -173,7 +184,7 @@ function twoWriterEvidence() {
       guards: true,
       processes: true
     },
-    ...commonBindings()
+    ...twoWriterBindings()
   };
 }
 
@@ -197,6 +208,18 @@ test("Phase 3 live producer binds exact completion, cancellation, concurrency, c
   assert.equal(receipt.phase, "3");
   assert.equal(receipt.provider.implementation, "official-grok-build-acp");
   assert.equal(receipt.provider.version, "0.2.112");
+  assert.equal(
+    receipt.provider.completion.pinRef,
+    completion.providerPinRef
+  );
+  assert.equal(
+    receipt.provider.twoWriter.pinRef,
+    twoWriter.providerPinRef
+  );
+  assert.notEqual(
+    receipt.provider.completion.capabilityDigest,
+    receipt.provider.twoWriter.capabilityDigest
+  );
   assert.equal(receipt.completion.providerGeneration, 2);
   assert.deepEqual(receipt.gates, PHASE_THREE_LIVE_GATE_IDS);
   assert.equal(receipt.completion.workerId, completion.workerId);
@@ -205,7 +228,7 @@ test("Phase 3 live producer binds exact completion, cancellation, concurrency, c
     twoWriter.workers.a.executionRootDigest,
     twoWriter.workers.b.executionRootDigest
   ]);
-  assert.equal(receipt.conflict.classification, "parent-drift");
+  assert.equal(receipt.conflict.classification, "drift");
   assert.equal(receipt.conflict.errorCode, "E_INTEGRATION");
   assert.deepEqual(receipt.inputs.completion.projection, completion);
   assert.deepEqual(receipt.inputs.twoWriter.projection, twoWriter);
@@ -247,6 +270,9 @@ test("Phase 3 live inputs fail closed when any mandatory real-lifecycle gate is 
   const twoWriterMutations = [
     (value) => { value.providerOverlap.proven = false; },
     (value) => {
+      value.providerOverlap.observedAt = "2026-07-26T11:59:00.000+02:00";
+    },
+    (value) => {
       value.workers.b.executionRootDigest =
         value.workers.a.executionRootDigest;
     },
@@ -262,29 +288,23 @@ test("Phase 3 live inputs fail closed when any mandatory real-lifecycle gate is 
   }
 });
 
-test("Phase 3 live producer rejects mismatched source, install, provider, or capability identities", () => {
+test("Phase 3 live producer rejects mismatched stable source, install, or provider release identities", () => {
   for (const field of [
     "sourceHeadCommit",
     "sourceHeadTree",
     "sourceInventoryDigest",
     "sourcePluginInventoryDigest",
+    "installedPluginInventoryDigest",
     "installedEntrypointDigest",
     "providerVersion",
     "providerBinaryDigest",
-    "providerCapabilityDigest",
-    "providerPinRef",
-    "providerLaunchBindingDigest",
-    "providerExecutableIdentityDigest",
-    "providerReleaseIdentityDigest",
-    "writeLifecycleCapabilityDigest"
+    "providerReleaseIdentityDigest"
   ]) {
     const completion = completionEvidence();
     const twoWriter = twoWriterEvidence();
     twoWriter[field] = field === "providerVersion"
       ? "0.2.113"
-      : field === "providerPinRef"
-        ? `gpin-${"f".repeat(32)}`
-        : field.endsWith("Commit") || field.endsWith("Tree")
+      : field.endsWith("Commit") || field.endsWith("Tree")
           ? "f".repeat(40)
           : digest("f");
     assert.throws(
@@ -309,6 +329,17 @@ test("Phase 3 live receipt replay and immutable publication fail closed under ta
   tampered.conflict.classification = "ready";
   tampered.receiptDigest = computePhaseThreeLiveReceiptDigest(tampered);
   assert.equal(validatePhaseThreeLiveReceipt(tampered).ok, false);
+
+  const detachedProviderBinding = clone(receipt);
+  detachedProviderBinding.provider.twoWriter.pinRef =
+    `gpin-${"0".repeat(32)}`;
+  detachedProviderBinding.receiptDigest =
+    computePhaseThreeLiveReceiptDigest(detachedProviderBinding);
+  assert.equal(validatePhaseThreeLiveReceipt(detachedProviderBinding).ok, false);
+  assert.match(
+    validatePhaseThreeLiveReceipt(detachedProviderBinding).errors.join("\n"),
+    /projections do not match replayable inputs/i
+  );
 
   const weakenedInput = clone(receipt);
   weakenedInput.inputs.completion.projection.productionCleanupQualified = false;

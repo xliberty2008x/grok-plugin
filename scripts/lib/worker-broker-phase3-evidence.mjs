@@ -76,6 +76,17 @@ const COMMON_BINDING_FIELDS = Object.freeze([
   "ambientProviderDiscoveryPoisoned",
   "writeLifecycleCapabilityDigest"
 ]);
+const MATCHED_BINDING_FIELDS = Object.freeze([
+  "sourceHeadCommit",
+  "sourceHeadTree",
+  "sourceInventoryDigest",
+  "sourcePluginInventoryDigest",
+  "installedPluginInventoryDigest",
+  "installedEntrypointDigest",
+  "providerVersion",
+  "providerBinaryDigest",
+  "providerReleaseIdentityDigest"
+]);
 
 const COMPLETION_FIELDS = new Set([
   "schemaVersion",
@@ -244,6 +255,12 @@ function safeRuntimeId(value) {
   return typeof value === "string" && SAFE_ID.test(value);
 }
 
+function canonicalIsoTimestamp(value) {
+  return typeof value === "string"
+    && Number.isFinite(Date.parse(value))
+    && new Date(Date.parse(value)).toISOString() === value;
+}
+
 function allDigests(value, fields) {
   return fields.every((field) => SHA256.test(value?.[field] || ""));
 }
@@ -270,8 +287,8 @@ function validCommonBindings(evidence) {
     && evidence.ambientProviderDiscoveryPoisoned === true;
 }
 
-function matchingCommonBindings(left, right) {
-  return COMMON_BINDING_FIELDS.every((field) => (
+function matchingStableBindings(left, right) {
+  return MATCHED_BINDING_FIELDS.every((field) => (
     left?.[field] === right?.[field]
   ));
 }
@@ -409,8 +426,7 @@ export function validatePhaseThreeTwoWriterEvidence(evidence) {
   if (!exactFields(evidence?.providerOverlap, TWO_WRITER_OVERLAP_FIELDS)
     || evidence?.providerOverlap?.proven !== true
     || evidence?.providerOverlap?.rootsDistinct !== true
-    || !Number.isSafeInteger(evidence?.providerOverlap?.observedAt)
-    || evidence.providerOverlap.observedAt <= 0
+    || !canonicalIsoTimestamp(evidence?.providerOverlap?.observedAt)
     || !SHA256.test(evidence?.providerOverlap?.observationDigest || "")) {
     errors.push("Two-writer evidence does not prove simultaneous provider overlap.");
   }
@@ -427,9 +443,9 @@ export function validatePhaseThreeTwoWriterEvidence(evidence) {
     || evidence?.parent?.abandonNoEffect !== true) {
     errors.push("Two-writer parent isolation or rejected-effect evidence is invalid.");
   }
-  if (workerB?.conflictClassification !== "parent-drift"
+  if (workerB?.conflictClassification !== "drift"
     || workerB?.rejectedIntegrationCode !== "E_INTEGRATION") {
-    errors.push("Two-writer evidence lacks the typed parent-drift conflict.");
+    errors.push("Two-writer evidence lacks the typed drift conflict.");
   }
   if (!allTrue(evidence?.replay, TWO_WRITER_REPLAY_FIELDS)) {
     errors.push("Two-writer restart/replay evidence is incomplete.");
@@ -485,14 +501,26 @@ function projectReceipt(completion, twoWriter, recordedAt, root) {
       implementation: "official-grok-build-acp",
       version: completion.providerVersion,
       binaryDigest: completion.providerBinaryDigest,
-      capabilityDigest: completion.providerCapabilityDigest,
-      pinRef: completion.providerPinRef,
-      launchBindingDigest: completion.providerLaunchBindingDigest,
-      executableIdentityDigest: completion.providerExecutableIdentityDigest,
       releaseIdentityDigest: completion.providerReleaseIdentityDigest,
-      ambientDiscoveryPoisoned: true
+      completion: {
+        capabilityDigest: completion.providerCapabilityDigest,
+        pinRef: completion.providerPinRef,
+        launchBindingDigest: completion.providerLaunchBindingDigest,
+        executableIdentityDigest: completion.providerExecutableIdentityDigest,
+        writeLifecycleCapabilityDigest:
+          completion.writeLifecycleCapabilityDigest,
+        ambientDiscoveryPoisoned: true
+      },
+      twoWriter: {
+        capabilityDigest: twoWriter.providerCapabilityDigest,
+        pinRef: twoWriter.providerPinRef,
+        launchBindingDigest: twoWriter.providerLaunchBindingDigest,
+        executableIdentityDigest: twoWriter.providerExecutableIdentityDigest,
+        writeLifecycleCapabilityDigest:
+          twoWriter.writeLifecycleCapabilityDigest,
+        ambientDiscoveryPoisoned: true
+      }
     },
-    writeLifecycleCapabilityDigest: completion.writeLifecycleCapabilityDigest,
     inputs: {
       completion: {
         digest: computePhaseThreeLiveInputDigest(completion),
@@ -564,7 +592,7 @@ export function buildPhaseThreeLiveReceipt({
   const completion = validatePhaseThreeCompletionEvidence(completionEvidence);
   const twoWriter = validatePhaseThreeTwoWriterEvidence(twoWriterEvidence);
   if (!completion.ok || !twoWriter.ok
-    || !matchingCommonBindings(completionEvidence, twoWriterEvidence)
+    || !matchingStableBindings(completionEvidence, twoWriterEvidence)
     || typeof root !== "string"
     || !root
     || typeof strict !== "boolean"
@@ -602,7 +630,6 @@ const RECEIPT_FIELDS = new Set([
   "recordedAt",
   "source",
   "provider",
-  "writeLifecycleCapabilityDigest",
   "inputs",
   "completion",
   "cancellation",
@@ -625,11 +652,16 @@ const RECEIPT_PROVIDER_FIELDS = new Set([
   "implementation",
   "version",
   "binaryDigest",
+  "releaseIdentityDigest",
+  "completion",
+  "twoWriter"
+]);
+const RECEIPT_PROVIDER_RUN_FIELDS = new Set([
   "capabilityDigest",
   "pinRef",
   "launchBindingDigest",
   "executableIdentityDigest",
-  "releaseIdentityDigest",
+  "writeLifecycleCapabilityDigest",
   "ambientDiscoveryPoisoned"
 ]);
 const RECEIPT_INPUT_FIELDS = new Set([
@@ -702,15 +734,28 @@ function replayableInputsMatchReceipt(receipt) {
       implementation: "official-grok-build-acp",
       version: completion.providerVersion,
       binaryDigest: completion.providerBinaryDigest,
-      capabilityDigest: completion.providerCapabilityDigest,
-      pinRef: completion.providerPinRef,
-      launchBindingDigest: completion.providerLaunchBindingDigest,
-      executableIdentityDigest: completion.providerExecutableIdentityDigest,
       releaseIdentityDigest: completion.providerReleaseIdentityDigest,
-      ambientDiscoveryPoisoned: completion.ambientProviderDiscoveryPoisoned
+      completion: {
+        capabilityDigest: completion.providerCapabilityDigest,
+        pinRef: completion.providerPinRef,
+        launchBindingDigest: completion.providerLaunchBindingDigest,
+        executableIdentityDigest: completion.providerExecutableIdentityDigest,
+        writeLifecycleCapabilityDigest:
+          completion.writeLifecycleCapabilityDigest,
+        ambientDiscoveryPoisoned:
+          completion.ambientProviderDiscoveryPoisoned
+      },
+      twoWriter: {
+        capabilityDigest: twoWriter.providerCapabilityDigest,
+        pinRef: twoWriter.providerPinRef,
+        launchBindingDigest: twoWriter.providerLaunchBindingDigest,
+        executableIdentityDigest: twoWriter.providerExecutableIdentityDigest,
+        writeLifecycleCapabilityDigest:
+          twoWriter.writeLifecycleCapabilityDigest,
+        ambientDiscoveryPoisoned:
+          twoWriter.ambientProviderDiscoveryPoisoned
+      }
     })
-    && receipt.writeLifecycleCapabilityDigest
-      === completion.writeLifecycleCapabilityDigest
     && stableStringify(receipt.completion) === stableStringify({
       workerId: completion.workerId,
       providerGeneration: completion.providerGeneration,
@@ -798,18 +843,28 @@ export function validatePhaseThreeLiveReceipt(receipt, {
     errors.push("Phase-3 live receipt source/install identity is invalid.");
   }
   const provider = receipt?.provider;
+  const providerRuns = [
+    provider?.completion,
+    provider?.twoWriter
+  ];
   if (!exactFields(provider, RECEIPT_PROVIDER_FIELDS)
     || provider?.implementation !== "official-grok-build-acp"
     || !safeRuntimeId(provider?.version)
-    || !PIN_REF.test(provider?.pinRef || "")
     || !allDigests(provider, [
       "binaryDigest",
-      "capabilityDigest",
-      "launchBindingDigest",
-      "executableIdentityDigest",
       "releaseIdentityDigest"
     ])
-    || provider?.ambientDiscoveryPoisoned !== true) {
+    || providerRuns.some((run) => (
+      !exactFields(run, RECEIPT_PROVIDER_RUN_FIELDS)
+      || !PIN_REF.test(run?.pinRef || "")
+      || !allDigests(run, [
+        "capabilityDigest",
+        "launchBindingDigest",
+        "executableIdentityDigest",
+        "writeLifecycleCapabilityDigest"
+      ])
+      || run?.ambientDiscoveryPoisoned !== true
+    ))) {
     errors.push("Phase-3 live receipt provider identity is invalid.");
   }
   const inputs = receipt?.inputs;
@@ -819,15 +874,14 @@ export function validatePhaseThreeLiveReceipt(receipt, {
   const twoWriterInputValidation = validatePhaseThreeTwoWriterEvidence(
     inputs?.twoWriter?.projection
   );
-  if (!SHA256.test(receipt?.writeLifecycleCapabilityDigest || "")
-    || !exactFields(inputs, RECEIPT_INPUT_FIELDS)
+  if (!exactFields(inputs, RECEIPT_INPUT_FIELDS)
     || !exactFields(inputs?.completion, RECEIPT_INPUT_ENTRY_FIELDS)
     || !exactFields(inputs?.twoWriter, RECEIPT_INPUT_ENTRY_FIELDS)
     || !SHA256.test(inputs?.completion?.digest || "")
     || !SHA256.test(inputs?.twoWriter?.digest || "")
     || !completionInputValidation.ok
     || !twoWriterInputValidation.ok
-    || !matchingCommonBindings(
+    || !matchingStableBindings(
       inputs?.completion?.projection,
       inputs?.twoWriter?.projection
     )
@@ -870,12 +924,11 @@ export function validatePhaseThreeLiveReceipt(receipt, {
     || !twoDistinctDigests(concurrency?.executionRootDigests)
     || !twoDistinctDigests(concurrency?.providerProcessDigests)
     || !SHA256.test(concurrency?.overlapObservationDigest || "")
-    || !Number.isSafeInteger(concurrency?.observedAt)
-    || concurrency.observedAt <= 0) {
+    || !canonicalIsoTimestamp(concurrency?.observedAt)) {
     errors.push("Phase-3 live receipt concurrency projection is invalid.");
   }
   if (!exactFields(receipt?.conflict, RECEIPT_CONFLICT_FIELDS)
-    || receipt?.conflict?.classification !== "parent-drift"
+    || receipt?.conflict?.classification !== "drift"
     || receipt?.conflict?.errorCode !== "E_INTEGRATION"
     || !allDigests(receipt?.conflict, [
       "errorMessageDigest",
