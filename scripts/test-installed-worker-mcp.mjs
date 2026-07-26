@@ -4363,6 +4363,10 @@ async function waitForInstalledMailboxOpen(context, tracker) {
 function snapshotInstalledMailboxProof(context, tracker, terminalJob) {
   const attemptId = tracker.mailboxAttemptId;
   if (typeof attemptId !== "string") fail("E_PRIVATE_STATE");
+  const expectedFinalReportDigest =
+    terminalJob.result?.workerReport?.reportSource === "acp-structured"
+      ? terminalJob.result?.workerReport?.reportDigest
+      : terminalJob.result?.textDigest;
   let attempt;
   let messages;
   try {
@@ -4435,7 +4439,7 @@ function snapshotInstalledMailboxProof(context, tracker, terminalJob) {
     || terminalJob.result?.mailboxEvidence?.finalReportSequence !== 2
     || terminalJob.result?.mailboxEvidence?.finalReportDigest
       !== attempt.finalReportDigest
-    || attempt.finalReportDigest !== terminalJob.result?.textDigest
+    || attempt.finalReportDigest !== expectedFinalReportDigest
   ) {
     fail("E_PRIVATE_STATE");
   }

@@ -241,7 +241,11 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   );
   assert.match(
     source,
-    /attempt\.finalReportDigest !== terminalJob\.result\?\.textDigest/
+    /terminalJob\.result\?\.workerReport\?\.reportSource === "acp-structured"/
+  );
+  assert.match(
+    source,
+    /attempt\.finalReportDigest !== expectedFinalReportDigest/
   );
   assert.match(
     source,
