@@ -35,7 +35,11 @@ function fakeOfficialRelease(fileIdentity) {
   });
 }
 
-export function installPinnedFakeCompanion(fake, env) {
+export function installPinnedFakeCompanion(
+  fake,
+  env,
+  { installedPluginRoot = null } = {}
+) {
   assert.equal(
     fs.existsSync("/bin/bash"),
     true,
@@ -81,11 +85,23 @@ export function installPinnedFakeCompanion(fake, env) {
     sourceBinary: providerShell
   });
 
-  const copyRoot = tempDir("grok-pinned-setup-plugin-");
-  const pluginRoot = path.join(copyRoot, "grok");
-  fs.cpSync(path.join(ROOT, "plugins", "grok"), pluginRoot, {
-    recursive: true
-  });
+  const copyRoot = installedPluginRoot == null
+    ? tempDir("grok-pinned-setup-plugin-")
+    : null;
+  const pluginRoot = installedPluginRoot == null
+    ? path.join(copyRoot, "grok")
+    : fs.realpathSync(installedPluginRoot);
+  if (installedPluginRoot == null) {
+    fs.cpSync(path.join(ROOT, "plugins", "grok"), pluginRoot, {
+      recursive: true
+    });
+  } else {
+    assert.notEqual(
+      pluginRoot,
+      fs.realpathSync(path.join(ROOT, "plugins", "grok")),
+      "the installed fake-provider fixture must never patch the source plugin"
+    );
+  }
 
   const executableIdentityFile = path.join(
     pluginRoot,
@@ -159,14 +175,22 @@ export function installPinnedFakeCompanion(fake, env) {
   fs.writeFileSync(providerFile, providerSource, "utf8");
 
   return Object.freeze({
+    pluginRoot,
     companionScript: path.join(
       pluginRoot,
       "scripts",
       "grok-companion.mjs"
     ),
+    codexCompanionScript: path.join(
+      pluginRoot,
+      "scripts",
+      "grok-codex.mjs"
+    ),
     env: pinnedEnv,
     cleanup() {
-      fs.rmSync(copyRoot, { recursive: true, force: true, maxRetries: 3 });
+      if (copyRoot) {
+        fs.rmSync(copyRoot, { recursive: true, force: true, maxRetries: 3 });
+      }
     }
   });
 }

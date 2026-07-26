@@ -33,6 +33,7 @@ import {
 import { profileFor, sameSecurityProfile } from "./lib/profiles.mjs";
 import {
   clearProviderCapabilityReceipt,
+  readValidProviderCapabilityReceipt,
   writeProviderCapabilityReceipt
 } from "./lib/provider-capability.mjs";
 import {
@@ -2444,6 +2445,48 @@ function prepareSharedTaskDispatch(root, job) {
   if (job.jobClass !== "task"
     || host?.kind !== "codex"
     || !host.sessionId) return null;
+  // Natural Codex tasks (read and write) must pin the exact setup-owned
+  // provider readiness receipt before admitJob so detached workers cannot drift
+  // to an ambient Grok binary. capabilityDigest is setup/readiness provenance
+  // only; implementer profile and launch authorization remain separate.
+  const capabilityReceipt = readValidProviderCapabilityReceipt();
+  if (!capabilityReceipt) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      `Valid provider capability receipt is missing or invalid; run ${hostCommand("setup")} before admitting a Codex task.`
+    );
+  }
+  const providerLaunchBinding = assertExecutableProviderLaunchBinding(
+    capabilityReceipt.providerLaunchBinding
+  );
+  const providerLaunchBindingDigest = digestProviderLaunchBinding(
+    providerLaunchBinding
+  );
+  if (providerLaunchBindingDigest !== capabilityReceipt.providerLaunchBindingDigest) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      `Valid provider capability receipt is missing or invalid; run ${hostCommand("setup")} before admitting a Codex task.`
+    );
+  }
+  const providerCapabilityDigest = capabilityReceipt.capabilityDigest;
+  const providerSpawnBinding = {
+    providerCapabilityDigest,
+    providerLaunchBinding,
+    providerLaunchBindingDigest
+  };
+  if (job.write) {
+    // Direct Codex write tasks retain the established nonce launcher until they
+    // have a provisioned execution binding. They still carry the exact setup
+    // provider pin so their detached worker cannot fall back to ambient Grok.
+    job.request = {
+      ...job.request,
+      spawn: {
+        ...(job.request?.spawn || {}),
+        ...providerSpawnBinding
+      }
+    };
+    return null;
+  }
   const principal = Object.freeze({ hostKind: host.kind, threadId: host.sessionId, pluginId: null });
   const role = materializeRole(job.write ? "implementer" : "explorer");
   const createdAt = job.createdAt || now();
@@ -2459,7 +2502,9 @@ function prepareSharedTaskDispatch(root, job) {
     contextManifestDigest: job.request?.contextManifest?.digest || null,
     resumeJobId: job.request?.resumeJobId || null,
     resumeSessionId: job.request?.resumeSessionId || null,
-    providerHomeId: job.request?.providerHomeId || job.id
+    providerHomeId: job.request?.providerHomeId || job.id,
+    providerCapabilityDigest,
+    providerLaunchBindingDigest
   });
   job.controlWorkspaceId = controlWorkspaceId;
   job.role = { ...role, tools: [...role.tools] };
@@ -2477,6 +2522,7 @@ function prepareSharedTaskDispatch(root, job) {
       requestDigest,
       successDefinition: "durable-job-commit",
       ownershipMode: "exact-host-session",
+      ...providerSpawnBinding,
       providerLaunchPending: true,
       providerLaunchInFlight: false,
       providerLaunchOutcome: "pending",

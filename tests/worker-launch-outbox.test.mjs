@@ -38,10 +38,15 @@ import {
   composeProviderPrompt,
   scrubStoredJob
 } from "../plugins/grok/scripts/lib/task-contract.mjs";
-import { tryReadJob, updateJob } from "../plugins/grok/scripts/lib/state.mjs";
+import {
+  listJobsReadonly,
+  tryReadJob,
+  updateJob
+} from "../plugins/grok/scripts/lib/state.mjs";
 import { resolveControlWorkspace } from "../plugins/grok/scripts/lib/workspace.mjs";
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
+import { installPinnedFakeCompanion } from "./pinned-fake-grok.mjs";
 import { git, initRepo, runCompanion, tempDir, testEnvironment } from "./helpers.mjs";
 
 const THREAD_ID = "019f6a2f-8e34-7db1-a101-b9ca29e5fe01";
@@ -588,32 +593,243 @@ test("provider guard bridge preserves only the exact write execution binding", (
 
 test("the Codex CLI task entrypoint uses the shared versioned launcher", {
   skip: process.platform === "win32"
-}, () => {
+}, (t) => {
   const root = initRepo();
   const pluginData = tempDir("worker-launch-cli-data-");
-  const fake = installFakeGrok(tempDir("worker-launch-cli-provider-"), { taskText: taskReport() });
-  fs.symlinkSync(fake.binary, path.join(path.dirname(fake.binary), "grok"));
-  const env = {
+  const fake = installFakeGrok(tempDir("worker-launch-cli-provider-"), {
+    taskText: taskReport(),
+    delayMs: 2_000
+  });
+  const baseEnv = {
     ...testEnvironment({ fake, pluginData }),
-    PATH: `${path.dirname(fake.binary)}${path.delimiter}${process.env.PATH || ""}`,
     GROK_COMPANION_PLUGIN_DATA: pluginData,
     GROK_COMPANION_HOST: "codex",
     GROK_COMPANION_HOST_SESSION_ID: THREAD_ID,
     CODEX_THREAD_ID: THREAD_ID
   };
-  const run = runCompanion(["task", "--wait", "prove shared launcher", "--json"], {
+  const pinned = installPinnedFakeCompanion(fake, baseEnv);
+  t.after(pinned.cleanup);
+  const { env } = pinned;
+  const setup = runCompanion(["setup", "--json"], {
     cwd: root,
     env,
-    timeout: 20_000
+    companionScript: pinned.companionScript
+  });
+  assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+  assert.equal(JSON.parse(setup.stdout).ready, true);
+  const receipt = JSON.parse(fs.readFileSync(
+    path.join(pluginData, "capabilities", "provider-capability-v2.json"),
+    "utf8"
+  ));
+  const run = runCompanion(["task", "--background", "prove shared launcher", "--json"], {
+    cwd: root,
+    env,
+    timeout: 20_000,
+    companionScript: pinned.companionScript
   });
   assert.equal(run.status, 0, run.stderr || run.stdout);
   const result = JSON.parse(run.stdout);
   const job = tryReadJob(root, result.id, env);
-  assert.equal(job.status, "completed");
   assert.equal(job.request.spawn.dispatch.schemaVersion, 2);
   assert.equal(job.request.spawn.dispatch.fence, 1);
   assert.equal(job.role.id, "explorer");
-  assert.equal(readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length, 1);
+  assert.equal(
+    job.request.spawn.providerCapabilityDigest,
+    receipt.capabilityDigest
+  );
+  assert.deepEqual(
+    job.request.spawn.providerLaunchBinding,
+    receipt.providerLaunchBinding
+  );
+  assert.equal(
+    job.request.spawn.providerLaunchBindingDigest,
+    receipt.providerLaunchBindingDigest
+  );
+  assertWorkerAuthorization(job, { allowLegacy: false });
+  for (const mutate of [
+    (candidate) => {
+      candidate.request.spawn.providerCapabilityDigest = "0".repeat(64);
+    },
+    (candidate) => {
+      candidate.request.spawn.providerLaunchBindingDigest = "0".repeat(64);
+    },
+    (candidate) => {
+      candidate.request.spawn.providerLaunchBinding.executableIdentityDigest =
+        "0".repeat(64);
+    }
+  ]) {
+    const tampered = structuredClone(job);
+    mutate(tampered);
+    assert.throws(
+      () => assertWorkerAuthorization(tampered, { allowLegacy: false }),
+      (error) => error?.code === "E_AUTH_REQUIRED"
+    );
+  }
+  const completed = runCompanion(
+    ["status", result.id, "--wait", "--timeout-ms", "10000", "--json"],
+    {
+      cwd: root,
+      env,
+      timeout: 20_000,
+      companionScript: pinned.companionScript
+    }
+  );
+  assert.equal(completed.status, 0, completed.stderr || completed.stdout);
+  assert.equal(JSON.parse(completed.stdout).status, "completed");
+
+  const writeEnvelope = {
+    schemaVersion: 1,
+    userRequest: "prove shared write launcher",
+    objective: "Prove provider readiness binding for a direct Codex write task",
+    mode: "write",
+    scope: { include: ["tracked.txt"], exclude: [] },
+    context: {
+      facts: [],
+      constraints: [],
+      expectedProjectMarkers: [],
+      requiredPaths: ["tracked.txt"],
+      workspaceState: "task_scoped",
+      upstreamFreshness: "not_checked"
+    },
+    nonGoals: [],
+    acceptanceCriteria: [
+      { id: "AC-01", text: "Use the shared write launcher" },
+      { id: "AC-02", text: "Retain the exact setup provider pin" }
+    ],
+    requiredVerification: [],
+    expectedReturnFormat: "GROK_WORKER_REPORT JSON"
+  };
+  const writeRun = runCompanion(
+    ["task", "--background", "--write", "--fresh", "--envelope-stdin", "--json"],
+    {
+      cwd: root,
+      env,
+      input: JSON.stringify(writeEnvelope),
+      timeout: 20_000,
+      companionScript: pinned.companionScript
+    }
+  );
+  assert.equal(writeRun.status, 0, writeRun.stderr || writeRun.stdout);
+  const writeJob = tryReadJob(root, JSON.parse(writeRun.stdout).id, env);
+  assert.equal(writeJob.write, true);
+  assert.equal(
+    writeJob.request.spawn.providerCapabilityDigest,
+    receipt.capabilityDigest
+  );
+  assert.deepEqual(
+    writeJob.request.spawn.providerLaunchBinding,
+    receipt.providerLaunchBinding
+  );
+  assert.equal(
+    writeJob.request.spawn.providerLaunchBindingDigest,
+    receipt.providerLaunchBindingDigest
+  );
+  assert.equal(writeJob.request.spawn.dispatch, undefined);
+  assert.equal(writeJob.controlWorkspaceId, undefined);
+  const writeCompleted = runCompanion(
+    [
+      "status",
+      writeJob.id,
+      "--wait",
+      "--timeout-ms",
+      "10000",
+      "--json"
+    ],
+    {
+      cwd: root,
+      env,
+      timeout: 20_000,
+      companionScript: pinned.companionScript
+    }
+  );
+  assert.equal(
+    writeCompleted.status,
+    0,
+    writeCompleted.stderr || writeCompleted.stdout
+  );
+  assert.equal(JSON.parse(writeCompleted.stdout).status, "completed");
+  assert.equal(
+    readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length,
+    2
+  );
+});
+
+test("the Codex CLI task entrypoint refuses missing or tampered setup capability before admission", {
+  skip: process.platform === "win32"
+}, (t) => {
+  const missingRoot = initRepo();
+  const missingPluginData = tempDir("worker-launch-cli-missing-data-");
+  const missingFake = installFakeGrok(tempDir("worker-launch-cli-missing-provider-"), {
+    taskText: taskReport()
+  });
+  const missingEnv = {
+    ...testEnvironment({ fake: missingFake, pluginData: missingPluginData }),
+    GROK_COMPANION_PLUGIN_DATA: missingPluginData,
+    GROK_COMPANION_HOST: "codex",
+    GROK_COMPANION_HOST_SESSION_ID: THREAD_ID,
+    CODEX_THREAD_ID: THREAD_ID
+  };
+  const missing = runCompanion(
+    ["task", "--wait", "reject missing setup capability", "--json"],
+    { cwd: missingRoot, env: missingEnv }
+  );
+  assert.notEqual(missing.status, 0);
+  assert.equal(JSON.parse(missing.stdout).error?.code, "E_CAPABILITY");
+  assert.deepEqual(listJobsReadonly(missingRoot, missingEnv), []);
+  assert.equal(
+    readFakeLog(missingFake.logFile).filter((entry) => entry.event === "prompt").length,
+    0
+  );
+
+  const tamperedRoot = initRepo();
+  const tamperedPluginData = tempDir("worker-launch-cli-tampered-data-");
+  const tamperedFake = installFakeGrok(tempDir("worker-launch-cli-tampered-provider-"), {
+    taskText: taskReport()
+  });
+  const tamperedBaseEnv = {
+    ...testEnvironment({ fake: tamperedFake, pluginData: tamperedPluginData }),
+    GROK_COMPANION_PLUGIN_DATA: tamperedPluginData,
+    GROK_COMPANION_HOST: "codex",
+    GROK_COMPANION_HOST_SESSION_ID: THREAD_ID,
+    CODEX_THREAD_ID: THREAD_ID
+  };
+  const pinned = installPinnedFakeCompanion(tamperedFake, tamperedBaseEnv);
+  t.after(pinned.cleanup);
+  const setup = runCompanion(["setup", "--json"], {
+    cwd: tamperedRoot,
+    env: pinned.env,
+    companionScript: pinned.companionScript
+  });
+  assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+  assert.equal(JSON.parse(setup.stdout).ready, true);
+  const receiptPath = path.join(
+    tamperedPluginData,
+    "capabilities",
+    "provider-capability-v2.json"
+  );
+  const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+  fs.writeFileSync(receiptPath, `${JSON.stringify({
+    ...receipt,
+    capabilityDigest: "0".repeat(64)
+  }, null, 2)}\n`, { mode: 0o600 });
+  const promptCount = readFakeLog(tamperedFake.logFile).filter(
+    (entry) => entry.event === "prompt"
+  ).length;
+  const tampered = runCompanion(
+    ["task", "--wait", "reject tampered setup capability", "--json"],
+    {
+      cwd: tamperedRoot,
+      env: pinned.env,
+      companionScript: pinned.companionScript
+    }
+  );
+  assert.notEqual(tampered.status, 0);
+  assert.equal(JSON.parse(tampered.stdout).error?.code, "E_CAPABILITY");
+  assert.deepEqual(listJobsReadonly(tamperedRoot, pinned.env), []);
+  assert.equal(
+    readFakeLog(tamperedFake.logFile).filter((entry) => entry.event === "prompt").length,
+    promptCount
+  );
 });
 
 test("authorization validation fails closed after immutable launch-contract drift", () => {

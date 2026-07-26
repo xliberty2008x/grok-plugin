@@ -24,15 +24,14 @@ import {
   initRepo,
   git,
   runCompanion,
-  runCodexCompanion,
   spawnNonblockingStdin,
   testEnvironment,
   waitFor,
-  CODEX_COMPANION,
   ROOT,
   tempDir
 } from "./helpers.mjs";
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
+import { installPinnedFakeCompanion } from "./pinned-fake-grok.mjs";
 
 /** Provider lifecycle needs process start tokens via `ps`; some sandboxes deny that. */
 const PROVIDER_LIFECYCLE_AVAILABLE = Boolean(processStartToken(process.pid));
@@ -751,7 +750,7 @@ test("Codex control-plane skill contracts describe host authority and explicit j
 
 test("integration: Codex nonblocking stdin waits for delayed TaskEnvelope and verification records", {
   skip: process.platform === "win32" && "nonblocking fd regression harness is POSIX-only"
-}, async () => {
+}, async (t) => {
   const root = initRepo();
   const { env: fixtureEnv, fake, pluginData } = fixture({
     taskText: workerReport({
@@ -770,6 +769,21 @@ test("integration: Codex nonblocking stdin waits for delayed TaskEnvelope and ve
   delete env.GROK_COMPANION_CLAUDE_SESSION_ID;
   delete env.CLAUDE_SESSION_ID;
   delete env.CLAUDE_PROJECT_DIR;
+  const pinned = installPinnedFakeCompanion(fake, env);
+  t.after(pinned.cleanup);
+  const setup = runCompanion(["setup", "--json"], {
+    cwd: root,
+    env: pinned.env,
+    companionScript: pinned.codexCompanionScript
+  });
+  assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+  assert.equal(JSON.parse(setup.stdout).ready, true);
+  const providerStartsAfterSetup = readFakeLog(fake.logFile).filter(
+    (entry) => entry.event === "argv"
+      && entry.args.includes("agent")
+      && entry.args.includes("stdio")
+  ).length;
+  assert.equal(providerStartsAfterSetup, 1);
 
   const envelope = JSON.stringify({
     schemaVersion: 1,
@@ -791,9 +805,9 @@ test("integration: Codex nonblocking stdin waits for delayed TaskEnvelope and ve
     expectedReturnFormat: "GROK_WORKER_REPORT JSON plus concise human summary"
   });
   const dispatch = spawnNonblockingStdin(
-    CODEX_COMPANION,
+    pinned.codexCompanionScript,
     ["task", "--background", "--envelope-stdin", "--stdin-ready", "--fresh", "--effort", "high", "--json"],
-    { cwd: root, env }
+    { cwd: root, env: pinned.env }
   );
 
   await waitFor(() => dispatch.stderr.includes(STDIN_READY_MARKER), { timeoutMs: 15000 });
@@ -801,7 +815,7 @@ test("integration: Codex nonblocking stdin waits for delayed TaskEnvelope and ve
   const providerStartsBeforeInput = readFakeLog(fake.logFile).filter(
     (entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio")
   );
-  assert.equal(providerStartsBeforeInput.length, 0);
+  assert.equal(providerStartsBeforeInput.length, providerStartsAfterSetup);
   const split = Math.floor(envelope.length / 2);
   dispatch.child.stdin.write(envelope.slice(0, split));
   await new Promise((resolve) => setTimeout(resolve, 25));
@@ -813,7 +827,11 @@ test("integration: Codex nonblocking stdin waits for delayed TaskEnvelope and ve
   assert.ok(job.id);
 
   const terminal = await waitFor(() => {
-    const result = runCodexCompanion(["status", job.id, "--json"], { cwd: root, env });
+    const result = runCompanion(["status", job.id, "--json"], {
+      cwd: root,
+      env: pinned.env,
+      companionScript: pinned.codexCompanionScript
+    });
     if (result.status !== 0) return null;
     const status = JSON.parse(result.stdout);
     return ["completed", "failed", "cancelled"].includes(status.status) ? status : null;
@@ -822,15 +840,15 @@ test("integration: Codex nonblocking stdin waits for delayed TaskEnvelope and ve
   const providerStarts = readFakeLog(fake.logFile).filter(
     (entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio")
   );
-  assert.equal(providerStarts.length, 1);
+  assert.equal(providerStarts.length, providerStartsAfterSetup + 1);
 
   const verification = JSON.stringify({
     commandOutcomes: [{ command: "git status --short", status: "passed", exitCode: 0 }]
   });
   const record = spawnNonblockingStdin(
-    CODEX_COMPANION,
+    pinned.codexCompanionScript,
     ["record-verification", job.id, "--verification-stdin", "--stdin-ready", "--json"],
-    { cwd: root, env }
+    { cwd: root, env: pinned.env }
   );
   await waitFor(() => record.stderr.includes(STDIN_READY_MARKER), { timeoutMs: 15000 });
   assert.equal(record.child.exitCode, null, "verification command exited before Codex could write stdin");

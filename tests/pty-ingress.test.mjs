@@ -6,8 +6,8 @@ import test from "node:test";
 
 import { STDIN_READY_MARKER } from "../plugins/grok/scripts/lib/stdin.mjs";
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
+import { installPinnedFakeCompanion } from "./pinned-fake-grok.mjs";
 import {
-  CODEX_COMPANION,
   initRepo,
   ptyPythonAvailable,
   run,
@@ -149,6 +149,21 @@ test("source Codex wrapper survives delayed input on a genuinely nonblocking PTY
     "GROK_AGENT",
     "GROK_LEADER_SOCKET"
   ]) delete env[key];
+  const pinned = installPinnedFakeCompanion(fake, env);
+  t.after(pinned.cleanup);
+  const setup = run(
+    process.execPath,
+    [pinned.codexCompanionScript, "setup", "--json"],
+    { cwd: root, env: pinned.env, timeout: 30_000 }
+  );
+  assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+  assert.equal(JSON.parse(setup.stdout).ready, true);
+  const providerStartsAfterSetup = readFakeLog(fake.logFile).filter(
+    (entry) => entry.event === "argv"
+      && entry.args.includes("agent")
+      && entry.args.includes("stdio")
+  ).length;
+  assert.equal(providerStartsAfterSetup, 1);
 
   const envelope = JSON.stringify({
     schemaVersion: 1,
@@ -170,15 +185,18 @@ test("source Codex wrapper survives delayed input on a genuinely nonblocking PTY
     expectedReturnFormat: "GROK_WORKER_REPORT JSON plus concise human summary"
   });
   const dispatch = runPtyStdin(
-    CODEX_COMPANION,
+    pinned.codexCompanionScript,
     ["task", "--background", "--envelope-stdin", "--stdin-ready", "--fresh", "--effort", "high", "--json"],
-    { cwd: root, env, input: envelope, timeout: 30_000 }
+    { cwd: root, env: pinned.env, input: envelope, timeout: 30_000 }
   );
   assert.equal(dispatch.driver.status, 0, dispatch.driver.stderr || dispatch.driver.stdout);
   assert.ok(dispatch.result, "PTY driver did not return structured evidence");
   assert.equal(dispatch.result.ready, true, dispatch.result.stderr);
   assert.equal(dispatch.result.aliveBeforeInput, true);
-  assert.equal(dispatch.result.providerStartsBeforeInput, 0);
+  assert.equal(
+    dispatch.result.providerStartsBeforeInput,
+    providerStartsAfterSetup
+  );
   assert.equal(dispatch.result.writeError, null);
   assert.equal(dispatch.result.code, 0, dispatch.result.stderr || dispatch.result.stdout);
   assert.match(dispatch.result.stderr, new RegExp(STDIN_READY_MARKER));
@@ -188,7 +206,11 @@ test("source Codex wrapper survives delayed input on a genuinely nonblocking PTY
   assert.ok(job.id);
 
   const terminal = await waitFor(() => {
-    const status = runCodexCompanion(["status", job.id, "--json"], { cwd: root, env, timeout: 5_000 });
+    const status = run(
+      process.execPath,
+      [pinned.codexCompanionScript, "status", job.id, "--json"],
+      { cwd: root, env: pinned.env, timeout: 5_000 }
+    );
     if (status.status !== 0) return null;
     const parsed = JSON.parse(status.stdout);
     return ["completed", "failed", "cancelled"].includes(parsed.status) ? parsed : null;
@@ -197,20 +219,28 @@ test("source Codex wrapper survives delayed input on a genuinely nonblocking PTY
   const providerStarts = readFakeLog(fake.logFile).filter(
     (entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio")
   );
-  assert.equal(providerStarts.length, 1);
+  assert.equal(providerStarts.length, providerStartsAfterSetup + 1);
 
   const verification = JSON.stringify({
     commandOutcomes: [{ command: "git status --short", status: "passed", exitCode: 0 }]
   });
   const record = runPtyStdin(
-    CODEX_COMPANION,
+    pinned.codexCompanionScript,
     ["record-verification", job.id, "--verification-stdin", "--stdin-ready", "--json"],
-    { cwd: root, env, input: verification, timeout: 30_000 }
+    {
+      cwd: root,
+      env: pinned.env,
+      input: verification,
+      timeout: 30_000
+    }
   );
   assert.equal(record.driver.status, 0, record.driver.stderr || record.driver.stdout);
   assert.equal(record.result?.ready, true, record.result?.stderr);
   assert.equal(record.result?.aliveBeforeInput, true);
-  assert.equal(record.result?.providerStartsBeforeInput, 1);
+  assert.equal(
+    record.result?.providerStartsBeforeInput,
+    providerStartsAfterSetup + 1
+  );
   assert.equal(record.result?.writeError, null);
   assert.equal(record.result?.code, 0, record.result?.stderr || record.result?.stdout);
   assert.equal(record.result?.ptyOutput, "", "private verification record or terminal control data was echoed by the PTY");
@@ -251,6 +281,21 @@ test("original issue #2 invocation waits for a delayed PTY writer without a read
       GROK_TEST_PTY_OBSERVE_LOG: fake.logFile
     }
   });
+  const pinned = installPinnedFakeCompanion(fake, env);
+  t.after(pinned.cleanup);
+  const setup = run(
+    process.execPath,
+    [pinned.codexCompanionScript, "setup", "--json"],
+    { cwd: root, env: pinned.env, timeout: 30_000 }
+  );
+  assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+  assert.equal(JSON.parse(setup.stdout).ready, true);
+  const providerStartsAfterSetup = readFakeLog(fake.logFile).filter(
+    (entry) => entry.event === "argv"
+      && entry.args.includes("agent")
+      && entry.args.includes("stdio")
+  ).length;
+  assert.equal(providerStartsAfterSetup, 1);
   const envelope = JSON.stringify({
     schemaVersion: 1,
     userRequest: "reproduce the original issue #2 invocation",
@@ -271,22 +316,29 @@ test("original issue #2 invocation waits for a delayed PTY writer without a read
     expectedReturnFormat: "GROK_WORKER_REPORT JSON plus concise human summary"
   });
   const dispatch = runPtyStdin(
-    CODEX_COMPANION,
+    pinned.codexCompanionScript,
     ["task", "--background", "--envelope-stdin", "--fresh", "--effort", "high", "--json"],
-    { cwd: root, env, input: envelope, timeout: 30_000 }
+    { cwd: root, env: pinned.env, input: envelope, timeout: 30_000 }
   );
   assert.equal(dispatch.driver.status, 0, dispatch.driver.stderr || dispatch.driver.stdout);
   assert.equal(dispatch.result?.requiresReady, false);
   assert.equal(dispatch.result?.ready, false, "the original invocation must not depend on a synthetic ready marker");
   assert.equal(dispatch.result?.aliveBeforeInput, true);
-  assert.equal(dispatch.result?.providerStartsBeforeInput, 0);
+  assert.equal(
+    dispatch.result?.providerStartsBeforeInput,
+    providerStartsAfterSetup
+  );
   assert.equal(dispatch.result?.writeError, null);
   assert.equal(dispatch.result?.code, 0, dispatch.result?.stderr || dispatch.result?.stdout);
   assert.doesNotMatch(dispatch.result?.stderr || "", /EAGAIN|resource temporarily unavailable/i);
   const job = JSON.parse(dispatch.result.stdout);
   assert.ok(job.id);
   const terminal = await waitFor(() => {
-    const status = runCodexCompanion(["status", job.id, "--json"], { cwd: root, env, timeout: 5_000 });
+    const status = run(
+      process.execPath,
+      [pinned.codexCompanionScript, "status", job.id, "--json"],
+      { cwd: root, env: pinned.env, timeout: 5_000 }
+    );
     if (status.status !== 0) return null;
     const parsed = JSON.parse(status.stdout);
     return ["completed", "failed", "cancelled"].includes(parsed.status) ? parsed : null;
@@ -295,7 +347,7 @@ test("original issue #2 invocation waits for a delayed PTY writer without a read
   const providerStarts = readFakeLog(fake.logFile).filter(
     (entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio")
   );
-  assert.equal(providerStarts.length, 1);
+  assert.equal(providerStarts.length, providerStartsAfterSetup + 1);
 });
 
 test("task envelope stdin keeps empty, malformed, and oversized failures as public E_USAGE", (t) => {

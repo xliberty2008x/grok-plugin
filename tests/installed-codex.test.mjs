@@ -15,6 +15,7 @@ import {
   ROOT
 } from "./helpers.mjs";
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
+import { installPinnedFakeCompanion } from "./pinned-fake-grok.mjs";
 import { STDIN_READY_MARKER } from "../plugins/grok/scripts/lib/stdin.mjs";
 
 const codexProbe = run("codex", ["plugin", "--help"], { timeout: 5000 });
@@ -76,7 +77,7 @@ test("installed Codex marketplace snapshot accepts private delayed nonblocking P
     "plugin install"
   );
   const installedRoot = fs.realpathSync(installed.installedPath);
-  const wrapper = path.join(installedRoot, "scripts", "grok-codex.mjs");
+  let wrapper = path.join(installedRoot, "scripts", "grok-codex.mjs");
   const cacheRoot = fs.realpathSync(path.join(codexHome, "plugins", "cache"));
   const cacheRelative = path.relative(cacheRoot, installedRoot);
   assert.equal(cacheRelative.startsWith("..") || path.isAbsolute(cacheRelative), false);
@@ -95,7 +96,7 @@ test("installed Codex marketplace snapshot accepts private delayed nonblocking P
     })}`
   });
   const pluginData = path.join(codexHome, "plugins", "data", "grok-grok-companion");
-  const env = {
+  let env = {
     ...installEnv,
     GROK_BIN: fake.binary,
     GROK_AUTH_PATH: fake.authPath,
@@ -115,6 +116,29 @@ test("installed Codex marketplace snapshot accepts private delayed nonblocking P
     "GROK_AGENT",
     "GROK_LEADER_SOCKET"
   ]) delete env[key];
+
+  const pinnedFake = installPinnedFakeCompanion(fake, env, {
+    installedPluginRoot: installedRoot
+  });
+  t.after(() => pinnedFake.cleanup());
+  env = pinnedFake.env;
+  wrapper = pinnedFake.codexCompanionScript;
+
+  const setup = parseSuccessful(
+    run(process.execPath, [wrapper, "setup", "--json"], {
+      cwd: root,
+      env,
+      timeout: 30_000
+    }),
+    "installed setup probe"
+  );
+  assert.equal(setup.ready, true, JSON.stringify(setup));
+  const providerStartsBeforeTask = readFakeLog(fake.logFile).filter(
+    (entry) => entry.event === "argv"
+      && entry.args.includes("agent")
+      && entry.args.includes("stdio")
+  ).length;
+  assert.equal(providerStartsBeforeTask, 1);
 
   const envelope = JSON.stringify({
     schemaVersion: 1,
@@ -146,7 +170,7 @@ test("installed Codex marketplace snapshot accepts private delayed nonblocking P
   assert.ok(dispatch.result, "PTY driver did not return structured evidence");
   assert.equal(dispatch.result.ready, true, dispatch.result.stderr);
   assert.equal(dispatch.result.aliveBeforeInput, true);
-  assert.equal(dispatch.result.providerStartsBeforeInput, 0);
+  assert.equal(dispatch.result.providerStartsBeforeInput, providerStartsBeforeTask);
   assert.equal(dispatch.result.writeError, null);
   assert.equal(dispatch.result.code, 0, dispatch.result.stderr || dispatch.result.stdout);
   assert.match(dispatch.result.stderr, new RegExp(STDIN_READY_MARKER));
@@ -163,8 +187,11 @@ test("installed Codex marketplace snapshot accepts private delayed nonblocking P
   const providerStarts = readFakeLog(fake.logFile).filter(
     (entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio")
   );
-  assert.equal(providerStarts.length, 1);
-  const taskProfileEvidence = readFakeLog(fake.logFile).find((entry) => entry.event === "agent-profile");
+  assert.equal(providerStarts.length, providerStartsBeforeTask + 1);
+  const taskProfileEvidence = readFakeLog(fake.logFile).find(
+    (entry) => entry.event === "agent-profile"
+      && path.basename(entry.path).startsWith("rescue-read-v3-")
+  );
   assert.ok(taskProfileEvidence?.exists, "installed provider could not read its materialized agent profile");
   assert.equal(taskProfileEvidence.insideGrokHome, true, "installed provider argv pointed back into the Codex plugin cache");
   assert.equal(taskProfileEvidence.mode, 0o600);
@@ -181,17 +208,12 @@ test("installed Codex marketplace snapshot accepts private delayed nonblocking P
   assert.equal(record.driver.status, 0, record.driver.stderr || record.driver.stdout);
   assert.equal(record.result?.ready, true, record.result?.stderr);
   assert.equal(record.result?.aliveBeforeInput, true);
-  assert.equal(record.result?.providerStartsBeforeInput, 1);
+  assert.equal(record.result?.providerStartsBeforeInput, providerStarts.length);
   assert.equal(record.result?.writeError, null);
   assert.equal(record.result?.code, 0, record.result?.stderr || record.result?.stdout);
   assert.equal(record.result?.ptyOutput, "", "private verification record or terminal control data was echoed by the PTY");
   assert.equal(JSON.parse(record.result.stdout).result.hostVerification, "passed");
 
-  const setup = parseSuccessful(
-    run(process.execPath, [wrapper, "setup", "--json"], { cwd: root, env, timeout: 30_000 }),
-    "installed setup probe"
-  );
-  assert.equal(setup.ready, true, JSON.stringify(setup));
   const profileEvents = readFakeLog(fake.logFile).filter((entry) => entry.event === "agent-profile");
   assert.equal(profileEvents.length, 2, "installed setup/task did not each launch one isolated ACP profile");
   const expectedDigests = new Map([
