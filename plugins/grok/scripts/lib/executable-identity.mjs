@@ -599,15 +599,20 @@ function captureDarwinExecutable(pid, expected, runLsof) {
   }
   const mapping = parseFirstDarwinTextMapping(run.stdout);
   const reopened = captureExecutableFileIdentity(expected.canonicalPath);
-  if (!mapping
-    || canonicalDevice(mapping.device) !== expected.device
-    || mapping.inode !== expected.inode
-    || mapping.size !== String(expected.size)
-    || mapping.name !== expected.canonicalPath
-    || !sameFileIdentity(reopened, expected)) {
+  const mismatches = [
+    ...(!mapping ? ["missing"] : []),
+    ...(mapping && canonicalDevice(mapping.device) !== expected.device
+      ? ["device"]
+      : []),
+    ...(mapping?.inode !== expected.inode ? ["inode"] : []),
+    ...(mapping?.size !== String(expected.size) ? ["size"] : []),
+    ...(mapping?.name !== expected.canonicalPath ? ["path"] : []),
+    ...(!sameFileIdentity(reopened, expected) ? ["reopened"] : [])
+  ];
+  if (mismatches.length) {
     throw new CompanionError(
       "E_PROCESS_IDENTITY",
-      "macOS spawned a different Grok text mapping than the durable intent."
+      `macOS spawned a different Grok text mapping than the durable intent (${mismatches.join(",")}).`
     );
   }
 }

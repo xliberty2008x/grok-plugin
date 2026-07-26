@@ -157,7 +157,13 @@ test("owner controllers keep integration and cleanup as distinct no-model author
     );
     assert.match(
       integrationSandbox,
-      new RegExp(`read_write = \\[${JSON.stringify(path.join(root, "target.txt")).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]`)
+      new RegExp(`read_write = \\[${JSON.stringify(root).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]`)
+    );
+    assert.equal(
+      integrationSandbox.includes(
+        `read_write = [${JSON.stringify(path.join(root, "target.txt"))}]`
+      ),
+      false
     );
     assert.match(
       cleanupSandbox,

@@ -1663,15 +1663,21 @@ export function workerOwnerControllerEnvironment(
     const sandboxProfile = `companion_${crypto.createHash("sha256").update(
       `${lineage}:${profileId}:${purpose}`
     ).digest("hex").slice(0, 20)}`;
+    // Grok Build's custom sandbox profile accepts directories, not individual
+    // files. The integration controller is no-model, pinned, and method-limited
+    // to the official worktree apply extension; the exact one-file artifact is
+    // independently verified before and after that call.
+    const readWrite = purpose === WORKTREE_INTEGRATION_PURPOSE
+      ? [sourceRoot]
+      : [effectTarget, gitWorktreesMetadataRoot];
     const readOnly = [
       sourceRoot,
       workerRoot,
       discoveredGitCommonDir,
       gitInstallation.installationRoot
-    ].filter((value, index, values) => values.indexOf(value) === index);
-    const readWrite = purpose === WORKTREE_INTEGRATION_PURPOSE
-      ? [effectTarget]
-      : [effectTarget, gitWorktreesMetadataRoot];
+    ].filter((value, index, values) => (
+      values.indexOf(value) === index && !readWrite.includes(value)
+    ));
     atomicPrivateFile(
       path.join(grokHome, "config.toml"),
       `[skills]\nignore = [${JSON.stringify(sourceRoot)}, ${JSON.stringify(workerRoot)}]\n\n[subagents]\nenabled = false\n\n[features]\nlsp_tools = false\n`
