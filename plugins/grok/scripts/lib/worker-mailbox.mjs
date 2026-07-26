@@ -13,6 +13,8 @@ import { CompanionError } from "./errors.mjs";
 import {
   isCancelledPromptStopReason,
   isSuccessfulPromptStopReason,
+  normalizeOutputSchema,
+  structuredPromptResult,
   validatePromptResponse
 } from "./acp-client.mjs";
 import {
@@ -468,6 +470,7 @@ export async function drainWorkerMailbox({
   sessionId,
   composePrompt,
   collectTurnText,
+  outputSchema = null,
   timeoutMs = 30 * 60 * 1000,
   env = process.env,
   onTurn = null,
@@ -481,6 +484,9 @@ export async function drainWorkerMailbox({
   if (typeof composePrompt !== "function") {
     throw new CompanionError("E_USAGE", "Mailbox pump requires composePrompt.");
   }
+  const normalizedOutputSchema = outputSchema == null
+    ? null
+    : normalizeOutputSchema(outputSchema);
 
   const turns = [];
   let deliveryUnknown = false;
@@ -682,6 +688,8 @@ export async function drainWorkerMailbox({
 
     let promptResult;
     let promptError = null;
+    let promptStructuredOutput;
+    let promptStructuredOutputError;
     const textCollector = typeof collectTurnText === "function"
       ? collectTurnText()
       : { text: () => "" };
@@ -691,13 +699,26 @@ export async function drainWorkerMailbox({
         "session/prompt",
         {
           sessionId,
-          prompt: [{ type: "text", text: promptText }]
+          prompt: [{ type: "text", text: promptText }],
+          ...(normalizedOutputSchema
+            ? { _meta: { outputSchema: normalizedOutputSchema } }
+            : {})
         },
         timeoutMs,
         {
           validateResult: validatePromptResponse
         }
       );
+      const structured = structuredPromptResult(
+        promptResult,
+        normalizedOutputSchema !== null
+      );
+      if (Object.hasOwn(structured, "structuredOutput")) {
+        promptStructuredOutput = structured.structuredOutput;
+      }
+      if (Object.hasOwn(structured, "structuredOutputError")) {
+        promptStructuredOutputError = structured.structuredOutputError;
+      }
     } catch (error) {
       promptError = error;
     }
@@ -812,7 +833,13 @@ export async function drainWorkerMailbox({
         turns.push({
           ...settled.turn,
           text: turnText,
-          stopReason: promptResult.stopReason
+          stopReason: promptResult.stopReason,
+          ...(promptStructuredOutput !== undefined
+            ? { structuredOutput: promptStructuredOutput }
+            : {}),
+          ...(promptStructuredOutputError !== undefined
+            ? { structuredOutputError: promptStructuredOutputError }
+            : {})
         });
         continue;
       }
@@ -849,7 +876,13 @@ export async function drainWorkerMailbox({
     turns.push({
       ...settled.turn,
       text: turnText,
-      stopReason: promptResult.stopReason
+      stopReason: promptResult.stopReason,
+      ...(promptStructuredOutput !== undefined
+        ? { structuredOutput: promptStructuredOutput }
+        : {}),
+      ...(promptStructuredOutputError !== undefined
+        ? { structuredOutputError: promptStructuredOutputError }
+        : {})
     });
     if (typeof onTurn === "function") {
       try {

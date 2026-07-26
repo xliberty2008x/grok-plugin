@@ -4608,8 +4608,12 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
         selectedSequence = selected.sequence;
         resolvedFinal = String(selected.text || "").trim();
         resolvedInterim = "";
-        structuredOutput = undefined;
-        structuredOutputError = undefined;
+        structuredOutput = Object.hasOwn(selected, "structuredOutput")
+          ? selected.structuredOutput
+          : undefined;
+        structuredOutputError = Object.hasOwn(selected, "structuredOutputError")
+          ? selected.structuredOutputError
+          : undefined;
       }
       mailboxEvidence = {
         schemaVersion: 1,

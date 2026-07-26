@@ -216,7 +216,11 @@ function openMailboxFixture({
   };
 }
 
-function mailboxClient({ reject = false } = {}) {
+function mailboxClient({
+  reject = false,
+  structuredOutput = undefined,
+  structuredOutputError = undefined
+} = {}) {
   let nextRequestId = 0;
   const calls = [];
   return {
@@ -230,7 +234,24 @@ function mailboxClient({ reject = false } = {}) {
       if (reject) throw Object.assign(new Error("provider response unavailable"), {
         code: "E_PROVIDER_EXIT"
       });
-      const response = { stopReason: "end_turn" };
+      const response = {
+        stopReason: "end_turn",
+        ...(
+          structuredOutput !== undefined
+          || structuredOutputError !== undefined
+            ? {
+                _meta: {
+                  ...(structuredOutput !== undefined
+                    ? { structuredOutput }
+                    : {}),
+                  ...(structuredOutputError !== undefined
+                    ? { structuredOutputError }
+                    : {})
+                }
+              }
+            : {}
+        )
+      };
       return typeof options.validateResult === "function"
         ? options.validateResult(response)
         : response;
@@ -480,6 +501,48 @@ test("provider-owned pump delivers ordered messages, closes body-free, and repla
     }),
     (error) => error?.code === "E_CAPABILITY"
   );
+});
+
+test("provider-owned pump requests and returns native structured output for mailbox turns", async () => {
+  const fixture = openMailboxFixture({
+    attemptId: "9".repeat(32),
+    idempotencyKey: "mb-spawn-structured-0001"
+  });
+  sendWorkerMessage({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    message: "Return the final structured report",
+    idempotencyKey: "mb-send-structured-0001",
+    env: fixture.env
+  });
+  const outputSchema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["outcome"],
+    properties: {
+      outcome: { type: "string", enum: ["complete"] }
+    }
+  };
+  const structuredOutput = { outcome: "complete" };
+  const client = mailboxClient({ structuredOutput });
+  const drained = await drainWorkerMailbox({
+    root: fixture.root,
+    workerId: fixture.workerId,
+    attemptId: fixture.attemptId,
+    client,
+    sessionId: SESSION,
+    composePrompt: ({ message, sequence }) => composeMailboxTurnPrompt(message, {
+      sequence,
+      workerId: fixture.workerId
+    }),
+    collectTurnText: () => ({ text: () => "unstructured fallback" }),
+    outputSchema,
+    env: fixture.env
+  });
+
+  assert.deepEqual(client.calls[0].params._meta, { outputSchema });
+  assert.deepEqual(drained.turns[0].structuredOutput, structuredOutput);
 });
 
 test("durable cancellation rejects queued turns and prevents another provider prompt between turns", async () => {

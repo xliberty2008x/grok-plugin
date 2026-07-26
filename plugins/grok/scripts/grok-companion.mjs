@@ -1641,6 +1641,7 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
                 workerId: id
               }),
               collectTurnText,
+              outputSchema: workerReportOutputSchema,
               timeoutMs,
               cancelRequested,
               validateAuthority: (transaction) => {

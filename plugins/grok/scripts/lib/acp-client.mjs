@@ -73,7 +73,7 @@ function cloneBoundedJson(value, {
   return JSON.parse(serialized);
 }
 
-function normalizeOutputSchema(value) {
+export function normalizeOutputSchema(value) {
   return cloneBoundedJson(value, {
     label: "ACP output schema",
     maximumBytes: MAX_OUTPUT_SCHEMA_BYTES,
@@ -81,7 +81,7 @@ function normalizeOutputSchema(value) {
   });
 }
 
-function structuredPromptResult(result, requested) {
+export function structuredPromptResult(result, requested) {
   if (!requested) return {};
   if (!Object.hasOwn(result, "_meta")) return {};
   const meta = result?._meta;
