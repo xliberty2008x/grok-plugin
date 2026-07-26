@@ -3,17 +3,20 @@ import path from "node:path";
 
 import { CompanionError } from "./errors.mjs";
 import {
-  captureGrokExecutableIdentity,
-  sameExecutableRelease
+  sameExecutableAttestation
 } from "./executable-identity.mjs";
 import {
   deleteSession,
-  discoverGrok,
   inspectImportedSessionPresence,
   taskCredentialEnvironment
 } from "./grok-provider.mjs";
 import { sameHostSession } from "./host.mjs";
 import { processGroupGone } from "./process-control.mjs";
+import {
+  assertProviderLaunchBinding,
+  providerLaunchBindingDigest,
+  resolveProviderExecutablePin
+} from "./provider-executable-pin.mjs";
 import { loadProviderGuard } from "./recursion-guard.mjs";
 import { jobFileIfPresent, tryReadJob } from "./state.mjs";
 import {
@@ -116,25 +119,54 @@ function bindOwnedProviderSession({
   }
   const expectedExecutable =
     job.provisioningRuntime?.intent?.executableIdentity;
-  const binary = discoverGrok();
-  const currentExecutable = captureGrokExecutableIdentity(binary);
+  const spawn = job.request?.spawn || {};
+  let executableBinding;
+  let resolvedExecutable;
+  try {
+    executableBinding = assertProviderLaunchBinding(
+      spawn.providerLaunchBinding
+    );
+    const bindingDigest = providerLaunchBindingDigest(executableBinding);
+    if (spawn.providerLaunchBindingDigest !== bindingDigest
+      || job.executionBinding?.providerLaunchBindingDigest !== bindingDigest
+      || job.provisioningRuntime?.intent?.providerLaunchBindingDigest
+        !== bindingDigest
+      || providerLaunchBindingDigest(
+        job.provisioningRuntime?.intent?.providerLaunchBinding
+      ) !== bindingDigest) {
+      throw new CompanionError(
+        "E_CONTEXT_DRIFT",
+        "The admitted Grok executable binding changed before provider-session cleanup."
+      );
+    }
+    resolvedExecutable = resolveProviderExecutablePin(
+      executableBinding,
+      { env }
+    );
+  } catch (error) {
+    if (error instanceof CompanionError) throw error;
+    throw new CompanionError(
+      "E_CONTEXT_DRIFT",
+      "The admitted Grok executable binding is unavailable for provider-session cleanup."
+    );
+  }
   if (
     !expectedExecutable
-    || !sameExecutableRelease(
+    || !sameExecutableAttestation(
       expectedExecutable,
-      currentExecutable.attestation
+      resolvedExecutable.executableIdentity
     )
   ) {
     throw new CompanionError(
       "E_CONTEXT_DRIFT",
-      "The installed Grok release changed before provider-session cleanup."
+      "The admitted Grok executable changed before provider-session cleanup."
     );
   }
   const jobFile = jobFileIfPresent(root, workerId, env);
   if (!jobFile) throw sessionError("Owned provider session state is unavailable.");
   const stateDirectory = path.dirname(path.dirname(jobFile));
   return Object.freeze({
-    binary,
+    binary: resolvedExecutable.binary,
     stateDirectory,
     homeMarker: workerId,
     cwd: job.executionBinding?.controlRoot || root
