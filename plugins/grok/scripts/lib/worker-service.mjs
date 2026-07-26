@@ -478,7 +478,11 @@ export function createWorkerService({
         return {
           ...admitted,
           handle: admitted.handle,
-          providerLaunchState: "not-ready",
+          // Preserve the durable admission/replay state reported by the
+          // mutation boundary. A terminal replay still performs no launch,
+          // but its verified-ready provisioning chain must not be masked as
+          // an unprovisioned admission.
+          providerLaunchState: admitted.providerLaunchState,
           providerLaunched: false
         };
       }
