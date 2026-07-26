@@ -818,6 +818,19 @@ async function cleanupSetupBoundary(boundary, {
   return clean;
 }
 
+function reportSetupBoundaryDiagnostic(phase, error = null) {
+  const match = String(error?.stack || "").match(
+    /test-installed-worker-mcp\.mjs:(\d+):\d+/
+  );
+  process.stderr.write(
+    `Installed Worker MCP setup-boundary diagnostic ${JSON.stringify({
+      schemaVersion: 1,
+      phase,
+      sourceLine: match ? Number(match[1]) : null
+    })}\n`
+  );
+}
+
 async function runSetupJson(command, args, {
   cwd,
   env,
@@ -880,7 +893,10 @@ async function runSetupJson(command, args, {
         intervalMs: SETUP_COMMAND_IDENTITY_INTERVAL_MS
       }).catch(() => ({ status: "incomplete-live" }));
       commandCapture.then((outcome) => {
-        if (outcome.status === "incomplete-live") abort("E_CLEANUP");
+        if (outcome.status === "incomplete-live") {
+          reportSetupBoundaryDiagnostic("command-identity-incomplete");
+          abort("E_CLEANUP");
+        }
         else if (outcome.status === "invalid-pid") abort("E_SETUP");
       });
     } else {
@@ -903,8 +919,9 @@ async function runSetupJson(command, args, {
       if (runner.interrupted) abort("E_INTERRUPTED");
       try {
         scanSetupBoundary(boundary);
-      } catch {
+      } catch (error) {
         boundary.scanFailed = true;
+        reportSetupBoundaryDiagnostic("active-scan", error);
         abort("E_CLEANUP");
       }
     }, 25);
@@ -947,8 +964,9 @@ async function runSetupJson(command, args, {
         }
         try {
           scanSetupBoundary(boundary);
-        } catch {
+        } catch (error) {
           boundary.scanFailed = true;
+          reportSetupBoundaryDiagnostic("final-scan", error);
           abortCode ||= "E_CLEANUP";
         }
         if (
