@@ -52,6 +52,22 @@ export const OFFICIAL_GROK_RELEASES = Object.freeze([
     size: 128_899_632,
     executableDigest:
       "e1fafdfffe14f339460befaf194360e8f90bfd02efe8a4f24cfa1c7aea657ffe"
+  }),
+  Object.freeze({
+    releaseSource: RELEASE_SOURCE,
+    packageName: "@xai-official/grok",
+    packageVersion: "0.2.112",
+    packageGitHead: "9bbd559437aaef77f2830978da7fcc8f59b07e33",
+    packageIntegrityDigest:
+      "49862ac444a3ca9db560cac29c96b5f2503b4b004a61ac9ac64a558842398143",
+    platform: "darwin",
+    arch: "arm64",
+    version: "0.2.112",
+    buildCommit: "9bbd559437aa",
+    channel: "stable",
+    size: 129_363_664,
+    executableDigest:
+      "5cf05fe670b1818561daf7566b580a5de6b81149166499d61072e49640b541a4"
   })
 ]);
 
