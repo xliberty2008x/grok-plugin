@@ -4479,7 +4479,7 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     || result.worker?.status !== "completed"
     || result.worker?.write !== true
     || result.worker?.roleId !== "implementer"
-    || result.worker?.hostVerification !== "not_run"
+    || result.worker?.result?.hostVerification !== "not_run"
   ) {
     fail("E_SCENARIO");
   }
@@ -4687,7 +4687,7 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     runnerWorktreeRegistrationAbsent: true,
     productionIntegrationQualified: false,
     productionCleanupQualified: false,
-    hostVerification: result.worker.hostVerification
+    hostVerification: result.worker.result.hostVerification
   });
 }
 
