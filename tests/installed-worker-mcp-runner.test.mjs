@@ -662,8 +662,18 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /!sameJson\(patchReplay, patch\)/);
   assert.match(source, /spawnReplayProven: true/);
   assert.match(source, /artifactReplayProven: true/);
-  assert.match(source, /providerRelaunchDelta: 0/);
-  assert.match(source, /worktreeCreateDelta: 0/);
+  assert.match(source, /artifactReplayAfterCleanupProven: true/);
+  assert.match(source, /spawnReplayNoDispatch: spawnReplay\.providerLaunched === false/);
+  assert.match(source, /providerGenerationDelta,/);
+  assert.match(source, /primaryTurnAdmissionDelta,/);
+  assert.match(source, /worktreeIdentityChanged,/);
+  assert.match(
+    source,
+    /removedBeforeArtifactReplay\.classification !== "absent"/
+  );
+  assert.match(source, /!sameJson\(metadataAfterCleanup, metadata\)/);
+  assert.match(source, /!sameJson\(contentAfterCleanup, content\)/);
+  assert.match(source, /!sameJson\(patchAfterCleanup, patch\)/);
   assert.match(
     source,
     /async function runWriteCancellationScenario\(baseContext, fixtureRoot\)/
@@ -678,8 +688,10 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   );
   assert.match(
     source,
-    /!sameJson\(activeAfterReplay\.identity, activeBeforeReplay\.identity\)/
+    /const runtimeIdentityChanged = !sameJson\(/
   );
+  assert.match(source, /providerProcessIdentityChanged,/);
+  assert.match(source, /runtimeIdentityChanged,/);
   assert.match(
     source,
     /"worker_cancel",\s*cancelArguments,\s*\["receipt", "replayed"\]/

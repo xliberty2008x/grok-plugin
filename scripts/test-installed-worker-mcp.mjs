@@ -225,6 +225,7 @@ const QUALIFICATION_STAGES = new Set([
   "write-smoke-production-cleanup",
   "write-smoke-session-absence",
   "write-smoke-cleanup-reconnect",
+  "write-smoke-artifact-post-cleanup",
   "write-smoke-cleanup",
   "write-cancel-fixture",
   "write-cancel-mcp-surface",
@@ -5597,6 +5598,19 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
       workerId,
       env: context.env
     });
+  const replayedPrimaryTurnAdmissionKeys = Object.keys(
+    replayedTerminalJob.request?.spawn?.primaryTurnAdmissions || {}
+  ).sort();
+  const providerGenerationDelta =
+    replayedTerminalJob.request?.spawn?.dispatch?.providerGeneration
+    - providerGeneration;
+  const primaryTurnAdmissionDelta =
+    replayedPrimaryTurnAdmissionKeys.length
+    - primaryTurnAdmissionKeys.length;
+  const worktreeIdentityChanged =
+    executionRootAfterReplay.dev !== executionRootBeforeReplay.dev
+    || executionRootAfterReplay.ino !== executionRootBeforeReplay.ino
+    || !sameJson(managedIdentityAfterReplay, managedIdentityBeforeReplay);
   if (
     canonicalDigest(replayedTerminalJob) !== terminalJobDigestBeforeReplay
     || !sameJson(replayedTerminalJob, terminalJob)
@@ -5610,9 +5624,13 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
       < Date.parse(writeSpawnWitnessBeforeReplay.witness.recordedAt)
     || !executionRootAfterReplay.isDirectory()
     || executionRootAfterReplay.isSymbolicLink()
-    || executionRootAfterReplay.dev !== executionRootBeforeReplay.dev
-    || executionRootAfterReplay.ino !== executionRootBeforeReplay.ino
-    || !sameJson(managedIdentityAfterReplay, managedIdentityBeforeReplay)
+    || providerGenerationDelta !== 0
+    || primaryTurnAdmissionDelta !== 0
+    || !sameJson(
+      replayedPrimaryTurnAdmissionKeys,
+      primaryTurnAdmissionKeys
+    )
+    || worktreeIdentityChanged
     || context.guard.loadProviderGuard(fixtureRoot, workerId) !== null
   ) {
     fail("E_PRIVATE_STATE");
@@ -5779,6 +5797,50 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     fail("E_SCENARIO");
   }
 
+  enterQualificationStage("write-smoke-artifact-post-cleanup");
+  const removedBeforeArtifactReplay =
+    context.workerWorktree.classifyWorkerWorktreeEffect({
+      controlRoot: fixtureRoot,
+      executionRoot: expectedExecutionRoot,
+      baseCommit: parentBefore.head,
+      workerId,
+      env: context.env
+    });
+  if (
+    removedBeforeArtifactReplay.classification !== "absent"
+    || fs.existsSync(expectedExecutionRoot)
+  ) {
+    fail("E_CLEANUP");
+  }
+  const metadataAfterCleanup = await callTool(
+    context,
+    client,
+    "worker_artifact",
+    { id: workerId, part: "metadata" },
+    ["artifact"]
+  );
+  const contentAfterCleanup = await callTool(
+    context,
+    client,
+    "worker_artifact",
+    { id: workerId, part: "content" },
+    ["artifact"]
+  );
+  const patchAfterCleanup = await callTool(
+    context,
+    client,
+    "worker_artifact",
+    { id: workerId, part: "patch" },
+    ["artifact"]
+  );
+  if (
+    !sameJson(metadataAfterCleanup, metadata)
+    || !sameJson(contentAfterCleanup, content)
+    || !sameJson(patchAfterCleanup, patch)
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+
   enterQualificationStage("write-smoke-cleanup");
   await closeMcp(context, client);
   await waitForWriteSmokeProcessClosure(
@@ -5830,8 +5892,11 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     absenceProofDigest: cleanupReceipt.absenceProofDigest,
     spawnReplayProven: true,
     artifactReplayProven: true,
-    providerRelaunchDelta: 0,
-    worktreeCreateDelta: 0,
+    artifactReplayAfterCleanupProven: true,
+    spawnReplayNoDispatch: spawnReplay.providerLaunched === false,
+    providerGenerationDelta,
+    primaryTurnAdmissionDelta,
+    worktreeIdentityChanged,
     integrationReplayProven: true,
     cleanupReplayProven: true,
     providerSessionAbsent: true
@@ -5972,8 +6037,31 @@ async function runWriteCancellationScenario(baseContext, fixtureRoot) {
     spawnArguments.idempotencyKey,
     { replayed: true, expectCurrentProjection: false }
   );
+  const providerGenerationDelta =
+    activeAfterReplay.identity.providerGeneration
+    - activeBeforeReplay.identity.providerGeneration;
+  const providerProcessIdentityChanged = !sameJson(
+    activeAfterReplay.identity.providerProcess,
+    activeBeforeReplay.identity.providerProcess
+  );
+  const worktreeIdentityChanged =
+    activeAfterReplay.identity.executionRootDevice
+      !== activeBeforeReplay.identity.executionRootDevice
+    || activeAfterReplay.identity.executionRootInode
+      !== activeBeforeReplay.identity.executionRootInode
+    || !sameJson(
+      activeAfterReplay.identity.managedWorktree,
+      activeBeforeReplay.identity.managedWorktree
+    );
+  const runtimeIdentityChanged = !sameJson(
+    activeAfterReplay.identity,
+    activeBeforeReplay.identity
+  );
   if (
-    !sameJson(activeAfterReplay.identity, activeBeforeReplay.identity)
+    runtimeIdentityChanged
+    || providerGenerationDelta !== 0
+    || providerProcessIdentityChanged
+    || worktreeIdentityChanged
     || writeSpawnWitnessAfterReplay.witness.responseSequence
       !== writeSpawnWitnessBeforeReplay.witness.responseSequence + 1
     || writeSpawnWitnessAfterReplay.witness.requestDigest
@@ -6225,8 +6313,11 @@ async function runWriteCancellationScenario(baseContext, fixtureRoot) {
     status: result.worker.status,
     activeProviderObserved: true,
     spawnReplayProven: true,
-    providerRelaunchDelta: 0,
-    worktreeCreateDelta: 0,
+    spawnReplayNoDispatch: spawnReplay.providerLaunched === false,
+    providerGenerationDelta,
+    providerProcessIdentityChanged,
+    worktreeIdentityChanged,
+    runtimeIdentityChanged,
     cancelReplayProven: true,
     taskRuntimeCleaned: true,
     parentUnchanged: true,
