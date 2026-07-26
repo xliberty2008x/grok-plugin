@@ -118,6 +118,10 @@ import { ROOT, git, initRepo, run, tempDir, waitFor } from "./helpers.mjs";
 
 const STARTED_AT = "2026-07-16T10:00:00.000Z";
 const ENDED_AT = "2026-07-16T10:00:01.000Z";
+const PRE_V5_PROOF_MANIFEST_DIGESTS = Object.freeze({
+  "0": "66426cce37e08f4041ed272bfe6c9400298b9f05e1494b5ebd47747e1f43de8a",
+  "1": "b2fa2be3c0f70da875c7fdc268694bbd0c97c3e087ae5aabe3c995c675dab74a"
+});
 const EVIDENCE_MODULE_URL = new URL("../scripts/lib/worker-broker-evidence.mjs", import.meta.url).href;
 const ZERO_SKIP_REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
 const DETERMINISTIC_CHECK_RUNNER = path.join(ROOT, "scripts/check-deterministic.mjs");
@@ -2150,7 +2154,9 @@ function seedPriorProofRunnerCurrent(
   slice = `runner-v1-${phase}`,
   version = 1,
   prerequisites = [],
-  manifestDigest = computeProofManifestDigest(phase)
+  manifestDigest = version < PROOF_PRODUCER_VERSION
+    ? PRE_V5_PROOF_MANIFEST_DIGESTS[phase]
+    : computeProofManifestDigest(phase)
 ) {
   let record = buildEvidenceRecord({
     root,
@@ -8307,7 +8313,7 @@ test("producer v5 atomically supersedes an immutable current v4 Phase 0/1 chain"
     "runner-v4-phase-0",
     4,
     [],
-    "66426cce37e08f4041ed272bfe6c9400298b9f05e1494b5ebd47747e1f43de8a"
+    PRE_V5_PROOF_MANIFEST_DIGESTS["0"]
   );
   const priorPhaseOne = seedPriorProofRunnerCurrent(
     root,
@@ -8319,7 +8325,7 @@ test("producer v5 atomically supersedes an immutable current v4 Phase 0/1 chain"
       recordDigest: priorPhaseZero.record.recordDigest,
       gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]]
     }],
-    "b2fa2be3c0f70da875c7fdc268694bbd0c97c3e087ae5aabe3c995c675dab74a"
+    PRE_V5_PROOF_MANIFEST_DIGESTS["1"]
   );
   priorPhaseOne.record = attachRecordDigest({
     ...priorPhaseOne.record,
