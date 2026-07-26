@@ -2149,7 +2149,8 @@ function seedPriorProofRunnerCurrent(
   phase = "0",
   slice = `runner-v1-${phase}`,
   version = 1,
-  prerequisites = []
+  prerequisites = [],
+  manifestDigest = computeProofManifestDigest(phase)
 ) {
   let record = buildEvidenceRecord({
     root,
@@ -2166,7 +2167,7 @@ function seedPriorProofRunnerCurrent(
     proofProducer: {
       id: PROOF_PRODUCER_ID,
       version,
-      manifestDigest: computeProofManifestDigest(phase)
+      manifestDigest
     }
   });
   const recordPath = rawEvidenceFixturePath(root, record);
@@ -4764,6 +4765,27 @@ test("Phase 0 proof manifest and persisted producer provenance are exact", () =>
   assert.match(computeProofManifestDigest("0"), /^[0-9a-f]{64}$/);
   assert.equal(Object.isFrozen(PHASE_PROOF_GATE_MANIFEST["0"]), true);
   assert.equal(Object.isFrozen(PHASE_PROOF_GATE_MANIFEST["0"][0].argv), true);
+  const focusedTimeouts = {
+    "0": 5 * 60_000,
+    "1": 15 * 60_000,
+    "2": 15 * 60_000,
+    "3": 15 * 60_000,
+    "4": 5 * 60_000,
+    "5": 5 * 60_000,
+    aggregate: 5 * 60_000
+  };
+  for (const [phase, gates] of Object.entries(PHASE_PROOF_GATE_MANIFEST)) {
+    assert.equal(
+      gates.find((gate) => gate.gateId === "repository-check")?.timeoutMs,
+      25 * 60_000,
+      `${phase} repository-check keeps the code-owned proof budget`
+    );
+    assert.equal(
+      gates[1]?.timeoutMs,
+      focusedTimeouts[phase],
+      `${phase} non-repository gate budget remains unchanged`
+    );
+  }
   assert.equal(
     PHASE_SCOPE["0"].filter((candidate) => candidate === ".github/workflows/ci.yml").length,
     1,
@@ -5421,13 +5443,13 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
 
 test("Phase 2 protected manifest, scope, and serial inventory are exact", () => {
   assert.equal(PHASE_TWO_SLICE, "mailbox-context-roles");
-  assert.equal(PROOF_PRODUCER_VERSION, 4);
+  assert.equal(PROOF_PRODUCER_VERSION, 5);
   assert.deepEqual(PHASE_PROOF_GATE_MANIFEST["2"], [
     {
       gateId: "repository-check",
       argv: ["node", "scripts/check-deterministic.mjs"],
       boundary: "source-provider-neutral",
-      timeoutMs: 15 * 60_000
+      timeoutMs: 25 * 60_000
     },
     {
       gateId: "phase-2-focused-tests",
@@ -5444,7 +5466,7 @@ test("Phase 2 protected manifest, scope, and serial inventory are exact", () => 
   ]);
   assert.equal(
     computeProofManifestDigest("2"),
-    "a88795f9f48d632451eed5d7dfd1b7fe482638fc83386128d3f70490f33dac22"
+    "966cacdb484e4fb5d214658a0d72aa24ace5e3b96910a479dc458587bc243d9c"
   );
   assert.deepEqual(PHASE2_FOCUSED_TEST_FILES, [
     "tests/acp-client.test.mjs",
@@ -5511,7 +5533,7 @@ test("Phase 3 protected manifest, scope, and zero-skip inventory are exact", () 
       gateId: "repository-check",
       argv: ["node", "scripts/check-deterministic.mjs"],
       boundary: "source-provider-neutral",
-      timeoutMs: 15 * 60_000
+      timeoutMs: 25 * 60_000
     },
     {
       gateId: "phase-3-focused-tests",
@@ -5641,8 +5663,8 @@ test("Phase 1 proof rejects unsupported slices and caller-supplied execution aut
   });
 });
 
-test("numbered phases are draft-only and producer v4 preserves the signed Phase 1 barrier", () => {
-  assert.equal(PROOF_PRODUCER_VERSION, 4);
+test("numbered phases are draft-only and producer v5 preserves the signed Phase 1 barrier", () => {
+  assert.equal(PROOF_PRODUCER_VERSION, 5);
   for (const phase of ["0", "1", "4", "5"]) {
     let unverified = buildEvidenceRecord({
       phase,
@@ -8277,24 +8299,27 @@ test("Phase 0 proof safely supersedes a canonical current v1 proof runner record
   assert.equal(loadLedger(malformedFixture.root).entries[0].currency, "current");
 });
 
-test("producer v4 atomically supersedes an immutable current v3 Phase 0/1 chain", () => {
-  const { root } = initPhaseOneProofRunnerFixture("proof-runner-v3-chain-cutover");
+test("producer v5 atomically supersedes an immutable current v4 Phase 0/1 chain", () => {
+  const { root } = initPhaseOneProofRunnerFixture("proof-runner-v4-chain-cutover");
   const priorPhaseZero = seedPriorProofRunnerCurrent(
     root,
     "0",
-    "runner-v3-phase-0",
-    3
+    "runner-v4-phase-0",
+    4,
+    [],
+    "66426cce37e08f4041ed272bfe6c9400298b9f05e1494b5ebd47747e1f43de8a"
   );
   const priorPhaseOne = seedPriorProofRunnerCurrent(
     root,
     "1",
-    "runner-v3-phase-1",
-    3,
+    "runner-v4-phase-1",
+    4,
     [{
       phase: "0",
       recordDigest: priorPhaseZero.record.recordDigest,
       gateIds: [...PHASE_MANDATORY_GATE_IDS["0"]]
-    }]
+    }],
+    "b2fa2be3c0f70da875c7fdc268694bbd0c97c3e087ae5aabe3c995c675dab74a"
   );
   priorPhaseOne.record = attachRecordDigest({
     ...priorPhaseOne.record,
@@ -8315,7 +8340,7 @@ test("producer v4 atomically supersedes an immutable current v3 Phase 0/1 chain"
         path: "tests/e2e-results/worker-broker/review-attestations/v1/0000000000000000-0000000000000000.json",
         digest: "0".repeat(64)
       },
-      issuer: "historical-v3-protected-reviewer",
+      issuer: "historical-v4-protected-reviewer",
       keyFingerprint: "0".repeat(64)
     })
   });
@@ -8336,23 +8361,23 @@ test("producer v4 atomically supersedes an immutable current v3 Phase 0/1 chain"
   fs.writeFileSync(priorLedgerPath, `${JSON.stringify(priorLedger, null, 2)}\n`);
   const phaseZeroBytes = fs.readFileSync(path.join(root, priorPhaseZero.recordPath));
   const phaseOneBytes = fs.readFileSync(path.join(root, priorPhaseOne.recordPath));
-  fs.writeFileSync(path.join(root, "tracked.txt"), "source advanced after producer v3\n");
+  fs.writeFileSync(path.join(root, "tracked.txt"), "source advanced after producer v4\n");
   git(root, "add", "tracked.txt");
-  git(root, "commit", "-m", "advance source after producer v3");
+  git(root, "commit", "-m", "advance source after producer v4");
   assert.notEqual(
     priorPhaseZero.record.source.sourceInventoryDigest,
     computeInventoryDigest(root, { includeEvidence: false }),
-    "the v3 chain must be stale before cutover"
+    "the v4 chain must be stale before cutover"
   );
 
   const replacement = provePhaseZero({
     phase: "0",
-    slice: "producer-v4-baseline",
+    slice: "producer-v5-baseline",
     root,
     write: true
   });
   assert.equal(replacement.ok, true, replacement.code);
-  assert.equal(replacement.record.proofProducer.version, 4);
+  assert.equal(replacement.record.proofProducer.version, 5);
   const ledger = loadLedger(root);
   assert.equal(
     ledger.entries.find((entry) => (
@@ -8373,12 +8398,12 @@ test("producer v4 atomically supersedes an immutable current v3 Phase 0/1 chain"
   assert.deepEqual(
     fs.readFileSync(path.join(root, priorPhaseZero.recordPath)),
     phaseZeroBytes,
-    "Phase 0 v3 bytes remain immutable"
+    "Phase 0 v4 bytes remain immutable"
   );
   assert.deepEqual(
     fs.readFileSync(path.join(root, priorPhaseOne.recordPath)),
     phaseOneBytes,
-    "Phase 1 v3 bytes remain immutable"
+    "Phase 1 v4 bytes remain immutable"
   );
   const strict = verifyLedger(root, { strict: true });
   assert.equal(strict.ok, true, strict.errors.join("; "));

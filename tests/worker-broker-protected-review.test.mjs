@@ -1012,10 +1012,10 @@ test("protected runtime owns the exact fixed Phase 2 and Phase 3 modes", () => {
   );
   assert.equal(PHASE_TWO_SLICE, "mailbox-context-roles");
   assert.equal(PHASE_THREE_SLICE, "execution-lease-artifact-integration");
-  assert.equal(PROOF_PRODUCER_VERSION, 4);
+  assert.equal(PROOF_PRODUCER_VERSION, 5);
   assert.equal(
     computeProofManifestDigest("2"),
-    "a88795f9f48d632451eed5d7dfd1b7fe482638fc83386128d3f70490f33dac22"
+    "966cacdb484e4fb5d214658a0d72aa24ace5e3b96910a479dc458587bc243d9c"
   );
   for (const marker of [
     '"prove-phase-2"',

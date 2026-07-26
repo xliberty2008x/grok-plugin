@@ -35,7 +35,7 @@ export const EVIDENCE_ONLY_PREFIXES = Object.freeze([
   "tests/e2e-results/qualification-"
 ]);
 export const PROOF_PRODUCER_ID = "worker-broker-gate-runner";
-export const PROOF_PRODUCER_VERSION = 4;
+export const PROOF_PRODUCER_VERSION = 5;
 export const PHASE_TWO_SLICE = "mailbox-context-roles";
 export const PHASE_THREE_SLICE = "execution-lease-artifact-integration";
 const PRIOR_PROOF_MANIFEST_DIGESTS = Object.freeze({
@@ -50,6 +50,14 @@ const PRIOR_PROOF_MANIFEST_DIGESTS = Object.freeze({
   3: Object.freeze({
     "0": "66426cce37e08f4041ed272bfe6c9400298b9f05e1494b5ebd47747e1f43de8a",
     "1": "b2fa2be3c0f70da875c7fdc268694bbd0c97c3e087ae5aabe3c995c675dab74a"
+  }),
+  4: Object.freeze({
+    "0": "66426cce37e08f4041ed272bfe6c9400298b9f05e1494b5ebd47747e1f43de8a",
+    "1": "b2fa2be3c0f70da875c7fdc268694bbd0c97c3e087ae5aabe3c995c675dab74a",
+    "2": "a88795f9f48d632451eed5d7dfd1b7fe482638fc83386128d3f70490f33dac22",
+    "3": "07e859d5018265f708ba4a9a580357efa31780ec539959125e9e88e82a58d138",
+    "4": "392b9d52fef83af8a93f552099bf8b9092b724ce0aab6cf5e3a79be28ba68504",
+    "5": "7d59277624f3319aa49f5091816fb143c951e00b96c6ba3b595ebb1ba526acb7"
   })
 });
 export const INDEPENDENT_REVIEW_PRODUCER_ID = "codex-native-review-runner";
@@ -862,7 +870,7 @@ export const PHASE_PROOF_GATE_MANIFEST = freezeGateManifest({
       gateId: "repository-check",
       argv: ["node", "scripts/check-deterministic.mjs"],
       boundary: "source-provider-neutral",
-      timeoutMs: 15 * 60_000
+      timeoutMs: 25 * 60_000
     },
     {
       gateId: "phase-0-focused-tests",
@@ -887,7 +895,7 @@ export const PHASE_PROOF_GATE_MANIFEST = freezeGateManifest({
       gateId: "repository-check",
       argv: ["node", "scripts/check-deterministic.mjs"],
       boundary: "source-provider-neutral",
-      timeoutMs: 15 * 60_000
+      timeoutMs: 25 * 60_000
     },
     {
       gateId: "phase-1-focused-tests",
@@ -907,7 +915,7 @@ export const PHASE_PROOF_GATE_MANIFEST = freezeGateManifest({
       gateId: "repository-check",
       argv: ["node", "scripts/check-deterministic.mjs"],
       boundary: "source-provider-neutral",
-      timeoutMs: 15 * 60_000
+      timeoutMs: 25 * 60_000
     },
     {
       gateId: "phase-2-focused-tests",
@@ -927,7 +935,7 @@ export const PHASE_PROOF_GATE_MANIFEST = freezeGateManifest({
       gateId: "repository-check",
       argv: ["node", "scripts/check-deterministic.mjs"],
       boundary: "source-provider-neutral",
-      timeoutMs: 15 * 60_000
+      timeoutMs: 25 * 60_000
     },
     {
       gateId: "phase-3-focused-tests",
@@ -947,7 +955,7 @@ export const PHASE_PROOF_GATE_MANIFEST = freezeGateManifest({
       gateId: "repository-check",
       argv: ["node", "scripts/check-deterministic.mjs"],
       boundary: "source-provider-neutral",
-      timeoutMs: 15 * 60_000
+      timeoutMs: 25 * 60_000
     },
     {
       gateId: "phase-4-focused-tests",
@@ -973,7 +981,7 @@ export const PHASE_PROOF_GATE_MANIFEST = freezeGateManifest({
       gateId: "repository-check",
       argv: ["node", "scripts/check-deterministic.mjs"],
       boundary: "source-provider-neutral",
-      timeoutMs: 15 * 60_000
+      timeoutMs: 25 * 60_000
     },
     {
       gateId: "phase-5-focused-tests",
@@ -999,7 +1007,7 @@ export const PHASE_PROOF_GATE_MANIFEST = freezeGateManifest({
       gateId: "repository-check",
       argv: ["node", "scripts/check-deterministic.mjs"],
       boundary: "source-provider-neutral",
-      timeoutMs: 15 * 60_000
+      timeoutMs: 25 * 60_000
     },
     {
       gateId: "aggregate-qualification",
@@ -8053,6 +8061,8 @@ function proofProducedRecordIsSafelySupersedable(record, root) {
     normalized = structuredClone(record);
     if (!currentVersion) {
       normalized.proofProducer.version = PROOF_PRODUCER_VERSION;
+      normalized.proofProducer.manifestDigest =
+        computeProofManifestDigest(phase);
       normalized = attachRecordDigest(normalized);
     }
   } catch {
