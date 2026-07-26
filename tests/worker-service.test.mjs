@@ -15,6 +15,9 @@ import {
   attachHostActionRequestToJob,
   readHostActionRequestBinding
 } from "../plugins/grok/scripts/lib/worker-host-actions.mjs";
+import {
+  providerLaunchBindingDigest
+} from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
 import { tryReadJob, updateJob } from "../plugins/grok/scripts/lib/state.mjs";
 import { createWorkerService } from "../plugins/grok/scripts/lib/worker-service.mjs";
 import {
@@ -31,6 +34,19 @@ const THREAD_B = "019f666b-1e72-74b1-b27c-9d186d7f1016";
 const TURN_ID = "019f666e-4084-7902-8447-249f72043a37";
 const FOLLOWUP_ATTEMPT = "e".repeat(32);
 const FOLLOWUP_SESSION = "019f918e-9a33-7781-b96a-2b2ddc635be1";
+const OFFICIAL_PROVIDER_LAUNCH_BINDING = Object.freeze({
+  schemaVersion: 1,
+  pinRef: `gpin-${"1".repeat(32)}`,
+  pinRecordDigest: "2".repeat(64),
+  executableIdentityDigest: "3".repeat(64),
+  releaseIdentityDigest: "4".repeat(64)
+});
+const OFFICIAL_PROVIDER_LAUNCH_FIXTURE = Object.freeze({
+  providerLaunchBinding: OFFICIAL_PROVIDER_LAUNCH_BINDING,
+  providerLaunchBindingDigest: providerLaunchBindingDigest(
+    OFFICIAL_PROVIDER_LAUNCH_BINDING
+  )
+});
 
 function metadata(cwd, overrides = {}) {
   const value = {
@@ -552,6 +568,7 @@ test("worker wait never starts a capability-bound job without the exact current 
       request: {
         spawn: {
           providerCapabilityDigest: boundDigest,
+          ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
           dispatch: { schemaVersion: 2, state, attemptId: null }
         }
       }
@@ -575,6 +592,7 @@ test("worker wait never starts a capability-bound job without the exact current 
       readJob: () => active(),
       listJobs: () => [],
       providerCapabilityDigest: capabilityDigest,
+      ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
       validateProviderCapability() {
         validations += 1;
         return liveDigest;
@@ -602,6 +620,7 @@ test("worker wait never starts a capability-bound job without the exact current 
     readJob: () => active("pending", "b".repeat(64)),
     listJobs: () => [],
     providerCapabilityDigest: capabilityDigest,
+    ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
     validateProviderCapability: () => capabilityDigest,
     allowUnboundDispatch: false,
     dispatchWorker() {
@@ -621,6 +640,7 @@ test("worker wait never starts a capability-bound job without the exact current 
       readJob: () => active(state),
       listJobs: () => [],
       providerCapabilityDigest: capabilityDigest,
+      ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
       validateProviderCapability() {
         validations += 1;
         return capabilityDigest;
@@ -648,6 +668,7 @@ test("worker service closes a broker-to-admission receipt race without durable c
     principal: { hostKind: "codex", threadId: THREAD_A },
     env: fixture.env,
     providerCapabilityDigest: capabilityDigest,
+    ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
     validateProviderCapability() {
       validations += 1;
       return null;
@@ -682,6 +703,7 @@ test("receipt drift after durable admission leaves a recoverable pending launch 
     principal: { hostKind: "codex", threadId: THREAD_A },
     env: fixture.env,
     providerCapabilityDigest: capabilityDigest,
+    ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
     validateProviderCapability() {
       validations += 1;
       return validations === 1 ? capabilityDigest : null;
@@ -713,6 +735,7 @@ test("receipt drift after durable admission leaves a recoverable pending launch 
     principal: { hostKind: "codex", threadId: THREAD_A },
     env: fixture.env,
     providerCapabilityDigest: capabilityDigest,
+    ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
     validateProviderCapability: () => capabilityDigest,
     allowUnboundDispatch: false,
     dispatchWorker() {
@@ -745,6 +768,7 @@ test("worker spawn returns a stable admission snapshot while dispatch advances p
     principal: { hostKind: "codex", threadId: THREAD_A },
     env: fixture.env,
     providerCapabilityDigest: capabilityDigest,
+    ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
     validateProviderCapability: () => capabilityDigest,
     allowUnboundDispatch: false,
     dispatchWorker
@@ -815,6 +839,7 @@ test("internal write admission returns not-ready and never dispatches before pro
       return writeLifecycleCapabilityDigest;
     },
     providerCapabilityDigest: "a".repeat(64),
+    ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
     validateProviderCapability() {
       readCapabilityChecks += 1;
       return null;
@@ -893,6 +918,7 @@ test("MCP advertises only the generic explorer role until runtime role policy ex
     principal: { hostKind: "codex", threadId: THREAD_A },
     env: fixture.env,
     providerCapabilityDigest: capabilityDigest,
+    ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
     validateProviderCapability: () => capabilityDigest,
     allowUnboundDispatch: false,
     dispatchWorker() {
@@ -926,6 +952,7 @@ test("worker service validates caller envelopes and delegates canonical context 
     principal: { hostKind: "codex", threadId: THREAD_A },
     env: fixture.env,
     providerCapabilityDigest,
+    ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
     dispatchWorker() {
       dispatches += 1;
       return { providerLaunchState: "pending", providerLaunched: false };
@@ -965,6 +992,7 @@ test("WorkerService resolves private decision bindings after owner authorization
     principal: parent.principal,
     env: fixture.env,
     providerCapabilityDigest: capabilityDigest,
+    ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
     validateProviderCapability() {
       validations += 1;
       return capabilityDigest;
@@ -1014,6 +1042,7 @@ test("WorkerService preserves a committed followup outbox when capability expire
     principal: parent.principal,
     env: fixture.env,
     providerCapabilityDigest: capabilityDigest,
+    ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
     validateProviderCapability() {
       validations += 1;
       return validations <= 2 ? capabilityDigest : null;
@@ -1055,6 +1084,7 @@ test("WorkerService does not persist a role decision after provider capability e
     principal: parent.principal,
     env: fixture.env,
     providerCapabilityDigest: capabilityDigest,
+    ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
     validateProviderCapability: () => null,
     allowUnboundDispatch: false
   });
@@ -1081,6 +1111,7 @@ test("WorkerService rejects mailbox admission when provider capability expires a
     principal: { hostKind: "codex", threadId: THREAD_A },
     env: fixture.env,
     providerCapabilityDigest: capabilityDigest,
+    ...OFFICIAL_PROVIDER_LAUNCH_FIXTURE,
     validateProviderCapability: () => null,
     allowUnboundDispatch: false
   });
