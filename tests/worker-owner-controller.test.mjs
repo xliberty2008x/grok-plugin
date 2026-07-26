@@ -14,6 +14,7 @@ import {
   WORKTREE_INTEGRATION_REQUEST_ALLOWLIST
 } from "../plugins/grok/scripts/lib/grok-provider.mjs";
 import {
+  normalizeWorkerOwnerSessionLoadResult,
   WORKTREE_CLOSE_REQUEST_ALLOWLIST,
   WORKTREE_REMOVE_REQUEST_ALLOWLIST
 } from "../plugins/grok/scripts/lib/worker-owner-controller.mjs";
@@ -37,6 +38,37 @@ function git(root, ...args) {
 function privateHomeDirectory(prefix) {
   return fs.mkdtempSync(path.join(os.homedir(), `.${prefix}`));
 }
+
+test("owner session load accepts the upstream ACP response shape and rejects a conflicting echoed id", () => {
+  const binding = {
+    sessionId: "provider-session-1",
+    executionRoot: "/private/provider-worktree"
+  };
+  assert.deepEqual(
+    normalizeWorkerOwnerSessionLoadResult(
+      {
+        models: {
+          availableModels: [],
+          currentModelId: null
+        },
+        _meta: { replayed: true }
+      },
+      binding
+    ),
+    {
+      sessionId: binding.sessionId,
+      cwd: binding.executionRoot,
+      noReplay: true
+    }
+  );
+  assert.throws(
+    () => normalizeWorkerOwnerSessionLoadResult(
+      { sessionId: "different-provider-session" },
+      binding
+    ),
+    (error) => error?.code === "E_PROTOCOL"
+  );
+});
 
 test("owner controllers keep integration and cleanup as distinct no-model authorities and remove their homes", () => {
   const root = privateHomeDirectory("grok-owner-control-");
@@ -93,7 +125,8 @@ test("owner controllers keep integration and cleanup as distinct no-model author
       purpose: WORKTREE_CLEANUP_PURPOSE,
       ...common,
       managedWorktreeParent: workerParent,
-      sessionId: "provider-session-1"
+      sessionId: "provider-session-1",
+      providerHomeId: "worker-provider-home-1"
     };
     assert.equal(
       assertWorkerOwnerControllerBinding(integrationBinding),

@@ -160,6 +160,7 @@ function terminalWriteFixture(t, label = "base") {
     workerProcess: null,
     providerProcess: null,
     request: {
+      providerHomeId: workerId,
       spawn: {
         executionBindingDigest: executionBinding.bindingDigest,
         providerLaunchOutcome: "launched",
@@ -496,4 +497,46 @@ test("cleanup adopts delete and official remove effects after response loss", as
   assert.equal(cleaned.receipt.status, "absent");
   assert.match(cleaned.receipt.sessionDeletionDigest, /^[a-f0-9]{64}$/);
   assert.match(cleaned.receipt.absenceProofDigest, /^[a-f0-9]{64}$/);
+});
+
+test("cleanup classifies bound session-load failure and does not delete or remove", async (t) => {
+  const fixture = terminalWriteFixture(t, "cleanup-load-failure");
+  const integrated = await integrateWriteWorker(integrationArguments(fixture));
+  let closeAttempts = 0;
+  let deleteCalls = 0;
+  let removeCalls = 0;
+
+  await assert.rejects(
+    cleanupWriteWorker({
+      root: fixture.root,
+      principal: fixture.principal,
+      workerId: fixture.workerId,
+      integrationReceiptDigest: integrated.receipt.receiptDigest,
+      idempotencyKey: `cleanup-load-failure-${fixture.workerId}`,
+      env: fixture.env,
+      runCloseEffect: async ({ binding }) => {
+        closeAttempts += 1;
+        assert.equal(binding.providerHomeId, fixture.workerId);
+        const error = new Error("provider session persistence unavailable");
+        error.details = { ownerControllerStage: "load" };
+        throw error;
+      },
+      inspectProviderSession: async () => {
+        throw new Error("must not inspect before exact close");
+      },
+      deleteProviderSession: async () => {
+        deleteCalls += 1;
+      },
+      runRemoveEffect: async () => {
+        removeCalls += 1;
+      }
+    }),
+    (error) => error?.code === "E_WORKTREE"
+      && error?.details?.classification === "session-load-failed"
+  );
+
+  assert.equal(closeAttempts, 2);
+  assert.equal(deleteCalls, 0);
+  assert.equal(removeCalls, 0);
+  assert.equal(fs.existsSync(fixture.worktree.executionRoot), true);
 });

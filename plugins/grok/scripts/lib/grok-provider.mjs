@@ -387,9 +387,31 @@ function existingPrivateDirectoryIdentity(directory) {
   });
 }
 
+function existingOwnedSessionDirectoryIdentity(directory) {
+  const resolved = path.resolve(directory);
+  const stat = fs.lstatSync(resolved);
+  if (
+    !stat.isDirectory()
+    || stat.isSymbolicLink()
+    || (stat.mode & 0o022) !== 0
+    || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    || fs.realpathSync(resolved) !== resolved
+  ) {
+    throw new CompanionError("E_STATE", "The isolated provider session directory is unsafe.");
+  }
+  return Object.freeze({
+    path: resolved,
+    device: String(stat.dev),
+    inode: String(stat.ino),
+    policy: "owned-session-directory"
+  });
+}
+
 function directoryIdentityMatches(identity) {
   try {
-    const current = existingPrivateDirectoryIdentity(identity.path);
+    const current = identity?.policy === "owned-session-directory"
+      ? existingOwnedSessionDirectoryIdentity(identity.path)
+      : existingPrivateDirectoryIdentity(identity.path);
     return current.device === identity.device && current.inode === identity.inode;
   } catch {
     return false;
@@ -1854,6 +1876,235 @@ export function workerOwnerControllerEnvironment(
       throw new CompanionError(
         "E_STATE",
         "Failed owner-controller environment could not be removed transactionally.",
+        { causeCode: error?.code || null }
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * Construct a close-only controller around one existing provider lineage.
+ *
+ * The controller receives a fresh private HOME/CWD, while GROK_HOME remains
+ * bound to the exact lineage that owns the provider's local session store.
+ * No lineage configuration or sandbox file is rewritten: the controller uses
+ * Grok Build's built-in strict sandbox and its caller exposes only the
+ * initialize/authenticate/load/close ACP surface.
+ */
+export function workerSessionCloseControllerEnvironment(
+  stateDir,
+  providerHomeId,
+  { homeMarker } = {}
+) {
+  if (typeof stateDir !== "string"
+    || !path.isAbsolute(stateDir)
+    || path.normalize(stateDir) !== stateDir) {
+    throw new CompanionError(
+      "E_STATE",
+      "Worker session-close controller requires one exact state directory."
+    );
+  }
+  const providerLineage = safeMarker(providerHomeId);
+  const controllerLineage = safeMarker(homeMarker);
+  if (!providerLineage
+    || providerLineage !== providerHomeId
+    || !controllerLineage
+    || controllerLineage !== homeMarker
+    || providerLineage === controllerLineage) {
+    throw new CompanionError(
+      "E_STATE",
+      "Worker session-close controller requires distinct exact home markers."
+    );
+  }
+
+  const taskHomes = path.join(stateDir, "task-homes");
+  const lineageHome = path.join(taskHomes, providerLineage);
+  const grokHome = path.join(lineageHome, ".grok");
+  const sessions = path.join(grokHome, "sessions");
+  const home = path.join(taskHomes, controllerLineage);
+  const controllerCwd = path.join(home, "controller-cwd");
+  const authFile = path.join(grokHome, "auth.json");
+  const sessionHomeIdentities = Object.freeze([
+    existingPrivateDirectoryIdentity(taskHomes),
+    existingPrivateDirectoryIdentity(lineageHome),
+    existingPrivateDirectoryIdentity(grokHome),
+    existingOwnedSessionDirectoryIdentity(sessions)
+  ]);
+  const sessionHomeIdentityDigest = crypto
+    .createHash("sha256")
+    .update(JSON.stringify(sessionHomeIdentities))
+    .digest("hex");
+  const verifySessionHome = () => {
+    if (!sessionHomeIdentities.every(directoryIdentityMatches)) {
+      throw new CompanionError(
+        "E_STATE",
+        "Worker provider-session home identity changed."
+      );
+    }
+    return sessionHomeIdentityDigest;
+  };
+  const assertCredentialAbsent = () => {
+    verifySessionHome();
+    try {
+      fs.lstatSync(authFile);
+      throw new CompanionError(
+        "E_STATE",
+        "Worker provider-session credential already exists or remained after authentication."
+      );
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    return true;
+  };
+
+  // Never take ownership of a lineage that still carries a reusable task
+  // credential. In particular, do not unlink an unbound pre-existing file.
+  assertCredentialAbsent();
+
+  let homeCreated = false;
+  const ephemeralIdentities = [];
+  let stagedCredential = null;
+  let credentialRevoked = false;
+  const knownSecrets = [];
+  const assertHomeAbsent = () => {
+    try {
+      fs.lstatSync(home);
+      throw new CompanionError(
+        "E_STATE",
+        "Worker session-close controller home remained after teardown."
+      );
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    return true;
+  };
+  const removeEphemeralHome = () => {
+    verifySessionHome();
+    if (!ephemeralIdentities.length
+      || !ephemeralIdentities.every(directoryIdentityMatches)) {
+      throw new CompanionError(
+        "E_STATE",
+        "Worker session-close controller home identity changed before teardown."
+      );
+    }
+    fs.rmSync(home, { recursive: true, force: true });
+    assertHomeAbsent();
+    verifySessionHome();
+    return true;
+  };
+
+  try {
+    try {
+      fs.mkdirSync(home, { mode: 0o700 });
+      homeCreated = true;
+    } catch (error) {
+      if (error?.code === "EEXIST") {
+        throw new CompanionError(
+          "E_STATE",
+          "Worker session-close controller claim home already exists."
+        );
+      }
+      throw error;
+    }
+    ephemeralIdentities.push(existingPrivateDirectoryIdentity(home));
+    fs.mkdirSync(controllerCwd, { mode: 0o700 });
+    ephemeralIdentities.push(existingPrivateDirectoryIdentity(controllerCwd));
+    verifySessionHome();
+
+    const env = childEnvironment({
+      HOME: home,
+      USERPROFILE: home,
+      GROK_HOME: grokHome,
+      GROK_FOLDER_TRUST: "1",
+      GROK_SUBAGENTS: "0",
+      GROK_MEMORY: "0",
+      GROK_WEB_FETCH: "0",
+      GROK_LSP_TOOLS: "0",
+      GROK_WORKSPACE_TOOL_DEFS_ENABLED: "0"
+    });
+    delete env.HOMEDRIVE;
+    delete env.HOMEPATH;
+    delete env.GROK_AUTH_PATH;
+
+    return Object.freeze({
+      purpose: WORKTREE_CLEANUP_PURPOSE,
+      profileId: WORKTREE_CLEANUP_CONTROLLER_PROFILE_ID,
+      home,
+      grokHome,
+      controllerCwd,
+      sandboxProfile: "strict",
+      env,
+      knownSecrets,
+      sessionHomeIdentityDigest,
+      verifySessionHome,
+      stageCredential() {
+        if (credentialRevoked) {
+          throw new CompanionError(
+            "E_STATE",
+            "A revoked session-close controller credential cannot be restaged."
+          );
+        }
+        if (stagedCredential) return;
+        assertCredentialAbsent();
+        const authPath = process.env.GROK_AUTH_PATH
+          || path.join(os.homedir(), ".grok", "auth.json");
+        if (!fs.existsSync(authPath)) {
+          throw new CompanionError(
+            "E_AUTH_REQUIRED",
+            `Grok cached authentication is unavailable. Run \`grok login\`, then ${hostCommand("setup")}.`
+          );
+        }
+        const payload = freshCachedCredentialPayload(
+          authPath,
+          MIN_ISOLATED_STARTUP_CREDENTIAL_VALIDITY_MS
+        );
+        stagedCredential = stageRevocableTaskCredential(
+          authPath,
+          authFile,
+          sessionHomeIdentities,
+          payload
+        );
+        knownSecrets.push(stagedCredential.key);
+      },
+      revokeCredential() {
+        verifySessionHome();
+        if (!stagedCredential) {
+          assertCredentialAbsent();
+          return;
+        }
+        if (!credentialRevoked) {
+          try { stagedCredential.refresh(); }
+          catch (error) { if (error?.code !== "ENOENT") throw error; }
+          stagedCredential.revoke();
+          credentialRevoked = true;
+        }
+        assertCredentialAbsent();
+      },
+      assertCredentialAbsent,
+      assertHomeAbsent,
+      cleanup(processIdentity) {
+        if (processIdentity && !processGroupGone(processIdentity)) {
+          throw new CompanionError(
+            "E_PROCESS_IDENTITY",
+            "Worker session-close controller home cannot be removed while its process group may live."
+          );
+        }
+        assertCredentialAbsent();
+        return removeEphemeralHome();
+      }
+    });
+  } catch (error) {
+    let cleanupFailure = null;
+    try {
+      if (homeCreated) removeEphemeralHome();
+    } catch (failure) {
+      cleanupFailure = failure;
+    }
+    if (cleanupFailure) {
+      throw new CompanionError(
+        "E_STATE",
+        "Failed session-close controller environment could not be removed transactionally.",
         { causeCode: error?.code || null }
       );
     }

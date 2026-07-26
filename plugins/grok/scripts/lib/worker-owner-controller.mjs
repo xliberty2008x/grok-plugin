@@ -22,6 +22,7 @@ import {
   waitForProviderBootstrapReady,
   workerOwnerControllerEnvironment,
   workerOwnerControllerSpawnArgs,
+  workerSessionCloseControllerEnvironment,
   WORKTREE_INTEGRATION_REQUEST_ALLOWLIST
 } from "./grok-provider.mjs";
 import { GrokWorktreeAcp } from "./grok-worktree-acp.mjs";
@@ -73,7 +74,8 @@ const INTEGRATION_BASE_KEYS = new Set([
 const CLEANUP_BASE_KEYS = new Set([
   ...BASE_COMMON_KEYS,
   "managedWorktreeParent",
-  "sessionId"
+  "sessionId",
+  "providerHomeId"
 ]);
 
 function isPlainRecord(value) {
@@ -245,9 +247,10 @@ function requestAllowlist(purpose, effect) {
   );
 }
 
-function normalizedLoadResult(result, binding) {
+export function normalizeWorkerOwnerSessionLoadResult(result, binding) {
   if (!isPlainRecord(result)
-    || result.sessionId !== binding.sessionId) {
+    || (Object.hasOwn(result, "sessionId")
+      && result.sessionId !== binding.sessionId)) {
     throw new CompanionError(
       "E_PROTOCOL",
       "Cleanup controller loaded a different provider session."
@@ -315,24 +318,30 @@ export async function openWorkerOwnerController({
     );
   }
   const allowlist = requestAllowlist(baseBinding.purpose, effect);
-  const environment = workerOwnerControllerEnvironment(
-    stateDir,
-    controlRoot,
-    executionRoot,
-    {
-      purpose: baseBinding.purpose,
-      homeMarker,
-      gitCommonDir,
-      baseCommit,
-      targetPath: baseBinding.purpose === WORKTREE_INTEGRATION_PURPOSE
-        ? baseBinding.targetPath
-        : null,
-      managedWorktreeParent:
-        baseBinding.purpose === WORKTREE_CLEANUP_PURPOSE
-          ? baseBinding.managedWorktreeParent
-          : null
-    }
-  );
+  const environment = effect === "close"
+    ? workerSessionCloseControllerEnvironment(
+        stateDir,
+        baseBinding.providerHomeId,
+        { homeMarker }
+      )
+    : workerOwnerControllerEnvironment(
+        stateDir,
+        controlRoot,
+        executionRoot,
+        {
+          purpose: baseBinding.purpose,
+          homeMarker,
+          gitCommonDir,
+          baseCommit,
+          targetPath: baseBinding.purpose === WORKTREE_INTEGRATION_PURPOSE
+            ? baseBinding.targetPath
+            : null,
+          managedWorktreeParent:
+            baseBinding.purpose === WORKTREE_CLEANUP_PURPOSE
+              ? baseBinding.managedWorktreeParent
+              : null
+        }
+      );
   const marker = homeMarker;
   let preparedIntent = null;
   let resolvedBinding = null;
@@ -368,8 +377,8 @@ export async function openWorkerOwnerController({
         "Worker owner-controller process group remained after shutdown."
       );
     }
-    if ((!child || !identity || processGroupGone(identity))
-      && resolvedBinding) {
+    const providerWriterGone = !identity || processGroupGone(identity);
+    if (providerWriterGone && resolvedBinding) {
       try {
         const loaded = loadProviderGuard(controlRoot, marker);
         if (loaded) {
@@ -385,11 +394,17 @@ export async function openWorkerOwnerController({
         cleanupFailure ||= error;
       }
     }
-    try { environment.revokeCredential(); }
-    catch (error) { cleanupFailure ||= error; }
-    try { environment.assertCredentialAbsent(); }
-    catch (error) { cleanupFailure ||= error; }
-    if (!cleanupFailure && (!identity || processGroupGone(identity))) {
+    // A live Grok process remains an authorized atomic writer to auth.json.
+    // Adopt and revoke the final credential inode only after its exact process
+    // group is proven gone; otherwise retain both credential and controller
+    // home for fail-closed recovery.
+    if (providerWriterGone) {
+      try { environment.revokeCredential(); }
+      catch (error) { cleanupFailure ||= error; }
+      try { environment.assertCredentialAbsent(); }
+      catch (error) { cleanupFailure ||= error; }
+    }
+    if (!cleanupFailure && providerWriterGone) {
       try { environment.cleanup(identity); }
       catch (error) { cleanupFailure ||= error; }
     }
@@ -447,13 +462,15 @@ export async function openWorkerOwnerController({
       { directory: path.join(environment.controllerCwd, "provider-bin") }
     );
     executableIdentity = capturedExecutable.attestation;
-    environment.verifyGitExecutable();
+    if (effect === "close") environment.verifySessionHome();
+    environment.verifyGitExecutable?.();
     inspectIsolation(
       capturedExecutable.canonicalPath,
       environment.controllerCwd,
       environment
     );
-    environment.verifyGitExecutable();
+    if (effect === "close") environment.verifySessionHome();
+    environment.verifyGitExecutable?.();
     environment.assertCredentialAbsent();
     const prepared = await durable.prepare(Object.freeze({
       purpose: baseBinding.purpose,
@@ -528,6 +545,7 @@ export async function openWorkerOwnerController({
       processIdentity: identity,
       binding: resolvedBinding
     });
+    if (effect === "close") environment.verifySessionHome();
     environment.stageCredential();
     await publishProviderBootstrapSpec(child, launch.specPayload);
     const ready = await waitForProviderBootstrapReady(
@@ -602,9 +620,19 @@ export async function openWorkerOwnerController({
         },
         30_000
       );
+      environment.verifySessionHome();
     }
-    environment.revokeCredential();
-    environment.assertCredentialAbsent();
+    if (effect === "close") {
+      // Grok Build may atomically enrich auth.json after authenticate returns.
+      // Keep the credential only inside this no-model, method-allowlisted
+      // load/close controller, then revoke it after its process group is gone
+      // in settleAfterTeardown. Revoking here races that upstream writer and
+      // can strand an unbound replacement credential.
+      environment.verifySessionHome();
+    } else {
+      environment.revokeCredential();
+      environment.assertCredentialAbsent();
+    }
     if (initialized?.protocolVersion !== 1
       || (effect === "close"
         && initialized?.agentCapabilities?.loadSession !== true)) {
@@ -682,6 +710,7 @@ export async function openWorkerOwnerController({
         );
       }
       effectStarted = true;
+      environment.verifySessionHome();
       const result = await client.request(
         "session/load",
         {
@@ -692,9 +721,16 @@ export async function openWorkerOwnerController({
         },
         45_000
       );
-      const receipt = normalizedLoadResult(result, baseBinding);
+      const receipt = normalizeWorkerOwnerSessionLoadResult(
+        result,
+        baseBinding
+      );
+      environment.verifySessionHome();
       loaded = true;
-      return receipt;
+      return Object.freeze({
+        ...receipt,
+        sessionHomeIdentityDigest: environment.sessionHomeIdentityDigest
+      });
     },
     async closeSession() {
       assertEffect("close");
@@ -707,10 +743,12 @@ export async function openWorkerOwnerController({
       const receipt = await adapter.close({
         sessionId: baseBinding.sessionId
       });
+      environment.verifySessionHome();
       closed = true;
       return Object.freeze({
         sessionId: baseBinding.sessionId,
-        success: receipt.success
+        success: receipt.success,
+        sessionHomeIdentityDigest: environment.sessionHomeIdentityDigest
       });
     },
     async removeWorktree() {
@@ -781,8 +819,21 @@ export function runCloseEffect(input) {
   return runOneEffect(
     { ...input, effect: "close" },
     async (controller, receipts) => {
-      receipts.push(await controller.loadSession());
-      receipts.push(await controller.closeSession());
+      let stage = "load";
+      try {
+        receipts.push(await controller.loadSession());
+        stage = "close";
+        receipts.push(await controller.closeSession());
+      } catch (error) {
+        const details = error?.details
+          && typeof error.details === "object"
+          && !Array.isArray(error.details)
+          ? { ...error.details }
+          : {};
+        details.ownerControllerStage = stage;
+        if (error && typeof error === "object") error.details = details;
+        throw error;
+      }
     }
   );
 }

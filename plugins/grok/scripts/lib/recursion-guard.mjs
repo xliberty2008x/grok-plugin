@@ -49,7 +49,8 @@ const WORKTREE_INTEGRATION_BINDING_KEYS = new Set([
 const WORKTREE_CLEANUP_BINDING_KEYS = new Set([
   ...WORKER_OWNER_CONTROLLER_COMMON_BINDING_KEYS,
   "managedWorktreeParent",
-  "sessionId"
+  "sessionId",
+  "providerHomeId"
 ]);
 const WORKTREE_PROVISIONING_RUNTIME_KEYS = new Set([
   "schemaVersion",
@@ -469,6 +470,7 @@ export function assertWorkerOwnerControllerBinding(binding) {
       !absolute(binding.managedWorktreeParent)
       || binding.managedWorktreeParent !== path.dirname(binding.executionRoot)
       || !boundedOpaqueText(binding.sessionId)
+      || !/^[a-zA-Z0-9._-]{1,80}$/.test(binding.providerHomeId || "")
     ))) {
     throw new CompanionError(
       "E_PROCESS_IDENTITY",

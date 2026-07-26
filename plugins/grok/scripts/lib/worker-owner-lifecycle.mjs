@@ -1110,6 +1110,11 @@ function ownerControllerInput({
     ? record.integration
     : record.cleanup;
   if (!lifecycle) throw stateError();
+  if (operation === "cleanup"
+    && (job.request?.providerHomeId !== workerId
+      || !/^[a-zA-Z0-9._-]{1,80}$/.test(job.request.providerHomeId))) {
+    throw stateError("Cleanup controller provider-session home binding is invalid.");
+  }
   const effectBindingDigest = digest({
     operation,
     effect,
@@ -1120,6 +1125,9 @@ function ownerControllerInput({
     integrationReceiptDigest:
       operation === "cleanup" ? lifecycle.integrationReceiptDigest : null,
     providerSessionDigest: digest(record.providerSessionId),
+    ...(operation === "cleanup"
+      ? { providerHomeDigest: digest(job.request?.providerHomeId) }
+      : {}),
     worktreeOperationDigest: digest(record.worktreeOperationId),
     controllerAttemptId,
     controllerFence: lifecycle.fence
@@ -1150,7 +1158,8 @@ function ownerControllerInput({
           workerId,
           env
         ),
-        sessionId: record.providerSessionId
+        sessionId: record.providerSessionId,
+        providerHomeId: job.request?.providerHomeId
       });
   const homeMarker = `owner-${effect}-${
     digest(`${workerId}:${controllerAttemptId}`).slice(0, 40)
@@ -1785,18 +1794,26 @@ export async function cleanupWriteWorker({
           closeReceiptDigest,
           updatedAt: now()
         }));
-      } catch {
+      } catch (error) {
         if (record.cleanup.closeAttempts < 2) continue;
+        const loadFailed =
+          error?.details?.ownerControllerStage === "load";
+        const classification = loadFailed
+          ? "session-load-failed"
+          : "session-close-response-lost";
+        const message = loadFailed
+          ? "Official session load failed from the bound provider home."
+          : "Official session close response was lost without durable adoption evidence.";
         blockCleanup(
           root,
           workerId,
           env,
-          "session-close-response-lost",
-          "Official session close response was lost without durable adoption evidence."
+          classification,
+          message
         );
         throw cleanupError(
-          "Official session close response was lost without durable adoption evidence.",
-          "session-close-response-lost"
+          message,
+          classification
         );
       }
     }
