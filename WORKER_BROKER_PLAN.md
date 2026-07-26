@@ -1,6 +1,6 @@
 # Native-like Grok Worker Broker execution and evidence plan
 
-Status: Active roadmap; Phase 3 source closure is implemented and deterministic-clean in the current working tree, but its exact committed-source live receipt and all downstream qualification remain pending
+Status: Active roadmap; Phase 3 source closure is implemented and deterministic-clean in the current working tree, but its exact committed-source operational E2E receipt and downstream host/CI closeout remain pending. Cryptographically attested qualification is optional post-E2E hardening, not an issue #25 blocker.
 
 Roadmap version: `1.1`
 
@@ -23,13 +23,34 @@ Current conservative phase status:
 | Phase | Current state | What exists | Why the phase is not complete |
 | --- | --- | --- | --- |
 | 0 — Evidence system | `implemented_unverified` | Schema, validator, capture/verify CLI, parser-backed static-import phase closure, fixed serial proof runners, immutable-record and ledger logic, fail-closed tests, pre-publication proof-home cleanup, fixed absolute Python/PTTY binding, provisional live-receipt replay, bounded zero-skip v2 diagnostics, a code-owned installed Worker MCP observation/publisher runner, and a protected signed-review request/attestation/promotion boundary | Exact source `2b39e13` passed Phase 1 324/324 and full 552/552 and produced a strictly valid ledger-current Phase 0 record. Committed Q2 source `4ce2d85` passed the evidence suite 121/121 and the root-owned Docker boundary 1/1 with 14 hostile scenarios, but later source work and the synthetic Docker signer mean exact clean-source replay and replacement records remain required |
-| 1 — Worker API | `implemented_unverified` | Protocol/schema projections, durable events/cursors, authority-bound reads, exact context-bound launch authorization, intent-bound private-channel provider bootstrap, exact controller/worker/provider identities, autonomous capability-bound startup recovery, atomic cleanup-safe terminalization, cancellation, root host-claim suppression, a bounded strict MCP STDIO client, stable transaction-time spawn responses, durable private response witnesses, and an atomic externally signed Phase 1 promotion path | Exact source `2b39e13` produced a strictly valid ledger-current, honest `implemented_unverified` Phase 1 record. Q2 implements the signed promotion boundary, but the final source still needs fresh Phase 0/1 proofs, a real protected independent issuer, installed MCP proof, and authenticated-provider proof |
-| 2 — Mailbox/context/roles | `implemented_unverified` production path plus protected producer | Provider/session/attempt-bound mailbox capability evidence, an attempt-bound ordered ACP delivery pump, explicit ambiguity states, body-free inflight and communication-chain records, autonomous crash settlement, broker-built canonical ContextPacket, immutable explorer/reviewer/security/test role-profile-tool policies, body-free Context Receipt, exact effective-prompt and provider-lineage binding, restart/tamper rejection, public exact-owner role decisions, grant-bound same-session follow-up through the normal durable launch outbox, and the fixed protected Phase 2 producer/replay surface | The installed authenticated vertical passed on source `e1b03af` and its provisional v2 receipt is committed in `1fa1cd5`; final-source Phase 0 plus protected signed Phase 1 predecessors and a current protected Phase 2 record are still missing |
+| 1 — Worker API | `implemented_unverified` | Protocol/schema projections, durable events/cursors, authority-bound reads, exact context-bound launch authorization, intent-bound private-channel provider bootstrap, exact controller/worker/provider identities, autonomous capability-bound startup recovery, atomic cleanup-safe terminalization, cancellation, root host-claim suppression, a bounded strict MCP STDIO client, stable transaction-time spawn responses, durable private response witnesses, and an optional atomic externally signed Phase 1 promotion path | Exact source `2b39e13` produced a strictly valid ledger-current, honest `implemented_unverified` Phase 1 record. The final source still needs fresh Phase 0/1 proofs plus installed MCP and authenticated-provider proof for operational E2E. Q2's real protected issuer is required only for the optional cryptographically attested tier |
+| 2 — Mailbox/context/roles | `implemented_unverified` production path plus protected producer | Provider/session/attempt-bound mailbox capability evidence, an attempt-bound ordered ACP delivery pump, explicit ambiguity states, body-free inflight and communication-chain records, autonomous crash settlement, broker-built canonical ContextPacket, immutable explorer/reviewer/security/test role-profile-tool policies, body-free Context Receipt, exact effective-prompt and provider-lineage binding, restart/tamper rejection, public exact-owner role decisions, grant-bound same-session follow-up through the normal durable launch outbox, and the fixed protected Phase 2 producer/replay surface | The installed authenticated vertical passed on source `e1b03af` and its provisional v2 receipt is committed in `1fa1cd5`; final-source installed/authenticated and natural-host replay are still missing for operational E2E. The protected predecessor chain/current Phase 2 record belong to the optional cryptographically attested tier |
 | 3 — Worktrees/artifacts | `source_complete_unqualified` in the current working tree | Control-workspace identity; distinct managed-root leases; two-writer admission; clean-parent fingerprinting; fenced `ExecutionBinding`; official Grok ACP create/apply/close/remove; native structured output; immutable artifact, preview, integration, verification, abandon, and cleanup receipts; serialized parent decisions; completion/cancellation recovery; and a fixed protected Phase 3 producer plus immutable live-receipt builder/verifier | Exact source `a554787` passed 501/501 plus both official-Grok commands, then published and strict-verified receipt `8e3870dd…` in evidence-only commit `8b5bad3`. The subsequent repository-wide check exposed a legacy deterministic fixture gap after trusted workers stopped forwarding `GROK_BIN`: 31 provider-backed tests launched ambient Grok instead of their fake. The current test-only PATH carrier plus pinned setup fixture closes that exact gap without changing production trust; because test source changed, the `a554787` receipt is supporting history and both live commands plus a new receipt remain required before Phase 4 |
 | 4 — Host presentation | `implemented_unverified` foundations plus root MCP subset | Raw task-owned Worker Protocol MCP operations, provider-capability-gated explorer-only spawn advertisement, host-claim suppression, presentation/alias/tree helpers, and external-worker labels | Native-shaped presentation, role-specific public spawn, persistent aliases, multi-wait, positive broker-owned host verification, MCP-first skills, installed natural MCP flow, Claude qualification, and a Phase 4 proof producer are missing |
-| 5 — Qualification | `implemented_unverified` | Deterministic safety-proof tests only | Paired native/Grok corpus, measurements, live boundaries, aggregate record, and release decision are not complete |
+| 5 — Qualification | `deferred` high-assurance tranche | Deterministic safety-proof tests only | Paired native/Grok corpus, measurements, protected phase chain, aggregate record, and cryptographically attested release decision are optional after operational E2E |
 
-Issue #25 must remain open. This plan records provisional installed/provider verticals on superseded source plus a strict Phase 3 supporting receipt on `a554787`, but does not claim current-source Phase 3 receipt proof after the repository-wide fixture correction, natural-host proof, aggregate qualification, or release readiness.
+Issue #25 must remain open until the operational E2E exit definition below passes. This plan records provisional installed/provider verticals on superseded source plus a strict Phase 3 supporting receipt on `a554787`, but does not yet claim current-source Phase 3 receipt proof after the repository-wide fixture correction, natural-host proof, independent final review, or required CI. A missing external Ed25519 issuer or root-owned protected runtime does not by itself keep issue #25 open.
+
+### Two delivery tiers
+
+Issue #25 uses two explicit delivery tiers so practical lifecycle completion is
+not blocked by enterprise-style cryptographic attestation:
+
+1. `operational_e2e_complete` is the mandatory issue #25 Definition of Done.
+   One exact committed and installed source must pass the real official-Grok
+   completion/cancellation and two-writer lifecycles, strict immutable receipt
+   replay, one fresh natural-Codex host flow, complete repository checks,
+   required CI, and fresh independent native validation. The main Codex host
+   remains the integration and readiness authority.
+2. `cryptographically_attested` is optional post-E2E hardening. It adds the
+   externally signed Ed25519 Phase 1 promotion, root-owned protected runtime,
+   protected Phase 2/3 records, final Phase 0-5 chain, and qualified aggregate.
+   It remains implemented and testable, but its missing external issuer cannot
+   block practical use, the operational E2E verdict, or closure of issue #25.
+
+Neither tier may be claimed from deterministic or simulated tests. Historical
+receipts remain supporting evidence only; the operational tier still requires
+the final exact-source real lifecycle and host-visible proof.
 
 The Native MCP Control Surface ADR is a follow-on design, not evidence that all E0-E7 execution slices are delivered. A task-owned MCP list/get/events/wait/result/spawn/decide/follow-up/cancel surface, the production Phase 1 provider-launch adapter, and the installed ordered-mailbox adapter now exist in the working tree. Post-terminal/reconnected follow-up proof, native-shaped presentation and multi-wait, positive broker-owned host-verification operation, skill preference changes, and natural MCP execution-loop proof remain future work. They must enter this plan as separately bounded deliveries with the same exact-source evidence rules before any related checklist item can be marked complete.
 
@@ -59,13 +80,14 @@ These bars are planning estimates, not evidence states or time estimates. They a
 | First read-only vertical E2E readiness | `100%` — `████████████████████` | The first installed authenticated vertical completed on exact source `e1b03af`: installation, setup/capability/MCP observations, three ordered prompts, reconnect/replay, completion, cancellation, cleanup, session deletion, and provisional receipt publication all passed. This is not final-source qualification; source-changing P2.5 and later phases require the same vertical to be rerun on the final freeze |
 | P3-V write-source implementation | `100%` — `████████████████████` | P3-P1 through P3-P5, managed-root leases, the two-writer path, and the fixed Phase 3 producer are implemented for the accepted bounded clean-parent/one-file contract. Broader artifact formats and dirty-source materialization remain explicitly unsupported rather than silently partial |
 | P3-V live lifecycle gate coverage | `100% supporting; current-source receipt pending` — `████████████████████` | `4 / 4` official-Grok gates passed on exact committed source `a554787`: real write/artifact, integration/host verification/cleanup, completion recovery/replay, active cancellation/restart, distinct execution roots, and a typed `drift`/`E_INTEGRATION` loser with no effect. Receipt `8e3870dd…` preserved both per-run provider bindings and strict-verified on evidence commit `8b5bad3`. A later repository-wide fixture-only source correction supersedes that exact identity, so formal current-source P3-V qualification remains `0%` until both live commands rerun on the fixture-correction commit and one new immutable receipt verifies |
-| Actual exact-source qualification evidence | `0%` — `░░░░░░░░░░░░░░░░░░░░` | No immutable current record exists for this source identity; installed/live Codex, authenticated Grok, Claude, paired corpus, and aggregate qualification are also absent; implementation progress and moving-tree tests are not qualification proof |
+| Operational exact-source E2E evidence | `0%` — `░░░░░░░░░░░░░░░░░░░░` | No immutable current live receipt or matched natural-Codex proof exists for this source identity. Historical real-provider passes remain supporting only |
+| Optional cryptographically attested evidence | `0%` — `░░░░░░░░░░░░░░░░░░░░` | No final current six-phase chain, external signed promotion, protected Phase 2/3 records, paired corpus, or aggregate qualification exists; this does not block the operational tier |
 
 Reproducible roadmap score after the stationary focused gate:
 
 | Phase | Earned units | Basis |
 | --- | ---: | --- |
-| Phase 0 | `4.50 / 8` | Evidence machinery plus the protected signed-review boundary are production-wired; final current records and real-issuer/live proof are absent |
+| Phase 0 | `4.50 / 8` | Evidence machinery plus the optional protected signed-review boundary are production-wired; final current records are absent |
 | Phase 1 | `6.25 / 8` | Root read API, autonomous outbox recovery, process safety, and cancellation are wired; compatibility/live provider proof remains |
 | Phase 2 | `7.75 / 8` | ContextPacket/Receipt, exact public host-action decisions, grant-bound same-session follow-up, ordered same-session ACP mailbox delivery, and the protected fixed producer are production-wired; the provisional installed vertical passed on `e1b03af`, while the final protected prerequisite chain/current record remains |
 | Phase 3 | `8.00 / 8` | The accepted clean-parent contract, official ACP execution, distinct leases/two writers, artifact lifecycle, explicit integration/verification/cleanup, restart/cancel behavior, and fixed producer are production-wired and negative-tested. Live/current-record qualification is tracked separately and remains pending |
@@ -173,7 +195,8 @@ Non-goals:
 | `not_started` | The contract may be described, but no usable implementation exists. |
 | `implemented_unverified` | Code or documentation exists, but required proof is missing, stale, dirty-tree-bound, or failing. |
 | `verified_on_draft` | All mandatory deterministic gates passed on one exact clean unmerged commit and a strict current evidence record validates. |
-| `qualified` | Aggregate-only release state: current deterministic Phase 0–5 records, signed Phase 1 review, matched installed/provider receipts, paired corpus, required CI, and release evidence passed for one exact source/install/runtime identity. Phase 0–5 records themselves must reject this state. |
+| `operational_e2e_complete` | Issue #25 exit state: one exact source/install identity passed both official-Grok live runners, strict immutable receipt replay, a fresh natural-Codex host flow, complete repository checks, required CI, and fresh independent native validation. |
+| `qualified` | Optional high-assurance aggregate-only state: current deterministic Phase 0–5 records, signed Phase 1 review, matched installed/provider receipts, paired corpus, required CI, and release evidence passed for one exact source/install/runtime identity. Phase 0–5 records themselves must reject this state. |
 | `blocked` | A named authority, safety, or architecture decision prevents safe progress. |
 | `deferred` | Intentionally outside the current phase or release scope. |
 
@@ -181,11 +204,11 @@ Rules:
 
 1. Implementation presence is not verification.
 2. A test summary, PR statement, issue checkbox, screenshot, worker report, or reviewer opinion is not an evidence record.
-3. `skip` and `not_run` cannot satisfy `verified_on_draft` or `qualified`.
+3. `skip` and `not_run` cannot satisfy `verified_on_draft`, `operational_e2e_complete`, or `qualified`.
 4. Historical and invalidated records remain readable and tamper-checked, but can never satisfy current prerequisites or qualification.
 5. Every current prerequisite names the exact predecessor record digest and mandatory passed gate IDs.
 6. A source, phase-scope, install, host, provider, or runtime identity change invalidates the boundary it affects.
-7. Final readiness requires six current `verified_on_draft` Phase 0–5 records plus one separately producer-owned `qualified` aggregate; per-phase records or standalone live receipts alone are insufficient.
+7. Operational readiness requires the exact-source live, natural-host, review, repository, and CI boundaries named above. The stronger optional `qualified` tier additionally requires six current `verified_on_draft` Phase 0–5 records plus one separately producer-owned aggregate.
 
 ## 4. Ownership, delegation, and review failures
 
@@ -252,22 +275,21 @@ npm run worker:verify -- --all --strict
 npm run worker:verify -- --all --strict --require-complete
 ```
 
-`test:protected-review` is an explicit external supporting gate: it must run
-without a skip and bind the root-owned runtime, exact Git, Docker
-client/Buildx/socket/daemon, immutable image ID, container IDs, restart replay,
-and hostile scenarios. It does not by itself promote Phase 1 because its signer
-and phase proofs are synthetic. Final Phase 1 promotion must repeat the same
-boundary from the frozen exact source with the actual proof chain and a real
-protected independent issuer, then persist the signed request, attestation,
-receipt, record, and ledger transition for offline replay.
+`test:protected-review` is an optional high-assurance supporting gate. When the
+`cryptographically_attested` tier is pursued, it must run without a skip and
+bind the root-owned runtime, exact Git, Docker client/Buildx/socket/daemon,
+immutable image ID, container IDs, restart replay, and hostile scenarios. It
+does not by itself promote Phase 1 because its signer and phase proofs are
+synthetic. A real protected independent issuer is required only for that
+optional tier, not for `operational_e2e_complete`.
 
 The original audit exposed both stale records and a structurally unsatisfiable
-completion model. Q1 corrected the model: numbered phases terminate at
-`verified_on_draft`, only the private aggregate may be `qualified`, and
-`--require-complete` requires exactly six current numbered records plus that
-aggregate. The command remains expected to fail until the final source has a
-complete current chain; that red result is missing qualification evidence, not
-permission to weaken the model.
+high-assurance completion model. Q1 corrected that model: numbered phases
+terminate at `verified_on_draft`, only the private aggregate may be `qualified`,
+and `--require-complete` requires exactly six current numbered records plus that
+aggregate. That command is an optional cryptographically attested release gate;
+its expected red result does not block the separately evidenced operational E2E
+exit state.
 
 `--all --strict` is an integrity/freshness replay. It may pass for an honestly incomplete ledger and therefore is never a completion claim. The corrected release model must make `--require-complete` require current `verified_on_draft` Phase 0–5 records and exactly one producer-owned `qualified` aggregate that composes signed review, matched live receipts, corpus, CI, and release proof. Standalone direct/natural receipts remain provisional supporting evidence and never become ledger-current phase records.
 
@@ -315,7 +337,7 @@ No generic result-ingestion path is trusted. Later phase/live producers must add
 
 ## 6. Phase 0 — Baseline and evidence system
 
-Current state: `source_complete_unqualified`; current-source live receipt and formal qualification pending
+Current state: `source_complete_unqualified`; current-source proof replay is pending, while operational live/host evidence is tracked by the issue exit definition
 
 Phase 0 establishes the fail-closed evidence machinery used by every downstream phase.
 
@@ -506,7 +528,12 @@ Operational cutover boundary:
 - Pre-upgrade workers must finish or stop before cutover. Legacy state directories must remain available until operators intentionally retire them.
 - The parent checkout must be clean, including ignored files, when captured and immediately before readiness. Dirty-source materialization and integration are unavailable and fail closed.
 
-Phase 3 source closure is complete. Phase 3 exits as evidence-complete only when both official-Grok commands pass on the final Phase 3 source commit, their complete public projections build one immutable receipt, strict receipt replay passes, the protected Phase 3 record validates against its exact prerequisites, and no deterministic result is substituted for those live boundaries.
+Phase 3 source closure is complete. Phase 3 exits as operationally
+evidence-complete when both official-Grok commands pass on the final Phase 3
+source commit, their complete public projections build one immutable receipt,
+strict receipt replay passes, and no deterministic result is substituted for
+those live boundaries. A protected Phase 3 record remains an optional
+`cryptographically_attested` extension.
 
 ## 10. Phase 4 — Native-feeling host adapters and presentation
 
@@ -644,6 +671,7 @@ This ledger distinguishes implementation found in the working tree from proof st
 | A-45 Fifth extended protected Phase 2 Docker attempt | Exact source `0fa006a` passed the fixture's validator and ran the complete internal suite, then failed the zero-skip repository gate with 801 pass and two failures. Bounded replay identified both as fixture/test portability gaps: the offline live-receipt test requires the immutable historical v1 receipt that the minimal workspace still omitted, and the mixed-time inventory race replaced eight bytes with eight bytes, relying on timestamp resolution to distinguish the change. The latter passed in an isolated rerun and failed under overlayfs when equal-size writes shared indistinguishable metadata. | The evidence assertion failed only because the exact historical v1 receipt path was absent. The fixture support allowlist now includes that immutable receipt. The inventory regression now changes both content and size, making the retained snapshot differ on every supported filesystem even when timestamps are coarse. Production inventory revalidation, source scopes, validator requirements, protected authority, and qualification semantics are unchanged. | Rerun the identical protected vertical without diagnostics or concurrent tests. Require validation, internal 803/803 zero-skip, fixed Phase 2 zero-skip, protected publication/verify, restart same-digest replay, cleanup, all hostile scenarios, and fresh independent review. |
 | A-46 Sixth extended protected Phase 2 Docker attempt | Exact source `59e9798` passed the internal repository gate 803/803 and the fixed Phase 2 gate, published and protected-verified the Phase 2 record, restarted the positive container, replayed the same record digest, reverified the full ledger, and found no transient evidence files. The test then stopped at the fifth hostile scenario even though the runtime correctly rejected the fsmonitor configuration with `E_REVIEW_TRUST_UNAVAILABLE`. | The first four hostile mutations fail in the outer bootstrap and therefore return the exact short `{ok:false,code}` envelope. Fsmonitor, textconv, clean-filter, and a structurally valid but tampered attestation reach the fresh operation process; the outer bootstrap deliberately normalizes their operation error into `{ok:false,code,gateId:null,failureKind:null,outputDigest:null}`. The old test treated both authority boundaries as one shape. The assertion now names and exactly checks the operation envelope for only those four scenarios; no error code, diagnostic value, trust check, or runtime behavior changes. | Rerun the identical protected vertical. Require the already-cleared positive lifecycle plus all hostile scenarios, complete cleanup, immutable image/server identity checks, a final diagnostic receipt, and fresh independent security review. |
 | A-47 Proof budget drift after real Phase 3 closure | Exact source `55a89f2` passed validation plus the full deterministic gate with 1023/1023 and separately passed both official-Grok completion/cancellation and concurrent two-writer lifecycles through strict receipt `c9b5c5c9…`. The first current-chain Phase 0 producer then failed closed with `E_PROOF_GATE` at `repository-check`: its fixed 15-minute budget no longer covered the measured roughly 18-minute serial repository gate. No record or ledger mutation occurred. | Producer v5 raises only code-owned `repository-check` budgets to 25 minutes for phases 0–5 and aggregate, preserves focused-gate budgets, retains v4 manifest digests for historical supersession, and gives the installed-cache updater a bounded 30-minute repository budget. There is no caller or environment timeout override. The pre-v5 live receipt remains honest supporting history but becomes stale for the new source. | Run targeted manifest/cutover tests, commit the exact v5 source, rerun the Phase 0 and Phase 1 producers, then immediately rerun both official-Grok live commands and publish a new strict receipt. Stop before signed Phase 1 promotion/Phase 3 protected publication unless a real external Ed25519 issuer and root-owned protected runtime are provisioned. |
+| A-48 Operational E2E versus cryptographic attestation | The practical Grok-worker lifecycle was incorrectly kept open by an enterprise-style trust tier: real Ed25519 review issuer, root-owned protected runtime, protected phase chain, corpus, and aggregate qualification. Those controls prevent same-author self-approval, but they are not required to prove that one exact installed Worker Broker actually spawns official Grok, returns and integrates verified work, reconnects, cancels, resolves two writers, and cleans up under host authority. | Preserve every signed/protected implementation and its fail-closed semantics, but make it an optional `cryptographically_attested` tier. Issue #25 now exits on `operational_e2e_complete`: current-source official-Grok completion/cancellation plus two-writer receipt, natural-Codex host proof, full repository checks, required CI, and fresh independent native validation. No deterministic result may replace a live boundary. | Freeze the governance-only source, rerun the two official-Grok commands early, publish and strict-verify the immutable receipt, run the natural-Codex proof, full check/CI, and independent review. Close issue #25 if those exact operational gates pass; report the absent external signer/protected aggregate as optional post-E2E hardening. |
 
 ## 13. Acceptance target definitions
 
@@ -662,16 +690,40 @@ Targets are not met until the measurement definition and replayable evidence exi
 | Conflict/scope detection | Wrong base, conflict, malicious path, symlink escape, tampering, and out-of-scope artifact block readiness. |
 | Host verification authority | No worker/provider/runtime path can set host verification to passed; only host-owned post-result/integration checks can. |
 
+### Issue #25 operational E2E exit
+
+Issue #25 may close when all of the following bind one exact committed source,
+installed plugin, provider binary, and capability identity:
+
+1. official-Grok completion/cancellation passes real provider start, terminal
+   result, reconnect/replay, explicit integration, host verification, active
+   cancellation/restart, cleanup, and absence checks;
+2. official-Grok two-writer passes real overlap, distinct execution roots, one
+   verified integration, one typed `drift`/`E_INTEGRATION` loser with no parent
+   effect, replay, abandon, cleanup, and absence checks;
+3. the complete projections publish one immutable receipt and strict replay
+   validates it;
+4. a fresh natural-Codex task proves the installed host-visible worker flow and
+   session cleanup without caller-forged authority metadata;
+5. the complete repository check and required CI pass with no mandatory skip;
+6. a fresh independent native review finds no unresolved blocking correctness,
+   security, or evidence-integrity issue.
+
+External Ed25519 signing, a root-owned protected runtime, protected Phase 2/3
+records, paired corpus, and the aggregate `qualified` record are optional
+post-E2E hardening. Their absence must remain visible but does not negate a
+passing operational lifecycle.
+
 ## 14. Issue and PR synchronization
 
 Issue #25 must link this plan near the top and mirror stable deliverable IDs. For every delivery:
 
 1. Keep the top-level phase unchecked until its exit definition is met.
 2. Check a nested item only when its exact commit, PR, immutable evidence path, and replay commands are linked.
-3. Label implementation-only work `implemented_unverified`; never collapse it into `verified_on_draft` or `qualified`.
+3. Label implementation-only work `implemented_unverified`; never collapse it into `verified_on_draft`, `operational_e2e_complete`, or `qualified`.
 4. Post the status delta, commands, exit codes, bounded outcomes, evidence record digests, and residual gaps.
-5. Use `Refs #25`, not `Closes #25`, until Phase 5 aggregate qualification passes.
-6. Do not close from a worker report, reviewer opinion, skipped mandatory gate, historical record, source/install mismatch, or failed Grok review lifecycle.
+5. Use `Refs #25`, not `Closes #25`, until the issue #25 operational E2E exit above passes.
+6. Do not close from a worker report, reviewer opinion, skipped mandatory operational gate, historical record, source/install mismatch, or failed Grok review lifecycle.
 7. If the PR carries this plan, update its body with the plan and evidence links after the final commit identity exists.
 
 ## 15. Execution order and final closeout checklist
@@ -692,7 +744,7 @@ Issue #25 must link this plan near the top and mirror stable deliverable IDs. Fo
 - The accepted Phase 3 pivot reuses official Grok Build ACP execution primitives. Commit `03afdf6` contains the strict worktree protocol seam, `65c6fba` contains MCP-hidden durable admission, and `afe8ea4` closes the bounded provisioner/recovery source slice. P3-P4 then passed twice: `73bd6a2` first proved the installed ready-only real edit/artifact path with one bound report-repair rotation, and `867554c` replaced that avoidable rotation with official ACP `outputSchema → structuredOutput`. The exact `867554c` live run used official `0.2.112`, completed in provider generation 1 with `reportSource:acp-structured`, produced the exact `target.txt` artifact, kept the parent unchanged, closed the provider group, and removed the runner disposable worktree. Focused adapter checks passed 58/58; a broad runtime batch exposed one host-action digest comparison and its bounded fix passed isolated replay; the post-alignment exact head `3acf79b` then passed `npm run check` with **959/959**, zero failed/cancelled/skipped/TODO. Fresh native final review found no P0/P1. That checkpoint's P3-P5 gap is now closed in source; current-source live receipt proof remains the active gate.
 - Phase 3 source closure reached `c3ff25f`, whose exact 22-file gate passed **501/501** with zero failed/cancelled/skipped/TODO and whose two official-Grok commands passed all four lifecycle gates. The completion run proved structured output, integration, host verification, restart/replay, active cancellation, cleanup, and absence; the two-writer run proved real provider overlap, distinct roots, one verified integration, one typed `drift`/`E_INTEGRATION` no-effect loser, replay, abandon, and absence. The subsequent receipt build rejected the valid real output because the new producer expected numeric overlap time, `parent-drift`, and identical per-install capability/pin identities. The current bounded correction validates canonical ISO plus the production `drift` enum, cross-binds only stable source/install/binary/release identity, and preserves both run-scoped provider bindings separately; the captured live projections now validate and build in targeted replay. Since that correction changes source, `c3ff25f` remains supporting only until both commands rerun and one immutable receipt verifies on the correction commit.
 - Exact correction source `a554787` passed the Phase 3 gate **501/501**, both official-Grok live commands, and strict receipt publication. Evidence-only commit `8b5bad3` preserves receipt digest `8e3870dda3c66716401961621f39ca11c2b2e6e92ef476c2a22c1e2b21b7c277`, source inventory `c6157976…`, both complete live projections, distinct per-run provider pins, and all six Phase 3 live gate IDs. The first repository-wide `npm run check` then reported 991 passed / 31 failed, with all failures confined to `control-plane`, `pty-ingress`, and `runtime`: after production correctly stopped forwarding setup-only `GROK_BIN`, their legacy fixtures fell through to ambient official Grok with fake auth. The current test-only correction puts the fake on fixture `PATH`, uses the copied-plugin native `/bin/bash` pin carrier for setup, and expects capability v2. Isolated replay now passes control-plane 33/33, PTY 4/4, runtime 59/59, and setup 2/2. No production trust or Worker runtime code changed. This verified fixture source change still invalidates `a554787` as the current receipt identity, so exact full check and both live commands must rerun after the new freeze.
-- Final exact-source qualification remains `0%`: there is no final current six-phase chain, matched final live receipts, paired corpus, protected signed Phase 1 promotion, or qualified aggregate.
+- Operational exact-source E2E remains `0%` until the current-source live receipt and matched natural-Codex proof exist. Optional cryptographically attested qualification also remains `0%` because there is no final current six-phase chain, paired corpus, protected signed Phase 1 promotion, or qualified aggregate.
 
 ### Accepted Phase 3 architecture pivot — 2026-07-25
 
@@ -757,7 +809,7 @@ The pre-pivot custom runtime is preserved reversibly as stash `pre-pivot custom 
 | P3-P4.1 — native Grok Build worker report | `source_complete_supporting_live_pass` at `867554c` | Broker-generated Worker Report JSON Schema is bound into provider launch, sent as ACP `_meta.outputSchema`, received as redacted/bounded `_meta.structuredOutput`, semantically revalidated, and content-addressed. Explicit native errors cannot downgrade to marker text; absent native fields retain compatibility; generation-2 repair remains marker-only | Exact installed replay passed in provider generation 1 with `reportSource:acp-structured`, no repair, and mailbox final digest equal to canonical report digest. Follow-up `worker_send` native schema propagation remains a separate bounded improvement |
 | P3-P5 — owner integration and cleanup | `source_complete_unqualified`; supporting live pass before evidence-producer changes | Explicit preview/integrate/verify/abandon/cleanup supports the bounded one-file overwrite vertical, persists intent/receipt, independently verifies the parent effect, closes the exact session, uses a distinct official remove-only controller, and proves Git/filesystem/process/guard/private-home absence. Serialized parent decisions make the two-writer loser a typed conflict rather than a partial apply | Rerun the completion/cancellation and two-writer commands on the final Phase 3 source commit; bind their complete projections into one immutable receipt |
 | P3-V — installed Worker Broker lifecycle | `supporting_live_pass_4_of_4_on_62ec8fc; current_source_receipt_pending; formal qualification unqualified` | Installed MCP `worker_spawn_write → wait/result → integrate → restart/replay → cancel → cleanup` plus the concurrent two-writer conflict path with official `0.2.112` | Both live commands passed on `62ec8fc`; deterministic Phase 3 closure passed 501/501 in the later source tree. Commit the final source, rerun both exact commands, build with `worker:phase3:evidence build --write`, verify the receipt, and retain source/install/provider/worker/operation/session/binding/artifact/integration/cleanup identities. Deterministic tests cannot satisfy this gate |
-| P3-Q — fixed Phase 3 producer and live receipt | `source_complete_unqualified` in the current working tree | Fixed 22-file zero-skip runner; protected Phase 3 predecessor/publication/replay route; strict completion/two-writer validators; bounded complete public input projections; hardened immutable receipt publication; current-source replay; and no live/release claim in the deterministic phase record | Commit, rerun both live commands, write and verify the immutable receipt, then publish the protected Phase 3 record only when its prerequisite chain is available |
+| P3-Q — fixed Phase 3 producer and live receipt | `source_complete_unqualified` in the current working tree | Fixed 22-file zero-skip runner; protected Phase 3 predecessor/publication/replay route; strict completion/two-writer validators; bounded complete public input projections; hardened immutable receipt publication; current-source replay; and no live/release claim in the deterministic phase record | Commit, rerun both live commands, write and verify the immutable receipt. Publish the protected Phase 3 record only if the optional cryptographically attested tier is pursued |
 
 At every slice the main agent must inspect the integrated diff, rerun the declared focused command, run a same-slice live probe when the external boundary changed, obtain fresh native validation for high-risk state/process/integration changes, commit the exact source, and record the commit plus replay command. “Done” means those artifacts exist and agree; a worker summary, passing mock, provider response, or uncommitted moving-tree result is never sufficient.
 
@@ -798,7 +850,7 @@ The main agent owns trust material, publication authority, integration decisions
 
 The first live failure starts one bounded remediation cycle. Classify it as an invalid harness assumption, a production-contract violation, or an unknown requiring only bounded non-sensitive diagnostics. Every code or test change in that cycle must map to the observed failure, an explicit `P3-V` acceptance criterion, or a verified safety gap, and the same real vertical must be rerun immediately after the change.
 
-If the identical vertical still cannot pass after that bounded cycle, or if it disproves a frozen architecture assumption, mark Phase 3 `blocked_reassess` and stop downstream implementation. Preserve the useful contracts and evidence, but reassess or simplify the architecture before authorizing more scaffolding. Time spent, deterministic test volume, helper completion, and native fallback output are not reasons to continue past this gate. A successful `P3-V` is provisional lifecycle evidence only; final qualification still requires the final-source gates below.
+If the identical vertical still cannot pass after that bounded cycle, or if it disproves a frozen architecture assumption, mark Phase 3 `blocked_reassess` and stop downstream implementation. Preserve the useful contracts and evidence, but reassess or simplify the architecture before authorizing more scaffolding. Time spent, deterministic test volume, helper completion, and native fallback output are not reasons to continue past this gate. A successful `P3-V` is provisional lifecycle evidence only; operational completion still requires the final-source live and host gates below.
 
 1. [Complete] Integrate all concurrent Phase 0/1 implementation and remediation edits without overlapping or discarding unrelated work; both writers are stopped and their integrated surfaces have been inspected.
 2. [Done at the remediation/review layer] All accepted runtime/evidence findings have source fixes. Fresh integrated, runtime, and parser/evidence rereviews report no remaining actionable findings; their reports are review input, not qualifying evidence.
@@ -815,11 +867,11 @@ If the identical vertical still cannot pass after that bounded cycle, or if it d
 13. [Active after repository-wide fixture gap] Commit only the production-faithful PATH/pinned-setup fixture correction plus this evidence checkpoint, replay full `npm run check`, inspect the committed diff, and use that new commit as the sole source identity for both live commands. No production runtime or unrelated Phase 3 source is allowed.
 14. Rerun the official installed/authenticated completion/cancellation command and the official two-writer command on the step-13 commit. Require real provider start, terminal result, reconnect/replay, integration/verification/cleanup, cancellation/restart, two distinct writer roots, typed `drift` plus `E_INTEGRATION`, and absence proof. Build the immutable receipt from both complete JSON projections with `npm run worker:phase3:evidence -- build --completion <json> --two-writer <json> --write`, then strict-verify it. Only after this gate may Phase 4 begin. Do not describe MCP-server restart as worker-crash recovery.
 15. Run a separate fresh natural-Codex task on that same final source/install/capability identity without caller-supplied `_meta`, and require successful presence → delete → absence proof for its session before receipt publication. The natural receipt proves host authority; only the matched synthetic-provider plus natural-Codex receipt pair may satisfy installed-host qualification.
-16. Execute the paired Phase 5 corpus and bounded measurements against the frozen final identity; if the corpus changes source, return to step 12 and invalidate all later records/receipts before refreezing.
-17. Only after steps 14–16 succeed, build deterministic final Phase 0–5 `verified_on_draft` records in dependency order with exact predecessor digests and mandatory gate IDs; those phase records must not absorb standalone live receipts. Then invoke the separate private aggregate producer to bind the exact phase digests, signed review, matched live receipts, corpus, CI, release evidence, and canonical dual-host qualification artifact into the only `qualified` record; strict-replay the complete chain.
-18. Require both ledger integrity (`npm run worker:verify -- --all --strict`) and release readiness (`npm run worker:verify -- --all --strict --require-complete`) to pass with no skipped mandatory boundary.
-19. Obtain fresh independent native validation of the exact final commit and its records/receipts; optional Grok review is additive only.
-20. Update issue #25 and PR #26 with exact commit, record/receipt digests and paths, replay commands, outcomes, and remaining unsupported cells.
-21. Close issue #25 only if the aggregate exit definition is satisfied; otherwise leave it open with the next concrete gate.
+16. Run the complete repository check and required CI on the same exact source, then obtain fresh independent native validation of the final commit and its records/receipts. Optional Grok review is additive only.
+17. Mark `operational_e2e_complete` only when steps 14–16 and strict receipt replay all pass with no skipped mandatory operational boundary.
+18. Update issue #25 and PR #26 with the exact commit, receipt digest/path, replay commands, live/natural-host/CI outcomes, independent-review verdict, and remaining unsupported or optional high-assurance cells.
+19. Close issue #25 when the operational E2E exit definition is satisfied. Do not keep it open solely because Ed25519 issuer, root-owned protected runtime, protected phase records, corpus, or aggregate qualification are absent.
+20. Optional after issue close: execute the paired Phase 5 corpus and bounded measurements against a frozen identity; build deterministic final Phase 0–5 `verified_on_draft` records in dependency order; obtain the external signed review; publish protected Phase 2/3 records; and invoke the private aggregate producer to create the only `qualified` record.
+21. Optional high-assurance replay requires both ledger integrity (`npm run worker:verify -- --all --strict`) and release readiness (`npm run worker:verify -- --all --strict --require-complete`) with no skipped mandatory cryptographic boundary.
 
 This sequence leaves enough durable evidence for a fresh session to determine what exists, what passed, what remains unqualified, which identity was tested, and exactly how to replay every readiness claim.
