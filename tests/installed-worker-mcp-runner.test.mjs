@@ -619,6 +619,51 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /fs\.readFileSync\(descriptor, "utf8"\)/);
   assert.match(source, /const ACTIVE_WINDOW_WORKLOAD_FILES = 8/);
   assert.match(source, /\{ workloadFiles: ACTIVE_WINDOW_WORKLOAD_FILES \}/);
+  assert.match(
+    source,
+    /const spawnArguments = \{\s*idempotencyKey: `installed-write-smoke-/
+  );
+  assert.match(
+    source,
+    /validateWriteSpawnResponseWitness\(\s*context,\s*spawned\.worker,\s*terminalJob,\s*spawnArguments\.idempotencyKey,\s*\{ replayed: false \}/
+  );
+  assert.match(
+    source,
+    /await closeMcp\(context, client\);\s*client = await startInstalledMcp\(context\);\s*await verifyMcpSurface\(context, client, \{ negative: true \}\);\s*\n\s*enterQualificationStage\("write-smoke-spawn-replay"\)/
+  );
+  assert.match(
+    source,
+    /"worker_spawn_write",\s*spawnArguments,\s*\[\s*"worker"/
+  );
+  assert.match(source, /spawnReplay\.replayed !== true/);
+  assert.match(
+    source,
+    /spawnReplay\.providerLaunchState !== "worktree-ready-no-dispatch"/
+  );
+  assert.match(source, /spawnReplay\.providerLaunched !== false/);
+  assert.match(
+    source,
+    /canonicalDigest\(replayedTerminalJob\) !== terminalJobDigestBeforeReplay/
+  );
+  assert.match(
+    source,
+    /executionRootAfterReplay\.dev !== executionRootBeforeReplay\.dev/
+  );
+  assert.match(
+    source,
+    /executionRootAfterReplay\.ino !== executionRootBeforeReplay\.ino/
+  );
+  assert.match(
+    source,
+    /!sameJson\(managedIdentityAfterReplay, managedIdentityBeforeReplay\)/
+  );
+  assert.match(source, /!sameJson\(metadataReplay, metadata\)/);
+  assert.match(source, /!sameJson\(contentReplay, content\)/);
+  assert.match(source, /!sameJson\(patchReplay, patch\)/);
+  assert.match(source, /spawnReplayProven: true/);
+  assert.match(source, /artifactReplayProven: true/);
+  assert.match(source, /providerRelaunchDelta: 0/);
+  assert.match(source, /worktreeCreateDelta: 0/);
 });
 
 test("installed Worker MCP runner preserves original stages and lets cleanup failure override", () => {

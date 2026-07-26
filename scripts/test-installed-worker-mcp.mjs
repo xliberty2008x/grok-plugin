@@ -217,6 +217,9 @@ const QUALIFICATION_STAGES = new Set([
   "write-smoke-artifact",
   "write-smoke-parent",
   "write-smoke-private",
+  "write-smoke-spawn-reconnect",
+  "write-smoke-spawn-replay",
+  "write-smoke-artifact-replay",
   "write-smoke-integration",
   "write-smoke-integration-reconnect",
   "write-smoke-production-cleanup",
@@ -2494,6 +2497,18 @@ const SPAWN_IDEMPOTENCY_RECORD_KEYS = new Set([
   "committedAt",
   "responseWitness"
 ]);
+const WRITE_SPAWN_IDEMPOTENCY_RECORD_KEYS = new Set([
+  "schemaVersion",
+  "workerId",
+  "owner",
+  "controlWorkspaceId",
+  "expectedExecutionRoot",
+  "admissionRequestDigest",
+  "executionBindingDigest",
+  "idempotencyKeyDigest",
+  "committedAt",
+  "responseWitness"
+]);
 const SPAWN_RESPONSE_WITNESS_KEYS = new Set([
   "schemaVersion",
   "witnessId",
@@ -3310,6 +3325,83 @@ function validateSpawnResponseWitness(
   }
   tracker.observedSpawnResponseWitnesses.push(structuredClone(witness));
   return handleDigest;
+}
+
+function validateWriteSpawnResponseWitness(
+  context,
+  publicWorker,
+  job,
+  spawnKey,
+  { replayed }
+) {
+  const keyDigest = crypto
+    .createHash("sha256")
+    .update(spawnKey)
+    .digest("hex");
+  let record;
+  try {
+    record = context.mutation.getSpawnIdempotencyRecord(
+      context.fixtureRoot,
+      spawnKey,
+      context.env
+    );
+  } catch {
+    fail("E_PRIVATE_STATE");
+  }
+  const witness = record?.responseWitness;
+  const handleDigest = publicWorkerDigest(publicWorker);
+  if (
+    !hasExactKeys(record, WRITE_SPAWN_IDEMPOTENCY_RECORD_KEYS)
+    || record.schemaVersion !== 5
+    || !hasExactKeys(record.owner, new Set(["hostKind", "sessionId"]))
+    || record.workerId !== job.id
+    || record.owner.hostKind !== job.host?.kind
+    || record.owner.sessionId !== job.host?.sessionId
+    || record.controlWorkspaceId !== job.controlWorkspaceId
+    || record.expectedExecutionRoot
+      !== job.executionBinding?.expectedExecutionRoot
+    || record.admissionRequestDigest
+      !== job.request?.spawn?.admissionRequestDigest
+    || record.executionBindingDigest
+      !== job.executionBinding?.bindingDigest
+    || record.idempotencyKeyDigest !== keyDigest
+    || record.idempotencyKeyDigest
+      !== job.request?.spawn?.idempotencyKeyDigest
+    || record.committedAt !== job.createdAt
+    || !hasExactKeys(witness, SPAWN_RESPONSE_WITNESS_KEYS)
+    || witness.schemaVersion !== 1
+    || !/^spawnw-[0-9a-f]{24}$/.test(witness.witnessId || "")
+    || witness.projection !== SPAWN_RESPONSE_WITNESS_PROJECTION
+    || witness.responseSequence !== (replayed ? 2 : 1)
+    || witness.workerId !== job.id
+    || witness.requestDigest !== record.admissionRequestDigest
+    || witness.idempotencyKeyDigest !== keyDigest
+    || witness.replayed !== replayed
+    || witness.handleDigest !== handleDigest
+    || witness.eventCursorSequence !== publicWorker?.eventCursor?.sequence
+    || !canonicalTimestamp(witness.recordedAt)
+    || Date.parse(witness.recordedAt) < Date.parse(record.committedAt)
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  if (replayed) {
+    let currentHandle;
+    try {
+      currentHandle = context.workerProtocol.projectWorkerHandle(job, {
+        trustHostAuthority: false
+      });
+    } catch {
+      fail("E_PRIVATE_STATE");
+    }
+    if (!sameJson(publicWorker, currentHandle)) fail("E_PRIVATE_STATE");
+  }
+  const { witnessId: ignoredWitnessId, ...witnessBody } = witness;
+  const expectedWitnessId = `spawnw-${canonicalDigest(witnessBody).slice(0, 24)}`;
+  if (witness.witnessId !== expectedWitnessId) fail("E_PRIVATE_STATE");
+  return Object.freeze({
+    recordDigest: canonicalDigest(record),
+    witness: structuredClone(witness)
+  });
 }
 
 function recordPrivateIdentityObservation(
@@ -4708,23 +4800,24 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
   await verifyMcpSurface(context, client, { negative: true });
 
   enterQualificationStage("write-smoke-spawn");
+  const spawnArguments = {
+    idempotencyKey: `installed-write-smoke-${crypto.randomUUID()}`,
+    userRequest: [
+      "Edit only target.txt in the current isolated worktree.",
+      "Replace its complete contents with exactly the single line: after",
+      "The file must end with one newline.",
+      "You must perform the mutation with an actual workspace editing tool; a completion report without an observed file change is a failure.",
+      "After editing, read target.txt again and verify its complete contents are exactly after followed by one newline.",
+      "Do not commit and do not modify any other path.",
+      "Verify the edit, then return the required structured worker report.",
+      "In that report, list only target.txt in changedFiles and mark AC-01 and AC-02 met only if the exact edit and one-file scope were verified."
+    ].join(" ")
+  };
   const spawned = await callTool(
     context,
     client,
     "worker_spawn_write",
-    {
-      idempotencyKey: `installed-write-smoke-${crypto.randomUUID()}`,
-      userRequest: [
-        "Edit only target.txt in the current isolated worktree.",
-        "Replace its complete contents with exactly the single line: after",
-        "The file must end with one newline.",
-        "You must perform the mutation with an actual workspace editing tool; a completion report without an observed file change is a failure.",
-        "After editing, read target.txt again and verify its complete contents are exactly after followed by one newline.",
-        "Do not commit and do not modify any other path.",
-        "Verify the edit, then return the required structured worker report.",
-        "In that report, list only target.txt in changedFiles and mark AC-01 and AC-02 met only if the exact edit and one-file scope were verified."
-      ].join(" ")
-    },
+    spawnArguments,
     [
       "worker",
       "replayed",
@@ -5223,6 +5316,148 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     fail("E_PRIVATE_STATE");
   }
 
+  const terminalJobDigestBeforeReplay = canonicalDigest(terminalJob);
+  const managedIdentityBeforeReplay = structuredClone(managedIdentity);
+  const executionRootBeforeReplay = fs.lstatSync(expectedExecutionRoot);
+  if (
+    !executionRootBeforeReplay.isDirectory()
+    || executionRootBeforeReplay.isSymbolicLink()
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  const writeSpawnWitnessBeforeReplay = validateWriteSpawnResponseWitness(
+    context,
+    spawned.worker,
+    terminalJob,
+    spawnArguments.idempotencyKey,
+    { replayed: false }
+  );
+  const retainedProviderIdentities = Object.values(primaryTurnAdmissions).map(
+    (admission) => structuredClone(admission.providerProcess)
+  );
+  await waitForWriteSmokeProcessClosure(
+    context,
+    workerId,
+    retainedProviderIdentities
+  );
+  if (context.guard.loadProviderGuard(fixtureRoot, workerId) !== null) {
+    fail("E_CLEANUP");
+  }
+
+  enterQualificationStage("write-smoke-spawn-reconnect");
+  await closeMcp(context, client);
+  client = await startInstalledMcp(context);
+  await verifyMcpSurface(context, client, { negative: true });
+
+  enterQualificationStage("write-smoke-spawn-replay");
+  const spawnReplay = await callTool(
+    context,
+    client,
+    "worker_spawn_write",
+    spawnArguments,
+    [
+      "worker",
+      "replayed",
+      "spawnSuccessDefinition",
+      "providerLaunchState",
+      "providerLaunched"
+    ]
+  );
+  if (
+    spawnReplay.replayed !== true
+    || spawnReplay.worker?.id !== workerId
+    || spawnReplay.worker?.status !== "completed"
+    || spawnReplay.worker?.phase !== "done"
+    || spawnReplay.worker?.terminal !== true
+    || spawnReplay.worker?.write !== true
+    || spawnReplay.worker?.roleId !== "implementer"
+    || spawnReplay.spawnSuccessDefinition !== "durable-job-commit"
+    || spawnReplay.providerLaunchState !== "worktree-ready-no-dispatch"
+    || spawnReplay.providerLaunched !== false
+  ) {
+    fail("E_SCENARIO");
+  }
+  const replayedTerminalJob = context.state.readJob(
+    fixtureRoot,
+    workerId,
+    context.env
+  );
+  const writeSpawnWitnessAfterReplay = validateWriteSpawnResponseWitness(
+    context,
+    spawnReplay.worker,
+    replayedTerminalJob,
+    spawnArguments.idempotencyKey,
+    { replayed: true }
+  );
+  const executionRootAfterReplay = fs.lstatSync(expectedExecutionRoot);
+  const managedIdentityAfterReplay =
+    context.workerWorktree.assertRegisteredWorkerWorktreeIdentity({
+      controlRoot: fixtureRoot,
+      executionRoot: expectedExecutionRoot,
+      baseCommit: parentBefore.head,
+      workerId,
+      env: context.env
+    });
+  if (
+    canonicalDigest(replayedTerminalJob) !== terminalJobDigestBeforeReplay
+    || !sameJson(replayedTerminalJob, terminalJob)
+    || writeSpawnWitnessAfterReplay.witness.responseSequence
+      !== writeSpawnWitnessBeforeReplay.witness.responseSequence + 1
+    || writeSpawnWitnessAfterReplay.witness.requestDigest
+      !== writeSpawnWitnessBeforeReplay.witness.requestDigest
+    || writeSpawnWitnessAfterReplay.witness.idempotencyKeyDigest
+      !== writeSpawnWitnessBeforeReplay.witness.idempotencyKeyDigest
+    || Date.parse(writeSpawnWitnessAfterReplay.witness.recordedAt)
+      < Date.parse(writeSpawnWitnessBeforeReplay.witness.recordedAt)
+    || !executionRootAfterReplay.isDirectory()
+    || executionRootAfterReplay.isSymbolicLink()
+    || executionRootAfterReplay.dev !== executionRootBeforeReplay.dev
+    || executionRootAfterReplay.ino !== executionRootBeforeReplay.ino
+    || !sameJson(managedIdentityAfterReplay, managedIdentityBeforeReplay)
+    || context.guard.loadProviderGuard(fixtureRoot, workerId) !== null
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+  await waitForWriteSmokeProcessClosure(
+    context,
+    workerId,
+    retainedProviderIdentities
+  );
+  context.workerWorktree.assertParentUnchanged(parentBefore, fixtureRoot);
+
+  enterQualificationStage("write-smoke-artifact-replay");
+  const metadataReplay = await callTool(
+    context,
+    client,
+    "worker_artifact",
+    { id: workerId, part: "metadata" },
+    ["artifact"]
+  );
+  const contentReplay = await callTool(
+    context,
+    client,
+    "worker_artifact",
+    { id: workerId, part: "content" },
+    ["artifact"]
+  );
+  const patchReplay = await callTool(
+    context,
+    client,
+    "worker_artifact",
+    { id: workerId, part: "patch" },
+    ["artifact"]
+  );
+  if (
+    !sameJson(metadataReplay, metadata)
+    || !sameJson(contentReplay, content)
+    || !sameJson(patchReplay, patch)
+    || canonicalDigest(
+      context.state.readJob(fixtureRoot, workerId, context.env)
+    ) !== terminalJobDigestBeforeReplay
+  ) {
+    fail("E_PRIVATE_STATE");
+  }
+
   enterQualificationStage("write-smoke-integration");
   const integrationArguments = {
     id: workerId,
@@ -5350,9 +5585,7 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
   await waitForWriteSmokeProcessClosure(
     context,
     workerId,
-    Object.values(primaryTurnAdmissions).map(
-      (admission) => structuredClone(admission.providerProcess)
-    )
+    retainedProviderIdentities
   );
   if (context.guard.loadProviderGuard(fixtureRoot, workerId) !== null) {
     fail("E_CLEANUP");
@@ -5396,6 +5629,10 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     hostVerificationDigest: hostVerification.evidenceDigest,
     cleanupReceiptDigest: cleanupReceipt.receiptDigest,
     absenceProofDigest: cleanupReceipt.absenceProofDigest,
+    spawnReplayProven: true,
+    artifactReplayProven: true,
+    providerRelaunchDelta: 0,
+    worktreeCreateDelta: 0,
     integrationReplayProven: true,
     cleanupReplayProven: true,
     providerSessionAbsent: true
