@@ -1403,6 +1403,95 @@ async function callWriteSmokeResult(context, client, workerId) {
     const privateErrorMessage = typeof privateJob?.error?.message === "string"
       ? privateJob.error.message
       : null;
+    let executionObservation = null;
+    try {
+      const executionRoot = privateJob?.executionBinding?.expectedExecutionRoot;
+      const baseCommit = privateJob?.executionBinding?.baseCommit;
+      const expectedRoot = context.workerWorktree.expectedWorkerWorktreeRoot(
+        context.fixtureRoot,
+        workerId,
+        context.env
+      );
+      if (
+        typeof executionRoot === "string"
+        && executionRoot === expectedRoot
+        && typeof baseCommit === "string"
+        && fs.existsSync(executionRoot)
+      ) {
+        const statusBytes = runBounded(
+          "git",
+          ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+          {
+            cwd: executionRoot,
+            env: context.env,
+            requireSilentStderr: false,
+            code: "E_SCENARIO"
+          }
+        ).stdout;
+        const changedBytes = runBounded(
+          "git",
+          [
+            "diff",
+            "--name-status",
+            "-z",
+            "--no-renames",
+            baseCommit,
+            "--"
+          ],
+          {
+            cwd: executionRoot,
+            env: context.env,
+            requireSilentStderr: false,
+            code: "E_SCENARIO"
+          }
+        ).stdout;
+        const untrackedBytes = runBounded(
+          "git",
+          ["ls-files", "--others", "--exclude-standard", "-z"],
+          {
+            cwd: executionRoot,
+            env: context.env,
+            requireSilentStderr: false,
+            code: "E_SCENARIO"
+          }
+        ).stdout;
+        const targetFile = path.join(executionRoot, "target.txt");
+        const target = fs.lstatSync(targetFile);
+        const targetContent = fs.readFileSync(targetFile);
+        let parentUnchanged = false;
+        try {
+          context.workerWorktree.assertParentUnchanged(
+            privateJob.executionBinding.parentFingerprint,
+            context.fixtureRoot
+          );
+          parentUnchanged = true;
+        } catch {}
+        executionObservation = {
+          parentUnchanged,
+          statusBytes: Buffer.byteLength(statusBytes),
+          statusDigest: crypto
+            .createHash("sha256")
+            .update(statusBytes)
+            .digest("hex"),
+          changedBytes: Buffer.byteLength(changedBytes),
+          changedDigest: crypto
+            .createHash("sha256")
+            .update(changedBytes)
+            .digest("hex"),
+          untrackedBytes: Buffer.byteLength(untrackedBytes),
+          targetRegular: target.isFile() && !target.isSymbolicLink(),
+          targetMode: target.mode & 0o7777,
+          targetBytes: targetContent.length,
+          targetContentDigest: crypto
+            .createHash("sha256")
+            .update(targetContent)
+            .digest("hex"),
+          targetExactExpected: targetContent.equals(Buffer.from("after\n"))
+        };
+      }
+    } catch {
+      executionObservation = { diagnosticFailed: true };
+    }
     process.stderr.write(
       `Installed Worker MCP write-smoke diagnostic ${JSON.stringify({
         schemaVersion: 1,
@@ -1454,6 +1543,7 @@ async function callWriteSmokeResult(context, client, workerId) {
         privateErrorMessageDigest: privateErrorMessage
           ? crypto.createHash("sha256").update(privateErrorMessage).digest("hex")
           : null,
+        executionObservation,
         lifecycleEventTypes: Array.isArray(privateJob?.lifecycleEvents)
           ? privateJob.lifecycleEvents
               .slice(-8)
