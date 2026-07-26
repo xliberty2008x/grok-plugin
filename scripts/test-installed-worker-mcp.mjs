@@ -951,6 +951,44 @@ function mkdirPrivate(directory) {
   if (!stat.isDirectory() || stat.isSymbolicLink()) fail("E_CLEANUP");
 }
 
+function privateLiveFixtureBase() {
+  const configured = process.env.GROK_COMPANION_LIVE_FIXTURE_ROOT;
+  const base = path.resolve(
+    configured || path.join(os.homedir(), ".grok-companion-live-fixtures")
+  );
+  fs.mkdirSync(base, { recursive: true, mode: 0o700 });
+  const resolved = fs.realpathSync(base);
+  const stat = fs.lstatSync(resolved);
+  const broadTemporaryRoots = [
+    os.tmpdir(),
+    "/tmp",
+    "/private/tmp",
+    process.env.TMPDIR,
+    process.env.TMP,
+    process.env.TEMP
+  ]
+    .filter((value) => typeof value === "string" && path.isAbsolute(value))
+    .map((value) => {
+      try {
+        return fs.realpathSync(value);
+      } catch {
+        return path.resolve(value);
+      }
+    });
+  if (
+    resolved !== base
+    || !stat.isDirectory()
+    || stat.isSymbolicLink()
+    || (stat.mode & 0o077) !== 0
+    || broadTemporaryRoots.some((temporary) => (
+      resolved === temporary || resolved.startsWith(`${temporary}${path.sep}`)
+    ))
+  ) {
+    fail("E_CAPABILITY");
+  }
+  return resolved;
+}
+
 function buildChildEnvironment({
   codexHome,
   pluginData,
@@ -5396,8 +5434,9 @@ async function qualify(runner, { writeSmoke = false } = {}) {
     fail("E_SOURCE");
   }
 
+  const runnerBase = writeSmoke ? privateLiveFixtureBase() : os.tmpdir();
   runner.temporaryRoot = fs.mkdtempSync(
-    path.join(os.tmpdir(), "grok-installed-worker-mcp-")
+    path.join(runnerBase, "grok-installed-worker-mcp-")
   );
   fs.chmodSync(runner.temporaryRoot, 0o700);
   const codexHome = path.join(runner.temporaryRoot, "codex-home");
