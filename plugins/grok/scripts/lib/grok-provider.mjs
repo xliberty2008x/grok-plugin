@@ -39,6 +39,7 @@ const EXACT_NONCE_ID = /^[0-9a-f]{32}$/;
 const OPAQUE_ID = /^[0-9a-f]{32,64}$/;
 const WORKTREE_PROVISIONING_PURPOSE = "worktree-provisioning";
 const WORKTREE_CONTROLLER_PROFILE_ID = "worktree-controller-v1";
+const MIN_ISOLATED_STARTUP_CREDENTIAL_VALIDITY_MS = 2 * 60 * 1000;
 const WORKTREE_CONTROLLER_REQUEST_ALLOWLIST = Object.freeze([
   "initialize",
   "_x.ai/git/worktree/create",
@@ -238,7 +239,10 @@ function ensureFreshCachedCredential(source, minimumValidityMs = 45 * 60 * 1000)
     // After a successful `grok models` call the CLI accepted the credential. Isolated
     // review jobs are short-lived; require a small remaining window rather than a full
     // 45-minute buffer when the provider did not extend expires_at.
-    const postRefreshFloorMs = Math.min(minimumValidityMs, 2 * 60 * 1000);
+    const postRefreshFloorMs = Math.min(
+      minimumValidityMs,
+      MIN_ISOLATED_STARTUP_CREDENTIAL_VALIDITY_MS
+    );
     if (refreshedExpiries.length && Math.max(...refreshedExpiries) - Date.now() < postRefreshFloorMs) {
       throw new CompanionError(
         "E_AUTH_REQUIRED",
@@ -1376,7 +1380,15 @@ export function taskEnvironment(
           );
         }
         if (stagedCredential) return;
-        const payload = freshCachedCredentialPayload(authPath);
+        // The credential is needed only through authenticated session creation
+        // and is revoked before the first workspace-capable prompt. Requiring a
+        // full job horizon here rejects an otherwise accepted cached session
+        // during its final rotation window even though no reusable credential
+        // survives into task execution.
+        const payload = freshCachedCredentialPayload(
+          authPath,
+          MIN_ISOLATED_STARTUP_CREDENTIAL_VALIDITY_MS
+        );
         stagedCredential = stageRevocableTaskCredential(
           authPath,
           authFile,

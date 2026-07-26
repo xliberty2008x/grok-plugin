@@ -326,6 +326,54 @@ test("worktree controller never refreshes or stages expiring auth before durable
   });
 });
 
+test("worktree controller accepts a bounded startup-only credential window", async () => {
+  await withFake({}, async (fake) => {
+    const root = initNonTemporaryRepo();
+    const stateDir = nonTemporaryDirectory(
+      "grok-controller-startup-auth-state-"
+    );
+    fs.writeFileSync(
+      fake.authPath,
+      `${JSON.stringify({
+        test: {
+          key: "test-secret-value-1234567890",
+          auth_mode: "oauth",
+          expires_at: new Date(Date.now() + 5 * 60_000).toISOString()
+        }
+      })}\n`,
+      { mode: 0o600 }
+    );
+    const environment = taskEnvironment(
+      stateDir,
+      root,
+      profileFor("task", true),
+      "worktree-controller-startup-auth",
+      controllerEnvironmentInput(root, stateDir)
+    );
+    try {
+      assert.equal(
+        fs.existsSync(path.join(environment.grokHome, "auth.json")),
+        false
+      );
+      environment.stageCredential();
+      assert.equal(
+        fs.existsSync(path.join(environment.grokHome, "auth.json")),
+        true
+      );
+      assert.equal(
+        readFakeLog(fake.logFile).some((entry) => entry.event === "models"),
+        false
+      );
+      environment.revokeCredential();
+      environment.assertCredentialAbsent();
+    } finally {
+      try { environment.revokeCredential(); } catch {}
+      fs.rmSync(stateDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 test("worktree provisioning refuses a repository-controlled Git executable", async () => {
   await withFake({}, async () => {
     const root = initRepo();
