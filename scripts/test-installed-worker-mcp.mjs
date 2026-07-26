@@ -216,6 +216,11 @@ const QUALIFICATION_STAGES = new Set([
   "write-smoke-artifact",
   "write-smoke-parent",
   "write-smoke-private",
+  "write-smoke-integration",
+  "write-smoke-integration-reconnect",
+  "write-smoke-production-cleanup",
+  "write-smoke-session-absence",
+  "write-smoke-cleanup-reconnect",
   "write-smoke-cleanup",
   "emergency-cleanup"
 ]);
@@ -1509,6 +1514,8 @@ async function verifyMcpSurface(context, client, { negative = false } = {}) {
       tools: listed.tools.filter((tool) => (
         tool?.name !== "worker_spawn_write"
         && tool?.name !== "worker_artifact"
+        && tool?.name !== "worker_integrate"
+        && tool?.name !== "worker_cleanup"
       ))
     };
     validateInstalledToolInventory(projected, context.defaultWorkerTools);
@@ -4486,7 +4493,7 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     .digest("hex");
 
   enterQualificationStage("write-smoke-mcp-surface");
-  const client = await startInstalledMcp(context);
+  let client = await startInstalledMcp(context);
   await verifyMcpSurface(context, client, { negative: true });
 
   enterQualificationStage("write-smoke-spawn");
@@ -5003,6 +5010,128 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     fail("E_PRIVATE_STATE");
   }
 
+  enterQualificationStage("write-smoke-integration");
+  const integrationArguments = {
+    id: workerId,
+    manifestDigest: metadata.artifact.manifestDigest,
+    idempotencyKey: `installed-write-integrate-${crypto.randomUUID()}`
+  };
+  const integrated = await callTool(
+    context,
+    client,
+    "worker_integrate",
+    integrationArguments,
+    ["receipt", "replayed"]
+  );
+  const integrationReceipt = integrated.receipt;
+  if (
+    integrated.replayed !== false
+    || integrationReceipt?.workerId !== workerId
+    || integrationReceipt?.manifestDigest !== metadata.artifact.manifestDigest
+    || !/^[a-f0-9]{64}$/.test(integrationReceipt?.receiptDigest || "")
+  ) {
+    fail("E_SCENARIO");
+  }
+  const hostVerification =
+    context.workerWorktree.verifyWriteVerticalIntegration({
+      controlRoot: fixtureRoot,
+      artifact: storedArtifact,
+      parentFingerprint: parentBefore,
+      expectedWorkerId: workerId
+    });
+  if (
+    fs.readFileSync(path.join(fixtureRoot, "target.txt"), "utf8")
+      !== expectedContent
+    || hostVerification.manifestDigest !== metadata.artifact.manifestDigest
+    || hostVerification.patchDigest !== metadata.artifact.patchDigest
+    || hostVerification.contentDigest !== metadata.artifact.contentDigest
+  ) {
+    fail("E_SCENARIO");
+  }
+
+  enterQualificationStage("write-smoke-integration-reconnect");
+  await closeMcp(context, client);
+  client = await startInstalledMcp(context);
+  await verifyMcpSurface(context, client);
+  const integrationReplay = await callTool(
+    context,
+    client,
+    "worker_integrate",
+    integrationArguments,
+    ["receipt", "replayed"]
+  );
+  if (
+    integrationReplay.replayed !== true
+    || !sameJson(integrationReplay.receipt, integrationReceipt)
+  ) {
+    fail("E_SCENARIO");
+  }
+  context.workerWorktree.verifyWriteVerticalIntegration({
+    controlRoot: fixtureRoot,
+    artifact: storedArtifact,
+    parentFingerprint: parentBefore,
+    expectedWorkerId: workerId
+  });
+
+  enterQualificationStage("write-smoke-production-cleanup");
+  const cleanupArguments = {
+    id: workerId,
+    integrationReceiptDigest: integrationReceipt.receiptDigest,
+    idempotencyKey: `installed-write-cleanup-${crypto.randomUUID()}`
+  };
+  const cleaned = await callTool(
+    context,
+    client,
+    "worker_cleanup",
+    cleanupArguments,
+    ["receipt", "replayed"]
+  );
+  const cleanupReceipt = cleaned.receipt;
+  if (
+    cleaned.replayed !== false
+    || cleanupReceipt?.workerId !== workerId
+    || cleanupReceipt?.integrationReceiptDigest
+      !== integrationReceipt.receiptDigest
+    || !/^[a-f0-9]{64}$/.test(cleanupReceipt?.receiptDigest || "")
+  ) {
+    fail("E_SCENARIO");
+  }
+
+  enterQualificationStage("write-smoke-session-absence");
+  const sessionPrincipal = Object.freeze({
+    hostKind: "codex",
+    threadId: context.threadId
+  });
+  for (let observation = 0; observation < 2; observation += 1) {
+    const absent = await context.workerSessionLifecycle
+      .inspectOwnedProviderSession({
+        root: fixtureRoot,
+        principal: sessionPrincipal,
+        workerId,
+        providerSessionId: terminalJob.grokSessionId,
+        env: context.env
+      });
+    if (absent?.present !== false) fail("E_SESSION");
+  }
+
+  enterQualificationStage("write-smoke-cleanup-reconnect");
+  await closeMcp(context, client);
+  client = await startInstalledMcp(context);
+  await verifyMcpSurface(context, client);
+  const cleanupReplay = await callTool(
+    context,
+    client,
+    "worker_cleanup",
+    cleanupArguments,
+    ["receipt", "replayed"]
+  );
+  if (
+    cleanupReplay.replayed !== true
+    || !sameJson(cleanupReplay.receipt, cleanupReceipt)
+  ) {
+    fail("E_SCENARIO");
+  }
+
   enterQualificationStage("write-smoke-cleanup");
   await closeMcp(context, client);
   await waitForWriteSmokeProcessClosure(
@@ -5015,12 +5144,6 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
   if (context.guard.loadProviderGuard(fixtureRoot, workerId) !== null) {
     fail("E_CLEANUP");
   }
-  context.workerWorktree.removeWorkerWorktree(
-    expectedExecutionRoot,
-    fixtureRoot,
-    workerId,
-    context.env
-  );
   const removed = context.workerWorktree.classifyWorkerWorktreeEffect({
     controlRoot: fixtureRoot,
     executionRoot: expectedExecutionRoot,
@@ -5034,7 +5157,6 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
   ) {
     fail("E_CLEANUP");
   }
-  context.workerWorktree.assertParentUnchanged(parentBefore, fixtureRoot);
   return Object.freeze({
     schemaVersion: 1,
     scenario: "official-grok-build-target-txt-write-smoke",
@@ -5050,13 +5172,20 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     patchDigest: metadata.artifact.patchDigest,
     contentDigest: metadata.artifact.contentDigest,
     parentFingerprintDigest: parentBefore.fingerprintDigest,
-    parentUnchanged: true,
-    integrationApplied: false,
+    parentUnchangedBeforeIntegration: true,
+    integrationApplied: true,
     runnerDisposableWorktreeRemoved: true,
     runnerWorktreeRegistrationAbsent: true,
-    productionIntegrationQualified: false,
-    productionCleanupQualified: false,
-    hostVerification: result.worker.result.hostVerification
+    productionIntegrationQualified: true,
+    productionCleanupQualified: true,
+    hostVerification: "passed",
+    integrationReceiptDigest: integrationReceipt.receiptDigest,
+    hostVerificationDigest: hostVerification.evidenceDigest,
+    cleanupReceiptDigest: cleanupReceipt.receiptDigest,
+    absenceProofDigest: cleanupReceipt.absenceProofDigest,
+    integrationReplayProven: true,
+    cleanupReplayProven: true,
+    providerSessionAbsent: true
   });
 }
 
@@ -6156,6 +6285,10 @@ async function qualify(runner, { writeSmoke = false } = {}) {
     installedRoot,
     "scripts/lib/worker-worktree.mjs"
   );
+  const workerSessionLifecycle = await importInstalled(
+    installedRoot,
+    "scripts/lib/worker-session-lifecycle.mjs"
+  );
   if (
     workerProtocol.MAX_LIFECYCLE_EVENTS
       !== MAX_TERMINAL_LIFECYCLE_EVENTS
@@ -6273,6 +6406,7 @@ async function qualify(runner, { writeSmoke = false } = {}) {
     provider,
     workerProtocol,
     workerWorktree,
+    workerSessionLifecycle,
     mailboxState,
     workerTools: writeSmoke
       ? broker.WRITE_SMOKE_WORKER_TOOLS

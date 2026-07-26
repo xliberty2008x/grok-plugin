@@ -6,6 +6,8 @@ import { pathToFileURL } from "node:url";
 
 import {
   BASE_WORKER_TOOLS,
+  WRITE_SMOKE_ENV_VALUE,
+  WRITE_SMOKE_WORKER_TOOLS,
   WORKER_TOOLS,
   callWorkerTool,
   createMcpBrokerRuntime,
@@ -41,6 +43,15 @@ const SPAWN_RUNTIME = createMcpBrokerRuntime({
 const LIVE_SPAWN_OPTIONS = Object.freeze({
   runtime: SPAWN_RUNTIME,
   readProviderCapabilityReceipt: () => SPAWN_RECEIPT
+});
+
+const WRITE_SMOKE_RUNTIME = createMcpBrokerRuntime({
+  env: {
+    ...process.env,
+    GROK_COMPANION_WRITE_SMOKE: WRITE_SMOKE_ENV_VALUE
+  },
+  providerCapabilityReceipt: SPAWN_RECEIPT,
+  writeSmoke: true
 });
 
 test("decision, follow-up, and send tools are advertised only by the exact combined capability receipt", () => {
@@ -178,6 +189,47 @@ test("MCP broker advertises sandbox metadata, pins protocol versions, and lists 
   assert.match(wait.description, /recovery maintenance/);
 });
 
+test("write-smoke owner lifecycle exposes only digest-bound integrate and cleanup mutations", () => {
+  assert.deepEqual(
+    WRITE_SMOKE_RUNTIME.tools.map((tool) => tool.name),
+    [
+      "worker_list_owned",
+      "worker_get",
+      "worker_events_after",
+      "worker_wait",
+      "worker_result",
+      "worker_spawn",
+      "worker_decide_host_action",
+      "worker_followup",
+      "worker_send",
+      "worker_spawn_write",
+      "worker_artifact",
+      "worker_integrate",
+      "worker_cleanup",
+      "worker_cancel"
+    ]
+  );
+  assert.deepEqual(WRITE_SMOKE_RUNTIME.tools, WRITE_SMOKE_WORKER_TOOLS);
+  for (const name of ["worker_integrate", "worker_cleanup"]) {
+    const tool = WRITE_SMOKE_RUNTIME.tools.find((entry) => entry.name === name);
+    assert.equal(tool.annotations.readOnlyHint, false);
+    assert.equal(tool.annotations.destructiveHint, true);
+    assert.equal(tool.annotations.idempotentHint, true);
+    assert.equal(tool.annotations.openWorldHint, false);
+    const schema = JSON.stringify(tool.inputSchema);
+    for (const forbidden of [
+      "root",
+      "path",
+      "sessionId",
+      "executionRoot",
+      "command",
+      "verification"
+    ]) {
+      assert.equal(schema.includes(`\"${forbidden}\"`), false);
+    }
+  }
+});
+
 test("worker_wait requires mutation authority before recovery-capable service creation", async () => {
   let serviceCreated = false;
   const withoutPluginId = {
@@ -220,6 +272,8 @@ test("frozen broker runtime cannot be widened and hidden operations never reach 
   for (const [name, runtime, expectedCode] of [
     ["worker_send", BASE_RUNTIME, "E_CAPABILITY"],
     ["worker_spawn", BASE_RUNTIME, "E_CAPABILITY"],
+    ["worker_integrate", SPAWN_RUNTIME, "E_CAPABILITY"],
+    ["worker_cleanup", SPAWN_RUNTIME, "E_CAPABILITY"],
     ["worker_decide_host_action", BASE_RUNTIME, "E_CAPABILITY"],
     ["worker_followup", BASE_RUNTIME, "E_CAPABILITY"]
   ]) {

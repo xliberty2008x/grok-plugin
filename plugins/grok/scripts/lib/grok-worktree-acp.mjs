@@ -12,11 +12,13 @@ import path from "node:path";
 import { CompanionError } from "./errors.mjs";
 
 export const XAI_WORKTREE_CREATE = "x.ai/git/worktree/create";
+export const XAI_WORKTREE_APPLY = "x.ai/git/worktree/apply";
 export const XAI_WORKTREE_REMOVE = "x.ai/git/worktree/remove";
 export const XAI_WORKTREE_STATUS = "x.ai/git/worktree/status";
 export const XAI_SESSION_CLOSE = "x.ai/session/close";
 
 export const XAI_WORKTREE_CREATE_WIRE = "_x.ai/git/worktree/create";
+export const XAI_WORKTREE_APPLY_WIRE = "_x.ai/git/worktree/apply";
 export const XAI_WORKTREE_REMOVE_WIRE = "_x.ai/git/worktree/remove";
 export const XAI_WORKTREE_STATUS_WIRE = "_x.ai/git/worktree/status";
 export const XAI_SESSION_CLOSE_WIRE = "_x.ai/session/close";
@@ -487,6 +489,128 @@ function validateCloseResult(result) {
   return Object.freeze({ success: true });
 }
 
+function validateApplyFileChange(value, label) {
+  const object = assertPlainObject(value, label);
+  const allowed = new Set([
+    "path",
+    "oldPath",
+    "type",
+    "staged",
+    "additions",
+    "deletions",
+    "patch",
+    "patchBytes",
+    "patchLines",
+    "oldText",
+    "newText"
+  ]);
+  assertOnlyKeys(object, allowed, label);
+  assertRequiredKeys(
+    object,
+    new Set(["path", "type", "additions", "deletions"]),
+    label
+  );
+  const relativePath = assertNonEmptyString(object.path, `${label}.path`);
+  if (path.isAbsolute(relativePath)
+    || relativePath.includes("\0")
+    || relativePath.split(/[\\/]/).some((segment) => (
+      segment === "" || segment === "." || segment === ".."
+    ))) {
+    throw protocolError(`${label}.path must be a safe relative path.`);
+  }
+  if (object.type !== "edit") {
+    throw protocolError(`${label}.type must be edit for the bounded overwrite vertical.`);
+  }
+  for (const key of ["additions", "deletions"]) {
+    if (!Number.isSafeInteger(object[key]) || object[key] < 0) {
+      throw protocolError(`${label}.${key} must be a non-negative integer.`);
+    }
+  }
+  if (Object.hasOwn(object, "oldPath")
+    || Object.hasOwn(object, "staged")
+    || Object.hasOwn(object, "patch")
+    || Object.hasOwn(object, "patchBytes")
+    || Object.hasOwn(object, "patchLines")
+    || Object.hasOwn(object, "oldText")
+    || Object.hasOwn(object, "newText")) {
+    throw protocolError(
+      `${label} contains unsupported content or alternate-path fields.`
+    );
+  }
+  return Object.freeze({
+    path: relativePath,
+    type: "edit",
+    additions: object.additions,
+    deletions: object.deletions
+  });
+}
+
+function validateApplyResult(result, {
+  expectedGitRoot,
+  expectedPaths
+}) {
+  const object = assertPlainObject(result, "Worktree apply result");
+  const status = assertNonEmptyString(
+    object.status,
+    "Worktree apply result.status"
+  );
+  if (status === "conflicts") {
+    assertOnlyKeys(
+      object,
+      new Set(["status", "files", "conflicts"]),
+      "Worktree apply result"
+    );
+    throw new CompanionError(
+      "E_INTEGRATION",
+      "Official Grok reported an integration conflict."
+    );
+  }
+  if (status !== "success") {
+    throw protocolError("Worktree apply result.status is invalid.");
+  }
+  assertOnlyKeys(
+    object,
+    new Set(["status", "files", "gitRoot"]),
+    "Worktree apply result"
+  );
+  assertRequiredKeys(
+    object,
+    new Set(["status", "files", "gitRoot"]),
+    "Worktree apply result"
+  );
+  if (!Array.isArray(object.files)
+    || object.files.length !== expectedPaths.length) {
+    throw new CompanionError(
+      "E_INTEGRATION",
+      "Official Grok applied an unexpected number of paths."
+    );
+  }
+  const files = object.files.map((entry, index) => (
+    validateApplyFileChange(entry, `Worktree apply result.files[${index}]`)
+  ));
+  if (files.some((entry, index) => entry.path !== expectedPaths[index])) {
+    throw new CompanionError(
+      "E_INTEGRATION",
+      "Official Grok applied a path outside the bounded integration contract."
+    );
+  }
+  const gitRoot = assertAbsolutePath(
+    object.gitRoot,
+    "Worktree apply result.gitRoot"
+  );
+  if (gitRoot !== expectedGitRoot) {
+    throw new CompanionError(
+      "E_INTEGRATION",
+      "Official Grok applied the worktree to a different Git root."
+    );
+  }
+  return Object.freeze({
+    status: "success",
+    files: Object.freeze(files),
+    gitRoot
+  });
+}
+
 function validateRemoveResult(result, {
   dryRun,
   expectedWorktreePath = null
@@ -755,6 +879,50 @@ export class GrokWorktreeAcp {
       { timeoutMs }
     );
     return validateCloseResult(result);
+  }
+
+  async apply({
+    operationId,
+    worktreePath,
+    expectedGitRoot,
+    expectedPaths,
+    timeoutMs = this.timeoutMs
+  } = {}) {
+    const sessionId = assertNonEmptyString(operationId, "operationId");
+    const exactWorktreePath = assertAbsolutePath(
+      worktreePath,
+      "worktreePath"
+    );
+    const exactGitRoot = assertAbsolutePath(
+      expectedGitRoot,
+      "expectedGitRoot"
+    );
+    if (!Array.isArray(expectedPaths)
+      || expectedPaths.length !== 1
+      || expectedPaths.some((entry) => typeof entry !== "string")) {
+      throw protocolError(
+        "Worktree apply requires exactly one expected relative path."
+      );
+    }
+    const paths = expectedPaths.map((entry, index) => (
+      validateApplyFileChange(
+        { path: entry, type: "edit", additions: 0, deletions: 0 },
+        `expectedPaths[${index}]`
+      ).path
+    ));
+    const result = await this.extensionRequest(
+      XAI_WORKTREE_APPLY,
+      {
+        sessionId,
+        worktreePath: exactWorktreePath,
+        mode: "overwrite"
+      },
+      { timeoutMs }
+    );
+    return validateApplyResult(result, {
+      expectedGitRoot: exactGitRoot,
+      expectedPaths: paths
+    });
   }
 
   async remove({

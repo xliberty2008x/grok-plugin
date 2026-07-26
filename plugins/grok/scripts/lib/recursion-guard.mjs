@@ -23,6 +23,34 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 const EXACT_NONCE_ID = /^[0-9a-f]{32}$/;
 const OPAQUE_ID = /^[0-9a-f]{32,64}$/;
 const WORKTREE_PROVISIONING_PURPOSE = "worktree-provisioning";
+export const WORKTREE_INTEGRATION_PURPOSE = "worktree-integration";
+export const WORKTREE_CLEANUP_PURPOSE = "worktree-cleanup";
+const WORKER_OWNER_CONTROLLER_PURPOSES = new Set([
+  WORKTREE_INTEGRATION_PURPOSE,
+  WORKTREE_CLEANUP_PURPOSE
+]);
+const WORKER_OWNER_CONTROLLER_COMMON_BINDING_KEYS = new Set([
+  "purpose",
+  "controlWorkspaceId",
+  "controlRoot",
+  "executionRoot",
+  "executionBindingDigest",
+  "effectBindingDigest",
+  "controllerAttemptId",
+  "controllerFence",
+  "holderId",
+  "providerSpawnIntentId"
+]);
+const WORKTREE_INTEGRATION_BINDING_KEYS = new Set([
+  ...WORKER_OWNER_CONTROLLER_COMMON_BINDING_KEYS,
+  "targetPath",
+  "operationId"
+]);
+const WORKTREE_CLEANUP_BINDING_KEYS = new Set([
+  ...WORKER_OWNER_CONTROLLER_COMMON_BINDING_KEYS,
+  "managedWorktreeParent",
+  "sessionId"
+]);
 const WORKTREE_PROVISIONING_RUNTIME_KEYS = new Set([
   "schemaVersion",
   "intent",
@@ -390,6 +418,133 @@ function normalizeWorktreeProvisioningGuardBinding(workspaceRoot, marker, bindin
       "E_PROCESS_IDENTITY",
       "Worktree provisioning guard is not exactly bound to its control workspace and fenced attempt."
     );
+  }
+  return Object.freeze({ ...binding });
+}
+
+function boundedOpaqueText(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 256
+    && value.trim() === value
+    && !value.includes("\0");
+}
+
+/**
+ * Validate the exact, purpose-specific owner-controller binding without
+ * consulting mutable repository state. The bootstrap uses this before it can
+ * register a guard or launch Grok.
+ */
+export function assertWorkerOwnerControllerBinding(binding) {
+  const purpose = binding?.purpose;
+  const keys = purpose === WORKTREE_INTEGRATION_PURPOSE
+    ? WORKTREE_INTEGRATION_BINDING_KEYS
+    : purpose === WORKTREE_CLEANUP_PURPOSE
+      ? WORKTREE_CLEANUP_BINDING_KEYS
+      : null;
+  const absolute = (value) => typeof value === "string"
+    && path.isAbsolute(value)
+    && path.normalize(value) === value
+    && value.length <= 4_096;
+  if (!keys
+    || !exactKeys(binding, keys)
+    || !WORKER_OWNER_CONTROLLER_PURPOSES.has(purpose)
+    || !/^cws-[0-9a-f]{32}$/.test(binding.controlWorkspaceId || "")
+    || !absolute(binding.controlRoot)
+    || !absolute(binding.executionRoot)
+    || binding.controlRoot === binding.executionRoot
+    || !SHA256_HEX.test(binding.executionBindingDigest || "")
+    || !SHA256_HEX.test(binding.effectBindingDigest || "")
+    || !EXACT_NONCE_ID.test(binding.controllerAttemptId || "")
+    || !Number.isSafeInteger(binding.controllerFence)
+    || binding.controllerFence < 1
+    || !OPAQUE_ID.test(binding.holderId || "")
+    || !EXACT_NONCE_ID.test(binding.providerSpawnIntentId || "")
+    || (purpose === WORKTREE_INTEGRATION_PURPOSE && (
+      !absolute(binding.targetPath)
+      || binding.targetPath !== path.join(binding.controlRoot, "target.txt")
+      || !boundedOpaqueText(binding.operationId)
+    ))
+    || (purpose === WORKTREE_CLEANUP_PURPOSE && (
+      !absolute(binding.managedWorktreeParent)
+      || binding.managedWorktreeParent !== path.dirname(binding.executionRoot)
+      || !boundedOpaqueText(binding.sessionId)
+    ))) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Worker owner-controller binding is malformed or exceeds its bounded authority."
+    );
+  }
+  return binding;
+}
+
+function normalizeWorkerOwnerControllerGuardBinding(
+  workspaceRoot,
+  marker,
+  binding,
+  env
+) {
+  assertWorkerOwnerControllerBinding(binding);
+  let callerRoot;
+  let executionRoot;
+  let control;
+  let executionControl;
+  try {
+    callerRoot = fs.realpathSync(workspaceRoot);
+    executionRoot = fs.realpathSync(binding.executionRoot);
+    control = resolveControlWorkspace(callerRoot, env);
+    executionControl = resolveControlWorkspace(executionRoot, env);
+  } catch {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Worker owner-controller repository roots are unavailable."
+    );
+  }
+  let exactEffectTarget;
+  try {
+    exactEffectTarget = binding.purpose === WORKTREE_INTEGRATION_PURPOSE
+      ? fs.realpathSync(binding.targetPath)
+      : fs.realpathSync(binding.managedWorktreeParent);
+  } catch {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Worker owner-controller effect target is unavailable."
+    );
+  }
+  const expectedEffectTarget = binding.purpose === WORKTREE_INTEGRATION_PURPOSE
+    ? binding.targetPath
+    : binding.managedWorktreeParent;
+  if (!markerName(marker)
+    || binding.controlRoot !== callerRoot
+    || binding.controlRoot !== control.controlRoot
+    || binding.executionRoot !== executionRoot
+    || executionControl.controlWorkspaceId !== control.controlWorkspaceId
+    || executionControl.controlRoot !== control.controlRoot
+    || binding.controlWorkspaceId !== control.controlWorkspaceId
+    || exactEffectTarget !== expectedEffectTarget) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Worker owner-controller binding is not attached to the exact managed worktree and control workspace."
+    );
+  }
+  if (binding.purpose === WORKTREE_INTEGRATION_PURPOSE) {
+    const target = fs.lstatSync(binding.targetPath);
+    if (!target.isFile() || target.isSymbolicLink()) {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "Worker integration target is not an exact regular file."
+      );
+    }
+  } else {
+    const parent = fs.lstatSync(binding.managedWorktreeParent);
+    if (!parent.isDirectory()
+      || parent.isSymbolicLink()
+      || (parent.mode & 0o077) !== 0) {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "Worker cleanup parent is aliased, shared, or not private."
+      );
+    }
   }
   return Object.freeze({ ...binding });
 }
@@ -1162,6 +1317,130 @@ export function registerWorktreeProvisioningGuard(
   }, env);
 }
 
+const WORKER_OWNER_CONTROLLER_GUARD_KEYS = new Set([
+  "schemaVersion",
+  "marker",
+  "owner",
+  "identityKind",
+  "launcherKind",
+  "purpose",
+  "providerProcess",
+  "binding",
+  "createdAt"
+]);
+
+function assertWorkerOwnerControllerGuardRecord(
+  workspaceRoot,
+  marker,
+  record,
+  expectedBinding,
+  env
+) {
+  const normalized = normalizeWorkerOwnerControllerGuardBinding(
+    workspaceRoot,
+    marker,
+    expectedBinding,
+    env
+  );
+  const valid = exactKeys(record, WORKER_OWNER_CONTROLLER_GUARD_KEYS)
+    && record.schemaVersion === 6
+    && record.marker === markerName(marker)
+    && typeof record.owner === "string"
+    && SHA256_HEX.test(record.owner)
+    && record.identityKind === "provider"
+    && record.launcherKind === "node-owner-controller-v1"
+    && record.purpose === normalized.purpose
+    && completeProviderProcess(record.providerProcess)
+    && exactKeys(
+      record.binding,
+      normalized.purpose === WORKTREE_INTEGRATION_PURPOSE
+        ? WORKTREE_INTEGRATION_BINDING_KEYS
+        : WORKTREE_CLEANUP_BINDING_KEYS
+    )
+    && JSON.stringify(record.binding) === JSON.stringify(normalized)
+    && canonicalTimestamp(record.createdAt);
+  if (!valid) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Worker owner-controller guard does not match its exact durable activation."
+    );
+  }
+  return record;
+}
+
+/**
+ * Publish the schema-6 guard for one already-durably-activated, no-model
+ * integration or cleanup controller. Unlike provisioning, this authority is
+ * never inferred from the worker dispatch/create journal.
+ */
+export function registerWorkerOwnerControllerGuard(
+  workspaceRoot,
+  marker,
+  providerProcess,
+  owner,
+  binding,
+  env = process.env
+) {
+  if (!completeProviderProcess(providerProcess)
+    || typeof owner !== "string"
+    || !owner
+    || owner.length > 256) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Worker owner-controller guard requires a complete provider identity."
+    );
+  }
+  const normalized = normalizeWorkerOwnerControllerGuardBinding(
+    workspaceRoot,
+    marker,
+    binding,
+    env
+  );
+  const record = {
+    schemaVersion: 6,
+    marker: markerName(marker),
+    owner: ownerDigest(owner),
+    identityKind: "provider",
+    launcherKind: "node-owner-controller-v1",
+    purpose: normalized.purpose,
+    providerProcess,
+    binding: normalized,
+    createdAt: new Date().toISOString()
+  };
+  return withWorkspaceStateTransaction(workspaceRoot, () => {
+    let existing;
+    try { existing = loadProviderGuard(workspaceRoot, marker); }
+    catch {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "Existing owner-controller guard aliases are malformed or conflicting."
+      );
+    }
+    if (existing) {
+      const authenticated = assertWorkerOwnerControllerGuardRecord(
+        workspaceRoot,
+        marker,
+        existing,
+        normalized,
+        env
+      );
+      if (authenticated.owner !== record.owner
+        || !sameGuardProcessIdentity(
+          authenticated.providerProcess,
+          providerProcess
+        )) {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "A different process or owner already holds this owner-controller activation."
+        );
+      }
+      return authenticated;
+    }
+    atomicJson(guardFile(workspaceRoot, marker), record);
+    return record;
+  }, env);
+}
+
 function guardChangedBeforeDelete() {
   return new CompanionError(
     "E_PROCESS_IDENTITY",
@@ -1478,6 +1757,42 @@ export function authenticateWorktreeProvisioningBootstrapGuard(
       throw new CompanionError(
         "E_PROCESS_IDENTITY",
         "Worktree provisioning bootstrap guard does not match the exact spawned process and intent."
+      );
+    }
+    return authenticated;
+  }, env);
+}
+
+/** Authenticate the exact schema-6 owner-controller bootstrap and binding. */
+export function authenticateWorkerOwnerControllerBootstrapGuard(
+  workspaceRoot,
+  marker,
+  providerProcess,
+  binding,
+  env = process.env
+) {
+  const normalized = normalizeWorkerOwnerControllerGuardBinding(
+    workspaceRoot,
+    marker,
+    binding,
+    env
+  );
+  return withWorkspaceStateTransaction(workspaceRoot, () => {
+    const guard = loadProviderGuard(workspaceRoot, marker);
+    const authenticated = assertWorkerOwnerControllerGuardRecord(
+      workspaceRoot,
+      marker,
+      guard,
+      normalized,
+      env
+    );
+    if (!sameGuardProcessIdentity(
+      authenticated?.providerProcess,
+      providerProcess
+    )) {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "Worker owner-controller guard does not match the exact activated process."
       );
     }
     return authenticated;

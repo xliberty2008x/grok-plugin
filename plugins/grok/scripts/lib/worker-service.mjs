@@ -42,6 +42,19 @@ import {
   assertTrackedWriteVerticalTarget,
   readWriteWorkerArtifact
 } from "./worker-worktree.mjs";
+import {
+  cleanupWriteWorker as cleanupOwnedWriteWorker,
+  integrateWriteWorker as integrateOwnedWriteWorker
+} from "./worker-owner-lifecycle.mjs";
+import {
+  runCloseEffect as runOfficialCloseEffect,
+  runIntegrationEffect as runOfficialIntegrationEffect,
+  runRemoveEffect as runOfficialRemoveEffect
+} from "./worker-owner-controller.mjs";
+import {
+  deleteOwnedProviderSession,
+  inspectOwnedProviderSession
+} from "./worker-session-lifecycle.mjs";
 
 export const MAX_WORKER_WAIT_MS = 30_000;
 const DEFAULT_WORKER_WAIT_MS = 10_000;
@@ -85,6 +98,13 @@ export function createWorkerService({
   dispatchWorker = launchWorker,
   provisionWriteWorktree = provisionWriteWorkerWorktree,
   authorizeWriteDispatch = authorizeReadyWriteWorkerDispatch,
+  integrateWriteArtifact = integrateOwnedWriteWorker,
+  cleanupWriteWorker = cleanupOwnedWriteWorker,
+  runIntegrationEffect = runOfficialIntegrationEffect,
+  runCloseEffect = runOfficialCloseEffect,
+  deleteProviderSession = null,
+  inspectProviderSession = null,
+  runRemoveEffect = runOfficialRemoveEffect,
   captureContext = captureContextManifest,
   maintain = null,
   maintenanceIntervalMs = 250
@@ -291,6 +311,99 @@ export function createWorkerService({
         payloadDigest: part === "patch"
           ? metadata.patchDigest
           : metadata.contentDigest
+      });
+    },
+
+    async integrate({ id, manifestDigest, idempotencyKey } = {}) {
+      if (!id || !manifestDigest || !idempotencyKey) {
+        throw new CompanionError(
+          "E_USAGE",
+          "id, manifestDigest, and idempotencyKey are required for integration."
+        );
+      }
+      assertBrokerMutationAuthority(principal, { root });
+      const job = ownedJob(id);
+      if (job.write !== true || !isWorkerTerminal(job) || job.status !== "completed") {
+        throw new CompanionError(
+          "E_JOB_ACTIVE",
+          "Write worker is not ready for integration."
+        );
+      }
+      if (currentWriteLifecycleCapabilityDigest()
+        !== writeLifecycleCapabilityDigest) {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "The write-lifecycle capability changed before integration."
+        );
+      }
+      if (typeof integrateWriteArtifact !== "function"
+        || typeof runIntegrationEffect !== "function") {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "The production integration controller is unavailable."
+        );
+      }
+      return integrateWriteArtifact({
+        root,
+        principal,
+        workerId: id,
+        manifestDigest,
+        idempotencyKey,
+        env,
+        runIntegrationEffect
+      });
+    },
+
+    async cleanup({ id, integrationReceiptDigest, idempotencyKey } = {}) {
+      if (!id || !integrationReceiptDigest || !idempotencyKey) {
+        throw new CompanionError(
+          "E_USAGE",
+          "id, integrationReceiptDigest, and idempotencyKey are required for cleanup."
+        );
+      }
+      assertBrokerMutationAuthority(principal, { root });
+      const job = ownedJob(id);
+      if (job.write !== true || !isWorkerTerminal(job) || job.status !== "completed") {
+        throw new CompanionError(
+          "E_JOB_ACTIVE",
+          "Write worker is not ready for cleanup."
+        );
+      }
+      if (typeof cleanupWriteWorker !== "function"
+        || typeof runCloseEffect !== "function"
+        || typeof runRemoveEffect !== "function") {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "The production cleanup controller is unavailable."
+        );
+      }
+      return cleanupWriteWorker({
+        root,
+        principal,
+        workerId: id,
+        integrationReceiptDigest,
+        idempotencyKey,
+        env,
+        runCloseEffect,
+        deleteProviderSession: deleteProviderSession || (({
+          providerSessionId
+        }) => deleteOwnedProviderSession({
+          root,
+          principal,
+          workerId: id,
+          providerSessionId,
+          env
+        })),
+        inspectProviderSession: inspectProviderSession || (({
+          providerSessionId
+        }) => inspectOwnedProviderSession({
+          root,
+          principal,
+          workerId: id,
+          providerSessionId,
+          env
+        })),
+        runRemoveEffect
       });
     },
 

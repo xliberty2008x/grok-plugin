@@ -19,11 +19,15 @@ import {
 import { redact, redactText } from "./redact.mjs";
 import { processGroupAlive, processGroupGone, processStartToken } from "./process-control.mjs";
 import {
+  assertWorkerOwnerControllerBinding,
   authenticateProviderBootstrapGuard,
+  authenticateWorkerOwnerControllerBootstrapGuard,
   authenticateWorktreeProvisioningBootstrapGuard,
   loadProviderGuard,
   registerProviderGuard,
-  unregisterProviderGuard
+  unregisterProviderGuard,
+  WORKTREE_CLEANUP_PURPOSE,
+  WORKTREE_INTEGRATION_PURPOSE
 } from "./recursion-guard.mjs";
 import { hostCommand, hostContext, pluginDataRoot } from "./host.mjs";
 
@@ -39,11 +43,25 @@ const EXACT_NONCE_ID = /^[0-9a-f]{32}$/;
 const OPAQUE_ID = /^[0-9a-f]{32,64}$/;
 const WORKTREE_PROVISIONING_PURPOSE = "worktree-provisioning";
 const WORKTREE_CONTROLLER_PROFILE_ID = "worktree-controller-v1";
+export const WORKTREE_INTEGRATION_CONTROLLER_PROFILE_ID =
+  "worktree-integration-controller-v1";
+export const WORKTREE_CLEANUP_CONTROLLER_PROFILE_ID =
+  "worktree-cleanup-controller-v1";
 const MIN_ISOLATED_STARTUP_CREDENTIAL_VALIDITY_MS = 2 * 60 * 1000;
 const WORKTREE_CONTROLLER_REQUEST_ALLOWLIST = Object.freeze([
   "initialize",
   "_x.ai/git/worktree/create",
   "_x.ai/session/close"
+]);
+export const WORKTREE_INTEGRATION_REQUEST_ALLOWLIST = Object.freeze([
+  "initialize",
+  "_x.ai/git/worktree/apply"
+]);
+export const WORKTREE_CLEANUP_REQUEST_ALLOWLIST = Object.freeze([
+  "initialize",
+  "session/load",
+  "_x.ai/session/close",
+  "_x.ai/git/worktree/remove"
 ]);
 const WORKTREE_PROVISIONING_BINDING_KEYS = new Set([
   "purpose",
@@ -74,6 +92,24 @@ function exactRecord(value, keys) {
 
 function isWorktreeProvisioningBinding(binding) {
   return binding?.purpose === WORKTREE_PROVISIONING_PURPOSE;
+}
+
+function isWorkerOwnerControllerBinding(binding) {
+  return binding?.purpose === WORKTREE_INTEGRATION_PURPOSE
+    || binding?.purpose === WORKTREE_CLEANUP_PURPOSE;
+}
+
+function workerOwnerControllerProfileId(purpose) {
+  if (purpose === WORKTREE_INTEGRATION_PURPOSE) {
+    return WORKTREE_INTEGRATION_CONTROLLER_PROFILE_ID;
+  }
+  if (purpose === WORKTREE_CLEANUP_PURPOSE) {
+    return WORKTREE_CLEANUP_CONTROLLER_PROFILE_ID;
+  }
+  throw new CompanionError(
+    "E_SECURITY_PROFILE",
+    "Unknown worker owner-controller purpose."
+  );
 }
 
 function validWorktreeProvisioningBinding(binding, root = null) {
@@ -1475,6 +1511,350 @@ export function taskEnvironment(
 }
 
 /**
+ * Construct a fresh, purpose-specific home for a no-model owner controller.
+ * Integration may write only controlRoot/target.txt. Cleanup may write only
+ * the exact managed worker parent and Git's linked-worktree admin directory.
+ */
+export function workerOwnerControllerEnvironment(
+  stateDir,
+  controlRoot,
+  executionRoot,
+  {
+    purpose,
+    homeMarker,
+    gitCommonDir: expectedGitCommonDir,
+    baseCommit,
+    targetPath = null,
+    managedWorktreeParent = null
+  } = {}
+) {
+  const profileId = workerOwnerControllerProfileId(purpose);
+  const lineage = safeMarker(homeMarker);
+  if (!lineage || lineage !== homeMarker) {
+    throw new CompanionError(
+      "E_STATE",
+      "Worker owner-controller requires an exact private home marker."
+    );
+  }
+  const home = path.join(stateDir, "task-homes", lineage);
+  const grokHome = path.join(home, ".grok");
+  let homeCreated = false;
+  let stagedCredential = null;
+  let credentialRevoked = false;
+  try {
+    privateDirectory(path.dirname(home));
+    try {
+      fs.mkdirSync(home, { mode: 0o700 });
+      homeCreated = true;
+    } catch (error) {
+      if (error?.code === "EEXIST") {
+        throw new CompanionError(
+          "E_STATE",
+          "Worker owner-controller claim home already exists."
+        );
+      }
+      throw error;
+    }
+    privateDirectory(home);
+    privateDirectory(grokHome);
+    const controllerCwd = path.join(home, "controller-cwd");
+    privateDirectory(controllerCwd);
+    const sourceRoot = fs.realpathSync(controlRoot);
+    const workerRoot = fs.realpathSync(executionRoot);
+    if (sourceRoot !== controlRoot
+      || workerRoot !== executionRoot
+      || sourceRoot === workerRoot) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        "Worker owner-controller roots are aliased or not distinct."
+      );
+    }
+    const trustedPath = process.env.PATH;
+    const gitInstallation = trustedGitInstallation(sourceRoot, trustedPath);
+    const discoveredGitCommonDir = canonicalGitCommonDirectory(
+      gitInstallation,
+      sourceRoot
+    );
+    const executionGitCommonDir = canonicalGitCommonDirectory(
+      gitInstallation,
+      workerRoot
+    );
+    if (typeof expectedGitCommonDir !== "string"
+      || !path.isAbsolute(expectedGitCommonDir)
+      || path.normalize(expectedGitCommonDir) !== expectedGitCommonDir
+      || fs.realpathSync(expectedGitCommonDir) !== discoveredGitCommonDir
+      || executionGitCommonDir !== discoveredGitCommonDir) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        "Worker owner-controller Git common directory is not exact."
+      );
+    }
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(baseCommit || "")) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        "Worker owner-controller requires one exact base commit."
+      );
+    }
+    let effectTarget;
+    if (purpose === WORKTREE_INTEGRATION_PURPOSE) {
+      const expectedTarget = path.join(sourceRoot, "target.txt");
+      if (targetPath !== expectedTarget
+        || fs.realpathSync(targetPath) !== expectedTarget) {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "Worker integration authority is not the exact control target.txt."
+        );
+      }
+      const target = fs.lstatSync(expectedTarget);
+      if (!target.isFile() || target.isSymbolicLink()) {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "Worker integration target is not a regular file."
+        );
+      }
+      effectTarget = expectedTarget;
+    } else {
+      const expectedParent = path.dirname(workerRoot);
+      if (managedWorktreeParent !== expectedParent
+        || fs.realpathSync(managedWorktreeParent) !== expectedParent) {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "Worker cleanup authority is not the exact managed worktree parent."
+        );
+      }
+      const parent = fs.lstatSync(expectedParent);
+      if (!parent.isDirectory()
+        || parent.isSymbolicLink()
+        || (parent.mode & 0o077) !== 0) {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "Worker cleanup parent is aliased, shared, or not private."
+        );
+      }
+      effectTarget = expectedParent;
+    }
+    assertControllerAuthorityOutsideBroadTemp({
+      controlRoot: sourceRoot,
+      gitCommonDir: discoveredGitCommonDir,
+      stateDir,
+      destinationParent: effectTarget
+    });
+    assertControllerGitSeparation({
+      gitInstallation,
+      controlRoot: sourceRoot,
+      stateDir,
+      home,
+      destinationRoot: effectTarget
+    });
+    assertNoGitObjectAlternates(discoveredGitCommonDir);
+    const gitWorktreesMetadataRoot = ensureGitWorktreesMetadataRoot(
+      discoveredGitCommonDir
+    );
+    const gitInfoAttributesBinding = captureGitInfoAttributesBinding(
+      discoveredGitCommonDir
+    );
+    assertControllerGitCheckoutSafe({
+      gitExecutable: gitInstallation.executable,
+      gitExecutableDirectory: gitInstallation.executableDirectory,
+      gitInstallationRoot: gitInstallation.installationRoot,
+      workspaceRoot: sourceRoot,
+      baseCommit
+    });
+    const sandboxProfile = `companion_${crypto.createHash("sha256").update(
+      `${lineage}:${profileId}:${purpose}`
+    ).digest("hex").slice(0, 20)}`;
+    const readOnly = [
+      sourceRoot,
+      workerRoot,
+      discoveredGitCommonDir,
+      gitInstallation.installationRoot
+    ].filter((value, index, values) => values.indexOf(value) === index);
+    const readWrite = purpose === WORKTREE_INTEGRATION_PURPOSE
+      ? [effectTarget]
+      : [effectTarget, gitWorktreesMetadataRoot];
+    atomicPrivateFile(
+      path.join(grokHome, "config.toml"),
+      `[skills]\nignore = [${JSON.stringify(sourceRoot)}, ${JSON.stringify(workerRoot)}]\n\n[subagents]\nenabled = false\n\n[features]\nlsp_tools = false\n`
+    );
+    atomicPrivateFile(
+      path.join(grokHome, "sandbox.toml"),
+      [
+        `[profiles.${sandboxProfile}]`,
+        'extends = "strict"',
+        "restrict_network = true",
+        `read_only = [${readOnly.map((item) => JSON.stringify(item)).join(", ")}]`,
+        `read_write = [${readWrite.map((item) => JSON.stringify(item)).join(", ")}]`,
+        "deny = []",
+        ""
+      ].join("\n")
+    );
+    const authPath = process.env.GROK_AUTH_PATH
+      || path.join(os.homedir(), ".grok", "auth.json");
+    if (!fs.existsSync(authPath)) {
+      throw new CompanionError(
+        "E_AUTH_REQUIRED",
+        `Grok cached authentication is unavailable. Run \`grok login\`, then ${hostCommand("setup")}.`
+      );
+    }
+    const authFile = path.join(grokHome, "auth.json");
+    const directoryIdentities = [home, grokHome].map(
+      existingPrivateDirectoryIdentity
+    );
+    const knownSecrets = [];
+    const gitEnv = controllerGitEnvironment(gitInstallation);
+    const env = childEnvironment({
+      ...gitEnv,
+      HOME: home,
+      USERPROFILE: home,
+      GROK_HOME: grokHome,
+      GROK_FOLDER_TRUST: "1",
+      PATH: gitInstallation.executableDirectory,
+      GROK_SUBAGENTS: "0",
+      GROK_MEMORY: "0",
+      GROK_WEB_FETCH: "0",
+      GROK_LSP_TOOLS: "0"
+    });
+    delete env.HOMEDRIVE;
+    delete env.HOMEPATH;
+    const assertCredentialAbsent = () => {
+      if (!directoryIdentities.every(directoryIdentityMatches)) {
+        throw new CompanionError(
+          "E_STATE",
+          "Worker owner-controller credential parent changed."
+        );
+      }
+      try {
+        fs.lstatSync(authFile);
+        throw new CompanionError(
+          "E_STATE",
+          "Worker owner-controller credential remained after initialization."
+        );
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    };
+    const assertHomeAbsent = () => {
+      try {
+        fs.lstatSync(home);
+        throw new CompanionError(
+          "E_STATE",
+          "Worker owner-controller home remained after teardown."
+        );
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      return true;
+    };
+    return Object.freeze({
+      purpose,
+      profileId,
+      home,
+      grokHome,
+      controllerCwd,
+      sandboxProfile,
+      env,
+      knownSecrets,
+      gitCommonDir: discoveredGitCommonDir,
+      gitWorktreesMetadataRoot,
+      gitExecutable: gitInstallation.executable,
+      gitExecutableDirectory: gitInstallation.executableDirectory,
+      gitExecutableDigest: gitInstallation.executableDigest,
+      effectTarget,
+      stageCredential() {
+        if (credentialRevoked) {
+          throw new CompanionError(
+            "E_STATE",
+            "A revoked owner-controller credential cannot be restaged."
+          );
+        }
+        if (stagedCredential) return;
+        const payload = freshCachedCredentialPayload(
+          authPath,
+          MIN_ISOLATED_STARTUP_CREDENTIAL_VALIDITY_MS
+        );
+        stagedCredential = stageRevocableTaskCredential(
+          authPath,
+          authFile,
+          directoryIdentities,
+          payload
+        );
+        knownSecrets.push(stagedCredential.key);
+      },
+      revokeCredential() {
+        if (stagedCredential) {
+          if (credentialRevoked) return;
+          try { stagedCredential.refresh(); }
+          catch (error) { if (error?.code !== "ENOENT") throw error; }
+          stagedCredential.revoke();
+          credentialRevoked = true;
+          return;
+        }
+        try { fs.unlinkSync(authFile); }
+        catch (error) { if (error?.code !== "ENOENT") throw error; }
+      },
+      assertCredentialAbsent,
+      assertHomeAbsent,
+      verifyGitExecutable() {
+        const current = recaptureTrustedGitInstallation(gitInstallation);
+        if (!sameTrustedGitInstallation(gitInstallation, current)
+          || !sameGitInfoAttributesBinding(
+            gitInfoAttributesBinding,
+            captureGitInfoAttributesBinding(discoveredGitCommonDir)
+          )) {
+          throw new CompanionError(
+            "E_CAPABILITY",
+            "Worker owner-controller Git authority changed."
+          );
+        }
+        assertNoGitObjectAlternates(discoveredGitCommonDir);
+        assertControllerGitCheckoutSafe({
+          gitExecutable: current.executable,
+          gitExecutableDirectory: current.executableDirectory,
+          gitInstallationRoot: current.installationRoot,
+          workspaceRoot: sourceRoot,
+          baseCommit
+        });
+        return current;
+      },
+      cleanup(processIdentity) {
+        if (processIdentity && !processGroupGone(processIdentity)) {
+          throw new CompanionError(
+            "E_PROCESS_IDENTITY",
+            "Worker owner-controller home cannot be removed while its process group may live."
+          );
+        }
+        assertCredentialAbsent();
+        if (!directoryIdentities.every(directoryIdentityMatches)) {
+          throw new CompanionError(
+            "E_STATE",
+            "Worker owner-controller home identity changed before teardown."
+          );
+        }
+        fs.rmSync(home, { recursive: true, force: true });
+        return assertHomeAbsent();
+      }
+    });
+  } catch (error) {
+    let cleanupFailure = null;
+    try { stagedCredential?.revoke(); }
+    catch (failure) { cleanupFailure = failure; }
+    try {
+      if (homeCreated) fs.rmSync(home, { recursive: true, force: true });
+    } catch (failure) {
+      cleanupFailure ||= failure;
+    }
+    if (cleanupFailure) {
+      throw new CompanionError(
+        "E_STATE",
+        "Failed owner-controller environment could not be removed transactionally.",
+        { causeCode: error?.code || null }
+      );
+    }
+    throw error;
+  }
+}
+
+/**
  * Stage only a short-lived credential in an existing isolated task home.
  * Qualification cleanup uses this after the provider runtime has already
  * removed its execution credential; it must not rewrite task configuration or
@@ -1576,7 +1956,7 @@ function protectedGitPaths(root) {
   return [...new Set([dotGit, ...values.map((item) => path.resolve(root, item))])];
 }
 
-function inspectIsolation(binary, root, environment) {
+export function inspectIsolation(binary, root, environment) {
   const inspect = spawnSync(binary, ["inspect", "--json"], { cwd: root, encoding: "utf8", shell: false, timeout: 30000, env: environment.env });
   if (inspect.status !== 0 || inspect.error) throw new CompanionError("E_CAPABILITY", "Grok could not validate the isolated provider environment.", { diagnostic: redactText(inspect.error?.message || inspect.stderr || inspect.stdout, environment.knownSecrets).slice(-2000) });
   let value;
@@ -1747,7 +2127,9 @@ async function cleanupFailedProviderStart({ child, identity, root, marker, stage
 function spawnArgs({ root, profile, model, effort, leaderSocket, taskProfile = null }) {
   const readOnlyProfile = profile.id === "rescue-read-v3" || profile.id === "rescue-report-v3" || profile.id === "setup-probe-v2";
   const args = ["--cwd", root, "--sandbox", profile.sandbox, "--permission-mode", profile.permissionMode, "--deny", "WebFetch", "--deny", "MCPTool", "--disable-web-search", "--no-subagents", "--no-memory", "--no-plan"];
-  if (profile.id === WORKTREE_CONTROLLER_PROFILE_ID) {
+  if (profile.id === WORKTREE_CONTROLLER_PROFILE_ID
+    || profile.id === WORKTREE_INTEGRATION_CONTROLLER_PROFILE_ID
+    || profile.id === WORKTREE_CLEANUP_CONTROLLER_PROFILE_ID) {
     args.push(
       "--deny", "Bash",
       "--deny", "Edit",
@@ -1766,6 +2148,40 @@ function spawnArgs({ root, profile, model, effort, leaderSocket, taskProfile = n
   if (effort) args.push("--reasoning-effort", effort);
   args.push("stdio");
   return args;
+}
+
+export function workerOwnerControllerSpawnArgs({
+  environment,
+  leaderSocket
+} = {}) {
+  if (!environment
+    || ![
+      WORKTREE_INTEGRATION_CONTROLLER_PROFILE_ID,
+      WORKTREE_CLEANUP_CONTROLLER_PROFILE_ID
+    ].includes(environment.profileId)
+    || typeof environment.controllerCwd !== "string"
+    || !path.isAbsolute(environment.controllerCwd)
+    || typeof environment.sandboxProfile !== "string"
+    || !environment.sandboxProfile
+    || typeof leaderSocket !== "string"
+    || !path.isAbsolute(leaderSocket)) {
+    throw new CompanionError(
+      "E_SECURITY_PROFILE",
+      "Worker owner-controller runtime profile is malformed."
+    );
+  }
+  return Object.freeze(spawnArgs({
+    root: environment.controllerCwd,
+    profile: {
+      id: environment.profileId,
+      sandbox: environment.sandboxProfile,
+      permissionMode: "dontAsk"
+    },
+    model: null,
+    effort: null,
+    leaderSocket,
+    taskProfile: null
+  }));
 }
 
 function extractJson(text) {
@@ -1963,17 +2379,29 @@ export function createProviderBootstrapLaunch({
   args
 }) {
   const worktreeProvisioning = isWorktreeProvisioningBinding(binding);
+  const workerOwnerController = isWorkerOwnerControllerBinding(binding);
+  const isolatedController = worktreeProvisioning || workerOwnerController;
+  const validOwnerController = workerOwnerController && (() => {
+    try {
+      assertWorkerOwnerControllerBinding(binding);
+      return root !== binding.controlRoot && root !== binding.executionRoot;
+    } catch {
+      return false;
+    }
+  })();
   if (!/^[a-zA-Z0-9._-]{1,80}$/.test(marker || "")
     || typeof owner !== "string"
     || !owner
     || (worktreeProvisioning
       ? !validWorktreeProvisioningBinding(binding, root)
+      : workerOwnerController
+        ? !validOwnerController
       : (
         !Number.isSafeInteger(binding?.providerGeneration)
         || binding.providerGeneration < 1
         || !EXACT_NONCE_ID.test(binding?.providerSpawnIntentId || "")
       ))
-    || (worktreeProvisioning && (() => {
+    || (isolatedController && (() => {
       try {
         assertExecutableAttestation(executableIdentity);
         return false;
@@ -1990,7 +2418,7 @@ export function createProviderBootstrapLaunch({
     owner,
     binding,
     binary,
-    ...(worktreeProvisioning ? { executableIdentity } : {}),
+    ...(isolatedController ? { executableIdentity } : {}),
     args
   })}\n`;
   if (Buffer.byteLength(specPayload, "utf8") > MAX_PROVIDER_BOOTSTRAP_SPEC_BYTES) {
@@ -2007,6 +2435,16 @@ export function createProviderBootstrapLaunch({
           "--holder-id", binding.holderId,
           "--spawn-intent-id", binding.providerSpawnIntentId
         ]
+      : workerOwnerController
+        ? [
+            PROVIDER_BOOTSTRAP,
+            "--job-marker", marker,
+            "--bootstrap-purpose", binding.purpose,
+            "--controller-attempt-id", binding.controllerAttemptId,
+            "--controller-fence", String(binding.controllerFence),
+            "--holder-id", binding.holderId,
+            "--spawn-intent-id", binding.providerSpawnIntentId
+          ]
       : [
           PROVIDER_BOOTSTRAP,
           "--job-marker", marker,
@@ -2094,7 +2532,9 @@ export function assertProviderBootstrapReadyMessage(
   expectedExecutableIdentity = null
 ) {
   const worktreeProvisioning = isWorktreeProvisioningBinding(binding);
+  const workerOwnerController = isWorkerOwnerControllerBinding(binding);
   const writeExecution = !worktreeProvisioning
+    && !workerOwnerController
     && Object.hasOwn(binding || {}, "executionBindingDigest");
   const keys = new Set([
     "type",
@@ -2110,6 +2550,17 @@ export function assertProviderBootstrapReadyMessage(
           "providerSpawnIntentId",
           "executableIdentity"
         ]
+      : workerOwnerController
+        ? [
+            "purpose",
+            "executionBindingDigest",
+            "effectBindingDigest",
+            "controllerAttemptId",
+            "controllerFence",
+            "holderId",
+            "providerSpawnIntentId",
+            "executableIdentity"
+          ]
       : (writeExecution ? ["executionBindingDigest"] : []))
   ]);
   const valid = exactRecord(message, keys)
@@ -2131,6 +2582,25 @@ export function assertProviderBootstrapReadyMessage(
           expectedExecutableIdentity
         )
       )
+      : workerOwnerController
+        ? (() => {
+            try {
+              assertWorkerOwnerControllerBinding(binding);
+            } catch {
+              return false;
+            }
+            return message.purpose === binding.purpose
+              && message.executionBindingDigest === binding.executionBindingDigest
+              && message.effectBindingDigest === binding.effectBindingDigest
+              && message.controllerAttemptId === binding.controllerAttemptId
+              && message.controllerFence === binding.controllerFence
+              && message.holderId === binding.holderId
+              && message.providerSpawnIntentId === binding.providerSpawnIntentId
+              && sameExecutableAttestation(
+                message.executableIdentity,
+                expectedExecutableIdentity
+              );
+          })()
       : (
         !writeExecution
         || (
@@ -2149,7 +2619,9 @@ export function assertProviderBootstrapReadyMessage(
 
 export function assertProviderBootstrapPromotionMessage(message, binding) {
   const worktreeProvisioning = isWorktreeProvisioningBinding(binding);
+  const workerOwnerController = isWorkerOwnerControllerBinding(binding);
   const writeExecution = !worktreeProvisioning
+    && !workerOwnerController
     && Object.hasOwn(binding || {}, "executionBindingDigest");
   const keys = new Set([
     "type",
@@ -2163,6 +2635,16 @@ export function assertProviderBootstrapPromotionMessage(message, binding) {
           "holderId",
           "providerSpawnIntentId"
         ]
+      : workerOwnerController
+        ? [
+            "purpose",
+            "executionBindingDigest",
+            "effectBindingDigest",
+            "controllerAttemptId",
+            "controllerFence",
+            "holderId",
+            "providerSpawnIntentId"
+          ]
       : [
           "providerGeneration",
           "providerSpawnIntentId",
@@ -2186,6 +2668,24 @@ export function assertProviderBootstrapPromotionMessage(message, binding) {
         && message.holderId === binding.holderId
         && message.providerSpawnIntentId === binding.providerSpawnIntentId
       )
+      : workerOwnerController
+        ? (() => {
+            const withoutMarker = Object.fromEntries(
+              Object.entries(binding || {}).filter(([key]) => key !== "marker")
+            );
+            try {
+              assertWorkerOwnerControllerBinding(withoutMarker);
+            } catch {
+              return false;
+            }
+            return message.purpose === binding.purpose
+              && message.executionBindingDigest === binding.executionBindingDigest
+              && message.effectBindingDigest === binding.effectBindingDigest
+              && message.controllerAttemptId === binding.controllerAttemptId
+              && message.controllerFence === binding.controllerFence
+              && message.holderId === binding.holderId
+              && message.providerSpawnIntentId === binding.providerSpawnIntentId;
+          })()
       : (
         message.providerGeneration === binding?.providerGeneration
         && message.providerSpawnIntentId === binding?.providerSpawnIntentId
@@ -2203,7 +2703,7 @@ export function assertProviderBootstrapPromotionMessage(message, binding) {
   return message;
 }
 
-function waitForProviderBootstrapReady(
+export function waitForProviderBootstrapReady(
   child,
   cancelRequested,
   binding,
@@ -2397,7 +2897,7 @@ export function promoteProviderBootstrap(child, binding, { timeoutMs = 5_000 } =
   });
 }
 
-function authenticateBoundBootstrapGuard(
+export function authenticateBoundBootstrapGuard(
   root,
   marker,
   identity,
@@ -2412,6 +2912,14 @@ function authenticateBoundBootstrapGuard(
         binding,
         env
       )
+    : isWorkerOwnerControllerBinding(binding)
+      ? authenticateWorkerOwnerControllerBootstrapGuard(
+          root,
+          marker,
+          identity,
+          binding,
+          env
+        )
     : authenticateProviderBootstrapGuard(root, marker, identity, binding, env);
 }
 

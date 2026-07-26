@@ -20,9 +20,13 @@ import {
   runSystemPs
 } from "./process-control.mjs";
 import {
+  assertWorkerOwnerControllerBinding,
+  registerWorkerOwnerControllerGuard,
   registerWorktreeProvisioningGuard,
   registerProviderGuard,
-  unregisterProviderGuard
+  unregisterProviderGuard,
+  WORKTREE_CLEANUP_PURPOSE,
+  WORKTREE_INTEGRATION_PURPOSE
 } from "./recursion-guard.mjs";
 
 const SPEC_KEYS = new Set([
@@ -38,6 +42,7 @@ const WORKTREE_PROVISIONING_SPEC_KEYS = new Set([
   ...SPEC_KEYS,
   "executableIdentity"
 ]);
+const WORKER_OWNER_CONTROLLER_SPEC_KEYS = WORKTREE_PROVISIONING_SPEC_KEYS;
 const BINDING_KEYS = new Set([
   "controlWorkspaceId",
   "executionRoot",
@@ -65,6 +70,10 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 const OPAQUE_ID = /^[0-9a-f]{32,64}$/;
 const EXACT_NONCE_ID = /^[0-9a-f]{32}$/;
 const WORKTREE_PROVISIONING_PURPOSE = "worktree-provisioning";
+const WORKER_OWNER_CONTROLLER_PURPOSES = new Set([
+  WORKTREE_INTEGRATION_PURPOSE,
+  WORKTREE_CLEANUP_PURPOSE
+]);
 const MIN_PROVIDER_VERSION = [0, 2, 99];
 const PROVIDER_SPEC_FD = 6;
 const MAX_PROVIDER_SPEC_BYTES = 64 * 1024;
@@ -106,6 +115,27 @@ function worktreeProvisioningBootstrapIdentityMatches(identity, expected) {
     && argument("--spawn-intent-id", expected.intentId);
 }
 
+function workerOwnerControllerBootstrapIdentityMatches(identity, expected) {
+  if (!identity?.pid
+    || !identity.startToken
+    || processStartToken(identity.pid) !== identity.startToken
+    || processIsZombie(identity.pid)) {
+    return false;
+  }
+  const command = processCommand(identity.pid);
+  if (!command || !command.includes(expected.marker)) return false;
+  const argument = (name, value) => new RegExp(
+    `(?:^|\\s)${regexLiteral(name)}\\s+${regexLiteral(value)}(?:\\s|$)`
+  ).test(command);
+  return /(?:^|\/)provider-bootstrap\.mjs(?:\s|$)/.test(command)
+    && argument("--job-marker", expected.marker)
+    && argument("--bootstrap-purpose", expected.purpose)
+    && argument("--controller-attempt-id", expected.controllerAttemptId)
+    && argument("--controller-fence", expected.controllerFence)
+    && argument("--holder-id", expected.holderId)
+    && argument("--spawn-intent-id", expected.intentId);
+}
+
 function parseArguments(argv) {
   const values = new Map();
   for (let index = 0; index < argv.length; index += 2) {
@@ -118,6 +148,29 @@ function parseArguments(argv) {
   }
   const marker = values.get("--job-marker");
   const purpose = values.get("--bootstrap-purpose");
+  if (WORKER_OWNER_CONTROLLER_PURPOSES.has(purpose)) {
+    const controllerAttemptId = values.get("--controller-attempt-id");
+    const controllerFence = Number(values.get("--controller-fence"));
+    const holderId = values.get("--holder-id");
+    const intentId = values.get("--spawn-intent-id");
+    if (values.size !== 6
+      || !/^[a-zA-Z0-9._-]{1,80}$/.test(marker || "")
+      || !EXACT_NONCE_ID.test(controllerAttemptId || "")
+      || !Number.isSafeInteger(controllerFence)
+      || controllerFence < 1
+      || !OPAQUE_ID.test(holderId || "")
+      || !EXACT_NONCE_ID.test(intentId || "")) {
+      throw new CompanionError("E_USAGE", "Owner-controller bootstrap arguments are incomplete.");
+    }
+    return Object.freeze({
+      marker,
+      purpose,
+      controllerAttemptId,
+      controllerFence,
+      holderId,
+      intentId
+    });
+  }
   if (purpose === WORKTREE_PROVISIONING_PURPOSE) {
     const provisioningAttemptId = values.get("--provisioning-attempt-id");
     const provisioningFence = Number(values.get("--provisioning-fence"));
@@ -174,14 +227,32 @@ function validateSpecification(spec, expected) {
     && OPAQUE_ID.test(spec.binding.holderId || "")
     && EXACT_NONCE_ID.test(spec.binding.providerSpawnIntentId || "");
   const expectedProvisioning = expected?.purpose === WORKTREE_PROVISIONING_PURPOSE;
+  const expectedOwnerController = WORKER_OWNER_CONTROLLER_PURPOSES.has(
+    expected?.purpose
+  );
+  const ownerControllerBinding = expectedOwnerController && (() => {
+    try {
+      assertWorkerOwnerControllerBinding(spec?.binding);
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+  const isolatedController = expectedProvisioning || expectedOwnerController;
   if (!exactRecord(
     spec,
-    expectedProvisioning ? WORKTREE_PROVISIONING_SPEC_KEYS : SPEC_KEYS
+    isolatedController
+      ? (expectedOwnerController
+          ? WORKER_OWNER_CONTROLLER_SPEC_KEYS
+          : WORKTREE_PROVISIONING_SPEC_KEYS)
+      : SPEC_KEYS
   )
     || spec.schemaVersion !== 1
     || (expectedProvisioning
       ? !provisioningBinding
-      : (!readBinding && !writeBinding))
+      : expectedOwnerController
+        ? !ownerControllerBinding
+        : (!readBinding && !writeBinding))
     || spec.marker !== expected.marker
     || (expectedProvisioning
       ? (
@@ -191,6 +262,14 @@ function validateSpecification(spec, expected) {
         || spec.binding.holderId !== expected.holderId
         || spec.binding.providerSpawnIntentId !== expected.intentId
       )
+      : expectedOwnerController
+        ? (
+          spec.binding.purpose !== expected.purpose
+          || spec.binding.controllerAttemptId !== expected.controllerAttemptId
+          || spec.binding.controllerFence !== expected.controllerFence
+          || spec.binding.holderId !== expected.holderId
+          || spec.binding.providerSpawnIntentId !== expected.intentId
+        )
       : (
         spec.binding.providerGeneration !== expected.generation
         || spec.binding.providerSpawnIntentId !== expected.intentId
@@ -206,7 +285,7 @@ function validateSpecification(spec, expected) {
     || !path.isAbsolute(spec.binary)
     || path.normalize(spec.binary) !== spec.binary
     || spec.binary.length > 4_096
-    || (expectedProvisioning && (() => {
+    || (isolatedController && (() => {
       try {
         assertExecutableAttestation(spec.executableIdentity);
         return false;
@@ -221,7 +300,7 @@ function validateSpecification(spec, expected) {
       || Buffer.byteLength(arg, "utf8") > MAX_PROVIDER_ARGUMENT_BYTES
     ))
     || !/^cws-[0-9a-f]{32}$/.test(spec.binding.controlWorkspaceId || "")
-    || (!expectedProvisioning && (
+    || (!isolatedController && (
       spec.binding.executionRoot !== spec.root
       || !EXACT_NONCE_ID.test(spec.binding.dispatchAttemptId || "")
       || !Number.isSafeInteger(spec.binding.dispatchFence)
@@ -431,12 +510,24 @@ export async function runProviderBootstrap({
     ? spec.binding.executionBindingDigest
     : null;
   const worktreeProvisioning = spec.binding.purpose === WORKTREE_PROVISIONING_PURPOSE;
-  const provisioningAcknowledgement = worktreeProvisioning
+  const workerOwnerController = WORKER_OWNER_CONTROLLER_PURPOSES.has(
+    spec.binding.purpose
+  );
+  const isolatedController = worktreeProvisioning || workerOwnerController;
+  const controllerAcknowledgement = isolatedController
     ? {
         purpose: spec.binding.purpose,
         executionBindingDigest: spec.binding.executionBindingDigest,
-        provisioningAttemptId: spec.binding.provisioningAttemptId,
-        provisioningFence: spec.binding.provisioningFence,
+        ...(worktreeProvisioning
+          ? {
+              provisioningAttemptId: spec.binding.provisioningAttemptId,
+              provisioningFence: spec.binding.provisioningFence
+            }
+          : {
+              effectBindingDigest: spec.binding.effectBindingDigest,
+              controllerAttemptId: spec.binding.controllerAttemptId,
+              controllerFence: spec.binding.controllerFence
+            }),
         holderId: spec.binding.holderId,
         providerSpawnIntentId: spec.binding.providerSpawnIntentId
       }
@@ -451,7 +542,9 @@ export async function runProviderBootstrap({
   if (!startToken
     || !(worktreeProvisioning
       ? worktreeProvisioningBootstrapIdentityMatches(providerProcess, expected)
-      : identityMatches(providerProcess, spec.marker, "provider-bootstrap"))
+      : workerOwnerController
+        ? workerOwnerControllerBootstrapIdentityMatches(providerProcess, expected)
+        : identityMatches(providerProcess, spec.marker, "provider-bootstrap"))
     || !groupMemberPids(process.pid).includes(process.pid)) {
     throw new CompanionError("E_PROCESS_IDENTITY", "Provider bootstrap is not the authenticated process-group leader.");
   }
@@ -516,8 +609,8 @@ export async function runProviderBootstrap({
       promotionAck({
         type: "provider-promoted",
         marker: spec.marker,
-        ...(worktreeProvisioning
-          ? provisioningAcknowledgement
+        ...(isolatedController
+          ? controllerAcknowledgement
           : {
               providerGeneration: spec.binding.providerGeneration,
               providerSpawnIntentId: spec.binding.providerSpawnIntentId,
@@ -552,6 +645,15 @@ export async function runProviderBootstrap({
           spec.binding,
           stateEnv
         )
+      : workerOwnerController
+        ? registerWorkerOwnerControllerGuard(
+            spec.binding.controlRoot,
+            spec.marker,
+            providerProcess,
+            spec.owner,
+            spec.binding,
+            stateEnv
+          )
       : registerProviderGuard(
           spec.root,
           spec.marker,
@@ -569,7 +671,7 @@ export async function runProviderBootstrap({
     const grokEnvironment = providerChildEnvironment(env);
     let capturedExecutableIdentity = null;
     let version;
-    if (worktreeProvisioning) {
+    if (isolatedController) {
       await testHooks?.beforeExecutableRecapture?.({ spec, providerProcess });
       capturedExecutableIdentity = captureExecutableIdentity(spec.binary, {
         env: grokEnvironment
@@ -605,7 +707,7 @@ export async function runProviderBootstrap({
     );
     await waitForSpawn(child);
     let spawnedExecutableIdentity = null;
-    if (worktreeProvisioning) {
+    if (isolatedController) {
       spawnedExecutableIdentity = attestExecutable(
         child.pid,
         capturedExecutableIdentity,
@@ -635,9 +737,9 @@ export async function runProviderBootstrap({
       type: "provider-ready",
       grokPid: child.pid,
       version,
-      ...(worktreeProvisioning
+      ...(isolatedController
         ? {
-            ...provisioningAcknowledgement,
+            ...controllerAcknowledgement,
             executableIdentity: spawnedExecutableIdentity
           }
         : (executionBindingDigest
@@ -653,7 +755,7 @@ export async function runProviderBootstrap({
     if (controlFailure) throw controlFailure;
     if (promoted) {
       unregisterProviderGuard(
-        worktreeProvisioning ? spec.binding.controlRoot : spec.root,
+        isolatedController ? spec.binding.controlRoot : spec.root,
         spec.marker,
         guardRecord,
         stateEnv
@@ -667,7 +769,7 @@ export async function runProviderBootstrap({
     if (guardRecord && promoted) {
       try {
         unregisterProviderGuard(
-          worktreeProvisioning ? spec.binding.controlRoot : spec.root,
+          isolatedController ? spec.binding.controlRoot : spec.root,
           spec.marker,
           guardRecord,
           stateEnv

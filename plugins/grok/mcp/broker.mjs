@@ -31,7 +31,8 @@ export const SUPPORTED_MCP_PROTOCOL_VERSIONS = Object.freeze([
 ]);
 export const DEFAULT_MCP_PROTOCOL_VERSION = "2025-11-25";
 export const WRITE_SMOKE_ENV_VALUE = "p3-p4-target-txt-v1";
-export const WRITE_SMOKE_CAPABILITY = "official-acp-target-txt-write-v1";
+export const WRITE_SMOKE_CAPABILITY =
+  "official-acp-target-txt-owner-lifecycle-v2";
 
 const CURSOR_SCHEMA = {
   type: "object",
@@ -260,6 +261,44 @@ export const WORKER_ARTIFACT_TOOL = deepFreeze({
   annotations: READ_ONLY_ANNOTATIONS
 });
 
+export const WORKER_INTEGRATE_TOOL = deepFreeze({
+  name: "worker_integrate",
+  title: "Integrate a target.txt worker artifact",
+  description: "Apply one exact owned target.txt artifact through the official Grok Build worktree API, then independently verify the parent checkout.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["id", "manifestDigest", "idempotencyKey"],
+    properties: {
+      id: WORKER_ID_SCHEMA,
+      manifestDigest: { type: "string", minLength: 64, maxLength: 64 },
+      idempotencyKey: { type: "string", minLength: 8, maxLength: 256 }
+    }
+  },
+  annotations: CANCEL_ANNOTATIONS
+});
+
+export const WORKER_CLEANUP_TOOL = deepFreeze({
+  name: "worker_cleanup",
+  title: "Clean up an integrated target.txt worker",
+  description: "Close and delete the exact owned provider session and remove its managed worktree through the official Grok Build API, then prove absence.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["id", "integrationReceiptDigest", "idempotencyKey"],
+    properties: {
+      id: WORKER_ID_SCHEMA,
+      integrationReceiptDigest: {
+        type: "string",
+        minLength: 64,
+        maxLength: 64
+      },
+      idempotencyKey: { type: "string", minLength: 8, maxLength: 256 }
+    }
+  },
+  annotations: CANCEL_ANNOTATIONS
+});
+
 /** Complete root-read continuation + ordered mailbox inventory; advertised atomically. */
 export const WORKER_TOOLS = deepFreeze([
   ...BASE_WORKER_TOOLS.slice(0, -1),
@@ -275,6 +314,8 @@ export const WRITE_SMOKE_WORKER_TOOLS = deepFreeze([
   ...WORKER_TOOLS.slice(0, -1),
   WORKER_SPAWN_WRITE_TOOL,
   WORKER_ARTIFACT_TOOL,
+  WORKER_INTEGRATE_TOOL,
+  WORKER_CLEANUP_TOOL,
   WORKER_TOOLS.at(-1)
 ]);
 
@@ -282,6 +323,8 @@ const MUTATION_AUTHORITY_TOOLS = new Set([
   "worker_wait",
   "worker_spawn",
   "worker_spawn_write",
+  "worker_integrate",
+  "worker_cleanup",
   "worker_decide_host_action",
   "worker_followup",
   "worker_send",
@@ -304,10 +347,15 @@ function validProviderCapabilityReceipt(receipt) {
 function writeSmokeCapabilityDigest(providerCapabilityDigest) {
   if (!SHA256_HEX.test(providerCapabilityDigest || "")) return null;
   return crypto.createHash("sha256").update(JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
     capability: WRITE_SMOKE_CAPABILITY,
     providerCapabilityDigest,
-    tool: WORKER_SPAWN_WRITE_TOOL.name,
+    tools: [
+      WORKER_SPAWN_WRITE_TOOL.name,
+      WORKER_ARTIFACT_TOOL.name,
+      WORKER_INTEGRATE_TOOL.name,
+      WORKER_CLEANUP_TOOL.name
+    ],
     targetPath: WRITE_VERTICAL_TARGET_PATH,
     scope: EXACT_WRITE_VERTICAL_SCOPE
   })).digest("hex");
@@ -496,6 +544,8 @@ export async function callWorkerTool(params, options = {}) {
       "worker_spawn",
       "worker_spawn_write",
       "worker_artifact",
+      "worker_integrate",
+      "worker_cleanup",
       "worker_decide_host_action",
       "worker_followup",
       "worker_send"
@@ -513,7 +563,7 @@ export async function callWorkerTool(params, options = {}) {
       message: "Required worker broker capability is unavailable."
     }, true);
   }
-  if (["worker_spawn_write", "worker_artifact"].includes(name)
+  if (["worker_spawn_write", "worker_artifact", "worker_integrate"].includes(name)
     && currentWriteLifecycleCapabilityDigest(runtime, options) === null) {
     return toolResult({
       code: "E_CAPABILITY",
@@ -568,6 +618,28 @@ export async function callWorkerTool(params, options = {}) {
     if (name === "worker_artifact") {
       return toolResult({
         artifact: service.artifact(args.id, { part: args.part || "metadata" })
+      });
+    }
+    if (name === "worker_integrate") {
+      const integrated = await service.integrate({
+        id: args.id,
+        manifestDigest: args.manifestDigest,
+        idempotencyKey: args.idempotencyKey
+      });
+      return toolResult({
+        receipt: integrated.receipt,
+        replayed: integrated.replayed
+      });
+    }
+    if (name === "worker_cleanup") {
+      const cleaned = await service.cleanup({
+        id: args.id,
+        integrationReceiptDigest: args.integrationReceiptDigest,
+        idempotencyKey: args.idempotencyKey
+      });
+      return toolResult({
+        receipt: cleaned.receipt,
+        replayed: cleaned.replayed
       });
     }
     if (name === "worker_spawn") {

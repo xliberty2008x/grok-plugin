@@ -1184,6 +1184,49 @@ export function classifyWorkerWorktreeEffect({
   }
 }
 
+/**
+ * Remove only the deterministic, private, empty wrapper left after an official
+ * worktree removal. This never invokes Git and cannot remove the checkout
+ * itself, a registration, or a non-empty/foreign directory.
+ */
+export function removeEmptyWorkerWorktreeParent({
+  controlRoot,
+  workerId,
+  env = process.env
+} = {}) {
+  if (!controlRoot || !workerId) {
+    throw new CompanionError(
+      "E_USAGE",
+      "Empty worker-parent cleanup requires control and worker identities."
+    );
+  }
+  const control = resolveControlWorkspace(controlRoot, env);
+  const workerParent = expectedWorkerWorktreeParent(
+    control.controlRoot,
+    workerId,
+    env
+  );
+  let stat;
+  try {
+    stat = fs.lstatSync(workerParent);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw new CompanionError("E_WORKTREE", "Managed worker parent cannot be inspected safely.");
+  }
+  if (!stat.isDirectory()
+    || stat.isSymbolicLink()
+    || fs.realpathSync(workerParent) !== workerParent
+    || (stat.mode & 0o077) !== 0
+    || fs.readdirSync(workerParent).length !== 0) {
+    throw new CompanionError(
+      "E_WORKTREE",
+      "Refusing to remove a non-private or non-empty managed worker parent."
+    );
+  }
+  fs.rmdirSync(workerParent);
+  return true;
+}
+
 export function captureParentFingerprint(root) {
   const canonicalRoot = fs.realpathSync(root);
   const head = resolveExactCommit(canonicalRoot, "HEAD");
@@ -1567,6 +1610,169 @@ export function prepareIntegration(options = {}) {
     hostVerification: "not_run",
     note: "Host must explicitly apply and re-run host verification; provider success does not set hostVerification."
   });
+}
+
+/**
+ * Classify the control checkout after an official one-file apply request.
+ *
+ * This observer is deliberately independent from the provider response. It is
+ * the reconciliation authority for the response-loss window:
+ *
+ * - `unchanged` permits one bounded reissue of the same official request;
+ * - `exact-effect` permits adoption or successful host verification;
+ * - every other shape is `drift` and must block.
+ *
+ * The exact effect keeps HEAD, tree, and the complete index/security identity
+ * unchanged, leaves exactly target.txt dirty, and reproduces the persisted
+ * artifact bytes and patch digest. Returned evidence contains no content or
+ * filesystem paths.
+ */
+export function inspectWriteVerticalIntegration({
+  controlRoot,
+  artifact,
+  parentFingerprint,
+  expectedWorkerId
+} = {}) {
+  if (!controlRoot
+    || !artifact?.record
+    || !parentFingerprint
+    || !expectedWorkerId) {
+    throw new CompanionError(
+      "E_USAGE",
+      "Write integration inspection requires control, artifact, parent, and worker identities."
+    );
+  }
+  const trustedBefore = assertValidParentFingerprint(parentFingerprint);
+  const root = fs.realpathSync(controlRoot);
+  const record = artifact.record;
+  if (record.workerId !== expectedWorkerId
+    || record.baseCommit !== trustedBefore.head
+    || record.manifestDigest !== artifact.manifest?.manifestDigest
+    || record.patch !== artifact.patch
+    || record.content !== artifact.content) {
+    throw new CompanionError(
+      "E_INTEGRATION",
+      "Write integration inspection artifact is not bound to the exact parent and worker."
+    );
+  }
+
+  let after;
+  try {
+    after = captureParentFingerprint(root);
+  } catch {
+    return Object.freeze({ classification: "drift", evidence: null });
+  }
+  if (after.fingerprintDigest === trustedBefore.fingerprintDigest) {
+    return Object.freeze({
+      classification: "unchanged",
+      evidence: Object.freeze({
+        schemaVersion: 1,
+        workerId: expectedWorkerId,
+        baseCommit: trustedBefore.head,
+        parentFingerprintDigest: after.fingerprintDigest,
+        manifestDigest: record.manifestDigest,
+        patchDigest: record.patchDigest,
+        contentDigest: record.contentDigest
+      })
+    });
+  }
+
+  try {
+    if (after.head !== trustedBefore.head
+      || after.tree !== trustedBefore.tree
+      || after.indexDigest !== trustedBefore.indexDigest
+      || after.indexSecurityDigest !== trustedBefore.indexSecurityDigest
+      || after.status !== ` M ${WRITE_VERTICAL_TARGET_PATH}\0`
+      || after.clean !== false) {
+      return Object.freeze({ classification: "drift", evidence: null });
+    }
+    const changed = git(
+      root,
+      [
+        "diff",
+        "--name-status",
+        "-z",
+        "--no-renames",
+        record.baseCommit,
+        "--"
+      ],
+      { encoding: null }
+    ).stdout || Buffer.alloc(0);
+    if (!changed.equals(Buffer.from(`M\0${WRITE_VERTICAL_TARGET_PATH}\0`))) {
+      return Object.freeze({ classification: "drift", evidence: null });
+    }
+    const target = readBoundedWriteTargetNoFollow(
+      path.join(root, WRITE_VERTICAL_TARGET_PATH),
+      "integrated target.txt"
+    );
+    const patch = git(
+      root,
+      [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--binary",
+        "--full-index",
+        record.baseCommit,
+        "--"
+      ],
+      { encoding: null }
+    ).stdout || Buffer.alloc(0);
+    const check = git(
+      root,
+      ["diff", "--check", record.baseCommit, "--", WRITE_VERTICAL_TARGET_PATH],
+      { allowFailure: true }
+    );
+    if (check.status !== 0
+      || target.buffer.length !== record.contentBytes
+      || sha(target.buffer) !== record.contentDigest
+      || target.text !== record.content
+      || patch.length !== record.patchBytes
+      || sha(patch) !== record.patchDigest
+      || !patch.equals(Buffer.from(record.patch, "utf8"))) {
+      return Object.freeze({ classification: "drift", evidence: null });
+    }
+    const evidenceBody = {
+      schemaVersion: 1,
+      workerId: expectedWorkerId,
+      baseCommit: record.baseCommit,
+      parentFingerprintDigest: trustedBefore.fingerprintDigest,
+      integratedFingerprintDigest: after.fingerprintDigest,
+      head: after.head,
+      tree: after.tree,
+      indexDigest: after.indexDigest,
+      indexSecurityDigest: after.indexSecurityDigest,
+      statusDigest: after.statusDigest,
+      worktreeDigest: after.worktreeDigest,
+      manifestDigest: record.manifestDigest,
+      securityDigest: record.securityDigest,
+      patchDigest: record.patchDigest,
+      contentDigest: record.contentDigest,
+      contentBytes: record.contentBytes
+    };
+    return Object.freeze({
+      classification: "exact-effect",
+      evidence: Object.freeze({
+        ...evidenceBody,
+        evidenceDigest: sha(stableStringify(evidenceBody))
+      })
+    });
+  } catch {
+    return Object.freeze({ classification: "drift", evidence: null });
+  }
+}
+
+/** Require the exact independently observed one-file integration effect. */
+export function verifyWriteVerticalIntegration(options = {}) {
+  const observed = inspectWriteVerticalIntegration(options);
+  if (observed.classification !== "exact-effect" || !observed.evidence) {
+    throw new CompanionError(
+      "E_INTEGRATION",
+      "Control checkout does not contain the exact bounded write-worker effect.",
+      { classification: observed.classification }
+    );
+  }
+  return observed.evidence;
 }
 
 function listedWorktreeRoots(controlRoot) {

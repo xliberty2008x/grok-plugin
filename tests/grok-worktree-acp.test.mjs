@@ -6,6 +6,7 @@ import { CompanionError } from "../plugins/grok/scripts/lib/errors.mjs";
 import {
   GrokWorktreeAcp,
   XAI_SESSION_CLOSE_WIRE,
+  XAI_WORKTREE_APPLY_WIRE,
   XAI_WORKTREE_CREATE_WIRE,
   XAI_WORKTREE_REMOVE_WIRE,
   XAI_WORKTREE_STATUS_WIRE,
@@ -612,6 +613,121 @@ test("close and remove use exact official wire methods and nested results", asyn
   ]);
 });
 
+test("apply uses the exact official overwrite wire contract and binds one path and Git root", async () => {
+  const client = new FakeAcpClient((call) => {
+    assert.equal(call.method, XAI_WORKTREE_APPLY_WIRE);
+    return nested({
+      status: "success",
+      files: [{
+        path: "target.txt",
+        type: "edit",
+        additions: 1,
+        deletions: 1
+      }],
+      gitRoot: SOURCE_GIT_ROOT
+    });
+  });
+  const adapter = new GrokWorktreeAcp(client);
+
+  assert.deepEqual(await adapter.apply({
+    operationId: OPERATION_ID,
+    worktreePath: WORKTREE_PATH,
+    expectedGitRoot: SOURCE_GIT_ROOT,
+    expectedPaths: ["target.txt"],
+    timeoutMs: 444
+  }), {
+    status: "success",
+    files: [{
+      path: "target.txt",
+      type: "edit",
+      additions: 1,
+      deletions: 1
+    }],
+    gitRoot: SOURCE_GIT_ROOT
+  });
+  assert.deepEqual(client.calls, [{
+    method: XAI_WORKTREE_APPLY_WIRE,
+    params: {
+      sessionId: OPERATION_ID,
+      worktreePath: WORKTREE_PATH,
+      mode: "overwrite"
+    },
+    timeoutMs: 444
+  }]);
+});
+
+test("apply rejects conflicts, unexpected paths, alternate roots, and content-bearing results", async (t) => {
+  const inputs = {
+    operationId: OPERATION_ID,
+    worktreePath: WORKTREE_PATH,
+    expectedGitRoot: SOURCE_GIT_ROOT,
+    expectedPaths: ["target.txt"]
+  };
+  const cases = [
+    ["conflict", {
+      status: "conflicts",
+      files: [],
+      conflicts: []
+    }, "E_INTEGRATION"],
+    ["unexpected path", {
+      status: "success",
+      files: [{
+        path: "other.txt",
+        type: "edit",
+        additions: 1,
+        deletions: 0
+      }],
+      gitRoot: SOURCE_GIT_ROOT
+    }, "E_INTEGRATION"],
+    ["alternate root", {
+      status: "success",
+      files: [{
+        path: "target.txt",
+        type: "edit",
+        additions: 1,
+        deletions: 0
+      }],
+      gitRoot: "/private/tmp/other-root"
+    }, "E_INTEGRATION"],
+    ["content-bearing response", {
+      status: "success",
+      files: [{
+        path: "target.txt",
+        type: "edit",
+        additions: 1,
+        deletions: 0,
+        patch: "secret"
+      }],
+      gitRoot: SOURCE_GIT_ROOT
+    }, "E_PROTOCOL"]
+  ];
+  for (const [name, response, code] of cases) {
+    await t.test(name, async () => {
+      const client = new FakeAcpClient(() => nested(response));
+      await assert.rejects(
+        new GrokWorktreeAcp(client).apply(inputs),
+        assertFailureCode(code)
+      );
+    });
+  }
+
+  const unused = new FakeAcpClient(() => {
+    throw new Error("request must not be dispatched");
+  });
+  const adapter = new GrokWorktreeAcp(unused);
+  for (const input of [
+    { ...inputs, operationId: "" },
+    { ...inputs, worktreePath: "relative" },
+    { ...inputs, expectedGitRoot: "relative" },
+    { ...inputs, expectedPaths: [] },
+    { ...inputs, expectedPaths: ["../target.txt"] },
+    { ...inputs, expectedPaths: ["target.txt", "other.txt"] }
+  ]) {
+    await assert.rejects(adapter.apply(input), assertFailureCode("E_PROTOCOL"));
+  }
+  assert.equal(unused.calls.length, 0);
+});
+
 test("close and remove reject ambiguous inputs and malformed nested results", async (t) => {
   const unused = new FakeAcpClient(() => {
     throw new Error("request must not be dispatched");
@@ -720,6 +836,15 @@ test("constructor, create inputs, and a pre-closed client fail before dispatch",
   );
   await assert.rejects(
     adapter.close({ sessionId: "provider-session-1" }),
+    assertFailureCode("E_PROTOCOL")
+  );
+  await assert.rejects(
+    adapter.apply({
+      operationId: OPERATION_ID,
+      worktreePath: WORKTREE_PATH,
+      expectedGitRoot: SOURCE_GIT_ROOT,
+      expectedPaths: ["target.txt"]
+    }),
     assertFailureCode("E_PROTOCOL")
   );
   await assert.rejects(
