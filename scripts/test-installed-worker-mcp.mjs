@@ -89,6 +89,7 @@ const LIVE_GATES = Object.freeze([
 const RPC_TIMEOUT_MS = 35_000;
 const MCP_SHUTDOWN_TIMEOUT_MS = 2_000;
 const SCENARIO_TIMEOUT_MS = 20 * 60_000;
+const ACTIVE_WINDOW_WORKLOAD_FILES = 8;
 const TERMINAL_PROCESS_CLOSURE_TIMEOUT_MS = 30_000;
 const STATE_POLL_MS = 100;
 const MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024;
@@ -4179,7 +4180,7 @@ function scenarioPrompt(label, { activeWindow = false } = {}) {
     "Do not edit files and do not invoke another agent.",
     ...(activeWindow ? [
       "Before finishing, use the read-only tools to inspect every numbered file under qualification-workload in ascending order.",
-      "Account for all 32 markers; do not return the final report before that bounded inspection is complete."
+      `Account for all ${ACTIVE_WINDOW_WORKLOAD_FILES} markers; do not return the final report before that bounded inspection is complete.`
     ] : []),
     "Your first response must complete the task without a repair attempt.",
     "End that first response with this exact final line:",
@@ -4528,7 +4529,7 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   const fixtureStatus = initializeFixtureRepository(
     fixtureRoot,
     context.env,
-    { workloadFiles: 32 }
+    { workloadFiles: ACTIVE_WINDOW_WORKLOAD_FILES }
   );
   const tracker = createTracker("authenticated-completion", fixtureStatus);
   context.runner.trackers.push({ context, tracker });
@@ -5402,7 +5403,7 @@ async function runCancellationScenario(baseContext, fixtureRoot) {
   const fixtureStatus = initializeFixtureRepository(
     fixtureRoot,
     context.env,
-    { workloadFiles: 32 }
+    { workloadFiles: ACTIVE_WINDOW_WORKLOAD_FILES }
   );
   const tracker = createTracker("mcp-restart-reconnect-cancellation", fixtureStatus);
   context.runner.trackers.push({ context, tracker });

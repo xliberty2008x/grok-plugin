@@ -613,7 +613,8 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /!sameJson\(finalProviderIdentity, providerIdentity\)/);
   assert.match(source, /reopened\.dev !== publishedIdentity\.dev/);
   assert.match(source, /fs\.readFileSync\(descriptor, "utf8"\)/);
-  assert.match(source, /\{ workloadFiles: 32 \}/);
+  assert.match(source, /const ACTIVE_WINDOW_WORKLOAD_FILES = 8/);
+  assert.match(source, /\{ workloadFiles: ACTIVE_WINDOW_WORKLOAD_FILES \}/);
 });
 
 test("installed Worker MCP runner preserves original stages and lets cleanup failure override", () => {
