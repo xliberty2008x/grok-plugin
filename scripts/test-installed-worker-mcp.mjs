@@ -1348,6 +1348,65 @@ async function callWriteSmokeWait(
   });
 }
 
+async function callWriteSmokeResult(context, client, workerId) {
+  checkInterrupted(context.runner);
+  let result;
+  try {
+    result = await client.request("tools/call", {
+      name: "worker_result",
+      arguments: { id: workerId },
+      _meta: createMetadata(
+        context.threadId,
+        context.fixtureRoot,
+        context.runner.turnIds
+      )
+    });
+  } catch {
+    fail("E_MCP");
+  }
+  const structured = result?.structuredContent;
+  const worker = structured?.worker;
+  const publicErrorCode = structured?.error?.code;
+  const status = /^[a-z][a-z0-9-]{0,31}$/.test(String(worker?.status || ""))
+    ? worker.status
+    : null;
+  const phase = /^[a-z][a-z0-9-]{0,63}$/.test(String(worker?.phase || ""))
+    ? worker.phase
+    : null;
+  const workerErrorCode = /^E_[A-Z0-9_]{1,126}$/.test(
+    String(worker?.error?.code || "")
+  )
+    ? worker.error.code
+    : null;
+  if (
+    /^E_[A-Z0-9_]{1,126}$/.test(String(publicErrorCode || ""))
+    || structured?.ok !== true
+    || status !== "completed"
+    || !Object.hasOwn(structured || {}, "artifact")
+  ) {
+    process.stderr.write(
+      `Installed Worker MCP write-smoke diagnostic ${JSON.stringify({
+        schemaVersion: 1,
+        stage: "write-smoke-result",
+        publicErrorCode: /^E_[A-Z0-9_]{1,126}$/.test(
+          String(publicErrorCode || "")
+        )
+          ? publicErrorCode
+          : null,
+        workerStatus: status,
+        workerPhase: phase,
+        workerErrorCode,
+        artifactPresent: Object.hasOwn(structured || {}, "artifact")
+      })}\n`
+    );
+    fail("E_SCENARIO");
+  }
+  return validateInstalledToolResult(result, {
+    outcome: "ok",
+    expectedPayloadKeys: ["worker", "artifact"]
+  });
+}
+
 async function verifyMcpSurface(context, client, { negative = false } = {}) {
   if (negative) {
     let denied;
@@ -3578,6 +3637,45 @@ async function waitForTerminalProcessClosure(
   fail("E_CLEANUP");
 }
 
+async function waitForWriteSmokeProcessClosure(context, workerId) {
+  const deadline = Date.now() + TERMINAL_PROCESS_CLOSURE_TIMEOUT_MS;
+  let stableScans = 0;
+  let latest = null;
+  while (Date.now() <= deadline) {
+    checkInterrupted(context.runner);
+    latest = context.state.readJob(
+      context.fixtureRoot,
+      workerId,
+      context.env
+    );
+    if (
+      latest.status !== "completed"
+      || latest.result?.taskRuntimeCleaned !== true
+    ) {
+      fail("E_CLEANUP");
+    }
+    const identities = [
+      latest.controllerProcess,
+      latest.workerProcess,
+      latest.providerProcess
+    ];
+    try {
+      identities.forEach((identity) => (
+        context.processControl.assertCompleteDetachedOwnedIdentity(identity)
+      ));
+    } catch {
+      fail("E_CLEANUP");
+    }
+    const allGone = identities.every((identity) => (
+      context.processControl.processGroupGone(identity)
+    ));
+    stableScans = allGone ? stableScans + 1 : 0;
+    if (stableScans >= 2) return latest;
+    await new Promise((resolve) => setTimeout(resolve, STATE_POLL_MS));
+  }
+  fail("E_CLEANUP");
+}
+
 function proveExactCancellationMarker(
   context,
   tracker,
@@ -4314,12 +4412,10 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
   if (!terminal) fail("E_SCENARIO");
 
   enterQualificationStage("write-smoke-result");
-  const result = await callTool(
+  const result = await callWriteSmokeResult(
     context,
     client,
-    "worker_result",
-    { id: workerId },
-    ["worker", "artifact"]
+    workerId
   );
   if (
     result.worker?.id !== workerId
@@ -4428,6 +4524,7 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
 
   enterQualificationStage("write-smoke-cleanup");
   await closeMcp(context, client);
+  await waitForWriteSmokeProcessClosure(context, workerId);
   context.workerWorktree.removeWorkerWorktree(
     expectedExecutionRoot,
     fixtureRoot,
