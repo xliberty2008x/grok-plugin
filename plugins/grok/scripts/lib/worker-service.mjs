@@ -355,18 +355,35 @@ export function createWorkerService({
     },
 
     async cleanup({ id, integrationReceiptDigest, idempotencyKey } = {}) {
-      if (!id || !integrationReceiptDigest || !idempotencyKey) {
+      if (!id || !idempotencyKey) {
         throw new CompanionError(
           "E_USAGE",
-          "id, integrationReceiptDigest, and idempotencyKey are required for cleanup."
+          "id and idempotencyKey are required for cleanup."
         );
       }
       assertBrokerMutationAuthority(principal, { root });
       const job = ownedJob(id);
-      if (job.write !== true || !isWorkerTerminal(job) || job.status !== "completed") {
+      if (job.write !== true
+        || !isWorkerTerminal(job)
+        || !["completed", "cancelled"].includes(job.status)) {
         throw new CompanionError(
           "E_JOB_ACTIVE",
           "Write worker is not ready for cleanup."
+        );
+      }
+      if (job.status === "completed"
+        && !/^[a-f0-9]{64}$/.test(integrationReceiptDigest || "")) {
+        throw new CompanionError(
+          "E_USAGE",
+          "Completed write cleanup requires integrationReceiptDigest."
+        );
+      }
+      if (job.status === "cancelled"
+        && integrationReceiptDigest !== undefined
+        && integrationReceiptDigest !== null) {
+        throw new CompanionError(
+          "E_USAGE",
+          "Cancelled write cleanup forbids integrationReceiptDigest."
         );
       }
       if (typeof cleanupWriteWorker !== "function"

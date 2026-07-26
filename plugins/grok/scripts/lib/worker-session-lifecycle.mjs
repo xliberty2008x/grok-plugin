@@ -13,7 +13,14 @@ import {
   taskCredentialEnvironment
 } from "./grok-provider.mjs";
 import { sameHostSession } from "./host.mjs";
+import { processGroupGone } from "./process-control.mjs";
+import { loadProviderGuard } from "./recursion-guard.mjs";
 import { jobFileIfPresent, tryReadJob } from "./state.mjs";
+import {
+  assertParentUnchanged,
+  expectedWorkerWorktreeRoot
+} from "./worker-worktree.mjs";
+import { resolveControlWorkspace } from "./workspace.mjs";
 
 const CANONICAL_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -33,6 +40,53 @@ function exactCredentialAbsent(grokHome) {
   }
 }
 
+function exactCancelledWriteCleanupJob(job, root, workerId, env) {
+  const binding = job?.executionBinding;
+  const dispatch = job?.request?.spawn?.dispatch;
+  let control;
+  try {
+    control = resolveControlWorkspace(root, env);
+    assertParentUnchanged(binding?.parentFingerprint, binding?.controlRoot);
+  } catch {
+    return false;
+  }
+  return job?.schemaVersion === 3
+    && job.kind === "task"
+    && job.jobClass === "task"
+    && job.write === true
+    && job.status === "cancelled"
+    && job.result?.stopReason === "cancelled"
+    && job.result?.taskRuntimeCleaned === true
+    && job.result?.hostVerification === "not_run"
+    && !Object.hasOwn(job.result || {}, "writeArtifact")
+    && binding?.workerId === workerId
+    && binding.controlWorkspaceId === job.controlWorkspaceId
+    && binding.controlWorkspaceId === control.controlWorkspaceId
+    && binding.controlRoot === control.controlRoot
+    && job.request?.spawn?.executionBindingDigest === binding.bindingDigest
+    && binding.expectedExecutionRoot === expectedWorkerWorktreeRoot(
+      control.controlRoot,
+      workerId,
+      env
+    )
+    && job.provisioning?.state === "ready"
+    && typeof job.provisioningRuntime?.intent?.operationId === "string"
+    && job.provisioningRuntime.intent.operationId.length > 0
+    && job.provisioningRuntime.intent.operationId.length <= 256
+    && job.provisioningRuntime?.intent?.executableIdentity
+    && [1, 2].includes(dispatch?.schemaVersion)
+    && dispatch.state === "provider-started"
+    && Number.isSafeInteger(dispatch.providerGeneration)
+    && dispatch.providerGeneration > 0
+    && job.request?.spawn?.providerLaunchOutcome === "launched"
+    && [
+      job.controllerProcess,
+      job.workerProcess,
+      job.providerProcess
+    ].every((identity) => processGroupGone(identity))
+    && loadProviderGuard(binding.controlRoot, workerId, env) === null;
+}
+
 function bindOwnedProviderSession({
   root,
   principal,
@@ -48,9 +102,11 @@ function bindOwnedProviderSession({
   if (!job || !sameHostSession(job, host)) {
     throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
   }
+  const terminalEligible = job?.status === "completed"
+    || exactCancelledWriteCleanupJob(job, root, workerId, env);
   if (
     job.write !== true
-    || job.status !== "completed"
+    || !terminalEligible
     || job.id !== workerId
     || job.request?.providerHomeId !== workerId
     || job.grokSessionId !== providerSessionId

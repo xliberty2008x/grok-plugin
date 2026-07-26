@@ -280,12 +280,12 @@ export const WORKER_INTEGRATE_TOOL = deepFreeze({
 
 export const WORKER_CLEANUP_TOOL = deepFreeze({
   name: "worker_cleanup",
-  title: "Clean up an integrated target.txt worker",
-  description: "Close and delete the exact owned provider session and remove its managed worktree through the official Grok Build API, then prove absence.",
+  title: "Clean up a terminal target.txt worker",
+  description: "Close and delete the exact owned provider session and remove its managed worktree through the official Grok Build API, then prove absence. Completed workers require their exact integration receipt; exact terminal-cancelled workers derive a discard cleanup from durable state.",
   inputSchema: {
     type: "object",
     additionalProperties: false,
-    required: ["id", "integrationReceiptDigest", "idempotencyKey"],
+    required: ["id", "idempotencyKey"],
     properties: {
       id: WORKER_ID_SCHEMA,
       integrationReceiptDigest: {

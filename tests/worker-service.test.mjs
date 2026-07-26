@@ -372,6 +372,96 @@ test("terminal worker reads suppress host-attested verification claims on every 
   assert.equal(JSON.stringify(events).includes('"hostVerification":"passed"'), false);
 });
 
+test("worker service derives integrated versus discarded cleanup only from the exact terminal job", async () => {
+  const root = initRepo();
+  const principal = resolveWorkerAuthority(metadata(root), { mutation: true });
+  const base = record("task-abababababababab", THREAD_A, {
+    write: true,
+    status: "cancelled",
+    phase: "done",
+    result: {
+      stopReason: "cancelled",
+      hostVerification: "not_run",
+      taskRuntimeCleaned: true
+    }
+  });
+  let current = base;
+  let cleanupCalls = 0;
+  let captured = null;
+  const service = createWorkerService({
+    root,
+    principal,
+    readJob: () => current,
+    listJobs: () => [current],
+    cleanupWriteWorker: async (args) => {
+      cleanupCalls += 1;
+      captured = args;
+      return {
+        receipt: { status: "absent", disposition: "discarded" },
+        replayed: false
+      };
+    },
+    runCloseEffect: async () => {},
+    deleteProviderSession: async () => {},
+    inspectProviderSession: async () => ({ present: false }),
+    runRemoveEffect: async () => {}
+  });
+
+  const discarded = await service.cleanup({
+    id: base.id,
+    idempotencyKey: "service-discard-cleanup"
+  });
+  assert.equal(discarded.receipt.disposition, "discarded");
+  assert.equal(captured.workerId, base.id);
+  assert.equal(captured.integrationReceiptDigest, undefined);
+
+  await assert.rejects(
+    service.cleanup({
+      id: base.id,
+      integrationReceiptDigest: "a".repeat(64),
+      idempotencyKey: "service-confused-discard"
+    }),
+    (error) => error?.code === "E_USAGE"
+  );
+
+  current = {
+    ...base,
+    status: "completed",
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: true
+    }
+  };
+  await assert.rejects(
+    service.cleanup({
+      id: base.id,
+      idempotencyKey: "service-missing-integration"
+    }),
+    (error) => error?.code === "E_USAGE"
+  );
+  await service.cleanup({
+    id: base.id,
+    integrationReceiptDigest: "b".repeat(64),
+    idempotencyKey: "service-integrated-cleanup"
+  });
+  assert.equal(captured.integrationReceiptDigest, "b".repeat(64));
+
+  for (const candidate of [
+    { ...base, status: "running" },
+    { ...base, write: false }
+  ]) {
+    current = candidate;
+    await assert.rejects(
+      service.cleanup({
+        id: base.id,
+        idempotencyKey: "service-ineligible-cleanup"
+      }),
+      (error) => error?.code === "E_JOB_ACTIVE"
+    );
+  }
+  assert.equal(cleanupCalls, 2);
+});
+
 test("worker wait never starts a capability-bound job without the exact current receipt", async () => {
   const root = initRepo();
   const capabilityDigest = "a".repeat(64);

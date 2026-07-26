@@ -204,6 +204,137 @@ function terminalWriteFixture(t, label = "base") {
   };
 }
 
+function terminalCancelledWriteFixture(
+  t,
+  label = "cancelled",
+  shared = {}
+) {
+  const root = shared.root || initRepo();
+  const env = shared.env || envFor();
+  if (!shared.root) {
+    fs.writeFileSync(path.join(root, "target.txt"), "before\n");
+    git(root, "add", "target.txt");
+    git(root, "commit", "-m", "add target");
+  }
+  const parentFingerprint = captureParentFingerprint(root);
+  const control = resolveControlWorkspace(root, env);
+  const workerId = `task-${crypto
+    .createHash("sha256")
+    .update(`cancelled:${label}`)
+    .digest("hex")
+    .slice(0, 24)}`;
+  const worktree = createWorkerWorktree({
+    controlRoot: root,
+    baseCommit: parentFingerprint.head,
+    workerId,
+    env
+  });
+  let removed = false;
+  t.after(() => {
+    if (removed) return;
+    try {
+      git(root, "worktree", "remove", "--force", worktree.executionRoot);
+    } catch {}
+    try {
+      fs.rmdirSync(path.dirname(worktree.executionRoot));
+    } catch {}
+  });
+  fs.writeFileSync(
+    path.join(worktree.executionRoot, "target.txt"),
+    `cancelled-${label}\n`
+  );
+  const baseTree = git(root, "rev-parse", "HEAD^{tree}");
+  const parentFingerprintDigest = digest(parentFingerprint);
+  const executionBinding = {
+    workerId,
+    controlWorkspaceId: control.controlWorkspaceId,
+    controlRoot: control.controlRoot,
+    gitCommonDir: control.gitCommonDir,
+    baseCommit: parentFingerprint.head,
+    baseTree,
+    parentFingerprint,
+    parentFingerprintDigest,
+    expectedExecutionRoot: worktree.executionRoot,
+    bindingDigest: digest({
+      workerId,
+      controlWorkspaceId: control.controlWorkspaceId,
+      baseCommit: parentFingerprint.head,
+      parentFingerprintDigest,
+      expectedExecutionRoot: worktree.executionRoot
+    })
+  };
+  const createdAt = new Date().toISOString();
+  const sessionTail = crypto
+    .createHash("sha256")
+    .update(`session:${label}`)
+    .digest("hex")
+    .slice(0, 12);
+  const job = {
+    schemaVersion: 3,
+    id: workerId,
+    kind: "task",
+    jobClass: "task",
+    write: true,
+    status: "cancelled",
+    phase: "done",
+    summary: "Cancelled exact write vertical",
+    progress: "Runtime cleaned; worktree retained",
+    createdAt,
+    updatedAt: createdAt,
+    startedAt: createdAt,
+    completedAt: createdAt,
+    heartbeatAt: createdAt,
+    host: { kind: "codex", sessionId: THREAD_A },
+    controlWorkspaceId: control.controlWorkspaceId,
+    executionBinding,
+    provisioning: { state: "ready" },
+    provisioningRuntime: {
+      intent: {
+        operationId: `worktree-${label}`,
+        executableIdentity: {
+          identityDigest: "e".repeat(64),
+          releaseIdentityDigest: "f".repeat(64)
+        }
+      }
+    },
+    grokSessionId: `019f666a-6469-7cc1-9a8d-${sessionTail}`,
+    controllerProcess: null,
+    workerProcess: null,
+    providerProcess: null,
+    request: {
+      providerHomeId: workerId,
+      spawn: {
+        executionBindingDigest: executionBinding.bindingDigest,
+        providerLaunchOutcome: "launched",
+        dispatch: {
+          schemaVersion: 2,
+          state: "provider-started",
+          providerGeneration: 1
+        }
+      }
+    },
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: true,
+      stopReason: "cancelled"
+    },
+    error: null,
+    lifecycleEvents: []
+  };
+  writeJob(root, job, env);
+  return {
+    root,
+    env,
+    workerId,
+    parentFingerprint,
+    control,
+    worktree,
+    job,
+    principal: authority(root),
+    markRemoved() { removed = true; }
+  };
+}
+
 async function simulateOwnerController(input, effectName, invoke) {
   assert.equal(typeof input.stateDir, "string");
   assert.equal(typeof input.controlRoot, "string");
@@ -281,6 +412,44 @@ function integrationArguments(fixture, overrides = {}) {
         return { status: "applied" };
       }
     ),
+    ...overrides
+  };
+}
+
+function discardCleanupArguments(fixture, overrides = {}) {
+  let sessionPresent = true;
+  return {
+    root: fixture.root,
+    principal: fixture.principal,
+    workerId: fixture.workerId,
+    idempotencyKey: `discard-${fixture.workerId}`,
+    env: fixture.env,
+    runCloseEffect: async ({ binding }) => {
+      assert.equal(binding.sessionId, fixture.job.grokSessionId);
+      assert.equal(binding.providerHomeId, fixture.workerId);
+      assert.equal(binding.executionRoot, fixture.worktree.executionRoot);
+      return { status: "closed" };
+    },
+    inspectProviderSession: async ({ providerSessionId }) => {
+      assert.equal(providerSessionId, fixture.job.grokSessionId);
+      return { present: sessionPresent };
+    },
+    deleteProviderSession: async ({ providerSessionId }) => {
+      assert.equal(providerSessionId, fixture.job.grokSessionId);
+      sessionPresent = false;
+      return { deleted: true };
+    },
+    runRemoveEffect: async ({ binding }) => {
+      assert.equal(binding.sessionId, fixture.job.grokSessionId);
+      git(
+        fixture.root,
+        "worktree",
+        "remove",
+        "--force",
+        fixture.worktree.executionRoot
+      );
+      return { status: "removed" };
+    },
     ...overrides
   };
 }
@@ -399,6 +568,200 @@ test("foreign owner is rejected before malformed idempotency is examined", async
     })),
     (error) => error?.code === "E_JOB_NOT_FOUND"
   );
+});
+
+test("terminal-cancelled write cleanup discards exact owned state and replays without effects", async (t) => {
+  const fixture = terminalCancelledWriteFixture(t, "discard-success");
+  let closeCalls = 0;
+  let deleteCalls = 0;
+  let removeCalls = 0;
+  const cleanupArgs = discardCleanupArguments(fixture, {
+    runCloseEffect: async ({ binding }) => {
+      closeCalls += 1;
+      assert.equal(binding.sessionId, fixture.job.grokSessionId);
+      assert.equal(binding.providerHomeId, fixture.workerId);
+      return { status: "closed" };
+    },
+    deleteProviderSession: async () => {
+      deleteCalls += 1;
+      return { deleted: true };
+    },
+    inspectProviderSession: (() => {
+      let present = true;
+      return async () => {
+        const observed = { present };
+        present = false;
+        return observed;
+      };
+    })(),
+    runRemoveEffect: async () => {
+      removeCalls += 1;
+      git(
+        fixture.root,
+        "worktree",
+        "remove",
+        "--force",
+        fixture.worktree.executionRoot
+      );
+      return { status: "removed" };
+    }
+  });
+
+  const cleaned = await cleanupWriteWorker(cleanupArgs);
+  fixture.markRemoved();
+  assert.equal(cleaned.replayed, false);
+  assert.equal(cleaned.receipt.status, "absent");
+  assert.equal(cleaned.receipt.disposition, "discarded");
+  assert.equal(cleaned.receipt.terminalStatus, "cancelled");
+  assert.equal(cleaned.receipt.integrationReceiptDigest, null);
+  assert.match(cleaned.receipt.terminalEvidenceDigest, /^[a-f0-9]{64}$/);
+  assert.equal(
+    cleaned.receipt.parentFingerprintDigest,
+    fixture.job.executionBinding.parentFingerprintDigest
+  );
+  assert.equal(closeCalls, 1);
+  assert.equal(deleteCalls, 1);
+  assert.equal(removeCalls, 1);
+  assert.equal(
+    fs.readFileSync(path.join(fixture.root, "target.txt"), "utf8"),
+    "before\n"
+  );
+
+  const replay = await cleanupWriteWorker({
+    ...cleanupArgs,
+    runCloseEffect: async () => { throw new Error("must not close"); },
+    deleteProviderSession: async () => { throw new Error("must not delete"); },
+    inspectProviderSession: async () => { throw new Error("must not inspect"); },
+    runRemoveEffect: async () => { throw new Error("must not remove"); }
+  });
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.receipt, cleaned.receipt);
+});
+
+test("terminal-cancelled cleanup rejects foreign ownership, parent drift, and caller-confused mode before effects", async (t) => {
+  const foreign = terminalCancelledWriteFixture(t, "discard-foreign");
+  let effects = 0;
+  const effect = async () => {
+    effects += 1;
+    throw new Error("effect must not run");
+  };
+  await assert.rejects(
+    cleanupWriteWorker(discardCleanupArguments(foreign, {
+      principal: authority(foreign.root, THREAD_B),
+      idempotencyKey: "",
+      runCloseEffect: effect,
+      deleteProviderSession: effect,
+      inspectProviderSession: effect,
+      runRemoveEffect: effect
+    })),
+    (error) => error?.code === "E_JOB_NOT_FOUND"
+  );
+
+  const confused = terminalCancelledWriteFixture(t, "discard-confused");
+  await assert.rejects(
+    cleanupWriteWorker(discardCleanupArguments(confused, {
+      integrationReceiptDigest: "a".repeat(64),
+      runCloseEffect: effect,
+      deleteProviderSession: effect,
+      inspectProviderSession: effect,
+      runRemoveEffect: effect
+    })),
+    (error) => error?.code === "E_INTEGRATION"
+  );
+
+  const drifted = terminalCancelledWriteFixture(t, "discard-drift");
+  fs.writeFileSync(path.join(drifted.root, "foreign.txt"), "parent drift\n");
+  await assert.rejects(
+    cleanupWriteWorker(discardCleanupArguments(drifted, {
+      runCloseEffect: effect,
+      deleteProviderSession: effect,
+      inspectProviderSession: effect,
+      runRemoveEffect: effect
+    })),
+    (error) => error?.code === "E_WORKTREE"
+      && error?.details?.classification === "parent-drift"
+  );
+  assert.equal(effects, 0);
+});
+
+test("terminal-cancelled cleanup rejects artifact presence, active/read workers, and completed workers without integration", async (t) => {
+  let effects = 0;
+  const effect = async () => {
+    effects += 1;
+    throw new Error("effect must not run");
+  };
+  for (const [label, mutate] of [
+    ["artifact", (job) => {
+      job.result.writeArtifact = {
+        manifestDigest: "a".repeat(64)
+      };
+    }],
+    ["active", (job) => {
+      job.status = "running";
+    }],
+    ["read", (job) => {
+      job.write = false;
+    }]
+  ]) {
+    const fixture = terminalCancelledWriteFixture(t, `discard-${label}`);
+    const job = structuredClone(fixture.job);
+    mutate(job);
+    writeJob(fixture.root, job, fixture.env);
+    await assert.rejects(
+      cleanupWriteWorker(discardCleanupArguments(fixture, {
+        runCloseEffect: effect,
+        deleteProviderSession: effect,
+        inspectProviderSession: effect,
+        runRemoveEffect: effect
+      })),
+      (error) => ["E_WORKTREE", "E_INTEGRATION"].includes(error?.code)
+    );
+  }
+
+  const completed = terminalWriteFixture(t, "cleanup-no-integration");
+  await assert.rejects(
+    cleanupWriteWorker({
+      ...discardCleanupArguments(completed, {
+        runCloseEffect: effect,
+        deleteProviderSession: effect,
+        inspectProviderSession: effect,
+        runRemoveEffect: effect
+      }),
+      integrationReceiptDigest: undefined
+    }),
+    (error) => error?.code === "E_INTEGRATION"
+  );
+  assert.equal(effects, 0);
+});
+
+test("discard cleanup keeps idempotency keys globally bound across workers", async (t) => {
+  const first = terminalCancelledWriteFixture(t, "discard-key-first");
+  const key = "shared-discard-idempotency-key";
+  const firstArgs = discardCleanupArguments(first, { idempotencyKey: key });
+  await cleanupWriteWorker(firstArgs);
+  first.markRemoved();
+
+  const second = terminalCancelledWriteFixture(
+    t,
+    "discard-key-second",
+    { root: first.root, env: first.env }
+  );
+  let effects = 0;
+  const effect = async () => {
+    effects += 1;
+    throw new Error("effect must not run");
+  };
+  await assert.rejects(
+    cleanupWriteWorker(discardCleanupArguments(second, {
+      idempotencyKey: key,
+      runCloseEffect: effect,
+      deleteProviderSession: effect,
+      inspectProviderSession: effect,
+      runRemoveEffect: effect
+    })),
+    (error) => error?.code === "E_IDEMPOTENCY_CONFLICT"
+  );
+  assert.equal(effects, 0);
 });
 
 test("cleanup closes, deletes, officially removes, proves absence, and replays", async (t) => {

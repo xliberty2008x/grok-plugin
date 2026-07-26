@@ -228,6 +228,17 @@ test("write-smoke owner lifecycle exposes only digest-bound integrate and cleanu
       assert.equal(schema.includes(`\"${forbidden}\"`), false);
     }
   }
+  const cleanup = WRITE_SMOKE_RUNTIME.tools.find(
+    (entry) => entry.name === "worker_cleanup"
+  );
+  assert.deepEqual(
+    cleanup.inputSchema.required,
+    ["id", "idempotencyKey"]
+  );
+  assert.equal(
+    Object.hasOwn(cleanup.inputSchema.properties, "integrationReceiptDigest"),
+    true
+  );
 });
 
 test("worker_wait requires mutation authority before recovery-capable service creation", async () => {
