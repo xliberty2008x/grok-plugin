@@ -1941,10 +1941,22 @@ export function authenticateProviderBootstrapGuard(
     const authenticated = assertProviderGuardForJob(workspaceRoot, job, guard, {
       expectedGeneration: normalized.providerGeneration
     });
-    const expectedSchemaVersion = job.write === true ? 4 : 3;
+    const executableBound = Object.hasOwn(
+      normalized,
+      "providerLaunchBindingDigest"
+    );
+    const expectedSchemaVersion = executableBound
+      ? (job.write === true ? 7 : 6)
+      : (job.write === true ? 4 : 3);
     if (authenticated?.schemaVersion !== expectedSchemaVersion
       || authenticated.providerSpawnIntentId !== normalized.providerSpawnIntentId
       || authenticated.executionBindingDigest !== normalized.executionBindingDigest
+      || (executableBound && (
+        authenticated.providerLaunchBindingDigest
+          !== normalized.providerLaunchBindingDigest
+        || authenticated.providerExecutableIdentityDigest
+          !== normalized.providerExecutableIdentityDigest
+      ))
       || !sameGuardProcessIdentity(authenticated.providerProcess, providerProcess)) {
       throw new CompanionError(
         "E_PROCESS_IDENTITY",
