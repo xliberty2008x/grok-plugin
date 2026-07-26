@@ -4532,6 +4532,73 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
 
   enterQualificationStage("write-smoke-private");
   const terminalJob = context.state.readJob(fixtureRoot, workerId, context.env);
+  const terminalDispatch = terminalJob.request?.spawn?.dispatch;
+  const providerGeneration = terminalDispatch?.providerGeneration;
+  const providerProcess = terminalJob.providerProcess;
+  const providerSpawnIntent = terminalJob.request?.spawn?.providerSpawnIntent;
+  const providerRotationIntent =
+    terminalJob.request?.spawn?.providerRotationIntent;
+  const primaryTurnAdmissions =
+    terminalJob.request?.spawn?.primaryTurnAdmissions;
+  let mailboxAttempt = null;
+  try {
+    mailboxAttempt = context.mailboxState.readAttemptMailbox(
+      fixtureRoot,
+      workerId,
+      terminalDispatch?.attemptId,
+      context.env
+    );
+  } catch {
+    mailboxAttempt = null;
+  }
+  const mailboxProofValid = mailboxAttempt?.state === "closed"
+    && mailboxAttempt.workerId === workerId
+    && mailboxAttempt.dispatchAttemptId === terminalDispatch?.attemptId
+    && mailboxAttempt.dispatchFence === terminalDispatch?.fence
+    && mailboxAttempt.providerGeneration === 1
+    && mailboxAttempt.providerSessionDigest
+      === context.mailboxState.stableDigest({
+        providerSessionId: terminalJob.grokSessionId
+      })
+    && mailboxAttempt.finalReportDigest === terminalJob.result?.textDigest
+    && mailboxAttempt.finalReportDigest
+      === terminalJob.result?.mailboxEvidence?.finalReportDigest;
+  const generationOneProof = providerGeneration === 1
+    && terminalDispatch?.nextProviderGeneration === null
+    && terminalDispatch?.providerRotationCount == null
+    && terminalDispatch?.providerRotatedAt == null
+    && providerRotationIntent == null
+    && terminalJob.result?.reportRepair == null
+    && providerProcess?.providerGeneration === 1
+    && providerSpawnIntent?.status === "registered"
+    && providerSpawnIntent.providerGeneration === 1
+    && primaryTurnAdmissions?.["1"]?.status === "consumed"
+    && primaryTurnAdmissions["1"].providerGeneration === 1;
+  const generationTwoAdmission = primaryTurnAdmissions?.["2"];
+  const generationTwoProof = providerGeneration === 2
+    && terminalDispatch?.nextProviderGeneration === null
+    && terminalDispatch?.providerRotationCount === 1
+    && typeof terminalDispatch?.providerRotatedAt === "string"
+    && providerRotationIntent?.status === "registered"
+    && providerRotationIntent.baseProviderGeneration === 1
+    && providerRotationIntent.targetProviderGeneration === 2
+    && providerSpawnIntent?.status === "registered"
+    && providerSpawnIntent.providerGeneration === 2
+    && providerSpawnIntent.intentId === providerRotationIntent.intentId
+    && terminalJob.result?.reportRepair?.attempted === true
+    && terminalJob.result.reportRepair.valid === true
+    && providerProcess?.providerGeneration === 2
+    && providerProcess.commandMarker === workerId
+    && providerProcess.dispatchAttemptId === terminalDispatch?.attemptId
+    && providerProcess.dispatchFence === terminalDispatch?.fence
+    && generationTwoAdmission?.status === "consumed"
+    && generationTwoAdmission.providerGeneration === 2
+    && generationTwoAdmission.providerSessionId === terminalJob.grokSessionId
+    && generationTwoAdmission.providerProcess?.pid === providerProcess.pid
+    && generationTwoAdmission.providerProcess?.startToken
+      === providerProcess.startToken;
+  const providerLifecycleProof = mailboxProofValid
+    && (generationOneProof || generationTwoProof);
   const expectedExecutionRoot = context.workerWorktree.expectedWorkerWorktreeRoot(
     fixtureRoot,
     workerId,
@@ -4556,7 +4623,7 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     || terminalJob.write !== true
     || terminalJob.role?.id !== "implementer"
     || terminalJob.profile?.id !== "rescue-write-v3"
-    || terminalJob.request?.spawn?.dispatch?.providerGeneration !== 1
+    || !providerLifecycleProof
     || terminalJob.request?.spawn?.providerLaunchOutcome !== "launched"
     || terminalJob.result?.taskRuntimeCleaned !== true
     || terminalJob.result?.workerReport?.valid !== true
@@ -4607,7 +4674,7 @@ async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     scenario: "official-grok-build-target-txt-write-smoke",
     workerId,
     status: result.worker.status,
-    providerGeneration: 1,
+    providerGeneration,
     targetPath: metadata.artifact.path,
     baseCommit: metadata.artifact.baseCommit,
     manifestDigest: metadata.artifact.manifestDigest,
