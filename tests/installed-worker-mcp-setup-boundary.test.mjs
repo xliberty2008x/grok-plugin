@@ -24,7 +24,7 @@ test("setup command identity defaults stay aligned with provider birth-token pol
 
 test("setup scan diagnostics expose only fixed non-sensitive classes", () => {
   assert.equal(Object.isFrozen(SETUP_SCAN_DIAGNOSTIC_CODES), true);
-  assert.equal(new Set(SETUP_SCAN_DIAGNOSTIC_CODES).size, 13);
+  assert.equal(new Set(SETUP_SCAN_DIAGNOSTIC_CODES).size, 18);
   for (const code of SETUP_SCAN_DIAGNOSTIC_CODES) {
     assert.match(code, /^[a-z][a-z-]+$/);
     assert.equal(boundedSetupScanDiagnosticCode(code), code);

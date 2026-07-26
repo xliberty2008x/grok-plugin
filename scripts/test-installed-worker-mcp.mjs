@@ -514,14 +514,14 @@ function validateSetupGuard(boundary, marker, record) {
     )
     || !canonicalTimestamp(record.createdAt)
   ) {
-    fail("E_CLEANUP");
+    failSetupScan("guard-shape");
   }
   try {
     boundary.processControl.assertCompleteDetachedOwnedIdentity(
       record.providerProcess
     );
   } catch {
-    fail("E_CLEANUP");
+    failSetupScan("guard-identity-shape");
   }
   let verifiedMatch = false;
   try {
@@ -531,7 +531,7 @@ function validateSetupGuard(boundary, marker, record) {
       "provider"
     );
   } catch {
-    fail("E_CLEANUP");
+    failSetupScan("guard-identity-match-probe");
   }
   if (verifiedMatch) return;
   let firstProcessGroupGone = false;
@@ -544,14 +544,14 @@ function validateSetupGuard(boundary, marker, record) {
       record.providerProcess
     );
   } catch {
-    fail("E_CLEANUP");
+    failSetupScan("guard-identity-mismatch-gone-proof");
   }
   if (decideSetupScanObservationDisposition({
     verifiedMatch,
     firstProcessGroupGone,
     secondProcessGroupGone
   }) !== "ignore-stale") {
-    fail("E_CLEANUP");
+    failSetupScan("guard-identity-mismatch-live-or-ambiguous");
   }
 }
 
@@ -600,7 +600,12 @@ function scanSetupBoundary(boundary) {
       if (!record) continue;
       try {
         validateSetupGuard(boundary, marker, record);
-      } catch {
+      } catch (error) {
+        if (boundedSetupScanDiagnosticCode(
+          error?.diagnostic?.setupScanCode
+        )) {
+          throw error;
+        }
         failSetupScan("guard-validation");
       }
       const previous = boundary.guardRecords.get(marker);
@@ -880,7 +885,7 @@ function reportSetupBoundaryDiagnostic(phase, error = null) {
   );
   process.stderr.write(
     `Installed Worker MCP setup-boundary diagnostic ${JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       phase,
       setupScanCode,
       sourceLine: match ? Number(match[1]) : null

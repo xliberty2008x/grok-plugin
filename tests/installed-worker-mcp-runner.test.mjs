@@ -564,6 +564,14 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /const setupJson = await runSetupJson\(/);
   assert.match(source, /captureSetupCommandIdentityWithPolling\(\{/);
   assert.match(source, /decideSetupScanObservationDisposition\(\{/);
+  assert.match(
+    source,
+    /setupScanCode = boundedSetupScanDiagnosticCode\(\s*error\?\.diagnostic\?\.setupScanCode\s*\)/
+  );
+  assert.match(
+    source,
+    /setup-boundary diagnostic \$\{JSON\.stringify\(\{\s*schemaVersion: 2,\s*phase,\s*setupScanCode,\s*sourceLine:/
+  );
   assert.match(source, /if \(!record\) continue;/);
   assert.match(source, /setupCleanupRequiresObservation\(setupJson\)/);
   assert.match(source, /commandObservationIdentity = Object\.freeze\(\{/);
