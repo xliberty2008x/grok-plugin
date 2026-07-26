@@ -6,10 +6,12 @@ import { processIsZombie, processStartToken } from "./process-control.mjs";
 import {
   workspaceState,
   assertSafeJobId,
+  resolveControlWorkspace,
   resolveWorkspaceStateDir,
   resolveAdmissionLockName
 } from "./workspace.mjs";
 import { pluginDataRoot, sameHostSession } from "./host.mjs";
+import { assertExecutionBinding } from "./worker-execution-binding.mjs";
 
 const JOB_ID_PATTERN = /^(review|adversarial-review|task|stop-review)-[a-f0-9]{16,64}$/;
 const JOB_STATUSES = new Set(["queued", "running", "completed", "failed", "cancelled"]);
@@ -76,12 +78,68 @@ function validateAuthoritativeJobCore(record, { expectedId = null } = {}) {
     : { ...record, jobClass: expectedJobClass };
 }
 
-function activeJobRequiresExclusiveAdmission(job) {
+function activeJobIsWriter(job) {
   if (job.write === true) return true;
   if (job.write === false) return false;
   // Schema-v1/v2 records may predate the write discriminator. An active
   // legacy job is therefore conservatively treated as a workspace writer.
   return ACTIVE.has(job.status);
+}
+
+function validProviderLineage(job) {
+  const lineage = job?.jobClass === "task"
+    ? job.request?.providerHomeId
+    : null;
+  return typeof lineage === "string"
+    && /^[a-zA-Z0-9._-]{1,80}$/.test(lineage)
+    ? lineage
+    : null;
+}
+
+function admissionLease(job, control) {
+  const lineage = validProviderLineage(job);
+  if (job?.write !== true) {
+    return Object.freeze({
+      kind: activeJobIsWriter(job) ? "global-writer" : "reader",
+      lineage,
+      executionRoot: null,
+      executionRootDigest: null
+    });
+  }
+  if (job.schemaVersion !== 3
+    || job.jobClass !== "task"
+    || !lineage
+    || !control) {
+    return Object.freeze({
+      kind: "global-writer",
+      lineage,
+      executionRoot: null,
+      executionRootDigest: null
+    });
+  }
+  try {
+    const binding = assertExecutionBinding(job.executionBinding, {
+      workerId: job.id,
+      controlWorkspaceId: control.controlWorkspaceId,
+      controlRoot: control.controlRoot,
+      gitCommonDir: control.gitCommonDir
+    });
+    return Object.freeze({
+      kind: "managed-writer",
+      lineage,
+      executionRoot: binding.expectedExecutionRoot,
+      executionRootDigest: binding.expectedExecutionRootDigest
+    });
+  } catch {
+    // A malformed, stale, cross-workspace, or unknown writer cannot safely
+    // participate in per-root leasing. Preserve the legacy global fence.
+    return Object.freeze({
+      kind: "global-writer",
+      lineage,
+      executionRoot: null,
+      executionRootDigest: null
+    });
+  }
 }
 
 function ensure(root, env = process.env) {
@@ -1001,10 +1059,11 @@ export function writeJob(root, job, env = process.env) {
 }
 
 /**
- * Atomically admit a new job while enforcing one workspace writer at a time.
- * Independent read-only lineages may overlap, but continuations sharing one
- * providerHomeId may not: they share transient auth/profile paths and one Grok
- * session store. A writer requires an otherwise idle workspace.
+ * Atomically admit a new job while leasing durable managed write roots.
+ * Modern schema-3 writers may overlap only when both their exact execution
+ * roots and provider lineages differ. Legacy, unknown, or invalid writers keep
+ * the conservative global fence. A terminal lineage remains fenced until its
+ * transient runtime cleanup is durably complete.
  */
 export function admitJob(root, job, env = process.env) {
   // Control-workspace admission lock — shared by all linked worktrees of one repo.
@@ -1014,34 +1073,61 @@ export function admitJob(root, job, env = process.env) {
 /** Admission primitive for callers already holding workspace admission. */
 function admitJobUnlocked(root, job, env = process.env) {
   job = validateAuthoritativeJobCore(job, { expectedId: job?.id ?? null });
-  const requestedLineage = job.jobClass === "task" ? job.request?.providerHomeId || null : null;
-  const requestedExclusive = activeJobRequiresExclusiveAdmission(job);
-  const conflict = listJobs(root, env).find((candidate) => {
-    const candidateLineage = candidate.jobClass === "task" ? candidate.request?.providerHomeId || null : null;
+  const control = resolveControlWorkspace(root, env);
+  const requestedLease = admissionLease(job, control);
+  const requestedLineage = requestedLease.lineage;
+  let conflict = null;
+  for (const candidate of listJobs(root, env)) {
+    const candidateLease = admissionLease(candidate, control);
+    const candidateLineage = candidateLease.lineage;
     if (terminal(candidate)) {
       // A terminal task can still own transient credentials/profile files. Do
       // not admit a continuation that would share and race that cleanup.
-      return Boolean(
+      if (
         requestedLineage
         && candidateLineage === requestedLineage
         && candidate.result?.taskRuntimeCleaned !== true
-      );
+      ) {
+        conflict = { candidate, candidateLease, kind: "provider-lineage" };
+        break;
+      }
+      continue;
     }
-    if (requestedExclusive || activeJobRequiresExclusiveAdmission(candidate)) return true;
-    return Boolean(requestedLineage && candidateLineage === requestedLineage);
-  });
+    if (requestedLineage && candidateLineage === requestedLineage) {
+      conflict = { candidate, candidateLease, kind: "provider-lineage" };
+      break;
+    }
+    if (requestedLease.kind === "global-writer"
+      || candidateLease.kind === "global-writer") {
+      conflict = { candidate, candidateLease, kind: "global-writer" };
+      break;
+    }
+    if (requestedLease.kind === "managed-writer"
+      && candidateLease.kind === "managed-writer"
+      && requestedLease.executionRoot === candidateLease.executionRoot) {
+      conflict = { candidate, candidateLease, kind: "execution-root" };
+      break;
+    }
+  }
   if (conflict) {
-    const conflictingLineage = requestedLineage && conflict.request?.providerHomeId === requestedLineage;
+    const { candidate, candidateLease, kind } = conflict;
+    const conflictingLineage = kind === "provider-lineage";
     throw new CompanionError(
       "E_JOB_ACTIVE",
       conflictingLineage
-        ? `Provider lineage ${requestedLineage} already has active job ${conflict.id}; wait or cancel it before continuing that Grok session.`
-        : `Workspace job ${conflict.id} is still ${conflict.status}; wait or cancel it before starting ${requestedExclusive ? "a write job" : "read-only work"}.`,
+        ? `Provider lineage ${requestedLineage} already has active job ${candidate.id}; wait or cancel it before continuing that Grok session.`
+        : kind === "execution-root"
+          ? `A managed write execution root already has active job ${candidate.id}; wait or cancel it before reusing that root.`
+          : `Workspace job ${candidate.id} is still ${candidate.status}; a legacy, unknown, or invalid writer requires an exclusive workspace lease.`,
       {
-        conflictingJobId: conflict.id,
-        conflictingStatus: conflict.status,
-        conflictingWrite: activeJobRequiresExclusiveAdmission(conflict),
-        conflictingProviderHomeId: conflictingLineage ? requestedLineage : null
+        conflictKind: kind,
+        conflictingJobId: candidate.id,
+        conflictingStatus: candidate.status,
+        conflictingWrite: activeJobIsWriter(candidate),
+        conflictingProviderHomeId: conflictingLineage ? requestedLineage : null,
+        conflictingExecutionRootDigest: kind === "execution-root"
+          ? candidateLease.executionRootDigest
+          : null
       }
     );
   }

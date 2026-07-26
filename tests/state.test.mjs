@@ -24,7 +24,13 @@ import {
   withWorkspaceStateTransaction,
   writeJob
 } from "../plugins/grok/scripts/lib/state.mjs";
-import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
+import {
+  createExecutionBinding
+} from "../plugins/grok/scripts/lib/worker-execution-binding.mjs";
+import {
+  resolveControlWorkspace,
+  workspaceState
+} from "../plugins/grok/scripts/lib/workspace.mjs";
 import { initRepo, tempDir } from "./helpers.mjs";
 
 const STATE_MODULE_URL = new URL("../plugins/grok/scripts/lib/state.mjs", import.meta.url).href;
@@ -81,6 +87,79 @@ function job(id, overrides = {}) {
     unknownFutureField: { preserved: true },
     ...overrides
   };
+}
+
+function stableStringify(value) {
+  if (value == null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((key) => (
+    `${JSON.stringify(key)}:${stableStringify(value[key])}`
+  )).join(",")}}`;
+}
+
+function sha256(value) {
+  return crypto
+    .createHash("sha256")
+    .update(typeof value === "string" ? value : stableStringify(value))
+    .digest("hex");
+}
+
+function parentFingerprint() {
+  const core = {
+    fingerprintVersion: 1,
+    head: "1".repeat(40),
+    tree: "2".repeat(40),
+    clean: true,
+    statusDigest: sha256(""),
+    indexDigest: sha256("index"),
+    indexSecurityDigest: sha256("index-security"),
+    worktreeDigest: sha256("worktree"),
+    worktreeEntryCount: 1,
+    status: ""
+  };
+  return { ...core, fingerprintDigest: sha256(core) };
+}
+
+function managedWriter(root, id, {
+  env = process.env,
+  executionRoot = path.join(workspaceState(root, env), "lease-fixtures", id),
+  lineage = id
+} = {}) {
+  const control = resolveControlWorkspace(root, env);
+  const executionBinding = createExecutionBinding({
+    workerId: id,
+    controlWorkspaceId: control.controlWorkspaceId,
+    controlRoot: control.controlRoot,
+    gitCommonDir: control.gitCommonDir,
+    baseCommit: "1".repeat(40),
+    baseTree: "2".repeat(40),
+    parentFingerprint: parentFingerprint(),
+    expectedExecutionRoot: executionRoot,
+    scope: { include: ["target.txt"], exclude: [] },
+    envelopeDigest: sha256(`envelope:${id}`),
+    roleDigest: sha256("role"),
+    profileDigest: sha256("profile"),
+    runtimeRolePolicyDigest: sha256("runtime-role-policy"),
+    admissionContextManifestId: `ctx-${"4".repeat(24)}`,
+    admissionContextManifestDigest: sha256("admission-context"),
+    providerCapabilityDigest: sha256("provider-capability"),
+    providerLaunchBindingDigest: null,
+    ownerDigest: sha256("owner"),
+    cancellationNonce: "c".repeat(32),
+    createdAt: "2026-07-26T00:00:00.000Z"
+  });
+  return job(id, {
+    schemaVersion: 3,
+    jobClass: "task",
+    write: true,
+    status: "running",
+    controlWorkspaceId: control.controlWorkspaceId,
+    executionBinding,
+    request: { providerHomeId: lineage }
+  });
 }
 
 function isGenericAuthoritativeStateError(error, forbidden = []) {
@@ -844,6 +923,164 @@ test("admission advances updatedAt without moving the creation heartbeat", () =>
 
   assert.ok(Date.parse(admitted.updatedAt) > Date.parse(createdAt));
   assert.equal(admitted.heartbeatAt, createdAt);
+});
+
+test("managed execution-root leases admit active writers on distinct roots and lineages", () => {
+  const env = { ...process.env, CLAUDE_PLUGIN_DATA: tempDir("grok-state-data-") };
+  const root = initRepo();
+  const first = managedWriter(root, generateId("task"), {
+    env,
+    lineage: "managed-lineage-a"
+  });
+  const second = managedWriter(root, generateId("task"), {
+    env,
+    lineage: "managed-lineage-b"
+  });
+
+  assert.doesNotThrow(() => admitJob(root, first, env));
+  assert.doesNotThrow(() => admitJob(root, second, env));
+  assert.deepEqual(
+    new Set(listJobs(root, env).map((candidate) => candidate.id)),
+    new Set([first.id, second.id])
+  );
+});
+
+test("managed execution-root leases reject same-root writers without exposing paths", () => {
+  const env = { ...process.env, CLAUDE_PLUGIN_DATA: tempDir("grok-state-data-") };
+  const root = initRepo();
+  const sharedRoot = path.join(workspaceState(root, env), "lease-fixtures", "shared-root");
+  const first = managedWriter(root, generateId("task"), {
+    env,
+    executionRoot: sharedRoot,
+    lineage: "managed-root-lineage-a"
+  });
+  const second = managedWriter(root, generateId("task"), {
+    env,
+    executionRoot: sharedRoot,
+    lineage: "managed-root-lineage-b"
+  });
+  admitJob(root, first, env);
+
+  assert.throws(
+    () => admitJob(root, second, env),
+    (error) => {
+      const publicConflict = JSON.stringify({
+        message: error?.message,
+        details: error?.details
+      });
+      return error?.code === "E_JOB_ACTIVE"
+        && error.details?.conflictKind === "execution-root"
+        && error.details?.conflictingJobId === first.id
+        && error.details?.conflictingExecutionRootDigest
+          === first.executionBinding.expectedExecutionRootDigest
+        && error.details?.conflictingProviderHomeId === null
+        && !publicConflict.includes(sharedRoot);
+    }
+  );
+});
+
+test("legacy, unknown, and invalid active writers retain the global admission fence", () => {
+  const scenarios = [
+    {
+      name: "legacy-writer",
+      create(root, env) {
+        return job(generateId("task"), {
+          schemaVersion: 1,
+          status: "running",
+          write: true
+        });
+      }
+    },
+    {
+      name: "unknown-writer",
+      create(root, env) {
+        void root;
+        void env;
+        const candidate = job(generateId("task"), { status: "running" });
+        delete candidate.write;
+        return candidate;
+      }
+    },
+    {
+      name: "invalid-modern-writer",
+      create(root, env) {
+        const candidate = managedWriter(root, generateId("task"), {
+          env,
+          lineage: "invalid-modern-lineage"
+        });
+        candidate.executionBinding = {
+          ...candidate.executionBinding,
+          expectedExecutionRootDigest: "f".repeat(64)
+        };
+        return candidate;
+      }
+    }
+  ];
+
+  for (const scenario of scenarios) {
+    const env = { ...process.env, CLAUDE_PLUGIN_DATA: tempDir("grok-state-data-") };
+    const root = initRepo();
+    const blocker = scenario.create(root, env);
+    admitJob(root, blocker, env);
+    assert.throws(
+      () => admitJob(root, job(generateId("task"), {
+        schemaVersion: 3,
+        jobClass: "task",
+        status: "queued",
+        write: false,
+        request: { providerHomeId: `${scenario.name}-reader` }
+      }), env),
+      (error) => error?.code === "E_JOB_ACTIVE"
+        && error.details?.conflictKind === "global-writer"
+        && error.details?.conflictingJobId === blocker.id
+        && error.details?.conflictingWrite === true,
+      scenario.name
+    );
+  }
+});
+
+test("managed writers and readers coexist when their provider lineages differ", () => {
+  for (const readerFirst of [true, false]) {
+    const env = { ...process.env, CLAUDE_PLUGIN_DATA: tempDir("grok-state-data-") };
+    const root = initRepo();
+    const writer = managedWriter(root, generateId("task"), {
+      env,
+      lineage: `writer-lineage-${readerFirst}`
+    });
+    const reader = job(generateId("task"), {
+      schemaVersion: 3,
+      jobClass: "task",
+      status: "running",
+      write: false,
+      request: { providerHomeId: `reader-lineage-${readerFirst}` }
+    });
+    const ordered = readerFirst ? [reader, writer] : [writer, reader];
+    for (const candidate of ordered) {
+      assert.doesNotThrow(() => admitJob(root, candidate, env));
+    }
+  }
+});
+
+test("managed execution-root leases still serialize a shared provider lineage", () => {
+  const env = { ...process.env, CLAUDE_PLUGIN_DATA: tempDir("grok-state-data-") };
+  const root = initRepo();
+  const first = managedWriter(root, generateId("task"), {
+    env,
+    lineage: "shared-managed-lineage"
+  });
+  const second = managedWriter(root, generateId("task"), {
+    env,
+    lineage: "shared-managed-lineage"
+  });
+  admitJob(root, first, env);
+
+  assert.throws(
+    () => admitJob(root, second, env),
+    (error) => error?.code === "E_JOB_ACTIVE"
+      && error.details?.conflictKind === "provider-lineage"
+      && error.details?.conflictingJobId === first.id
+      && error.details?.conflictingProviderHomeId === "shared-managed-lineage"
+  );
 });
 
 test("workspace admission gives write jobs an exclusive lease", () => {
