@@ -42,6 +42,7 @@ export {
 
 export const WORKTREE_CLOSE_REQUEST_ALLOWLIST = Object.freeze([
   "initialize",
+  "authenticate",
   "session/load",
   "_x.ai/session/close"
 ]);
@@ -584,6 +585,24 @@ export async function openWorkerOwnerController({
       },
       30_000
     );
+    if (effect === "close") {
+      if (!(initialized?.authMethods || []).some(
+        (method) => method?.id === "cached_token"
+      )) {
+        throw new CompanionError(
+          "E_CAPABILITY",
+          "Cleanup controller requires Grok cached-token authentication before session load."
+        );
+      }
+      await client.request(
+        "authenticate",
+        {
+          methodId: "cached_token",
+          _meta: { headless: true }
+        },
+        30_000
+      );
+    }
     environment.revokeCredential();
     environment.assertCredentialAbsent();
     if (initialized?.protocolVersion !== 1

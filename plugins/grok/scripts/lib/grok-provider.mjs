@@ -59,6 +59,7 @@ export const WORKTREE_INTEGRATION_REQUEST_ALLOWLIST = Object.freeze([
 ]);
 export const WORKTREE_CLEANUP_REQUEST_ALLOWLIST = Object.freeze([
   "initialize",
+  "authenticate",
   "session/load",
   "_x.ai/session/close",
   "_x.ai/git/worktree/remove"

@@ -192,6 +192,7 @@ test("owner controllers keep integration and cleanup as distinct no-model author
     ]);
     assert.deepEqual(WORKTREE_CLOSE_REQUEST_ALLOWLIST, [
       "initialize",
+      "authenticate",
       "session/load",
       "_x.ai/session/close"
     ]);
