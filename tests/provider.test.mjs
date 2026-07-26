@@ -24,6 +24,7 @@ import {
   runStructuredReview,
   REVIEW_SCHEMA,
   selectAcpPermissionOption,
+  taskCredentialEnvironment,
   taskEnvironment,
   validateReview
 } from "../plugins/grok/scripts/lib/grok-provider.mjs";
@@ -320,6 +321,63 @@ test("worktree controller never refreshes or stages expiring auth before durable
       );
     } finally {
       try { environment.revokeCredential(); } catch {}
+      fs.rmSync(stateDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("task credential refresh paths use the setup-owned provider binary instead of ambient discovery", async () => {
+  await withFake({}, async (fake) => {
+    const root = initRepo();
+    const stateDir = fs.realpathSync(
+      tempDir("provider-pinned-refresh-state-")
+    );
+    fs.writeFileSync(
+      fake.authPath,
+      `${JSON.stringify({
+        test: {
+          key: "test-secret-value-1234567890",
+          auth_mode: "oauth",
+          expires_at: new Date(Date.now() + 5 * 60_000).toISOString()
+        }
+      })}\n`,
+      { mode: 0o600 }
+    );
+    const ambientBinary = process.env.GROK_BIN;
+    process.env.GROK_BIN = path.join(stateDir, "missing-ambient-grok");
+    let environment;
+    let credentialEnvironment;
+    try {
+      environment = taskEnvironment(
+        stateDir,
+        root,
+        profileFor("task", true),
+        "pinned-credential-refresh",
+        { providerExecutableBinary: fs.realpathSync(fake.binary) }
+      );
+      assert.equal(
+        readFakeLog(fake.logFile).some((entry) => entry.event === "models"),
+        true
+      );
+      environment.revokeCredential();
+      const refreshesBeforeSessionCleanup = readFakeLog(fake.logFile)
+        .filter((entry) => entry.event === "models").length;
+      credentialEnvironment = taskCredentialEnvironment(
+        stateDir,
+        "pinned-credential-refresh",
+        { providerExecutableBinary: fs.realpathSync(fake.binary) }
+      );
+      assert.equal(
+        readFakeLog(fake.logFile)
+          .filter((entry) => entry.event === "models").length,
+        refreshesBeforeSessionCleanup + 1
+      );
+    } finally {
+      if (ambientBinary === undefined) delete process.env.GROK_BIN;
+      else process.env.GROK_BIN = ambientBinary;
+      try { credentialEnvironment?.revokeCredential(); } catch {}
+      try { environment?.revokeCredential(); } catch {}
       fs.rmSync(stateDir, { recursive: true, force: true });
       fs.rmSync(root, { recursive: true, force: true });
     }

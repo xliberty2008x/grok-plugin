@@ -181,7 +181,8 @@ async function withOwnedSessionCredential(options, operation) {
   try {
     credential = taskCredentialEnvironment(
       binding.stateDirectory,
-      binding.homeMarker
+      binding.homeMarker,
+      { providerExecutableBinary: binding.binary }
     );
     result = await operation(binding, credential);
   } catch (error) {

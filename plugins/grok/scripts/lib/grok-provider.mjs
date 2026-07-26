@@ -250,7 +250,11 @@ function authEntryExpiries(parsed) {
  * GROK_AUTH_PATH), refresh must use a temporary HOME that carries that file so
  * `grok models` can rotate the staged session and write the result back.
  */
-function ensureFreshCachedCredential(source, minimumValidityMs = 45 * 60 * 1000) {
+function ensureFreshCachedCredential(
+  source,
+  minimumValidityMs = 45 * 60 * 1000,
+  providerBinary = null
+) {
   const sourcePath = path.resolve(source);
   let parsed;
   try { parsed = JSON.parse(fs.readFileSync(sourcePath, "utf8")); }
@@ -277,7 +281,7 @@ function ensureFreshCachedCredential(source, minimumValidityMs = 45 * 60 * 1000)
       });
     }
 
-    const refreshed = spawnSync(discoverGrok(), ["models"], {
+    const refreshed = spawnSync(providerBinary || discoverGrok(), ["models"], {
       encoding: "utf8",
       shell: false,
       timeout: 30000,
@@ -1301,6 +1305,7 @@ export function taskEnvironment(
   profile,
   homeMarker = "task",
   {
+    providerExecutableBinary = null,
     worktreeProvisioningController = false,
     worktreeProvisioningDestinationParent = null,
     worktreeProvisioningExpectedRoot = null,
@@ -1433,7 +1438,11 @@ export function taskEnvironment(
     const authPath = process.env.GROK_AUTH_PATH || path.join(os.homedir(), ".grok", "auth.json");
     if (!fs.existsSync(authPath)) throw new CompanionError("E_AUTH_REQUIRED", `Grok cached authentication is unavailable. Run \`grok login\`, then ${hostCommand("setup")}.`);
     if (!worktreeProvisioningController) {
-      ensureFreshCachedCredential(authPath);
+      ensureFreshCachedCredential(
+        authPath,
+        45 * 60 * 1000,
+        providerExecutableBinary
+      );
     }
     const authFile = path.join(grokHome, "auth.json");
     const directoryIdentities = worktreeProvisioningController
@@ -2301,7 +2310,11 @@ export function workerSessionCloseControllerEnvironment(
  * removed its execution credential; it must not rewrite task configuration or
  * sandbox policy while proving provider-session deletion.
  */
-export function taskCredentialEnvironment(stateDir, homeMarker = "task") {
+export function taskCredentialEnvironment(
+  stateDir,
+  homeMarker = "task",
+  { providerExecutableBinary = null } = {}
+) {
   const lineage = safeMarker(homeMarker);
   if (!lineage || lineage !== homeMarker) {
     throw new CompanionError("E_STATE", "A qualified isolated task home is required.");
@@ -2318,7 +2331,11 @@ export function taskCredentialEnvironment(stateDir, homeMarker = "task") {
       `Grok cached authentication is unavailable. Run \`grok login\`, then ${hostCommand("setup")}.`
     );
   }
-  ensureFreshCachedCredential(authPath);
+  ensureFreshCachedCredential(
+    authPath,
+    45 * 60 * 1000,
+    providerExecutableBinary
+  );
   const authFile = path.join(grokHome, "auth.json");
   try {
     fs.lstatSync(authFile);
@@ -4489,7 +4506,18 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
         assertExecutableProviderLaunchBinding(providerExecutableBinding),
         { env: providerExecutableEnv }
       );
-  const environment = /^rescue-(read|write|report)-v3$/.test(profile.id || "") ? taskEnvironment(stateDir, root, profile, providerHomeId || jobMarker) : null;
+  const environment = /^rescue-(read|write|report)-v3$/.test(profile.id || "")
+    ? taskEnvironment(
+        stateDir,
+        root,
+        profile,
+        providerHomeId || jobMarker,
+        {
+          providerExecutableBinary:
+            resolvedExecutablePin?.binary || null
+        }
+      )
+    : null;
   const effectiveProfile = environment?.sandboxProfile ? { ...profile, sandbox: environment.sandboxProfile } : profile;
   const boundProviderLaunch = providerLaunch
     && typeof providerLaunch.prepare === "function"
