@@ -2117,7 +2117,10 @@ function sameSpawnIntent(intent, {
 } = {}) {
   if (processKind === "provider") {
     return Boolean(
-      intent?.schemaVersion === PROVIDER_SPAWN_INTENT_SCHEMA_VERSION
+      [
+        PROVIDER_SPAWN_INTENT_SCHEMA_VERSION,
+        BOUND_PROVIDER_SPAWN_INTENT_SCHEMA_VERSION
+      ].includes(intent?.schemaVersion)
       && intent.attemptId === attemptId
       && intent.dispatchFence === fence
       && intent.providerGeneration === providerGeneration
