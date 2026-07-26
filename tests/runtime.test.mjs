@@ -17,6 +17,9 @@ import { launchContractDigest } from "../plugins/grok/scripts/lib/worker-launch-
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import {
+  installPinnedFakeCompanion
+} from "./pinned-fake-grok.mjs";
+import {
   CODEX_COMPANION,
   COMPANION,
   initRepo,
@@ -70,43 +73,86 @@ function fixture(config = {}) {
   return { fake, pluginData, env };
 }
 
-test("setup validates headless isolation before enabling the stop gate", () => {
+test("setup validates headless isolation before enabling the stop gate", (t) => {
   const root = initRepo();
   const readyFixture = fixture();
-  const ready = parseJson(runCompanion(["setup", "--enable-review-gate", "--json"], { cwd: root, env: readyFixture.env }));
+  const readyPinned = installPinnedFakeCompanion(
+    readyFixture.fake,
+    readyFixture.env
+  );
+  t.after(readyPinned.cleanup);
+  const ready = parseJson(runCompanion(
+    ["setup", "--enable-review-gate", "--json"],
+    {
+      cwd: root,
+      env: readyPinned.env,
+      companionScript: readyPinned.companionScript
+    }
+  ));
   assert.equal(ready.ready, true);
   assert.equal(ready.grok.headlessReview.isolated, true);
   assert.equal(ready.config.stopReviewGate, true);
 
   const failedRoot = initRepo();
   const failedFixture = fixture({ helpText: "Usage: grok --sandbox PROFILE\n" });
-  const failed = parseJson(runCompanion(["setup", "--enable-review-gate", "--json"], { cwd: failedRoot, env: failedFixture.env }));
+  const failedPinned = installPinnedFakeCompanion(
+    failedFixture.fake,
+    failedFixture.env
+  );
+  t.after(failedPinned.cleanup);
+  const failed = parseJson(runCompanion(
+    ["setup", "--enable-review-gate", "--json"],
+    {
+      cwd: failedRoot,
+      env: failedPinned.env,
+      companionScript: failedPinned.companionScript
+    }
+  ));
   assert.equal(failed.ready, false);
   assert.equal(failed.grok.error.code, "E_CAPABILITY");
   assert.equal(failed.config.stopReviewGate, false);
 });
 
-test("a failed setup attempt revokes the previously published provider capability", () => {
+test("a failed setup attempt revokes the previously published provider capability", (t) => {
   const root = initRepo();
   const readyFixture = fixture();
-  const ready = parseJson(runCompanion(["setup", "--json"], { cwd: root, env: readyFixture.env }));
+  const readyPinned = installPinnedFakeCompanion(
+    readyFixture.fake,
+    readyFixture.env
+  );
+  t.after(readyPinned.cleanup);
+  const ready = parseJson(runCompanion(
+    ["setup", "--json"],
+    {
+      cwd: root,
+      env: readyPinned.env,
+      companionScript: readyPinned.companionScript
+    }
+  ));
   assert.equal(ready.ready, true);
   const receipt = path.join(
-    pluginDataRoot(readyFixture.env),
+    pluginDataRoot(readyPinned.env),
     "capabilities",
-    "provider-capability-v1.json"
+    "provider-capability-v2.json"
   );
   assert.equal(fs.existsSync(receipt), true);
 
   const failedFake = installFakeGrok(tempDir("fake-grok-setup-revocation-"), {
     helpText: "Usage: grok --sandbox PROFILE\n"
   });
-  const failedEnv = {
-    ...readyFixture.env,
-    GROK_BIN: failedFake.binary,
-    GROK_AUTH_PATH: failedFake.authPath
-  };
-  const failed = parseJson(runCompanion(["setup", "--json"], { cwd: root, env: failedEnv }));
+  const failedPinned = installPinnedFakeCompanion(
+    failedFake,
+    readyPinned.env
+  );
+  t.after(failedPinned.cleanup);
+  const failed = parseJson(runCompanion(
+    ["setup", "--json"],
+    {
+      cwd: root,
+      env: failedPinned.env,
+      companionScript: failedPinned.companionScript
+    }
+  ));
   assert.equal(failed.ready, false);
   assert.equal(failed.grok.error.code, "E_CAPABILITY");
   assert.equal(fs.existsSync(receipt), false);

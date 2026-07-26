@@ -56,10 +56,25 @@ export function initRepo() {
 }
 
 export function testEnvironment({ fake, pluginData = tempDir("grok-plugin-data-"), sessionId = "claude-test-session", extra = {} }) {
+  const providerDirectory = path.dirname(fake.binary);
+  const providerCommand = path.join(
+    providerDirectory,
+    process.platform === "win32" ? "grok.exe" : "grok"
+  );
+  if (!fs.existsSync(providerCommand)) {
+    fs.symlinkSync(fake.binary, providerCommand);
+  }
+  if (
+    fs.realpathSync(providerCommand) !== fs.realpathSync(fake.binary)
+    || !fs.lstatSync(providerCommand).isSymbolicLink()
+  ) {
+    throw new Error("Deterministic Grok PATH carrier is invalid.");
+  }
   return {
     ...process.env,
     GROK_BIN: fake.binary,
     GROK_AUTH_PATH: fake.authPath,
+    PATH: `${providerDirectory}${path.delimiter}${process.env.PATH || ""}`,
     CLAUDE_PLUGIN_DATA: pluginData,
     GROK_COMPANION_HOST: "claude-code",
     GROK_COMPANION_HOST_SESSION_ID: sessionId,
@@ -68,8 +83,19 @@ export function testEnvironment({ fake, pluginData = tempDir("grok-plugin-data-"
   };
 }
 
-export function runCompanion(args, { cwd, env, timeout = 60000, input } = {}) {
-  return run(process.execPath, [COMPANION, ...args], { cwd, env, timeout, input });
+export function runCompanion(args, {
+  cwd,
+  env,
+  timeout = 60000,
+  input,
+  companionScript = COMPANION
+} = {}) {
+  return run(process.execPath, [companionScript, ...args], {
+    cwd,
+    env,
+    timeout,
+    input
+  });
 }
 
 export function runCodexCompanion(args, { cwd, env, timeout = 60000, input } = {}) {
