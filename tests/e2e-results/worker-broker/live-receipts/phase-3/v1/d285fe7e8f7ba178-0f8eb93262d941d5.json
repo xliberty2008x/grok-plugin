@@ -1,0 +1,255 @@
+{
+  "schemaVersion": 1,
+  "producerId": "worker-broker-phase-3-live-receipt",
+  "producerVersion": 1,
+  "manifestDigest": "08cc7d5d5cfd699b6e428db0ad5aa519ec625bf538bb167d40c9701eb1897001",
+  "phase": "3",
+  "evidenceClass": "supporting-live-unqualified",
+  "recordedAt": "2026-07-26T19:18:42.707Z",
+  "source": {
+    "headCommit": "dc9f4243cb4c8e387953be2f6eefad19e4a2f427",
+    "headTree": "2554c75ce80497e80e0dc5248b5bc30ad5a85054",
+    "sourceInventoryDigest": "d285fe7e8f7ba17857c98926c08167461f6c8a64660a9608ad522d8facaccd7c",
+    "phaseScopeDigest": "da9536e2fba1091c00cc1067e832158fda1c21db98a70c3a02269a2f23c84bf8",
+    "sourcePluginInventoryDigest": "eff629f27e11088e3337e3daecbd6e3c4699166d93eadb4160a3ddc4587dbe4d",
+    "installedPluginInventoryDigest": "eff629f27e11088e3337e3daecbd6e3c4699166d93eadb4160a3ddc4587dbe4d",
+    "installedEntrypointDigest": "0af3baebef576e7fc5f00d3b0ba007b695c47da6f89dfca310fcd02a1021e815"
+  },
+  "provider": {
+    "implementation": "official-grok-build-acp",
+    "version": "0.2.112",
+    "binaryDigest": "5cf05fe670b1818561daf7566b580a5de6b81149166499d61072e49640b541a4",
+    "releaseIdentityDigest": "d99f01c6f7eb52c7e101d6f0a840315d8fef10ec2edfdfa501dabda44fb86bd1",
+    "completion": {
+      "capabilityDigest": "b63f1162c6a9cd9e2debf3c92893c7f7a16d60de3baeebed8ce1dfe615c40669",
+      "pinRef": "gpin-86925d188ffba96849158a92fa01054b",
+      "launchBindingDigest": "0b30f12037be379268019ee76708ccad8c003a0c44b3298fef8cebb62a1c9394",
+      "executableIdentityDigest": "ef1ac6ef2e04a4b25fbc1ae3af48661489e6e31299ac546bd67682469e3f91c3",
+      "writeLifecycleCapabilityDigest": "5f8903f85ed4bf2b5e18d3839f28b178e957a370a8c2e5948e961b70124c79bc",
+      "ambientDiscoveryPoisoned": true
+    },
+    "twoWriter": {
+      "capabilityDigest": "8220f88c27d1898ba765d01597f6a9e427dda4b0a607a79f9ed645e9e911fd4f",
+      "pinRef": "gpin-aa9b1aadb020b8683fccdf2fd5d2547d",
+      "launchBindingDigest": "b8487400b693308733a7a4bb607d27565c716e38ddf57acce0c17200c5911328",
+      "executableIdentityDigest": "094fe6cafd9e612f680cd0fbf19dab4f2a25e0a76ba3f0efb5f81e4061901c4e",
+      "writeLifecycleCapabilityDigest": "5c38eac0f42449557c4e8960ad19a49c32ae306dcf81281cde563eb9f6d4ca96",
+      "ambientDiscoveryPoisoned": true
+    }
+  },
+  "inputs": {
+    "completion": {
+      "digest": "2838ab5d5f2ef481d7d2ee9213bc89b3838c60094222f7f6c176dd9607c816b6",
+      "projection": {
+        "schemaVersion": 1,
+        "scenario": "official-grok-build-target-txt-write-smoke",
+        "workerId": "task-01e0b6de8b7a804254bfc967",
+        "status": "completed",
+        "providerGeneration": 1,
+        "reportSource": "acp-structured",
+        "reportDigest": "b48f6c28d718e47341764f6fdce3e1368b7a0c3dd04906807dd57e437bb5391f",
+        "nativeStructuredOutput": true,
+        "targetPath": "target.txt",
+        "baseCommit": "8809930e03cdc7bc7b7ee4ac624b60807e9bbb6c",
+        "manifestDigest": "f985749b7f5e805ca81880460605af642c5af3756d8e363b13eae6db39dfdb63",
+        "patchDigest": "3973cbde4dc92c5047bd1493e6608242cf35a3814e883a0603f855e0b2d4dc40",
+        "contentDigest": "7b9a72466d3960eb2aacccfc848939453490db0678bd4725def3f789b891c919",
+        "parentFingerprintDigest": "adc3e52fb21fa2c87942fd123c569741439c7ce6b61a8fc34b0f582db21a5666",
+        "parentUnchangedBeforeIntegration": true,
+        "integrationApplied": true,
+        "runnerDisposableWorktreeRemoved": true,
+        "runnerWorktreeRegistrationAbsent": true,
+        "productionIntegrationQualified": true,
+        "productionCleanupQualified": true,
+        "hostVerification": "passed",
+        "integrationReceiptDigest": "5ba390f027d07f9c48b7d9bf6a8405dfaaf451d29f6fe59288c1503f3f121d21",
+        "hostVerificationDigest": "f44b541323ffe2cd9a284cdd525c7a15a5225874adb071f0cb6cbd9e09cde8af",
+        "cleanupReceiptDigest": "8d9cf98ab385484310cde570cdb4390651b4899d56e58aad75f86583689b6864",
+        "absenceProofDigest": "89e3e7022a73b3cf3696404ad1e735864658ee34d7a96d09ea4b769b505774b4",
+        "spawnReplayProven": true,
+        "artifactReplayProven": true,
+        "artifactReplayAfterCleanupProven": true,
+        "spawnReplayNoDispatch": true,
+        "providerGenerationDelta": 0,
+        "primaryTurnAdmissionDelta": 0,
+        "worktreeIdentityChanged": false,
+        "integrationReplayProven": true,
+        "cleanupReplayProven": true,
+        "providerSessionAbsent": true,
+        "activeWriteCancellationProven": true,
+        "writeCancellation": {
+          "workerId": "task-5559841557b9ac7d2138854c",
+          "status": "cancelled",
+          "activeProviderObserved": true,
+          "spawnReplayProven": true,
+          "spawnReplayNoDispatch": true,
+          "providerGenerationDelta": 0,
+          "providerProcessIdentityChanged": false,
+          "worktreeIdentityChanged": false,
+          "runtimeIdentityChanged": false,
+          "cancelReplayProven": true,
+          "taskRuntimeCleaned": true,
+          "parentUnchanged": true,
+          "artifactAbsent": true,
+          "cleanupDisposition": "discarded",
+          "cleanupReceiptDigest": "f05e1226c93f83592fe560d9d599ad727bab5b150ac96b5330b692b6e53d7944",
+          "terminalEvidenceDigest": "9427554695b8f37febf00a3c185a54b177211322fa5ee1908b6dcdecbfb71d27",
+          "absenceProofDigest": "d6a99bee5a613cc1787f16d9b6fa5fbfdfb1b91e1e638fdf24af4659d32a5318",
+          "cleanupReplayProven": true,
+          "providerSessionAbsent": true,
+          "worktreeAbsent": true
+        },
+        "sourceHeadCommit": "dc9f4243cb4c8e387953be2f6eefad19e4a2f427",
+        "sourceHeadTree": "2554c75ce80497e80e0dc5248b5bc30ad5a85054",
+        "sourceInventoryDigest": "d285fe7e8f7ba17857c98926c08167461f6c8a64660a9608ad522d8facaccd7c",
+        "sourcePluginInventoryDigest": "eff629f27e11088e3337e3daecbd6e3c4699166d93eadb4160a3ddc4587dbe4d",
+        "installedPluginInventoryDigest": "eff629f27e11088e3337e3daecbd6e3c4699166d93eadb4160a3ddc4587dbe4d",
+        "installedEntrypointDigest": "0af3baebef576e7fc5f00d3b0ba007b695c47da6f89dfca310fcd02a1021e815",
+        "providerVersion": "0.2.112",
+        "providerBinaryDigest": "5cf05fe670b1818561daf7566b580a5de6b81149166499d61072e49640b541a4",
+        "providerCapabilityDigest": "b63f1162c6a9cd9e2debf3c92893c7f7a16d60de3baeebed8ce1dfe615c40669",
+        "providerPinRef": "gpin-86925d188ffba96849158a92fa01054b",
+        "providerLaunchBindingDigest": "0b30f12037be379268019ee76708ccad8c003a0c44b3298fef8cebb62a1c9394",
+        "providerExecutableIdentityDigest": "ef1ac6ef2e04a4b25fbc1ae3af48661489e6e31299ac546bd67682469e3f91c3",
+        "providerReleaseIdentityDigest": "d99f01c6f7eb52c7e101d6f0a840315d8fef10ec2edfdfa501dabda44fb86bd1",
+        "ambientProviderDiscoveryPoisoned": true,
+        "writeLifecycleCapabilityDigest": "5f8903f85ed4bf2b5e18d3839f28b178e957a370a8c2e5948e961b70124c79bc"
+      }
+    },
+    "twoWriter": {
+      "digest": "66cda97e158b42f52f593662defb47ad652b672f3c2a8212dfe6192815f2eb6f",
+      "projection": {
+        "schemaVersion": 1,
+        "scenario": "official-grok-build-two-writer-conflict",
+        "workers": {
+          "a": {
+            "id": "task-235b0974494d6017dba43f06",
+            "executionBindingDigest": "99d96125b55c415f08e3cb0022f89477734daf25300a8b13c2a9e631e5ca95d4",
+            "executionRootDigest": "3187b54051c0f31ed9bc56158863a2abe73f0da7652e7898730711ad0adfba8d",
+            "providerProcessDigest": "cacb79e5f39cf1db73515887296ff6a20f14bc229b9edc8af658033487585e5c",
+            "manifestDigest": "397c7a25fcdfcb4853ddbae3366830bb6e45f44d019bf4fcb9205ee5407efc9e",
+            "patchDigest": "0a9c0843b3035da18aba27b410db56ae2067e857e09ba843ff774075383b63bb",
+            "contentDigest": "e6510f16d26011b8a4d5dbea730c426cca7e88328f980ca83f6aac6f7abd5c74",
+            "readyObservationDigest": "30119b1ec76be97b049ebdb3dfff4b9eddce24604a73e9060efbc99150bc1cf7",
+            "integrationReceiptDigest": "70f321746ee57bec13cfc33addded266e465377131e816bae692233c6fb109ab",
+            "verificationObservationDigest": "9047cb34e45f38bbdfa471ad62a6f08aaccbf8401bbbc56e4afd0919ca44ebe9",
+            "cleanupReceiptDigest": "496c5c00c9480f5bd46262100385bc2fbf20594d15db30257d052bfb3e82361e"
+          },
+          "b": {
+            "id": "task-587eecee218b017365ea6a91",
+            "executionBindingDigest": "50c5388888e643f7d620943aa2cbbcfa4070a1353e1aa524627e96428cefa5cc",
+            "executionRootDigest": "61db81318f6a0e01a5e7c3f7f2d04963f22f91462f952b44cb859979cd482717",
+            "providerProcessDigest": "242c1bd2fa9eccc51291405e32e3af840e61dbbce76d6cb8d89ee2a787d4ea42",
+            "manifestDigest": "64ee8d6bf46281c1623e9501605dd85a16b3365c2626d626e5e5991eafe422b5",
+            "patchDigest": "0f64e55711c66bb5192d7d7623978274b569a1b7b23291caa233ae90337f7ed8",
+            "contentDigest": "3739d64d25927064319a9c4eabd8f33b96badcd222c52c385d841c5052d52627",
+            "readyObservationDigest": "b9aae81106297f94c6d86804ae3f01aa262f5cc770e7ea0fecbb62b6614e01c2",
+            "conflictObservationDigest": "fd93430fa1edf02bd25994cd657b1b0841f814b1bb0847de438eb3447ac2fe7c",
+            "conflictClassification": "drift",
+            "rejectedIntegrationCode": "E_INTEGRATION",
+            "rejectedIntegrationMessageDigest": "47f9e5f425b263cebb7b05eb578e1f3a0d669d8e31fb957a57bf07f6120bc20e",
+            "abandonReceiptDigest": "b343a50d2a89f83f707a91025a865f3b340f2a66c02ed4b8ca24d286cb656759"
+          }
+        },
+        "providerOverlap": {
+          "proven": true,
+          "observedAt": "2026-07-26T19:17:23.615Z",
+          "observationDigest": "cb57de5e0e2c86684b4acadaf337981fc02a9dacfda3c7279057384774ce0a17",
+          "rootsDistinct": true
+        },
+        "parent": {
+          "baseCommit": "fa1503f5ed55de73aae33d07b3b67271ffbd85a9",
+          "beforeFingerprintDigest": "42697aa5290c107b40e669f1c4f03d6749cf40ee1600b94f774b144124485cb0",
+          "unchangedBeforeIntegration": true,
+          "indexUnchangedBeforeIntegration": true,
+          "integratedContentDigest": "e6510f16d26011b8a4d5dbea730c426cca7e88328f980ca83f6aac6f7abd5c74",
+          "rejectedIntegrationNoEffect": true,
+          "abandonNoEffect": true
+        },
+        "replay": {
+          "retainedArtifactBAfterReconnect": true,
+          "verificationA": true,
+          "integrationA": true,
+          "cleanupA": true,
+          "abandonB": true,
+          "immutableArtifactsAfterCleanup": true
+        },
+        "absence": {
+          "sessions": true,
+          "worktrees": true,
+          "guards": true,
+          "processes": true
+        },
+        "sourceHeadCommit": "dc9f4243cb4c8e387953be2f6eefad19e4a2f427",
+        "sourceHeadTree": "2554c75ce80497e80e0dc5248b5bc30ad5a85054",
+        "sourceInventoryDigest": "d285fe7e8f7ba17857c98926c08167461f6c8a64660a9608ad522d8facaccd7c",
+        "sourcePluginInventoryDigest": "eff629f27e11088e3337e3daecbd6e3c4699166d93eadb4160a3ddc4587dbe4d",
+        "installedPluginInventoryDigest": "eff629f27e11088e3337e3daecbd6e3c4699166d93eadb4160a3ddc4587dbe4d",
+        "installedEntrypointDigest": "0af3baebef576e7fc5f00d3b0ba007b695c47da6f89dfca310fcd02a1021e815",
+        "providerVersion": "0.2.112",
+        "providerBinaryDigest": "5cf05fe670b1818561daf7566b580a5de6b81149166499d61072e49640b541a4",
+        "providerCapabilityDigest": "8220f88c27d1898ba765d01597f6a9e427dda4b0a607a79f9ed645e9e911fd4f",
+        "providerPinRef": "gpin-aa9b1aadb020b8683fccdf2fd5d2547d",
+        "providerLaunchBindingDigest": "b8487400b693308733a7a4bb607d27565c716e38ddf57acce0c17200c5911328",
+        "providerExecutableIdentityDigest": "094fe6cafd9e612f680cd0fbf19dab4f2a25e0a76ba3f0efb5f81e4061901c4e",
+        "providerReleaseIdentityDigest": "d99f01c6f7eb52c7e101d6f0a840315d8fef10ec2edfdfa501dabda44fb86bd1",
+        "ambientProviderDiscoveryPoisoned": true,
+        "writeLifecycleCapabilityDigest": "5c38eac0f42449557c4e8960ad19a49c32ae306dcf81281cde563eb9f6d4ca96"
+      }
+    }
+  },
+  "completion": {
+    "workerId": "task-01e0b6de8b7a804254bfc967",
+    "providerGeneration": 1,
+    "reportSource": "acp-structured",
+    "reportDigest": "b48f6c28d718e47341764f6fdce3e1368b7a0c3dd04906807dd57e437bb5391f",
+    "manifestDigest": "f985749b7f5e805ca81880460605af642c5af3756d8e363b13eae6db39dfdb63",
+    "patchDigest": "3973cbde4dc92c5047bd1493e6608242cf35a3814e883a0603f855e0b2d4dc40",
+    "contentDigest": "7b9a72466d3960eb2aacccfc848939453490db0678bd4725def3f789b891c919",
+    "integrationReceiptDigest": "5ba390f027d07f9c48b7d9bf6a8405dfaaf451d29f6fe59288c1503f3f121d21",
+    "hostVerificationDigest": "f44b541323ffe2cd9a284cdd525c7a15a5225874adb071f0cb6cbd9e09cde8af",
+    "cleanupReceiptDigest": "8d9cf98ab385484310cde570cdb4390651b4899d56e58aad75f86583689b6864",
+    "absenceProofDigest": "89e3e7022a73b3cf3696404ad1e735864658ee34d7a96d09ea4b769b505774b4"
+  },
+  "cancellation": {
+    "workerId": "task-5559841557b9ac7d2138854c",
+    "cleanupReceiptDigest": "f05e1226c93f83592fe560d9d599ad727bab5b150ac96b5330b692b6e53d7944",
+    "terminalEvidenceDigest": "9427554695b8f37febf00a3c185a54b177211322fa5ee1908b6dcdecbfb71d27",
+    "absenceProofDigest": "d6a99bee5a613cc1787f16d9b6fa5fbfdfb1b91e1e638fdf24af4659d32a5318"
+  },
+  "concurrency": {
+    "workerAId": "task-235b0974494d6017dba43f06",
+    "workerBId": "task-587eecee218b017365ea6a91",
+    "executionBindingDigests": [
+      "99d96125b55c415f08e3cb0022f89477734daf25300a8b13c2a9e631e5ca95d4",
+      "50c5388888e643f7d620943aa2cbbcfa4070a1353e1aa524627e96428cefa5cc"
+    ],
+    "executionRootDigests": [
+      "3187b54051c0f31ed9bc56158863a2abe73f0da7652e7898730711ad0adfba8d",
+      "61db81318f6a0e01a5e7c3f7f2d04963f22f91462f952b44cb859979cd482717"
+    ],
+    "providerProcessDigests": [
+      "cacb79e5f39cf1db73515887296ff6a20f14bc229b9edc8af658033487585e5c",
+      "242c1bd2fa9eccc51291405e32e3af840e61dbbce76d6cb8d89ee2a787d4ea42"
+    ],
+    "overlapObservationDigest": "cb57de5e0e2c86684b4acadaf337981fc02a9dacfda3c7279057384774ce0a17",
+    "observedAt": "2026-07-26T19:17:23.615Z"
+  },
+  "conflict": {
+    "classification": "drift",
+    "errorCode": "E_INTEGRATION",
+    "errorMessageDigest": "47f9e5f425b263cebb7b05eb578e1f3a0d669d8e31fb957a57bf07f6120bc20e",
+    "observationDigest": "fd93430fa1edf02bd25994cd657b1b0841f814b1bb0847de438eb3447ac2fe7c",
+    "abandonReceiptDigest": "b343a50d2a89f83f707a91025a865f3b340f2a66c02ed4b8ca24d286cb656759"
+  },
+  "gates": [
+    "completion-integration-cleanup",
+    "completion-restart-replay",
+    "active-cancellation-restart-absence",
+    "distinct-root-writer-overlap",
+    "typed-conflict-abandon",
+    "two-writer-restart-replay-absence"
+  ],
+  "outcome": "pass",
+  "receiptDigest": "0f8eb93262d941d5eedaeb0b02d5dec9937d0dc089cf5fc4a21b66d183229c83"
+}
