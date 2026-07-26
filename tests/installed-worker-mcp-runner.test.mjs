@@ -271,7 +271,7 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   );
   assert.match(
     source,
-    /context\.provider\.taskCredentialEnvironment\([\s\S]*?\["models"\][\s\S]*?context\.provider\.parseAdvertisedModels\(/
+    /context\.provider\.taskCredentialEnvironment\(\s*binding\.stateDirectory,\s*binding\.homeMarker,\s*\{\s*providerExecutableBinary: context\.providerBinary\s*\}\s*\)[\s\S]*?\["models"\][\s\S]*?context\.provider\.parseAdvertisedModels\(/
   );
   assert.match(
     source,
@@ -280,7 +280,7 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /runInstalledWorkerSessionCredentialTransaction\(\{/);
   assert.match(
     source,
-    /context\.provider\.taskCredentialEnvironment\([\s\S]*?catch \(error\) \{[\s\S]*?if \(environment\) \{[\s\S]*?environment\.revokeCredential\(\)[\s\S]*?if \(error instanceof QualificationError\) throw error;\s*fail\("E_SESSION"\);/
+    /context\.provider\.taskCredentialEnvironment\(\s*binding\.stateDirectory,\s*binding\.homeMarker,\s*\{\s*providerExecutableBinary: context\.providerBinary\s*\}\s*\)[\s\S]*?catch \(error\) \{[\s\S]*?if \(environment\) \{[\s\S]*?environment\.revokeCredential\(\)[\s\S]*?if \(error instanceof QualificationError\) throw error;\s*fail\("E_SESSION"\);/
   );
   assert.match(source, /deleteAcknowledged: tracker\.sessionDeleteAcknowledged === true/);
   assert.match(

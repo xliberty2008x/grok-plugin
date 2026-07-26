@@ -18,6 +18,7 @@ import {
   probe,
   cleanupReviewEnvironment,
   gatedCleanupReviewEnvironment,
+  reviewEnvironment,
   ensureChildExit,
   runHeadless,
   runProvider,
@@ -345,9 +346,17 @@ test("task credential refresh paths use the setup-owned provider binary instead 
       { mode: 0o600 }
     );
     const ambientBinary = process.env.GROK_BIN;
-    process.env.GROK_BIN = path.join(stateDir, "missing-ambient-grok");
+    const ambientInvocation = path.join(stateDir, "ambient-discovery-used");
+    const ambientPoison = path.join(stateDir, "ambient-grok-poison");
+    fs.writeFileSync(
+      ambientPoison,
+      `#!/bin/sh\nprintf 'invoked\\n' >> ${JSON.stringify(ambientInvocation)}\nexit 97\n`,
+      { mode: 0o700 }
+    );
+    process.env.GROK_BIN = ambientPoison;
     let environment;
     let credentialEnvironment;
+    let reviewIsolation;
     try {
       environment = taskEnvironment(
         stateDir,
@@ -373,11 +382,33 @@ test("task credential refresh paths use the setup-owned provider binary instead 
           .filter((entry) => entry.event === "models").length,
         refreshesBeforeSessionCleanup + 1
       );
+      credentialEnvironment.revokeCredential();
+      credentialEnvironment = null;
+      const refreshesBeforeReview = readFakeLog(fake.logFile)
+        .filter((entry) => entry.event === "models").length;
+      reviewIsolation = reviewEnvironment(
+        stateDir,
+        "pinned-review-refresh",
+        { providerExecutableBinary: fs.realpathSync(fake.binary) }
+      );
+      assert.equal(
+        readFakeLog(fake.logFile)
+          .filter((entry) => entry.event === "models").length,
+        refreshesBeforeReview + 1
+      );
+      assert.equal(
+        fs.existsSync(ambientInvocation),
+        false,
+        "post-pin credential refresh must not execute ambient Grok"
+      );
     } finally {
       if (ambientBinary === undefined) delete process.env.GROK_BIN;
       else process.env.GROK_BIN = ambientBinary;
       try { credentialEnvironment?.revokeCredential(); } catch {}
       try { environment?.revokeCredential(); } catch {}
+      if (reviewIsolation) {
+        cleanupReviewEnvironment(stateDir, "pinned-review-refresh");
+      }
       fs.rmSync(stateDir, { recursive: true, force: true });
       fs.rmSync(root, { recursive: true, force: true });
     }

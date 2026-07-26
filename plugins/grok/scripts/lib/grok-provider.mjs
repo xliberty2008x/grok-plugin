@@ -714,7 +714,14 @@ function stageRevocableTaskCredential(
   };
 }
 
-export function reviewEnvironment(stateDir, jobMarker, { includeCredential = true } = {}) {
+export function reviewEnvironment(
+  stateDir,
+  jobMarker,
+  {
+    includeCredential = true,
+    providerExecutableBinary = null
+  } = {}
+) {
   const marker = safeMarker(jobMarker), home = path.join(stateDir, "review-homes", marker), grokHome = path.join(home, ".grok");
   fs.mkdirSync(grokHome, { recursive: true, mode: 0o700 });
   const sentinel = path.join(home, "sandbox-enforcement-sentinel"), profile = `companion_${crypto.createHash("sha256").update(marker).digest("hex").slice(0, 20)}`;
@@ -724,7 +731,11 @@ export function reviewEnvironment(stateDir, jobMarker, { includeCredential = tru
   const extra = { HOME: home, USERPROFILE: home, GROK_HOME: grokHome, GROK_FOLDER_TRUST: "1" };
   const knownSecrets = [];
   if (includeCredential && fs.existsSync(authPath)) {
-    ensureFreshCachedCredential(authPath);
+    ensureFreshCachedCredential(
+      authPath,
+      45 * 60 * 1000,
+      providerExecutableBinary
+    );
     knownSecrets.push(writeReviewCredential(authPath, path.join(grokHome, "auth.json")));
   }
   const env = childEnvironment(extra);
@@ -4346,7 +4357,11 @@ function anonymousPrompt(directory, prompt) {
 export async function runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker = "review", resumeSessionId = null, structured = false, cancelRequested = () => false, onEvent = () => {}, timeoutMs = 15 * 60 * 1000, maxOutputBytes = 1024 * 1024 }) {
   assertProviderPlatform();
   const binary = discoverGrok(), version = grokVersion(binary);
-  const marker = safeMarker(jobMarker), isolation = reviewEnvironment(stateDir, marker);
+  const marker = safeMarker(jobMarker), isolation = reviewEnvironment(
+    stateDir,
+    marker,
+    { providerExecutableBinary: binary }
+  );
   const leaderSocket = path.join(stateDir, `leader-${marker}-${process.pid}-${Date.now()}.sock`);
   // Prefer anonymous fd 3 prompts locally. On CI (GitHub Actions sets CI=true), sandbox
   // re-exec cannot re-open /dev/fd/3 reliably ("Bad file descriptor"). Use a mode-0600
@@ -5280,7 +5295,11 @@ export async function probe(root, stateDir, {
   const auth = spawnSync(binary, ["models"], { encoding: "utf8", shell: false, timeout: 30000, env: childEnvironment() });
   if (auth.status !== 0) throw new CompanionError("E_AUTH_REQUIRED", `Grok authentication is unavailable or expired. Run \`grok login\`, then retry ${hostCommand("setup")}.`, { diagnostic: redactText(auth.stderr || auth.stdout).slice(-2000) });
   const marker = `setup-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
-  const isolation = reviewEnvironment(stateDir, marker);
+  const isolation = reviewEnvironment(
+    stateDir,
+    marker,
+    { providerExecutableBinary: binary }
+  );
   let provider = null;
   let failedProviderProcess = null;
   let primaryError = null;

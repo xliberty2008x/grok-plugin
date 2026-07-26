@@ -4092,7 +4092,8 @@ function stageAuthenticatedSessionCredential(context, tracker) {
   try {
     environment = context.provider.taskCredentialEnvironment(
       binding.stateDirectory,
-      binding.homeMarker
+      binding.homeMarker,
+      { providerExecutableBinary: context.providerBinary }
     );
     if (
       environment?.home !== binding.home
