@@ -53,19 +53,19 @@ Parity means:
 ### Evidence and qualification status
 
 - The authenticated macOS 10/10 matrix with Grok Build 0.2.99 on July 13, 2026 is retained under `tests/e2e-results/` as **historical** evidence for an earlier contract (profile contract v2, terminal-capable write profile, shared mode homes, pre-TaskEnvelope control plane). It does **not** qualify the current hardened worktree.
-- On July 14, 2026, the current worktree passed the opt-in authenticated direct-runtime suite for setup, review, read/write TaskEnvelope jobs, stop gate, same-lineage resume, capability denial, and transcript transfer; the opt-in cancellation case passed separately. This is current implementation evidence, but it is not a recorded installed-host release qualification.
-- On July 14, 2026, the locally installed Codex snapshot also passed a real-provider development probe with Grok Build 0.2.101: the delayed issue #2 task completed, the installed result renderer succeeded, and three independent issue #5 read jobs overlapped and completed with `taskRuntimeCleaned: true`, `hostVerification: passed`, and no runtime-observed workspace changes. The deterministic suite now repeats the three-job concurrency/profile lifecycle and bounded diagnostic contract.
-- A fresh natural `codex exec` loaded the installed skill but hit the account usage limit before it could dispatch Grok. Authenticated installed-Codex **natural host orchestration** has therefore not passed for this hardening slice; the direct installed-wrapper evidence cannot be promoted across that boundary.
-- This branch is therefore an **unqualified hardening candidate**, not a release-ready build.
+- The July 14 direct-runtime and installed-wrapper probes remain supporting predecessor evidence.
+- Issue #25 reached `operational_e2e_complete` on exact source `e89272f` and evidence head `ef2dd03` with official Grok Build 0.2.112. The recorded verticals cover completion, active cancellation/restart, simultaneous isolated writers with drift rejection, strict receipt replay, cleanup/absence, and a natural installed-Codex job (`task-3d5e7911248df005be9eb092`) with passed host verification.
+- Deterministic tests support but do not replace those real lifecycle observations. The qualification is scoped to the recorded macOS/Codex Worker Broker path.
+- The dual-host branch remains an **unqualified hardening candidate**, not a release-ready build, until independent Claude Code and remaining platform release gates pass.
 
 ### Residual limitations (document honestly)
 
 1. **macOS child-network isolation** is not enforced by Grok; the plugin does not claim otherwise.
-2. **Worker Broker write spawn is not yet enabled or qualified.** The strict official ACP worktree protocol seam, durable write admission, exact-package executable attestation, promotion-gated create→verified-ready, committed-source response-loss recovery/absence-proven reissue, and zero-create ready replay exist. Ready-only model-provider launch, artifact retrieval/integration, cancellation, official remove, and end cleanup still have to pass P3-V. The clean direct provisioner proof at `afe8ea4` is supporting evidence only and must not be described as an installed Worker Broker lifecycle.
-3. **Authenticated installed-Codex natural host-orchestration E2E** for this hardening slice remains outstanding; direct installed-wrapper execution has passed but is a different evidence boundary.
+2. **Worker Broker operational qualification is exact-source scoped.** Issue #25 passed the official-provider write, cancellation/restart, two-writer, integration, verification, replay, and cleanup verticals on `e89272f`/`ef2dd03`. Later source changes require new qualification; restrictive-umask compatibility and external protected attestation remain optional hardening.
+3. **Independent Claude Code natural host-orchestration E2E** remains outstanding. The natural installed-Codex boundary passed for issue #25, but it cannot be promoted across the second host boundary.
 4. Cross-platform authenticated provider qualification beyond historical macOS evidence remains open.
 
-Remaining release work: run and record authenticated installed-Codex natural-flow E2E, record release-candidate evidence for the direct runtime, obtain provider-neutral CI on the declared OS/Node matrix, keep Linux provider-unverified and Windows provider-unsupported until evidence exists, perform clean-profile marketplace installs, and only then decide whether to promote `0.3.0-dev.1` to a release candidate.
+Remaining release work: independently qualify Claude Code, record the dual-host release-candidate evidence, keep Linux provider-unverified and Windows provider-unsupported until evidence exists, perform clean-profile marketplace installs, and only then decide whether to promote `0.3.0-dev.1` to a release candidate.
 
 Promotion evidence is an aggregate dual-host record bound to a deterministic
 source inventory digest. The record itself is excluded from that digest to
@@ -565,7 +565,7 @@ Before release, run the protected `GROK_E2E=1` headless review, sandbox, cancell
 - Document Grok's independent `~/.grok/sessions` store and the `grok sessions list` / `grok sessions delete <session-id>` cleanup flow for imported sessions; document both host forms of the rescue resume command.
 - Disclose that prompts, plugin-collected review context, repository content selected by task tools, command output, imported Claude context, and filtered user-visible Codex context may be processed through Grok/xAI services despite the local CLI transport.
 - Explain read-only versus write profiles, no-terminal write tools, host-owned verification, and managed-policy limitations.
-- Document residual limitations: macOS child-network caveat; post-mutation scope detection inside isolated execution worktrees; dirty-source materialization and managed-root concurrency remain unavailable until their explicit P3 slices pass; outstanding authenticated installed-Codex natural-flow E2E for this slice.
+- Document residual limitations: macOS child-network caveat; exact-source qualification boundaries; restrictive-umask compatibility; outstanding independent Claude Code and platform qualification.
 - Document stable error codes and troubleshooting.
 - Publish the 0.2.99 compatibility floor separately from exact authenticated test evidence; do not imply historical July 13 evidence qualifies the current worktree.
 - Classify this branch as an unqualified hardening candidate until re-qualification completes.
@@ -655,7 +655,7 @@ Implementation SHOULD occur on `codex/grok-port` and merge into `main` only afte
 | R17 | Version fields drift across manifests | Medium | Medium | One source, bump script, CI synchronization test | G2, G8 |
 | R18 | Host treats provider claims as verified because write profile has no terminal | High | High | hostVerification stays `not_run`; requiredVerification is host-owned; document control-plane roles | G5, G7 |
 | R19 | Scope violations leave unreverted mutations | Medium | High | One writer, post-mutation detection, `E_SCOPE_VIOLATION`, host review required | G4, G7 |
-| R20 | Authenticated installed-Codex natural-flow E2E remains outstanding for this slice | High | High | Block release until rerun and record results | G7, G8 |
+| R20 | Independent Claude Code natural-flow E2E remains outstanding for this dual-host release | High | High | Block release until the second host is run and recorded against the final candidate | G7, G8 |
 
 ## 17. Explicit non-goals for v0.3
 
@@ -691,7 +691,7 @@ The first release is complete only when:
 - Contract-version-3 read/write ACP profiles retain the exact no-terminal tool IDs and `agentProfileDigest`; only isolated provider-bundled skills may coexist with builtin capabilities.
 - SessionEnd cleans only the current Claude session's complete process groups and retains guard/state with `E_PROCESS_IDENTITY` whenever ownership or shutdown cannot be verified.
 - Codex jobs remain recoverable across task closure because the host has no `SessionEnd` plugin event.
-- Installation and validation succeed from clean Claude Code and Codex profiles, including authenticated installed-Codex natural-flow E2E for this hardening slice.
+- Installation and validation succeed from clean Claude Code and Codex profiles, reproducing the recorded Codex natural flow and independently passing the Claude Code natural flow for the final candidate.
 - Versions and attribution are synchronized.
 - Provider-neutral Linux, macOS, and Windows CI is green; the full fake-provider suite is green on Linux and macOS; every provider-supported OS has authenticated release evidence **for this worktree**.
 - Residual limitations are stated honestly and do not contradict release claims.
