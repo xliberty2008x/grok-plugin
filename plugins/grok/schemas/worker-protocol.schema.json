@@ -1,0 +1,957 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xliberty2008x/grok-plugin/schemas/worker-protocol.schema.json",
+  "title": "Worker Protocol v1 public types",
+  "description": "Public WorkerHandle, WorkerEvent, WorkerSnapshot, WorkerResult, cursor, and WorkerError schemas.",
+  "oneOf": [
+    { "$ref": "#/$defs/WorkerHandle" },
+    { "$ref": "#/$defs/WorkerSnapshot" },
+    { "$ref": "#/$defs/WorkerEvent" },
+    { "$ref": "#/$defs/WorkerEventPage" },
+    { "$ref": "#/$defs/WorkerEventCursor" },
+    { "$ref": "#/$defs/WorkerResult" },
+    { "$ref": "#/$defs/WorkerError" },
+    { "$ref": "#/$defs/CancellationReceipt" },
+    { "$ref": "#/$defs/DeliveryReceipt" }
+  ],
+  "$defs": {
+    "isoDateTime": {
+      "type": ["string", "null"],
+      "maxLength": 64
+    },
+    "workerId": {
+      "type": "string",
+      "pattern": "^(review|adversarial-review|task|stop-review)-[a-f0-9]{16,64}$"
+    },
+    "publicErrorCode": {
+      "type": "string",
+      "enum": [
+        "E_AUTH_REQUIRED",
+        "E_CAPABILITY",
+        "E_CANCELLED",
+        "E_CONTEXT_DRIFT",
+        "E_DELIVERY",
+        "E_GIT_REQUIRED",
+        "E_GROK_NOT_FOUND",
+        "E_GROK_VERSION",
+        "E_IDEMPOTENCY_CONFLICT",
+        "E_IMPORT_RESULT",
+        "E_IMPORT_SOURCE",
+        "E_INTEGRATION",
+        "E_JOB_ACTIVE",
+        "E_JOB_NOT_FOUND",
+        "E_NO_RESUME_CANDIDATE",
+        "E_OUTPUT_LIMIT",
+        "E_POLICY",
+        "E_PROCESS_IDENTITY",
+        "E_PROTOCOL",
+        "E_PROVIDER_EXIT",
+        "E_RECURSION",
+        "E_REVIEW_MUTATED_WORKSPACE",
+        "E_REVIEW_TOO_LARGE",
+        "E_ROLE",
+        "E_SCHEMA",
+        "E_SCOPE_VIOLATION",
+        "E_SECURITY_PROFILE",
+        "E_STATE",
+        "E_TIMEOUT",
+        "E_USAGE",
+        "E_WORKER_LOST",
+        "E_WORKTREE",
+        "E_BROKER"
+      ]
+    },
+    "publicText": {
+      "type": "string",
+      "maxLength": 2000
+    },
+    "hostActionDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision", "decidedAt", "application", "applied"],
+      "properties": {
+        "decision": { "type": "string", "enum": ["grant", "deny"] },
+        "decidedAt": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "application": { "const": "future-admission-only" },
+        "applied": { "const": false }
+      }
+    },
+    "awaitingHostAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "requestId",
+        "requestedRoleId",
+        "requestedAt",
+        "status",
+        "decision",
+        "application",
+        "applied"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "role_admission" },
+        "requestId": { "type": "string", "pattern": "^har-[a-f0-9]{24}$" },
+        "requestedRoleId": { "type": "string", "enum": ["reviewer", "security", "test"] },
+        "requestedAt": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "status": { "type": "string", "enum": ["awaiting", "granted", "denied"] },
+        "decision": {
+          "anyOf": [
+            { "$ref": "#/$defs/hostActionDecision" },
+            { "type": "null" }
+          ]
+        },
+        "application": { "const": "future-admission-only" },
+        "applied": { "const": false }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "awaiting" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": { "decision": { "type": "null" } }
+          },
+          "else": {
+            "properties": { "decision": { "$ref": "#/$defs/hostActionDecision" } }
+          }
+        }
+      ]
+    },
+    "publicPath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!(?:\\.[\\\\/])*(?:[A-Za-z][A-Za-z0-9+.-]*:|[\\\\/]|~[\\\\/]))(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$)).+"
+    },
+    "textEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bytes", "digest"],
+      "properties": {
+        "bytes": { "type": "integer", "minimum": 0 },
+        "digest": { "type": ["string", "null"], "maxLength": 256 }
+      }
+    },
+    "reviewFinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["severity", "title", "body"],
+      "properties": {
+        "severity": { "type": "string", "enum": ["critical", "high", "medium", "low", "info"] },
+        "title": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "body": { "type": "string", "minLength": 1, "maxLength": 6000 },
+        "file": { "$ref": "#/$defs/publicPath" },
+        "line": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "summary", "findings"],
+      "properties": {
+        "verdict": { "type": "string", "enum": ["pass", "needs_changes"] },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "findings": {
+          "type": "array",
+          "maxItems": 200,
+          "items": { "$ref": "#/$defs/reviewFinding" }
+        }
+      }
+    },
+    "acceptanceResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "status": { "type": "string", "enum": ["met", "unmet", "unknown"] },
+        "note": { "$ref": "#/$defs/publicText" }
+      }
+    },
+    "workerReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion", "structured", "valid", "outcome", "summary",
+        "changedFiles", "checksClaimed", "acceptanceResults", "risks",
+        "questions", "validationIssues"
+      ],
+      "properties": {
+        "schemaVersion": { "type": ["integer", "null"] },
+        "structured": { "type": "boolean" },
+        "valid": { "type": "boolean" },
+        "outcome": { "type": "string", "enum": ["complete", "partial", "blocked"] },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "changedFiles": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/publicPath" } },
+        "checksClaimed": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicText" } },
+        "acceptanceResults": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/acceptanceResult" } },
+        "risks": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicText" } },
+        "questions": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicText" } },
+        "validationIssues": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/publicText" } }
+      }
+    },
+    "nestedWorkerError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "$ref": "#/$defs/publicErrorCode" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 2000 }
+      }
+    },
+    "reportRepair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempted", "valid", "validationIssues"],
+      "properties": {
+        "attempted": { "type": "boolean" },
+        "valid": { "type": "boolean" },
+        "initialResponse": { "$ref": "#/$defs/textEvidence" },
+        "validationIssues": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/publicText" } },
+        "error": { "$ref": "#/$defs/nestedWorkerError" }
+      }
+    },
+    "providerClaims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["success", "outcome", "summary", "changedFiles", "checksClaimed", "observedFileAgreement"],
+      "properties": {
+        "success": { "type": "boolean" },
+        "outcome": { "type": "string", "enum": ["complete", "partial", "blocked"] },
+        "summary": { "type": ["string", "null"], "maxLength": 2000 },
+        "changedFiles": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/publicPath" } },
+        "checksClaimed": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicText" } },
+        "observedFileAgreement": { "type": "boolean" }
+      }
+    },
+    "contextIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "manifestId", "digest", "head", "branch", "dirtyDigest", "ignoredDigest",
+        "trackedTreeIdentity", "metadataIdentity"
+      ],
+      "properties": {
+        "manifestId": { "type": ["string", "null"], "maxLength": 256 },
+        "digest": { "type": ["string", "null"], "maxLength": 256 },
+        "head": { "type": ["string", "null"], "maxLength": 256 },
+        "branch": { "type": ["string", "null"], "maxLength": 256 },
+        "dirtyDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "ignoredDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "trackedTreeIdentity": { "type": ["string", "null"], "maxLength": 256 },
+        "metadataIdentity": { "type": ["string", "null"], "maxLength": 256 }
+      }
+    },
+    "commandOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "status", "exitCode"],
+      "properties": {
+        "command": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "status": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "exitCode": { "type": ["integer", "null"] }
+      }
+    },
+    "reconcilerEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["privilege", "replayedPrompt", "at"],
+      "properties": {
+        "privilege": { "type": ["string", "null"], "maxLength": 128 },
+        "replayedPrompt": { "type": "boolean" },
+        "at": { "$ref": "#/$defs/isoDateTime" }
+      }
+    },
+    "runtimeEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion", "preContext", "postContext", "observedChangedPaths",
+        "diffSummary", "commandOutcomes", "scopeViolations", "executionStatus",
+        "hostVerification"
+      ],
+      "properties": {
+        "schemaVersion": { "type": ["integer", "null"] },
+        "preContext": { "anyOf": [{ "$ref": "#/$defs/contextIdentity" }, { "type": "null" }] },
+        "postContext": { "anyOf": [{ "$ref": "#/$defs/contextIdentity" }, { "type": "null" }] },
+        "observedChangedPaths": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/publicPath" } },
+        "diffSummary": { "type": ["string", "null"], "maxLength": 4000 },
+        "commandOutcomes": { "type": "array", "maxItems": 40, "items": { "$ref": "#/$defs/commandOutcome" } },
+        "scopeViolations": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/publicPath" } },
+        "executionStatus": { "type": ["string", "null"], "maxLength": 64 },
+        "hostVerification": { "type": "string", "enum": ["not_run", "passed", "failed", "skipped"] },
+        "reconciler": { "$ref": "#/$defs/reconcilerEvidence" }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "authority", "recordedAt", "observedChangedPaths"],
+      "properties": {
+        "outcome": { "type": "string", "enum": ["not_run", "passed", "failed", "skipped"] },
+        "authority": { "type": "string", "enum": ["host_asserted", "unknown"] },
+        "recordedAt": { "$ref": "#/$defs/isoDateTime" },
+        "observedChangedPaths": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/publicPath" } }
+      }
+    },
+    "errorDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "warning": { "$ref": "#/$defs/publicText" },
+        "privacyWarning": { "$ref": "#/$defs/publicText" },
+        "available": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicText" } },
+        "missing": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicText" } },
+        "code": { "type": "integer" },
+        "signal": { "type": "string", "maxLength": 64 },
+        "hint": { "$ref": "#/$defs/publicText" },
+        "rootKeys": { "type": "array", "maxItems": 24, "items": { "type": "string", "maxLength": 128 } },
+        "hasUnknownRootKeys": { "type": "boolean" },
+        "summaryType": { "type": "string", "maxLength": 64 },
+        "findingsCount": { "type": "integer", "minimum": 0 },
+        "findingsShapeOk": { "type": "boolean" },
+        "payloadDigest": { "type": "string", "maxLength": 256 },
+        "paths": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/publicPath" } },
+        "changed": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/publicPath" } },
+        "reasons": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicText" } },
+        "missingMarkers": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicPath" } },
+        "missingPaths": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicPath" } },
+        "unsafePaths": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicPath" } },
+        "workspaceState": { "type": "string", "enum": ["complete", "task_scoped", "unknown"] },
+        "conflictingJobId": { "$ref": "#/$defs/workerId" },
+        "conflictingProviderHomeId": { "$ref": "#/$defs/workerId" },
+        "limitBytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "WorkerError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workerProtocolVersion", "errorSchemaVersion", "code", "message"],
+      "properties": {
+        "workerProtocolVersion": { "type": "integer", "const": 1 },
+        "errorSchemaVersion": { "type": "integer", "const": 1 },
+        "code": { "$ref": "#/$defs/publicErrorCode" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "details": { "$ref": "#/$defs/errorDetails" }
+      }
+    },
+    "WorkerEventCursor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "workerId", "sequence"],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "workerId": { "$ref": "#/$defs/workerId" },
+        "sequence": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "lifecycleDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "envelopeId": { "type": "string", "maxLength": 256 },
+        "resumeJobId": { "type": "string", "maxLength": 256 },
+        "spawnSuccessDefinition": { "type": "string", "maxLength": 1000 },
+        "requestAcceptedAt": { "type": "string", "maxLength": 64 },
+        "reconciler": { "type": "string", "maxLength": 128 },
+        "messageId": { "type": "string", "maxLength": 256 },
+        "state": { "type": "string", "enum": ["accepted", "pending", "delivered", "delivery_unknown", "rejected"] },
+        "contentDigest": { "type": "string", "maxLength": 256 },
+        "parentWorkerId": { "type": "string", "maxLength": 256 },
+        "version": { "type": "string", "maxLength": 128 },
+        "eventType": { "type": "string", "enum": ["tool", "plan", "message"] },
+        "name": { "type": "string", "maxLength": 300 },
+        "status": { "type": "string", "maxLength": 80 },
+        "verdict": { "type": "string", "enum": ["pass", "needs_changes"] },
+        "outcome": { "type": "string", "enum": ["complete", "partial", "blocked"] },
+        "hostVerification": { "type": "string", "enum": ["not_run", "passed", "failed", "skipped"] },
+        "authority": { "type": "string", "const": "host_asserted" },
+        "mode": { "type": "string", "enum": ["read", "write"] },
+        "write": { "type": "boolean" },
+        "replayedPrompt": { "type": "boolean" },
+        "structured": { "type": "boolean" },
+        "exitCode": { "type": "integer" },
+        "findings": { "type": "integer", "minimum": 0 },
+        "commands": { "type": "integer", "minimum": 0 },
+        "plan": { "type": "array", "maxItems": 20, "items": { "type": "string", "maxLength": 500 } },
+        "questions": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicText" } },
+        "validationIssues": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/publicText" } },
+        "observedChangedPaths": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/publicPath" } }
+      }
+    },
+    "WorkerEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workerProtocolVersion", "eventSchemaVersion", "type", "at", "summary", "sequence"],
+      "properties": {
+        "workerProtocolVersion": { "type": "integer", "const": 1 },
+        "eventSchemaVersion": { "type": "integer", "const": 1 },
+        "type": {
+          "type": "string",
+          "enum": [
+            "task.accepted", "plan.updated", "activity.started", "activity.completed",
+            "checkpoint", "blocked", "final.report", "cancellation.requested"
+          ]
+        },
+        "at": { "$ref": "#/$defs/isoDateTime" },
+        "summary": { "type": "string", "maxLength": 2000 },
+        "sequence": { "type": ["integer", "null"], "minimum": 1 },
+        "detail": { "$ref": "#/$defs/lifecycleDetail" }
+      }
+    },
+    "WorkerEventPage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workerProtocolVersion",
+        "eventCursorSchemaVersion",
+        "events",
+        "nextCursor",
+        "firstAvailableCursor",
+        "firstAvailableSequence",
+        "latestAvailableSequence",
+        "latestAvailableCursor",
+        "gap",
+        "terminal",
+        "workerId"
+      ],
+      "properties": {
+        "workerProtocolVersion": { "type": "integer", "const": 1 },
+        "eventCursorSchemaVersion": { "type": "integer", "const": 1 },
+        "events": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/WorkerEvent" }
+        },
+        "nextCursor": { "$ref": "#/$defs/WorkerEventCursor" },
+        "firstAvailableCursor": { "$ref": "#/$defs/WorkerEventCursor" },
+        "firstAvailableSequence": { "type": ["integer", "null"], "minimum": 1 },
+        "latestAvailableSequence": { "type": "integer", "minimum": 0 },
+        "latestAvailableCursor": { "$ref": "#/$defs/WorkerEventCursor" },
+        "gap": { "type": "boolean" },
+        "terminal": { "type": "boolean" },
+        "workerId": { "$ref": "#/$defs/workerId" },
+        "timedOut": { "type": "boolean" }
+      }
+    },
+    "securityProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "contractVersion", "agentProfileDigest"],
+      "properties": {
+        "id": { "type": ["string", "null"], "maxLength": 256 },
+        "contractVersion": { "type": ["integer", "null"] },
+        "agentProfileDigest": { "type": ["string", "null"], "maxLength": 256 }
+      }
+    },
+    "WorkerHandle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workerProtocolVersion",
+        "handleSchemaVersion",
+        "id",
+        "status",
+        "terminal"
+      ],
+      "properties": {
+        "workerProtocolVersion": { "type": "integer", "const": 1 },
+        "handleSchemaVersion": { "type": "integer", "const": 1 },
+        "id": { "$ref": "#/$defs/workerId" },
+        "kind": { "type": ["string", "null"], "maxLength": 128 },
+        "jobClass": { "type": ["string", "null"], "maxLength": 128 },
+        "write": { "type": "boolean" },
+        "status": { "type": "string", "enum": ["queued", "running", "completed", "failed", "cancelled", "unknown"] },
+        "phase": { "type": ["string", "null"], "maxLength": 128 },
+        "summary": { "type": ["string", "null"], "maxLength": 2000 },
+        "progress": { "type": ["string", "null"], "maxLength": 2000 },
+        "createdAt": { "$ref": "#/$defs/isoDateTime" },
+        "startedAt": { "$ref": "#/$defs/isoDateTime" },
+        "updatedAt": { "$ref": "#/$defs/isoDateTime" },
+        "completedAt": { "$ref": "#/$defs/isoDateTime" },
+        "heartbeatAt": { "$ref": "#/$defs/isoDateTime" },
+        "profileId": { "type": ["string", "null"], "maxLength": 256 },
+        "model": { "type": ["string", "null"], "maxLength": 256 },
+        "effort": { "type": ["string", "null"], "maxLength": 128 },
+        "parentWorkerId": { "type": ["string", "null"], "maxLength": 256 },
+        "lineageWorkerId": { "type": ["string", "null"], "maxLength": 256 },
+        "eventCursor": { "$ref": "#/$defs/WorkerEventCursor" },
+        "taskEnvelopeId": { "type": ["string", "null"], "maxLength": 256 },
+        "taskEnvelopeDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "contextManifestId": { "type": ["string", "null"], "maxLength": 256 },
+        "contextDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "workspaceSnapshotDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "hostTaskBinding": { "type": ["string", "null"], "maxLength": 256 },
+        "securityProfile": { "$ref": "#/$defs/securityProfile" },
+        "terminal": { "type": "boolean" },
+        "controlWorkspaceId": { "type": ["string", "null"], "maxLength": 256 },
+        "executionRootDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "roleId": { "type": ["string", "null"], "maxLength": 256 },
+        "externalWorkerLabel": { "type": ["string", "null"], "maxLength": 64 }
+      }
+    },
+    "WorkerResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workerProtocolVersion", "resultSchemaVersion", "hostVerification"],
+      "properties": {
+        "workerProtocolVersion": { "type": "integer", "const": 1 },
+        "resultSchemaVersion": { "type": "integer", "const": 1 },
+        "review": { "$ref": "#/$defs/review" },
+        "workerReport": { "$ref": "#/$defs/workerReport" },
+        "reportRepair": { "$ref": "#/$defs/reportRepair" },
+        "providerClaims": { "$ref": "#/$defs/providerClaims" },
+        "runtimeEvidence": { "$ref": "#/$defs/runtimeEvidence" },
+        "verification": { "$ref": "#/$defs/verification" },
+        "textBytes": { "type": "integer", "minimum": 0 },
+        "textDigest": { "type": "string", "maxLength": 256 },
+        "textTruncated": { "type": "boolean" },
+        "interim": { "$ref": "#/$defs/textEvidence" },
+        "hostVerification": {
+          "type": "string",
+          "enum": ["not_run", "passed", "failed", "skipped"]
+        },
+        "stopReason": { "type": ["string", "null"], "maxLength": 2000 },
+        "skipped": { "type": "boolean" },
+        "skipReason": { "type": ["string", "null"], "maxLength": 2000 },
+        "providerSessionDeleted": { "type": ["boolean", "null"] },
+        "taskRuntimeCleaned": { "type": ["boolean", "null"] },
+        "privacyWarning": { "type": ["string", "null"], "maxLength": 2000 },
+        "cancellation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["requestAcceptedAt", "processGroupGoneAt", "terminalRecordCommittedAt", "receiptId"],
+          "properties": {
+            "requestAcceptedAt": { "$ref": "#/$defs/isoDateTime" },
+            "processGroupGoneAt": { "$ref": "#/$defs/isoDateTime" },
+            "terminalRecordCommittedAt": { "$ref": "#/$defs/isoDateTime" },
+            "receiptId": { "type": ["string", "null"], "maxLength": 256 }
+          }
+        }
+      }
+    },
+    "taskScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["include", "exclude"],
+      "properties": {
+        "include": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicPath" } },
+        "exclude": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicPath" } }
+      }
+    },
+    "taskContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "facts", "constraints", "expectedProjectMarkers", "requiredPaths",
+        "workspaceState", "upstreamFreshness"
+      ],
+      "properties": {
+        "facts": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicText" } },
+        "constraints": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicText" } },
+        "expectedProjectMarkers": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/publicPath" } },
+        "requiredPaths": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicPath" } },
+        "workspaceState": { "type": "string", "enum": ["complete", "task_scoped", "unknown"] },
+        "upstreamFreshness": { "type": "string", "enum": ["verified", "not_checked"] }
+      }
+    },
+    "acceptanceCriterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "text"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "text": { "type": "string", "maxLength": 2000 }
+      }
+    },
+    "taskContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion", "envelopeId", "digest", "objective", "mode", "scope",
+        "nonGoals", "acceptanceCriteria", "requiredVerification",
+        "expectedReturnFormat", "context", "contextManifestId"
+      ],
+      "properties": {
+        "schemaVersion": { "type": ["integer", "null"] },
+        "envelopeId": { "type": ["string", "null"], "maxLength": 256 },
+        "digest": { "type": ["string", "null"], "maxLength": 256 },
+        "objective": { "type": ["string", "null"], "maxLength": 2000 },
+        "mode": { "type": "string", "enum": ["read", "write"] },
+        "scope": { "$ref": "#/$defs/taskScope" },
+        "nonGoals": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicText" } },
+        "acceptanceCriteria": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/acceptanceCriterion" } },
+        "requiredVerification": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicText" } },
+        "expectedReturnFormat": { "type": ["string", "null"], "maxLength": 2000 },
+        "context": { "$ref": "#/$defs/taskContext" },
+        "contextManifestId": { "type": ["string", "null"], "maxLength": 256 }
+      }
+    },
+    "contextReceiptProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "precedence", "envelopeId", "envelopeDigest"],
+      "properties": {
+        "source": { "type": "string", "enum": ["none", "explicit-envelope"] },
+        "precedence": {
+          "type": "array",
+          "maxItems": 2,
+          "items": {
+            "type": "string",
+            "enum": ["explicit-facts", "explicit-constraints"]
+          }
+        },
+        "envelopeId": {
+          "type": ["string", "null"],
+          "pattern": "^env-[a-f0-9]{24}$"
+        },
+        "envelopeDigest": {
+          "type": ["string", "null"],
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "contextReceiptBounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxFacts", "maxFactChars", "maxConstraints", "maxConstraintChars",
+        "effectiveMaxFacts", "effectiveMaxConstraints"
+      ],
+      "properties": {
+        "maxFacts": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "maxFactChars": { "type": "integer", "minimum": 0, "maximum": 2000 },
+        "maxConstraints": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "maxConstraintChars": { "type": "integer", "minimum": 0, "maximum": 2000 },
+        "effectiveMaxFacts": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "effectiveMaxConstraints": { "type": "integer", "minimum": 0, "maximum": 64 }
+      }
+    },
+    "ContextReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion", "packetId", "packetDigest", "mode", "provenance",
+        "factCount", "factsDigest", "constraintCount", "constraintsDigest",
+        "omissions", "bounds", "truncated", "hiddenRecordsExported",
+        "rolePolicyDigest", "logicalRoleId", "roleDigest", "providerProfileId",
+        "providerProfileVersion", "agentProfileDigest",
+        "allowedProviderToolIdsDigest", "deniedProviderToolIdsDigest",
+        "lineageWorkerId", "contextManifestId", "contextManifestDigest",
+        "effectivePromptDigest", "receiptDigest"
+      ],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "packetId": { "type": "string", "pattern": "^ctxpkt-[a-f0-9]{24}$" },
+        "packetDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "mode": { "type": "string", "enum": ["none", "explicit-envelope"] },
+        "provenance": { "$ref": "#/$defs/contextReceiptProvenance" },
+        "factCount": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "factsDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "constraintCount": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "constraintsDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "omissions": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "all-context-omitted", "hidden-system-instructions",
+              "developer-instructions", "raw-transcripts", "credentials",
+              "provider-session-ids", "user-request-body",
+              "default-objective-duplication", "secret-bearing-material",
+              "tool-records"
+            ]
+          }
+        },
+        "bounds": { "$ref": "#/$defs/contextReceiptBounds" },
+        "truncated": { "type": "boolean", "const": false },
+        "hiddenRecordsExported": { "type": "boolean", "const": false },
+        "rolePolicyDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "logicalRoleId": {
+          "type": "string",
+          "enum": ["explorer", "implementer", "reviewer", "security", "test"]
+        },
+        "roleDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "providerProfileId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+        "providerProfileVersion": { "type": "integer", "minimum": 1 },
+        "agentProfileDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "allowedProviderToolIdsDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "deniedProviderToolIdsDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "lineageWorkerId": { "$ref": "#/$defs/workerId" },
+        "contextManifestId": { "type": "string", "pattern": "^ctx-[a-f0-9]{24}$" },
+        "contextManifestDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "effectivePromptDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "receiptDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "none" } } },
+          "then": {
+            "properties": {
+              "provenance": {
+                "properties": {
+                  "source": { "const": "none" },
+                  "precedence": { "const": [] },
+                  "envelopeId": { "const": null },
+                  "envelopeDigest": { "const": null }
+                }
+              },
+              "factCount": { "const": 0 },
+              "factsDigest": {
+                "const": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+              },
+              "constraintCount": { "const": 0 },
+              "constraintsDigest": {
+                "const": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+              },
+              "omissions": { "const": ["all-context-omitted"] },
+              "bounds": {
+                "properties": {
+                  "maxFacts": { "const": 0 },
+                  "maxFactChars": { "const": 0 },
+                  "maxConstraints": { "const": 0 },
+                  "maxConstraintChars": { "const": 0 },
+                  "effectiveMaxFacts": { "const": 0 },
+                  "effectiveMaxConstraints": { "const": 0 }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "provenance": {
+                "properties": {
+                  "source": { "const": "explicit-envelope" },
+                  "precedence": {
+                    "const": ["explicit-facts", "explicit-constraints"]
+                  }
+                }
+              },
+              "omissions": {
+                "not": { "contains": { "const": "all-context-omitted" } },
+                "allOf": [
+                  { "contains": { "const": "hidden-system-instructions" } },
+                  { "contains": { "const": "developer-instructions" } },
+                  { "contains": { "const": "raw-transcripts" } },
+                  { "contains": { "const": "credentials" } },
+                  { "contains": { "const": "provider-session-ids" } },
+                  { "contains": { "const": "user-request-body" } },
+                  { "contains": { "const": "default-objective-duplication" } },
+                  { "contains": { "const": "secret-bearing-material" } },
+                  { "contains": { "const": "tool-records" } }
+                ]
+              },
+              "bounds": {
+                "properties": {
+                  "maxFacts": { "minimum": 1 },
+                  "maxFactChars": { "minimum": 1 },
+                  "maxConstraints": { "minimum": 1 },
+                  "maxConstraintChars": { "minimum": 1 },
+                  "effectiveMaxFacts": { "minimum": 1 },
+                  "effectiveMaxConstraints": { "minimum": 1 }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "materialization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "reasons", "submodules", "upstreamFreshness"],
+      "properties": {
+        "state": { "type": "string", "enum": ["local_complete", "partial", "unknown"] },
+        "reasons": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicText" } },
+        "submodules": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/publicText" } },
+        "upstreamFreshness": { "type": "string", "enum": ["verified", "not_checked"] }
+      }
+    },
+    "contextManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion", "manifestId", "digest", "capturedAt", "branch", "head",
+        "dirtyDigest", "dirtyEntryCount", "ignoredDigest", "ignoredEntryCount",
+        "trackedTreeIdentity", "metadataIdentity", "insideWorktree", "linkedWorktree",
+        "sparse", "shallow", "upstreamRef", "upstreamCommit", "upstreamFreshness",
+        "projectMarkers", "materialization"
+      ],
+      "properties": {
+        "schemaVersion": { "type": ["integer", "null"] },
+        "manifestId": { "type": ["string", "null"], "maxLength": 256 },
+        "digest": { "type": ["string", "null"], "maxLength": 256 },
+        "capturedAt": { "$ref": "#/$defs/isoDateTime" },
+        "branch": { "type": ["string", "null"], "maxLength": 256 },
+        "head": { "type": ["string", "null"], "maxLength": 256 },
+        "dirtyDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "dirtyEntryCount": { "type": "integer", "minimum": 0 },
+        "ignoredDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "ignoredEntryCount": { "type": "integer", "minimum": 0 },
+        "trackedTreeIdentity": { "type": ["string", "null"], "maxLength": 256 },
+        "metadataIdentity": { "type": ["string", "null"], "maxLength": 256 },
+        "insideWorktree": { "type": "boolean" },
+        "linkedWorktree": { "type": "boolean" },
+        "sparse": { "type": "boolean" },
+        "shallow": { "type": "boolean" },
+        "upstreamRef": { "type": ["string", "null"], "maxLength": 256 },
+        "upstreamCommit": { "type": ["string", "null"], "maxLength": 256 },
+        "upstreamFreshness": { "type": "string", "enum": ["verified", "not_checked"] },
+        "projectMarkers": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/publicPath" } },
+        "materialization": { "$ref": "#/$defs/materialization" }
+      }
+    },
+    "WorkerSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workerProtocolVersion",
+        "snapshotSchemaVersion",
+        "id",
+        "status",
+        "contextBindingMode",
+        "contextReceipt",
+        "terminal"
+      ],
+      "properties": {
+        "workerProtocolVersion": { "type": "integer", "const": 1 },
+        "snapshotSchemaVersion": { "type": "integer", "const": 1 },
+        "schemaVersion": { "type": ["integer", "null"] },
+        "id": { "$ref": "#/$defs/workerId" },
+        "kind": { "type": ["string", "null"], "maxLength": 128 },
+        "jobClass": { "type": ["string", "null"], "maxLength": 128 },
+        "write": { "type": "boolean" },
+        "status": { "type": "string", "enum": ["queued", "running", "completed", "failed", "cancelled", "unknown"] },
+        "phase": { "type": ["string", "null"], "maxLength": 128 },
+        "summary": { "type": ["string", "null"], "maxLength": 2000 },
+        "progress": { "type": ["string", "null"], "maxLength": 2000 },
+        "createdAt": { "$ref": "#/$defs/isoDateTime" },
+        "startedAt": { "$ref": "#/$defs/isoDateTime" },
+        "updatedAt": { "$ref": "#/$defs/isoDateTime" },
+        "completedAt": { "$ref": "#/$defs/isoDateTime" },
+        "heartbeatAt": { "$ref": "#/$defs/isoDateTime" },
+        "profileId": { "type": ["string", "null"], "maxLength": 256 },
+        "model": { "type": ["string", "null"], "maxLength": 256 },
+        "effort": { "type": ["string", "null"], "maxLength": 128 },
+        "parentWorkerId": { "type": ["string", "null"], "maxLength": 256 },
+        "lineageWorkerId": { "type": ["string", "null"], "maxLength": 256 },
+        "eventCursor": { "$ref": "#/$defs/WorkerEventCursor" },
+        "taskEnvelopeId": { "type": ["string", "null"], "maxLength": 256 },
+        "taskEnvelopeDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "contextManifestId": { "type": ["string", "null"], "maxLength": 256 },
+        "contextDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "workspaceSnapshotDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "hostTaskBinding": { "type": ["string", "null"], "maxLength": 256 },
+        "securityProfile": { "$ref": "#/$defs/securityProfile" },
+        "latestPlan": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "type": "string", "maxLength": 2000 }
+        },
+        "lifecycleEvents": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/WorkerEvent" }
+        },
+        "taskContract": { "anyOf": [{ "$ref": "#/$defs/taskContract" }, { "type": "null" }] },
+        "contextBindingMode": {
+          "type": ["string", "null"],
+          "enum": ["context-receipt-v1", null]
+        },
+        "contextReceipt": {
+          "anyOf": [
+            { "$ref": "#/$defs/ContextReceipt" },
+            { "type": "null" }
+          ]
+        },
+        "context": { "anyOf": [{ "$ref": "#/$defs/contextManifest" }, { "type": "null" }] },
+        "resumeJobId": { "type": ["string", "null"], "maxLength": 256 },
+        "result": {
+          "anyOf": [
+            { "$ref": "#/$defs/WorkerResult" },
+            { "type": "null" }
+          ]
+        },
+        "error": {
+          "anyOf": [
+            { "$ref": "#/$defs/WorkerError" },
+            { "type": "null" }
+          ]
+        },
+        "terminal": { "type": "boolean" },
+        "controlWorkspaceId": { "type": ["string", "null"], "maxLength": 256 },
+        "executionRootDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "roleId": { "type": ["string", "null"], "maxLength": 256 },
+        "externalWorkerLabel": { "type": ["string", "null"], "maxLength": 64 },
+        "awaitingHostAction": {
+          "anyOf": [
+            { "$ref": "#/$defs/awaitingHostAction" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "contextBindingMode": { "const": "context-receipt-v1" }
+            },
+            "required": ["contextBindingMode"]
+          },
+          "then": {
+            "properties": {
+              "contextReceipt": { "$ref": "#/$defs/ContextReceipt" }
+            }
+          },
+          "else": {
+            "properties": {
+              "contextReceipt": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
+    "CancellationReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receiptId", "workerId", "status", "requestAcceptedAt"],
+      "properties": {
+        "receiptId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "workerId": { "$ref": "#/$defs/workerId" },
+        "status": {
+          "type": "string",
+          "enum": ["accepted", "already_cancelled", "already_terminal"]
+        },
+        "requestAcceptedAt": { "type": "string", "maxLength": 64 },
+        "processGroupGoneAt": { "$ref": "#/$defs/isoDateTime" },
+        "terminalRecordCommittedAt": { "$ref": "#/$defs/isoDateTime" },
+        "idempotencyKeyDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "cancellationRequestSequence": { "type": ["integer", "null"] }
+      }
+    },
+    "DeliveryReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["messageId", "workerId", "state", "acceptedAt"],
+      "properties": {
+        "messageId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "workerId": { "$ref": "#/$defs/workerId" },
+        "state": {
+          "type": "string",
+          "enum": ["accepted", "pending", "delivered", "delivery_unknown", "rejected"]
+        },
+        "acceptedAt": { "type": "string", "maxLength": 64 },
+        "outcomeAt": { "type": ["string", "null"], "maxLength": 64 },
+        "idempotencyKeyDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "contentDigest": { "type": ["string", "null"], "maxLength": 256 },
+        "reason": { "type": ["string", "null"], "maxLength": 2000 }
+      }
+    }
+  }
+}

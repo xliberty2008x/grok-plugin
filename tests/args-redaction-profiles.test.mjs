@@ -111,6 +111,7 @@ test("execution profiles keep reviews immutable and grant writes only to write r
   assert.equal(readTask.transport, "acp");
   assert.equal(readTask.agent, "build");
   assert.equal(readTask.sandbox, "strict");
+  assert.equal(readTask.promptMode, "full");
   assert.match(readTask.agentProfileDigest, /^[a-f0-9]{64}$/);
   assert.deepEqual(readTask.allowedTools, ["read_file", "list_dir", "grep"]);
   assert.ok(!readTask.allowedTools.includes("write"));
@@ -118,6 +119,16 @@ test("execution profiles keep reviews immutable and grant writes only to write r
   const writeTask = profileFor("task", true);
   assert.equal(writeTask.sandbox, "strict");
   assert.equal(writeTask.permissionMode, "acceptEdits");
+  assert.equal(writeTask.promptMode, "extend");
+  assert.deepEqual(writeTask.completionRequirement, {
+    tool: "search_replace",
+    reminder: "A write task requires a real workspace edit. Continue the requested implementation and call search_replace before finishing.",
+    recovery: {
+      maxRetries: 1,
+      baseDelayMs: 100,
+      maxDelayMs: 100
+    }
+  });
   assert.match(writeTask.agentProfileDigest, /^[a-f0-9]{64}$/);
   assert.equal(writeTask.allowedTools.includes("run_terminal_cmd"), false);
   assert.ok(writeTask.allowedTools.includes("search_replace"));
@@ -125,8 +136,9 @@ test("execution profiles keep reviews immutable and grant writes only to write r
   const reportRepair = profileFor("report-repair");
   assert.equal(reportRepair.id, "rescue-report-v3");
   assert.equal(reportRepair.permissionMode, "dontAsk");
+  assert.equal(reportRepair.promptMode, "full");
   assert.match(reportRepair.agentProfileDigest, /^[a-f0-9]{64}$/);
-  assert.deepEqual(reportRepair.allowedTools, []);
+  assert.deepEqual(reportRepair.allowedTools, ["todo_write"]);
   for (const denied of ["Bash", "Edit", "Write"]) assert.ok(reportRepair.deniedTools.includes(denied));
 });
 
@@ -137,4 +149,18 @@ test("security-profile comparison ignores diagnostics but rejects privilege chan
   assert.equal(sameSecurityProfile(left, profileFor("task", true)), false);
   assert.equal(sameSecurityProfile(left, { ...left, webSearch: true }), false);
   assert.equal(sameSecurityProfile(left, { ...left, agentProfileDigest: "0".repeat(64) }), false);
+  const write = profileFor("task", true);
+  assert.equal(
+    sameSecurityProfile(write, {
+      ...write,
+      completionRequirement: {
+        ...write.completionRequirement,
+        recovery: {
+          ...write.completionRequirement.recovery,
+          maxRetries: 2
+        }
+      }
+    }),
+    false
+  );
 });

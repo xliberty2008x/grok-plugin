@@ -1,0 +1,166 @@
+{
+  "schemaVersion": 1,
+  "roadmapVersion": "1.0",
+  "recordType": "worker-broker-slice",
+  "issue": "https://github.com/xliberty2008x/grok-plugin/issues/25",
+  "pullRequest": "https://github.com/xliberty2008x/grok-plugin/pull/26",
+  "phase": "1",
+  "slice": "worker-protocol-and-read-only-broker",
+  "status": "verified_on_draft",
+  "recordedAt": "2026-07-16T10:21:12Z",
+  "releaseQualification": false,
+  "evidenceSystemQualification": false,
+  "provisionalSupportingRecord": true,
+  "source": {
+    "pluginVersion": "0.3.0-dev.1",
+    "foundationCommit": "bbae1948e91829ffe1b95e114072ec7bf78661f3",
+    "headCommit": "dcb78b87e61969f99fb2c9cb0f1452aaa454ede0",
+    "headTree": "99547ef79ecbfb9efe1c91327f5778122c94c13c",
+    "cleanTreeAtVerification": true
+  },
+  "installation": {
+    "method": "npm run codex:update-local",
+    "sourcePluginInventoryDigest": "55c1e08be8faeddf98d1d8edb77e833ad0c7f9727c7c5c79f87e6f83efd32f46",
+    "installedPluginInventoryDigest": "55c1e08be8faeddf98d1d8edb77e833ad0c7f9727c7c5c79f87e6f83efd32f46",
+    "installedFileCount": 71,
+    "sourceAndInstalledInventoriesEqual": true,
+    "privateInstallPathRecorded": false
+  },
+  "runtime": {
+    "platform": "macOS",
+    "architecture": "arm64",
+    "node": "25.5.0",
+    "git": "2.45.1",
+    "codexStandalone": "0.143.0",
+    "codexDesktopBundled": "0.144.2",
+    "grokBuild": "0.2.101",
+    "grokBuildRevision": "5bc4b5dfadcf"
+  },
+  "verification": [
+    {
+      "command": "npm run check",
+      "boundary": "source-provider-neutral",
+      "outcome": "pass",
+      "testsPassed": 227,
+      "testsSkipped": 1,
+      "testsFailed": 0,
+      "skipMeaning": "Expected authenticated-provider E2E skip; not provider qualification."
+    },
+    {
+      "command": "node --test tests/worker-service.test.mjs tests/mcp-worker-broker.test.mjs tests/worker-protocol.test.mjs tests/codex-support.test.mjs",
+      "boundary": "focused-source-provider-neutral",
+      "outcome": "pass",
+      "testsPassed": 24,
+      "testsSkipped": 0,
+      "testsFailed": 0
+    },
+    {
+      "command": "git diff --check",
+      "boundary": "source",
+      "outcome": "pass"
+    },
+    {
+      "command": "npm run codex:update-local",
+      "boundary": "installed-plugin-packaging-and-pty",
+      "outcome": "pass",
+      "assertions": [
+        "full source check passed",
+        "installed Codex PTY gate passed",
+        "cache refresh passed",
+        "source and installed plugin inventories matched"
+      ]
+    }
+  ],
+  "liveScenarios": [
+    {
+      "id": "standalone-codex-owned-list",
+      "boundary": "current-codex-mcp-identity-and-read-path",
+      "runtime": "Codex CLI 0.143.0",
+      "outcome": "pass"
+    },
+    {
+      "id": "standalone-codex-cross-task-known-id",
+      "boundary": "current-codex-mcp-task-isolation",
+      "runtime": "Codex CLI 0.143.0",
+      "expected": "Foreign known worker is observationally equivalent to a missing worker.",
+      "actual": "E_JOB_NOT_FOUND",
+      "outcome": "pass"
+    },
+    {
+      "id": "desktop-bundled-codex-owned-list",
+      "boundary": "current-desktop-codex-mcp-identity-and-read-path",
+      "runtime": "Codex Desktop bundled CLI 0.144.2",
+      "outcome": "pass"
+    },
+    {
+      "id": "fresh-installed-plugin-discovery-and-list",
+      "boundary": "installed-plugin-discovery-packaging-and-read-path",
+      "runtime": "fresh Codex task",
+      "actual": "Discovered grok_workers and called worker_list_owned.",
+      "outcome": "pass"
+    }
+  ],
+  "continuousIntegration": {
+    "workflowRun": "https://github.com/xliberty2008x/grok-plugin/actions/runs/29431061793",
+    "runId": 29431061793,
+    "outcome": "pass_with_skipped_protected_jobs",
+    "passedJobs": [
+      "Ubuntu Node 18.18.2",
+      "Ubuntu Node 22",
+      "macOS Node 18.18.2",
+      "macOS Node 22",
+      "Windows Node 18.18.2 provider-neutral",
+      "Windows Node 22 provider-neutral",
+      "PTY ingress Ubuntu",
+      "PTY ingress macOS"
+    ],
+    "skippedJobs": [
+      "Installed Codex self-hosted macOS",
+      "Natural Codex plus real Grok self-hosted macOS"
+    ],
+    "skippedJobsCountAsPassed": false
+  },
+  "authoritySeparation": {
+    "workerClaims": "Not used as authoritative verification.",
+    "runtimeObservations": "Durable sequences, public projections, read-only state access, and installed broker discovery were observed.",
+    "hostVerification": "Deterministic commands and installed packaging/PTY checks passed.",
+    "independentValidation": "Fresh native review recorded GO with no P0-P2 findings against dcb78b8; MCP protocol pinning was deferred for the read-only slice."
+  },
+  "delegation": {
+    "grokJobId": "task-fd5019e5ec5949d578f16e4b",
+    "outcome": "partial",
+    "summary": "Grok produced initial side-effect-free state-helper edits; main Codex inspected, corrected, completed, integrated, and verified the slice."
+  },
+  "supportedClaims": [
+    "provider-neutral Worker Protocol foundation on the referenced draft commits",
+    "current-Codex task/workspace identity behavior for the recorded live probes",
+    "plugin-bundled read-only MCP packaging and task-owned read isolation"
+  ],
+  "unsupportedClaims": [
+    "complete Phase 1",
+    "release qualification",
+    "authenticated natural Codex-to-Grok orchestration",
+    "stable public Codex MCP metadata contract",
+    "spawn or cancellation",
+    "broker restart without event loss or duplication",
+    "parent/subagent delegation",
+    "mailbox, worktree isolation, host UI, or native parity"
+  ],
+  "openGates": [
+    "publish complete WorkerEvent, WorkerResult, and WorkerError schemas",
+    "pin supported MCP protocol versions",
+    "freeze parent/subagent ownership semantics",
+    "implement idempotent spawn of read-only workers plus idempotent cancel",
+    "separate trusted reconciliation from model-callable broker requests",
+    "prove two-process restart and reconnect behavior",
+    "record exact-source authenticated natural-host evidence"
+  ],
+  "privacy": {
+    "rawPromptsStored": false,
+    "rawTranscriptsStored": false,
+    "credentialsStored": false,
+    "providerSessionIdsStored": false,
+    "privateProcessIdentityStored": false,
+    "privateFilesystemPathsStored": false
+  }
+}

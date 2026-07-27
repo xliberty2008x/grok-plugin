@@ -4,12 +4,34 @@ import path from "node:path";
 import { CompanionError } from "./errors.mjs";
 import { git } from "./workspace.mjs";
 import { redact, redactText, sanitizeDisplayText } from "./redact.mjs";
+import {
+  MAX_CONTEXT_CONSTRAINTS,
+  MAX_CONTEXT_CONSTRAINT_CHARS,
+  MAX_CONTEXT_FACTS,
+  MAX_CONTEXT_FACT_CHARS,
+  composeEffectiveProviderPrompt,
+  validateExplicitContextItems
+} from "./worker-context.mjs";
+import { validateProviderHostActionRequest } from "./worker-host-actions.mjs";
 
 const timestamp = () => new Date().toISOString();
 
 export const TASK_ENVELOPE_VERSION = 1;
 export const CONTEXT_MANIFEST_VERSION = 1;
 export const WORKER_REPORT_VERSION = 1;
+const WORKER_REPORT_REQUIRED_FIELDS = Object.freeze([
+  "outcome",
+  "summary",
+  "changedFiles",
+  "checksClaimed",
+  "acceptanceResults",
+  "risks",
+  "questions"
+]);
+const WORKER_REPORT_ALLOWED_FIELDS = Object.freeze([
+  ...WORKER_REPORT_REQUIRED_FIELDS,
+  "hostActionRequest"
+]);
 export const LIFECYCLE_EVENT_TYPES = Object.freeze([
   "task.accepted",
   "plan.updated",
@@ -17,9 +39,11 @@ export const LIFECYCLE_EVENT_TYPES = Object.freeze([
   "activity.completed",
   "checkpoint",
   "blocked",
-  "final.report"
+  "final.report",
+  "cancellation.requested"
 ]);
-const MAX_LIFECYCLE_EVENTS = 128;
+/** Bounded retention for durable lifecycle evidence (oldest entries are dropped first). */
+export const MAX_LIFECYCLE_EVENTS = 128;
 const MAX_TEXT = 16 * 1024;
 const MAX_USER_REQUEST = 64 * 1024;
 const MAX_LIST = 64;
@@ -41,9 +65,87 @@ const TASK_ENVELOPE_INPUT_KEYS = new Set([
   "requiredVerification",
   "expectedReturnFormat"
 ]);
+const TASK_ENVELOPE_KEYS = new Set([
+  "schemaVersion",
+  "userRequest",
+  "objective",
+  "mode",
+  "scope",
+  "context",
+  "nonGoals",
+  "acceptanceCriteria",
+  "requiredVerification",
+  "expectedReturnFormat",
+  "contextManifestId",
+  "envelopeId",
+  "digest"
+]);
 
 function sha(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+const SHA256_HEX = /^[a-f0-9]{64}$/;
+const CONTEXT_MANIFEST_ID = /^ctx-[a-f0-9]{24}$/;
+
+function retainedTextDigest(literal, existingDigest) {
+  if (typeof literal === "string") return sha(literal);
+  return SHA256_HEX.test(existingDigest || "") ? existingDigest : null;
+}
+
+/**
+ * Remove raw provider/request text before a job record is durably retained.
+ *
+ * Literal text is authoritative when present: its digest replaces any stale or
+ * forged pre-existing digest. Without a literal, only a well-formed SHA-256
+ * witness is retained. A default objective is another copy of userRequest, so
+ * replace it with the same digest; a distinct caller-supplied objective remains
+ * available as the bounded public task description.
+ */
+export function scrubStoredRequest(request) {
+  if (!request || typeof request !== "object" || Array.isArray(request)) return null;
+
+  const prompt = typeof request.prompt === "string" ? request.prompt : null;
+  const envelope = request.envelope && typeof request.envelope === "object" && !Array.isArray(request.envelope)
+    ? request.envelope
+    : null;
+  const userRequest = typeof envelope?.userRequest === "string" ? envelope.userRequest : null;
+  const userRequestDigest = retainedTextDigest(userRequest, envelope?.userRequestDigest);
+  const defaultObjective = userRequest !== null && envelope?.objective === userRequest;
+  const duplicatePublicObjective = userRequest !== null && request.publicObjective === userRequest;
+
+  return {
+    ...request,
+    prompt: null,
+    promptDigest: retainedTextDigest(prompt, request.promptDigest),
+    ...(duplicatePublicObjective ? { publicObjective: null } : {}),
+    envelope: envelope ? {
+      ...envelope,
+      userRequest: null,
+      userRequestDigest,
+      ...(defaultObjective ? { objective: userRequestDigest } : {})
+    } : null
+  };
+}
+
+/** Normalize the request and any title derived from its default objective. */
+export function scrubStoredJob(job) {
+  if (!job || typeof job !== "object" || Array.isArray(job)) return null;
+  const userRequest = typeof job.request?.envelope?.userRequest === "string"
+    ? job.request.envelope.userRequest
+    : null;
+  const defaultTitle = userRequest !== null
+    && typeof job.title === "string"
+    && job.title === userRequest.slice(0, 100);
+  const request = scrubStoredRequest(job.request);
+  const digest = request?.envelope?.userRequestDigest;
+  return {
+    ...job,
+    request,
+    ...(defaultTitle && SHA256_HEX.test(digest || "")
+      ? { title: `task:${digest.slice(0, 24)}` }
+      : {})
+  };
 }
 
 function clip(value, limit = MAX_TEXT) {
@@ -115,6 +217,96 @@ function canonicalJson(value) {
 }
 
 /**
+ * Code-owned JSON Schema passed through Grok Build's ACP `outputSchema`
+ * extension. Grok performs the first structural validation; the broker still
+ * owns semantic validation, exact acceptance-ID accounting, scope checks, and
+ * host verification.
+ */
+export function buildWorkerReportOutputSchema(acceptanceCriteria = []) {
+  const criteria = Array.isArray(acceptanceCriteria)
+    ? acceptanceCriteria.slice(0, MAX_LIST)
+    : [];
+  const acceptanceIds = criteria
+    .map((criterion) => criterion?.id)
+    .filter((id) => typeof id === "string" && id.length > 0);
+  const acceptanceItem = {
+    type: "object",
+    additionalProperties: false,
+    required: ["id", "status"],
+    properties: {
+      id: acceptanceIds.length
+        ? { type: "string", enum: acceptanceIds }
+        : { type: "string", minLength: 1, maxLength: 80 },
+      status: {
+        type: "string",
+        enum: ["met", "unmet", "unknown"]
+      },
+      note: { type: "string", maxLength: MAX_ITEM }
+    }
+  };
+  return Object.freeze({
+    type: "object",
+    additionalProperties: false,
+    required: [...WORKER_REPORT_REQUIRED_FIELDS, "hostActionRequest"],
+    properties: {
+      outcome: {
+        type: "string",
+        enum: ["complete", "partial", "blocked"]
+      },
+      summary: {
+        type: "string",
+        minLength: 1,
+        maxLength: 2000
+      },
+      changedFiles: {
+        type: "array",
+        maxItems: 200,
+        items: { type: "string", minLength: 1, maxLength: 1024 }
+      },
+      checksClaimed: {
+        type: "array",
+        maxItems: MAX_LIST,
+        items: { type: "string", maxLength: MAX_ITEM }
+      },
+      acceptanceResults: {
+        type: "array",
+        minItems: acceptanceIds.length,
+        maxItems: acceptanceIds.length || MAX_LIST,
+        items: acceptanceItem
+      },
+      risks: {
+        type: "array",
+        maxItems: MAX_LIST,
+        items: { type: "string", maxLength: MAX_ITEM }
+      },
+      questions: {
+        type: "array",
+        maxItems: MAX_LIST,
+        items: { type: "string", maxLength: MAX_ITEM }
+      },
+      hostActionRequest: {
+        anyOf: [
+          { type: "null" },
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["schemaVersion", "kind", "requestedRoleId"],
+            properties: {
+              schemaVersion: { const: 1 },
+              kind: { const: "role_admission" },
+              requestedRoleId: {
+                type: "string",
+                enum: ["reviewer", "security", "test", "implementer"]
+              }
+            }
+          }
+        ]
+      }
+    }
+  });
+}
+
+/**
  * Build TaskEnvelope v1 from structured fields or plain-text CLI task input.
  * Plain-text paths remain compatible by constructing a default envelope.
  */
@@ -133,6 +325,8 @@ export function buildTaskEnvelope({
   contextManifestId = null
 } = {}) {
   const request = boundedLiteral(userRequest, "userRequest");
+  const resolvedObjective = clip(String(objective ?? request).trim() || request);
+  const defaultObjective = objective == null ? resolvedObjective : null;
   const resolvedMode = mode === "write" ? "write" : "read";
   const criteria = normalizeAcceptance(
     acceptanceCriteria?.length
@@ -144,18 +338,48 @@ export function buildTaskEnvelope({
     if (acceptanceIds.has(criterion.id)) throw new CompanionError("E_USAGE", `Duplicate acceptance criterion ID ${criterion.id}.`);
     acceptanceIds.add(criterion.id);
   }
+  const explicitFacts = validateExplicitContextItems(
+    context?.facts ?? contextFacts,
+    {
+      name: "context.facts",
+      maxItems: MAX_CONTEXT_FACTS,
+      maxChars: MAX_CONTEXT_FACT_CHARS
+    }
+  );
+  const explicitConstraints = validateExplicitContextItems(
+    context?.constraints ?? constraints,
+    {
+      name: "context.constraints",
+      maxItems: MAX_CONTEXT_CONSTRAINTS,
+      maxChars: MAX_CONTEXT_CONSTRAINT_CHARS
+    }
+  );
+  for (const [name, items] of [
+    ["context.facts", explicitFacts],
+    ["context.constraints", explicitConstraints]
+  ]) {
+    const duplicate = items.findIndex((item) => (
+      item === request || (defaultObjective !== null && item === defaultObjective)
+    ));
+    if (duplicate >= 0) {
+      throw new CompanionError(
+        "E_POLICY",
+        `${name}[${duplicate}] duplicates the literal user request/default objective.`
+      );
+    }
+  }
   const envelope = {
     schemaVersion: TASK_ENVELOPE_VERSION,
     userRequest: request,
-    objective: clip(String(objective ?? request).trim() || request),
+    objective: resolvedObjective,
     mode: resolvedMode,
     scope: {
       include: asStringList(scope?.include),
       exclude: asStringList(scope?.exclude)
     },
     context: {
-      facts: asStringList(context?.facts ?? contextFacts),
-      constraints: asStringList(context?.constraints ?? constraints),
+      facts: explicitFacts,
+      constraints: explicitConstraints,
       expectedProjectMarkers: asStringList(context?.expectedProjectMarkers, { max: 32 }),
       requiredPaths: asRepositoryPathList(context?.requiredPaths, "context.requiredPaths"),
       workspaceState: ["complete", "task_scoped", "unknown"].includes(context?.workspaceState)
@@ -168,7 +392,7 @@ export function buildTaskEnvelope({
     requiredVerification: asStringList(requiredVerification),
     expectedReturnFormat: clip(
       expectedReturnFormat
-        || "End with GROK_WORKER_REPORT: followed by one JSON object containing outcome, summary, changedFiles, checksClaimed, acceptanceResults, risks, and questions."
+        || "Return one Worker Report JSON object containing outcome, summary, changedFiles, checksClaimed, acceptanceResults, risks, questions, and hostActionRequest. The runtime requests native structured output; only when that channel is unavailable, prefix the fallback object with GROK_WORKER_REPORT:."
     ),
     contextManifestId: contextManifestId || null
   };
@@ -178,6 +402,75 @@ export function buildTaskEnvelope({
     envelopeId: `env-${digest.slice(0, 24)}`,
     digest
   };
+}
+
+function taskEnvelopeSchemaError() {
+  return new CompanionError(
+    "E_SCHEMA",
+    "TaskEnvelope does not match its canonical versioned contract."
+  );
+}
+
+function taskEnvelopeBuilderInput(envelope, contextManifestId = envelope?.contextManifestId ?? null) {
+  return {
+    userRequest: envelope.userRequest,
+    objective: envelope.objective,
+    mode: envelope.mode,
+    scope: envelope.scope,
+    context: envelope.context,
+    nonGoals: envelope.nonGoals,
+    acceptanceCriteria: envelope.acceptanceCriteria,
+    requiredVerification: envelope.requiredVerification,
+    expectedReturnFormat: envelope.expectedReturnFormat,
+    contextManifestId
+  };
+}
+
+/**
+ * Validate an executable TaskEnvelope before it enters durable launch state.
+ *
+ * Canonically rebuilding the envelope enforces the same key, type, bound,
+ * normalization, digest, and envelope-id contract used by the sole builder.
+ * Privacy-scrubbed durable envelopes are deliberately not accepted here: this
+ * boundary is for a new executable request while its literal text is present.
+ */
+export function assertTaskEnvelope(envelope) {
+  try {
+    if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+      throw taskEnvelopeSchemaError();
+    }
+    const keys = Object.keys(envelope);
+    if (keys.length !== TASK_ENVELOPE_KEYS.size
+      || keys.some((key) => !TASK_ENVELOPE_KEYS.has(key))
+      || envelope.schemaVersion !== TASK_ENVELOPE_VERSION
+      || typeof envelope.userRequest !== "string"
+      || typeof envelope.objective !== "string"
+      || !["read", "write"].includes(envelope.mode)
+      || (envelope.contextManifestId !== null
+        && !CONTEXT_MANIFEST_ID.test(envelope.contextManifestId || ""))
+      || typeof envelope.expectedReturnFormat !== "string"
+      || !/^env-[a-f0-9]{24}$/.test(envelope.envelopeId || "")
+      || !SHA256_HEX.test(envelope.digest || "")) {
+      throw taskEnvelopeSchemaError();
+    }
+    const rebuilt = buildTaskEnvelope(taskEnvelopeBuilderInput(envelope));
+    if (canonicalJson(envelope) !== canonicalJson(rebuilt)) {
+      throw taskEnvelopeSchemaError();
+    }
+    return envelope;
+  } catch (error) {
+    if (error instanceof CompanionError && error.code === "E_SCHEMA") throw error;
+    throw taskEnvelopeSchemaError();
+  }
+}
+
+/** Rebuild a validated envelope after binding the trusted context identity. */
+export function bindTaskEnvelopeContext(envelope, contextManifestId) {
+  const validated = assertTaskEnvelope(envelope);
+  if (typeof contextManifestId !== "string" || !contextManifestId) {
+    throw taskEnvelopeSchemaError();
+  }
+  return buildTaskEnvelope(taskEnvelopeBuilderInput(validated, contextManifestId));
 }
 
 /** Parse and validate the bounded JSON object accepted by --envelope-stdin. */
@@ -679,15 +972,57 @@ export function assertContextCompatible(root, expected, { mode = "execute" } = {
   return current;
 }
 
+/**
+ * Assign strictly increasing integer sequences to lifecycle events.
+ * Legacy entries without a sequence receive deterministic 1..n values in array order.
+ * Existing valid sequences are preserved when they remain strictly increasing.
+ */
+export function normalizeLifecycleEventSequences(events) {
+  if (!Array.isArray(events) || events.length === 0) return [];
+  let lastSequence = 0;
+  return events.map((event) => {
+    const base = event && typeof event === "object" && !Array.isArray(event)
+      ? { ...event }
+      : { type: "checkpoint", at: null, summary: "" };
+    const provided = base.sequence;
+    let sequence;
+    if (Number.isSafeInteger(provided) && provided > lastSequence) {
+      sequence = provided;
+    } else {
+      if (lastSequence >= Number.MAX_SAFE_INTEGER) {
+        throw new CompanionError("E_STATE", "Lifecycle event sequence space is exhausted.");
+      }
+      sequence = lastSequence + 1;
+    }
+    lastSequence = sequence;
+    return { ...base, sequence };
+  });
+}
+
+/**
+ * Append a typed lifecycle event with a durable monotonic sequence number.
+ * Retention keeps the newest MAX_LIFECYCLE_EVENTS entries; sequences of retained
+ * events are unchanged so cursors survive normal append/restart behavior.
+ */
 export function appendLifecycleEvent(events, type, summary, detail = undefined) {
   if (!LIFECYCLE_EVENT_TYPES.includes(type)) {
     throw new CompanionError("E_STATE", `Unknown lifecycle event type ${type}.`);
   }
-  const list = Array.isArray(events) ? events.slice(-MAX_LIFECYCLE_EVENTS + 1) : [];
+  const normalized = normalizeLifecycleEventSequences(Array.isArray(events) ? events : []);
+  const list = normalized.length >= MAX_LIFECYCLE_EVENTS
+    ? normalized.slice(-(MAX_LIFECYCLE_EVENTS - 1))
+    : normalized.slice();
+  const lastSequence = list.length
+    ? list[list.length - 1].sequence
+    : (normalized.length ? normalized[normalized.length - 1].sequence : 0);
+  if (lastSequence >= Number.MAX_SAFE_INTEGER) {
+    throw new CompanionError("E_STATE", "Lifecycle event sequence space is exhausted.");
+  }
   const entry = {
     type,
     at: timestamp(),
-    summary: clip(redactText(summary || type), 500)
+    summary: clip(redactText(summary || type), 500),
+    sequence: lastSequence + 1
   };
   if (detail !== undefined) entry.detail = redact(boundLifecycleDetail(detail));
   list.push(entry);
@@ -717,25 +1052,49 @@ function boundLifecycleDetail(detail) {
  * Build a structured final worker report from provider output.
  * Interim message text must not be passed here.
  */
-export function buildWorkerReport({
-  providerText = "",
-  outcome = null,
-  summary = null,
-  changedFiles = null,
-  checksClaimed = null,
-  acceptanceResults = null,
-  risks = null,
-  questions = null,
-  acceptanceCriteria = []
-} = {}) {
-  const parsedReport = parseStructuredWorkerPayload(providerText);
+export function buildWorkerReport(options = {}) {
+  const {
+    providerText = "",
+    outcome = null,
+    summary = null,
+    changedFiles = null,
+    checksClaimed = null,
+    acceptanceResults = null,
+    risks = null,
+    questions = null,
+    hostActionRequest = undefined,
+    acceptanceCriteria = [],
+    nativeStructuredOutput = undefined,
+    nativeStructuredOutputError = undefined
+  } = options;
+  const nativeOutputPresent = Object.hasOwn(options, "nativeStructuredOutput");
+  const nativeErrorPresent = Object.hasOwn(options, "nativeStructuredOutputError");
+  const nativeOutputValidShape = nativeStructuredOutput
+    && typeof nativeStructuredOutput === "object"
+    && !Array.isArray(nativeStructuredOutput);
+  const nativeShapeIssues = [];
+  if (nativeOutputPresent && nativeErrorPresent) {
+    nativeShapeIssues.push("ACP returned both structured output and a structured-output error.");
+  } else if (nativeErrorPresent) {
+    nativeShapeIssues.push("Grok Build could not produce schema-valid structured output.");
+  } else if (nativeOutputPresent && !nativeOutputValidShape) {
+    nativeShapeIssues.push("ACP structured output must be a Worker Report object.");
+  }
+  const parsedReport = nativeOutputPresent && !nativeErrorPresent && nativeOutputValidShape
+    ? {
+        value: nativeStructuredOutput,
+        markerPresent: true,
+        source: "acp-structured"
+      }
+    : (!nativeOutputPresent && !nativeErrorPresent
+        ? parseStructuredWorkerPayload(providerText)
+        : null);
   const parsed = parsedReport?.value || null;
   const text = clip(String(providerText || "").trim());
-  const requiredFields = ["outcome", "summary", "changedFiles", "checksClaimed", "acceptanceResults", "risks", "questions"];
-  const allowedFields = new Set(requiredFields);
+  const allowedFields = new Set(WORKER_REPORT_ALLOWED_FIELDS);
   const shapeIssues = [];
   if (parsed) {
-    for (const field of requiredFields) if (!Object.hasOwn(parsed, field)) shapeIssues.push(`Structured worker report omitted ${field}.`);
+    for (const field of WORKER_REPORT_REQUIRED_FIELDS) if (!Object.hasOwn(parsed, field)) shapeIssues.push(`Structured worker report omitted ${field}.`);
     for (const field of Object.keys(parsed)) if (!allowedFields.has(field)) shapeIssues.push(`Structured worker report included unsupported field ${field}.`);
     if (typeof parsed.summary !== "string" || !parsed.summary.trim()) shapeIssues.push("Structured worker report summary must be a non-empty string.");
     for (const field of ["changedFiles", "checksClaimed", "acceptanceResults", "risks", "questions"]) {
@@ -755,20 +1114,46 @@ export function buildWorkerReport({
   const questionsList = asStringList(questions ?? parsed?.questions);
   const criteria = Array.isArray(acceptanceCriteria) ? acceptanceCriteria : [];
   const normalizedAcceptance = normalizeAcceptanceResults(acceptanceResults ?? parsed?.acceptanceResults, criteria);
+  const hostActionPresent = hostActionRequest !== undefined
+    || Boolean(parsed && Object.hasOwn(parsed, "hostActionRequest"));
+  const normalizedHostAction = validateProviderHostActionRequest(
+    hostActionRequest !== undefined ? hostActionRequest : parsed?.hostActionRequest,
+    { present: hostActionPresent }
+  );
   const requestedOutcome = ["complete", "partial", "blocked"].includes(outcome)
     ? outcome
     : ["complete", "partial", "blocked"].includes(parsed?.outcome)
       ? parsed.outcome
       : null;
-  const validationIssues = [...shapeIssues, ...normalizedPaths.issues, ...normalizedAcceptance.issues];
+  const validationIssues = [
+    ...nativeShapeIssues,
+    ...shapeIssues,
+    ...normalizedPaths.issues,
+    ...normalizedAcceptance.issues,
+    ...normalizedHostAction.issues
+  ];
   if (parsed && !requestedOutcome) validationIssues.push("Structured worker report omitted a valid outcome.");
-  if (!parsed) validationIssues.push("Provider did not return a GROK_WORKER_REPORT JSON object.");
-  else if (!parsedReport.markerPresent) validationIssues.push("Provider returned JSON without the required GROK_WORKER_REPORT marker.");
+  if (!parsed && !nativeOutputPresent && !nativeErrorPresent) {
+    validationIssues.push("Provider did not return a GROK_WORKER_REPORT JSON object.");
+  } else if (parsed && parsedReport.source !== "acp-structured" && !parsedReport.markerPresent) {
+    validationIssues.push("Provider returned JSON without the required GROK_WORKER_REPORT marker.");
+  }
   const resolvedOutcome = requestedOutcome || "partial";
-  return {
+  const reportSource = parsedReport?.source === "acp-structured"
+    ? "acp-structured"
+    : nativeErrorPresent
+      ? "acp-structured-error"
+      : parsedReport?.markerPresent
+        ? "text-marker"
+        : "text-unmarked";
+  const report = {
     schemaVersion: WORKER_REPORT_VERSION,
-    structured: Boolean(parsedReport?.markerPresent),
-    valid: Boolean(parsedReport?.markerPresent) && validationIssues.length === 0,
+    structured: parsedReport?.source === "acp-structured"
+      || Boolean(parsedReport?.markerPresent),
+    valid: (
+      parsedReport?.source === "acp-structured"
+      || Boolean(parsedReport?.markerPresent)
+    ) && validationIssues.length === 0,
     outcome: resolvedOutcome,
     summary: resolvedSummary,
     changedFiles: files,
@@ -776,11 +1161,32 @@ export function buildWorkerReport({
     acceptanceResults: normalizedAcceptance.results,
     risks: risksList,
     questions: questionsList,
-    validationIssues
+    ...(hostActionPresent && normalizedHostAction.ok
+      ? { hostActionRequest: normalizedHostAction.value }
+      : {}),
+    validationIssues,
+    reportSource,
+    reportDigest: null
   };
+  if (report.valid) {
+    report.reportDigest = sha(canonicalJson({
+      schemaVersion: report.schemaVersion,
+      outcome: report.outcome,
+      summary: report.summary,
+      changedFiles: report.changedFiles,
+      checksClaimed: report.checksClaimed,
+      acceptanceResults: report.acceptanceResults,
+      risks: report.risks,
+      questions: report.questions,
+      ...(Object.hasOwn(report, "hostActionRequest")
+        ? { hostActionRequest: report.hostActionRequest }
+        : {})
+    }));
+  }
+  return report;
 }
 
-/** Build one same-session, no-tool repair turn for a malformed final worker report. */
+/** Build one same-session, no-tool-use repair turn for a malformed final worker report. */
 export function composeWorkerReportRepairPrompt(envelope, report) {
   const criteria = Array.isArray(envelope?.acceptanceCriteria) ? envelope.acceptanceCriteria : [];
   const acceptanceTemplate = criteria.map((criterion) => ({
@@ -795,7 +1201,8 @@ export function composeWorkerReportRepairPrompt(envelope, report) {
     checksClaimed: ["only checks actually run with available tools"],
     acceptanceResults: acceptanceTemplate,
     risks: ["remaining risk"],
-    questions: ["blocking question"]
+    questions: ["blocking question"],
+    hostActionRequest: null
   };
   const issues = asStringList(report?.validationIssues, { max: 20 });
   return [
@@ -803,7 +1210,7 @@ export function composeWorkerReportRepairPrompt(envelope, report) {
     "Do not call tools, inspect files, modify the workspace, or repeat implementation.",
     `The previous report was invalid: ${issues.join("; ") || "required report marker/schema missing"}.`,
     "Return exactly one line. It must begin with GROK_WORKER_REPORT: followed immediately by one JSON object.",
-    "Use exactly the seven keys shown below, no Markdown fence, no prose before or after, and exactly one acceptance result for every supplied ID. Choose outcome from complete, partial, or blocked; choose each status from met, unmet, or unknown.",
+    "Use exactly the eight keys shown below, no Markdown fence, no prose before or after, and exactly one acceptance result for every supplied ID. Choose outcome from complete, partial, or blocked; choose each status from met, unmet, or unknown. hostActionRequest must be null unless the worker is requesting one future read-only role admission.",
     `GROK_WORKER_REPORT: ${JSON.stringify(template)}`
   ].join("\n");
 }
@@ -1135,7 +1542,28 @@ function observeIgnoredDrift(preGit, postGit, changed, { observer }) {
 /**
  * Compose the provider prompt from a TaskEnvelope without putting envelope JSON on argv.
  */
-export function composeProviderPrompt(envelope, { root, constraints = null, contextManifest = null } = {}) {
+export function composeProviderPrompt(envelope, {
+  root,
+  constraints = null,
+  contextManifest = null,
+  contextPacket = null,
+  runtimeRolePolicy = null
+} = {}) {
+  if (contextPacket !== null || runtimeRolePolicy !== null) {
+    if (constraints !== null || contextPacket === null || runtimeRolePolicy === null) {
+      throw new CompanionError(
+        "E_STATE",
+        "Receipt-backed provider prompt requires one packet/policy pair and no prompt override."
+      );
+    }
+    return composeEffectiveProviderPrompt({
+      envelope,
+      contextPacket,
+      rolePolicy: runtimeRolePolicy,
+      contextManifest,
+      root
+    });
+  }
   const context = envelope.context || { facts: [], constraints: [], expectedProjectMarkers: [], requiredPaths: [], workspaceState: "unknown", upstreamFreshness: "not_checked" };
   const facts = Array.isArray(context.facts) ? context.facts : [];
   const hostConstraints = Array.isArray(context.constraints) ? context.constraints : [];
@@ -1165,7 +1593,7 @@ export function composeProviderPrompt(envelope, { root, constraints = null, cont
     `Non-goals:\n${envelope.nonGoals.length ? envelope.nonGoals.map((item) => `- ${item}`).join("\n") : "(none)"}`,
     `Acceptance criteria:\n${envelope.acceptanceCriteria.map((item) => `- ${item.id}: ${item.text}`).join("\n")}`,
     `Host-owned verification after your return:\n${envelope.requiredVerification.length ? envelope.requiredVerification.map((item) => `- ${item}`).join("\n") : "(host will choose authoritative checks; claim only evidence your available tools actually produced)"}`,
-    `Expected return format:\n${envelope.expectedReturnFormat}\nThe GROK_WORKER_REPORT object must be the final content in your response. Do not put progress prose after it.`,
+    `Expected return format:\n${envelope.expectedReturnFormat}\nReturn the Worker Report object as the final response through the runtime's native structured-output channel. Do not prefix native JSON with GROK_WORKER_REPORT:. Only if native structured output is unavailable, use GROK_WORKER_REPORT: followed by the object. Do not put progress prose after the final object.`,
     `Context-manifest identity: ${envelope.contextManifestId || "unbound"}`,
     `Context-manifest summary: ${manifestSummary}`
   ];

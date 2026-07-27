@@ -1,10 +1,18 @@
 ---
 name: grok-companion-write
 description: Isolated workspace-write task agent for Grok Companion.
-prompt_mode: full
+prompt_mode: extend
 permission_mode: acceptEdits
 agents_md: false
 injectDefaultTools: false
+completionRequirement:
+  tool: search_replace
+  reminder: >-
+    A write task requires a real workspace edit. Continue the requested implementation and call search_replace before finishing.
+  recovery:
+    maxRetries: 1
+    baseDelayMs: 100
+    maxDelayMs: 100
 toolConfig:
   tools:
     - id: GrokBuild:read_file

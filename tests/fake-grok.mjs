@@ -49,6 +49,13 @@ function nextPromptNumber(binary) {
   return state.prompts;
 }
 
+function sessionsStoreFile(binary, config) {
+  if (config.sessionsStoreByGrokHome && process.env.GROK_HOME) {
+    return path.join(process.env.GROK_HOME, "sessions.json");
+  }
+  return `${binary}.sessions.json`;
+}
+
 function reviewValue(config) {
   const value = config.review ?? {
     summary: "No material findings in the fake review.",
@@ -61,6 +68,22 @@ function reviewValue(config) {
 
 function reviewJson(config) {
   return JSON.stringify(reviewValue(config));
+}
+
+function workerReportValue(text) {
+  const source = String(text || "").trim();
+  const marker = source.lastIndexOf("GROK_WORKER_REPORT:");
+  const candidate = marker >= 0
+    ? source.slice(marker + "GROK_WORKER_REPORT:".length).trim()
+    : source;
+  try {
+    const value = JSON.parse(candidate);
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function send(message) {
@@ -133,13 +156,33 @@ async function serveAcp(binary, config) {
 
     if (message.method === "session/new") {
       currentSession = config.sessionId ?? "fake-session-00000001";
-      send({ jsonrpc: "2.0", id: message.id, result: { sessionId: currentSession, models: {} } });
+      const response = {
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { sessionId: currentSession, models: {} }
+      };
+      if (Number.isSafeInteger(config.sessionResponseDelayMs)
+        && config.sessionResponseDelayMs > 0) {
+        setTimeout(() => send(response), config.sessionResponseDelayMs);
+      } else {
+        send(response);
+      }
       return;
     }
 
     if (message.method === "session/load") {
       currentSession = message.params?.sessionId;
-      send({ jsonrpc: "2.0", id: message.id, result: { sessionId: currentSession, models: {} } });
+      const response = {
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { sessionId: currentSession, models: {} }
+      };
+      if (Number.isSafeInteger(config.sessionResponseDelayMs)
+        && config.sessionResponseDelayMs > 0) {
+        setTimeout(() => send(response), config.sessionResponseDelayMs);
+      } else {
+        send(response);
+      }
       return;
     }
 
@@ -156,7 +199,9 @@ async function serveAcp(binary, config) {
         return;
       }
 
-      if (config.cancelMode === "wait") {
+      if (config.cancelMode === "wait"
+        && (!Number.isSafeInteger(config.cancelModeOnPrompt)
+          || config.cancelModeOnPrompt === promptNumber)) {
         heldPrompt = { id: message.id, sessionId: currentSession };
         update(currentSession, {
           sessionUpdate: "agent_message_chunk",
@@ -217,12 +262,42 @@ async function serveAcp(binary, config) {
         });
       }
 
+      const outputSchemaRequested = Boolean(
+        message.params?._meta?.outputSchema
+        && typeof message.params._meta.outputSchema === "object"
+        && !Array.isArray(message.params._meta.outputSchema)
+      );
+      const configuredStructuredOutput = Array.isArray(config.structuredOutputs)
+        ? config.structuredOutputs[promptNumber - 1]
+        : config.structuredOutput;
+      const configuredStructuredError = Array.isArray(config.structuredOutputErrors)
+        ? config.structuredOutputErrors[promptNumber - 1]
+        : config.structuredOutputError;
+      const structuredOutput = configuredStructuredOutput === undefined
+        ? workerReportValue(text)
+        : configuredStructuredOutput;
+      const structuredMeta = outputSchemaRequested
+        ? (typeof configuredStructuredError === "string" && configuredStructuredError
+            ? { structuredOutputError: configuredStructuredError }
+            : structuredOutput !== undefined
+              ? { structuredOutput }
+              : {
+                  structuredOutputError:
+                    "fake provider could not produce schema-valid structured output"
+                })
+        : null;
       const finish = () => send({
         jsonrpc: "2.0",
         id: message.id,
-        result: { stopReason: config.stopReason ?? "end_turn" }
+        result: {
+          stopReason: config.stopReason ?? "end_turn",
+          ...(structuredMeta ? { _meta: structuredMeta } : {})
+        }
       });
-      if (config.delayMs) setTimeout(finish, config.delayMs);
+      const delayMs = Array.isArray(config.delayMsByPrompt)
+        ? config.delayMsByPrompt[promptNumber - 1]
+        : config.delayMs;
+      if (Number.isSafeInteger(delayMs) && delayMs > 0) setTimeout(finish, delayMs);
       else finish();
       return;
     }
@@ -263,11 +338,31 @@ function optionValue(args, name) {
   return index >= 0 ? args[index + 1] ?? null : null;
 }
 
-function stubbornDescendant(config, transport) {
-  const child = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});process.on('SIGHUP',()=>{});setInterval(()=>{},1000)"], {
+async function stubbornDescendant(config, transport) {
+  const child = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});process.on('SIGHUP',()=>{});process.send?.({ready:true});setInterval(()=>{},1000)"], {
     detached: false,
-    stdio: "ignore"
+    stdio: ["ignore", "ignore", "ignore", "ipc"]
   });
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      child.off("message", onMessage);
+      child.off("error", onError);
+      child.off("exit", onExit);
+      callback(value);
+    };
+    const onMessage = (message) => {
+      if (message?.ready === true) finish(resolve);
+    };
+    const onError = (error) => finish(reject, error);
+    const onExit = (code, signal) => finish(reject, new Error(`Stubborn descendant exited before readiness (${code ?? signal}).`));
+    child.on("message", onMessage);
+    child.once("error", onError);
+    child.once("exit", onExit);
+  });
+  if (child.connected) child.disconnect();
   child.unref();
   appendLog(config, { event: "descendant", transport, pid: child.pid, processGroupId: process.pid });
   return child;
@@ -282,7 +377,7 @@ async function serveHeadless(binary, config, args) {
   const sessionId = config.headlessSessionId || resumeSessionId || optionValue(args, "--session-id") || "fake-headless-session-00000001";
   appendLog(config, { event: "headless", promptNumber, prompt, sessionId, structured, args });
   appendLog(config, { event: "prompt", promptNumber, prompt, sessionId, transport: "headless" });
-  if (config.headlessSpawnStubbornDescendant) stubbornDescendant(config, "headless");
+  if (config.headlessSpawnStubbornDescendant) await stubbornDescendant(config, "headless");
 
   if (config.headlessStderr) process.stderr.write(config.headlessStderr);
   if (config.headlessExitCode) {
@@ -370,6 +465,9 @@ async function main() {
   if (args[0] === "inspect" && args[1] === "--json") {
     const authFile = process.env.GROK_HOME ? path.join(process.env.GROK_HOME, "auth.json") : null;
     appendLog(effective, { event: "inspect-environment", home: process.env.HOME, grokHome: process.env.GROK_HOME, config: process.env.GROK_HOME && fs.existsSync(path.join(process.env.GROK_HOME, "config.toml")) ? fs.readFileSync(path.join(process.env.GROK_HOME, "config.toml"), "utf8") : null, authExists: Boolean(authFile && fs.existsSync(authFile)), authMode: authFile && fs.existsSync(authFile) ? fs.statSync(authFile).mode & 0o777 : null });
+    if (Number.isSafeInteger(effective.inspectDelayMs) && effective.inspectDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, effective.inspectDelayMs));
+    }
     let inspectValue = effective.inspectValue;
     if (!inspectValue && effective.inspectBundledSkill && process.env.GROK_HOME) {
       const skills = [
@@ -387,11 +485,15 @@ async function main() {
   }
 
   if (args[0] === "models") {
+    const authFile = process.env.GROK_HOME
+      ? path.join(process.env.GROK_HOME, "auth.json")
+      : null;
     appendLog(effective, {
       event: "models",
       home: process.env.HOME || null,
       userProfile: process.env.USERPROFILE || null,
-      grokHome: process.env.GROK_HOME || null
+      grokHome: process.env.GROK_HOME || null,
+      authExists: Boolean(authFile && fs.existsSync(authFile))
     });
     if (effective.authError) {
       process.stderr.write(effective.authError);
@@ -430,21 +532,45 @@ async function main() {
   }
 
   if (args[0] === "sessions" && args[1] === "list") {
-    const store = readJson(`${binary}.sessions.json`, { sessions: [] });
+    if (Object.hasOwn(effective, "sessionsListOutput")) {
+      process.stdout.write(String(effective.sessionsListOutput));
+      if (effective.sessionsListStderr) process.stderr.write(String(effective.sessionsListStderr));
+      if (Number.isInteger(effective.sessionsListExitCode)) {
+        process.exitCode = effective.sessionsListExitCode;
+      }
+      return;
+    }
+    const storeFile = sessionsStoreFile(binary, effective);
+    const store = readJson(storeFile, { sessions: [] });
     const now = Date.now();
+    let pollStateChanged = false;
     const visible = (store.sessions || []).filter((entry) => {
       if (!entry?.id) return false;
       if (entry.neverReady) return false;
+      if (Number.isSafeInteger(entry.remainingListPolls) && entry.remainingListPolls > 0) {
+        entry.remainingListPolls -= 1;
+        pollStateChanged = true;
+        return false;
+      }
       if (typeof entry.readyAt === "number" && entry.readyAt > now) return false;
       return true;
     });
+    if (pollStateChanged) writeJson(storeFile, store);
     appendLog(effective, {
       event: "sessions-list",
       home: process.env.HOME || null,
       grokHome: process.env.GROK_HOME || null,
+      authExists: Boolean(
+        process.env.GROK_HOME
+        && fs.existsSync(path.join(process.env.GROK_HOME, "auth.json"))
+      ),
       count: visible.length,
       sessionIds: visible.map((entry) => entry.id)
     });
+    if (visible.length === 0) {
+      process.stdout.write("No sessions found.\n");
+      return;
+    }
     process.stdout.write("SESSION ID                            CREATED     UPDATED     STATUS      SUMMARY\n");
     for (const entry of visible) {
       process.stdout.write(`${entry.id}  2026-07-14  2026-07-14  local  imported\n`);
@@ -453,14 +579,34 @@ async function main() {
   }
 
   if (args[0] === "sessions" && args[1] === "delete") {
-    appendLog(effective, { event: "delete-session", sessionId: args[2] ?? null });
-    const store = readJson(`${binary}.sessions.json`, { sessions: [] });
-    store.sessions = (store.sessions || []).filter((entry) => entry?.id !== args[2]);
-    writeJson(`${binary}.sessions.json`, store);
+    const storeFile = sessionsStoreFile(binary, effective);
+    const store = readJson(storeFile, { sessions: [] });
+    const removed = (store.sessions || []).some(
+      (entry) => entry?.id === args[2]
+    );
+    appendLog(effective, {
+      event: "delete-session",
+      sessionId: args[2] ?? null,
+      home: process.env.HOME || null,
+      grokHome: process.env.GROK_HOME || null,
+      authExists: Boolean(
+        process.env.GROK_HOME
+        && fs.existsSync(path.join(process.env.GROK_HOME, "auth.json"))
+      ),
+      removed
+    });
     if (effective.deleteSessionFails) {
       process.stderr.write("delete failed with xai-FAKESECRET000000\n");
       process.exitCode = 1;
+      return;
     }
+    store.sessions = (store.sessions || []).filter((entry) => entry?.id !== args[2]);
+    writeJson(storeFile, store);
+    process.stdout.write(
+      removed
+        ? `Deleted session ${args[2]}\n`
+        : `No session found with id ${args[2]}.\n`
+    );
     return;
   }
 
@@ -488,7 +634,7 @@ async function main() {
       home: process.env.HOME || null,
       grokHome: process.env.GROK_HOME || null
     });
-    if (effective.importSpawnStubbornDescendant) stubbornDescendant(effective, "import");
+    if (effective.importSpawnStubbornDescendant) await stubbornDescendant(effective, "import");
     if (effective.importStderr) process.stderr.write(String(effective.importStderr));
     let importedId = null;
     if (Object.hasOwn(effective, "importOutput")) {
@@ -509,15 +655,20 @@ async function main() {
     }
     // Register imported session for readiness checks. Never store transcript content.
     if (importedId && !effective.importExitCode) {
-      const store = readJson(`${binary}.sessions.json`, { sessions: [] });
+      const storeFile = sessionsStoreFile(binary, effective);
+      const store = readJson(storeFile, { sessions: [] });
       const readyDelayMs = Number(effective.importReadyAfterMs);
+      const readyAfterPolls = Number(effective.importReadyAfterPolls);
       const entry = {
         id: importedId,
         readyAt: Number.isFinite(readyDelayMs) && readyDelayMs > 0 ? Date.now() + readyDelayMs : Date.now(),
-        neverReady: Boolean(effective.importNeverReady)
+        neverReady: Boolean(effective.importNeverReady),
+        ...(Number.isSafeInteger(readyAfterPolls) && readyAfterPolls > 0
+          ? { remainingListPolls: readyAfterPolls }
+          : {})
       };
       store.sessions = [...(store.sessions || []).filter((item) => item?.id !== importedId), entry];
-      writeJson(`${binary}.sessions.json`, store);
+      writeJson(storeFile, store);
       appendLog(effective, {
         event: "import-session-registered",
         sessionId: importedId,

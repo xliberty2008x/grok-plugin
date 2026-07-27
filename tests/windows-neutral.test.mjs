@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import { normalizeUpdate } from "../plugins/grok/scripts/lib/acp-client.mjs";
@@ -7,6 +10,7 @@ import { CompanionError, exitCodeFor } from "../plugins/grok/scripts/lib/errors.
 import { assertProviderPlatform, ensureChildExit } from "../plugins/grok/scripts/lib/grok-provider.mjs";
 import { profileFor, sameSecurityProfile } from "../plugins/grok/scripts/lib/profiles.mjs";
 import { redactText } from "../plugins/grok/scripts/lib/redact.mjs";
+import { proveWorkerBrokerPhase } from "../scripts/lib/worker-broker-evidence.mjs";
 
 async function withPlatform(platform, fn) {
   const original = Object.getOwnPropertyDescriptor(process, "platform");
@@ -67,4 +71,27 @@ test("Windows provider platform guard reports E_CAPABILITY rather than process i
       (error) => error instanceof CompanionError && error.code === "E_CAPABILITY" && error.code !== "E_PROCESS_IDENTITY"
     );
   });
+});
+
+test("Windows-neutral proof producer rejects unsupported cleanup before publication", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "grok-proof-platform-"));
+  try {
+    await withPlatform("win32", async () => {
+      assert.deepEqual(
+        proveWorkerBrokerPhase({
+          phase: "0",
+          slice: "windows-platform-guard",
+          root,
+          write: true
+        }),
+        { ok: false, code: "E_PROOF_PLATFORM" }
+      );
+    });
+    assert.equal(
+      fs.existsSync(path.join(root, "tests/e2e-results/worker-broker/ledger.json")),
+      false
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -6,6 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
+  assertCompleteDetachedOwnedIdentity,
   identityMatches,
   isGrokProcessCommand,
   processGroupAlive,
@@ -32,6 +33,27 @@ test("Grok ancestor classification rejects unrelated commands", () => {
     "/usr/bin/python /workspace/grok_review.py"
   ]) {
     assert.equal(isGrokProcessCommand(command), false, command);
+  }
+});
+
+test("complete detached process identity assertion is reusable and fail-closed", () => {
+  assert.doesNotThrow(() => assertCompleteDetachedOwnedIdentity({
+    pid: 321,
+    startToken: "Mon Jul 22 12:34:56 2026",
+    processGroupId: 321
+  }));
+  for (const identity of [
+    null,
+    { pid: 321, startToken: null, processGroupId: 321 },
+    { pid: 321, startToken: "[REDACTED]", processGroupId: 321 },
+    { pid: 321, startToken: " padded ", processGroupId: 321 },
+    { pid: 321, startToken: "valid", processGroupId: 322 },
+    { pid: 0, startToken: "valid", processGroupId: 0 }
+  ]) {
+    assert.throws(
+      () => assertCompleteDetachedOwnedIdentity(identity),
+      (error) => error?.code === "E_PROCESS_IDENTITY"
+    );
   }
 });
 

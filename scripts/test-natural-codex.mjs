@@ -7,15 +7,140 @@ import process from "node:process";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { readValidProviderCapabilityReceipt } from "../plugins/grok/scripts/lib/provider-capability.mjs";
+import { providerLaunchBindingDigest } from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
+import { assertDispatchContract } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CODEX_BIN = process.env.CODEX_BIN || "codex";
 const MODEL = process.env.CODEX_E2E_MODEL || "gpt-5.5";
 const SCHEMA = path.join(ROOT, "tests", "natural-codex-output.schema.json");
 const CODEX_HOME = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
 const DATA_ROOT = path.join(CODEX_HOME, "plugins", "data", "grok-grok-companion");
+const SHA256_HEX = /^[a-f0-9]{64}$/;
 
 function fail(message, details = "") {
   throw new Error(`${message}${details.trim() ? `\n${details.trim()}` : ""}`);
+}
+
+function isCanonicalIsoTimestamp(value) {
+  if (typeof value !== "string" || !value) return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
+/**
+ * Accept only a clean generation-1 provider lifecycle, or exactly one production
+ * authorized same-session generation-1-to-2 structured-report repair.
+ * Fail closed on any broader retry/rotation shape.
+ */
+function assertNaturalProviderLifecycle(job) {
+  try {
+    assertDispatchContract(job);
+  } catch (error) {
+    fail(
+      "Persisted natural task failed production dispatch contract validation.",
+      error?.message || String(error)
+    );
+  }
+
+  const spawn = job.request?.spawn;
+  const dispatch = spawn?.dispatch;
+  if (dispatch?.schemaVersion !== 2) {
+    fail("Persisted natural task did not use dispatch-v2.");
+  }
+
+  const providerProcess = job.providerProcess;
+  const providerSpawnIntent = spawn?.providerSpawnIntent;
+  const providerRotationIntent = spawn?.providerRotationIntent;
+  const reportRepair = job.result?.reportRepair;
+  const generation = dispatch.providerGeneration;
+
+  const boundProviderProcess = providerProcess != null
+    && providerProcess.commandMarker === job.id
+    && providerProcess.dispatchAttemptId === dispatch.attemptId
+    && providerProcess.dispatchFence === dispatch.fence
+    && Number.isSafeInteger(providerProcess.providerGeneration);
+
+  const boundSpawnIntent = providerSpawnIntent != null
+    && providerSpawnIntent.attemptId === dispatch.attemptId
+    && providerSpawnIntent.dispatchFence === dispatch.fence;
+
+  const generationOneProof = generation === 1
+    && dispatch.nextProviderGeneration === null
+    && dispatch.providerRotationCount == null
+    && dispatch.providerRotatedAt == null
+    && dispatch.providerRotationAuthorizedAt == null
+    && providerRotationIntent == null
+    && reportRepair == null
+    && boundSpawnIntent
+    && providerSpawnIntent.status === "registered"
+    && providerSpawnIntent.providerGeneration === 1
+    && boundProviderProcess
+    && providerProcess.providerGeneration === 1;
+
+  const boundRotationIntent = providerRotationIntent != null
+    && providerRotationIntent.attemptId === dispatch.attemptId
+    && providerRotationIntent.dispatchFence === dispatch.fence;
+
+  const initialResponse = reportRepair?.initialResponse;
+  const generationTwoProof = generation === 2
+    && dispatch.nextProviderGeneration === null
+    && dispatch.providerRotationCount === 1
+    && isCanonicalIsoTimestamp(dispatch.providerRotationAuthorizedAt)
+    && isCanonicalIsoTimestamp(dispatch.providerRotatedAt)
+    && boundRotationIntent
+    && providerRotationIntent.status === "registered"
+    && providerRotationIntent.baseProviderGeneration === 1
+    && providerRotationIntent.targetProviderGeneration === 2
+    && boundSpawnIntent
+    && providerSpawnIntent.status === "registered"
+    && providerSpawnIntent.providerGeneration === 2
+    && providerSpawnIntent.intentId === providerRotationIntent.intentId
+    && reportRepair?.attempted === true
+    && reportRepair.valid === true
+    && Number.isSafeInteger(initialResponse?.bytes)
+    && initialResponse.bytes > 0
+    && typeof initialResponse?.digest === "string"
+    && SHA256_HEX.test(initialResponse.digest)
+    && Array.isArray(reportRepair.validationIssues)
+    && reportRepair.validationIssues.length === 0
+    && boundProviderProcess
+    && providerProcess.providerGeneration === 2;
+
+  if (!generationOneProof && !generationTwoProof) {
+    fail(
+      "Persisted natural task did not prove a clean generation-1 provider lifecycle or one exact authorized generation-1-to-2 report repair.",
+      JSON.stringify({
+        providerGeneration: generation ?? null,
+        nextProviderGeneration: dispatch.nextProviderGeneration ?? null,
+        providerRotationCount: dispatch.providerRotationCount ?? null,
+        providerRotationAuthorizedAt: dispatch.providerRotationAuthorizedAt ?? null,
+        providerRotatedAt: dispatch.providerRotatedAt ?? null,
+        rotationIntentStatus: providerRotationIntent?.status ?? null,
+        rotationBase: providerRotationIntent?.baseProviderGeneration ?? null,
+        rotationTarget: providerRotationIntent?.targetProviderGeneration ?? null,
+        spawnStatus: providerSpawnIntent?.status ?? null,
+        spawnGeneration: providerSpawnIntent?.providerGeneration ?? null,
+        processGeneration: providerProcess?.providerGeneration ?? null,
+        reportRepair: reportRepair
+          ? {
+              attempted: reportRepair.attempted === true,
+              valid: reportRepair.valid === true,
+              initialResponseBytes: initialResponse?.bytes ?? null,
+              initialResponseDigest: typeof initialResponse?.digest === "string"
+                ? initialResponse.digest
+                : null,
+              validationIssueCount: Array.isArray(reportRepair.validationIssues)
+                ? reportRepair.validationIssues.length
+                : null
+            }
+          : null
+      })
+    );
+  }
+
+  return generation;
 }
 
 function run(command, args, { timeout = 60_000 } = {}) {
@@ -95,16 +220,39 @@ function main() {
     if (job.profile?.id !== "rescue-read-v3") fail(`Natural task used unexpected profile ${job.profile?.id || "missing"}.`);
     if (!/^\d+\.\d+\.\d+/.test(String(job.profile?.grokVersion || ""))) fail("Persisted natural task did not record a real Grok version.");
     if (job.result?.workerReport?.outcome !== "complete") fail("Persisted worker report was not complete.");
+    if (job.result?.workerReport?.valid !== true
+      || job.result?.workerReport?.structured !== true
+      || job.result?.workerReport?.reportSource !== "acp-structured") {
+      fail("Persisted natural task did not use valid native ACP structured output.");
+    }
     if (job.result?.hostVerification !== "passed") fail("Persisted host verification was not passed.");
     if (job.result?.taskRuntimeCleaned !== true) fail("Persisted task did not prove transient runtime cleanup.");
     if (job.error) fail("Persisted natural task contains an error.", JSON.stringify(job.error));
-
-    const version = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
-    const installedWrapper = path.join(CODEX_HOME, "plugins", "cache", "grok-companion", "grok", version, "scripts", "grok-codex.mjs");
-    const rendered = checked(process.execPath, [installedWrapper, "result", job.id], { timeout: 30_000 });
-    if (!rendered.stdout.includes("Outcome: complete") || !rendered.stdout.includes("Host verification: passed")) {
-      fail("Installed result renderer did not return the completed, host-verified job.", rendered.stdout);
+    const capability = readValidProviderCapabilityReceipt({
+      env: {
+        ...process.env,
+        GROK_COMPANION_HOST: "codex",
+        GROK_COMPANION_PLUGIN_DATA: DATA_ROOT
+      }
+    });
+    if (!capability) fail("The natural task did not leave one valid setup provider capability.");
+    const spawn = job.request?.spawn;
+    let observedProviderLaunchBindingDigest = null;
+    try {
+      observedProviderLaunchBindingDigest = providerLaunchBindingDigest(
+        spawn?.providerLaunchBinding
+      );
+    } catch {}
+    if (spawn?.providerCapabilityDigest !== capability.capabilityDigest
+      || spawn?.providerLaunchBindingDigest
+        !== capability.providerLaunchBindingDigest
+      || observedProviderLaunchBindingDigest
+        !== capability.providerLaunchBindingDigest
+      || JSON.stringify(spawn.providerLaunchBinding)
+        !== JSON.stringify(capability.providerLaunchBinding)) {
+      fail("Persisted natural task was not bound to the exact valid setup provider pin.");
     }
+    const acceptedProviderGeneration = assertNaturalProviderLifecycle(job);
 
     const stateRoot = path.dirname(path.dirname(jobFile));
     const grokHome = path.join(stateRoot, "task-homes", job.request?.providerHomeId || job.id, ".grok");
@@ -122,6 +270,10 @@ function main() {
       hostVerification: job.result.hostVerification,
       taskRuntimeCleaned: job.result.taskRuntimeCleaned,
       profileId: job.profile.id,
+      reportSource: job.result.workerReport.reportSource,
+      providerGeneration: acceptedProviderGeneration,
+      providerCapabilityDigest: spawn.providerCapabilityDigest,
+      providerLaunchBindingDigest: spawn.providerLaunchBindingDigest,
       codexVersion,
       grokVersion: job.profile.grokVersion || null,
       model: MODEL

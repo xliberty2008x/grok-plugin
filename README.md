@@ -1,6 +1,6 @@
 # Grok Companion for Claude Code and Codex
 
-Grok Companion is a dual-host marketplace plugin that delegates code review, investigation, and implementation work from **Claude Code** or **OpenAI Codex** to the locally installed [official Grok Build CLI](https://docs.x.ai/build/overview). Host facades never solve the task themselves: they forward to a shared Node runtime that owns jobs, isolation, and Grok process lifecycle.
+Grok Companion is a dual-host marketplace plugin that delegates code review, investigation, and implementation work from **Claude Code** or **OpenAI Codex** to the locally installed [official Grok Build CLI](https://docs.x.ai/build/overview). Host facades never solve the task themselves: they forward to a shared Node runtime that owns job identity, isolation policy, durable evidence, and Grok process lifecycle. For the issue #25 write-worker path, official Grok ACP executes worktree mechanics while the broker independently binds and verifies them.
 
 | | |
 |---|---|
@@ -11,12 +11,30 @@ Grok Companion is a dual-host marketplace plugin that delegates code review, inv
 | **Plugin name** | `grok` |
 | **Claude namespace** | `/grok:*` slash commands |
 | **Codex namespace** | `$grok:*` skills |
-| **Grok CLI floor** | Official Grok Build **0.2.99+** (0.2.99 is the enforced and authenticated compatibility floor) |
+| **Grok CLI floor** | Official Grok Build **0.2.99+**; Worker Broker operational qualification used **0.2.112** |
 | **License** | Apache-2.0 |
 
 Command shape is modeled on OpenAI's [`codex-plugin-cc` v1.0.6](https://github.com/openai/codex-plugin-cc/tree/db52e28f4d9ded852ab3942cea316258ae4ef346). Reviews use headless Grok with the `explore` agent; resumable rescue tasks use ACP v1 over `grok agent stdio`; transcript import uses `grok import --json`.
 
-**Qualification status:** the macOS 10-case matrix recorded on July 13, 2026 covers the historical `0.2.0` profile-v2 contract only. It does **not** qualify this `0.3.0-dev.1` profile-v3 worktree. On July 14, the clean installed Codex snapshot completed one issue #2 task and three concurrent issue #5 read tasks through real Grok Build 0.2.101, with no workspace changes, verified cleanup, and passed host checks. That is direct installed-runtime development evidence, not a natural Codex skill-orchestration pass: a fresh `codex exec` attempt reached the installed skill but the account usage limit stopped it before dispatch. Natural installed orchestration and independent Claude Code evidence must still pass before `0.3.0` can be released. Linux provider execution remains authenticated-provider-unverified. Windows runs provider-neutral CI only; Grok provider execution and process ownership/control are unsupported in this prerelease.
+**Qualification status:** the historical July 13 profile-v2 matrix does not qualify the current v3 hardening worktree. Separately, issue [#25](https://github.com/xliberty2008x/grok-plugin/issues/25) reached `operational_e2e_complete` on exact source `e89272f` and evidence head `ef2dd03`. The proof used official Grok Build 0.2.112 for completion, active cancellation/restart, and simultaneous isolated writers with drift rejection; it also includes a natural installed-Codex invocation, strict receipt replay, cleanup/absence checks, independent review, and hosted CI run [30225725682](https://github.com/xliberty2008x/grok-plugin/actions/runs/30225725682). Deterministic tests are supporting evidence, not a substitute for those live lifecycles. This qualification is scoped to the documented macOS/Codex path: the dual-host prerelease remains release-unqualified until independent Claude Code and remaining platform gates pass, and Windows provider execution/process control remain unsupported.
+
+### Worker Broker delivery in numbers
+
+These figures describe the issue #25 implementation tranche from `main` through evidence head `ef2dd03`. Runtime and token provenance is recorded in the [post-closeout delivery accounting comment](https://github.com/xliberty2008x/grok-plugin/issues/25#issuecomment-5087869339).
+
+| Measure | Recorded value |
+|---|---:|
+| Calendar window | 2026-07-15 17:38 to 2026-07-27 02:10 (11 days, 8 hours, 31 minutes) |
+| Tracked active execution | 57 hours, 6 minutes, 23 seconds |
+| Codex goal accounting | 25,626,812 model tokens |
+| Git history | 172 commits |
+| Diff against `main` | 160 files; 137,166 insertions; 916 deletions |
+| Hosted deterministic gates | 1,027 tests in each of 4 full Unix lanes, plus 2 Windows and 2 PTY lanes |
+| Live lifecycle jobs | 4 official-provider jobs plus 1 natural installed-Codex job |
+
+The diff totals include generated schemas, fixtures, receipts, and other evidence artifacts; they are not a hand-written source-line estimate.
+
+This metrics update is post-qualification documentation and is not part of the exact `e89272f`/`ef2dd03` evidence identity. It changes no plugin/runtime bytes and does not requalify the documentation head; the scoped operational claim remains bound to the exact source and receipt above.
 
 > **External processing:** The CLI runs locally, but model requests are processed through Grok/xAI services. Task prompts, review context collected by the plugin, repository content selected by Grok task tools, command output, imported Claude context, and the user-visible subset of imported Codex context may be processed under your Grok account, organization policy, and applicable xAI terms. Do not delegate material that should not cross that boundary. See [Data boundary](#data-boundary) and [Security model](#execution-and-security-model).
 
@@ -115,7 +133,7 @@ Grok binary discovery order:
 2. `grok` on `PATH`
 3. Documented per-user location such as `~/.grok/bin/grok`
 
-Provider qualification reminder: the stored macOS evidence is historical `0.2.0` evidence, not current v3 qualification. Keep this prerelease unqualified until authenticated installed-host evidence is recorded; Linux remains provider-unverified and Windows provider-unsupported.
+Provider qualification reminder: current Worker Broker evidence qualifies the exact v3 macOS/Codex path with official Grok Build 0.2.112. The dual-host prerelease remains release-unqualified; this evidence does not qualify Linux provider execution, independent Claude Code orchestration, or Windows provider execution/process control.
 
 ---
 
@@ -506,7 +524,7 @@ Codex `SessionStart` also writes mode-private metadata under `PLUGIN_DATA/host-s
 - **Rescue** runs ACP v1 over `grok agent stdio` with checked-in `toolConfig` profiles, `injectDefaultTools: false`, security-contract version **3**, and a persisted SHA-256 `agentProfileDigest` (continuation requires the same digest and contract). Before each process starts, the verified profile is copied to a unique mode-`0600` file inside isolated `GROK_HOME`; it is removed only after the owned process group is verified gone. Provider argv never points back into a Codex/Claude plugin cache.
   - **Read-only** tools: exactly `GrokBuild:read_file`, `GrokBuild:list_dir`, and `GrokBuild:grep` under a strict derived sandbox.
   - **Write** tools: those three plus `GrokBuild:search_replace` and `GrokBuild:todo_write`. There is no terminal, background process, task-manager, kill, or output-retrieval tool, and no bypass-permissions expansion.
-  - **Report repair** uses a separate zero-tool `rescue-report-v3` profile in the same lineage.
+  - **Report repair** uses a separate no-workspace `rescue-report-v3` profile in the same lineage. It exposes only the provider-required plan-state `GrokBuild:todo_write` compatibility tool, and the prompt forbids invoking it.
   - Root `--tools` flags are not used for ACP enforcement (Grok 0.2.99 documents them as headless-only).
 - **Credentials:** tool-using jobs require cached `grok login` material. Reviews use a transient private credential copy removed with the review home. Rescue stages an atomically refreshed sanitized mode-`0600` copy for session authentication, removes it before `session/prompt`, and retries removal on every terminal/error path. It is not a persistent task credential. Opaque values are exact redaction sentinels in memory and never enter job JSON or raw user output.
 - **Isolation inspect:** before tasks, external hooks/skills/plugins/MCP/non-builtin agents are rejected; provider-bundled skills may load only when real paths stay under `<isolated GROK_HOME>/skills/` or `<isolated GROK_HOME>/bundled/skills/`.
@@ -566,7 +584,7 @@ Contributor commands match `package.json` and [`.github/workflows/ci.yml`](.gith
 npm ci --ignore-scripts   # as in CI
 npm run validate          # structure, versions, manifests, contracts
 npm test                  # full offline suite, including three concurrent read jobs
-npm run check             # validate && test
+npm run check             # validate + deterministic offline tests; skip/TODO fails; installed/authenticated boundaries run separately
 npm run test:pty-ingress  # issue #2 real nonblocking PTY + negative-input gate
 npm run test:installed-codex # clean CODEX_HOME install and cached-wrapper gate
 npm run codex:update-local # verify, reinstall into this Codex home, compare source/cache
@@ -658,14 +676,14 @@ Deeper design and release gates:
 - No documented native Grok review RPC equivalent to the pinned Codex reviewer; reviews use plugin-owned prompts and a validated JSON schema.
 - Reviews are **context-only**: the plugin embeds selected Git evidence up to 8 MiB (and rejects oversized targets) rather than granting repository tools to the review agent.
 - Stop gate is **advisory**; use a foreground review for a full structured verdict.
-- Grok Build **0.2.99** is the compatibility floor and the authenticated qualification endpoint; newer versions are capability-probed at setup but not automatically release-qualified.
-- The macOS authenticated 10/10 matrix from 2026-07-13 covers historical `0.2.0`/profile-v2 behavior and does not qualify this v3 worktree. **Linux** provider execution remains unverified; **Windows** provider execution and process control remain unsupported.
+- Grok Build **0.2.99** is the compatibility floor; Worker Broker operational qualification used exact official version **0.2.112**. Other versions are capability-probed at setup but are not automatically qualified.
+- The v3 Worker Broker is operationally qualified for the recorded macOS/Codex path only; the dual-host prerelease remains release-unqualified. **Linux** and independent Claude Code provider execution remain unqualified; **Windows** provider execution and process control remain unsupported.
 - Setup readiness is not authenticated review execution or OS process-control certification.
 - Codex default hooks require explicit trust; no Codex `SessionEnd`; unfinished Codex jobs are command-driven for cleanup.
 - `grok import --json` NDJSON is parsed defensively; public shape is not treated as a stable plugin contract.
 - Platform sandboxes differ; macOS does not enforce Grok's Linux child-network boundary.
 - No direct xAI REST API usage and no host fallback when Grok fails.
-- Remaining release work (per [PLAN.md](PLAN.md)): merge the `0.3.0` hardening tranche, record authenticated installed-host evidence for the exact commit/tree/cache digest, and only then decide whether to tag `v0.3.0`.
+- Remaining release work (per [PLAN.md](PLAN.md)): independently qualify Claude Code and the remaining supported platform boundaries, then decide whether to tag `v0.3.0`.
 
 ---
 

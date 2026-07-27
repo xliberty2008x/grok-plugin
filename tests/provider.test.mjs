@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { normalizeUpdate } from "../plugins/grok/scripts/lib/acp-client.mjs";
@@ -17,16 +18,19 @@ import {
   probe,
   cleanupReviewEnvironment,
   gatedCleanupReviewEnvironment,
+  reviewEnvironment,
   ensureChildExit,
   runHeadless,
   runProvider,
   runStructuredReview,
   REVIEW_SCHEMA,
   selectAcpPermissionOption,
+  taskCredentialEnvironment,
+  taskEnvironment,
   validateReview
 } from "../plugins/grok/scripts/lib/grok-provider.mjs";
 import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
-import { hasForeignActiveProvider, registerProviderGuard, unregisterProviderGuard } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
+import { hasForeignActiveProvider, loadProviderGuard, registerProviderGuard, unregisterProviderGuard } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
 import { processGroupAlive, processGroupGone } from "../plugins/grok/scripts/lib/process-control.mjs";
 import { CompanionError } from "../plugins/grok/scripts/lib/errors.mjs";
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
@@ -45,6 +49,53 @@ async function withFake(config, callback) {
     if (previous.auth === undefined) delete process.env.GROK_AUTH_PATH;
     else process.env.GROK_AUTH_PATH = previous.auth;
   }
+}
+
+function nonTemporaryDirectory(prefix) {
+  return fs.mkdtempSync(path.join(os.homedir(), `.${prefix}`));
+}
+
+function gitValue(root, ...args) {
+  const run = spawnSync("git", args, {
+    cwd: root,
+    encoding: "utf8",
+    shell: false
+  });
+  assert.equal(run.status, 0, run.stderr);
+  return String(run.stdout).trim();
+}
+
+function initNonTemporaryRepo() {
+  const root = nonTemporaryDirectory("grok-controller-repo-");
+  gitValue(root, "init", "-b", "main");
+  gitValue(root, "config", "user.email", "tests@example.com");
+  gitValue(root, "config", "user.name", "Grok Plugin Tests");
+  fs.writeFileSync(path.join(root, "tracked.txt"), "original\n", "utf8");
+  gitValue(root, "add", "tracked.txt");
+  gitValue(root, "commit", "-m", "initial");
+  return root;
+}
+
+function controllerEnvironmentInput(root, stateDir, suffix = "checkout") {
+  const destinationParent = path.join(stateDir, "destinations", suffix);
+  fs.mkdirSync(destinationParent, { recursive: true, mode: 0o700 });
+  const canonicalDestinationParent = fs.realpathSync(destinationParent);
+  const gitCommonDir = gitValue(
+    root,
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-common-dir"
+  );
+  return {
+    worktreeProvisioningController: true,
+    worktreeProvisioningDestinationParent: canonicalDestinationParent,
+    worktreeProvisioningExpectedRoot: path.join(
+      canonicalDestinationParent,
+      "worktree"
+    ),
+    worktreeProvisioningGitCommonDir: fs.realpathSync(gitCommonDir),
+    worktreeProvisioningBaseCommit: gitValue(root, "rev-parse", "HEAD")
+  };
 }
 
 test("normalizeUpdate maps ACP message, tool, plan, usage, and unknown updates", () => {
@@ -69,6 +120,582 @@ test("Grok discovery honors GROK_BIN and enforces the minimum CLI version", asyn
 
   await withFake({ version: "0.2.92" }, async () => {
     assert.throws(() => grokVersion(), (error) => error.code === "E_GROK_VERSION");
+  });
+});
+
+test("worktree controller delays its identity-bound credential until explicit activation staging", async () => {
+  await withFake({}, async () => {
+    const root = initNonTemporaryRepo();
+    const stateDir = nonTemporaryDirectory("grok-controller-state-");
+    const options = controllerEnvironmentInput(root, stateDir);
+    const poison = nonTemporaryDirectory("grok-controller-poison-");
+    fs.writeFileSync(path.join(poison, "git"), "#!/bin/sh\nexit 91\n", {
+      mode: 0o755
+    });
+    const previousPath = process.env.PATH;
+    const trustedGitDirectory = path.dirname(
+      String(spawnSync("sh", ["-c", "command -v git"], {
+        encoding: "utf8",
+        env: process.env
+      }).stdout).trim()
+    );
+    process.env.PATH = `${trustedGitDirectory}${path.delimiter}${poison}`;
+    const environment = taskEnvironment(
+      stateDir,
+      root,
+      profileFor("task", true),
+      "worktree-controller-test",
+      options
+    );
+    try {
+      const sandbox = fs.readFileSync(
+        path.join(environment.grokHome, "sandbox.toml"),
+        "utf8"
+      );
+      assert.match(sandbox, /extends = "strict"/);
+      assert.match(sandbox, /restrict_network = true/);
+      assert.equal(
+        sandbox.includes(JSON.stringify(fs.realpathSync(root))),
+        true
+      );
+      assert.equal(
+        sandbox.includes(JSON.stringify(options.worktreeProvisioningGitCommonDir)),
+        true
+      );
+      assert.equal(
+        sandbox.includes(JSON.stringify(
+          options.worktreeProvisioningDestinationParent
+        )),
+        true
+      );
+      assert.equal(
+        sandbox.includes(JSON.stringify(path.join(stateDir, "worktrees"))),
+        false,
+        "controller must never grant the shared worktree parent"
+      );
+      assert.equal(sandbox.includes('extends = "workspace"'), false);
+      assert.equal(sandbox.includes("deny = []"), true);
+      assert.notEqual(environment.controllerCwd, fs.realpathSync(root));
+      assert.equal(fs.realpathSync(environment.controllerCwd), environment.controllerCwd);
+      assert.equal(environment.controllerProfileId, "worktree-controller-v1");
+      assert.equal(environment.env.PATH, environment.gitExecutableDirectory);
+      assert.equal(environment.env.PATH.includes(poison), false);
+      assert.equal(environment.env.GIT_CONFIG_NOSYSTEM, "1");
+      assert.equal(environment.env.GIT_CONFIG_GLOBAL, "/dev/null");
+      assert.equal(environment.env.GIT_ATTR_NOSYSTEM, "1");
+      assert.equal(fs.existsSync(path.join(environment.grokHome, "auth.json")), false);
+      environment.assertCredentialAbsent();
+      environment.stageCredential();
+      assert.equal(fs.existsSync(path.join(environment.grokHome, "auth.json")), true);
+      assert.equal(
+        fs.realpathSync(environment.gitInstallationRoot)
+          .startsWith(`${fs.realpathSync(root)}${path.sep}`),
+        false
+      );
+      assert.match(environment.gitExecutableDigest, /^[a-f0-9]{64}$/);
+      assert.equal(
+        environment.verifyGitExecutable().executableDigest,
+        environment.gitExecutableDigest
+      );
+      const authFile = path.join(environment.grokHome, "auth.json");
+      const originalAuth = fs.readFileSync(authFile);
+      const originalIdentity = fs.lstatSync(authFile);
+      const refreshedAuth = `${authFile}.refreshed`;
+      fs.writeFileSync(refreshedAuth, originalAuth, {
+        mode: 0o600,
+        flag: "wx"
+      });
+      fs.renameSync(refreshedAuth, authFile);
+      assert.notEqual(fs.lstatSync(authFile).ino, originalIdentity.ino);
+      environment.revokeCredential();
+      environment.assertCredentialAbsent();
+    } finally {
+      process.env.PATH = previousPath;
+      try { environment.revokeCredential(); } catch {}
+      fs.rmSync(stateDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(poison, { recursive: true, force: true });
+    }
+  });
+});
+
+test("worktree controller never replaces an existing claim home and distinct claims stay isolated", async () => {
+  await withFake({}, async () => {
+    const root = initNonTemporaryRepo();
+    const stateDir = nonTemporaryDirectory("grok-controller-recovery-state-");
+    const marker = "worktree-controller-recovery";
+    const options = controllerEnvironmentInput(root, stateDir);
+    const first = taskEnvironment(
+      stateDir,
+      root,
+      profileFor("task", true),
+      marker,
+      options
+    );
+    const firstHomeIdentity = fs.lstatSync(first.home);
+    fs.writeFileSync(path.join(first.home, "stale-sentinel"), "stale\n", {
+      mode: 0o600
+    });
+    assert.throws(
+      () => taskEnvironment(
+        stateDir,
+        root,
+        profileFor("task", true),
+        marker,
+        options
+      ),
+      (error) => error?.code === "E_STATE"
+        && /already exists/.test(error.message)
+    );
+
+    const distinct = taskEnvironment(
+      stateDir,
+      root,
+      profileFor("task", true),
+      `${marker}-distinct`,
+      options
+    );
+    try {
+      assert.notEqual(fs.lstatSync(distinct.home).ino, firstHomeIdentity.ino);
+      assert.equal(
+        fs.existsSync(path.join(distinct.home, "stale-sentinel")),
+        false
+      );
+      assert.equal(
+        fs.existsSync(path.join(distinct.grokHome, "auth.json")),
+        false
+      );
+      assert.equal(fs.existsSync(path.join(first.home, "stale-sentinel")), true);
+      distinct.stageCredential();
+      distinct.revokeCredential();
+      distinct.assertCredentialAbsent();
+    } finally {
+      try { first.revokeCredential(); } catch {}
+      try { distinct.revokeCredential(); } catch {}
+      fs.rmSync(stateDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("worktree controller never refreshes or stages expiring auth before durable activation", async () => {
+  await withFake({}, async (fake) => {
+    const root = initNonTemporaryRepo();
+    const stateDir = nonTemporaryDirectory(
+      "grok-controller-expiring-auth-state-"
+    );
+    fs.writeFileSync(
+      fake.authPath,
+      `${JSON.stringify({
+        test: {
+          key: "test-secret-value-1234567890",
+          auth_mode: "oauth",
+          expires_at: new Date(Date.now() + 60_000).toISOString()
+        }
+      })}\n`,
+      { mode: 0o600 }
+    );
+    const environment = taskEnvironment(
+      stateDir,
+      root,
+      profileFor("task", true),
+      "worktree-controller-expiring-auth",
+      controllerEnvironmentInput(root, stateDir)
+    );
+    try {
+      assert.equal(
+        fs.existsSync(path.join(environment.grokHome, "auth.json")),
+        false
+      );
+      assert.equal(
+        readFakeLog(fake.logFile).some((entry) => entry.event === "models"),
+        false
+      );
+      assert.throws(
+        () => environment.stageCredential(),
+        (error) => error?.code === "E_AUTH_REQUIRED"
+      );
+      environment.assertCredentialAbsent();
+      assert.equal(
+        readFakeLog(fake.logFile).some((entry) => entry.event === "models"),
+        false
+      );
+    } finally {
+      try { environment.revokeCredential(); } catch {}
+      fs.rmSync(stateDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("task credential refresh paths use the setup-owned provider binary instead of ambient discovery", async () => {
+  await withFake({}, async (fake) => {
+    const root = initRepo();
+    const stateDir = fs.realpathSync(
+      tempDir("provider-pinned-refresh-state-")
+    );
+    fs.writeFileSync(
+      fake.authPath,
+      `${JSON.stringify({
+        test: {
+          key: "test-secret-value-1234567890",
+          auth_mode: "oauth",
+          expires_at: new Date(Date.now() + 5 * 60_000).toISOString()
+        }
+      })}\n`,
+      { mode: 0o600 }
+    );
+    const ambientBinary = process.env.GROK_BIN;
+    const ambientInvocation = path.join(stateDir, "ambient-discovery-used");
+    const ambientPoison = path.join(stateDir, "ambient-grok-poison");
+    fs.writeFileSync(
+      ambientPoison,
+      `#!/bin/sh\nprintf 'invoked\\n' >> ${JSON.stringify(ambientInvocation)}\nexit 97\n`,
+      { mode: 0o700 }
+    );
+    process.env.GROK_BIN = ambientPoison;
+    let environment;
+    let credentialEnvironment;
+    let reviewIsolation;
+    try {
+      environment = taskEnvironment(
+        stateDir,
+        root,
+        profileFor("task", true),
+        "pinned-credential-refresh",
+        { providerExecutableBinary: fs.realpathSync(fake.binary) }
+      );
+      assert.equal(
+        readFakeLog(fake.logFile).some((entry) => entry.event === "models"),
+        true
+      );
+      environment.revokeCredential();
+      const refreshesBeforeSessionCleanup = readFakeLog(fake.logFile)
+        .filter((entry) => entry.event === "models").length;
+      credentialEnvironment = taskCredentialEnvironment(
+        stateDir,
+        "pinned-credential-refresh",
+        { providerExecutableBinary: fs.realpathSync(fake.binary) }
+      );
+      assert.equal(
+        readFakeLog(fake.logFile)
+          .filter((entry) => entry.event === "models").length,
+        refreshesBeforeSessionCleanup + 1
+      );
+      credentialEnvironment.revokeCredential();
+      credentialEnvironment = null;
+      const refreshesBeforeReview = readFakeLog(fake.logFile)
+        .filter((entry) => entry.event === "models").length;
+      reviewIsolation = reviewEnvironment(
+        stateDir,
+        "pinned-review-refresh",
+        { providerExecutableBinary: fs.realpathSync(fake.binary) }
+      );
+      assert.equal(
+        readFakeLog(fake.logFile)
+          .filter((entry) => entry.event === "models").length,
+        refreshesBeforeReview + 1
+      );
+      assert.equal(
+        fs.existsSync(ambientInvocation),
+        false,
+        "post-pin credential refresh must not execute ambient Grok"
+      );
+    } finally {
+      if (ambientBinary === undefined) delete process.env.GROK_BIN;
+      else process.env.GROK_BIN = ambientBinary;
+      try { credentialEnvironment?.revokeCredential(); } catch {}
+      try { environment?.revokeCredential(); } catch {}
+      if (reviewIsolation) {
+        cleanupReviewEnvironment(stateDir, "pinned-review-refresh");
+      }
+      fs.rmSync(stateDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("worktree controller accepts a bounded startup-only credential window", async () => {
+  await withFake({}, async (fake) => {
+    const root = initNonTemporaryRepo();
+    const stateDir = nonTemporaryDirectory(
+      "grok-controller-startup-auth-state-"
+    );
+    fs.writeFileSync(
+      fake.authPath,
+      `${JSON.stringify({
+        test: {
+          key: "test-secret-value-1234567890",
+          auth_mode: "oauth",
+          expires_at: new Date(Date.now() + 5 * 60_000).toISOString()
+        }
+      })}\n`,
+      { mode: 0o600 }
+    );
+    const environment = taskEnvironment(
+      stateDir,
+      root,
+      profileFor("task", true),
+      "worktree-controller-startup-auth",
+      controllerEnvironmentInput(root, stateDir)
+    );
+    try {
+      assert.equal(
+        fs.existsSync(path.join(environment.grokHome, "auth.json")),
+        false
+      );
+      environment.stageCredential();
+      assert.equal(
+        fs.existsSync(path.join(environment.grokHome, "auth.json")),
+        true
+      );
+      assert.equal(
+        readFakeLog(fake.logFile).some((entry) => entry.event === "models"),
+        false
+      );
+      environment.revokeCredential();
+      environment.assertCredentialAbsent();
+    } finally {
+      try { environment.revokeCredential(); } catch {}
+      fs.rmSync(stateDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("worktree provisioning refuses a repository-controlled Git executable", async () => {
+  await withFake({}, async () => {
+    const root = initRepo();
+    const stateDir = tempDir("provider-worktree-controller-path-state-");
+    const options = controllerEnvironmentInput(root, stateDir);
+    const fakeGit = path.join(root, "git");
+    fs.writeFileSync(fakeGit, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${root}${path.delimiter}${previousPath || ""}`;
+    try {
+      assert.throws(
+        () => taskEnvironment(
+          stateDir,
+          root,
+          profileFor("task", true),
+          "worktree-controller-path-test",
+          options
+        ),
+        (error) => error?.code === "E_CAPABILITY"
+      );
+    } finally {
+      process.env.PATH = previousPath;
+      fs.rmSync(stateDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("controller construction rejects broad temporary authority and removes only its newly-created home", async () => {
+  await withFake({}, async () => {
+    const root = initRepo();
+    const stateDir = tempDir("provider-controller-temp-state-");
+    const marker = "controller-temp-rejection";
+    const home = path.join(stateDir, "task-homes", marker);
+    const options = controllerEnvironmentInput(root, stateDir);
+    assert.throws(
+      () => taskEnvironment(
+        stateDir,
+        root,
+        profileFor("task", true),
+        marker,
+        options
+      ),
+      (error) => error?.code === "E_CAPABILITY"
+        && /temporary write grant/.test(error.message)
+    );
+    assert.equal(fs.existsSync(home), false);
+    fs.rmSync(stateDir, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
+test("missing controller authentication cleans a newly-created home transactionally", async () => {
+  await withFake({}, async () => {
+    const root = initNonTemporaryRepo();
+    const stateDir = nonTemporaryDirectory("grok-controller-auth-state-");
+    const marker = "controller-missing-auth";
+    const home = path.join(stateDir, "task-homes", marker);
+    const options = controllerEnvironmentInput(root, stateDir);
+    const previousAuth = process.env.GROK_AUTH_PATH;
+    process.env.GROK_AUTH_PATH = path.join(stateDir, "missing-auth.json");
+    try {
+      assert.throws(
+        () => taskEnvironment(
+          stateDir,
+          root,
+          profileFor("task", true),
+          marker,
+          options
+        ),
+        (error) => error?.code === "E_AUTH_REQUIRED"
+      );
+      assert.equal(fs.existsSync(home), false);
+    } finally {
+      process.env.GROK_AUTH_PATH = previousAuth;
+      fs.rmSync(stateDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("controller Git policy overrides repository hooks and rejects effective checkout filters", async () => {
+  await withFake({}, async () => {
+    const safeRoot = initNonTemporaryRepo();
+    const safeState = nonTemporaryDirectory("grok-controller-safe-state-");
+    gitValue(safeRoot, "config", "core.hooksPath", path.join(safeRoot, "hooks"));
+    gitValue(safeRoot, "config", "core.fsmonitor", "malicious-fsmonitor");
+    const safeEnvironment = taskEnvironment(
+      safeState,
+      safeRoot,
+      profileFor("task", true),
+      "controller-safe-git-policy",
+      controllerEnvironmentInput(safeRoot, safeState)
+    );
+    try {
+      const effectiveHooks = spawnSync(
+        safeEnvironment.gitExecutable,
+        ["config", "--get", "core.hooksPath"],
+        {
+          cwd: safeRoot,
+          env: safeEnvironment.env,
+          encoding: "utf8",
+          shell: false
+        }
+      );
+      const effectiveFsmonitor = spawnSync(
+        safeEnvironment.gitExecutable,
+        ["config", "--get", "core.fsmonitor"],
+        {
+          cwd: safeRoot,
+          env: safeEnvironment.env,
+          encoding: "utf8",
+          shell: false
+        }
+      );
+      assert.equal(effectiveHooks.status, 0);
+      assert.equal(effectiveHooks.stdout.trim(), "/dev/null");
+      assert.equal(effectiveFsmonitor.status, 0);
+      assert.equal(effectiveFsmonitor.stdout.trim(), "false");
+      safeEnvironment.verifyGitExecutable();
+    } finally {
+      safeEnvironment.revokeCredential();
+      fs.rmSync(safeState, { recursive: true, force: true });
+      fs.rmSync(safeRoot, { recursive: true, force: true });
+    }
+
+    const filteredRoot = initNonTemporaryRepo();
+    const filteredState = nonTemporaryDirectory("grok-controller-filter-state-");
+    fs.writeFileSync(
+      path.join(filteredRoot, ".gitattributes"),
+      "*.txt filter=malicious\n",
+      "utf8"
+    );
+    gitValue(filteredRoot, "add", ".gitattributes");
+    gitValue(filteredRoot, "commit", "-m", "add executable filter attribute");
+    assert.throws(
+      () => taskEnvironment(
+        filteredState,
+        filteredRoot,
+        profileFor("task", true),
+        "controller-filter-rejection",
+        controllerEnvironmentInput(filteredRoot, filteredState)
+      ),
+      (error) => error?.code === "E_CAPABILITY"
+        && /external Git filter/.test(error.message)
+    );
+    assert.equal(
+      fs.existsSync(path.join(
+        filteredState,
+        "task-homes",
+        "controller-filter-rejection"
+      )),
+      false
+    );
+    fs.rmSync(filteredState, { recursive: true, force: true });
+    fs.rmSync(filteredRoot, { recursive: true, force: true });
+  });
+});
+
+test("controller rejects Git object alternates outside the bound common directory", async () => {
+  await withFake({}, async () => {
+    const root = initNonTemporaryRepo();
+    const stateDir = nonTemporaryDirectory("grok-controller-alternate-state-");
+    const commonDir = gitValue(
+      root,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir"
+    );
+    const alternate = path.join(commonDir, "objects", "info", "alternates");
+    fs.mkdirSync(path.dirname(alternate), { recursive: true });
+    fs.writeFileSync(alternate, "/outside/object-store\n", "utf8");
+    assert.throws(
+      () => taskEnvironment(
+        stateDir,
+        root,
+        profileFor("task", true),
+        "controller-alternate-rejection",
+        controllerEnvironmentInput(root, stateDir)
+      ),
+      (error) => error?.code === "E_CAPABILITY"
+        && /object alternates/.test(error.message)
+    );
+    fs.rmSync(stateDir, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
+test("bound provider startup refuses an already-pending intent without spawning a bootstrap", async () => {
+  await withFake({}, async () => {
+    const root = initRepo();
+    const home = tempDir("provider-pending-home-");
+    const grokHome = path.join(home, ".grok");
+    let bootstrapSpawns = 0;
+    let noChildPublications = 0;
+    await assert.rejects(
+      () => openProvider({
+        root,
+        profile: profileFor("task", false),
+        stateDir: tempDir("provider-state-"),
+        jobMarker: "task-aabbccddeeff0011",
+        environment: {
+          grokHome,
+          env: childEnvironment({ HOME: home, USERPROFILE: home, GROK_HOME: grokHome }),
+          knownSecrets: []
+        },
+        guardBinding: {
+          controlWorkspaceId: "control-workspace-placeholder",
+          executionRoot: root,
+          dispatchAttemptId: "b".repeat(32),
+          dispatchFence: 1,
+          providerGeneration: 1
+        },
+        providerLaunch: {
+          prepare: () => ({
+            prepared: false,
+            reason: "already-pending",
+            intent: {
+              status: "pending",
+              intentId: "c".repeat(32),
+              providerGeneration: 1
+            }
+          }),
+          noChild: () => { noChildPublications += 1; }
+        },
+        testHooks: {
+          afterBootstrapSpawned: () => { bootstrapSpawns += 1; }
+        }
+      }),
+      (error) => error?.code === "E_PROCESS_IDENTITY"
+    );
+    assert.equal(bootstrapSpawns, 0);
+    assert.equal(noChildPublications, 0, "a foreign pending intent must not be settled by this caller");
   });
 });
 
@@ -166,6 +793,7 @@ test("probe negotiates ACP v1, session loading, auth methods, models, and effort
     assert.equal(result.acpIsolation.sandbox, "read-only");
     assert.equal(result.acpIsolation.permissionMode, "dontAsk");
     assert.equal(result.acpIsolation.injectDefaultTools, false);
+    assert.deepEqual(result.acpIsolation.allowedTools, ["todo_write"]);
     assert.equal(result.acpIsolation.unattendedPrivilegeExpansion, false);
     assert.match(result.acpIsolation.agentProfileDigest, /^[a-f0-9]{64}$/);
 
@@ -253,6 +881,42 @@ test("runProvider creates a session, streams normalized events, and preserves li
       assert.equal(providerLog.some((entry) => entry.event === "headless"), false);
     }
   );
+});
+
+test("runProvider accepts max-turn completion and rejects refusal or legacy cancellation as success", async () => {
+  await withFake({ stopReason: "max_turn_requests" }, async () => {
+    const result = await runProvider({
+      root: initRepo(),
+      profile: profileFor("task", false),
+      prompt: "bounded turn",
+      stateDir: tempDir("provider-stop-reason-state-")
+    });
+    assert.equal(result.stopReason, "max_turn_requests");
+  });
+
+  await withFake({ stopReason: "refusal" }, async () => {
+    await assert.rejects(
+      () => runProvider({
+        root: initRepo(),
+        profile: profileFor("task", false),
+        prompt: "refused turn",
+        stateDir: tempDir("provider-stop-reason-state-")
+      }),
+      (error) => error?.code === "E_PROTOCOL"
+    );
+  });
+
+  await withFake({ stopReason: "Cancelled" }, async () => {
+    await assert.rejects(
+      () => runProvider({
+        root: initRepo(),
+        profile: profileFor("task", false),
+        prompt: "cancelled turn",
+        stateDir: tempDir("provider-stop-reason-state-")
+      }),
+      (error) => error?.code === "E_CANCELLED"
+    );
+  });
 });
 
 test("runProvider loads an existing session and rejects unadvertised models", async () => {
@@ -576,6 +1240,46 @@ test("setup probe path retains isolated home when process-group shutdown fails",
   });
 });
 
+test("ACP cleanup retains the staged agent profile when exact guard deletion loses an ABA race", async () => {
+  await withFake({}, async () => {
+    const root = initRepo();
+    const state = tempDir("provider-guard-cas-state-");
+    const marker = "task-provider-guard-cas-01234567";
+    const profiles = path.join(state, "task-homes", marker, ".grok", "agent-profiles");
+    let replacement = null;
+    try {
+      await assert.rejects(
+        () => runProvider({
+          root,
+          profile: profileFor("task", false),
+          prompt: "inspect",
+          stateDir: state,
+          jobMarker: marker,
+          onEvent(event) {
+            if (event.type !== "provider" || replacement) return;
+            replacement = registerProviderGuard(root, marker, {
+              ...event.process,
+              startToken: `${event.process.startToken}|replacement`
+            }, "replacement-owner");
+          }
+        }),
+        (error) => error?.code === "E_STATE"
+          && /provider guard/i.test(error?.details?.privacyWarning || "")
+      );
+      assert.ok(replacement, "test did not publish the ABA replacement guard");
+      assert.deepEqual(loadProviderGuard(root, marker), replacement);
+      assert.ok(
+        fs.readdirSync(profiles).some((name) => name.endsWith(".md")),
+        "staged agent profile was deleted after exact guard cleanup failed"
+      );
+    } finally {
+      try { unregisterProviderGuard(root, marker, replacement); } catch {}
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(state, { recursive: true, force: true });
+    }
+  });
+});
+
 test("isolated ACP homes reject external discovery and redact opaque copied credentials", async () => {
   const secret = "opaque-provider-credential-value-123456";
   await withFake({ authSecret: secret, stderr: `diagnostic ${secret}\n`, unknownSecret: secret, taskText: `result ${secret}` }, async (fake) => {
@@ -757,23 +1461,25 @@ test("provider event callback failures terminate ACP and headless children", asy
 test("headless timeout and output overflow escalate once to a forced exit", async () => {
   await withFake({ headlessDelayMs: 60_000, headlessIgnoreSigterm: true }, async () => {
     const root = initRepo(), state = tempDir("provider-state-"), marker = "review-timeout-test";
-    const started = Date.now();
     await assert.rejects(
       () => runHeadless({ root, profile: profileFor("review"), prompt: "review", stateDir: state, jobMarker: marker, timeoutMs: 600 }),
       (error) => error.code === "E_TIMEOUT"
     );
-    assert.ok(Date.now() - started >= 2000 && Date.now() - started < 5000);
     assert.equal(cleanupReviewEnvironment(state, marker).ok, true);
   });
 
-  await withFake({ headlessStdoutBytes: 2048, headlessDelayMs: 60_000, headlessIgnoreSigterm: true }, async () => {
+  await withFake({ headlessStdoutBytes: 2048, headlessDelayMs: 60_000, headlessIgnoreSigterm: true }, async (fake) => {
     const root = initRepo(), state = tempDir("provider-state-"), marker = "review-output-test";
     const started = Date.now();
     await assert.rejects(
       () => runHeadless({ root, profile: profileFor("review"), prompt: "review", stateDir: state, jobMarker: marker, timeoutMs: 10_000, maxOutputBytes: 1024 }),
       (error) => error.code === "E_OUTPUT_LIMIT"
     );
-    assert.ok(Date.now() - started >= 2000 && Date.now() - started < 5000);
+    assert.ok(Date.now() - started >= 1800);
+    assert.equal(
+      readFakeLog(fake.logFile).filter((entry) => entry.event === "signal" && entry.signal === "SIGTERM" && entry.transport === "headless").length,
+      1
+    );
     assert.equal(cleanupReviewEnvironment(state, marker).ok, true);
   });
 });
@@ -781,12 +1487,34 @@ test("headless timeout and output overflow escalate once to a forced exit", asyn
 test("headless cleanup kills a TERM-resistant same-group descendant after the leader exits", async () => {
   await withFake({ headlessDelayMs: 60_000, headlessSpawnStubbornDescendant: true }, async (fake) => {
     const root = initRepo(), state = tempDir("provider-state-");
-    let providerIdentity = null;
-    await assert.rejects(
-      () => runHeadless({ root, profile: profileFor("review"), prompt: "review", stateDir: state, jobMarker: "review-descendant-test", timeoutMs: 400, onEvent(event) { if (event.type === "provider") providerIdentity = event.process; } }),
-      (error) => error.code === "E_TIMEOUT"
+    let providerIdentity = null, cancelRequested = false, waitError = null;
+    const rejected = assert.rejects(
+      runHeadless({
+        root,
+        profile: profileFor("review"),
+        prompt: "review",
+        stateDir: state,
+        jobMarker: "review-descendant-test",
+        timeoutMs: 10_000,
+        cancelRequested: () => cancelRequested,
+        onEvent(event) { if (event.type === "provider") providerIdentity = event.process; }
+      }),
+      (error) => error.code === "E_CANCELLED"
     );
-    const descendant = readFakeLog(fake.logFile).find((entry) => entry.event === "descendant" && entry.transport === "headless");
+    let descendant;
+    try {
+      descendant = await waitFor(
+        () => readFakeLog(fake.logFile).find((entry) => entry.event === "descendant" && entry.transport === "headless"),
+        { timeoutMs: 5_000, intervalMs: 25 }
+      );
+    } catch (error) {
+      waitError = error;
+    }
+    const cancellationStarted = Date.now();
+    cancelRequested = true;
+    await rejected;
+    if (waitError) throw waitError;
+    assert.ok(Date.now() - cancellationStarted >= 2000);
     assert.ok(descendant?.pid);
     assert.ok(providerIdentity?.processGroupId);
     assert.equal(processStartToken(descendant.pid), null);

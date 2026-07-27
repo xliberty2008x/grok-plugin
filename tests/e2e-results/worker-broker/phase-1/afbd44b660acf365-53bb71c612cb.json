@@ -1,0 +1,243 @@
+{
+  "schemaVersion": 1,
+  "roadmapVersion": "1.0",
+  "recordType": "worker-broker-slice",
+  "issue": "https://github.com/xliberty2008x/grok-plugin/issues/25",
+  "pullRequest": "https://github.com/xliberty2008x/grok-plugin/pull/26",
+  "phase": "1",
+  "slice": "worker-api",
+  "status": "implemented_unverified",
+  "recordedAt": "2026-07-23T03:58:09.079Z",
+  "releaseQualification": false,
+  "evidenceSystemQualification": true,
+  "provisionalSupportingRecord": false,
+  "qualification": {
+    "deterministic": "pass",
+    "installedHost": "not_run",
+    "provider": "not_run",
+    "release": "not_run"
+  },
+  "source": {
+    "pluginVersion": "0.3.0-dev.1",
+    "foundationCommit": null,
+    "headCommit": "2b39e137c2def0962438f08b626ad5af5bb797dd",
+    "headTree": "134c5c17033c4f329d26d5d95bd2cef5007d5bd9",
+    "sourceInventoryDigest": "afbd44b660acf365a856979b7aa45fff0ec6b34b7297ada4757e952571f3f5e1",
+    "phaseScopeDigest": "934f7559cf35cae49ca2b506cb53801e2d9aaea335ae6573b30e9968aaeeca3d",
+    "cleanTreeAtVerification": true,
+    "phaseScopePaths": [
+      "plugins/grok/.codex-plugin/plugin.json",
+      "plugins/grok/.mcp.json",
+      "plugins/grok/mcp/broker.mjs",
+      "plugins/grok/mcp/server.mjs",
+      "plugins/grok/provider-agents/report-repair.md",
+      "plugins/grok/provider-agents/rescue-read.md",
+      "plugins/grok/provider-agents/rescue-write.md",
+      "plugins/grok/provider-agents/setup-probe.md",
+      "plugins/grok/schemas/review-output.schema.json",
+      "plugins/grok/schemas/worker-protocol.schema.json",
+      "plugins/grok/scripts/grok-companion.mjs",
+      "plugins/grok/scripts/lib/acp-client.mjs",
+      "plugins/grok/scripts/lib/args.mjs",
+      "plugins/grok/scripts/lib/errors.mjs",
+      "plugins/grok/scripts/lib/git-review.mjs",
+      "plugins/grok/scripts/lib/grok-provider.mjs",
+      "plugins/grok/scripts/lib/host.mjs",
+      "plugins/grok/scripts/lib/process-control.mjs",
+      "plugins/grok/scripts/lib/profiles.mjs",
+      "plugins/grok/scripts/lib/provider-bootstrap.mjs",
+      "plugins/grok/scripts/lib/provider-capability.mjs",
+      "plugins/grok/scripts/lib/recursion-guard.mjs",
+      "plugins/grok/scripts/lib/redact.mjs",
+      "plugins/grok/scripts/lib/state.mjs",
+      "plugins/grok/scripts/lib/stdin.mjs",
+      "plugins/grok/scripts/lib/task-contract.mjs",
+      "plugins/grok/scripts/lib/transcript.mjs",
+      "plugins/grok/scripts/lib/worker-authority.mjs",
+      "plugins/grok/scripts/lib/worker-context.mjs",
+      "plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs",
+      "plugins/grok/scripts/lib/worker-launch-contract.mjs",
+      "plugins/grok/scripts/lib/worker-mailbox.mjs",
+      "plugins/grok/scripts/lib/worker-mutation.mjs",
+      "plugins/grok/scripts/lib/worker-presentation.mjs",
+      "plugins/grok/scripts/lib/worker-protocol.mjs",
+      "plugins/grok/scripts/lib/worker-reconcile.mjs",
+      "plugins/grok/scripts/lib/worker-recovery.mjs",
+      "plugins/grok/scripts/lib/worker-roles.mjs",
+      "plugins/grok/scripts/lib/worker-runtime.mjs",
+      "plugins/grok/scripts/lib/worker-service.mjs",
+      "plugins/grok/scripts/lib/worker-worktree.mjs",
+      "plugins/grok/scripts/lib/workspace.mjs",
+      "plugins/grok/skills/rescue/SKILL.md",
+      "plugins/grok/skills/result/SKILL.md",
+      "plugins/grok/skills/status/SKILL.md",
+      "scripts/check-deterministic.mjs",
+      "scripts/lib/deterministic-test-runner.mjs",
+      "scripts/lib/static-esm-import-parser.mjs",
+      "scripts/lib/zero-skip-test-reporter.mjs",
+      "scripts/test-deterministic.mjs",
+      "scripts/test-phase1-focused.mjs",
+      "tests/args-redaction-profiles.test.mjs",
+      "tests/control-plane.test.mjs",
+      "tests/fake-grok.mjs",
+      "tests/helpers.mjs",
+      "tests/mcp-worker-broker.test.mjs",
+      "tests/mcp-worker-runtime.test.mjs",
+      "tests/process-control-owned-identity.test.mjs",
+      "tests/process-control.test.mjs",
+      "tests/provider-bootstrap-crash-window.test.mjs",
+      "tests/provider-capability.test.mjs",
+      "tests/provider-startup-cancel.test.mjs",
+      "tests/provider.test.mjs",
+      "tests/recursion-guard.test.mjs",
+      "tests/redact.test.mjs",
+      "tests/runtime.test.mjs",
+      "tests/state.test.mjs",
+      "tests/worker-cli-authority.test.mjs",
+      "tests/worker-dispatch-supervisor.test.mjs",
+      "tests/worker-launch-outbox.test.mjs",
+      "tests/worker-mailbox.test.mjs",
+      "tests/worker-mutation.test.mjs",
+      "tests/worker-protocol.test.mjs",
+      "tests/worker-provider-rotation-intent.test.mjs",
+      "tests/worker-reconcile-safety.test.mjs",
+      "tests/worker-recovery-fence.test.mjs",
+      "tests/worker-runtime-teardown.test.mjs",
+      "tests/worker-safety-proofs.test.mjs",
+      "tests/worker-service.test.mjs",
+      "tests/worker-startup-crash-window.test.mjs",
+      "tests/worker-terminal-intent.test.mjs"
+    ]
+  },
+  "installation": {
+    "method": "source-tree",
+    "sourcePluginInventoryDigest": null,
+    "installedPluginInventoryDigest": null,
+    "installedFileCount": null,
+    "sourceAndInstalledInventoriesEqual": null,
+    "privateInstallPathRecorded": false
+  },
+  "runtime": {
+    "platform": "macOS",
+    "architecture": "arm64",
+    "node": "25.5.0",
+    "git": "2.45.1",
+    "codexStandalone": null,
+    "codexDesktopBundled": null,
+    "grokBuild": null,
+    "grokBuildRevision": null,
+    "mcpProtocolVersion": "2025-11-25"
+  },
+  "prerequisites": [
+    {
+      "phase": "0",
+      "recordDigest": "f7c9779e2dcd980dcfd4fcd248229a25ba2e7c91677569adbee65ad0dfe55a36",
+      "gateIds": [
+        "repository-check",
+        "phase-0-focused-tests",
+        "git-diff-check"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "gateId": "repository-check",
+      "argv": [
+        "node",
+        "scripts/check-deterministic.mjs"
+      ],
+      "boundary": "source-provider-neutral",
+      "outcome": "pass",
+      "startedAt": "2026-07-23T03:40:03.899Z",
+      "endedAt": "2026-07-23T03:50:47.611Z",
+      "exitCode": 0,
+      "outputDigest": "a10f172e875b5348431cfd09564f2fa94d9dd85da418c1ee91d4be8d8a7e6fa7",
+      "assertions": [
+        "code-owned manifest gate exited successfully",
+        "output was bounded and redacted before digest"
+      ]
+    },
+    {
+      "gateId": "phase-1-focused-tests",
+      "argv": [
+        "node",
+        "scripts/test-phase1-focused.mjs"
+      ],
+      "boundary": "focused-source-provider-neutral",
+      "outcome": "pass",
+      "startedAt": "2026-07-23T03:50:47.720Z",
+      "endedAt": "2026-07-23T03:58:08.471Z",
+      "exitCode": 0,
+      "outputDigest": "f54422da93e487b2e993c82fd481cbc948ac8a99e54bb1c0fb2f93787766aa19",
+      "assertions": [
+        "code-owned manifest gate exited successfully",
+        "output was bounded and redacted before digest"
+      ]
+    },
+    {
+      "gateId": "git-diff-check",
+      "argv": [
+        "git",
+        "show",
+        "--check",
+        "--format=",
+        "HEAD"
+      ],
+      "boundary": "source",
+      "outcome": "pass",
+      "startedAt": "2026-07-23T03:58:08.598Z",
+      "endedAt": "2026-07-23T03:58:08.613Z",
+      "exitCode": 0,
+      "outputDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "assertions": [
+        "code-owned manifest gate exited successfully",
+        "output was bounded and redacted before digest"
+      ]
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "phase-1-proof-runner",
+      "boundary": "deterministic",
+      "expected": "all fixed Phase 1 gates pass on one stable clean source and prerequisite identity",
+      "actual": "all fixed gates passed and source identity remained stable",
+      "outcome": "pass"
+    }
+  ],
+  "liveScenarios": [],
+  "ci": null,
+  "authorities": {
+    "workerClaims": "none",
+    "runtimeObservations": "broker-owned bounded Phase 1 gate runner",
+    "hostVerification": "not_run",
+    "independentValidation": "not_run"
+  },
+  "limits": {
+    "residualRisks": [
+      "Installed-host and authenticated-provider qualification remain unproven.",
+      "The local producer assumes reviewed gates and all descendants are quiescent; hostile same-UID races and data retained through open descriptors require a separately privileged supervisor."
+    ],
+    "unsupportedPlatforms": [
+      "windows-proof-producer-cleanup",
+      "windows-provider-execution",
+      "linux-provider-unqualified"
+    ],
+    "invalidationTriggers": [
+      "source inventory change outside evidence-only paths",
+      "phase-scope path change",
+      "proof gate manifest change",
+      "dirty tree when cleanTreeAtVerification claimed"
+    ],
+    "supersededBy": null,
+    "liveQualificationGaps": [
+      "installed natural host proof not run",
+      "authenticated Grok provider proof not run"
+    ]
+  },
+  "proofProducer": {
+    "id": "worker-broker-gate-runner",
+    "version": 2,
+    "manifestDigest": "b2fa2be3c0f70da875c7fdc268694bbd0c97c3e087ae5aabe3c995c675dab74a"
+  },
+  "recordDigest": "53bb71c612cb696c5a7a845a8b04cd728dea9b1c0626684c886d04aa0bc06489"
+}

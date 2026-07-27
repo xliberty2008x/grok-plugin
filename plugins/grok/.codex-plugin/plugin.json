@@ -16,6 +16,7 @@
     "codex"
   ],
   "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Grok Companion",
     "shortDescription": "Delegate coding work and reviews to Grok Build",
