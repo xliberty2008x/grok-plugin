@@ -3225,6 +3225,11 @@ test("worker restart recovery settles an inflight mailbox turn as unknown withou
     );
     return messages[0]?.state === "inflight" ? messages[0] : null;
   }, { timeoutMs: 15_000, intervalMs: 25 });
+  await waitFor(
+    () => readFakeLog(fake.logFile)
+      .find((entry) => entry.event === "prompt" && entry.promptNumber === 2) || null,
+    { timeoutMs: 15_000, intervalMs: 25 }
+  );
   const active = tryReadJob(root, workerId, env);
   process.kill(-active.workerProcess.processGroupId, "SIGKILL");
 
