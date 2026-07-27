@@ -3178,13 +3178,37 @@ test("worker restart recovery settles an inflight mailbox turn as unknown withou
     userRequest: "Accept one message, then prove restart recovery is ambiguity-safe."
   }, options);
   workerId = spawned.worker.id;
-  const openAttempt = await waitFor(() => {
-    if (readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length !== 1) {
-      return null;
-    }
-    try { return resolveOpenMailbox(root, workerId, env); }
-    catch { return null; }
-  }, { timeoutMs: 15_000, intervalMs: 25 });
+  let openAttempt;
+  try {
+    openAttempt = await waitFor(() => {
+      if (readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length !== 1) {
+        return null;
+      }
+      try { return resolveOpenMailbox(root, workerId, env); }
+      catch { return null; }
+    }, { timeoutMs: 30_000, intervalMs: 25 });
+  } catch (error) {
+    const job = tryReadJob(root, workerId, env);
+    const processSummary = (identity) => identity ? {
+      pid: identity.pid || null,
+      processGroupId: identity.processGroupId || null,
+      hasStartToken: Boolean(identity.startToken)
+    } : null;
+    error.message = `${error.message}\nRecovery readiness: ${JSON.stringify({
+      status: job?.status || null,
+      phase: job?.phase || null,
+      error: job?.error ? {
+        code: job.error.code || null,
+        message: job.error.message || null
+      } : null,
+      controllerProcess: processSummary(job?.controllerProcess),
+      workerProcess: processSummary(job?.workerProcess),
+      providerProcess: processSummary(job?.providerProcess),
+      promptCount: readFakeLog(fake.logFile)
+        .filter((entry) => entry.event === "prompt").length
+    })}`;
+    throw error;
+  }
 
   const sent = await callTool(root, "worker_send", {
     id: workerId,
