@@ -41,7 +41,7 @@ import {
   providerLaunchBindingDigest as digestProviderLaunchBinding,
   publishProviderExecutablePin
 } from "./lib/provider-executable-pin.mjs";
-import { admitJob, appendJobLog, config, setConfig, generateId, writeJob, updateJob, listJobs, readJob, selectJob, requestCancel, isCancelRequested, terminal, now, retain, logFile, withWorkspaceAdmission, withWorkspaceStateTransaction } from "./lib/state.mjs";
+import { admitJob, appendJobLog, config, setConfig, generateId, writeJob, updateJob, listJobs, listStatusReadonly, readJob, readJobStatusReadonly, selectJob, requestCancel, isCancelRequested, terminal, now, retain, logFile, withWorkspaceAdmission, withWorkspaceStateTransaction } from "./lib/state.mjs";
 import { resolveControlWorkspace, workspaceRoot, workspaceState } from "./lib/workspace.mjs";
 import { redact, redactText, sanitizeDisplayText } from "./lib/redact.mjs";
 import { readBoundedStdin, STDIN_READY_MARKER } from "./lib/stdin.mjs";
@@ -123,7 +123,7 @@ const PLUGIN_ROOT = path.resolve(path.dirname(SCRIPT), "..");
 const VALID_EFFORTS = new Set(["low", "medium", "high"]);
 
 function usage() {
-  return ["Usage:", "  grok-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]", "  grok-companion.mjs review|adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]", "  grok-companion.mjs task [--wait|--background] [--write] [--resume|--fresh] [--job-id <id>] [--model <id>] [--effort low|medium|high] [--envelope-stdin [--stdin-ready] | --envelope-file <private-path> | -- <task>]", "  grok-companion.mjs transfer [--source <claude-or-codex-jsonl>] [--model <id>] [--effort low|medium|high] [--json]", "  grok-companion.mjs status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--json]", "  grok-companion.mjs result [job-id] [--json]", "  grok-companion.mjs cancel [job-id] [--json]"].join("\n");
+  return ["Usage:", "  grok-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]", "  grok-companion.mjs review|adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]", "  grok-companion.mjs task [--wait|--background] [--write] [--resume|--fresh] [--job-id <id>] [--model <id>] [--effort low|medium|high] [--envelope-stdin [--stdin-ready] | --envelope-file <private-path> | -- <task>]", "  grok-companion.mjs transfer [--source <claude-or-codex-jsonl>] [--model <id>] [--effort low|medium|high] [--json]", "  grok-companion.mjs status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--readonly] [--json]", "  grok-companion.mjs result [job-id] [--json]", "  grok-companion.mjs cancel [job-id] [--json]"].join("\n");
 }
 
 function stdinReadySignal(enabled) {
@@ -2892,8 +2892,57 @@ async function handleTask(raw) {
 }
 
 async function handleStatus(raw) {
-  const { options, positionals } = parseArgs(argvFrom(raw), { values: ["timeout-ms", "cwd"], booleans: ["wait", "all", "json"] });
+  const { options, positionals } = parseArgs(argvFrom(raw), {
+    values: ["timeout-ms", "cwd"],
+    booleans: ["wait", "all", "json", "readonly"]
+  });
   if (positionals.length > 1) throw new CompanionError("E_USAGE", "Status accepts at most one job ID.");
+  if (options.readonly) {
+    if (options.wait || options["timeout-ms"] != null) {
+      throw new CompanionError(
+        "E_USAGE",
+        "status --readonly cannot be combined with --wait or --timeout-ms; use default status for recovery waits."
+      );
+    }
+    const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd());
+    const host = currentHost();
+    if (positionals[0]) {
+      const { job } = readJobStatusReadonly(root, positionals[0]);
+      const value = assertHostJobAccess(job, "status");
+      if (options.json) out(publicJson(value, { detail: true }), true);
+      else out(renderJob(value));
+      return;
+    }
+    const { jobs, migrationRequired } = listStatusReadonly(root);
+    let value = jobs;
+    if (!options.all) {
+      if (!host.sessionId) {
+        throw new CompanionError(
+          "E_JOB_NOT_FOUND",
+          "Current host session identity is unavailable; provide an explicit job ID or pass --all."
+        );
+      }
+      value = jobs.filter((job) => sameHostSession(job, host));
+    }
+    if (options.json) {
+      if (options.all) {
+        out({ jobs: publicJson(value, { detail: false }), migrationRequired: Boolean(migrationRequired) }, true);
+      } else {
+        out(publicJson(value, { detail: false }), true);
+      }
+      return;
+    }
+    const table = [
+      "| Job | Kind | Status | Phase | Progress | Heartbeat |",
+      "|---|---|---|---|---|---|",
+      ...value.map((j) => `| ${j.id} | ${j.kind} | ${j.status} | ${j.phase} | ${sanitizeDisplayText(j.progress || j.summary || "").replace(/\|/g, "\\|")} | ${j.heartbeatAt || j.updatedAt || "-"} |`)
+    ];
+    if (options.all && migrationRequired) {
+      table.push("", "migrationRequired: true (valid legacy state is pending; pure preflight did not migrate)");
+    }
+    out(table.join("\n"));
+    return;
+  }
   const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd()); await recoverActiveJobs(root);
   if (positionals[0]) assertHostJobAccess(readJob(root, positionals[0]), "status");
   if (positionals[0] && options.wait) {

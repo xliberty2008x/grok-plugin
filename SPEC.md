@@ -596,7 +596,7 @@ Because the public `grok import --json` output contract is not fully documented,
 ### 11.7 `/grok:status`
 
 ```text
-/grok:status [job-id] [--wait] [--timeout-ms <ms>] [--all]
+/grok:status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--readonly] [--json]
 ```
 
 Rules:
@@ -610,8 +610,17 @@ Rules:
 - Default wait timeout is 240,000 ms.
 - The maximum requested timeout is 900,000 ms and the internal polling interval is 250 ms.
 - A wait timeout returns the latest job snapshot and does not cancel the job; the current record has no separate `waitTimedOut` field.
+- **Default status** MAY recover lost workers, migrate late legacy state into an existing control store, and create or repair private state directories. This remains the normal monitoring path after dispatch.
+- **`--readonly`** is the pure preflight/read surface. It MUST NOT recover, migrate, mkdir, chmod, lock, clean, publish migration markers/receipts, or perform any durable or metadata filesystem mutation. In-memory caches and read-only descriptors are allowed. It MUST strictly validate authoritative records and fail closed with sanitized `E_STATE` on malformed, unsafe, symlinked, oversized, wrong-owner, or privacy-unsafe state rather than hiding corruption. When a control store exists, control jobs remain observable and `--all --json` MUST expose whether valid legacy state still requires migration. Pure `--readonly` MUST NOT be documented or treated as a writability probe.
+- Invalid combinations: `--readonly` with `--wait` or `--timeout-ms` MUST fail with `E_USAGE`.
+- Readonly JSON shapes:
+  - `status --all --readonly --json` → `{ "jobs": [<public job projections>], "migrationRequired": <boolean> }`
+  - `status --readonly --json` (session-filtered, no job ID) → `[<public job projections>]` (array; same public projection as default status without `--all`)
+  - `status <job-id> --readonly --json` → one public job projection
+- `migrationRequired` is `true` only when valid, quiescent legacy state still needs cutover work (pending unpublished entries or missing snapshot receipt). Divergent or unsafe legacy state MUST fail closed with `E_STATE` instead of a soft flag.
+- Workspace control-state initialization/repair, legacy migration, durable state locks, and atomic private job/state writes MUST surface `EPERM`, `EACCES`, and `EROFS` as sanitized `E_STORAGE_READONLY` (prerequisite exit classification). Those CompanionError codes MUST NOT be replaced by authoritative-state `E_STATE` at list/read/admission boundaries. Public `E_STORAGE_READONLY` payloads MUST NOT include private absolute state paths. Job admission (`admitJob`) performs durable lock and write before worker/provider launch, so storage-capability failure is observable before launch.
 
-Human status includes ID, kind, status, phase, progress, heartbeat, and summary. An explicit task may also include the host resume command via job ID, stored worker report fields, runtime-observed paths, or error. Provider session IDs remain private. Internal `--json` output returns the public job projection or list of projections, not the private full record.
+Human status includes ID, kind, status, phase, progress, heartbeat, and summary. An explicit task may also include the host resume command via job ID, stored worker report fields, runtime-observed paths, or error. Provider session IDs remain private. Internal `--json` output returns the public job projection or list of projections, not the private full record, except for the readonly `--all` object shape above.
 
 ### 11.8 `/grok:result`
 
@@ -912,6 +921,7 @@ Resuming a session MUST NOT weaken or change its stored security profile. A requ
 | `E_IMPORT_SOURCE` | Unsafe or invalid transcript source |
 | `E_IMPORT_RESULT` | Import did not produce a usable session ID |
 | `E_STATE` | State read, write, or lock failure |
+| `E_STORAGE_READONLY` | Workspace control-state storage is not writable (capability/prerequisite; e.g. EPERM/EACCES/EROFS on state initialization/repair, migration, durable lock, or atomic admission write) |
 | `E_SECURITY_PROFILE` | The checked-in ACP agent profile no longer matches its recorded digest |
 | `E_WORKER_LOST` | Recorded worker disappeared |
 | `E_PROCESS_IDENTITY` | A recorded PID could not be proven to belong to the job |

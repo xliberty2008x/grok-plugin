@@ -2,7 +2,12 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { CompanionError } from "./errors.mjs";
+import {
+  CompanionError,
+  isStorageCapabilityError,
+  rethrowStorageCapability,
+  storageReadonlyError
+} from "./errors.mjs";
 import { pluginDataRoot } from "./host.mjs";
 
 export function git(cwd, args, { allowFailure = false, encoding = "utf8", maxBuffer = 8 * 1024 * 1024 } = {}) {
@@ -110,13 +115,129 @@ const LEGACY_METADATA_TTL_MS = 500;
 const LEGACY_FULL_RESCAN_MS = 60_000;
 const legacySnapshotCache = new Map();
 
+function readonlyStateError() {
+  return new CompanionError("E_STATE", "Authoritative job state is malformed or unsafe.");
+}
+
 function safeDirectory(directory, label) {
-  const stat = fs.lstatSync(directory);
-  if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(directory) !== directory) {
-    throw new CompanionError("E_STATE", `Refusing unsafe ${label} ${directory}.`);
+  try {
+    const stat = fs.lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(directory) !== directory) {
+      throw new CompanionError("E_STATE", `Refusing unsafe ${label} ${directory}.`);
+    }
+    if ((stat.mode & 0o077) !== 0) fs.chmodSync(directory, 0o700);
+    return directory;
+  } catch (error) {
+    rethrowStorageCapability(error);
   }
-  if ((stat.mode & 0o077) !== 0) fs.chmodSync(directory, 0o700);
+}
+
+/**
+ * Fail-closed private directory assertion with zero durable mutations.
+ * Rejects symlinks, path swaps, group/other access, and wrong ownership.
+ */
+function assertExistingPrivateDir(directory) {
+  let stat;
+  try {
+    stat = fs.lstatSync(directory);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw readonlyStateError();
+  }
+  try {
+    if (!stat.isDirectory()
+      || stat.isSymbolicLink()
+      || fs.realpathSync(directory) !== directory
+      || (stat.mode & 0o077) !== 0
+      || (typeof process.getuid === "function" && stat.uid !== process.getuid())) {
+      throw readonlyStateError();
+    }
+  } catch (error) {
+    if (error instanceof CompanionError) throw error;
+    throw readonlyStateError();
+  }
   return directory;
+}
+
+function readonlyPathExists(file) {
+  try {
+    fs.lstatSync(file);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw readonlyStateError();
+  }
+}
+
+function readonlyRealpathOrAbsent(file) {
+  try {
+    return fs.realpathSync(file);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw readonlyStateError();
+  }
+}
+
+function quiescentLegacySnapshotReadonly(legacyDir, env) {
+  try {
+    const captured = cachedLegacySnapshot(legacyDir, env);
+    const snapshot = { ...captured.snapshot, legacyDir };
+    assertLegacySnapshotQuiescent(snapshot);
+    return snapshot;
+  } catch {
+    throw readonlyStateError();
+  }
+}
+
+function pureDestinationPath(controlDir, relative) {
+  const segments = safeLegacyRelativePath(relative).split("/");
+  const destination = path.join(controlDir, ...segments);
+  if (!destination.startsWith(`${controlDir}${path.sep}`)) {
+    throw new CompanionError("E_STATE", "Legacy migration destination escaped the control state directory.");
+  }
+  return destination;
+}
+
+function planLegacyEntryReadonly(controlDir, entry, acknowledged) {
+  const destination = pureDestinationPath(controlDir, entry.path);
+  const existing = destinationDigest(destination);
+  if (acknowledged.has(entryAcknowledgementKey(entry))) {
+    if (existing) return null;
+  } else if (existing) {
+    if (existing.contentDigest !== entry.contentDigest || existing.size !== entry.size) {
+      throw new CompanionError("E_STATE", `Conflicting late legacy/control state at ${entry.path}.`);
+    }
+    return null;
+  }
+  return { destination, entry };
+}
+
+/**
+ * Pure assessment of whether valid legacy state still requires cutover work.
+ * Reads only; never migrates, mkdir, chmod, or publishes markers.
+ */
+function assessLegacyMigrationRequired(controlDir, stateParent, controlRoot, env) {
+  try {
+    let required = false;
+    for (const legacyDir of legacyStateDirsReadonly(stateParent, controlRoot)) {
+      if (legacyDir === controlDir || !assertExistingPrivateDir(legacyDir)) continue;
+      const snapshot = quiescentLegacySnapshotReadonly(legacyDir, env);
+      const acknowledged = acknowledgedLegacyEntries(controlDir, snapshot);
+      const pending = snapshot.entries
+        .map((entry) => planLegacyEntryReadonly(controlDir, entry, acknowledged))
+        .filter(Boolean);
+      if (pending.length > 0) {
+        required = true;
+        continue;
+      }
+      if (!readonlyPathExists(snapshotMarkerPath(controlDir, snapshot))) {
+        required = true;
+      }
+    }
+    return required;
+  } catch {
+    throw readonlyStateError();
+  }
 }
 
 function legacyStateDir(stateParent, controlRoot) {
@@ -135,12 +256,42 @@ export function listedWorktreeRoots(fromRoot) {
     }))];
 }
 
+function listedWorktreeRootsReadonly(fromRoot) {
+  try {
+    const run = git(fromRoot, ["worktree", "list", "--porcelain", "-z"], { allowFailure: true });
+    if (run.status !== 0) throw readonlyStateError();
+    const roots = [];
+    for (const entry of String(run.stdout || "").split("\0")) {
+      if (!entry.startsWith("worktree ")) continue;
+      try {
+        roots.push(fs.realpathSync(entry.slice("worktree ".length)));
+      } catch {
+        // A Git-registered but missing/prunable worktree can still own legacy
+        // path-keyed state. Its canonical identity cannot be proven readonly,
+        // so never omit it and report a false migrationRequired result.
+        throw readonlyStateError();
+      }
+    }
+    return [...new Set(roots)];
+  } catch {
+    throw readonlyStateError();
+  }
+}
+
 function legacyStateDirs(stateParent, controlRoot) {
   const roots = [...new Set([
     fs.realpathSync(controlRoot),
     ...listedWorktreeRoots(controlRoot)
   ])];
   return roots.map((root) => legacyStateDir(stateParent, root));
+}
+
+function legacyStateDirsReadonly(stateParent, controlRoot) {
+  const roots = [...new Set([
+    readonlyRealpathOrAbsent(controlRoot),
+    ...listedWorktreeRootsReadonly(controlRoot)
+  ].filter(Boolean))];
+  return roots.map((root) => path.join(stateParent, workspaceStateSegment(root)));
 }
 
 function legacySourceDigest(legacyDir) {
@@ -468,7 +619,9 @@ function destinationFor(controlDir, relative) {
   for (const segment of segments.slice(0, -1)) {
     parent = path.join(parent, segment);
     try { fs.mkdirSync(parent, { mode: 0o700 }); }
-    catch (error) { if (error.code !== "EEXIST") throw error; }
+    catch (error) {
+      if (error.code !== "EEXIST") rethrowStorageCapability(error);
+    }
     safeDirectory(parent, "legacy migration destination");
   }
   const destination = path.join(parent, segments.at(-1));
@@ -509,6 +662,7 @@ function planLegacyEntry(controlDir, entry, acknowledged) {
 function publishLegacyEntry(destination, entry) {
   const temporary = `${destination}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.migrate`;
   let descriptor;
+  let primaryError = null;
   try {
     descriptor = fs.openSync(temporary, "wx", 0o600);
     try {
@@ -522,14 +676,26 @@ function publishLegacyEntry(destination, entry) {
     // linkSync publishes a complete file without replacing an existing record.
     fs.linkSync(temporary, destination);
   } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-    const raced = destinationDigest(destination);
-    if (!raced || raced.contentDigest !== entry.contentDigest || raced.size !== entry.size) {
-      throw new CompanionError("E_STATE", `Conflicting late legacy/control state at ${entry.path}.`);
+    try {
+      if (error.code === "EEXIST") {
+        const raced = destinationDigest(destination);
+        if (!raced || raced.contentDigest !== entry.contentDigest || raced.size !== entry.size) {
+          throw new CompanionError("E_STATE", `Conflicting late legacy/control state at ${entry.path}.`);
+        }
+        return;
+      }
+      rethrowStorageCapability(error);
+    } catch (normalized) {
+      primaryError = normalized;
+      throw normalized;
     }
   } finally {
     if (descriptor != null) try { fs.closeSync(descriptor); } catch {}
-    try { fs.unlinkSync(temporary); } catch {}
+    try {
+      fs.unlinkSync(temporary);
+    } catch (error) {
+      if (!primaryError && isStorageCapabilityError(error)) throw storageReadonlyError(error);
+    }
   }
 }
 
@@ -580,26 +746,38 @@ function writeLegacySnapshotMarker(controlDir, snapshot, serialized) {
   const marker = snapshotMarkerPath(controlDir, snapshot);
   const temporary = `${marker}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
   let descriptor;
+  let primaryError = null;
   try {
-    descriptor = fs.openSync(temporary, "wx", 0o600);
-    fs.writeFileSync(descriptor, serialized);
-    fs.fsyncSync(descriptor);
-    fs.closeSync(descriptor);
-    descriptor = null;
     try {
-      fs.linkSync(temporary, marker);
+      descriptor = fs.openSync(temporary, "wx", 0o600);
+      fs.writeFileSync(descriptor, serialized);
+      fs.fsyncSync(descriptor);
+      fs.closeSync(descriptor);
+      descriptor = null;
+      try {
+        fs.linkSync(temporary, marker);
+      } catch (error) {
+        if (error.code !== "EEXIST") rethrowStorageCapability(error);
+        parseSnapshotMarker(marker, snapshot.sourceDigest);
+      }
+      if (process.platform !== "win32") {
+        const directoryDescriptor = fs.openSync(controlDir, fs.constants.O_RDONLY);
+        try { fs.fsyncSync(directoryDescriptor); }
+        finally { fs.closeSync(directoryDescriptor); }
+      }
     } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-      parseSnapshotMarker(marker, snapshot.sourceDigest);
+      rethrowStorageCapability(error);
     }
-    if (process.platform !== "win32") {
-      const directoryDescriptor = fs.openSync(controlDir, fs.constants.O_RDONLY);
-      try { fs.fsyncSync(directoryDescriptor); }
-      finally { fs.closeSync(directoryDescriptor); }
-    }
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
     if (descriptor != null) try { fs.closeSync(descriptor); } catch {}
-    try { fs.unlinkSync(temporary); } catch {}
+    try {
+      fs.unlinkSync(temporary);
+    } catch (error) {
+      if (!primaryError && isStorageCapabilityError(error)) throw storageReadonlyError(error);
+    }
   }
 }
 
@@ -637,15 +815,28 @@ function migrateLegacyState(controlDir, stateParent, controlRoot, env) {
 
 export function controlStateDir(control, env = process.env) {
   const configuredData = pluginDataRoot(env);
-  fs.mkdirSync(configuredData, { recursive: true, mode: 0o700 });
-  const pluginData = fs.realpathSync(configuredData);
+  try {
+    fs.mkdirSync(configuredData, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    rethrowStorageCapability(error);
+  }
+  let pluginData;
+  try {
+    pluginData = fs.realpathSync(configuredData);
+  } catch (error) {
+    rethrowStorageCapability(error);
+  }
   const stateParent = path.join(pluginData, "state");
   try { fs.mkdirSync(stateParent, { mode: 0o700 }); }
-  catch (error) { if (error.code !== "EEXIST") throw error; }
+  catch (error) {
+    if (error.code !== "EEXIST") rethrowStorageCapability(error);
+  }
   safeDirectory(stateParent, "plugin state directory");
   const controlDir = path.join(stateParent, controlStateSegment(control.controlWorkspaceId));
   try { fs.mkdirSync(controlDir, { mode: 0o700 }); }
-  catch (error) { if (error.code !== "EEXIST") throw error; }
+  catch (error) {
+    if (error.code !== "EEXIST") rethrowStorageCapability(error);
+  }
   safeDirectory(controlDir, "control state directory");
   migrateLegacyState(controlDir, stateParent, control.controlRoot, env);
   return controlDir;
@@ -744,6 +935,86 @@ export function resolveWorkspaceStateDir(root, env = process.env) {
 }
 
 /**
+ * Pure control/legacy state discovery for status --readonly preflight.
+ * Never migrates, creates directories, chmods, locks, cleans, or publishes markers.
+ * Fail-closed on unsafe/privacy-violating authoritative stores with E_STATE.
+ *
+ * @returns {{ base: string|null, bases: string[], migrationRequired: boolean }}
+ */
+export function resolveWorkspaceStateReadonly(root, env = process.env) {
+  let configuredData;
+  try {
+    configuredData = pluginDataRoot(env);
+  } catch {
+    throw readonlyStateError();
+  }
+  const pluginData = readonlyRealpathOrAbsent(configuredData);
+  if (!pluginData) return { base: null, bases: [], migrationRequired: false };
+  const stateParent = path.join(pluginData, "state");
+  if (!assertExistingPrivateDir(stateParent)) {
+    return { base: null, bases: [], migrationRequired: false };
+  }
+
+  let resolvedControl = null;
+  try {
+    const executionRoot = workspaceRoot(root, true);
+    const common = gitCommonDir(executionRoot);
+    const controlWorkspaceId = controlWorkspaceIdFromCommon(common);
+    resolvedControl = {
+      controlDir: path.join(stateParent, controlStateSegment(controlWorkspaceId)),
+      controlRoot: mainWorktreeRoot(executionRoot)
+    };
+  } catch (error) {
+    if (!(error instanceof CompanionError) || error.code !== "E_GIT_REQUIRED") {
+      throw readonlyStateError();
+    }
+    // Preserve the established non-Git legacy fallback.
+  }
+  const controlDir = resolvedControl
+    ? assertExistingPrivateDir(resolvedControl.controlDir)
+    : null;
+  if (controlDir) {
+    return {
+      base: controlDir,
+      bases: [controlDir],
+      migrationRequired: assessLegacyMigrationRequired(
+        controlDir,
+        stateParent,
+        resolvedControl.controlRoot,
+        env
+      )
+    };
+  }
+
+  let canonicalRoot = readonlyRealpathOrAbsent(root);
+  if (!canonicalRoot) return { base: null, bases: [], migrationRequired: false };
+  try {
+    canonicalRoot = workspaceRoot(root, false);
+  } catch (error) {
+    if (!(error instanceof CompanionError) || error.code !== "E_GIT_REQUIRED") {
+      throw readonlyStateError();
+    }
+    // Keep the canonical path for the established non-Git legacy layout.
+  }
+  const callerLegacy = path.join(stateParent, workspaceStateSegment(canonicalRoot));
+  const candidates = resolvedControl
+    ? legacyStateDirsReadonly(stateParent, resolvedControl.controlRoot)
+    : [callerLegacy];
+  const bases = [];
+  for (const legacy of [...new Set(candidates)]) {
+    if (!assertExistingPrivateDir(legacy)) continue;
+    quiescentLegacySnapshotReadonly(legacy, env);
+    bases.push(legacy);
+  }
+  // Before the control store exists, every registered worktree remains a
+  // possible authoritative legacy source. Return all validated stores so pure
+  // status cannot hide another worktree's jobs while still preferring the
+  // caller's historical projection for compatibility.
+  const base = bases.includes(callerLegacy) ? callerLegacy : (bases[0] ?? null);
+  return { base, bases, migrationRequired: bases.length > 0 };
+}
+
+/**
  * Ensure and return the job-state directory for a workspace path.
  * Uses control-workspace identity so all linked worktrees share one store.
  */
@@ -758,11 +1029,22 @@ export function workspaceState(root, env = process.env) {
   if (control) return controlStateDir(control, env);
   const canonicalRoot = fs.realpathSync(root);
   const configuredData = pluginDataRoot(env);
-  fs.mkdirSync(configuredData, { recursive: true, mode: 0o700 });
-  const pluginData = fs.realpathSync(configuredData);
+  try {
+    fs.mkdirSync(configuredData, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    rethrowStorageCapability(error);
+  }
+  let pluginData;
+  try {
+    pluginData = fs.realpathSync(configuredData);
+  } catch (error) {
+    rethrowStorageCapability(error);
+  }
   const stateParent = path.join(pluginData, "state");
   try { fs.mkdirSync(stateParent, { mode: 0o700 }); }
-  catch (error) { if (error.code !== "EEXIST") throw error; }
+  catch (error) {
+    if (error.code !== "EEXIST") rethrowStorageCapability(error);
+  }
   safeDirectory(stateParent, "plugin state directory");
   return path.join(stateParent, workspaceStateSegment(canonicalRoot));
 }

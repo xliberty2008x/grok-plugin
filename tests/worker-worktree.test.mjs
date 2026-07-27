@@ -846,7 +846,10 @@ test("active legacy job blocks cutover and admission until quiescent without par
 
   assert.throws(
     () => admitJob(root, makeJob("task-333333333333333c", "queued", "new-control-admission"), env),
-    cutoverBlocked
+    (error) => error?.code === "E_STATE"
+      && error.message === "Authoritative job state is malformed or unsafe."
+      && !error.message.includes(root)
+      && !error.message.includes(activeId)
   );
   assert.equal(fs.existsSync(path.join(controlState, "jobs")), false, "control admission bypassed cutover fence");
 

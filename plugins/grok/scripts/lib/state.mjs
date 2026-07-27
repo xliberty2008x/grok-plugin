@@ -1,13 +1,19 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { CompanionError } from "./errors.mjs";
+import {
+  CompanionError,
+  isStorageCapabilityError,
+  rethrowStorageCapability,
+  storageReadonlyError
+} from "./errors.mjs";
 import { processIsZombie, processStartToken } from "./process-control.mjs";
 import {
   workspaceState,
   assertSafeJobId,
   resolveControlWorkspace,
   resolveWorkspaceStateDir,
+  resolveWorkspaceStateReadonly,
   resolveAdmissionLockName
 } from "./workspace.mjs";
 import { pluginDataRoot, sameHostSession } from "./host.mjs";
@@ -174,12 +180,25 @@ function ensure(root, env = process.env) {
   const base = workspaceState(root, env);
   for (const dir of [base, path.join(base, "jobs"), path.join(base, "locks")]) {
     try { fs.mkdirSync(dir, { mode: 0o700 }); }
-    catch (error) { if (error.code !== "EEXIST") throw error; }
-    const stat = fs.lstatSync(dir);
+    catch (error) {
+      if (error.code !== "EEXIST") rethrowStorageCapability(error);
+    }
+    let stat;
+    try {
+      stat = fs.lstatSync(dir);
+    } catch (error) {
+      rethrowStorageCapability(error);
+    }
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
       throw new CompanionError("E_STATE", `Refusing unsafe plugin state directory ${dir}.`);
     }
-    if ((stat.mode & 0o077) !== 0) fs.chmodSync(dir, 0o700);
+    if ((stat.mode & 0o077) !== 0) {
+      try {
+        fs.chmodSync(dir, 0o700);
+      } catch (error) {
+        rethrowStorageCapability(error);
+      }
+    }
   }
   return base;
 }
@@ -193,6 +212,76 @@ function readPrivateFile(file, { maxBytes = 8 * 1024 * 1024 } = {}) {
     return fs.readFileSync(descriptor, "utf8");
   } finally {
     if (descriptor != null) fs.closeSync(descriptor);
+  }
+}
+
+/**
+ * Strict private job-file read for status --readonly.
+ * Fail-closed on symlink, oversize, wrong owner, privacy-unsafe mode, or schema issues.
+ * Never hides corruption as a missing job.
+ */
+function readAuthoritativeJobFileStrictPrivate(file, expectedId) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const before = fs.fstatSync(descriptor);
+    if (!before.isFile()
+      || before.size < 1
+      || before.size > 8 * 1024 * 1024
+      || (before.mode & 0o077) !== 0
+      || (typeof process.getuid === "function" && before.uid !== process.getuid())) {
+      throw authoritativeJobStateError();
+    }
+    const pathStat = fs.lstatSync(file);
+    if (pathStat.isSymbolicLink()
+      || !pathStat.isFile()
+      || pathStat.dev !== before.dev
+      || pathStat.ino !== before.ino
+      || fs.realpathSync(file) !== file) {
+      throw authoritativeJobStateError();
+    }
+    const contents = Buffer.alloc(Number(before.size));
+    let offset = 0;
+    while (offset < contents.length) {
+      const count = fs.readSync(descriptor, contents, offset, contents.length - offset, offset);
+      if (count === 0) break;
+      offset += count;
+    }
+    const after = fs.fstatSync(descriptor);
+    if (offset !== contents.length
+      || before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs) {
+      throw authoritativeJobStateError();
+    }
+    const record = JSON.parse(contents.toString("utf8"));
+    return validateAuthoritativeJobCore(record, { expectedId });
+  } catch (error) {
+    if (error?.code === "ENOENT") throw error;
+    if (error instanceof CompanionError) throw error;
+    throw authoritativeJobStateError();
+  } finally {
+    if (descriptor != null) fs.closeSync(descriptor);
+  }
+}
+
+function assertPrivateJobsDirectory(directory) {
+  try {
+    const stat = fs.lstatSync(directory);
+    if (!stat.isDirectory()
+      || stat.isSymbolicLink()
+      || fs.realpathSync(directory) !== directory
+      || (stat.mode & 0o077) !== 0
+      || (typeof process.getuid === "function" && stat.uid !== process.getuid())) {
+      throw authoritativeJobStateError();
+    }
+    return directory;
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    if (error instanceof CompanionError) throw error;
+    throw authoritativeJobStateError();
   }
 }
 
@@ -221,7 +310,8 @@ function atomicPrivateFile(file, contents) {
       try { fs.closeSync(descriptor); } catch {}
     }
     try { fs.unlinkSync(tmp); } catch {}
-    throw error;
+    if (error instanceof CompanionError) throw error;
+    rethrowStorageCapability(error);
   }
 }
 
@@ -239,12 +329,25 @@ export function ensurePrivateStateDirectory(root, segments = [], env = process.e
     }
     current = path.join(current, segment);
     try { fs.mkdirSync(current, { mode: 0o700 }); }
-    catch (error) { if (error.code !== "EEXIST") throw error; }
-    const stat = fs.lstatSync(current);
+    catch (error) {
+      if (error.code !== "EEXIST") rethrowStorageCapability(error);
+    }
+    let stat;
+    try {
+      stat = fs.lstatSync(current);
+    } catch (error) {
+      rethrowStorageCapability(error);
+    }
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
       throw new CompanionError("E_STATE", `Refusing unsafe plugin state directory ${current}.`);
     }
-    if ((stat.mode & 0o077) !== 0) fs.chmodSync(current, 0o700);
+    if ((stat.mode & 0o077) !== 0) {
+      try {
+        fs.chmodSync(current, 0o700);
+      } catch (error) {
+        rethrowStorageCapability(error);
+      }
+    }
   }
   return current;
 }
@@ -287,71 +390,77 @@ function lockGenerationFingerprint(identity, ownerToken = "ownerless") {
 }
 
 function inspectLock(lock) {
-  let stat;
   try {
-    stat = fs.lstatSync(lock);
-  } catch (error) {
-    if (error.code === "ENOENT") return null;
-    throw error;
-  }
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new CompanionError("E_STATE", `Refusing unsafe state lock ${path.basename(lock, ".lock")}.`);
-  }
-  const identity = lockDirectoryIdentity(stat);
-  let owner = null;
-  let ownerFingerprint = null;
-  let ownerMissing = false;
-  try {
-    const ownerContents = readPrivateFile(path.join(lock, "owner.json"), { maxBytes: 4096 });
-    owner = JSON.parse(ownerContents);
-    ownerFingerprint = crypto.createHash("sha256").update(ownerContents).digest("hex");
-  } catch (error) {
-    if (error instanceof CompanionError) throw error;
-    ownerMissing = error?.code === "ENOENT";
-    if (!ownerMissing && !(error instanceof SyntaxError)) throw error;
-  }
-  // A process can die after fsyncing the exclusive owner temp file but before
-  // link(2) publishes owner.json. When exactly one complete provisional owner
-  // is bound to this lock generation, use its PID/start token for liveness so
-  // a proven-dead constructor is recoverable without weakening the grace for
-  // genuinely ownerless or ambiguous construction windows.
-  if (ownerMissing) {
-    let provisionalNames = [];
+    let stat;
     try {
-      provisionalNames = fs.readdirSync(lock).filter((name) => (
-        /^owner\.json\.\d+\.[a-f0-9]{12}\.tmp$/.test(name)
-      ));
+      stat = fs.lstatSync(lock);
     } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
+      if (error.code === "ENOENT") return null;
+      throw error;
     }
-    if (provisionalNames.length === 1) {
-      const provisionalName = provisionalNames[0];
-      const pid = Number(provisionalName.match(/^owner\.json\.(\d+)\./)?.[1]);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new CompanionError("E_STATE", `Refusing unsafe state lock ${path.basename(lock, ".lock")}.`);
+    }
+    const identity = lockDirectoryIdentity(stat);
+    let owner = null;
+    let ownerFingerprint = null;
+    let ownerMissing = false;
+    try {
+      const ownerContents = readPrivateFile(path.join(lock, "owner.json"), { maxBytes: 4096 });
+      owner = JSON.parse(ownerContents);
+      ownerFingerprint = crypto.createHash("sha256").update(ownerContents).digest("hex");
+    } catch (error) {
+      if (error instanceof CompanionError) throw error;
+      ownerMissing = error?.code === "ENOENT";
+      if (!ownerMissing && !(error instanceof SyntaxError)) throw error;
+    }
+    // A process can die after fsyncing the exclusive owner temp file but before
+    // link(2) publishes owner.json. When exactly one complete provisional owner
+    // is bound to this lock generation, use its PID/start token for liveness so
+    // a proven-dead constructor is recoverable without weakening the grace for
+    // genuinely ownerless or ambiguous construction windows.
+    if (ownerMissing) {
+      let provisionalNames = [];
       try {
-        const ownerContents = readPrivateFile(path.join(lock, provisionalName), { maxBytes: 4096 });
-        const provisional = JSON.parse(ownerContents);
-        if (provisional?.schemaVersion === 2 && provisional.pid === pid) {
-          owner = provisional;
-          ownerFingerprint = crypto.createHash("sha256").update(ownerContents).digest("hex");
-        }
+        provisionalNames = fs.readdirSync(lock).filter((name) => (
+          /^owner\.json\.\d+\.[a-f0-9]{12}\.tmp$/.test(name)
+        ));
       } catch (error) {
-        if (error instanceof CompanionError) throw error;
-        if (error?.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+        if (error?.code !== "ENOENT") throw error;
+      }
+      if (provisionalNames.length === 1) {
+        const provisionalName = provisionalNames[0];
+        const pid = Number(provisionalName.match(/^owner\.json\.(\d+)\./)?.[1]);
+        try {
+          const ownerContents = readPrivateFile(path.join(lock, provisionalName), { maxBytes: 4096 });
+          const provisional = JSON.parse(ownerContents);
+          if (provisional?.schemaVersion === 2 && provisional.pid === pid) {
+            owner = provisional;
+            ownerFingerprint = crypto.createHash("sha256").update(ownerContents).digest("hex");
+          }
+        } catch (error) {
+          if (error instanceof CompanionError) throw error;
+          if (error?.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+        }
       }
     }
+    return {
+      identity,
+      mtimeMs: stat.mtimeMs,
+      owner,
+      ownerFingerprint,
+      ownerToken: typeof owner?.token === "string" && /^[a-f0-9]{32}$/.test(owner.token) ? owner.token : null,
+      ownerDirectory: owner?.directory
+        && typeof owner.directory.dev === "string"
+        && typeof owner.directory.ino === "string"
+        ? owner.directory
+        : null
+    };
+  } catch (error) {
+    if (error instanceof CompanionError && error.code === "E_STORAGE_READONLY") throw error;
+    if (isStorageCapabilityError(error)) throw storageReadonlyError(error);
+    throw authoritativeJobStateError();
   }
-  return {
-    identity,
-    mtimeMs: stat.mtimeMs,
-    owner,
-    ownerFingerprint,
-    ownerToken: typeof owner?.token === "string" && /^[a-f0-9]{32}$/.test(owner.token) ? owner.token : null,
-    ownerDirectory: owner?.directory
-      && typeof owner.directory.dev === "string"
-      && typeof owner.directory.ino === "string"
-      ? owner.directory
-      : null
-  };
 }
 
 function ownerClaimsLockGeneration(snapshot) {
@@ -394,26 +503,42 @@ function exclusivePrivateJson(file, value) {
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
   let descriptor;
   let published = false;
+  let primaryError = null;
   try {
-    descriptor = fs.openSync(tmp, "wx", 0o600);
-    fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`);
-    fs.fchmodSync(descriptor, 0o600);
-    fs.fsyncSync(descriptor);
-    fs.closeSync(descriptor);
-    descriptor = null;
-    // link(2) is an atomic no-replace publication: observers either see no
-    // owner/transition or the complete, fsynced record, never a partial write.
-    fs.linkSync(tmp, file);
-    published = true;
+    try {
+      descriptor = fs.openSync(tmp, "wx", 0o600);
+      fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`);
+      fs.fchmodSync(descriptor, 0o600);
+      fs.fsyncSync(descriptor);
+      fs.closeSync(descriptor);
+      descriptor = null;
+      // link(2) is an atomic no-replace publication: observers either see no
+      // owner/transition or the complete, fsynced record, never a partial write.
+      fs.linkSync(tmp, file);
+      published = true;
+    } catch (error) {
+      if (error instanceof CompanionError) throw error;
+      rethrowStorageCapability(error);
+    }
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    if (descriptor != null) fs.closeSync(descriptor);
-    try { fs.unlinkSync(tmp); } catch {}
+    if (descriptor != null) try { fs.closeSync(descriptor); } catch {}
+    try {
+      fs.unlinkSync(tmp);
+    } catch (error) {
+      if (!primaryError && isStorageCapabilityError(error)) throw storageReadonlyError(error);
+    }
   }
   if (published && process.platform !== "win32") {
     let directoryDescriptor;
     try {
       directoryDescriptor = fs.openSync(path.dirname(file), fs.constants.O_RDONLY);
       fs.fsyncSync(directoryDescriptor);
+    } catch (error) {
+      if (error instanceof CompanionError) throw error;
+      rethrowStorageCapability(error);
     } finally {
       if (directoryDescriptor != null) fs.closeSync(directoryDescriptor);
     }
@@ -447,6 +572,7 @@ function inspectTransitionFile(file) {
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     if (error instanceof CompanionError) throw error;
+    if (isStorageCapabilityError(error)) throw storageReadonlyError(error);
     throw new CompanionError("E_STATE", "Could not inspect state-lock transition record.");
   } finally {
     if (descriptor != null) fs.closeSync(descriptor);
@@ -481,19 +607,37 @@ function clearAbandonedTransition(lock, expected) {
     fs.linkSync(transitionFile, witness);
   } catch (error) {
     if (["EEXIST", "ENOENT"].includes(error.code)) return false;
-    throw error;
+    rethrowStorageCapability(error);
   }
+  let result = false;
+  let primaryError = null;
   try {
     const pinned = inspectTransitionFile(witness);
     const current = inspectTransitionFile(transitionFile);
     if (!sameTransition(pinned, expected)
       || !sameTransition(current, expected)
-      || !transitionIsReclaimable(pinned)) return false;
-    fs.unlinkSync(transitionFile);
-    return true;
-  } finally {
-    try { fs.unlinkSync(witness); } catch {}
+      || !transitionIsReclaimable(pinned)) {
+      result = false;
+    } else {
+      try {
+        fs.unlinkSync(transitionFile);
+      } catch (error) {
+        rethrowStorageCapability(error);
+      }
+      result = true;
+    }
+  } catch (error) {
+    primaryError = error;
   }
+  try {
+    fs.unlinkSync(witness);
+  } catch (error) {
+    if (error?.code !== "ENOENT" && !primaryError && isStorageCapabilityError(error)) {
+      primaryError = storageReadonlyError(error);
+    }
+  }
+  if (primaryError) throw primaryError;
+  return result;
 }
 
 function sameOwnerGeneration(snapshot, expectedToken, { allowMissingOwner = false } = {}) {
@@ -502,16 +646,25 @@ function sameOwnerGeneration(snapshot, expectedToken, { allowMissingOwner = fals
   return allowMissingOwner && snapshot.owner == null;
 }
 
+function runLockCleanup(cleanup, preservePrimary = false) {
+  try {
+    cleanup();
+  } catch (cleanupError) {
+    if (!preservePrimary) throw cleanupError;
+  }
+}
+
 function removeOwnedTransition(lock, generation, transitionToken) {
   const transitionFile = path.join(lock, LOCK_TRANSITION_FILE);
+  const transition = inspectTransitionFile(transitionFile);
+  if (!transition
+    || transition.token !== transitionToken
+    || !sameLockDirectory(transition.target, generation.identity)) return;
   try {
-    const transition = inspectTransitionFile(transitionFile);
-    if (!transition
-      || transition.token !== transitionToken
-      || !sameLockDirectory(transition.target, generation.identity)) return;
     fs.unlinkSync(transitionFile);
   } catch (error) {
-    if (error?.code !== "ENOENT") return;
+    if (error?.code === "ENOENT") return;
+    if (isStorageCapabilityError(error)) throw storageReadonlyError(error);
   }
 }
 
@@ -567,6 +720,7 @@ function reclaimLockGeneration(lock, generation) {
   const transition = claimLockTransition(lock, generation, "reclaim");
   if (!transition) return false;
   let renamed = false;
+  let primaryError = null;
   try {
     const current = inspectLock(lock);
     if (!current
@@ -592,9 +746,15 @@ function reclaimLockGeneration(lock, generation) {
     return true;
   } catch (error) {
     if (["EEXIST", "ENOTEMPTY", "ENOENT"].includes(error.code)) return false;
-    throw error;
+    primaryError = isStorageCapabilityError(error) ? storageReadonlyError(error) : error;
+    throw primaryError;
   } finally {
-    if (!renamed) removeOwnedTransition(lock, generation, transition.token);
+    if (!renamed) {
+      runLockCleanup(
+        () => removeOwnedTransition(lock, generation, transition.token),
+        primaryError !== null
+      );
+    }
   }
 }
 
@@ -636,7 +796,10 @@ function releaseLockGeneration(lock, generation, { allowMissingOwner = false } =
       }
       fs.rmSync(retired, { recursive: true, force: true });
     } catch (error) {
-      if (!["EEXIST", "ENOTEMPTY", "ENOENT"].includes(error.code)) throw error;
+      if (!["EEXIST", "ENOTEMPTY", "ENOENT"].includes(error.code)) {
+        if (isStorageCapabilityError(error)) throw storageReadonlyError(error);
+        throw error;
+      }
       removeOwnedTransition(lock, generation, transition.token);
     }
     return;
@@ -644,7 +807,15 @@ function releaseLockGeneration(lock, generation, { allowMissingOwner = false } =
 }
 
 function acquireLock(root, name, env = process.env) {
-  const base = ensure(root, env), lock = path.join(base, "locks", `${name}.lock`), deadline = Date.now() + 5000;
+  let base;
+  try {
+    base = ensure(root, env);
+  } catch (error) {
+    if (error instanceof CompanionError && error.code === "E_STORAGE_READONLY") throw error;
+    if (isStorageCapabilityError(error)) throw storageReadonlyError(error);
+    throw authoritativeJobStateError();
+  }
+  const lock = path.join(base, "locks", `${name}.lock`), deadline = Date.now() + 5000;
   let generation = null;
   for (;;) {
     try {
@@ -670,13 +841,24 @@ function acquireLock(root, name, env = process.env) {
           throw new CompanionError("E_STATE", `Lost state lock ${name} while publishing its owner.`);
         }
       } catch (error) {
-        releaseLockGeneration(lock, generation, { allowMissingOwner: true });
+        runLockCleanup(
+          () => releaseLockGeneration(lock, generation, { allowMissingOwner: true }),
+          true
+        );
         throw error;
       }
       break;
     }
     catch (error) {
-      if (error.code !== "EEXIST") throw new CompanionError("E_STATE", `Could not acquire state lock ${name}.`);
+      if (error instanceof CompanionError) {
+        if (error.code === "E_STORAGE_READONLY") throw error;
+        throw new CompanionError("E_STATE", `Could not acquire state lock ${name}.`);
+      }
+      if (error.code !== "EEXIST") {
+        // Durable lock creation: map storage capability errors; other OS failures stay fail-closed E_STATE.
+        if (isStorageCapabilityError(error)) throw storageReadonlyError(error);
+        throw new CompanionError("E_STATE", `Could not acquire state lock ${name}.`);
+      }
       try {
         const existing = inspectLock(lock);
         if (!existing) continue;
@@ -684,6 +866,7 @@ function acquireLock(root, name, env = process.env) {
       } catch (inspectError) {
         if (inspectError?.code === "ENOENT") continue;
         if (inspectError instanceof CompanionError) throw inspectError;
+        if (isStorageCapabilityError(inspectError)) throw storageReadonlyError(inspectError);
         throw new CompanionError("E_STATE", `Could not inspect state lock ${name}.`);
       }
       if (Date.now() >= deadline) throw new CompanionError("E_STATE", `Timed out acquiring state lock ${name}.`);
@@ -695,7 +878,18 @@ function acquireLock(root, name, env = process.env) {
 
 function withLock(root, name, action, env = process.env) {
   const { lock, generation } = acquireLock(root, name, env);
-  try { return action(); } finally { releaseLockGeneration(lock, generation); }
+  let result;
+  let primaryError = null;
+  let actionFailed = false;
+  try {
+    result = action();
+  } catch (error) {
+    actionFailed = true;
+    primaryError = error;
+  }
+  runLockCleanup(() => releaseLockGeneration(lock, generation), actionFailed);
+  if (actionFailed) throw primaryError;
+  return result;
 }
 
 /**
@@ -835,7 +1029,8 @@ function tryReadJobStrict(root, id, env = process.env) {
     return readAuthoritativeJobFile(file, id);
   } catch (error) {
     if (error?.code === "ENOENT") return null;
-    if (error instanceof CompanionError && error.code === "E_USAGE") throw error;
+    if (error instanceof CompanionError
+      && ["E_USAGE", "E_STORAGE_READONLY"].includes(error.code)) throw error;
     throw authoritativeJobStateError();
   }
 }
@@ -857,6 +1052,9 @@ export function tryReadJob(root, id, env = process.env) {
 /**
  * List job records without ensure(), recovery, or directory creation.
  * Absent state directories yield an empty list rather than creating storage.
+ * Note: this helper still uses resolveWorkspaceStateDir, which may migrate late
+ * legacy state into an existing control store. Prefer listStatusReadonly for a
+ * strictly non-mutating preflight surface.
  */
 export function listJobsReadonly(root, env = process.env) {
   const base = resolveWorkspaceStateDir(root, env);
@@ -881,6 +1079,84 @@ export function listJobsReadonly(root, env = process.env) {
       }
     })
     .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+}
+
+/**
+ * Strictly non-mutating status preflight listing.
+ * Validates authoritative records fail-closed (never hides corruption) and
+ * reports whether valid legacy state still requires migration. Performs no
+ * recovery, migration, mkdir, chmod, lock, clean, or marker publication.
+ *
+ * @returns {{ jobs: object[], migrationRequired: boolean }}
+ */
+export function listStatusReadonly(root, env = process.env) {
+  const resolved = resolveWorkspaceStateReadonly(root, env);
+  const bases = Array.isArray(resolved.bases)
+    ? resolved.bases
+    : (resolved.base ? [resolved.base] : []);
+  if (bases.length === 0) {
+    return { jobs: [], migrationRequired: resolved.migrationRequired };
+  }
+  const jobs = new Map();
+  for (const base of bases) {
+    const jobsDir = assertPrivateJobsDirectory(path.join(base, "jobs"));
+    if (!jobsDir) continue;
+    let names;
+    try {
+      names = fs.readdirSync(jobsDir);
+    } catch {
+      throw authoritativeJobStateError();
+    }
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      const expectedId = jobIdFromJsonFileName(name);
+      if (!expectedId || jobs.has(expectedId)) throw authoritativeJobStateError();
+      try {
+        jobs.set(
+          expectedId,
+          readAuthoritativeJobFileStrictPrivate(path.join(jobsDir, name), expectedId)
+        );
+      } catch (error) {
+        if (error?.code === "ENOENT") throw authoritativeJobStateError();
+        throw error instanceof CompanionError ? error : authoritativeJobStateError();
+      }
+    }
+  }
+  return {
+    jobs: [...jobs.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))),
+    migrationRequired: resolved.migrationRequired
+  };
+}
+
+/**
+ * Strictly non-mutating single-job status read. Fail-closed on corruption.
+ */
+export function readJobStatusReadonly(root, id, env = process.env) {
+  assertSafeJobId(id);
+  const resolved = resolveWorkspaceStateReadonly(root, env);
+  const bases = Array.isArray(resolved.bases)
+    ? resolved.bases
+    : (resolved.base ? [resolved.base] : []);
+  if (bases.length === 0) {
+    throw new CompanionError("E_JOB_NOT_FOUND", `Job ${id} was not found in this repository.`);
+  }
+  let found = null;
+  for (const base of bases) {
+    const jobsDir = assertPrivateJobsDirectory(path.join(base, "jobs"));
+    if (!jobsDir) continue;
+    try {
+      const candidate = readAuthoritativeJobFileStrictPrivate(path.join(jobsDir, `${id}.json`), id);
+      if (found) throw authoritativeJobStateError();
+      found = candidate;
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error instanceof CompanionError ? error : authoritativeJobStateError();
+    }
+  }
+  if (!found) {
+    throw new CompanionError("E_JOB_NOT_FOUND", `Job ${id} was not found in this repository.`);
+  }
+  return { job: found, migrationRequired: resolved.migrationRequired };
 }
 
 function exactRecoveryLimit(value, key) {
@@ -1190,7 +1466,8 @@ export function listJobs(root, env = process.env) {
   try {
     dir = path.join(ensure(root, env), "jobs");
     names = fs.readdirSync(dir);
-  } catch {
+  } catch (error) {
+    if (error instanceof CompanionError && error.code === "E_STORAGE_READONLY") throw error;
     throw authoritativeJobStateError();
   }
   const jobs = [];
