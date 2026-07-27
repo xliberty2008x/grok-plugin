@@ -165,13 +165,78 @@ optional and separate from CI.
 ### Enable
 
 1. Create a dedicated SuperGrok / `grok login` session (prefer a bot identity).
-2. Copy the session file contents into a repository secret named `GROK_AUTH_JSON`
-   (the full `auth.json` body).
-3. Merge the workflow `.github/workflows/grok-pr-review.yml` (already in tree when
+2. Authenticate the GitHub CLI with `gh auth login`. The account must be allowed
+   to update Actions secrets for the target repository.
+3. Install the macOS LaunchAgent below. It watches `~/.grok/auth.json`, also
+   checks every five minutes, and sends a sufficiently fresh refreshable session
+   to the repository Actions secret store. It never copies the credential into
+   this repository, a commit, Git metadata, command arguments, environment
+   variables, logs, or its state files. Its only durable state is a SHA-256
+   digest after a successful upload. During installation it verifies that the
+   real `~/.grok` directory is owned by the current user and tightens that
+   directory to mode `0700`; it refuses symlinks or a different owner.
+   Installation also performs one immediate forced synchronization. A failed
+   immediate upload leaves the watcher armed, reports
+   `installed-pending-sync`, and exits nonzero so the pending state is not
+   mistaken for success. Successful installation reports
+   `installed-synchronized`.
+4. Merge the workflow `.github/workflows/grok-pr-review.yml` (already in tree when
    this section applies).
-4. Optional repository variables:
+5. Optional repository variables:
    - `GROK_PR_REVIEW_TRUSTED_REF` — git ref for the review runtime (default `main`)
-   - `GROK_CLI_VERSION` — `@xai-official/grok` version (default `0.2.99`)
+   - `GROK_CLI_VERSION` — `@xai-official/grok` version (default `0.2.112`)
+
+The GitHub Actions secret is fixed as `GROK_AUTH_JSON`. Determine the absolute
+GitHub CLI path once:
+
+```bash
+GH_BIN="$(command -v gh)"
+```
+
+Install the watcher for the exact repository:
+
+```bash
+npm run grok:ci-auth:install -- \
+  --repo OWNER/REPO \
+  --gh-bin "$GH_BIN"
+```
+
+After any later `grok login`, the file change triggers synchronization. These
+commands inspect the installation, remove the watcher, or force a manual upload:
+
+```bash
+npm run grok:ci-auth:status -- --repo OWNER/REPO
+npm run grok:ci-auth:uninstall -- --repo OWNER/REPO
+
+STATE_DIR="$HOME/Library/Application Support/Grok Companion CI Auth/REPO_DIGEST/state"
+npm run grok:ci-auth:sync -- \
+  --repo OWNER/REPO \
+  --gh-bin "$GH_BIN" \
+  --state-dir "$STATE_DIR" \
+  --force
+```
+
+Use the state directory printed by the installer dry-run or status output in the
+manual command; `REPO_DIGEST` is intentionally not derived by hand. To inspect
+the exact installation plan without writing files or loading a service:
+
+```bash
+npm run grok:ci-auth:install -- \
+  --repo OWNER/REPO \
+  --gh-bin "$GH_BIN" \
+  --dry-run
+```
+
+Never add `~/.grok/auth.json` or its contents to Git. The supported destination
+is GitHub's encrypted Actions secret store only. Unchanged credentials normally
+produce a digest-based no-op, but are forcibly uploaded at least once every 24
+hours while the local session remains sufficiently fresh, so a remotely deleted
+or overwritten secret self-heals. An expired local session remains `pending`
+until the next `grok login`. Status reports installation health as `absent`,
+`degraded`, or `loaded` and synchronization as `pending` or `current`. Upload
+locking uses a two-minute stale floor, which exceeds the 45-second lock wait
+plus 30-second upload timeout; a still-live owner is retained for a conservative
+24-hour hard TTL to tolerate macOS sleep while bounding PID-reuse recovery.
 
 ### Policy
 
@@ -179,7 +244,9 @@ optional and separate from CI.
 - **Drafts** are skipped until `ready_for_review`.
 - Runtime scripts, companion, and **review prompts** come from the **trusted ref**, not
   from the PR tip. The PR head is only the git tree under review.
-- Rotate `GROK_AUTH_JSON` when jobs fail with authentication errors.
+- Run `grok login` again when the local session is expired or lacks at least 45
+  minutes of validity. The watcher then rotates `GROK_AUTH_JSON`; it refuses
+  incomplete, over-permissive, symlinked, or stale credential files.
 
 ### Local dry-run of the poster
 
