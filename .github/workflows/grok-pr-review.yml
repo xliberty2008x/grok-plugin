@@ -62,7 +62,7 @@ jobs:
 
       - name: Install Grok Build CLI
         env:
-          GROK_CLI_VERSION: ${{ vars.GROK_CLI_VERSION || '0.2.99' }}
+          GROK_CLI_VERSION: ${{ vars.GROK_CLI_VERSION || '0.2.112' }}
         run: npm install -g "@xai-official/grok@${GROK_CLI_VERSION}"
 
       - name: Run trusted Grok review
