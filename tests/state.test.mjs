@@ -245,7 +245,11 @@ test("workspace state refuses symlinked state and lock directories", () => {
     fs.symlinkSync(outside, `${stateRoot}/locks`, "dir");
     assert.throws(
       () => setConfig(root, { disclosureAccepted: true }),
-      (error) => error?.code === "E_STATE" && /unsafe plugin state directory/.test(error.message)
+      (error) => error?.code === "E_STATE"
+        && error.message === "Authoritative job state is malformed or unsafe."
+        && !error.message.includes(stateRoot)
+        && !error.message.includes(pluginData)
+        && !error.message.includes(outside)
     );
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_PLUGIN_DATA;

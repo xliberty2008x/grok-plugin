@@ -324,7 +324,7 @@ Claude uses **slash commands**. Codex uses **skills** with the `$grok:` namespac
 | `/grok:adversarial-review` | `$grok:adversarial-review` | Read-only design challenge | `[--wait\|--background] [--base <ref>] [--scope auto\|working-tree\|branch] [focus ...]` |
 | `/grok:rescue` | `$grok:rescue` | Native-like persistent worker workflow | `[--job-id <prior-id>\|--fresh] [--model <id>] [--effort low\|medium\|high] [task ...]` |
 | `/grok:transfer` | `$grok:transfer` | Import host transcript into Grok | `[--source <jsonl>] [--model <id>] [--effort low\|medium\|high]` |
-| `/grok:status` | `$grok:status` | List or wait on jobs | `[job-id] [--wait] [--timeout-ms <ms>] [--all]` |
+| `/grok:status` | `$grok:status` | List or wait on jobs; pure preflight with `--readonly` | `[job-id] [--wait] [--timeout-ms <ms>] [--all] [--readonly] [--json]` |
 | `/grok:result` | `$grok:result` | Full stored result for a finished job | `[job-id]` |
 | `/grok:cancel` | `$grok:cancel` | Cancel an active job | `[job-id]` |
 
@@ -393,9 +393,12 @@ Normal `/grok:review` does **not** accept custom focus text; use adversarial rev
 
 - Background returns a job ID immediately; the runtime detaches its own worker (do not create a second host background task).
 - Without a job ID, `status` shows a compact table for the **current host session** in this repository; `--all` includes all host sessions in the repository.
-- `--wait` on status requires an explicit job ID. Default wait timeout is **240000 ms**; maximum requested timeout is **900000 ms**.
+- **Default `status`** may recover lost workers and migrate late legacy state. Use it for normal monitoring after dispatch.
+- **`status --readonly`** is a pure preflight/read path: no recovery, migration, mkdir, chmod, lock, clean, or marker publication. It does **not** prove writability. Rescue preflight MUST use `status --all --readonly --json`, which returns `{ "jobs": [...], "migrationRequired": boolean }`. Do not combine `--readonly` with `--wait` or `--timeout-ms`.
+- `--wait` on status requires an explicit job ID and is recovery status only. Default wait timeout is **240000 ms**; maximum requested timeout is **900000 ms**.
 - Without a job ID, `result` selects the newest finished job for the exact current host session; `cancel` selects the newest active job in that session.
 - Explicit job IDs remain scoped to the exact host task that created them; another task cannot use an ID to read, cancel, verify, or continue that job.
+- Unwritable workspace control state (EPERM/EACCES/EROFS during state initialization/repair, migration, durable lock, or atomic admission write) surfaces as **`E_STORAGE_READONLY`** (prerequisite) before worker/provider launch, not generic `E_STATE`.
 
 ### Rescue (investigation vs implementation)
 
@@ -564,6 +567,7 @@ Do not delegate secrets, regulated data, or third-party material that must not b
 | `E_REVIEW_TOO_LARGE` | Diff/untracked evidence exceeds limits | Narrow scope/base, or shrink untracked files |
 | `E_REVIEW_MUTATED_WORKSPACE` | Review process changed the repo | Treat as hard failure; do not trust a verdict; inspect Git status |
 | `E_WORKER_LOST` | Background worker disappeared | Inspect job status/result; do not expect automatic replay (prompts are not re-run) |
+| `E_STORAGE_READONLY` | Workspace control-state storage is not writable (EPERM/EACCES/EROFS) | Fix ownership/permissions or mount media writable for private mode 0700 state; retry |
 | `E_PROCESS_IDENTITY` | Could not verify process-group ownership/shutdown | Leave guards/state for manual inspection; do not force-kill arbitrary PIDs |
 | Raw `EAGAIN` while dispatching from Codex | An older cached runtime or an already-open task is still active | From this checkout run `npm run codex:update-local`, then test from a newly started Codex task |
 | Grok reports `Operation not permitted` for `--agent-profile` | The installed snapshot still points Grok at a host plugin-cache path | Update to `0.3.0-dev.1` or newer with `npm run codex:update-local`, start a new task, and rerun `$grok:setup` |
@@ -572,7 +576,7 @@ Do not delegate secrets, regulated data, or third-party material that must not b
 | Host paraphrased a review | Facade/skill contract violated | Runtime output for review/result/transfer/status must be shown verbatim |
 | Codex skills missing after install | Snapshot stale or marketplace not local path | Re-add marketplace with absolute path, `codex plugin add grok@grok-companion --json`, new task |
 
-Stable error codes also include `E_USAGE`, `E_GIT_REQUIRED`, `E_POLICY`, `E_PROTOCOL`, `E_PROVIDER_EXIT`, `E_SCHEMA`, `E_TIMEOUT`, `E_CANCELLED`, `E_JOB_NOT_FOUND`, `E_JOB_ACTIVE`, `E_IMPORT_SOURCE`, `E_IMPORT_RESULT`, `E_STATE`, and `E_SECURITY_PROFILE` (see [SPEC.md](SPEC.md) §16).
+Stable error codes also include `E_USAGE`, `E_GIT_REQUIRED`, `E_POLICY`, `E_PROTOCOL`, `E_PROVIDER_EXIT`, `E_SCHEMA`, `E_TIMEOUT`, `E_CANCELLED`, `E_JOB_NOT_FOUND`, `E_JOB_ACTIVE`, `E_IMPORT_SOURCE`, `E_IMPORT_RESULT`, `E_STATE`, `E_STORAGE_READONLY`, and `E_SECURITY_PROFILE` (see [SPEC.md](SPEC.md) §16).
 
 ---
 
