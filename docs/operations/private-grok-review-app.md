@@ -7,8 +7,11 @@ all repositories, including repositories that accept pull requests from forks;
 the central runner reads bounded Git data and never executes fork or target
 code.
 
-Keep the current per-repository `grok-pr-review.yml` path in place during
-qualification. Migration is a separate, gated final step.
+Keep any existing per-repository `grok-pr-review.yml` path in place during that
+repository's qualification. Migration is a separate, gated final step.
+When the central control repository is also a target, migrate only its
+per-repository review workflow; its central App worker, `GROK_AUTH_JSON`, and
+single auth watcher must remain.
 
 ## 1. Deployment identities and key separation
 
@@ -368,6 +371,22 @@ one dual-run live qualification proves all of the following:
   integration file or secret.
 
 If any item is missing, keep the legacy path and mark the App unqualified.
+
+### Operator-approved central-repository exception
+
+For `xliberty2008x/grok-plugin`, the repository owner explicitly approved
+retiring only the duplicate per-repository workflow after live proof of the
+installed App, automatic exact-head dispatch, an actual Grok provider run,
+zero-finding and inline-finding reviews, an applicable suggestion, stale-head
+supersession, root and nested `AGENTS.md`, and the Check requested action.
+
+This narrow exception does not mark unobserved surfaces as qualified. A manual
+command from a read-only or external human and a deliberately ambiguous GitHub
+posting response remain residual live checks; report them as such rather than
+simulating them. The exception does not apply to other target repositories and
+does not authorize removal of the central App worker, central
+`GROK_AUTH_JSON`, or its single auth watcher. Roll back by reverting the commit
+that removed the per-repository workflow.
 
 After the entire gate passes, migrate each target repository individually:
 

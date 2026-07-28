@@ -138,20 +138,17 @@ and MUST NOT be reported as a Grok provider failure. Any untested boundary
 remains explicitly unqualified; `runtime_ingress`, `host_orchestration`, or
 `artifact_install` failures block release.
 
-## Optional Grok PR review (GitHub Actions)
+## Grok PR review (central GitHub App)
 
-> **Legacy during App migration:** Do not copy this workflow into new target
-> repositories. The private, central
-> [Grok Review GitHub App](apps/grok-review-app/README.md) is the intended
-> install-only path. Keep an existing per-repository workflow, secret, and auth
-> watcher only through the
-> [dual-run live qualification gate](docs/operations/private-grok-review-app.md#8-migration-gate);
-> remove them only after every gate item passes.
+The private [Grok Review GitHub App](apps/grok-review-app/README.md) is the
+supported PR review path. Install the App on a target repository; do not add a
+Grok workflow, `GROK_AUTH_JSON`, or an auth watcher to that repository.
 
-Same-repository, non-draft pull requests can run the plugin's headless Grok
-review and post an informational GitHub review (`COMMENT`) with inline findings
-when mappable. Findings never fail the check; only auth, CLI, schema, or API
-errors fail the job.
+The App dispatches the trusted central
+`.github/workflows/grok-review-app-worker.yml`, which posts an informational
+native GitHub `COMMENT` review and inline findings when mappable. Findings do
+not gate merges. The central worker workflow, central `GROK_AUTH_JSON`, and one
+central auth watcher are infrastructure and must remain.
 
 ### Superpowers-style methodology (not a runner plugin install)
 
@@ -162,40 +159,37 @@ and host tools that break the CI trust model (auth/token split, no agent-held
 `GITHUB_TOKEN`).
 
 Instead, the trusted Companion headless `explore` review uses a **Superpowers-style
-code-reviewer contract** in `plugins/grok/prompts/review.md` (severity calibration,
-strengths + readiness in the summary, plan/architecture/testing checks). Posted
-reviews are attributed as Superpowers-style Grok Companion reviews.
+code-reviewer contract** in `apps/grok-review-app/prompts/review.md` (severity
+calibration, structured findings, exact suggestions, and explicit zero-finding
+summaries). Posted reviews are attributed as Superpowers-style Grok Companion
+reviews.
 
 For **local interactive** Superpowers or Grok bundled `/review` (PENDING reviews,
 subagent orchestration), install those plugins/skills on your machine — they are
 optional and separate from CI.
 
-### Enable
+### Central authentication
 
 1. Create a dedicated SuperGrok / `grok login` session (prefer a bot identity).
 2. Authenticate the GitHub CLI with `gh auth login`. The account must be allowed
-   to update Actions secrets for the target repository.
-3. Install the macOS LaunchAgent below. It watches `~/.grok/auth.json`, also
+   to update Actions secrets for the central control repository.
+3. Install the macOS LaunchAgent for the central control repository only. It
+   watches `~/.grok/auth.json`, also
    checks every five minutes, and sends a sufficiently fresh refreshable session
-   to the repository Actions secret store. It never copies the credential into
-   this repository, a commit, Git metadata, command arguments, environment
-   variables, logs, or its state files. Its only durable state is a SHA-256
-   digest after a successful upload. During installation it verifies that the
-   real `~/.grok` directory is owned by the current user and tightens that
+   to the central repository Actions secret store. It never copies the
+   credential into this repository, a commit, Git metadata, command arguments,
+   environment variables, logs, or its state files. Its only durable state is a
+   SHA-256 digest after a successful upload. During installation it verifies
+   that the real `~/.grok` directory is owned by the current user and tightens that
    directory to mode `0700`; it refuses symlinks or a different owner.
    Installation also performs one immediate forced synchronization. A failed
    immediate upload leaves the watcher armed, reports
    `installed-pending-sync`, and exits nonzero so the pending state is not
    mistaken for success. Successful installation reports
    `installed-synchronized`.
-4. Merge the workflow `.github/workflows/grok-pr-review.yml` (already in tree when
-   this section applies).
-5. Optional repository variables:
-   - `GROK_PR_REVIEW_TRUSTED_REF` — git ref for the review runtime (default `main`)
-   - `GROK_CLI_VERSION` — `@xai-official/grok` version (default `0.2.112`)
 
-The GitHub Actions secret is fixed as `GROK_AUTH_JSON`. Determine the absolute
-GitHub CLI path once:
+The central GitHub Actions secret is fixed as `GROK_AUTH_JSON`. Determine the
+absolute GitHub CLI path once:
 
 ```bash
 GH_BIN="$(command -v gh)"
@@ -205,7 +199,7 @@ Install the watcher for the exact repository:
 
 ```bash
 npm run grok:ci-auth:install -- \
-  --repo OWNER/REPO \
+  --repo xliberty2008x/grok-plugin \
   --gh-bin "$GH_BIN"
 ```
 
@@ -213,12 +207,12 @@ After any later `grok login`, the file change triggers synchronization. These
 commands inspect the installation, remove the watcher, or force a manual upload:
 
 ```bash
-npm run grok:ci-auth:status -- --repo OWNER/REPO
-npm run grok:ci-auth:uninstall -- --repo OWNER/REPO
+npm run grok:ci-auth:status -- --repo xliberty2008x/grok-plugin
+npm run grok:ci-auth:uninstall -- --repo xliberty2008x/grok-plugin
 
 STATE_DIR="$HOME/Library/Application Support/Grok Companion CI Auth/REPO_DIGEST/state"
 npm run grok:ci-auth:sync -- \
-  --repo OWNER/REPO \
+  --repo xliberty2008x/grok-plugin \
   --gh-bin "$GH_BIN" \
   --state-dir "$STATE_DIR" \
   --force
@@ -230,7 +224,7 @@ the exact installation plan without writing files or loading a service:
 
 ```bash
 npm run grok:ci-auth:install -- \
-  --repo OWNER/REPO \
+  --repo xliberty2008x/grok-plugin \
   --gh-bin "$GH_BIN" \
   --dry-run
 ```
@@ -248,20 +242,13 @@ plus 30-second upload timeout; a still-live owner is retained for a conservative
 
 ### Policy
 
-- **Forks** are skipped (secrets are unavailable and `pull_request_target` is not used).
-- **Drafts** are skipped until `ready_for_review`.
-- Runtime scripts, companion, and **review prompts** come from the **trusted ref**, not
-  from the PR tip. The PR head is only the git tree under review.
+- **Forks** are reviewed as bounded Git data; fork or target code is never
+  executed.
+- **Drafts** are not reviewed automatically; an authorized manual review remains
+  available.
+- Runtime scripts, Companion, and **review prompts** come from the pinned central
+  runtime, not from the PR tip. The PR head is only bounded Git data under
+  review.
 - Run `grok login` again when the local session is expired or lacks at least 45
-  minutes of validity. The watcher then rotates `GROK_AUTH_JSON`; it refuses
-  incomplete, over-permissive, symlinked, or stale credential files.
-
-### Local dry-run of the poster
-
-```bash
-node scripts/ci/post-grok-review.mjs \
-  --job-json /path/to/review-job.json \
-  --diff /path/to/pr.diff \
-  --owner OWNER --repo REPO --pr N --head-sha SHA \
-  --dry-run
-```
+  minutes of validity. The central watcher then rotates `GROK_AUTH_JSON`; it
+  refuses incomplete, over-permissive, symlinked, or stale credential files.
