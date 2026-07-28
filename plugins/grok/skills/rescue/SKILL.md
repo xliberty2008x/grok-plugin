@@ -76,13 +76,13 @@ Use the companion cancel command for cancellation. Do not widen Grok's profile m
 
 The runtime keeps a **fail-closed pre-launch provider capability receipt gate** before admitting a Codex task. Pure `status --readonly` is neither a capability check nor a writability check; missing receipts surface only at admission.
 
-**Recoverable exact match only.** Treat admission failure as a recoverable setup prerequisite **only** when the runtime emits `E_CAPABILITY` with the exact message form:
+**Recoverable exact match only.** Treat admission failure as a recoverable setup prerequisite **only** when the runtime emits `E_CAPABILITY` with the exact canonical message from the host helper `missingInvalidProviderCapabilityReceiptMessage` (parameterized only by `hostCommand("setup")`). On Codex that exact form is:
 
 ```text
 Valid provider capability receipt is missing or invalid; run $grok:setup before admitting a Codex task.
 ```
 
-(The setup command token may be the host-local form such as `$grok:setup`; the rest of the sentence must match exactly.) Do **not** auto-setup for arbitrary `E_CAPABILITY` (unsupported model, effort, platform, executable identity, provider capability drift, isolation/external extensions, or any other non-receipt capability failure).
+The sole host-local variable is the setup command token (`$grok:setup` in this Codex skill; other hosts use their own `hostCommand("setup")` form). The rest of the sentence must match exactly. Do **not** auto-setup for arbitrary `E_CAPABILITY` (unsupported model, effort, platform, executable identity, provider capability drift, isolation/external extensions, or any other non-receipt capability failure).
 
 **One setup, one identical retry, no duplicate launch:**
 

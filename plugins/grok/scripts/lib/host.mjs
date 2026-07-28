@@ -110,6 +110,16 @@ export function hostCommand(command, args = "", env = process.env) {
   return hostContext(env).kind === "codex" ? `$grok:${command}${suffix}` : `/grok:${command}${suffix}`;
 }
 
+/**
+ * Canonical fail-closed message for a missing or invalid setup-owned provider
+ * capability receipt at Codex task admission. The only host-local variable is
+ * the setup command token from hostCommand ("$grok:setup" on Codex,
+ * "/grok:setup" on Claude and other non-Codex hosts).
+ */
+export function missingInvalidProviderCapabilityReceiptMessage(env = process.env) {
+  return `Valid provider capability receipt is missing or invalid; run ${hostCommand("setup", "", env)} before admitting a Codex task.`;
+}
+
 export const HOST_ENVIRONMENT_KEYS = Object.freeze([
   HOST_ENV,
   HOST_SESSION_ENV,

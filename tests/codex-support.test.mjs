@@ -13,6 +13,7 @@ import {
   hostCommand,
   hostContext,
   jobHostContext,
+  missingInvalidProviderCapabilityReceiptMessage,
   pluginDataRoot,
   sameHostSession
 } from "../plugins/grok/scripts/lib/host.mjs";
@@ -113,6 +114,16 @@ test("Codex host detection honors normalized overrides and uses a Codex data fal
   assert.equal(hostCommand("setup", "", { CODEX_THREAD_ID: "codex-thread" }), "$grok:setup");
   assert.equal(hostCommand("status", "job-123", { CODEX_THREAD_ID: "codex-thread" }), "$grok:status job-123");
   assert.equal(hostCommand("setup", "", { GROK_COMPANION_CLAUDE_SESSION_ID: "claude-session" }), "/grok:setup");
+  assert.equal(
+    missingInvalidProviderCapabilityReceiptMessage({ CODEX_THREAD_ID: "codex-thread" }),
+    `Valid provider capability receipt is missing or invalid; run ${hostCommand("setup", "", { CODEX_THREAD_ID: "codex-thread" })} before admitting a Codex task.`
+  );
+  assert.equal(
+    missingInvalidProviderCapabilityReceiptMessage({
+      GROK_COMPANION_CLAUDE_SESSION_ID: "claude-session"
+    }),
+    `Valid provider capability receipt is missing or invalid; run ${hostCommand("setup", "", { GROK_COMPANION_CLAUDE_SESSION_ID: "claude-session" })} before admitting a Codex task.`
+  );
 
   const home = path.join(path.sep, "tmp", "home-for-codex-test");
   const codexHome = path.join(home, "custom-codex");
@@ -442,10 +453,15 @@ test("Codex manifest, marketplace, public skills, hooks, and wrapper form one in
   assert.match(read("plugins/grok/skills/rescue/SKILL.md"), /substitute a different worker unless the active fallback policy permits it/i);
   // Issue #32: capability-receipt remediation is a skill contract, not a general orchestrator.
   const rescueSkill = read("plugins/grok/skills/rescue/SKILL.md");
-  assert.match(
-    rescueSkill,
-    /Valid provider capability receipt is missing or invalid; run \$grok:setup before admitting a Codex task\./
-  );
+  const readme = read("README.md");
+  const companion = read("plugins/grok/scripts/grok-companion.mjs");
+  const canonicalCodex = missingInvalidProviderCapabilityReceiptMessage({
+    CODEX_THREAD_ID: "codex-thread"
+  });
+  assert.ok(rescueSkill.includes(canonicalCodex));
+  assert.ok(readme.includes(canonicalCodex));
+  assert.equal(companion.split("missingInvalidProviderCapabilityReceiptMessage(").length - 1, 2);
+  assert.match(rescueSkill, /missingInvalidProviderCapabilityReceiptMessage/);
   assert.match(rescueSkill, /authoritative setup action \*\*at most once\*\*/i);
   assert.match(rescueSkill, /identical\*\* bounded task launch \*\*exactly once\*\*/i);
   assert.match(rescueSkill, /surface the setup failure unchanged and \*\*stop\*\*/i);
@@ -455,6 +471,8 @@ test("Codex manifest, marketplace, public skills, hooks, and wrapper form one in
   assert.match(rescueSkill, /Do \*\*not\*\* auto-setup for arbitrary `E_CAPABILITY`/i);
   assert.match(rescueSkill, /neither a capability check nor a writability check/i);
   assert.match(rescueSkill, /no duplicate launch/i);
+  assert.match(readme, /any other `E_CAPABILITY` message/);
+  assert.match(readme, /Sole setup-recoverable path/i);
   assert.doesNotMatch(rescueSkill, /general orchestration framework/i);
 
   assert.deepEqual(Object.keys(defaultHooks.hooks).sort(), ["SessionStart", "Stop"]);
