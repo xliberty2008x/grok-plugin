@@ -92,13 +92,13 @@ jobs:
           GROK_REVIEW_RUNTIME_BUNDLE_SHA256: ${{ vars.GROK_REVIEW_RUNTIME_BUNDLE_SHA256 }}
           GROK_REVIEW_NODE_VERSION: 22.17.1
           GROK_CLI_VERSION: ${{ vars.GROK_CLI_VERSION }}
-          GITHUB_APP_ID: ${{ vars.GITHUB_APP_ID }}
-          GITHUB_APP_CLIENT_ID: ${{ vars.GITHUB_APP_CLIENT_ID }}
+          GITHUB_APP_ID: ${{ vars.GROK_REVIEW_APP_ID }}
+          GITHUB_APP_CLIENT_ID: ${{ vars.GROK_REVIEW_APP_CLIENT_ID }}
           GROK_REVIEW_WORKER_ORIGIN: ${{ vars.GROK_REVIEW_WORKER_URL }}
           GROK_REVIEW_MODEL: ${{ vars.GROK_MODEL || 'grok-code-fast-1' }}
           GROK_REVIEW_MODEL_VERSION: ${{ vars.GROK_MODEL || 'grok-code-fast-1' }}
           GROK_REVIEW_EFFORT: ${{ vars.GROK_EFFORT || 'high' }}
-          GITHUB_APP_PRIVATE_KEY: ${{ secrets.GITHUB_APP_PRIVATE_KEY }}
+          GITHUB_APP_PRIVATE_KEY: ${{ secrets.GROK_REVIEW_APP_PRIVATE_KEY }}
           RUNNER_CALLBACK_SECRET: ${{ secrets.RUNNER_CALLBACK_SECRET }}
           RECEIPT_PRIVATE_KEY: ${{ secrets.RECEIPT_SIGNING_PRIVATE_KEY }}
           RECEIPT_PUBLIC_KEY: ${{ vars.RECEIPT_SIGNING_PUBLIC_KEY }}

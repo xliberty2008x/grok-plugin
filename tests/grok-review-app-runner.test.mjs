@@ -1104,14 +1104,14 @@ test("workflow is dispatch-only, least-privilege, exact-action pinned, and non-a
   assert.match(workflow, /@xai-official\/grok@0\.2\.112/);
   assert.match(workflow, /git status --porcelain=v1 --untracked-files=all/);
   for (const name of [
-    "vars.GITHUB_APP_ID",
-    "vars.GITHUB_APP_CLIENT_ID",
+    "vars.GROK_REVIEW_APP_ID",
+    "vars.GROK_REVIEW_APP_CLIENT_ID",
     "vars.GROK_REVIEW_WORKER_URL",
     "vars.GROK_REVIEW_RUNTIME_COMMIT",
     "vars.GROK_REVIEW_RUNTIME_BUNDLE_SHA256",
     "vars.GROK_CLI_VERSION",
     "vars.RECEIPT_SIGNING_PUBLIC_KEY",
-    "secrets.GITHUB_APP_PRIVATE_KEY",
+    "secrets.GROK_REVIEW_APP_PRIVATE_KEY",
     "secrets.GROK_AUTH_JSON",
     "secrets.RUNNER_CALLBACK_SECRET",
     "secrets.RECEIPT_SIGNING_PRIVATE_KEY"

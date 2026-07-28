@@ -133,7 +133,7 @@ Secrets:
 
 | Name | Meaning |
 |---|---|
-| `GITHUB_APP_PRIVATE_KEY` | GitHub-generated **RSA** App private key (PEM) |
+| `GROK_REVIEW_APP_PRIVATE_KEY` | GitHub-generated **RSA** App private key (PEM) |
 | `GROK_AUTH_JSON` | Central dedicated Grok Build login material |
 | `RUNNER_CALLBACK_SECRET` | Same callback HMAC key configured on the Worker |
 | `RECEIPT_SIGNING_PRIVATE_KEY` | Separate **Ed25519** receipt-signing private key (PKCS#8 PEM) |
@@ -142,8 +142,8 @@ Variables:
 
 | Name | Meaning |
 |---|---|
-| `GITHUB_APP_CLIENT_ID` | App client ID used as the GitHub App JWT issuer |
-| `GITHUB_APP_ID` | Numeric App ID used for App/check identity validation |
+| `GROK_REVIEW_APP_CLIENT_ID` | App client ID used as the GitHub App JWT issuer |
+| `GROK_REVIEW_APP_ID` | Numeric App ID used for App/check identity validation |
 | `GROK_REVIEW_WORKER_URL` | Worker origin, without the webhook path |
 | `GROK_REVIEW_RUNTIME_COMMIT` | Exact trusted plugin commit used by the runner |
 | `GROK_REVIEW_RUNTIME_BUNDLE_SHA256` | SHA-256 of `git archive --format=tar <GROK_REVIEW_RUNTIME_COMMIT>` |

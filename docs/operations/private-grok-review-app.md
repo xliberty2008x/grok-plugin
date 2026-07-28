@@ -19,7 +19,7 @@ Use distinct identities and credentials:
 | GitHub App webhook secret | Worker secret `WEBHOOK_SECRET` | Authenticate raw GitHub webhooks |
 | Central dispatch token | Worker secret `CONTROL_REPO_TOKEN` | Actions write on the central control repository only |
 | Callback HMAC key | Worker and central secrets named `RUNNER_CALLBACK_SECRET` | Authenticate runner callbacks |
-| GitHub App RSA private key | Central secret `GITHUB_APP_PRIVATE_KEY` | Mint App JWTs and exact-repository installation tokens |
+| GitHub App RSA private key | Central secret `GROK_REVIEW_APP_PRIVATE_KEY` | Mint App JWTs and exact-repository installation tokens |
 | Grok login JSON | Central secret `GROK_AUTH_JSON` | Authenticate the tool-free Grok provider |
 | Ed25519 receipt private key | Central secret `RECEIPT_SIGNING_PRIVATE_KEY` | Sign sanitized review receipts |
 | Ed25519 receipt public-key map | Worker secret `RECEIPT_PUBLIC_KEYS_JSON` | Verify receipts before D1 acceptance |
@@ -35,8 +35,8 @@ violates this contract.
 
 Prepare these non-secret central Actions variables:
 
-- `GITHUB_APP_CLIENT_ID`
-- `GITHUB_APP_ID`
+- `GROK_REVIEW_APP_CLIENT_ID`
+- `GROK_REVIEW_APP_ID`
 - `GROK_REVIEW_WORKER_URL`
 - `GROK_REVIEW_RUNTIME_COMMIT`
 - `GROK_REVIEW_RUNTIME_BUNDLE_SHA256`
@@ -140,7 +140,7 @@ Before saving, verify:
 
 Save the generated App ID and client ID as protected deployment metadata.
 Generate and download one GitHub App RSA private key. Store it directly as the
-central `GITHUB_APP_PRIVATE_KEY` secret, then remove unsecured copies according
+central `GROK_REVIEW_APP_PRIVATE_KEY` secret, then remove unsecured copies according
 to the operator's key-retention policy. Set the App webhook secret to the same
 high-entropy value already configured as Worker `WEBHOOK_SECRET`.
 
@@ -160,7 +160,7 @@ only `GROK_AUTH_JSON` secret after migration. Configure:
 Secrets:
 
 ```text
-GITHUB_APP_PRIVATE_KEY
+GROK_REVIEW_APP_PRIVATE_KEY
 GROK_AUTH_JSON
 RUNNER_CALLBACK_SECRET
 RECEIPT_SIGNING_PRIVATE_KEY
@@ -169,8 +169,8 @@ RECEIPT_SIGNING_PRIVATE_KEY
 Variables:
 
 ```text
-GITHUB_APP_CLIENT_ID
-GITHUB_APP_ID
+GROK_REVIEW_APP_CLIENT_ID
+GROK_REVIEW_APP_ID
 GROK_REVIEW_WORKER_URL
 GROK_REVIEW_RUNTIME_COMMIT
 GROK_REVIEW_RUNTIME_BUNDLE_SHA256
