@@ -179,8 +179,15 @@ export function boundPathEvidence(value, { max = 200, marker = "[CHANGED_PATHS_O
 function asRepositoryPathList(value, name, { max = MAX_LIST } = {}) {
   const paths = asStringList(value, { max });
   return [...new Set(paths.map((item) => {
-    const normalized = item.replace(/\\/g, "/").replace(/^\.\//, "");
-    if (!normalized || path.posix.isAbsolute(normalized) || /^[A-Za-z]:\//.test(normalized) || normalized.split("/").includes("..")) {
+    const normalized = item.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
+    if (
+      !normalized
+      || Buffer.byteLength(normalized, "utf8") > 1024
+      || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(normalized)
+      || path.posix.isAbsolute(normalized)
+      || normalized.startsWith("~/")
+      || normalized.split("/").includes("..")
+    ) {
       throw new CompanionError("E_USAGE", `${name} must contain only repository-relative paths.`);
     }
     return normalized;
@@ -380,7 +387,11 @@ export function buildTaskEnvelope({
     context: {
       facts: explicitFacts,
       constraints: explicitConstraints,
-      expectedProjectMarkers: asStringList(context?.expectedProjectMarkers, { max: 32 }),
+      expectedProjectMarkers: asRepositoryPathList(
+        context?.expectedProjectMarkers,
+        "context.expectedProjectMarkers",
+        { max: 32 }
+      ),
       requiredPaths: asRepositoryPathList(context?.requiredPaths, "context.requiredPaths"),
       workspaceState: ["complete", "task_scoped", "unknown"].includes(context?.workspaceState)
         ? context.workspaceState
@@ -615,9 +626,29 @@ export function captureContextManifest(root) {
 export function assertTaskContextReady(envelope, manifest, { structuredInput = false } = {}) {
   if (!structuredInput) return;
   const expectedMarkers = envelope?.context?.expectedProjectMarkers || [];
-  const availableMarkers = new Set(manifest?.projectMarkers || []);
-  const missingMarkers = expectedMarkers.filter((marker) => !availableMarkers.has(marker));
   const workspaceRoot = manifest?.workspaceRoot ? fs.realpathSync(manifest.workspaceRoot) : null;
+  const missingMarkers = [];
+  const unsafeMarkers = [];
+  for (const relative of expectedMarkers) {
+    if (!workspaceRoot) { missingMarkers.push(relative); continue; }
+    const absolute = path.resolve(workspaceRoot, relative);
+    if (absolute !== workspaceRoot && !absolute.startsWith(`${workspaceRoot}${path.sep}`)) {
+      unsafeMarkers.push(relative);
+      continue;
+    }
+    if (!fs.existsSync(absolute)) {
+      missingMarkers.push(relative);
+      continue;
+    }
+    try {
+      const real = fs.realpathSync(absolute);
+      if (real !== workspaceRoot && !real.startsWith(`${workspaceRoot}${path.sep}`)) {
+        unsafeMarkers.push(relative);
+      }
+    } catch {
+      missingMarkers.push(relative);
+    }
+  }
   const requiredPaths = envelope?.context?.requiredPaths || [];
   const missingPaths = [];
   const unsafePaths = [];
@@ -651,13 +682,22 @@ export function assertTaskContextReady(envelope, manifest, { structuredInput = f
     reasons.push("ignored-worktree-inventory-incomplete");
   }
   if (missingMarkers.length) reasons.push(`missing-project-markers:${missingMarkers.join(",")}`);
+  if (unsafeMarkers.length) reasons.push(`project-markers-escape-workspace:${unsafeMarkers.join(",")}`);
   if (missingPaths.length) reasons.push(`missing-required-paths:${missingPaths.join(",")}`);
   if (unsafePaths.length) reasons.push(`required-paths-escape-workspace:${unsafePaths.join(",")}`);
   if (reasons.length) {
     throw new CompanionError(
       "E_CONTEXT_INCOMPLETE",
-      `Task context is not ready for delegation (${reasons.join("; ")}). Complete host preflight or mark a bounded task_scoped checkout explicitly.`,
-      { reasons, missingMarkers, missingPaths, unsafePaths, workspaceState, materialization: manifest?.materialization || null }
+      `Task context is not ready for delegation (${reasons.join("; ")}). Correct the declared markers, paths, workspace state, or freshness evidence before delegating.`,
+      {
+        reasons,
+        missingMarkers,
+        unsafeMarkers,
+        missingPaths,
+        unsafePaths,
+        workspaceState,
+        materialization: manifest?.materialization || null
+      }
     );
   }
 }
