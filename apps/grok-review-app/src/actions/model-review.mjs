@@ -276,7 +276,9 @@ export function computeRuntimeBundleDigest({ runtimeRoot, commit }) {
  * }} input
  */
 export async function runIsolatedModelReview(input) {
-  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "grok-review-model-"));
+  const parent = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "grok-review-model-"))
+  );
   fs.chmodSync(parent, 0o700);
   const modelRoot = path.join(parent, "empty-review-repository");
   const stateDir = path.join(parent, "state");
