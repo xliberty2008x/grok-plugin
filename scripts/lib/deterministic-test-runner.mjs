@@ -1,6 +1,7 @@
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -75,6 +76,15 @@ function emptyAggregate() {
   };
 }
 
+function elapsedMilliseconds(startedAt, now) {
+  try {
+    const elapsed = Math.round(now() - startedAt);
+    return Number.isSafeInteger(elapsed) && elapsed >= 0 ? elapsed : 0;
+  } catch {
+    return 0;
+  }
+}
+
 /** Run an exact test inventory one file at a time and aggregate zero-skip output. */
 export function runDeterministicTestFiles({
   files,
@@ -83,6 +93,7 @@ export function runDeterministicTestFiles({
   node = process.execPath,
   env = process.env,
   run = spawnSync,
+  now = () => performance.now(),
   stdout = process.stdout,
   stderr = process.stderr
 } = {}) {
@@ -98,6 +109,12 @@ export function runDeterministicTestFiles({
     const file = files[index];
     const child = index + 1;
     let result;
+    let startedAt;
+    try {
+      startedAt = now();
+    } catch {
+      startedAt = 0;
+    }
     // Emit only a fixed ordinal before the blocking child call. This keeps
     // paths, environment values, and child output private while allowing a
     // bounded CI timeout to identify the last child that actually started.
@@ -116,10 +133,16 @@ export function runDeterministicTestFiles({
         stdio: ["ignore", "pipe", "pipe"]
       });
     } catch {
+      stderr.write(
+        `Deterministic test child ${child} completed in ${elapsedMilliseconds(startedAt, now)} ms.\n`
+      );
       stderr.write(`Deterministic test child ${child} could not start.\n`);
       failed = true;
       continue;
     }
+    stderr.write(
+      `Deterministic test child ${child} completed in ${elapsedMilliseconds(startedAt, now)} ms.\n`
+    );
 
     // Never forward or interpolate raw child stderr, spawn error details, paths,
     // signals, or invalid stdout. Only fixed, ordinal diagnostics leave here.

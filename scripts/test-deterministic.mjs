@@ -6,6 +6,12 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { runDeterministicTestFiles } from "./lib/deterministic-test-runner.mjs";
+import {
+  DETERMINISTIC_TEST_SHARDS,
+  parseDeterministicShardArgument,
+  selectDeterministicTestFiles,
+  validateDeterministicTestShards
+} from "./lib/deterministic-test-shards.mjs";
 
 export { runDeterministicTestFiles };
 
@@ -27,8 +33,34 @@ export function listDeterministicTestFiles(testRoot = TEST_ROOT) {
     .sort();
 }
 
-function main() {
-  return runDeterministicTestFiles({ files: listDeterministicTestFiles() });
+export function main(argv = process.argv.slice(2)) {
+  let shard;
+  try {
+    shard = parseDeterministicShardArgument(argv);
+  } catch {
+    process.stderr.write(
+      "Usage: node scripts/test-deterministic.mjs [--shard=1/3|--shard=2/3|--shard=3/3]\n"
+    );
+    return 1;
+  }
+
+  const inventory = listDeterministicTestFiles();
+  const manifestErrors = validateDeterministicTestShards({
+    inventory,
+    externalBoundaryTests: EXTERNAL_BOUNDARY_TESTS,
+    shards: DETERMINISTIC_TEST_SHARDS
+  });
+  if (manifestErrors.length > 0) {
+    process.stderr.write("The deterministic shard manifest does not match the test inventory.\n");
+    return 1;
+  }
+  return runDeterministicTestFiles({
+    files: selectDeterministicTestFiles({
+      inventory,
+      shard,
+      shards: DETERMINISTIC_TEST_SHARDS
+    })
+  });
 }
 
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : null;

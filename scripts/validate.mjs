@@ -8,7 +8,17 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { hasYamlFrontmatter } from "./lib/frontmatter.mjs";
+import { validateHostedCiWorkflow } from "./lib/ci-workflow-contract.mjs";
+import {
+  DETERMINISTIC_TEST_SHARD_COUNT,
+  DETERMINISTIC_TEST_SHARDS,
+  validateDeterministicTestShards
+} from "./lib/deterministic-test-shards.mjs";
 import { activeVersionForPlan, qualificationEvidencePath, qualificationSourceDigest, validateQualificationEvidence, validateReadmeReleaseStatus, validateReleasePlan } from "./lib/version-policy.mjs";
+import {
+  EXTERNAL_BOUNDARY_TESTS,
+  listDeterministicTestFiles
+} from "./test-deterministic.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = new Set(process.argv.slice(2));
@@ -276,6 +286,10 @@ if (!versionsOnly) {
     ".agents/plugins/marketplace.json",
     ".github/workflows/ci.yml",
     "scripts/validate.mjs",
+    "scripts/lib/ci-workflow-contract.mjs",
+    "scripts/test-deterministic.mjs",
+    "scripts/lib/deterministic-test-runner.mjs",
+    "scripts/lib/deterministic-test-shards.mjs",
     "scripts/bump-version.mjs",
     "scripts/update-local-codex.mjs",
     "scripts/test-natural-codex.mjs",
@@ -292,6 +306,7 @@ if (!versionsOnly) {
     "tests/installed-worker-mcp-setup-boundary.test.mjs",
     "tests/installed-worker-mcp-session-boundary.test.mjs",
     "tests/natural-codex-output.schema.json",
+    "tests/deterministic-sharding.test.mjs",
     "tests/worker-broker-evidence.test.mjs",
     "tests/worker-broker-protected-review.test.mjs",
     "tests/worker-protocol.test.mjs",
@@ -460,6 +475,14 @@ if (!versionsOnly) {
     if (packageJson.scripts?.["codex:update-local"] !== "node scripts/update-local-codex.mjs") {
       problem("codex:update-local must execute the verified local-cache updater directly.", "package.json");
     }
+  }
+
+  for (const message of validateDeterministicTestShards({
+    inventory: listDeterministicTestFiles(),
+    externalBoundaryTests: EXTERNAL_BOUNDARY_TESTS,
+    shards: DETERMINISTIC_TEST_SHARDS
+  })) {
+    problem(message, "scripts/lib/deterministic-test-shards.mjs");
   }
 
   const contributing = readText("CONTRIBUTING.md", { required: false });
@@ -1320,10 +1343,10 @@ if (!versionsOnly) {
   if (workflow != null) {
     if (!/permissions:\s*\n\s+contents:\s*read/m.test(workflow)) problem("CI must declare read-only contents permission.", ".github/workflows/ci.yml");
     if (/GROK_E2E\s*[:=]\s*["']?1/i.test(workflow) || /test:e2e/.test(workflow)) problem("Default CI must not run quota-consuming Grok E2E tests.", ".github/workflows/ci.yml");
-    if (!/npm run test:pty-ingress/.test(workflow)) problem("CI must expose the source nonblocking PTY regression as a named gate.", ".github/workflows/ci.yml");
-    if (!/npm run test:deterministic/.test(workflow)) problem("Linux/macOS CI must run the deterministic zero-skip suite.", ".github/workflows/ci.yml");
-    if (!/validate-and-test:[\s\S]{0,320}?timeout-minutes:\s*45\b/.test(workflow)) {
-      problem("The deterministic validation matrix must retain its 45-minute completion budget.", ".github/workflows/ci.yml");
+    for (const message of validateHostedCiWorkflow(workflow, {
+      shardCount: DETERMINISTIC_TEST_SHARD_COUNT
+    })) {
+      problem(message, ".github/workflows/ci.yml");
     }
     if (!/CODEX_PLUGIN_RUNNER_ENABLED/.test(workflow) || !/npm run test:installed-codex/.test(workflow)) {
       problem("CI must define the opt-in Codex-equipped installed-snapshot gate.", ".github/workflows/ci.yml");
