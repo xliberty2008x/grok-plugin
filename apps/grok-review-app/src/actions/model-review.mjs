@@ -39,6 +39,15 @@ function modelError(code) {
   return error;
 }
 
+function modelIdentityPhase(code, operation) {
+  try {
+    return operation();
+  } catch (error) {
+    if (error?.code !== "E_PROCESS_IDENTITY") throw error;
+    throw modelError(code);
+  }
+}
+
 function sha256(bytes) {
   return crypto.createHash("sha256").update(bytes).digest("hex");
 }
@@ -281,7 +290,10 @@ export async function runIsolatedModelReview(input) {
   const priorGrokBin = process.env.GROK_BIN;
   try {
     initializeEmptyGitRepository(modelRoot);
-    const source = captureGrokExecutableIdentity(input.grokBinary);
+    const source = modelIdentityPhase(
+      "grok_source_identity_capture_failed",
+      () => captureGrokExecutableIdentity(input.grokBinary)
+    );
     if (
       source.executableDigest !== input.expectedGrokIdentity?.sha256
       || source.attestation.identityDigest
@@ -291,9 +303,12 @@ export async function runIsolatedModelReview(input) {
     ) {
       throw modelError("grok_source_identity_changed");
     }
-    const pinned = materializePinnedGrokExecutable(input.grokBinary, {
-      directory: path.join(parent, "pinned-grok")
-    });
+    const pinned = modelIdentityPhase(
+      "grok_materialized_identity_capture_failed",
+      () => materializePinnedGrokExecutable(input.grokBinary, {
+        directory: path.join(parent, "pinned-grok")
+      })
+    );
     if (
       pinned.executableDigest !== input.expectedGrokIdentity.sha256
       || pinned.attestation.releaseIdentityDigest
