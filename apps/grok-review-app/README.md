@@ -107,7 +107,7 @@ Non-secret vars:
 | `CONTROL_REPO_OWNER` | Owner of the central control repository |
 | `CONTROL_REPO_NAME` | Central control repository name |
 | `CONTROL_WORKFLOW_FILE` | `grok-review-app-worker.yml` |
-| `CONTROL_REF` | Control branch/tag containing the central workflow; the runner separately hard-gates the exact runtime commit |
+| `CONTROL_REF` | Immutable control-repo tag `grok-review-runtime-<40 lowercase hex>`; must point to the same commit as `GROK_REVIEW_RUNTIME_COMMIT`. GitHub `workflow_dispatch.ref` accepts a branch or tag name, not a raw SHA; the runner still hard-gates `GITHUB_SHA`, checked-out HEAD, and bundle digest |
 | `GITHUB_APP_ID` | Canonical decimal App ID used for App-owned Check validation |
 
 Secrets:
