@@ -19,6 +19,21 @@ import { logSafe } from "./http.mjs";
 const ALLOWED_TRIGGER_KINDS = new Set(Object.values(TRIGGER_KIND));
 
 /**
+ * Immutable workflow_dispatch ref: tag name only (GitHub rejects raw SHAs).
+ * Format: grok-review-runtime-<40 lowercase hex commit SHA>.
+ * Must point at the same commit as GROK_REVIEW_RUNTIME_COMMIT.
+ */
+const CONTROL_RUNTIME_REF_RE = /^grok-review-runtime-[0-9a-f]{40}$/;
+
+/**
+ * @param {unknown} ref
+ * @returns {boolean}
+ */
+export function isValidControlRuntimeRef(ref) {
+  return typeof ref === "string" && CONTROL_RUNTIME_REF_RE.test(ref);
+}
+
+/**
  * Build workflow_dispatch inputs: decimal ID strings + enum only.
  * @param {{
  *   requestId: string,
@@ -143,6 +158,11 @@ export async function dispatchWorkflow(opts) {
   const built = buildDispatchInputs(opts.inputs);
   if (!built.ok) {
     return { ok: false, reason: built.reason };
+  }
+  // Fail closed before any GitHub call: reject main, branches, raw SHAs,
+  // missing/malformed tags. Only the immutable runtime tag form is accepted.
+  if (!isValidControlRuntimeRef(opts.ref)) {
+    return { ok: false, reason: "invalid_control_ref" };
   }
 
   const url = buildDispatchUrl({
@@ -364,7 +384,8 @@ export function controlRepoConfig(env) {
     owner: String(env.CONTROL_REPO_OWNER || ""),
     repo: String(env.CONTROL_REPO_NAME || ""),
     workflowId: String(env.CONTROL_WORKFLOW_FILE || "grok-review.yml"),
-    ref: String(env.CONTROL_REF || "main"),
+    // No branch fallback: CONTROL_REF must be the immutable runtime tag.
+    ref: String(env.CONTROL_REF || ""),
     token: String(env.CONTROL_REPO_TOKEN || "")
   };
 }

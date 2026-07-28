@@ -31,6 +31,7 @@ import worker, {
   buildManualCommentRequestKey,
   canonicalDecimalId,
   createMemoryDb,
+  dispatchWorkflow,
   encodeExternalId,
   getDelivery,
   getOutboxJobByKey,
@@ -57,6 +58,7 @@ import worker, {
   upsertInstallation,
   verifyGitHubSignature256
 } from "../apps/grok-review-app/src/index.mjs";
+import { controlRepoConfig } from "../apps/grok-review-app/src/github.mjs";
 import { bytesToHex as toHex } from "../apps/grok-review-app/src/crypto-util.mjs";
 import { signReceipt } from "../apps/grok-review-app/src/actions/receipt.mjs";
 import { RECEIPT_SCHEMA_VERSION } from "../apps/grok-review-app/src/receipt-contract.mjs";
@@ -79,6 +81,9 @@ const HUGE_INSTALL = "9007199254740995";
 
 const HEAD_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const HEAD_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+/** Immutable workflow_dispatch ref (tag → trusted runtime commit). */
+const CONTROL_RUNTIME_REF =
+  "grok-review-runtime-ea3594fb1f7cc546ede6d3dca2282860e54b8721";
 
 const RECEIPT_KEY_PAIR = generateKeyPairSync("ed25519");
 const RECEIPT_PRIVATE_KEY_PEM = RECEIPT_KEY_PAIR.privateKey
@@ -103,7 +108,7 @@ function makeEnv(overrides = {}) {
     CONTROL_REPO_OWNER: "control-org",
     CONTROL_REPO_NAME: "control-repo",
     CONTROL_WORKFLOW_FILE: "grok-review.yml",
-    CONTROL_REF: "main",
+    CONTROL_REF: CONTROL_RUNTIME_REF,
     CONTROL_REPO_TOKEN: "ghs_test_control_token",
     GITHUB_APP_ID: "12345",
     ...overrides
@@ -1998,6 +2003,76 @@ test("dispatch inputs are decimal strings + trigger_kind only", () => {
   assert.equal(built.ok, true);
   assert.equal(built.inputs.installation_id, HUGE_INSTALL);
   assert.equal(Object.keys(built.inputs).length, 7);
+});
+
+// Incident #42: CONTROL_REF=main resolved a different SHA than GROK_REVIEW_RUNTIME_COMMIT.
+// workflow_dispatch.ref is a branch/tag name only; pin via immutable runtime tag.
+test("dispatchWorkflow rejects mutable CONTROL_REF without fetch; accepts grok-review-runtime tag", async () => {
+  const inputs = {
+    requestId: "1",
+    installationId: "2",
+    repositoryId: "3",
+    pullNumber: "4",
+    triggerId: "5",
+    actorId: "6",
+    triggerKind: TRIGGER_KIND.AUTOMATIC
+  };
+  const base = {
+    token: "ghs_test",
+    owner: "control-org",
+    repo: "control-repo",
+    workflowId: "grok-review.yml",
+    inputs
+  };
+
+  assert.equal(controlRepoConfig({}).ref, "");
+  assert.equal(controlRepoConfig({ CONTROL_REF: CONTROL_RUNTIME_REF }).ref, CONTROL_RUNTIME_REF);
+
+  const rejectedRefs = [
+    "main",
+    "refs/heads/main",
+    "ea3594fb1f7cc546ede6d3dca2282860e54b8721",
+    "grok-review-runtime-EA3594FB1F7CC546EDE6D3DCA2282860E54B8721",
+    "grok-review-runtime-ea3594fb1f7cc546ede6d3dca2282860e54b872",
+    "grok-review-runtime-ea3594fb1f7cc546ede6d3dca2282860e54b87211",
+    "grok-review-runtime-",
+    "v1.0.0",
+    "",
+    undefined
+  ];
+  for (const ref of rejectedRefs) {
+    let fetchCalled = false;
+    const result = await dispatchWorkflow({
+      ...base,
+      ref,
+      fetchImpl: async () => {
+        fetchCalled = true;
+        throw new Error("fetch must not run for invalid control ref");
+      }
+    });
+    assert.equal(result.ok, false, `expected reject for ref=${String(ref)}`);
+    assert.equal(result.reason, "invalid_control_ref");
+    assert.equal(fetchCalled, false);
+  }
+
+  let dispatchedBody = null;
+  const ok = await dispatchWorkflow({
+    ...base,
+    ref: CONTROL_RUNTIME_REF,
+    fetchImpl: async (_url, init) => {
+      dispatchedBody = JSON.parse(String(init.body));
+      return new Response(
+        JSON.stringify({
+          workflow_run_id: "9001",
+          run_url: `${GITHUB_API_BASE}/repos/control-org/control-repo/actions/runs/9001`,
+          html_url: "https://github.com/control-org/control-repo/actions/runs/9001"
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+  });
+  assert.equal(ok.ok, true);
+  assert.equal(dispatchedBody.ref, CONTROL_RUNTIME_REF);
 });
 
 // ---------------------------------------------------------------------------
