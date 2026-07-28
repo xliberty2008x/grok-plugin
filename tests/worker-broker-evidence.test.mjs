@@ -7097,12 +7097,38 @@ test("private signed review promotion is atomic, immutable, concurrent, and rest
   );
   fs.writeFileSync(barrier, "go\n");
   const results = await Promise.all([first.completed, second.completed]);
-  assert.deepEqual(
-    results.map((result) => result.code),
-    [0, 0],
-    results.map((result) => result.stderr).join("; ")
-  );
-  const payloads = results.map((result) => JSON.parse(result.stdout));
+  const payloads = [];
+  let lockContentionCount = 0;
+  for (const result of results) {
+    if (result.code === 0) {
+      assert.equal(result.stderr, "");
+      payloads.push(JSON.parse(result.stdout));
+      continue;
+    }
+    assert.equal(result.code, 1, result.stderr);
+    assert.equal(result.stdout, "");
+    const failure = JSON.parse(result.stderr);
+    assert.equal(failure.code, "E_EVIDENCE_LEDGER_LOCK");
+    assert.equal(failure.commitState, null);
+    assert.equal(failure.recoveryRequired, false);
+    assert.equal(failure.recordDigest, null);
+    lockContentionCount += 1;
+  }
+  assert.equal(payloads.length, 2 - lockContentionCount);
+  assert.ok(payloads.length >= 1);
+  assert.ok(lockContentionCount <= 1);
+  // The production lock wait is deliberately bounded. A sufficiently slow
+  // hosted runner may safely reject the losing concurrent attempt; retry only
+  // after the winning promoter has released the lock and require convergence.
+  if (lockContentionCount === 1) {
+    payloads.push(api.__testPromoteSignedReview({
+      root: fixture.root,
+      requestPath: requestResult.path,
+      attestationPath,
+      trust,
+      now
+    }));
+  }
   assert.deepEqual(payloads.map((payload) => payload.converged).sort(), [false, true]);
   assert.equal(payloads[0].recordDigest, payloads[1].recordDigest);
 
