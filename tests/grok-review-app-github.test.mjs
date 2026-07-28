@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   createPublicKey,
   generateKeyPairSync,
+  webcrypto,
   verify as verifySignature
 } from "node:crypto";
 import test from "node:test";
@@ -40,6 +41,8 @@ import {
   validateSanitizedReceipt,
   verifyReceiptEnvelope
 } from "../apps/grok-review-app/src/receipt-contract.mjs";
+
+if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
 const HEAD = "a".repeat(40);
 const BASE = "b".repeat(40);

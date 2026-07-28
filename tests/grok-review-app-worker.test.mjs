@@ -5,7 +5,7 @@
  */
 
 import assert from "node:assert/strict";
-import { generateKeyPairSync } from "node:crypto";
+import { generateKeyPairSync, webcrypto } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -60,6 +60,8 @@ import worker, {
 import { bytesToHex as toHex } from "../apps/grok-review-app/src/crypto-util.mjs";
 import { signReceipt } from "../apps/grok-review-app/src/actions/receipt.mjs";
 import { RECEIPT_SCHEMA_VERSION } from "../apps/grok-review-app/src/receipt-contract.mjs";
+
+if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP_ROOT = path.join(ROOT, "apps", "grok-review-app");

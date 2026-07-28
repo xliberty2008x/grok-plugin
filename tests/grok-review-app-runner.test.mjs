@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { webcrypto } from "node:crypto";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -19,6 +20,8 @@ import {
 } from "../apps/grok-review-app/src/actions/central-runner.mjs";
 import { buildPrReviewPayload } from "../scripts/ci/lib/build-pr-review-payload.mjs";
 import { collectRightSideMap } from "../scripts/ci/lib/diff-right-lines.mjs";
+
+if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
 const HEAD = "a".repeat(40);
 const BASE = "b".repeat(40);
