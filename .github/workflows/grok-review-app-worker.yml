@@ -77,7 +77,8 @@ jobs:
           test "$(uname -m)" = "arm64"
           npm install --global --no-audit --no-fund @xai-official/grok@0.2.112
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
-          node --input-type=module -e 'import { attestLocalGrok } from "./apps/grok-review-app/src/actions/model-review.mjs"; attestLocalGrok({ expectedVersion: "0.2.112", expectedSha256: "5cf05fe670b1818561daf7566b580a5de6b81149166499d61072e49640b541a4" });'
+          test -x "${HOME}/.grok/bin/grok"
+          GROK_BIN="${HOME}/.grok/bin/grok" node --input-type=module -e 'import { attestLocalGrok } from "./apps/grok-review-app/src/actions/model-review.mjs"; attestLocalGrok({ expectedVersion: "0.2.112", expectedSha256: "5cf05fe670b1818561daf7566b580a5de6b81149166499d61072e49640b541a4" });'
 
       - name: Run exact-head Grok App review
         env:
@@ -103,7 +104,9 @@ jobs:
           RECEIPT_PRIVATE_KEY: ${{ secrets.RECEIPT_SIGNING_PRIVATE_KEY }}
           RECEIPT_PUBLIC_KEY: ${{ vars.RECEIPT_SIGNING_PUBLIC_KEY }}
           GROK_AUTH_JSON: ${{ secrets.GROK_AUTH_JSON }}
-        run: exec node apps/grok-review-app/src/actions/runner-cli.mjs
+        run: |
+          export GROK_BIN="${HOME}/.grok/bin/grok"
+          exec node apps/grok-review-app/src/actions/runner-cli.mjs
 
       - name: Remove transient review directories
         if: always()
