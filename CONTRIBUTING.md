@@ -160,8 +160,8 @@ and host tools that break the CI trust model (auth/token split, no agent-held
 
 Instead, the trusted Companion headless `explore` review uses a **Superpowers-style
 code-reviewer contract** in `apps/grok-review-app/prompts/review.md` (severity
-calibration, strengths + readiness in the summary, plan/architecture/testing
-checks). Posted reviews are attributed as Superpowers-style Grok Companion
+calibration, structured findings, exact suggestions, and explicit zero-finding
+summaries). Posted reviews are attributed as Superpowers-style Grok Companion
 reviews.
 
 For **local interactive** Superpowers or Grok bundled `/review` (PENDING reviews,
