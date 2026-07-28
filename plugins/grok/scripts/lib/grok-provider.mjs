@@ -2479,6 +2479,10 @@ function checkedInAgentProfile(profile) {
   if (profile?.id === "rescue-write-v3") return path.join(PLUGIN_ROOT, "provider-agents", "rescue-write.md");
   if (profile?.id === "rescue-report-v3") return path.join(PLUGIN_ROOT, "provider-agents", "report-repair.md");
   if (profile?.id === "setup-probe-v2") return path.join(PLUGIN_ROOT, "provider-agents", "setup-probe.md");
+  if (profile?.id === "deep-research-v1") return path.join(PLUGIN_ROOT, "provider-agents", "deep-research.md");
+  if (profile?.id === "deep-research-workspace-v1") {
+    return path.join(PLUGIN_ROOT, "provider-agents", "deep-research-workspace.md");
+  }
   return null;
 }
 
@@ -2495,7 +2499,11 @@ function materializeAgentProfile(profile, environment) {
   const expectedDigest = profile.agentProfileDigest;
   const actualDigest = crypto.createHash("sha256").update(contents).digest("hex");
   if (!expectedDigest || expectedDigest !== actualDigest) {
-    const label = profile.id === "setup-probe-v2" ? "setup probe" : "rescue task";
+    const label = profile.id === "setup-probe-v2"
+      ? "setup probe"
+      : (profile.id === "deep-research-v1" || profile.id === "deep-research-workspace-v1")
+        ? "deep-research job"
+        : "rescue task";
     throw new CompanionError("E_SECURITY_PROFILE", `The checked-in Grok agent profile changed; start a fresh ${label} under the current security contract.`);
   }
   if (!environment?.grokHome) {
@@ -2614,7 +2622,24 @@ async function cleanupFailedProviderStart({ child, identity, root, marker, stage
 
 function spawnArgs({ root, profile, model, effort, leaderSocket, taskProfile = null }) {
   const readOnlyProfile = profile.id === "rescue-read-v3" || profile.id === "rescue-report-v3" || profile.id === "setup-probe-v2";
+  const deepResearchProfile = profile.id === "deep-research-v1"
+    || profile.id === "deep-research-workspace-v1";
+  const deepResearchWorkspace = profile.id === "deep-research-workspace-v1";
   const args = ["--cwd", root, "--sandbox", profile.sandbox, "--permission-mode", profile.permissionMode, "--deny", "WebFetch", "--deny", "MCPTool", "--disable-web-search", "--no-subagents", "--no-memory", "--no-plan"];
+  if (deepResearchProfile) {
+    // Preserve the long-standing base inventory above for fixture pinning,
+    // then replace its network/subagent denials with the research-only set.
+    args.length = 6;
+    args.push(
+      "--deny", "WebFetch",
+      "--deny", "MCPTool",
+      "--deny", "Bash",
+      "--deny", "Edit",
+      "--deny", "Write",
+      "--no-memory",
+      "--no-plan"
+    );
+  }
   if (profile.id === WORKTREE_CONTROLLER_PROFILE_ID
     || profile.id === WORKTREE_INTEGRATION_CONTROLLER_PROFILE_ID
     || profile.id === WORKTREE_CLEANUP_CONTROLLER_PROFILE_ID) {
@@ -2626,6 +2651,12 @@ function spawnArgs({ root, profile, model, effort, leaderSocket, taskProfile = n
       "--deny", "Grep",
       "--deny", "WebSearch"
     );
+  } else if (deepResearchProfile) {
+    // Web-only must not expose repository read tools; workspace mode may read
+    // only the temporary tracked snapshot (cwd), never write or shell.
+    if (!deepResearchWorkspace) {
+      args.push("--deny", "Read", "--deny", "Grep");
+    }
   } else if (readOnlyProfile) args.push("--deny", "Bash", "--deny", "Edit", "--deny", "Write");
   else if (profile.id === "rescue-write-v3") args.push("--deny", "Bash");
   // Setup probe uses permissionMode dontAsk, so it never receives unattended --always-approve expansion.
@@ -3764,7 +3795,7 @@ export async function cleanupBoundBootstrapStart({
   stagedProfile.cleanup();
 }
 
-export async function openProvider({ root, profile, model = null, effort = null, stateDir, jobMarker = "probe", environment = null, knownSecrets = environment?.knownSecrets || [], cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, providerExecutableBinding = null, providerExecutableEnv = process.env, testHooks = null }) {
+export async function openProvider({ root, profile, model = null, effort = null, stateDir, jobMarker = "probe", environment = null, knownSecrets = environment?.knownSecrets || [], cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, providerExecutableBinding = null, providerExecutableEnv = process.env, strictPermissionRequests = false, testHooks = null }) {
   assertProviderPlatform();
   const boundBootstrap = Boolean(guardBinding);
   const worktreeProvisioningBootstrap = isWorktreeProvisioningBinding(guardBinding);
@@ -4234,14 +4265,21 @@ export async function openProvider({ root, profile, model = null, effort = null,
       throw error;
     }
   }
+  let eventError = null;
   const permissionPolicy = (params) => {
+    if (strictPermissionRequests) {
+      eventError = new CompanionError(
+        "E_SECURITY_PROFILE",
+        "Unexpected ACP permission request under a strict provider profile."
+      );
+      return { outcome: { outcome: "cancelled" } };
+    }
     if (worktreeProvisioningBootstrap) {
       return { outcome: { outcome: "cancelled" } };
     }
     const selected = selectAcpPermissionOption(params?.options, { write: runtimeProfile.id === "rescue-write-v3" });
     return selected?.optionId ? { outcome: { outcome: "selected", optionId: selected.optionId } } : { outcome: { outcome: "cancelled" } };
   };
-  let eventError = null;
   const emitEvent = (event) => {
     if (eventError) return;
     try { onEvent(event); }

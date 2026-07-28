@@ -69,7 +69,9 @@ export const PUBLIC_WORKER_ERROR_CODES = Object.freeze([
   "E_USAGE",
   "E_WORKER_LOST",
   "E_WORKTREE",
-  "E_BROKER"
+  "E_BROKER",
+  "E_WORKFLOW_INCOMPLETE",
+  "E_RESEARCH_PAUSED"
 ]);
 
 /** Re-export retention bound so adapters share one constant with append paths. */
@@ -79,7 +81,7 @@ const ACTIVE_WORKER_STATUSES = new Set(["queued", "running"]);
 const PUBLIC_WORKER_STATUSES = new Set(["queued", "running", "completed", "failed", "cancelled", "unknown"]);
 const PUBLIC_LIFECYCLE_EVENT_TYPES = new Set(LIFECYCLE_EVENT_TYPES);
 const PUBLIC_WORKER_ERROR_CODE_SET = new Set(PUBLIC_WORKER_ERROR_CODES);
-const WORKER_ID_PATTERN = /^(?:review|adversarial-review|task|stop-review)-[a-f0-9]{16,64}$/;
+const WORKER_ID_PATTERN = /^(?:review|adversarial-review|task|stop-review|deep-research)-[a-f0-9]{16,64}$/;
 const MAX_PUBLIC_TEXT_BYTES = 2000;
 const MAX_PUBLIC_PLAN_ITEMS = 128;
 const MAX_PUBLIC_LIST_ITEMS = 64;
@@ -311,6 +313,57 @@ function projectTextEvidence(value) {
   return {
     bytes: publicByteCount(value.bytes),
     digest: nullableText(value.digest, 256)
+  };
+}
+
+function projectResearchReport(value) {
+  if (!isPlainObject(value)) return null;
+  const pathMatch = typeof value.path === "string"
+    ? /(?:^|\/)workflows\/([^/]+)\/scratch\/report\.md$/.exec(value.path)
+    : null;
+  return {
+    schemaVersion: 1,
+    valid: Boolean(value.valid),
+    path: pathMatch ? `workflows/${pathMatch[1]}/scratch/report.md` : null,
+    bytes: publicByteCount(value.bytes),
+    sha256: nullableText(value.sha256, 256),
+    sourceCount: publicByteCount(value.sourceCount),
+    coverageNotes: publicStringList(value.coverageNotes, { maxItems: 16, maxBytes: 500 }),
+    status: ["verified", "partial"].includes(value.status || value.assessment)
+      ? (value.status || value.assessment)
+      : "partial",
+    hostVerification: "not_run",
+    textPreview: nullableText(value.textPreview, 500)
+  };
+}
+
+function projectWorkflow(value) {
+  if (!isPlainObject(value)) return null;
+  const phases = Array.isArray(value.phases)
+    ? value.phases.slice(0, 64).map((phase) => {
+        if (typeof phase === "string") return boundedText(phase, { max: 240 });
+        if (!isPlainObject(phase)) return null;
+        return sanitizePublicProjection({
+          id: nullableText(phase.id, 128),
+          name: nullableText(phase.name, 240),
+          status: nullableText(phase.status, 80),
+          summary: nullableText(phase.summary, 1000)
+        });
+      }).filter(Boolean)
+    : [];
+  return {
+    runId: nullableText(value.runId, 256),
+    revision: nullableInteger(value.revision),
+    status: nullableText(value.status, 80),
+    phases,
+    currentPhase: nullableText(value.currentPhase, 240),
+    elapsedMs: nullableInteger(value.elapsedMs),
+    agentsUsed: nullableInteger(value.agentsUsed),
+    agentBudget: nullableInteger(value.agentBudget),
+    usageIncomplete: Boolean(value.usageIncomplete),
+    activeAgents: nullableInteger(value.activeAgents),
+    agentLaunches: nullableInteger(value.agentLaunches),
+    pauseMessage: nullableText(value.pauseMessage, 1000)
   };
 }
 
@@ -979,6 +1032,8 @@ function projectPublicResult(job, { detail = true, trustHostAuthority = true } =
   const runtimeEvidence = projectRuntimeEvidence(job.result.runtimeEvidence, { trustHostAuthority });
   const verification = projectVerification(job.result.verification, { trustHostAuthority });
   const interim = projectTextEvidence(job.result.interim);
+  const researchReport = projectResearchReport(job.result.researchReport);
+  const workflow = projectWorkflow(job.result.workflow || job.workflow);
   return sanitizePublicProjection({
     workerProtocolVersion: WORKER_PROTOCOL_VERSION,
     resultSchemaVersion: WORKER_RESULT_SCHEMA_VERSION,
@@ -988,6 +1043,8 @@ function projectPublicResult(job, { detail = true, trustHostAuthority = true } =
     ...(providerClaims ? { providerClaims } : {}),
     ...(runtimeEvidence ? { runtimeEvidence } : {}),
     ...(verification ? { verification } : {}),
+    ...(researchReport ? { researchReport } : {}),
+    ...(workflow ? { workflow } : {}),
     ...(typeof job.result.textDigest === "string" ? {
       textBytes: Number.isSafeInteger(job.result.textBytes) && job.result.textBytes >= 0
         ? job.result.textBytes

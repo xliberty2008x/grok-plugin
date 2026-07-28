@@ -4,6 +4,25 @@
 
 Status: hardening candidate; not release-qualified.
 
+- Added first-class Grok `/deep-research` dispatch as a dedicated companion
+  surface (`$grok:deep-research` / `/grok:deep-research`), not an arbitrary
+  plugin runner. Jobs use kind `deep-research`, schema v3, and dedicated
+  `deep-research-v1` / `deep-research-workspace-v1` ACP profiles with
+  public-web defaults (`--background`, `--web-only`), optional read-only
+  tracked workspace snapshots (read tools only in workspace mode), private
+  32 KiB query stdin staged in a digest-bound one-use private file (never the
+  job registry), detached background workers, session-scoped capability
+  gating, exact `/deep-research <query>` launch text, workflow-run binding
+  with monotonic revisions, exact `/workflow stop <run-id>` cancellation,
+  cwd/session/run-bound 512 KiB report collection, provider-byte-bound
+  capability receipts, and stable
+  pause/incomplete/security/timeout errors without automatic resume or replay.
+  WebFetch is denied pending independent proof of `allow_local=false`, and
+  reports record the resulting reduced coverage.
+  Rescue profiles and Worker Broker spawn contracts are unchanged. The local
+  stable Grok 0.2.112 build used for development did not advertise the
+  workflow commands in an isolated ACP session, so real completion,
+  cancellation, and crash/restart remain unqualified on that build.
 - Fixed `record-verification` scope reconciliation so host-created pytest and
   Python cache drift is excluded only for exact `.pytest_cache` and
   `__pycache__` path components. The runtime still stores the full exact

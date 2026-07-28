@@ -20,13 +20,14 @@ import { pluginDataRoot, sameHostSession } from "./host.mjs";
 import { assertExecutionBinding } from "./worker-execution-binding.mjs";
 import { expectedWorkerWorktreeRoot } from "./worker-worktree.mjs";
 
-const JOB_ID_PATTERN = /^(review|adversarial-review|task|stop-review)-[a-f0-9]{16,64}$/;
+const JOB_ID_PATTERN = /^(review|adversarial-review|task|stop-review|deep-research)-[a-f0-9]{16,64}$/;
 const JOB_STATUSES = new Set(["queued", "running", "completed", "failed", "cancelled"]);
 const JOB_CLASS_BY_KIND = new Map([
   ["task", "task"],
   ["review", "review"],
   ["adversarial-review", "review"],
-  ["stop-review", "review"]
+  ["stop-review", "review"],
+  ["deep-research", "research"]
 ]);
 const JOB_CLASSES = new Set(JOB_CLASS_BY_KIND.values());
 const ACTIVE = new Set(["queued", "running"]);

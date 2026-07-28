@@ -1,7 +1,7 @@
 {
   "name": "grok",
   "version": "0.3.0-dev.1",
-  "description": "Delegate coding tasks and read-only reviews to the official Grok Build CLI from Codex.",
+  "description": "Delegate coding tasks, read-only reviews, and first-class Grok /deep-research to the official Grok Build CLI from Codex.",
   "author": {
     "name": "grok-plugin community maintainers"
   },
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Grok Companion",
     "shortDescription": "Delegate coding work and reviews to Grok Build",
-    "longDescription": "Use the official Grok Build CLI as an isolated companion agent for setup checks, code reviews, implementation tasks, transcript transfer, and background-job control.",
+    "longDescription": "Use the official Grok Build CLI as an isolated companion agent for setup checks, code reviews, implementation tasks, first-class /deep-research, transcript transfer, and background-job control.",
     "developerName": "grok-plugin community maintainers",
     "category": "Developer Tools",
     "capabilities": [
@@ -31,6 +31,7 @@
     "defaultPrompt": [
       "Ask Grok to review my current changes",
       "Delegate this implementation task to Grok",
+      "Run deep research on this topic with Grok",
       "Show my recent Grok companion jobs"
     ]
   }
