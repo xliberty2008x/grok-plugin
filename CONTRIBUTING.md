@@ -140,6 +140,14 @@ remains explicitly unqualified; `runtime_ingress`, `host_orchestration`, or
 
 ## Optional Grok PR review (GitHub Actions)
 
+> **Legacy during App migration:** Do not copy this workflow into new target
+> repositories. The private, central
+> [Grok Review GitHub App](apps/grok-review-app/README.md) is the intended
+> install-only path. Keep an existing per-repository workflow, secret, and auth
+> watcher only through the
+> [dual-run live qualification gate](docs/operations/private-grok-review-app.md#8-migration-gate);
+> remove them only after every gate item passes.
+
 Same-repository, non-draft pull requests can run the plugin's headless Grok
 review and post an informational GitHub review (`COMMENT`) with inline findings
 when mappable. Findings never fail the check; only auth, CLI, schema, or API

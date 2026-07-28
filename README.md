@@ -38,6 +38,13 @@ This metrics update is post-qualification documentation and is not part of the e
 
 > **External processing:** The CLI runs locally, but model requests are processed through Grok/xAI services. Task prompts, review context collected by the plugin, repository content selected by Grok task tools, command output, imported Claude context, and the user-visible subset of imported Codex context may be processed under your Grok account, organization policy, and applicable xAI terms. Do not delegate material that should not cross that boundary. See [Data boundary](#data-boundary) and [Security model](#execution-and-security-model).
 
+> **Private GitHub App migration:** A central, install-only Grok PR review App is
+> being qualified so target repositories need no workflow, secret, watcher, or
+> integration file. See the [App architecture](apps/grok-review-app/README.md)
+> and [deployment/migration runbook](docs/operations/private-grok-review-app.md).
+> Existing per-repository review workflows remain legacy during dual-run
+> qualification and must not be removed before the runbook's live gate passes.
+
 ---
 
 ## Table of contents

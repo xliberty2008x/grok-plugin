@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://x.ai/schemas/grok-review-app/review-output.schema.json",
+  "title": "Grok Review App structured review output",
+  "description": "App-only review contract. Extends the generic summary/findings shape with an optional exact suggestion object. Verdict is runtime-derived and must not be model-supplied. Not part of Worker Protocol v1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "findings"],
+  "properties": {
+    "summary": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "findings": {
+      "type": "array",
+      "maxItems": 200,
+      "description": "Actionable defects only. Empty means pass; any finding means needs_changes. Optional suggestion is App-only and never projected into Worker Protocol v1.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "title", "body"],
+        "properties": {
+          "severity": { "enum": ["critical", "high", "medium", "low", "info"] },
+          "title": { "type": "string", "minLength": 1, "maxLength": 240 },
+          "body": { "type": "string", "minLength": 1, "maxLength": 6000 },
+          "file": { "type": ["string", "null"], "maxLength": 1024 },
+          "line": { "type": ["integer", "null"], "minimum": 1 },
+          "suggestion": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["startLine", "endLine", "replacement"],
+            "properties": {
+              "startLine": { "type": "integer", "minimum": 1 },
+              "endLine": { "type": "integer", "minimum": 1 },
+              "replacement": { "type": "string", "maxLength": 16384 }
+            }
+          }
+        }
+      }
+    }
+  }
+}
