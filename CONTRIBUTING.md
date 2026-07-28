@@ -1,5 +1,22 @@
 # Contributing
 
+## Pull requests and protected `main`
+
+External contributors open pull requests **from a fork** into `main`. Direct
+pushes to `main` are not the contribution path.
+
+Before merge, wait for all of:
+
+- Hosted CI (`CI required`)
+- GitGuardian
+- Grok review
+- Resolved discussion threads
+- Owner review
+
+Release versioning, qualification evidence, and host-boundary rules below still
+apply to any release-bearing change; this section only documents the fork-PR
+merge gates for protected `main`.
+
 ## Versioning convention and change taxonomy
 
 The repository follows Semantic Versioning, with an explicit rule for the
