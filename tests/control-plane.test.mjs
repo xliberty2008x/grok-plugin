@@ -392,14 +392,20 @@ test("changed-path overflow remains a fail-closed scope violation", () => {
 
 test("structured context readiness fails closed for unverified whole-project work", () => {
   const root = initRepo();
-  fs.writeFileSync(path.join(root, "package.json"), "{}\n");
+  fs.mkdirSync(path.join(root, ".github", "workflows"), { recursive: true });
+  fs.writeFileSync(path.join(root, "pyproject.toml"), "[project]\nname = \"fixture\"\n");
+  fs.writeFileSync(path.join(root, "AGENTS.md"), "# Fixture guidance\n");
+  fs.writeFileSync(path.join(root, ".github", "workflows", "quality.yml"), "name: quality\n");
+  git(root, "add", "pyproject.toml", "AGENTS.md", ".github/workflows/quality.yml");
+  git(root, "commit", "-m", "add project markers");
   const manifest = captureContextManifest(root);
+  assert.deepEqual(manifest.projectMarkers, ["pyproject.toml"]);
   const complete = buildTaskEnvelope({
     userRequest: "inspect the whole project",
     context: {
       workspaceState: "complete",
       upstreamFreshness: "not_checked",
-      expectedProjectMarkers: ["package.json"]
+      expectedProjectMarkers: ["pyproject.toml", "AGENTS.md", ".github/workflows/quality.yml"]
     }
   });
   assert.throws(
@@ -407,16 +413,98 @@ test("structured context readiness fails closed for unverified whole-project wor
     (error) => error?.code === "E_CONTEXT_INCOMPLETE" && /upstream-freshness-not-verified/.test(error.message)
   );
 
+  const verifiedComplete = buildTaskEnvelope({
+    userRequest: "inspect all declared project markers",
+    context: {
+      workspaceState: "complete",
+      upstreamFreshness: "verified",
+      expectedProjectMarkers: ["pyproject.toml", "AGENTS.md", ".github/workflows/quality.yml"]
+    }
+  });
+  assert.doesNotThrow(() => assertTaskContextReady(verifiedComplete, manifest, { structuredInput: true }));
+
+  const linkedParent = tempDir("grok-plugin-linked-parent-");
+  const linkedRoot = path.join(linkedParent, "checkout");
+  git(root, "worktree", "add", "-b", "linked-fixture", linkedRoot);
+  const linkedManifest = captureContextManifest(linkedRoot);
+  assert.deepEqual(linkedManifest.projectMarkers, ["pyproject.toml"]);
+  assert.doesNotThrow(() => assertTaskContextReady(verifiedComplete, linkedManifest, { structuredInput: true }));
+
   const scoped = buildTaskEnvelope({
     userRequest: "inspect the available package",
     context: {
       workspaceState: "task_scoped",
       upstreamFreshness: "not_checked",
-      expectedProjectMarkers: ["package.json"],
-      requiredPaths: ["tracked.txt", "package.json"]
+      expectedProjectMarkers: ["pyproject.toml", "AGENTS.md"],
+      requiredPaths: ["tracked.txt", "pyproject.toml"]
     }
   });
   assert.doesNotThrow(() => assertTaskContextReady(scoped, manifest, { structuredInput: true }));
+
+  const missingMarker = buildTaskEnvelope({
+    userRequest: "inspect a project with a missing marker",
+    context: {
+      workspaceState: "task_scoped",
+      expectedProjectMarkers: ["docs/missing-marker.md"],
+      requiredPaths: ["tracked.txt"]
+    }
+  });
+  assert.throws(
+    () => assertTaskContextReady(missingMarker, manifest, { structuredInput: true }),
+    (error) => error?.code === "E_CONTEXT_INCOMPLETE"
+      && error.details?.missingMarkers?.includes("docs/missing-marker.md")
+      && error.details?.reasons?.includes("missing-project-markers:docs/missing-marker.md")
+      && !/Complete host preflight/.test(error.message)
+  );
+
+  for (const marker of [
+    "/tmp/outside",
+    "C:\\outside",
+    "C:outside",
+    "nested/../outside",
+    "file:///etc/passwd",
+    "././https://example.test/marker",
+    "~/outside",
+    "a".repeat(1025)
+  ]) {
+    assert.throws(
+      () => buildTaskEnvelope({
+        userRequest: "reject an unsafe project marker",
+        context: { expectedProjectMarkers: [marker] }
+      }),
+      (error) => error?.code === "E_USAGE"
+    );
+  }
+
+  fs.mkdirSync(path.join(root, "marker-links"));
+  fs.symlinkSync("../AGENTS.md", path.join(root, "marker-links", "internal"));
+  const externalMarker = path.join(tempDir("grok-plugin-external-marker-"), "marker.txt");
+  fs.writeFileSync(externalMarker, "outside\n");
+  fs.symlinkSync(externalMarker, path.join(root, "marker-links", "external"));
+  const internalSymlinkMarker = buildTaskEnvelope({
+    userRequest: "accept an internal project marker symlink",
+    context: {
+      workspaceState: "task_scoped",
+      expectedProjectMarkers: ["marker-links/internal"],
+      requiredPaths: ["tracked.txt"]
+    }
+  });
+  assert.doesNotThrow(() => assertTaskContextReady(internalSymlinkMarker, manifest, { structuredInput: true }));
+  const escapingSymlinkMarker = buildTaskEnvelope({
+    userRequest: "reject an escaping project marker symlink",
+    context: {
+      workspaceState: "task_scoped",
+      expectedProjectMarkers: ["marker-links/external"],
+      requiredPaths: ["tracked.txt"]
+    }
+  });
+  assert.throws(
+    () => assertTaskContextReady(escapingSymlinkMarker, manifest, { structuredInput: true }),
+    (error) => error?.code === "E_CONTEXT_INCOMPLETE"
+      && error.details?.unsafeMarkers?.includes("marker-links/external")
+      && error.details?.reasons?.includes("project-markers-escape-workspace:marker-links/external")
+  );
+
   const emptySlice = buildTaskEnvelope({
     userRequest: "inspect an unspecified checkout slice",
     context: { workspaceState: "task_scoped", upstreamFreshness: "not_checked" }
@@ -431,7 +519,7 @@ test("structured context readiness fails closed for unverified whole-project wor
     context: {
       workspaceState: "task_scoped",
       upstreamFreshness: "not_checked",
-      requiredPaths: ["src", "package.json"]
+      requiredPaths: ["src", "pyproject.toml"]
     }
   });
   assert.throws(
@@ -748,10 +836,16 @@ test("Codex control-plane skill contracts describe host authority and explicit j
   assert.match(result, /not_run/);
 });
 
-test("integration: Codex nonblocking stdin waits for delayed TaskEnvelope and verification records", {
+test("integration: Codex nonblocking stdin accepts arbitrary markers and records verification", {
   skip: process.platform === "win32" && "nonblocking fd regression harness is POSIX-only"
 }, async (t) => {
   const root = initRepo();
+  fs.mkdirSync(path.join(root, ".github", "workflows"), { recursive: true });
+  fs.writeFileSync(path.join(root, "pyproject.toml"), "[project]\nname = \"fixture\"\n");
+  fs.writeFileSync(path.join(root, "AGENTS.md"), "# Fixture guidance\n");
+  fs.writeFileSync(path.join(root, ".github", "workflows", "quality.yml"), "name: quality\n");
+  git(root, "add", "pyproject.toml", "AGENTS.md", ".github/workflows/quality.yml");
+  git(root, "commit", "-m", "add arbitrary project markers");
   const { env: fixtureEnv, fake, pluginData } = fixture({
     taskText: workerReport({
       summary: "Delayed Codex ingress completed",
@@ -794,7 +888,7 @@ test("integration: Codex nonblocking stdin waits for delayed TaskEnvelope and ve
     context: {
       facts: ["The host writes the envelope after process creation."],
       constraints: ["Keep the checkout unchanged."],
-      expectedProjectMarkers: [],
+      expectedProjectMarkers: ["pyproject.toml", "AGENTS.md", ".github/workflows/quality.yml"],
       requiredPaths: ["tracked.txt"],
       workspaceState: "task_scoped",
       upstreamFreshness: "not_checked"
