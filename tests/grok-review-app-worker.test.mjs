@@ -465,6 +465,15 @@ test("migration, wrangler, and README match hardened contracts", () => {
   const wrangler = fs.readFileSync(WRANGLER_PATH, "utf8");
   assert.match(wrangler, /workers_dev = true/);
   assert.match(wrangler, /database_id = "00000000-0000-0000-0000-000000000000"/);
+  for (const variable of [
+    "CONTROL_REPO_OWNER",
+    "CONTROL_REPO_NAME",
+    "CONTROL_WORKFLOW_FILE",
+    "CONTROL_REF",
+    "GITHUB_APP_ID"
+  ]) {
+    assert.match(wrangler, new RegExp(`^${variable} = ""$`, "m"));
+  }
   assert.match(wrangler, /\/github\/webhooks/);
 
   const readme = fs.readFileSync(README_PATH, "utf8");

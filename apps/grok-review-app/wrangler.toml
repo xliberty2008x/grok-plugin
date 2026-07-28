@@ -27,17 +27,17 @@ crons = ["*/1 * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "grok-review-control"
-database_id = "75c8890a-693a-496a-9d4e-74fdb0ebdbe7"
+database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
 [vars]
 # Non-secret control-plane configuration (fill per environment; no secrets).
-CONTROL_REPO_OWNER = "xliberty2008x"
-CONTROL_REPO_NAME = "grok-plugin"
-CONTROL_WORKFLOW_FILE = "grok-review-app-worker.yml"
-CONTROL_REF = "main"
+CONTROL_REPO_OWNER = ""
+CONTROL_REPO_NAME = ""
+CONTROL_WORKFLOW_FILE = ""
+CONTROL_REF = ""
 # Canonical decimal GitHub App ID (string) used to verify app-owned check_run actions.
-GITHUB_APP_ID = "4415698"
+GITHUB_APP_ID = ""
 
 [observability]
 enabled = false
