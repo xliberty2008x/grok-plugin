@@ -38,6 +38,7 @@ function isUnconditionalRunStep(step, command) {
 }
 
 export function validateHostedCiWorkflow(source, { shardCount = 3 } = {}) {
+  source = source.replace(/\r\n?/gu, "\n");
   const errors = [];
   const expectedTriggers = [
     "on:",

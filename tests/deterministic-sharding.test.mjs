@@ -113,6 +113,7 @@ test("manifest validation fails closed on missing, duplicate, extra, external, a
 test("hosted CI contract rejects matrix and gate mutations that could hide coverage failures", () => {
   const workflow = fs.readFileSync(path.join(ROOT, ".github/workflows/ci.yml"), "utf8");
   assert.deepEqual(validateHostedCiWorkflow(workflow), []);
+  assert.deepEqual(validateHostedCiWorkflow(workflow.replace(/\n/gu, "\r\n")), []);
 
   const mutations = [
     workflow.replace(
