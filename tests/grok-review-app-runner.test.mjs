@@ -1102,6 +1102,10 @@ test("workflow is dispatch-only, least-privilege, exact-action pinned, and non-a
     /group:\s*grok-review-\$\{\{ inputs\.repository_id \}\}-\$\{\{ inputs\.pull_number \}\}/
   );
   assert.match(workflow, /@xai-official\/grok@0\.2\.112/);
+  assert.equal(
+    workflow.match(/GROK_BIN="\$\{HOME\}\/\.grok\/bin\/grok"/g)?.length,
+    2
+  );
   assert.match(workflow, /git status --porcelain=v1 --untracked-files=all/);
   for (const name of [
     "vars.GROK_REVIEW_APP_ID",
