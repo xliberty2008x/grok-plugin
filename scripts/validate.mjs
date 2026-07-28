@@ -324,6 +324,49 @@ if (!versionsOnly) {
     "plugins/grok/schemas/worker-broker-review-request.schema.json",
     "plugins/grok/schemas/worker-broker-review-attestation.schema.json",
     "plugins/grok/schemas/worker-protocol.schema.json",
+    ".github/workflows/grok-review-app-worker.yml",
+    "apps/grok-review-app/README.md",
+    "apps/grok-review-app/github-app-manifest.template.json",
+    "apps/grok-review-app/migrations/0001_init.sql",
+    "apps/grok-review-app/schemas/review-output.schema.json",
+    "apps/grok-review-app/prompts/review.md",
+    "apps/grok-review-app/prompts/report-repair.md",
+    "apps/grok-review-app/src/callback.mjs",
+    "apps/grok-review-app/src/constants.mjs",
+    "apps/grok-review-app/src/crypto-util.mjs",
+    "apps/grok-review-app/src/db.mjs",
+    "apps/grok-review-app/src/external-id.mjs",
+    "apps/grok-review-app/src/github.mjs",
+    "apps/grok-review-app/src/http.mjs",
+    "apps/grok-review-app/src/ids.mjs",
+    "apps/grok-review-app/src/index.mjs",
+    "apps/grok-review-app/src/memory-db.mjs",
+    "apps/grok-review-app/src/outbox.mjs",
+    "apps/grok-review-app/src/receipt-contract.mjs",
+    "apps/grok-review-app/src/webhook.mjs",
+    "apps/grok-review-app/src/actions/callback-client.mjs",
+    "apps/grok-review-app/src/actions/central-runner.mjs",
+    "apps/grok-review-app/src/actions/collector-errors.mjs",
+    "apps/grok-review-app/src/actions/exact-head-repository.mjs",
+    "apps/grok-review-app/src/actions/exact-head-diff.mjs",
+    "apps/grok-review-app/src/actions/github-app-auth.mjs",
+    "apps/grok-review-app/src/actions/github-authority.mjs",
+    "apps/grok-review-app/src/actions/github-checks.mjs",
+    "apps/grok-review-app/src/actions/github-http.mjs",
+    "apps/grok-review-app/src/actions/github-reviews.mjs",
+    "apps/grok-review-app/src/actions/head-instructions.mjs",
+    "apps/grok-review-app/src/actions/model-review.mjs",
+    "apps/grok-review-app/src/actions/receipt.mjs",
+    "apps/grok-review-app/src/actions/review-packet.mjs",
+    "apps/grok-review-app/src/actions/runner-cli.mjs",
+    "apps/grok-review-app/wrangler.toml",
+    "docs/operations/private-grok-review-app.md",
+    "tests/grok-review-app-github.test.mjs",
+    "tests/grok-review-app-runner.test.mjs",
+    "tests/grok-review-app-target-collector.test.mjs",
+    "tests/grok-review-app-worker.test.mjs",
+    "scripts/ci/lib/build-pr-review-payload.mjs",
+    "scripts/ci/lib/diff-right-lines.mjs",
     "plugins/grok/scripts/grok-companion.mjs",
     "plugins/grok/scripts/grok-codex.mjs",
     "plugins/grok/mcp/broker.mjs",
@@ -344,6 +387,47 @@ if (!versionsOnly) {
   for (const name of commandNames) required.push(`plugins/grok/commands/${name}.md`);
   for (const name of commandNames) required.push(`plugins/grok/skills/${name}/SKILL.md`);
   for (const file of required) requiredFile(file);
+
+  const appManifest = readJson("apps/grok-review-app/github-app-manifest.template.json");
+  if (appManifest) {
+    const file = "apps/grok-review-app/github-app-manifest.template.json";
+    const exactPermissions = {
+      checks: "write",
+      contents: "read",
+      issues: "read",
+      metadata: "read",
+      pull_requests: "write"
+    };
+    const exactEvents = [
+      "check_run",
+      "installation",
+      "installation_repositories",
+      "issue_comment",
+      "pull_request"
+    ];
+    if (appManifest.public !== false || appManifest.request_oauth_on_install !== false) {
+      problem("The Grok Review GitHub App must remain private and must not request OAuth on install.", file);
+    }
+    if (
+      JSON.stringify(Object.fromEntries(
+        Object.entries(appManifest.default_permissions || {}).sort(([left], [right]) => left.localeCompare(right))
+      )) !== JSON.stringify(exactPermissions)
+    ) {
+      problem("The Grok Review GitHub App permission set must remain exact and least-privilege.", file);
+    }
+    if (
+      !Array.isArray(appManifest.default_events)
+      || JSON.stringify([...appManifest.default_events].sort()) !== JSON.stringify(exactEvents)
+    ) {
+      problem("The Grok Review GitHub App event subscription set must remain exact.", file);
+    }
+    if (
+      appManifest.hook_attributes?.active !== true
+      || appManifest.hook_attributes?.url !== "https://grok-review.example.invalid/github/webhooks"
+    ) {
+      problem("The checked-in App manifest must keep the reserved webhook template URL and active hook.", file);
+    }
+  }
 
   const packageJson = readJson("package.json");
   if (packageJson) {
@@ -475,6 +559,74 @@ if (!versionsOnly) {
       if (!schema.required?.includes(field) || !schema.properties?.[field]) problem(`Review schema is missing required field ${field}.`, "plugins/grok/schemas/review-output.schema.json");
     }
     if (schema.properties?.verdict || schema.required?.includes("verdict")) problem("Review schema must not accept a model-controlled verdict; runtime derives it from findings.", "plugins/grok/schemas/review-output.schema.json");
+    const genericFindingProps = schema.properties?.findings?.items?.properties || {};
+    if (Object.hasOwn(genericFindingProps, "suggestion")) {
+      problem("Generic review schema must not accept App-only suggestion fields (Worker Protocol v1 wire compatibility).", "plugins/grok/schemas/review-output.schema.json");
+    }
+  }
+
+  // App-only structured review contract: summary/findings + exact optional suggestion.
+  const appReviewSchema = readJson("apps/grok-review-app/schemas/review-output.schema.json");
+  if (appReviewSchema) {
+    const file = "apps/grok-review-app/schemas/review-output.schema.json";
+    if (appReviewSchema.$schema !== "https://json-schema.org/draft/2020-12/schema") {
+      problem("App review schema must use JSON Schema 2020-12.", file);
+    }
+    for (const field of ["summary", "findings"]) {
+      if (!appReviewSchema.required?.includes(field) || !appReviewSchema.properties?.[field]) {
+        problem(`App review schema is missing required field ${field}.`, file);
+      }
+    }
+    if (appReviewSchema.properties?.verdict || appReviewSchema.required?.includes("verdict")) {
+      problem("App review schema must not accept a model-controlled verdict; runtime derives it from findings.", file);
+    }
+    if (appReviewSchema.additionalProperties !== false) {
+      problem("App review schema must set additionalProperties false at the root.", file);
+    }
+    const finding = appReviewSchema.properties?.findings?.items;
+    if (!finding || finding.type !== "object" || finding.additionalProperties !== false) {
+      problem("App review schema findings items must be a closed object.", file);
+    }
+    const findingProps = finding?.properties || {};
+    for (const field of ["severity", "title", "body", "file", "line", "suggestion"]) {
+      if (!findingProps[field]) problem(`App review schema finding is missing property ${field}.`, file);
+    }
+    const suggestion = findingProps.suggestion;
+    if (suggestion) {
+      if (suggestion.type !== "object" || suggestion.additionalProperties !== false) {
+        problem("App suggestion must be a closed object.", file);
+      }
+      const requiredSuggestion = suggestion.required || [];
+      for (const field of ["startLine", "endLine", "replacement"]) {
+        if (!requiredSuggestion.includes(field) || !suggestion.properties?.[field]) {
+          problem(`App suggestion must require exact field ${field}.`, file);
+        }
+      }
+      const suggestionKeys = Object.keys(suggestion.properties || {}).sort();
+      if (JSON.stringify(suggestionKeys) !== JSON.stringify(["endLine", "replacement", "startLine"])) {
+        problem("App suggestion must contain exactly startLine, endLine, and replacement.", file);
+      }
+      if (suggestion.properties?.startLine?.type !== "integer" || suggestion.properties?.startLine?.minimum !== 1) {
+        problem("App suggestion startLine must be a positive integer.", file);
+      }
+      if (suggestion.properties?.endLine?.type !== "integer" || suggestion.properties?.endLine?.minimum !== 1) {
+        problem("App suggestion endLine must be a positive integer.", file);
+      }
+      if (suggestion.properties?.replacement?.type !== "string") {
+        problem("App suggestion replacement must be a string.", file);
+      }
+      const replacementMax = suggestion.properties?.replacement?.maxLength;
+      if (replacementMax !== 16384) {
+        problem("App suggestion replacement maxLength must be 16384 (16 KiB UTF-8 character ceiling in schema).", file);
+      }
+    }
+    const appPrompt = readText("apps/grok-review-app/prompts/review.md", { required: false });
+    if (appPrompt != null) {
+      if (!appPrompt.includes("suggestion")) problem("App review prompt must document optional suggestions.", "apps/grok-review-app/prompts/review.md");
+      if (!appPrompt.includes("startLine") || !appPrompt.includes("endLine") || !appPrompt.includes("replacement")) {
+        problem("App review prompt must name the exact suggestion fields.", "apps/grok-review-app/prompts/review.md");
+      }
+    }
   }
 
   const workerEvidenceSchema = readJson("plugins/grok/schemas/worker-broker-evidence.schema.json");

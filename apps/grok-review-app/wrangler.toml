@@ -1,0 +1,43 @@
+# Private Grok Review GitHub App — Cloudflare Worker deploy config
+# Placeholder D1 ID and empty non-secret vars only. Never commit secrets.
+#
+# Required secrets (set via `wrangler secret put <NAME>`):
+#   WEBHOOK_SECRET             — GitHub App webhook secret
+#   RUNNER_CALLBACK_SECRET     — HMAC secret shared only with the central runner
+#   CONTROL_REPO_TOKEN         — Actions-write token for the central control repo only
+#   RECEIPT_PUBLIC_KEYS_JSON   — trusted Ed25519 public-key map (never a private key)
+#
+# Public webhook path: POST /github/webhooks
+# Callback path:       POST /internal/callback
+
+name = "grok-review-app"
+main = "src/index.mjs"
+compatibility_date = "2026-03-10"
+
+# Enable workers.dev hostname so the Worker is reachable without a custom route.
+# Pin a custom route/domain in the dashboard or via [[routes]] when ready.
+workers_dev = true
+
+[triggers]
+crons = ["*/1 * * * *"]
+
+# Account / zone binding is environment-local; leave unset in-repo.
+# account_id is intentionally omitted.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "grok-review-control"
+database_id = "75c8890a-693a-496a-9d4e-74fdb0ebdbe7"
+migrations_dir = "migrations"
+
+[vars]
+# Non-secret control-plane configuration (fill per environment; no secrets).
+CONTROL_REPO_OWNER = "xliberty2008x"
+CONTROL_REPO_NAME = "grok-plugin"
+CONTROL_WORKFLOW_FILE = "grok-review-app-worker.yml"
+CONTROL_REF = "main"
+# Canonical decimal GitHub App ID (string) used to verify app-owned check_run actions.
+GITHUB_APP_ID = "4415698"
+
+[observability]
+enabled = false

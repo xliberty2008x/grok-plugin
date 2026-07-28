@@ -90,6 +90,12 @@ const WORKTREE_PROVISIONING_BINDING_KEYS = new Set([
 export const REVIEW_SCHEMA = Object.freeze(JSON.parse(
   fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8")
 ));
+/** Default same-session repair prompt for generic structured reviews. */
+export const DEFAULT_REVIEW_REPAIR_PROMPT = "Your previous response was not valid review JSON. Return only one JSON object with exactly summary and findings. Omit verdict; the runtime derives pass from zero findings and needs_changes from one or more findings. Preserve substantive findings and use repository-relative paths.";
+/** App-only suggestion replacement ceiling (UTF-8 bytes). */
+export const MAX_SUGGESTION_REPLACEMENT_BYTES = 16 * 1024;
+/** Aggregate validated App review JSON ceiling (UTF-8 bytes). */
+export const MAX_APP_REVIEW_OUTPUT_BYTES = 512 * 1024;
 const ALLOW_ENV = new Set(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "COLORTERM", "NO_COLOR", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "SystemRoot", "ComSpec", "PATHEXT"]);
 
 function exactRecord(value, keys) {
@@ -232,6 +238,19 @@ function outputSchemaDigest(outputSchema) {
     throw new CompanionError("E_PROTOCOL", "Provider output schema exceeds 65536 bytes.");
   }
   return crypto.createHash("sha256").update(serialized).digest("hex");
+}
+
+/**
+ * Resolve an explicit trusted headless output schema.
+ * Must be a plain JSON object, serializable, and within the 64 KiB bound.
+ * Returns the generic REVIEW_SCHEMA when the caller omits the option.
+ * @param {object|null|undefined} outputSchema
+ * @returns {object}
+ */
+export function resolveTrustedOutputSchema(outputSchema) {
+  if (outputSchema === undefined || outputSchema === null) return REVIEW_SCHEMA;
+  outputSchemaDigest(outputSchema);
+  return outputSchema;
 }
 
 function authEntryExpiries(parsed) {
@@ -2719,6 +2738,20 @@ function requestDuringProviderStartup(client, method, params, timeoutMs, cancelR
 }
 
 /**
+ * Repository-relative path check shared by generic and App review validators.
+ * @param {unknown} file
+ * @returns {boolean}
+ */
+function reviewPathOk(file) {
+  if (file === undefined || file === null) return true;
+  if (typeof file !== "string" || !file.trim() || file.length > 1024) return false;
+  const normalized = file.replace(/\\/g, "/");
+  return !path.posix.isAbsolute(normalized)
+    && !/^[A-Za-z]:\//.test(normalized)
+    && !normalized.split("/").includes("..");
+}
+
+/**
  * Validate provider review payload and deterministically derive the verdict.
  * Zero findings always passes; nonzero findings always needs_changes.
  * Model-supplied verdict is rejected; the public verdict exists only after validation.
@@ -2726,14 +2759,6 @@ function requestDuringProviderStartup(client, method, params, timeoutMs, cancelR
 export function validateReview(value) {
   const rootKeys = value && typeof value === "object" && !Array.isArray(value) ? Object.keys(value) : [];
   const allowedKeys = new Set(["summary", "findings"]);
-  const reviewPathOk = (file) => {
-    if (file === undefined || file === null) return true;
-    if (typeof file !== "string" || !file.trim() || file.length > 1024) return false;
-    const normalized = file.replace(/\\/g, "/");
-    return !path.posix.isAbsolute(normalized)
-      && !/^[A-Za-z]:\//.test(normalized)
-      && !normalized.split("/").includes("..");
-  };
   const findingsOk = Array.isArray(value?.findings) && value.findings.length <= 200 && value.findings.every((f) => f
     && typeof f === "object"
     && !Array.isArray(f)
@@ -2781,6 +2806,136 @@ export function validateReview(value) {
     summary: redactText(value.summary.trim()),
     findings
   };
+}
+
+/**
+ * Whether a suggestion object has the exact App structural shape
+ * `{ startLine, endLine, replacement }` with correct types.
+ * Safety (bounds, safe integers range order) is checked separately so unsafe
+ * but structured suggestions can degrade to ordinary findings.
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isAppSuggestionStructure(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.length !== 3) return false;
+  if (!keys.includes("startLine") || !keys.includes("endLine") || !keys.includes("replacement")) {
+    return false;
+  }
+  return typeof value.startLine === "number"
+    && typeof value.endLine === "number"
+    && typeof value.replacement === "string";
+}
+
+/**
+ * Safe suggestion: exact structure, safe positive integers, ordered range,
+ * and replacement within the 16 KiB UTF-8 ceiling. Never mutates replacement.
+ * @param {unknown} value
+ * @returns {value is { startLine: number, endLine: number, replacement: string }}
+ */
+function isSafeAppSuggestion(value) {
+  if (!isAppSuggestionStructure(value)) return false;
+  if (!Number.isSafeInteger(value.startLine) || !Number.isSafeInteger(value.endLine)) return false;
+  if (value.startLine < 1 || value.endLine < value.startLine) return false;
+  if (Buffer.byteLength(value.replacement, "utf8") > MAX_SUGGESTION_REPLACEMENT_BYTES) return false;
+  if (redactText(value.replacement) !== value.replacement) return false;
+  return true;
+}
+
+/**
+ * App-only review validator: summary/findings plus optional exact suggestion.
+ * Structurally valid but unsafe suggestions degrade to ordinary findings
+ * without mutating or truncating replacement text. Aggregate output is bounded.
+ * Suggestions never enter Worker Protocol v1 (this path is App-direct only).
+ * @param {unknown} value
+ * @returns {{ verdict: "pass"|"needs_changes", summary: string, findings: object[] }}
+ */
+export function validateAppReview(value) {
+  const rootKeys = value && typeof value === "object" && !Array.isArray(value) ? Object.keys(value) : [];
+  const allowedKeys = new Set(["summary", "findings"]);
+  const findingKeys = new Set(["severity", "title", "body", "file", "line", "suggestion"]);
+
+  const findingsOk = Array.isArray(value?.findings) && value.findings.length <= 200 && value.findings.every((f) => {
+    if (!f || typeof f !== "object" || Array.isArray(f)) return false;
+    if (!Object.keys(f).every((key) => findingKeys.has(key))) return false;
+    if (!["critical", "high", "medium", "low", "info"].includes(f.severity)) return false;
+    if (typeof f.title !== "string" || !f.title.trim() || f.title.length > 240) return false;
+    if (typeof f.body !== "string" || !f.body.trim() || f.body.length > 6000) return false;
+    if (!reviewPathOk(f.file)) return false;
+    if (!(f.line === undefined || f.line === null || (Number.isInteger(f.line) && f.line >= 1))) return false;
+    if (f.suggestion === undefined) return true;
+    // Malformed structure fails validation; unsafe-but-structured degrades later.
+    return isAppSuggestionStructure(f.suggestion);
+  });
+
+  const ok = Boolean(
+    value
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && rootKeys.every((key) => allowedKeys.has(key))
+    && typeof value.summary === "string"
+    && value.summary.trim()
+    && value.summary.length <= 2000
+    && findingsOk
+  );
+  if (!ok) {
+    const details = {
+      rootKeys: rootKeys.filter((key) => allowedKeys.has(key)).slice(0, 24),
+      hasUnknownRootKeys: rootKeys.some((key) => !allowedKeys.has(key)),
+      summaryType: typeof value?.summary,
+      findingsCount: Array.isArray(value?.findings) ? value.findings.length : null,
+      findingsShapeOk: findingsOk,
+      hint: "Return only summary and findings. Optional suggestion must be exactly {startLine,endLine,replacement}. Omit verdict."
+    };
+    try {
+      details.payloadDigest = crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
+    } catch {
+      details.payloadDigest = null;
+    }
+    throw new CompanionError("E_SCHEMA", "Grok App review output did not match the required schema.", details);
+  }
+
+  const findings = value.findings.map((f) => {
+    const finding = {
+      severity: f.severity,
+      title: redactText(f.title.trim()),
+      body: redactText(f.body.trim()),
+      ...(f.file === undefined ? {} : { file: f.file === null ? null : redactText(f.file.trim().replace(/\\/g, "/")) }),
+      ...(f.line === undefined ? {} : { line: f.line })
+    };
+    if (f.suggestion !== undefined && isSafeAppSuggestion(f.suggestion)) {
+      // Preserve replacement bytes exactly (no redact/truncate). Title/body already redacted.
+      finding.suggestion = {
+        startLine: f.suggestion.startLine,
+        endLine: f.suggestion.endLine,
+        replacement: f.suggestion.replacement
+      };
+    }
+    // Unsafe structured suggestion: degrade to ordinary finding (omit suggestion).
+    return finding;
+  });
+
+  const review = {
+    verdict: findings.length === 0 ? "pass" : "needs_changes",
+    summary: redactText(value.summary.trim()),
+    findings
+  };
+
+  let serialized;
+  try {
+    serialized = JSON.stringify(review);
+  } catch {
+    throw new CompanionError("E_SCHEMA", "Grok App review output is not JSON-serializable.");
+  }
+  if (Buffer.byteLength(serialized, "utf8") > MAX_APP_REVIEW_OUTPUT_BYTES) {
+    throw new CompanionError(
+      "E_SCHEMA",
+      `Grok App review output exceeds ${MAX_APP_REVIEW_OUTPUT_BYTES} bytes.`,
+      { bytes: Buffer.byteLength(serialized, "utf8") }
+    );
+  }
+  return review;
 }
 
 /**
@@ -4327,14 +4482,19 @@ export async function ensureChildExit(child, identity, { naturalExitMs = 750 } =
   if (!await waitGone(1500)) throw new CompanionError("E_PROCESS_IDENTITY", `Verified Grok process group ${identity.processGroupId || identity.pid} did not exit after SIGKILL.`, { pid: identity.pid, processGroupId: identity.processGroupId || null });
 }
 
-function headlessArgs({ root, promptFile, model, effort, leaderSocket, resumeSessionId, newSessionId, structured, sandboxProfile }) {
+function headlessArgs({ root, promptFile, model, effort, leaderSocket, resumeSessionId, newSessionId, structured, sandboxProfile, outputSchema = null }) {
   const args = ["--cwd", root, "--agent", "explore", "--sandbox", sandboxProfile, "--permission-mode", "default", "--tools", "todo_write", "--disallowed-tools", "Agent,run_terminal_cmd,read_file,list_dir,grep,search_replace,write,web_search,web_fetch,search_tool,use_tool", "--deny", "MCPTool(*)", "--deny", "Bash(*)", "--deny", "Read(*)", "--deny", "Grep(*)", "--deny", "Edit(*)", "--deny", "Write(*)", "--deny", "WebFetch(*)", "--disable-web-search", "--no-subagents", "--no-memory", "--no-plan", "--leader-socket", leaderSocket];
   if (model) args.push("--model", model);
   if (effort) args.push("--reasoning-effort", effort);
   if (resumeSessionId) args.push("--resume", resumeSessionId);
   else args.push("--session-id", newSessionId);
-  if (structured) args.push("--json-schema", JSON.stringify(REVIEW_SCHEMA));
-  else args.push("--output-format", "json");
+  if (structured) {
+    // Trusted schema is passed as a single argv element (spawn shell:false) — never via shell interpolation.
+    const schema = resolveTrustedOutputSchema(outputSchema);
+    args.push("--json-schema", JSON.stringify(schema));
+  } else {
+    args.push("--output-format", "json");
+  }
   args.push("--verbatim", "--prompt-file", promptFile);
   return args;
 }
@@ -4354,8 +4514,10 @@ function anonymousPrompt(directory, prompt) {
   }
 }
 
-export async function runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker = "review", resumeSessionId = null, structured = false, cancelRequested = () => false, onEvent = () => {}, timeoutMs = 15 * 60 * 1000, maxOutputBytes = 1024 * 1024 }) {
+export async function runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker = "review", resumeSessionId = null, structured = false, outputSchema = null, cancelRequested = () => false, onEvent = () => {}, timeoutMs = 15 * 60 * 1000, maxOutputBytes = 1024 * 1024 }) {
   assertProviderPlatform();
+  // Validate trusted schema early (bounded + serializable) before spawning.
+  const trustedSchema = structured ? resolveTrustedOutputSchema(outputSchema) : null;
   const binary = discoverGrok(), version = grokVersion(binary);
   const marker = safeMarker(jobMarker), isolation = reviewEnvironment(
     stateDir,
@@ -4402,7 +4564,7 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
     if (cancelRequested()) {
       throw new CompanionError("E_CANCELLED", "Grok job was cancelled before provider process creation.");
     }
-    child = spawn(binary, headlessArgs({ root, promptFile, model, effort, leaderSocket, resumeSessionId, newSessionId, structured, sandboxProfile: isolation.sandboxProfile }), { cwd: root, env: { ...isolation.env, GROK_COMPANION_JOB_MARKER: marker }, shell: false, detached: process.platform !== "win32", stdio });
+    child = spawn(binary, headlessArgs({ root, promptFile, model, effort, leaderSocket, resumeSessionId, newSessionId, structured, sandboxProfile: isolation.sandboxProfile, outputSchema: trustedSchema }), { cwd: root, env: { ...isolation.env, GROK_COMPANION_JOB_MARKER: marker }, shell: false, detached: process.platform !== "win32", stdio });
   } catch (error) {
     closePromptFd();
     throw error;
@@ -4933,26 +5095,52 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
   }
 }
 
+/**
+ * Run a structured review with optional App-specific trusted schema, validator,
+ * and repair prompt. Defaults preserve the generic REVIEW_SCHEMA / validateReview
+ * / DEFAULT_REVIEW_REPAIR_PROMPT contract for existing Worker Protocol consumers.
+ *
+ * @param {object} options
+ * @param {object} [options.outputSchema] Explicit trusted JSON Schema (bounded, serializable).
+ * @param {(value: unknown) => object} [options.validator] Post-parse validator (default validateReview).
+ * @param {string} [options.repairPrompt] Same-session repair prompt (default generic).
+ */
 export async function runStructuredReview(options) {
-  const execute = (values) => values.profile?.transport === "headless" ? runHeadless({ ...values, structured: true }) : runProvider(values);
-  let run = await execute(options), parsed = run.structuredOutput ?? extractJson(run.text);
-  try { return { ...run, review: validateReview(parsed) }; }
+  const {
+    outputSchema = null,
+    validator = null,
+    repairPrompt = null,
+    ...rest
+  } = options && typeof options === "object" ? options : {};
+  const trustedSchema = resolveTrustedOutputSchema(outputSchema);
+  const validate = typeof validator === "function" ? validator : validateReview;
+  const repairText = typeof repairPrompt === "string" && repairPrompt.trim()
+    ? repairPrompt
+    : DEFAULT_REVIEW_REPAIR_PROMPT;
+  const execute = (values) => {
+    const payload = { ...values, outputSchema: trustedSchema };
+    return values.profile?.transport === "headless"
+      ? runHeadless({ ...payload, structured: true })
+      : runProvider(payload);
+  };
+  let run = await execute(rest), parsed = run.structuredOutput ?? extractJson(run.text);
+  try { return { ...run, review: validate(parsed) }; }
   catch (firstError) {
     const repair = await execute({
-      ...options,
+      ...rest,
       resumeSessionId: run.sessionId,
-      prompt: "Your previous response was not valid review JSON. Return only one JSON object with exactly summary and findings. Omit verdict; the runtime derives pass from zero findings and needs_changes from one or more findings. Preserve substantive findings and use repository-relative paths."
+      prompt: repairText
     });
     parsed = repair.structuredOutput ?? extractJson(repair.text);
     try {
-      return { ...repair, review: validateReview(parsed) };
+      return { ...repair, review: validate(parsed) };
     } catch (repairError) {
       const details = {
         ...(repairError?.details && typeof repairError.details === "object" ? repairError.details : {}),
         firstError: firstError?.code || null,
         repairAttempted: true,
         attempts: 2,
-        jobId: options.jobMarker || null
+        jobId: rest.jobMarker || null
       };
       throw new CompanionError(
         repairError?.code || "E_SCHEMA",
