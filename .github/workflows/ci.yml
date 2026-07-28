@@ -153,3 +153,24 @@ jobs:
         env:
           CODEX_E2E_MODEL: ${{ vars.CODEX_E2E_MODEL }}
         run: npm run test:natural-codex
+
+  # Stable public branch-protection check. Always runs so a failed hosted job
+  # still produces this named result. Self-hosted jobs are intentionally out of
+  # scope (skipped on pull requests; not merge gates for fork PRs).
+  ci-required:
+    name: CI required
+    if: always()
+    needs: [pty-ingress, validate-and-test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Require hosted CI job groups
+        run: |
+          echo "pty-ingress: ${{ needs.pty-ingress.result }}"
+          echo "validate-and-test: ${{ needs.validate-and-test.result }}"
+          if [ "${{ needs.pty-ingress.result }}" != "success" ] || \
+             [ "${{ needs.validate-and-test.result }}" != "success" ]; then
+            echo "::error::CI required failed: pty-ingress and validate-and-test must both succeed"
+            exit 1
+          fi
