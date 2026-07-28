@@ -440,6 +440,22 @@ test("Codex manifest, marketplace, public skills, hooks, and wrapper form one in
     assert.match(read(`plugins/grok/skills/${name}/agents/openai.yaml`), /allow_implicit_invocation:\s*false/);
   }
   assert.match(read("plugins/grok/skills/rescue/SKILL.md"), /substitute a different worker unless the active fallback policy permits it/i);
+  // Issue #32: capability-receipt remediation is a skill contract, not a general orchestrator.
+  const rescueSkill = read("plugins/grok/skills/rescue/SKILL.md");
+  assert.match(
+    rescueSkill,
+    /Valid provider capability receipt is missing or invalid; run \$grok:setup before admitting a Codex task\./
+  );
+  assert.match(rescueSkill, /authoritative setup action \*\*at most once\*\*/i);
+  assert.match(rescueSkill, /identical\*\* bounded task launch \*\*exactly once\*\*/i);
+  assert.match(rescueSkill, /surface the setup failure unchanged and \*\*stop\*\*/i);
+  assert.match(rescueSkill, /Do not retry the task/i);
+  assert.match(rescueSkill, /non-receipt `E_CAPABILITY`/i);
+  assert.match(rescueSkill, /eligible for the documented fallback policy/i);
+  assert.match(rescueSkill, /Do \*\*not\*\* auto-setup for arbitrary `E_CAPABILITY`/i);
+  assert.match(rescueSkill, /neither a capability check nor a writability check/i);
+  assert.match(rescueSkill, /no duplicate launch/i);
+  assert.doesNotMatch(rescueSkill, /general orchestration framework/i);
 
   assert.deepEqual(Object.keys(defaultHooks.hooks).sort(), ["SessionStart", "Stop"]);
   assert.deepEqual(Object.keys(claudeHooks.hooks), ["SessionEnd"]);
