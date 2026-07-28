@@ -32,6 +32,7 @@ import {
 } from "./helpers.mjs";
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import { installPinnedFakeCompanion } from "./pinned-fake-grok.mjs";
+import { missingInvalidProviderCapabilityReceiptMessage } from "../plugins/grok/scripts/lib/host.mjs";
 
 /** Provider lifecycle needs process start tokens via `ps`; some sandboxes deny that. */
 const PROVIDER_LIFECYCLE_AVAILABLE = Boolean(processStartToken(process.pid));
@@ -834,6 +835,83 @@ test("Codex control-plane skill contracts describe host authority and explicit j
   assert.match(result, /hostVerification/);
   assert.match(result, /worker report/i);
   assert.match(result, /not_run/);
+});
+
+test("rescue skill remediates only the exact missing capability-receipt admission error", () => {
+  const rescue = fs.readFileSync(path.join(ROOT, "plugins/grok/skills/rescue/SKILL.md"), "utf8");
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  const companion = fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/grok-companion.mjs"), "utf8");
+  const hostLib = fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/host.mjs"), "utf8");
+  const canonicalCodex = missingInvalidProviderCapabilityReceiptMessage({
+    CODEX_THREAD_ID: "codex-thread"
+  });
+  const canonicalClaude = missingInvalidProviderCapabilityReceiptMessage({
+    GROK_COMPANION_CLAUDE_SESSION_ID: "claude-session"
+  });
+
+  // AC-1: single helper source of truth; both emitters use it; skill/docs bind to canonical forms.
+  assert.match(hostLib, /export function missingInvalidProviderCapabilityReceiptMessage/);
+  assert.equal(companion.split("missingInvalidProviderCapabilityReceiptMessage(").length - 1, 2);
+  assert.equal(companion.includes("Valid provider capability receipt is missing or invalid; run"), false);
+  assert.equal(
+    canonicalCodex,
+    "Valid provider capability receipt is missing or invalid; run $grok:setup before admitting a Codex task."
+  );
+  assert.equal(
+    canonicalClaude,
+    "Valid provider capability receipt is missing or invalid; run /grok:setup before admitting a Codex task."
+  );
+  assert.ok(rescue.includes(canonicalCodex));
+  assert.ok(readme.includes(canonicalCodex));
+  assert.match(rescue, /missingInvalidProviderCapabilityReceiptMessage/);
+  assert.match(rescue, /Recoverable exact match only/i);
+  assert.match(rescue, /Do \*\*not\*\* auto-setup for arbitrary `E_CAPABILITY`/i);
+  assert.match(rescue, /unsupported model, effort, platform, executable identity, provider capability drift/i);
+  assert.match(rescue, /sole host-local variable is the setup command token/i);
+
+  // AC-2: setup success → one identical bounded task retry; preserve envelope bounds.
+  assert.match(rescue, /authoritative setup action \*\*at most once\*\*/i);
+  assert.match(rescue, /node <resolved-grok-codex\.mjs> setup/);
+  assert.match(rescue, /Setup success:[\s\S]*?identical\*\* bounded task launch \*\*exactly once\*\*/i);
+  assert.match(rescue, /Preserve the original TaskEnvelope/i);
+  assert.match(
+    rescue,
+    /same user request, objective, scope, mode, freshness facts, model, effort, acceptance criteria/i
+  );
+  assert.match(rescue, /process\/PTY framing, and write profile/i);
+  assert.match(rescue, /Do not start a concurrent second process/i);
+  assert.match(rescue, /do not re-run setup before or after this single retry/i);
+
+  // AC-3: setup failure surfaces unchanged and stops without task retry or fallback concealment.
+  assert.match(
+    rescue,
+    /Setup failure:[\s\S]*?surface the setup failure unchanged and \*\*stop\*\*/i
+  );
+  assert.match(rescue, /Do not retry the task[\s\S]*?do not conceal the failure via worker fallback/i);
+
+  // AC-4: persistent receipt error or any non-receipt E_CAPABILITY stays terminal + fallback-eligible.
+  assert.match(
+    rescue,
+    /Persistent receipt error after that one retry[\s\S]*?any non-receipt `E_CAPABILITY`[\s\S]*?\*\*terminal\*\* and eligible for the documented fallback policy/i
+  );
+  assert.match(rescue, /Do not auto-setup again; do not auto-retry again/i);
+
+  // AC-5 / AC-6 bounds: pre-launch receipt gate; status --readonly is neither capability nor writability.
+  assert.match(rescue, /fail-closed pre-launch provider capability receipt gate/i);
+  assert.match(
+    rescue,
+    /Pure `status --readonly` is neither a capability check nor a writability check/i
+  );
+  assert.match(readme, /pre-launch provider capability receipt gate/i);
+  assert.match(
+    readme,
+    /status --readonly`?\s*is neither a capability check nor a writability check/i
+  );
+  assert.match(readme, /any other `E_CAPABILITY` message/);
+  assert.match(readme, /exact setup-recoverable message only/);
+  assert.match(readme, /\*\*Sole setup-recoverable path:\*\*/i);
+  assert.match(rescue, /One setup, one identical retry, no duplicate launch/i);
+  assert.match(rescue, /E_STORAGE_READONLY/);
 });
 
 test("integration: Codex nonblocking stdin accepts arbitrary markers and records verification", {

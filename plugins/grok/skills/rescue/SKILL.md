@@ -62,7 +62,7 @@ Build one JSON object with exactly these TaskEnvelope v1 input fields:
    node <resolved-grok-codex.mjs> task --background --envelope-stdin --stdin-ready [--write] [--fresh] [--job-id <id>] [--model <id>] [--effort low|medium|high]
    ```
 
-   Codex unified execution does not accept stdin bytes in the process-start call. Launch the command with `tty: true`, a short yield, and no task text in argv. The runtime switches its private PTY input to raw mode, which disables PTY echo, attaches the asynchronous reader, and writes the exact readiness line `GROK_COMPANION_STDIN_READY` to stderr. Retain the returned process session ID and wait for that marker. Then make exactly one `write_stdin` call on that same session whose characters are the compact TaskEnvelope JSON followed by `\n\u0004`. The literal EOT byte terminates the raw PTY frame; do not omit it, send it in a separate call, or send any bytes after it. If the user aborts before a job ID exists, send one literal `\u0003` on that session; the runtime restores the PTY and returns `E_CANCELLED`. Never start a second process to deliver input, interpolate the envelope into shell syntax, expose it through terminal echo, or treat the initial lack of output as failure. `mode: write` must match `--write`; omit `--write` for read mode. If the runtime fails with `E_STORAGE_READONLY` at this step, admission could not durably write job state (before worker/provider launch); fix plugin-data writability and retry—do not treat it as malformed `E_STATE` or a provider failure.
+   Codex unified execution does not accept stdin bytes in the process-start call. Launch the command with `tty: true`, a short yield, and no task text in argv. The runtime switches its private PTY input to raw mode, which disables PTY echo, attaches the asynchronous reader, and writes the exact readiness line `GROK_COMPANION_STDIN_READY` to stderr. Retain the returned process session ID and wait for that marker. Then make exactly one `write_stdin` call on that same session whose characters are the compact TaskEnvelope JSON followed by `\n\u0004`. The literal EOT byte terminates the raw PTY frame; do not omit it, send it in a separate call, or send any bytes after it. If the user aborts before a job ID exists, send one literal `\u0003` on that session; the runtime restores the PTY and returns `E_CANCELLED`. Never start a second process to deliver input, interpolate the envelope into shell syntax, expose it through terminal echo, or treat the initial lack of output as failure. `mode: write` must match `--write`; omit `--write` for read mode. If the runtime fails with `E_STORAGE_READONLY` at this step, admission could not durably write job state (before worker/provider launch); fix plugin-data writability and retry—do not treat it as malformed `E_STATE` or a provider failure. If admission fails with the exact missing/invalid provider capability receipt error, follow [Recoverable setup prerequisite (capability receipt only)](#recoverable-setup-prerequisite-capability-receipt-only)—do not auto-setup for any other `E_CAPABILITY`.
 4. Record the returned job ID immediately. If the host execution tool yields a live process/session handle, retain and continue that exact handle; never discard it or start a duplicate job.
 5. Follow the exact job with default recovery `status <job-id> --wait --timeout-ms <bounded-ms>` or bounded status calls (not `--readonly`). Surface phase, meaningful plan/activity, and heartbeat without exposing private logs or hidden reasoning.
 6. When terminal, call `result <job-id>` and integrate the structured worker report. For continuation, use the explicit parent `--job-id`; never select an implicit latest job for new workflows.
@@ -71,6 +71,30 @@ Build one JSON object with exactly these TaskEnvelope v1 input fields:
 9. Report a synthesized outcome containing every job ID in the logical chain, worker claims, runtime evidence, host verification, unresolved risks/questions, and any exact error code.
 
 Use the companion cancel command for cancellation. Do not widen Grok's profile merely to perform host checks, silently replay a failed task, signal opaque process trees yourself, or substitute a different worker unless the active fallback policy permits it after a concrete failure.
+
+## Recoverable setup prerequisite (capability receipt only)
+
+The runtime keeps a **fail-closed pre-launch provider capability receipt gate** before admitting a Codex task. Pure `status --readonly` is neither a capability check nor a writability check; missing receipts surface only at admission.
+
+**Recoverable exact match only.** Treat admission failure as a recoverable setup prerequisite **only** when the runtime emits `E_CAPABILITY` with the exact canonical message from the host helper `missingInvalidProviderCapabilityReceiptMessage` (parameterized only by `hostCommand("setup")`). On Codex that exact form is:
+
+```text
+Valid provider capability receipt is missing or invalid; run $grok:setup before admitting a Codex task.
+```
+
+The sole host-local variable is the setup command token (`$grok:setup` in this Codex skill; other hosts use their own `hostCommand("setup")` form). The rest of the sentence must match exactly. Do **not** auto-setup for arbitrary `E_CAPABILITY` (unsupported model, effort, platform, executable identity, provider capability drift, isolation/external extensions, or any other non-receipt capability failure).
+
+**One setup, one identical retry, no duplicate launch:**
+
+1. Invoke the authoritative setup action **at most once**:
+
+   ```text
+   node <resolved-grok-codex.mjs> setup
+   ```
+
+2. **Setup failure:** surface the setup failure unchanged and **stop**. Do not retry the task, do not run setup again, and do not conceal the failure via worker fallback.
+3. **Setup success:** retry the **identical** bounded task launch **exactly once**. Preserve the original TaskEnvelope (same user request, objective, scope, mode, freshness facts, model, effort, acceptance criteria, required verification, process/PTY framing, and write profile). Do not start a concurrent second process, do not change argv flags that define mode/model/effort/fresh/job-id, and do not re-run setup before or after this single retry.
+4. **Persistent receipt error after that one retry**, or **any non-receipt `E_CAPABILITY`** at any step: remain **terminal** and eligible for the documented fallback policy. Do not auto-setup again; do not auto-retry again; do not mask the error as success.
 
 ## `record-verification` input contract
 

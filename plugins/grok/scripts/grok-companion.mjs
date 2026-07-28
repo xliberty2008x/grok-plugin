@@ -53,7 +53,7 @@ import {
   unregisterProviderGuard,
   unregisterProviderGuardInWorkspaceTransaction
 } from "./lib/recursion-guard.mjs";
-import { hostCommand, hostContext, jobHostContext, pluginDataRoot, readCodexSessionMetadata, sameHostSession } from "./lib/host.mjs";
+import { hostCommand, hostContext, jobHostContext, missingInvalidProviderCapabilityReceiptMessage, pluginDataRoot, readCodexSessionMetadata, sameHostSession } from "./lib/host.mjs";
 import { codexTranscriptToClaude, createAnonymousTranscript, disposeConvertedTranscript, openTranscriptSource, readTranscriptSnapshot } from "./lib/transcript.mjs";
 import {
   appendLifecycleEvent,
@@ -2453,7 +2453,7 @@ function prepareSharedTaskDispatch(root, job) {
   if (!capabilityReceipt) {
     throw new CompanionError(
       "E_CAPABILITY",
-      `Valid provider capability receipt is missing or invalid; run ${hostCommand("setup")} before admitting a Codex task.`
+      missingInvalidProviderCapabilityReceiptMessage()
     );
   }
   const providerLaunchBinding = assertExecutableProviderLaunchBinding(
@@ -2465,7 +2465,7 @@ function prepareSharedTaskDispatch(root, job) {
   if (providerLaunchBindingDigest !== capabilityReceipt.providerLaunchBindingDigest) {
     throw new CompanionError(
       "E_CAPABILITY",
-      `Valid provider capability receipt is missing or invalid; run ${hostCommand("setup")} before admitting a Codex task.`
+      missingInvalidProviderCapabilityReceiptMessage()
     );
   }
   const providerCapabilityDigest = capabilityReceipt.capabilityDigest;

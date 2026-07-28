@@ -22,6 +22,7 @@ import {
 import {
   CODEX_COMPANION,
   COMPANION,
+  ROOT,
   initRepo,
   runCodexCompanion,
   runCompanion,
@@ -30,7 +31,11 @@ import {
   testEnvironment,
   waitFor
 } from "./helpers.mjs";
-import { pluginDataRoot, writeCodexSessionMetadata } from "../plugins/grok/scripts/lib/host.mjs";
+import {
+  missingInvalidProviderCapabilityReceiptMessage,
+  pluginDataRoot,
+  writeCodexSessionMetadata
+} from "../plugins/grok/scripts/lib/host.mjs";
 
 function parseJson(result) {
   assert.equal(result.status, 0, `command failed\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
@@ -156,6 +161,279 @@ test("a failed setup attempt revokes the previously published provider capabilit
   assert.equal(failed.ready, false);
   assert.equal(failed.grok.error.code, "E_CAPABILITY");
   assert.equal(fs.existsSync(receipt), false);
+});
+
+function codexTaskEnv(baseEnv, pluginData, threadId) {
+  const env = {
+    ...baseEnv,
+    CODEX_THREAD_ID: threadId,
+    GROK_COMPANION_HOST: "codex",
+    GROK_COMPANION_HOST_SESSION_ID: threadId,
+    GROK_COMPANION_PLUGIN_DATA: pluginData
+  };
+  delete env.CLAUDE_PLUGIN_DATA;
+  delete env.GROK_COMPANION_CLAUDE_SESSION_ID;
+  delete env.CLAUDE_SESSION_ID;
+  delete env.CLAUDE_PROJECT_DIR;
+  return env;
+}
+
+function agentStdioCount(logFile) {
+  return readFakeLog(logFile).filter(
+    (entry) => entry.event === "argv"
+      && entry.args.includes("agent")
+      && entry.args.includes("stdio")
+  ).length;
+}
+
+function receiptPathFor(env) {
+  return path.join(pluginDataRoot(env), "capabilities", "provider-capability-v2.json");
+}
+
+function pluginDataForJobs(env) {
+  return env.GROK_COMPANION_PLUGIN_DATA || env.CLAUDE_PLUGIN_DATA;
+}
+
+function canonicalReceiptAdmissionMessage(env = {}) {
+  return missingInvalidProviderCapabilityReceiptMessage({
+    GROK_COMPANION_HOST: "codex",
+    CODEX_THREAD_ID: "codex-receipt-gate",
+    ...env
+  });
+}
+
+test("missingInvalidProviderCapabilityReceiptMessage is hostCommand-parameterized only", () => {
+  assert.equal(
+    missingInvalidProviderCapabilityReceiptMessage({ CODEX_THREAD_ID: "codex-thread" }),
+    "Valid provider capability receipt is missing or invalid; run $grok:setup before admitting a Codex task."
+  );
+  assert.equal(
+    missingInvalidProviderCapabilityReceiptMessage({
+      GROK_COMPANION_CLAUDE_SESSION_ID: "claude-session"
+    }),
+    "Valid provider capability receipt is missing or invalid; run /grok:setup before admitting a Codex task."
+  );
+  assert.equal(
+    missingInvalidProviderCapabilityReceiptMessage({ GROK_COMPANION_HOST: "cli" }),
+    "Valid provider capability receipt is missing or invalid; run /grok:setup before admitting a Codex task."
+  );
+});
+
+test("Codex task admission emits the canonical receipt E_CAPABILITY before durable job or task provider launch", {
+  skip: process.platform === "win32" && "pinned fake-provider setup fixtures require /bin/bash"
+}, (t) => {
+  const canonical = canonicalReceiptAdmissionMessage();
+  const companionSource = fs.readFileSync(
+    path.join(ROOT, "plugins/grok/scripts/grok-companion.mjs"),
+    "utf8"
+  );
+  // Both gate emitter sites must use the single exported helper (no inline duplicates).
+  assert.equal(
+    companionSource.split("missingInvalidProviderCapabilityReceiptMessage(").length - 1,
+    2
+  );
+  assert.equal(
+    companionSource.includes("Valid provider capability receipt is missing or invalid; run"),
+    false
+  );
+
+  // Missing receipt: fail closed before admitJob and before any task provider launch.
+  const missingRoot = initRepo();
+  const missingFixture = fixture({ taskText: taskReport("should not launch") });
+  const missingEnv = codexTaskEnv(
+    missingFixture.env,
+    missingFixture.pluginData,
+    "codex-receipt-missing"
+  );
+  const missingAttempt = runCompanion(
+    ["task", "--wait", "missing receipt gate fixture", "--json"],
+    { cwd: missingRoot, env: missingEnv }
+  );
+  assert.notEqual(missingAttempt.status, 0, missingAttempt.stdout);
+  const missingError = JSON.parse(missingAttempt.stdout).error;
+  assert.equal(missingError.code, "E_CAPABILITY");
+  assert.equal(missingError.message, canonical);
+  assert.deepEqual(persistedJobs(pluginDataForJobs(missingEnv)), []);
+  assert.equal(agentStdioCount(missingFixture.fake.logFile), 0);
+
+  // Tampered receipt after one successful setup: same canonical gate, still no admission/launch.
+  const tamperedRoot = initRepo();
+  const tamperedFixture = fixture({ taskText: taskReport("tampered should not launch") });
+  const tamperedBase = codexTaskEnv(
+    tamperedFixture.env,
+    tamperedFixture.pluginData,
+    "codex-receipt-tampered"
+  );
+  const pinned = installPinnedFakeCompanion(tamperedFixture.fake, tamperedBase);
+  t.after(pinned.cleanup);
+  const setup = parseJson(runCompanion(["setup", "--json"], {
+    cwd: tamperedRoot,
+    env: pinned.env,
+    companionScript: pinned.codexCompanionScript
+  }));
+  assert.equal(setup.ready, true);
+  const setupProviderStarts = agentStdioCount(tamperedFixture.fake.logFile);
+  assert.equal(setupProviderStarts, 1);
+  const receiptFile = receiptPathFor(pinned.env);
+  const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8"));
+  fs.writeFileSync(
+    receiptFile,
+    `${JSON.stringify({ ...receipt, capabilityDigest: "0".repeat(64) }, null, 2)}\n`,
+    { mode: 0o600 }
+  );
+  const tamperedAttempt = runCompanion(
+    ["task", "--wait", "tampered receipt gate fixture", "--json"],
+    {
+      cwd: tamperedRoot,
+      env: pinned.env,
+      companionScript: pinned.codexCompanionScript
+    }
+  );
+  assert.notEqual(tamperedAttempt.status, 0, tamperedAttempt.stdout);
+  const tamperedError = JSON.parse(tamperedAttempt.stdout).error;
+  assert.equal(tamperedError.code, "E_CAPABILITY");
+  assert.equal(tamperedError.message, canonical);
+  assert.deepEqual(persistedJobs(pluginDataForJobs(pinned.env)), []);
+  assert.equal(agentStdioCount(tamperedFixture.fake.logFile), setupProviderStarts);
+});
+
+test("Codex receipt recovery: one setup then identical task retry admits without duplicate launch", {
+  skip: process.platform === "win32" && "pinned fake-provider setup fixtures require /bin/bash"
+}, (t) => {
+  const root = initRepo();
+  const runtime = fixture({ taskText: taskReport("receipt recovery completed") });
+  const baseEnv = codexTaskEnv(runtime.env, runtime.pluginData, "codex-receipt-recovery");
+  const pinned = installPinnedFakeCompanion(runtime.fake, baseEnv);
+  t.after(pinned.cleanup);
+  const canonical = missingInvalidProviderCapabilityReceiptMessage(pinned.env);
+  const taskArgs = ["task", "--wait", "identical receipt recovery fixture", "--json"];
+
+  // First admission fails closed on the exact missing-receipt message.
+  const first = runCompanion(taskArgs, {
+    cwd: root,
+    env: pinned.env,
+    companionScript: pinned.codexCompanionScript
+  });
+  assert.notEqual(first.status, 0, first.stdout);
+  const firstError = JSON.parse(first.stdout).error;
+  assert.equal(firstError.code, "E_CAPABILITY");
+  assert.equal(firstError.message, canonical);
+  assert.deepEqual(persistedJobs(pluginDataForJobs(pinned.env)), []);
+  assert.equal(agentStdioCount(runtime.fake.logFile), 0);
+
+  // Host rescue workflow: exactly one authoritative setup.
+  const setup = parseJson(runCompanion(["setup", "--json"], {
+    cwd: root,
+    env: pinned.env,
+    companionScript: pinned.codexCompanionScript
+  }));
+  assert.equal(setup.ready, true);
+  assert.equal(agentStdioCount(runtime.fake.logFile), 1);
+  assert.equal(fs.existsSync(receiptPathFor(pinned.env)), true);
+
+  // Identical task argv/input retry is admitted once; no duplicate job or task provider launch.
+  const retry = parseJson(runCompanion(taskArgs, {
+    cwd: root,
+    env: pinned.env,
+    companionScript: pinned.codexCompanionScript
+  }));
+  assert.equal(retry.status, "completed");
+  const jobs = persistedJobs(pluginDataForJobs(pinned.env));
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].id, retry.id);
+  assert.equal(agentStdioCount(runtime.fake.logFile), 2);
+});
+
+test("Codex receipt recovery stops on setup failure and keeps non-receipt E_CAPABILITY terminal", {
+  skip: process.platform === "win32" && "pinned fake-provider setup fixtures require /bin/bash"
+}, (t) => {
+  const canonical = canonicalReceiptAdmissionMessage();
+
+  // Setup failure: surface setup error and stop without task retry.
+  const stopRoot = initRepo();
+  const stopFixture = fixture({ taskText: taskReport("must not retry after setup failure") });
+  const stopEnv = codexTaskEnv(stopFixture.env, stopFixture.pluginData, "codex-receipt-setup-fail");
+  const stopPinned = installPinnedFakeCompanion(stopFixture.fake, stopEnv);
+  t.after(stopPinned.cleanup);
+  const blocked = runCompanion(
+    ["task", "--wait", "setup failure stop fixture", "--json"],
+    {
+      cwd: stopRoot,
+      env: stopPinned.env,
+      companionScript: stopPinned.codexCompanionScript
+    }
+  );
+  assert.notEqual(blocked.status, 0);
+  assert.equal(JSON.parse(blocked.stdout).error.message, canonical);
+  assert.deepEqual(persistedJobs(pluginDataForJobs(stopPinned.env)), []);
+
+  const brokenFake = installFakeGrok(tempDir("fake-grok-receipt-setup-fail-"), {
+    helpText: "Usage: grok --sandbox PROFILE\n"
+  });
+  const brokenPinned = installPinnedFakeCompanion(brokenFake, stopPinned.env);
+  t.after(brokenPinned.cleanup);
+  const failedSetup = parseJson(runCompanion(["setup", "--json"], {
+    cwd: stopRoot,
+    env: brokenPinned.env,
+    companionScript: brokenPinned.codexCompanionScript
+  }));
+  assert.equal(failedSetup.ready, false);
+  assert.equal(failedSetup.grok.error.code, "E_CAPABILITY");
+  // Non-receipt capability failure from setup is not the exact receipt prerequisite message.
+  assert.notEqual(failedSetup.grok.error.message, canonical);
+  // Host workflow surfaces setup failure unchanged and stops: no task retry after failed setup.
+  assert.deepEqual(persistedJobs(pluginDataForJobs(brokenPinned.env)), []);
+  assert.equal(fs.existsSync(receiptPathFor(brokenPinned.env)), false);
+
+  // Persistent invalid receipt after one setup + one retry remains terminal (no second setup).
+  const persistentRoot = initRepo();
+  const persistentFixture = fixture({ taskText: taskReport("persistent invalid receipt") });
+  const persistentEnv = codexTaskEnv(
+    persistentFixture.env,
+    persistentFixture.pluginData,
+    "codex-receipt-persistent"
+  );
+  const persistentPinned = installPinnedFakeCompanion(persistentFixture.fake, persistentEnv);
+  t.after(persistentPinned.cleanup);
+  const firstMissing = runCompanion(
+    ["task", "--wait", "persistent receipt fixture", "--json"],
+    {
+      cwd: persistentRoot,
+      env: persistentPinned.env,
+      companionScript: persistentPinned.codexCompanionScript
+    }
+  );
+  assert.equal(JSON.parse(firstMissing.stdout).error.message, canonical);
+  const setupOnce = parseJson(runCompanion(["setup", "--json"], {
+    cwd: persistentRoot,
+    env: persistentPinned.env,
+    companionScript: persistentPinned.codexCompanionScript
+  }));
+  assert.equal(setupOnce.ready, true);
+  const setupStarts = agentStdioCount(persistentFixture.fake.logFile);
+  assert.equal(setupStarts, 1);
+  // Simulate a still-invalid receipt on the single allowed retry.
+  const receiptFile = receiptPathFor(persistentPinned.env);
+  const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8"));
+  fs.writeFileSync(
+    receiptFile,
+    `${JSON.stringify({ ...receipt, capabilityDigest: "a".repeat(64) }, null, 2)}\n`,
+    { mode: 0o600 }
+  );
+  const retry = runCompanion(
+    ["task", "--wait", "persistent receipt fixture", "--json"],
+    {
+      cwd: persistentRoot,
+      env: persistentPinned.env,
+      companionScript: persistentPinned.codexCompanionScript
+    }
+  );
+  assert.notEqual(retry.status, 0);
+  assert.equal(JSON.parse(retry.stdout).error.code, "E_CAPABILITY");
+  assert.equal(JSON.parse(retry.stdout).error.message, canonical);
+  assert.deepEqual(persistedJobs(pluginDataForJobs(persistentPinned.env)), []);
+  // No second setup and no task provider launch after the terminal receipt error.
+  assert.equal(agentStdioCount(persistentFixture.fake.logFile), setupStarts);
 });
 
 function transferFixture(config = {}) {
