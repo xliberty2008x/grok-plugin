@@ -37,6 +37,14 @@ function isUnconditionalRunStep(step, command) {
     && new RegExp(`^\\s{8}run:\\s*${command}\\s*$`, "mu").test(step);
 }
 
+function isShardOneValidationStep(step) {
+  return step?.trimEnd() === [
+    "      - name: Validate release structure",
+    "        if: matrix.shard == 1",
+    "        run: npm run validate"
+  ].join("\n");
+}
+
 export function validateHostedCiWorkflow(source, { shardCount = 3 } = {}) {
   source = source.replace(/\r\n?/gu, "\n");
   const errors = [];
@@ -70,6 +78,7 @@ export function validateHostedCiWorkflow(source, { shardCount = 3 } = {}) {
     errors.push("CI must define the sharded Unix deterministic matrix.");
   } else {
     const matrix = workflowMatrix(unixJob);
+    const validationRun = workflowStep(unixJob, "Validate release structure");
     const deterministicRun = workflowStep(unixJob, "Run deterministic zero-skip shard");
     if (!/runs-on:\s*\$\{\{\s*matrix\.os\s*\}\}/u.test(unixJob)
       || !/timeout-minutes:\s*20\b/u.test(unixJob)
@@ -86,7 +95,7 @@ export function validateHostedCiWorkflow(source, { shardCount = 3 } = {}) {
       ])) {
       errors.push("The Unix deterministic matrix must remain OS x Node x three exact shards with a 20-minute budget and fail-fast disabled.");
     }
-    if (!/name:\s*Validate release structure[\s\S]*?if:\s*matrix\.shard\s*==\s*1[\s\S]*?run:\s*npm run validate/u.test(unixJob)) {
+    if (!isShardOneValidationStep(validationRun)) {
       errors.push("Each Unix OS/Node combination must run structural validation only on shard 1.");
     }
     if (!isUnconditionalRunStep(
@@ -99,6 +108,9 @@ export function validateHostedCiWorkflow(source, { shardCount = 3 } = {}) {
 
   const windowsJob = workflowJob(source, "windows-neutral");
   const windowsMatrix = windowsJob == null ? "" : workflowMatrix(windowsJob);
+  const windowsValidate = windowsJob == null
+    ? null
+    : workflowStep(windowsJob, "Validate release structure");
   const windowsRun = windowsJob == null
     ? null
     : workflowStep(windowsJob, "Run provider-neutral tests (Windows; provider unverified)");
@@ -109,7 +121,7 @@ export function validateHostedCiWorkflow(source, { shardCount = 3 } = {}) {
     || !isExactMatrix(windowsMatrix, [
       /node:\s*\[18\.18\.2,\s*22\.x\]/u
     ])
-    || !/npm run validate/u.test(windowsJob)
+    || !isUnconditionalRunStep(windowsValidate, "npm run validate")
     || !isUnconditionalRunStep(windowsRun, "node --test tests/windows-neutral\\.test\\.mjs")) {
     errors.push("CI must preserve both fail-closed Windows Node validation and provider-neutral lanes.");
   }

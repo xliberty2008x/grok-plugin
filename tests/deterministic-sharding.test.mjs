@@ -165,6 +165,14 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
       "      - name: Run deterministic zero-skip shard\n        if: false"
     ),
     workflow.replace(
+      "        if: matrix.shard == 1",
+      "        if: matrix.shard == 12"
+    ),
+    workflow.replace(
+      "        if: matrix.shard == 1",
+      "        if: matrix.shard == 1 && false"
+    ),
+    workflow.replace(
       "        run: npm run test:deterministic -- --shard=${{ matrix.shard }}/3",
       "        shell: bash {0} || true\n        run: npm run test:deterministic -- --shard=${{ matrix.shard }}/3"
     ),
@@ -175,6 +183,10 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
     workflow.replace(
       "      - name: Run provider-neutral tests (Windows; provider unverified)",
       "      - name: Run provider-neutral tests (Windows; provider unverified)\n        if: false"
+    ),
+    workflow.replace(
+      "      - name: Validate release structure\n        run: npm run validate",
+      "      - name: Validate release structure\n        if: false\n        run: npm run validate"
     ),
     workflow.replace(
       "        run: |\n          if [ \"$PTY_INGRESS_RESULT\"",

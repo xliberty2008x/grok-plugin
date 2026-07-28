@@ -52,6 +52,9 @@ export function main(argv = process.argv.slice(2)) {
   });
   if (manifestErrors.length > 0) {
     process.stderr.write("The deterministic shard manifest does not match the test inventory.\n");
+    for (const message of manifestErrors) {
+      process.stderr.write(`${message}\n`);
+    }
     return 1;
   }
   return runDeterministicTestFiles({
