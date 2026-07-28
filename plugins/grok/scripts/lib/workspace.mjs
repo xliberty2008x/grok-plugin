@@ -1050,6 +1050,6 @@ export function workspaceState(root, env = process.env) {
 }
 
 export function assertSafeJobId(id) {
-  if (!/^(review|adversarial-review|task|stop-review)-[a-f0-9]{16,64}$/.test(String(id))) throw new CompanionError("E_USAGE", "Invalid job ID.");
+  if (!/^(review|adversarial-review|task|stop-review|deep-research)-[a-f0-9]{16,64}$/.test(String(id))) throw new CompanionError("E_USAGE", "Invalid job ID.");
   return id;
 }

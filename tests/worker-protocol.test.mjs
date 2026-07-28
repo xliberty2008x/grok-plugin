@@ -576,6 +576,49 @@ test("untrusted context receipts must cross-bind every public worker identity", 
   }
 });
 
+test("deep-research public result conforms to the exact WorkerResult schema", () => {
+  const workflow = {
+    runId: "run-schema",
+    revision: 4,
+    status: "complete",
+    phases: ["search", "synthesis"],
+    currentPhase: "synthesis",
+    elapsedMs: 1234,
+    agentsUsed: 2,
+    agentBudget: 8,
+    usageIncomplete: false,
+    activeAgents: 0,
+    agentLaunches: 2,
+    pauseMessage: null
+  };
+  const snapshot = projectWorkerSnapshot(job({
+    kind: "deep-research",
+    jobClass: "research",
+    status: "completed",
+    phase: "done",
+    workflow,
+    result: {
+      hostVerification: "not_run",
+      workflow,
+      researchReport: {
+        valid: true,
+        path: "/private/runtime/workflows/run-schema/scratch/report.md",
+        bytes: 64,
+        sha256: "a".repeat(64),
+        sourceCount: 3,
+        coverageNotes: ["WebFetch disabled."],
+        status: "verified",
+        textPreview: "Report preview"
+      }
+    }
+  }));
+  assert.equal(
+    snapshot.result.researchReport.path,
+    "workflows/run-schema/scratch/report.md"
+  );
+  assertConforms("WorkerResult", snapshot.result);
+});
+
 test("untrusted cursor projection suppresses host verification authority", () => {
   for (const claim of [
     "Host verification: passed",

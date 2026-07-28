@@ -383,7 +383,7 @@ if (!versionsOnly) {
     "plugins/grok/skills/grok-result-handling/SKILL.md",
     "plugins/grok/skills/grok-prompting/SKILL.md"
   ];
-  const commandNames = ["setup", "review", "adversarial-review", "rescue", "transfer", "status", "result", "cancel"];
+  const commandNames = ["setup", "review", "adversarial-review", "rescue", "deep-research", "transfer", "status", "result", "cancel"];
   for (const name of commandNames) required.push(`plugins/grok/commands/${name}.md`);
   for (const name of commandNames) required.push(`plugins/grok/skills/${name}/SKILL.md`);
   for (const file of required) requiredFile(file);
@@ -1166,7 +1166,9 @@ if (!versionsOnly) {
     if (text == null) continue;
     if (!hasYamlFrontmatter(text)) problem("Command file must start with YAML frontmatter.", file);
     if (!/^description:\s*\S+/m.test(text)) problem("Command frontmatter must include a description.", file);
-    if (!/modified|adapted/i.test(text) || !/openai\/codex-plugin-cc/i.test(text)) {
+    // deep-research is a first-class Grok-native surface, not an openai/codex-plugin-cc adaptation.
+    if (name !== "deep-research"
+      && (!/modified|adapted/i.test(text) || !/openai\/codex-plugin-cc/i.test(text))) {
       problem("Adapted command must carry a prominent modification notice naming openai/codex-plugin-cc.", file);
     }
   }

@@ -76,6 +76,7 @@ Use Grok Companion when you want either host to:
 - Run **read-only, schema-validated** reviews of working-tree or branch changes.
 - Run an **adversarial** design challenge against the same Git evidence.
 - **Delegate investigation or implementation** to an isolated Grok ACP session (foreground or background).
+- Run **first-class Grok `/deep-research`** (background + public-web defaults, optional read-only workspace snapshot).
 - **Resume**, **status-check**, **fetch results for**, or **cancel** companion jobs.
 - **Import** the current host transcript into a resumable Grok session (Claude as-is; Codex privacy-filtered).
 - Optionally gate host stop with a **stop-time review** (disabled by default).
@@ -97,6 +98,7 @@ Claude Code  /grok:*  ──┐
 Codex        $grok:*  ──┘                              │
                                                        ├── headless explore (reviews)
                                                        ├── ACP v1 stdio (rescue tasks)
+                                                       ├── ACP v1 stdio (deep-research workflow)
                                                        └── grok import (transfer)
 SessionStart / Stop hooks ─────────────────────────────┘
 Claude SessionEnd (cleanup) ───────────────────────────┘
@@ -331,6 +333,7 @@ Claude uses **slash commands**. Codex uses **skills** with the `$grok:` namespac
 | `/grok:review` | `$grok:review` | Read-only defect-oriented review | `[--wait\|--background] [--base <ref>] [--scope auto\|working-tree\|branch]` |
 | `/grok:adversarial-review` | `$grok:adversarial-review` | Read-only design challenge | `[--wait\|--background] [--base <ref>] [--scope auto\|working-tree\|branch] [focus ...]` |
 | `/grok:rescue` | `$grok:rescue` | Native-like persistent worker workflow | `[--job-id <prior-id>\|--fresh] [--model <id>] [--effort low\|medium\|high] [task ...]` |
+| `/grok:deep-research` | `$grok:deep-research` | First-class Grok `/deep-research` (public web by default) | `[--wait\|--background] [--web-only\|--workspace] [--model <id>] [--effort low\|medium\|high]` + private query stdin |
 | `/grok:transfer` | `$grok:transfer` | Import host transcript into Grok | `[--source <jsonl>] [--model <id>] [--effort low\|medium\|high]` |
 | `/grok:status` | `$grok:status` | List or wait on jobs; pure preflight with `--readonly` | `[job-id] [--wait] [--timeout-ms <ms>] [--all] [--readonly] [--json]` |
 | `/grok:result` | `$grok:result` | Full stored result for a finished job | `[job-id]` |
@@ -354,11 +357,32 @@ Claude uses **slash commands**. Codex uses **skills** with the `$grok:` namespac
 
 Internal helper skills (`grok-cli-runtime`, `grok-prompting`, `grok-result-handling`) support the host control plane and are not user workflows.
 
+### Deep-research data and verification boundaries
+
+- Defaults are **background** and **web-only** (empty private cwd, public web only). Explicit `--workspace` mounts a temporary **tracked-files-only read-only snapshot**; untracked/ignored files, symlinks, and `.git`/`.grok`/`.agents`/`.claude`/`.cursor`/`.codex` are excluded. The real checkout is never mutated.
+- Query text is private stdin only (max 32 KiB, no NUL). It is not placed on argv.
+- Capability gating happens **after** session creation from session-scoped command advertisement (`available_commands_update` or `x.ai/commands/list`) plus workflow capability; missing `/deep-research` fails `E_CAPABILITY` and never sends the slash.
+- Upstream prompt text is exactly `/deep-research <query>` (companion wrapper flags are not forwarded).
+- Progress is workflow-bound under the bound ACP session (`sessions/<percent-encoded-provider-cwd>/<session-id>/workflows/<run-id>/...`); session/prompt completion is launch acknowledgement only.
+- `--background` returns after a detached owned research worker is recorded; `--wait` emits bounded phase changes while polling the durable job.
+- Report status `verified` or `partial` is **provider-side only**. Companion `hostVerification` remains `not_run`. There is no automatic resume/replay after pause, budget limits, failure, interruption, timeout, or crash.
+- WebFetch requires independent `allow_local=false` attestation. It is disabled in the current profile, with explicit reduced coverage, because that proof is not yet available. Unexpected ACP permission requests fail closed (`E_SECURITY_PROFILE`).
+- Deep-research is **not** arbitrary Grok plugin execution and does not use TaskEnvelope, mailbox, report repair, or rescue resume.
+- Runtime support is capability-gated rather than version-gated. The local stable Grok 0.2.112 probe used during this implementation did not advertise `deep-research` or `workflow` in an isolated ACP session, so the real completion/cancellation/crash verticals remain unqualified on that build even though deterministic and fake-ACP lifecycle tests pass.
+
 ---
 
 ## Common workflows
 
 Examples below use Claude syntax. On Codex, switch the prefix to `$grok:` and keep the same arguments (for example `$grok:review --wait`).
+
+### Background public-web deep research
+
+```text
+/grok:deep-research
+```
+
+Supply the query through the skill/command private-stdin contract. Defaults are background + web-only. Optional flags: `--wait`, `--workspace`, `--model`, `--effort`.
 
 ### Foreground review
 

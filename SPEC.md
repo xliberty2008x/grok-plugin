@@ -38,15 +38,17 @@ Behavioral parity does not require identical provider internals. Headless Grok r
   - `/grok:review`
   - `/grok:adversarial-review`
   - `/grok:rescue`
+  - `/grok:deep-research`
   - `/grok:transfer`
   - `/grok:status`
   - `/grok:result`
   - `/grok:cancel`
 - A `grok:grok-rescue` Claude subagent acting as a control-plane adapter.
-- Eight equivalent Codex skills named `$grok:setup`, `$grok:review`, `$grok:adversarial-review`, `$grok:rescue`, `$grok:transfer`, `$grok:status`, `$grok:result`, and `$grok:cancel`.
+- Nine equivalent Codex skills named `$grok:setup`, `$grok:review`, `$grok:adversarial-review`, `$grok:rescue`, `$grok:deep-research`, `$grok:transfer`, `$grok:status`, `$grok:result`, and `$grok:cancel`.
 - Grok Build execution through the local `grok` binary.
 - Headless `grok --agent explore` execution for normal, adversarial, and stop reviews.
 - ACP v1 over `grok agent stdio` for resumable rescue tasks.
+- First-class built-in `/deep-research` dispatch over a dedicated persistent ACP runner and `deep-research-v1` profile (not arbitrary plugin execution).
 - TaskEnvelope v1, ContextManifest v1, schema-3 jobs, and profile contract v3.
 - Persistent job metadata, public JSON projection, logs, results, progress, heartbeat, and Grok session IDs.
 - Shared `SessionStart` and optional `Stop` hooks, plus a Claude-only `SessionEnd` hook.
@@ -63,6 +65,8 @@ Behavioral parity does not require identical provider internals. Headless Grok r
 - Automatic fallback to Claude when Grok fails.
 - Native Grok review behavior unless xAI publishes and supports such an API.
 - A shared long-lived Grok broker in v0.3.
+- Arbitrary Grok plugin invocation through the companion (deep-research is the only first-class built-in workflow surface in v1).
+- Automatic silent deep-research routing, write-capable research, or automatic resume/replay after provider failure.
 - Provider-enforced macOS child-network isolation (Grok does not enforce it; the plugin documents the gap).
 - Pre-mutation prevention of every write-scope violation inside a broker-bound, official-provider-managed execution worktree; scope is detected after mutation, while the control checkout remains unchanged until explicit host integration.
 - Claiming the July 13, 2026 macOS matrix qualifies this hardened worktree.
@@ -169,6 +173,20 @@ A shared Grok process MUST NOT be used in v0.3 because Grok sandbox selection is
 | Stop review | custom profile extending `strict` | Headless; no repository tools or edits | Disabled | Disabled | Headless `todo_write` only for schema scaffolding |
 | Read-only rescue (`rescue-read-v3`) | `strict` (plus isolated custom extend of `strict`) | Isolated per-lineage ACP home; `dontAsk` | Disabled | Disabled | `GrokBuild:read_file`, `list_dir`, `grep` only |
 | Write rescue (`rescue-write-v3`) | `strict` (plus isolated custom extend of `strict`) | Isolated per-lineage ACP home; `acceptEdits`; unattended edits inside sandbox | Disabled | Disabled | `GrokBuild:read_file`, `list_dir`, `grep`, `search_replace`, `todo_write` only |
+| Deep-research (`deep-research-v1`) | `strict` (plus isolated custom extend with public network) | Isolated research home; `dontAsk`; web-only empty private cwd | Enabled (public) | Built-in only (max 4 active / 8 launches) | `GrokBuild:web_search` and `GrokBuild:task` plus its monitoring/cancellation dependencies (no repository reads); `WebFetch` remains denied until `allow_local=false` is independently attested |
+| Deep-research workspace (`deep-research-workspace-v1`) | `strict` (plus isolated custom extend with public network) | Isolated research home; `dontAsk`; temporary tracked RO snapshot cwd | Enabled (public) | Built-in only (max 4 active / 8 launches) | Above plus `GrokBuild:read_file`/`list_dir`/`grep` against the snapshot only |
+
+Deep-research MUST require live session advertisement of the exact
+`deep-research` command and the workflow-management capability before sending
+slash text. Its feature receipt MUST bind the provider executable digest,
+provider version, checked-in profile digest, and advertised commands. Reports
+MUST be read only from
+`sessions/<percent-encoded-provider-cwd>/<session-id>/workflows/<run-id>/scratch/report.md`
+inside the isolated home and persisted as `researchReport.schemaVersion = 1`
+with provider status `verified|partial`, full Markdown, byte count, SHA-256,
+source count, coverage notes, and `hostVerification = not_run`.
+`verified` MUST come from an explicit field on the bound provider workflow
+update; report prose is untrusted data and MUST NOT manufacture that status.
 
 Write rescue MUST NOT expose terminal, background-task, kill-task, get-task-output, web, MCP, image, memory, planning, scheduling, or user-interaction tools. Command execution and authoritative verification are host-owned. The write profile MUST deny Bash at process start.
 
@@ -721,7 +739,7 @@ New jobs MUST use schema version 3. The persisted record SHALL include:
     "processGroupId": "integer or null"
   },
   "profile": {
-    "id": "review-v1 | adversarial-review-v1 | stop-review-v1 | rescue-read-v3 | rescue-write-v3 | rescue-report-v3",
+    "id": "review-v1 | adversarial-review-v1 | stop-review-v1 | rescue-read-v3 | rescue-write-v3 | rescue-report-v3 | deep-research-v1",
     "contractVersion": 3,
     "agentProfileDigest": "SHA-256 hex for an ACP profile, otherwise null",
     "transport": "acp | headless",

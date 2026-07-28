@@ -5,7 +5,7 @@
  */
 
 import assert from "node:assert/strict";
-import { generateKeyPairSync } from "node:crypto";
+import { generateKeyPairSync, webcrypto } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -60,6 +60,8 @@ import worker, {
 import { bytesToHex as toHex } from "../apps/grok-review-app/src/crypto-util.mjs";
 import { signReceipt } from "../apps/grok-review-app/src/actions/receipt.mjs";
 import { RECEIPT_SCHEMA_VERSION } from "../apps/grok-review-app/src/receipt-contract.mjs";
+
+if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP_ROOT = path.join(ROOT, "apps", "grok-review-app");
@@ -465,6 +467,15 @@ test("migration, wrangler, and README match hardened contracts", () => {
   const wrangler = fs.readFileSync(WRANGLER_PATH, "utf8");
   assert.match(wrangler, /workers_dev = true/);
   assert.match(wrangler, /database_id = "00000000-0000-0000-0000-000000000000"/);
+  for (const variable of [
+    "CONTROL_REPO_OWNER",
+    "CONTROL_REPO_NAME",
+    "CONTROL_WORKFLOW_FILE",
+    "CONTROL_REF",
+    "GITHUB_APP_ID"
+  ]) {
+    assert.match(wrangler, new RegExp(`^${variable} = ""$`, "m"));
+  }
   assert.match(wrangler, /\/github\/webhooks/);
 
   const readme = fs.readFileSync(README_PATH, "utf8");

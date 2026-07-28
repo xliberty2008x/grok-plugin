@@ -21,7 +21,7 @@
     },
     "workerId": {
       "type": "string",
-      "pattern": "^(review|adversarial-review|task|stop-review)-[a-f0-9]{16,64}$"
+      "pattern": "^(review|adversarial-review|task|stop-review|deep-research)-[a-f0-9]{16,64}$"
     },
     "publicErrorCode": {
       "type": "string",
@@ -47,6 +47,7 @@
         "E_PROTOCOL",
         "E_PROVIDER_EXIT",
         "E_RECURSION",
+        "E_RESEARCH_PAUSED",
         "E_REVIEW_MUTATED_WORKSPACE",
         "E_REVIEW_TOO_LARGE",
         "E_ROLE",
@@ -57,6 +58,7 @@
         "E_TIMEOUT",
         "E_USAGE",
         "E_WORKER_LOST",
+        "E_WORKFLOW_INCOMPLETE",
         "E_WORKTREE",
         "E_BROKER"
       ]
@@ -494,6 +496,43 @@
         "externalWorkerLabel": { "type": ["string", "null"], "maxLength": 64 }
       }
     },
+    "researchReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "valid", "bytes", "sourceCount", "coverageNotes", "status", "hostVerification"],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "valid": { "type": "boolean" },
+        "path": { "type": ["string", "null"], "maxLength": 1024 },
+        "bytes": { "type": "integer", "minimum": 0, "maximum": 524288 },
+        "sha256": { "type": ["string", "null"], "maxLength": 256 },
+        "sourceCount": { "type": "integer", "minimum": 0 },
+        "coverageNotes": { "type": "array", "maxItems": 16, "items": { "type": "string", "maxLength": 500 } },
+        "status": { "type": "string", "enum": ["verified", "partial"] },
+        "hostVerification": { "type": "string", "const": "not_run" },
+        "textPreview": { "type": ["string", "null"], "maxLength": 500 },
+        "markdown": { "type": ["string", "null"], "maxLength": 524288 }
+      }
+    },
+    "researchWorkflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "revision", "status", "phases", "usageIncomplete"],
+      "properties": {
+        "runId": { "type": ["string", "null"], "maxLength": 256 },
+        "revision": { "type": ["integer", "null"] },
+        "status": { "type": ["string", "null"], "maxLength": 80 },
+        "phases": { "type": "array", "maxItems": 64 },
+        "currentPhase": { "type": ["string", "null"], "maxLength": 240 },
+        "elapsedMs": { "type": ["integer", "null"], "minimum": 0 },
+        "agentsUsed": { "type": ["integer", "null"], "minimum": 0 },
+        "agentBudget": { "type": ["integer", "null"], "minimum": 0 },
+        "usageIncomplete": { "type": "boolean" },
+        "activeAgents": { "type": ["integer", "null"], "minimum": 0 },
+        "agentLaunches": { "type": ["integer", "null"], "minimum": 0 },
+        "pauseMessage": { "type": ["string", "null"], "maxLength": 1000 }
+      }
+    },
     "WorkerResult": {
       "type": "object",
       "additionalProperties": false,
@@ -507,6 +546,8 @@
         "providerClaims": { "$ref": "#/$defs/providerClaims" },
         "runtimeEvidence": { "$ref": "#/$defs/runtimeEvidence" },
         "verification": { "$ref": "#/$defs/verification" },
+        "researchReport": { "$ref": "#/$defs/researchReport" },
+        "workflow": { "$ref": "#/$defs/researchWorkflow" },
         "textBytes": { "type": "integer", "minimum": 0 },
         "textDigest": { "type": "string", "maxLength": 256 },
         "textTruncated": { "type": "boolean" },

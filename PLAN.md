@@ -10,11 +10,11 @@ Worker Broker roadmap and evidence ledger: [WORKER_BROKER_PLAN.md](WORKER_BROKER
 
 ## 1. Objective
 
-Harden and qualify `grok-plugin` as a dual-host Claude Code and Codex marketplace plugin that exposes the official Grok Build CLI as a companion coding agent. The implemented target is user-visible parity with [`openai/codex-plugin-cc` v1.0.6](https://github.com/openai/codex-plugin-cc/tree/db52e28f4d9ded852ab3942cea316258ae4ef346), while using Grok-supported runtime interfaces and a host control plane for rescue.
+Harden and qualify `grok-plugin` as a dual-host Claude Code and Codex marketplace plugin that exposes the official Grok Build CLI as a companion coding agent. The implemented target is user-visible parity with [`openai/codex-plugin-cc` v1.0.6](https://github.com/openai/codex-plugin-cc/tree/db52e28f4d9ded852ab3942cea316258ae4ef346), while using Grok-supported runtime interfaces and a host control plane for rescue. The package also exposes first-class built-in `/deep-research` dispatch without changing rescue or Worker Broker trust boundaries.
 
 Parity means:
 
-- The same eight command families, arguments, foreground/background modes, and output discipline.
+- The same eight command families, arguments, foreground/background modes, and output discipline, plus first-class deep-research.
 - Equivalent review, adversarial review, rescue, transcript transfer, resume, status, result, cancellation, session cleanup, and stop-gate behavior.
 - Equivalent read-only and write-capable safety boundaries under strict sandboxing.
 - Equivalent failure transparency: neither host may silently substitute its own work when Grok fails.
@@ -57,6 +57,20 @@ Parity means:
 - Issue #25 reached `operational_e2e_complete` on exact source `e89272f` and evidence head `ef2dd03` with official Grok Build 0.2.112. The recorded verticals cover completion, active cancellation/restart, simultaneous isolated writers with drift rejection, strict receipt replay, cleanup/absence, and a natural installed-Codex job (`task-3d5e7911248df005be9eb092`) with passed host verification.
 - Deterministic tests support but do not replace those real lifecycle observations. The qualification is scoped to the recorded macOS/Codex Worker Broker path.
 - The dual-host branch remains an **unqualified hardening candidate**, not a release-ready build, until independent Claude Code and remaining platform release gates pass.
+
+### Deep-research v1 (implemented)
+
+- Surfaces: Codex `$grok:deep-research`, Claude `/grok:deep-research`.
+- Defaults: `--background` and `--web-only`; optional explicit `--workspace` read-only tracked snapshot.
+- Private query stdin (32 KiB, no NUL) is staged in a digest-bound one-use mode-0600 file rather than the job registry; dedicated persistent ACP process; session/prompt is launch acknowledgement only.
+- Capability gate requires live `/deep-research` command advertisement and workflow tool (`E_CAPABILITY` otherwise).
+- Binds one unseen deep-research workflow run with monotonic revisions; cancellation sends `/workflow stop <exact-run-id>` and waits for settled cleanup.
+- Upstream slash text is exactly `/deep-research <query>` (wrapper flags stay in the companion); capability is session-scoped after `session/new`.
+- Report validation for `sessions/<percent-encoded-provider-cwd>/<session-id>/workflows/<run-id>/scratch/report.md` (regular UTF-8 file ≤512 KiB, path containment, SHA-256); provider report status `verified|partial` only; `hostVerification` remains `not_run`.
+- `--background` uses the detached launcher/worker pattern; workspace mode permits read tools against the RO snapshot only.
+- WebFetch is denied until `allow_local=false` is independently attested; the report records reduced coverage.
+- No TaskEnvelope/mailbox/report-repair/rescue-resume/record-verification path; no Worker Broker spawn mutation; no arbitrary plugin runner.
+- Deterministic and fake-ACP lifecycles are implemented. Live qualification is still blocked on the current local stable Grok 0.2.112 build because its isolated session does not advertise `deep-research` or `workflow`; the runtime correctly returns `E_CAPABILITY` before sending slash text.
 
 ### Residual limitations (document honestly)
 

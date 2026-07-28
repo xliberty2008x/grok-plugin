@@ -32,6 +32,17 @@ import {
 } from "./lib/grok-provider.mjs";
 import { profileFor, sameSecurityProfile } from "./lib/profiles.mjs";
 import {
+  applyResearchPrivacy,
+  cleanupResearchRuntimeArtifacts,
+  consumeDeepResearchQuery,
+  DEEP_RESEARCH_KIND,
+  parseDeepResearchOptions,
+  parseDeepResearchQuery,
+  publicResearchReport,
+  runDeepResearch,
+  stageDeepResearchQuery
+} from "./lib/deep-research.mjs";
+import {
   clearProviderCapabilityReceipt,
   readValidProviderCapabilityReceipt,
   writeProviderCapabilityReceipt
@@ -123,7 +134,7 @@ const PLUGIN_ROOT = path.resolve(path.dirname(SCRIPT), "..");
 const VALID_EFFORTS = new Set(["low", "medium", "high"]);
 
 function usage() {
-  return ["Usage:", "  grok-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]", "  grok-companion.mjs review|adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]", "  grok-companion.mjs task [--wait|--background] [--write] [--resume|--fresh] [--job-id <id>] [--model <id>] [--effort low|medium|high] [--envelope-stdin [--stdin-ready] | --envelope-file <private-path> | -- <task>]", "  grok-companion.mjs transfer [--source <claude-or-codex-jsonl>] [--model <id>] [--effort low|medium|high] [--json]", "  grok-companion.mjs status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--readonly] [--json]", "  grok-companion.mjs result [job-id] [--json]", "  grok-companion.mjs cancel [job-id] [--json]"].join("\n");
+  return ["Usage:", "  grok-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]", "  grok-companion.mjs review|adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]", "  grok-companion.mjs task [--wait|--background] [--write] [--resume|--fresh] [--job-id <id>] [--model <id>] [--effort low|medium|high] [--envelope-stdin [--stdin-ready] | --envelope-file <private-path> | -- <task>]", "  grok-companion.mjs deep-research [--wait|--background] [--web-only|--workspace] [--model <id>] [--effort low|medium|high] [--query-stdin [--stdin-ready]] [--json]", "  grok-companion.mjs transfer [--source <claude-or-codex-jsonl>] [--model <id>] [--effort low|medium|high] [--json]", "  grok-companion.mjs status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--readonly] [--json]", "  grok-companion.mjs result [job-id] [--json]", "  grok-companion.mjs cancel [job-id] [--json]"].join("\n");
 }
 
 function stdinReadySignal(enabled) {
@@ -229,6 +240,21 @@ function publicJob(job, options = {}) {
   return projectWorkerSnapshot(job, options);
 }
 function publicJson(value, options = {}) { return Array.isArray(value) ? value.map((job) => publicJob(job, options)) : publicJob(value, options); }
+function researchResultJson(job) {
+  const projected = publicJob(job);
+  const markdown = job?.result?.researchReport?.markdown || job?.result?.researchReport?.text || null;
+  if (job?.jobClass !== "research" || typeof markdown !== "string") return projected;
+  return {
+    ...projected,
+    result: {
+      ...(projected.result || {}),
+      researchReport: {
+        ...(projected.result?.researchReport || {}),
+        markdown
+      }
+    }
+  };
+}
 function assertHostJobAccess(job, operation) {
   const host = currentHost();
   const recorded = jobHostContext(job);
@@ -572,6 +598,44 @@ async function recoverActiveJobs(root) {
       return current;
     });
   }
+  // Terminal research records: research-only privacy/cleanup (never TaskEnvelope).
+  for (const job of listJobs(root).filter((candidate) => (
+    !dispatchV1(candidate)
+    && terminal(candidate)
+    && candidate.jobClass === "research"
+    && candidate.result?.researchRuntimeCleaned !== true
+  ))) {
+    withWorkspaceAdmission(root, () => {
+      const currentJob = readJob(root, job.id);
+      if (!terminal(currentJob) || currentJob.result?.researchRuntimeCleaned === true) return;
+      const { identity: providerIdentity } = resolveProviderCleanupTarget(root, currentJob);
+      const identities = [providerIdentity, currentJob.workerProcess].filter(Boolean);
+      let cleanup = cleanupResearchRuntimeArtifacts(stateDir(root), currentJob.id, identities);
+      if (!cleanup.ok) {
+        updateJob(root, currentJob.id, (current) => {
+          current.pendingTerminal ||= {
+            status: current.status,
+            phase: current.phase,
+            completedAt: current.completedAt,
+            error: current.error || null,
+            summary: current.summary || null
+          };
+          current.status = "running";
+          current.phase = "cleanup-blocked";
+          current.completedAt = null;
+          current.progress = "Deep-research finished; runtime cleanup is still pending";
+          current.result = applyResearchPrivacy(current.result, cleanup);
+          return current;
+        });
+        return;
+      }
+      cleanup = includeGuardCleanup(root, currentJob.id, cleanup, { inWorkspaceTransaction: true });
+      updateJob(root, currentJob.id, (current) => {
+        current.result = applyResearchPrivacy(current.result, cleanup);
+        return current;
+      });
+    });
+  }
   // Re-clean terminal task records produced by older runtimes or a cleanup
   // failure after provider exit. If either recorded group still lives, move the
   // record back to cleanup-blocked so the active recovery path can terminate it.
@@ -634,6 +698,7 @@ async function recoverActiveJobs(root) {
     let cleanupError = null;
     let providerIdentity = null;
     let taskCleanup = null;
+    let researchCleanup = null;
     try {
       providerIdentity = await terminateProviderCleanupTarget(root, job);
       if (cleanupBlocked) await terminateVerified(job.workerProcess, job.id, "worker");
@@ -651,6 +716,19 @@ async function recoverActiveJobs(root) {
         });
       }
     }
+    if (!cleanupError && job.jobClass === "research") {
+      researchCleanup = cleanupResearchRuntimeArtifacts(
+        stateDir(root),
+        job.id,
+        [providerIdentity, job.workerProcess].filter(Boolean)
+      );
+      researchCleanup = includeGuardCleanup(root, job.id, researchCleanup);
+      if (!researchCleanup.ok) {
+        cleanupError = new CompanionError("E_STATE", "Deep-research provider exited, but transient runtime cleanup is incomplete.", {
+          privacyWarning: researchCleanup.warning
+        });
+      }
+    }
     if (cleanupError) {
       updateJob(root, job.id, (current) => {
         if (terminal(current)) return current;
@@ -661,6 +739,12 @@ async function recoverActiveJobs(root) {
         current.heartbeatAt = now();
         if (current.jobClass === "review") {
           current.result = applyReviewPrivacy(current.result, null, "Isolated review home retained because process cleanup could not be verified.");
+        } else if (current.jobClass === "research") {
+          current.result = applyResearchPrivacy(
+            current.result,
+            researchCleanup,
+            researchCleanup?.warning || "Research runtime artifacts retained because process cleanup could not be verified."
+          );
         } else {
           current.result = applyTaskPrivacy(
             current.result,
@@ -679,7 +763,10 @@ async function recoverActiveJobs(root) {
       : job.pendingTerminal?.status === "cancelled"
         ? "cancelled"
         : "failed";
-    const evidence = captureTerminalEvidence(root, job, pendingExecutionStatus);
+    // Research jobs never use TaskEnvelope evidence paths.
+    const evidence = job.jobClass === "research"
+      ? { postContext: null, runtimeEvidence: null }
+      : captureTerminalEvidence(root, job, pendingExecutionStatus);
     updateJob(root, job.id, (current) => {
       // The worker can finish between the liveness check above and this locked
       // update. Never turn that freshly completed record into E_WORKER_LOST.
@@ -696,25 +783,46 @@ async function recoverActiveJobs(root) {
         current.error = pending.error || null;
         if (pending.summary) current.summary = pending.summary;
       } else {
-        current.error = { code: "E_WORKER_LOST", message: "The background worker disappeared; the prompt was not replayed." };
+        current.error = {
+          code: current.jobClass === "research"
+            ? "E_WORKFLOW_INCOMPLETE"
+            : "E_WORKER_LOST",
+          message: current.jobClass === "research"
+            ? "The deep-research workflow was interrupted when its worker disappeared; it was not replayed."
+            : "The background worker disappeared; the prompt was not replayed."
+        };
+        if (current.jobClass === "research") {
+          current.workflow = {
+            ...(current.workflow || {}),
+            status: "interrupted"
+          };
+        }
       }
       if (current.error?.message) current.summary = current.error.message;
-      current.completionContextManifest = evidence.postContext;
+      if (current.jobClass !== "research") {
+        current.completionContextManifest = evidence.postContext;
+      }
       current.result = {
         ...(current.result || {}),
         hostVerification: current.result?.hostVerification || "not_run",
-        runtimeEvidence: evidence.runtimeEvidence
+        ...(evidence.runtimeEvidence ? { runtimeEvidence: evidence.runtimeEvidence } : {}),
+        replay: false,
+        resume: false
       };
       if (cleanup) {
         current.result = applyReviewPrivacy(current.result, cleanup);
       } else if (current.jobClass === "task") {
         current.result = applyTaskPrivacy(current.result, taskCleanup || { ok: true });
+      } else if (current.jobClass === "research") {
+        current.result = applyResearchPrivacy(current.result, researchCleanup || { ok: true });
       }
       delete current.pendingTerminal;
       current.lifecycleEvents = appendLifecycleEvent(
         current.lifecycleEvents,
         current.error ? "blocked" : "checkpoint",
-        current.error?.message || "Task runtime cleanup completed"
+        current.error?.message || (current.jobClass === "research"
+          ? "Deep-research runtime cleanup completed"
+          : "Task runtime cleanup completed")
       );
       return current;
     });
@@ -734,7 +842,7 @@ function baseRecord({ id, kind, root, profile, title, request, write, model, eff
     schemaVersion: 3,
     id,
     kind,
-    jobClass: kind.includes("review") ? "review" : "task",
+    jobClass: kind === "deep-research" ? "research" : kind.includes("review") ? "review" : "task",
     title,
     summary: "Queued",
     write,
@@ -803,7 +911,7 @@ function renderReview(job) {
   return lines.join("\n");
 }
 
-function renderJob(job) {
+function renderJob(job, { includeResearchReport = false } = {}) {
   const lines = [
     `Job: ${job.id}`,
     `Kind: ${job.kind}`,
@@ -816,10 +924,10 @@ function renderJob(job) {
   if (job.createdAt) lines.push(`Created: ${job.createdAt}`);
   if (job.updatedAt) lines.push(`Updated: ${job.updatedAt}`);
   if (job.grokSessionId) {
-    lines.push(
-      `Grok session: ${job.grokSessionId}`,
-      `Resume through this host: ${hostCommand("rescue", `--resume --job-id ${job.id} <next task>`)}`
-    );
+    lines.push(`Grok session: ${job.grokSessionId}`);
+    if (job.jobClass !== "research") {
+      lines.push(`Resume through this host: ${hostCommand("rescue", `--resume --job-id ${job.id} <next task>`)}`);
+    }
   }
   if (job.result?.workerReport) {
     const report = job.result.workerReport;
@@ -839,6 +947,24 @@ function renderJob(job) {
     if (job.result.hostVerification) lines.push(`Host verification: ${job.result.hostVerification}`);
     if (job.result.runtimeEvidence?.observedChangedPaths?.length) {
       lines.push(`Runtime-observed paths: ${job.result.runtimeEvidence.observedChangedPaths.join(", ")}`);
+    }
+  } else if (job.jobClass === "research" && job.result?.researchReport) {
+    const report = job.result.researchReport;
+    lines.push(
+      `Workflow: ${job.result.workflow?.runId || "-"} (${job.result.workflow?.status || "-"})`,
+      `Report status: ${report.status || report.assessment || "partial"}`,
+      `Sources: ${report.sourceCount ?? 0}`,
+      `Host verification: ${job.result.hostVerification || "not_run"}`
+    );
+    if (report.coverageNotes?.length) {
+      lines.push("Coverage notes:", ...report.coverageNotes.map((item) => `- ${item}`));
+    }
+    if (includeResearchReport && (report.markdown || report.text)) {
+      lines.push(
+        "",
+        "[Untrusted provider research report]",
+        sanitizeDisplayText(report.markdown || report.text).slice(0, 512 * 1024)
+      );
     }
   } else if (job.result?.text) {
     lines.push("", job.result.text);
@@ -2891,6 +3017,416 @@ async function handleTask(raw) {
   );
 }
 
+async function handleDeepResearch(raw) {
+  // Deep-research is a dedicated branch: no TaskEnvelope, mailbox, report repair,
+  // rescue resume, or record-verification. Query arrives on private stdin only.
+  const { options, positionals } = parseArgs(raw, {
+    values: ["model", "effort", "cwd"],
+    booleans: ["wait", "background", "web-only", "workspace", "json", "query-stdin", "stdin-ready"]
+  });
+  if (positionals.length) {
+    throw new CompanionError(
+      "E_USAGE",
+      "Deep-research query must be supplied on private stdin via --query-stdin; positional query text is refused."
+    );
+  }
+  if (!options["query-stdin"]) {
+    throw new CompanionError("E_USAGE", "Deep-research requires --query-stdin for private query ingress.");
+  }
+  if (options["stdin-ready"] && !options["query-stdin"]) {
+    throw new CompanionError("E_USAGE", "--stdin-ready requires --query-stdin.");
+  }
+  const researchOptions = parseDeepResearchOptions({
+    wait: options.wait,
+    background: options.background,
+    "web-only": options["web-only"],
+    workspace: options.workspace,
+    model: options.model,
+    effort: options.effort
+  });
+  if (options.model || options.effort) validateModelEffort(options);
+  const query = parseDeepResearchQuery(await readBoundedStdin({
+    limitBytes: 32 * 1024,
+    label: "Deep-research query",
+    onReady: stdinReadySignal(options["stdin-ready"])
+  }));
+  const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd());
+  const profile = researchOptions.workspace
+    ? profileFor("deep-research-workspace")
+    : profileFor("deep-research");
+  const id = generateId(DEEP_RESEARCH_KIND);
+  const stagedQuery = stageDeepResearchQuery(stateDir(root), id, query);
+  const job = baseRecord({
+    id,
+    kind: DEEP_RESEARCH_KIND,
+    root,
+    profile,
+    title: "Deep-research query",
+    request: {
+      queryDigest: stagedQuery.digest,
+      queryBytes: stagedQuery.bytes,
+      researchOptions: {
+        background: researchOptions.background,
+        webOnly: researchOptions.webOnly,
+        workspace: researchOptions.workspace
+      },
+      publicObjective: null
+    },
+    write: false,
+    model: researchOptions.model || options.model || null,
+    effort: researchOptions.effort || options.effort || null,
+    lifecycleEvents: appendLifecycleEvent([], "task.accepted", "Deep-research accepted", {
+      mode: researchOptions.workspace ? "workspace" : "web-only"
+    })
+  });
+  job.progress = "Deep-research accepted";
+  job.summary = "Deep-research accepted";
+  job.workflow = null;
+  let finished;
+  try {
+    finished = await startDeepResearchJob(root, job, researchOptions.background, {
+      announce: researchOptions.wait && !options.json
+    });
+  } catch (error) {
+    cleanupResearchRuntimeArtifacts(stateDir(root), id, []);
+    throw error;
+  }
+  out(
+    options.json
+      ? (researchOptions.background ? publicJson(finished) : researchResultJson(finished))
+      : researchOptions.background
+        ? `Grok deep-research started in the background.\nJob: ${id}\nPhase: ${finished.phase}\nProgress: ${finished.progress || "Deep-research accepted"}\nCheck: ${hostCommand("status", id)}`
+        : renderJob(finished, { includeResearchReport: true }),
+    options.json
+  );
+}
+
+async function startDeepResearchJob(root, job, background, { announce = false } = {}) {
+  const nonce = crypto.randomBytes(16).toString("hex");
+  job.workerAuthorization = nonce;
+  admitJob(root, job);
+  let diagnostic = "";
+  let launcher = null;
+  let launcherCode = -1;
+  try {
+    // Detached launcher pattern: launcher records an owned child and exits;
+    // --wait polls the durable job, --background returns immediately.
+    launcher = spawn(process.execPath, [SCRIPT, "--launch-deep-research", job.id, "--cwd", root], {
+      cwd: root,
+      shell: false,
+      stdio: ["ignore", "ignore", "pipe"],
+      env: workerEnvironment(nonce)
+    });
+    launcher.stderr?.setEncoding("utf8");
+    launcher.stderr?.on("data", (chunk) => { diagnostic = `${diagnostic}${chunk}`.slice(-8192); });
+    launcherCode = await new Promise((resolve) => {
+      launcher.once("error", (error) => { diagnostic = sanitizeDisplayText(error.message); resolve(-1); });
+      launcher.once("close", resolve);
+    });
+  } catch (error) {
+    diagnostic = sanitizeDisplayText(error.message);
+  }
+  if (launcherCode !== 0) {
+    const cleanup = cleanupResearchRuntimeArtifacts(stateDir(root), job.id, []);
+    updateJob(root, job.id, (current) => {
+      const intendedTerminal = {
+        status: "failed",
+        phase: "failed",
+        completedAt: now(),
+        error: {
+          code: "E_WORKER_LOST",
+          message: redactText(diagnostic) || "Could not launch the isolated deep-research worker."
+        }
+      };
+      if (cleanup.ok) {
+        current.status = intendedTerminal.status;
+        current.phase = intendedTerminal.phase;
+        current.completedAt = intendedTerminal.completedAt;
+      } else {
+        current.pendingTerminal = {
+          ...intendedTerminal,
+          summary: intendedTerminal.error.message
+        };
+        current.status = "running";
+        current.phase = "cleanup-blocked";
+        current.completedAt = null;
+      }
+      current.error = intendedTerminal.error;
+      current.summary = current.error.message;
+      current.progress = cleanup.ok
+        ? current.summary
+        : "Deep-research launch failed; private query cleanup is pending";
+      current.result = applyResearchPrivacy({
+        hostVerification: "not_run",
+        workflow: null,
+        researchReport: null,
+        replay: false,
+        resume: false
+      }, cleanup);
+      current.lifecycleEvents = appendLifecycleEvent(current.lifecycleEvents, "blocked", current.error.message);
+      return current;
+    });
+  }
+  if (background) return readJob(root, job.id);
+  let finished = readJob(root, job.id);
+  let lastRecovery = 0;
+  let lastProgressSignature = null;
+  while (!terminal(finished)) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (Date.now() - lastRecovery >= 500) {
+      lastRecovery = Date.now();
+      await recoverActiveJobs(root);
+    }
+    finished = readJob(root, job.id);
+    if (announce) {
+      const signature = JSON.stringify([
+        finished.phase,
+        finished.workflow?.revision ?? null,
+        finished.workflow?.status ?? null,
+        finished.workflow?.currentPhase ?? null
+      ]);
+      if (signature !== lastProgressSignature) {
+        lastProgressSignature = signature;
+        const phase = finished.workflow?.currentPhase
+          || finished.workflow?.status
+          || finished.phase
+          || "running";
+        const agents = Number.isSafeInteger(finished.workflow?.activeAgents)
+          ? `; active agents ${finished.workflow.activeAgents}`
+          : "";
+        process.stderr.write(`Deep-research: ${sanitizeDisplayText(String(phase)).slice(0, 160)}${agents}\n`);
+      }
+    }
+  }
+  if (finished.status === "failed" || finished.status === "cancelled") {
+    throw new CompanionError(
+      finished.error?.code || "E_PROVIDER_EXIT",
+      finished.error?.message || diagnostic || "Deep-research job failed.",
+      finished.error?.details
+    );
+  }
+  return finished;
+}
+
+async function executeDeepResearch(root, id) {
+  const workerNonce = process.env.GROK_COMPANION_WORKER_NONCE;
+  let job = updateJob(root, id, (current) => {
+    if (terminal(current)) return current;
+    current.status = "running";
+    current.phase = "starting";
+    current.startedAt = current.startedAt || now();
+    current.workerProcess = {
+      pid: process.pid,
+      startToken: processStartToken(process.pid),
+      nonce: workerNonce || current.workerAuthorization || null,
+      processGroupId: process.platform === "win32" ? null : process.pid,
+      commandMarker: id
+    };
+    current.progress = "Deep-research provider starting";
+    current.lifecycleEvents = appendLifecycleEvent(
+      current.lifecycleEvents,
+      "checkpoint",
+      "Deep-research provider starting"
+    );
+    return touchJob(current);
+  });
+  if (terminal(job)) return;
+  let query = null;
+  const heartbeatTimer = setInterval(() => {
+    try {
+      updateJob(root, id, (current) => (terminal(current) ? current : touchJob(current)));
+    } catch { /* best effort */ }
+  }, 1000);
+  heartbeatTimer.unref?.();
+  try {
+    query = consumeDeepResearchQuery(
+      stateDir(root),
+      id,
+      job.request?.queryDigest
+    );
+    if (isCancelRequested(root, id, workerNonce)) {
+      throw new CompanionError("E_CANCELLED", "Deep-research was cancelled before provider execution.");
+    }
+    const result = await runDeepResearch({
+      root,
+      profile: job.profile,
+      query,
+      options: job.request?.researchOptions || {},
+      stateDir: stateDir(root),
+      jobMarker: id,
+      model: job.model,
+      effort: job.effort,
+      cancelRequested: () => isCancelRequested(root, id, workerNonce),
+      onEvent: (event) => {
+        try {
+          if (event?.type === "workflow") {
+            updateJob(root, id, (current) => {
+              if (terminal(current)) return current;
+              current.workflow = {
+                runId: event.runId || null,
+                revision: event.revision ?? null,
+                status: event.status || null,
+                phases: event.phases || [],
+                currentPhase: event.currentPhase ?? null,
+                elapsedMs: event.elapsedMs ?? 0,
+                agentsUsed: event.agentsUsed ?? 0,
+                agentBudget: event.agentBudget ?? null,
+                usageIncomplete: Boolean(event.usageIncomplete),
+                activeAgents: event.activeAgents ?? null,
+                agentLaunches: event.agentLaunches ?? null,
+                pauseMessage: event.pauseMessage ?? null
+              };
+              current.progress = `Workflow ${event.status || "running"}${event.runId ? ` (${event.runId})` : ""}`.slice(0, 160);
+              current.phase = "researching";
+              return touchJob(current);
+            });
+          } else if (event?.type === "launch-ack") {
+            updateJob(root, id, (current) => {
+              if (terminal(current)) return current;
+              current.grokSessionId = event.sessionId || current.grokSessionId;
+              current.progress = "Deep-research launch acknowledged; waiting for workflow";
+              current.phase = "launched";
+              current.lifecycleEvents = appendLifecycleEvent(
+                current.lifecycleEvents,
+                "checkpoint",
+                "Deep-research launch acknowledged"
+              );
+              return touchJob(current);
+            });
+          } else if (event?.type === "session") {
+            updateJob(root, id, (current) => {
+              if (terminal(current)) return current;
+              current.grokSessionId = event.sessionId || current.grokSessionId;
+              return touchJob(current);
+            });
+          } else if (event?.type === "provider" && event.process) {
+            updateJob(root, id, (current) => {
+              if (terminal(current)) return current;
+              current.providerProcess = event.process;
+              return touchJob(current);
+            });
+          }
+        } catch { /* progress updates are best effort */ }
+      }
+    });
+    const researchReport = result.researchReport
+      ? {
+          ...result.researchReport,
+          textPreview: publicResearchReport(result.researchReport)?.textPreview || null
+        }
+      : null;
+    const providerIdentity = result.provider?.process || null;
+    const cleanup = cleanupResearchRuntimeArtifacts(
+      stateDir(root),
+      id,
+      [providerIdentity].filter(Boolean)
+    );
+    if (!cleanup.ok) {
+      throw new CompanionError(
+        "E_STATE",
+        cleanup.warning || "Deep-research cleanup could not be verified."
+      );
+    }
+    // Commit terminal success only after provider exit and private-home cleanup.
+    updateJob(root, id, (current) => {
+      current.status = "completed";
+      current.phase = "done";
+      current.completedAt = now();
+      current.grokSessionId = result.sessionId || current.grokSessionId;
+      current.workflow = result.workflow || current.workflow;
+      current.summary = `Deep-research completed (${researchReport?.status || researchReport?.assessment || "verified"})`;
+      current.progress = current.summary;
+      current.result = applyResearchPrivacy({
+        hostVerification: "not_run",
+        capabilityReceipt: result.capabilityReceipt || null,
+        workflow: result.workflow || null,
+        researchReport: researchReport
+          ? {
+              schemaVersion: 1,
+              valid: researchReport.valid,
+              runId: researchReport.runId,
+              path: researchReport.path,
+              bytes: researchReport.bytes,
+              sha256: researchReport.sha256,
+              sourceCount: researchReport.sourceCount,
+              coverageNotes: researchReport.coverageNotes,
+              status: researchReport.status || researchReport.assessment || "partial",
+              hostVerification: "not_run",
+              markdown: researchReport.markdown || researchReport.text,
+              textPreview: researchReport.textPreview
+            }
+          : null,
+        workspaceSnapshot: result.workspaceSnapshot || null,
+        webFetchAttestation: result.webFetchAttestation || null,
+        stopReason: result.stopReason || "workflow_complete"
+      }, cleanup);
+      current.lifecycleEvents = appendLifecycleEvent(
+        current.lifecycleEvents,
+        "checkpoint",
+        current.summary
+      );
+      return touchJob(current);
+    });
+  } catch (error) {
+    const payload = redact(asErrorPayload(error));
+    const status = payload.code === "E_CANCELLED" ? "cancelled" : "failed";
+    let failureCleanup = null;
+    try {
+      const latest = readJob(root, id);
+      failureCleanup = cleanupResearchRuntimeArtifacts(
+        stateDir(root),
+        id,
+        [latest.providerProcess].filter(Boolean)
+      );
+    } catch (cleanupError) {
+      failureCleanup = { ok: false, warning: cleanupError?.message || String(cleanupError) };
+    }
+    updateJob(root, id, (current) => {
+      const intendedTerminal = {
+        status,
+        phase: status,
+        completedAt: now(),
+        error: payload,
+        summary: payload.message
+      };
+      if (!failureCleanup?.ok) {
+        current.pendingTerminal = intendedTerminal;
+        current.status = "running";
+        current.phase = "cleanup-blocked";
+        current.completedAt = null;
+      } else {
+        current.status = status;
+        current.phase = status;
+        current.completedAt = intendedTerminal.completedAt;
+        delete current.pendingTerminal;
+      }
+      current.error = payload;
+      current.summary = payload.message;
+      current.progress = failureCleanup?.ok
+        ? payload.message
+        : "Deep-research finished; runtime cleanup is still pending";
+      current.workflow = error?.details?.workflow || current.workflow || null;
+      current.result = applyResearchPrivacy({
+        hostVerification: "not_run",
+        workflow: current.workflow,
+        researchReport: error?.details?.researchReport
+          ? publicResearchReport(error.details.researchReport)
+          : null,
+        replay: false,
+        resume: false
+      }, failureCleanup);
+      current.lifecycleEvents = appendLifecycleEvent(
+        current.lifecycleEvents,
+        "blocked",
+        payload.message
+      );
+      return touchJob(current);
+    });
+  } finally {
+    clearInterval(heartbeatTimer);
+  }
+}
+
 async function handleStatus(raw) {
   const { options, positionals } = parseArgs(argvFrom(raw), {
     values: ["timeout-ms", "cwd"],
@@ -2965,7 +3501,14 @@ async function handleStatus(raw) {
 async function handleResult(raw) {
   const { options, positionals } = parseArgs(argvFrom(raw), { values: ["cwd"], booleans: ["json"] }); const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd()); await recoverActiveJobs(root); const job = assertHostJobAccess(selectJob(root, { id: positionals[0], host: currentHost(), finished: !positionals[0] }), "result");
   if (!terminal(job)) throw new CompanionError("E_JOB_ACTIVE", `Job ${job.id} is still ${job.status}; run ${hostCommand("status", `${job.id} --wait`)}.`);
-  out(options.json ? publicJson(job) : job.jobClass === "review" ? renderReview(job) : renderJob(job), options.json);
+  out(
+    options.json
+      ? (job.jobClass === "research" ? researchResultJson(job) : publicJson(job))
+      : job.jobClass === "review"
+        ? renderReview(job)
+        : renderJob(job, { includeResearchReport: job.jobClass === "research" }),
+    options.json
+  );
 }
 
 async function handleCancel(raw) {
@@ -3034,6 +3577,8 @@ async function handleCancel(raw) {
         value.progress = "Cancellation requested; process cleanup is still pending";
         if (value.jobClass === "review") {
           value.result = applyReviewPrivacy(value.result, null, "Isolated review home retained because force-cancel process cleanup could not be verified.");
+        } else if (value.jobClass === "research") {
+          value.result = applyResearchPrivacy(value.result, null, "Research runtime artifacts retained because force-cancel process cleanup could not be verified.");
         } else {
           value.result = applyTaskPrivacy(value.result, null, "Task runtime artifacts retained because force-cancel process cleanup could not be verified.");
         }
@@ -3062,18 +3607,58 @@ async function handleCancel(raw) {
       });
       throw new CompanionError("E_STATE", "Task was stopped, but transient runtime cleanup is incomplete.", { privacyWarning: taskCleanup.warning });
     }
+    let researchCleanup = current.jobClass === "research"
+      ? cleanupResearchRuntimeArtifacts(
+        stateDir(root),
+        current.id,
+        [providerIdentity, current.workerProcess].filter(Boolean)
+      )
+      : null;
+    if (researchCleanup) researchCleanup = includeGuardCleanup(root, current.id, researchCleanup);
+    if (researchCleanup && !researchCleanup.ok) {
+      updateJob(root, current.id, (value) => {
+        value.pendingTerminal = forcedTerminal;
+        value.status = "running";
+        value.phase = "cleanup-blocked";
+        value.completedAt = null;
+        value.error = {
+          code: "E_STATE",
+          message: "Deep-research was stopped, but transient runtime cleanup is incomplete.",
+          details: { privacyWarning: researchCleanup.warning }
+        };
+        value.summary = value.error.message;
+        value.result = applyResearchPrivacy(value.result, researchCleanup);
+        return value;
+      });
+      throw new CompanionError(
+        "E_STATE",
+        "Deep-research was stopped, but transient runtime cleanup is incomplete.",
+        { privacyWarning: researchCleanup.warning }
+      );
+    }
     let cleanup = current.jobClass === "review" ? cleanupReviewEnvironment(stateDir(root), current.id) : null;
     if (cleanup) cleanup = includeGuardCleanup(root, current.id, cleanup);
-    const evidence = captureTerminalEvidence(root, current, "cancelled");
+    const evidence = current.jobClass === "research"
+      ? { postContext: null, runtimeEvidence: null }
+      : captureTerminalEvidence(root, current, "cancelled");
     current = updateJob(root, current.id, (value) => {
       value.status = "cancelled"; value.phase = "cancelled"; value.completedAt = now(); value.error = { code: "E_CANCELLED", message: "Grok job was force-cancelled after the graceful timeout." }; value.summary = value.error.message;
       Object.assign(value, scrubStoredJob(value));
-      value.completionContextManifest = evidence.postContext;
-      value.result = { ...(value.result || {}), hostVerification: value.result?.hostVerification || "not_run", runtimeEvidence: evidence.runtimeEvidence };
+      if (value.jobClass !== "research") {
+        value.completionContextManifest = evidence.postContext;
+      }
+      value.result = {
+        ...(value.result || {}),
+        hostVerification: value.result?.hostVerification || "not_run",
+        ...(evidence.runtimeEvidence ? { runtimeEvidence: evidence.runtimeEvidence } : {}),
+        replay: false,
+        resume: false
+      };
       value.lifecycleEvents = appendLifecycleEvent(value.lifecycleEvents, "blocked", value.error.message);
       // Additive/clearing privacy: success clears a stale warning; failure appends without erasing prior evidence.
       if (cleanup) value.result = applyReviewPrivacy(value.result, cleanup);
       if (taskCleanup) value.result = applyTaskPrivacy(value.result, taskCleanup);
+      if (researchCleanup) value.result = applyResearchPrivacy(value.result, researchCleanup);
       return value;
     });
   }
@@ -3362,10 +3947,13 @@ async function handleTransfer(raw) {
 
 async function main() {
   const [command, ...raw] = process.argv.slice(2);
-  const internal = command === "--launch-worker" || command === "--worker";
+  const internal = command === "--launch-worker"
+    || command === "--worker"
+    || command === "--launch-deep-research"
+    || command === "--deep-research-worker";
   const grokEnvironment = process.env.GROK_COMPANION_CHILD === "1" || process.env.GROK_COMPANION_JOB_MARKER || process.env.GROK_AGENT || process.env.GROK_LEADER_SOCKET;
   let guardedWorkspace = false;
-  if (!internal && ["setup", "review", "adversarial-review", "task", "transfer"].includes(command)) {
+  if (!internal && ["setup", "review", "adversarial-review", "task", "deep-research", "transfer"].includes(command)) {
     const invocationArgs = command === "task" ? raw : argvFrom(raw);
     const cwdIndex = invocationArgs.indexOf("--cwd");
     const candidates = [process.cwd(), cwdIndex >= 0 && invocationArgs[cwdIndex + 1]].filter(Boolean);
@@ -3878,9 +4466,142 @@ async function main() {
     }
     return;
   }
+  if (command === "--launch-deep-research") {
+    const id = raw[0];
+    const cwdFlag = raw[1];
+    const cwd = raw[2];
+    if (raw.length !== 3 || cwdFlag !== "--cwd") {
+      throw new CompanionError("E_USAGE", "Invalid deep-research launcher invocation.");
+    }
+    const root = workspaceRoot(cwd);
+    const nonce = process.env.GROK_COMPANION_WORKER_NONCE;
+    const record = readJob(root, id);
+    if (record.kind !== DEEP_RESEARCH_KIND || record.jobClass !== "research") {
+      throw new CompanionError("E_USAGE", "Deep-research launcher requires a deep-research job.");
+    }
+    if (!nonce || record.workerAuthorization !== nonce) {
+      throw new CompanionError("E_RECURSION", "Unauthenticated deep-research worker invocation refused.");
+    }
+    if (terminal(record)) return;
+    if (isCancelRequested(root, id, nonce)) {
+      const cleanup = cleanupResearchRuntimeArtifacts(stateDir(root), id, []);
+      updateJob(root, id, (current) => {
+        if (terminal(current)) return current;
+        current.workerAuthorization = null;
+        const intendedTerminal = {
+          status: "cancelled",
+          phase: "cancelled",
+          completedAt: now(),
+          error: {
+            code: "E_CANCELLED",
+            message: "Deep-research was cancelled before worker launch."
+          }
+        };
+        if (cleanup.ok) {
+          current.status = intendedTerminal.status;
+          current.phase = intendedTerminal.phase;
+          current.completedAt = intendedTerminal.completedAt;
+        } else {
+          current.pendingTerminal = {
+            ...intendedTerminal,
+            summary: intendedTerminal.error.message
+          };
+          current.status = "running";
+          current.phase = "cleanup-blocked";
+          current.completedAt = null;
+        }
+        current.error = intendedTerminal.error;
+        current.summary = current.error.message;
+        current.progress = cleanup.ok
+          ? current.summary
+          : "Deep-research cancellation accepted; private query cleanup is pending";
+        current.result = applyResearchPrivacy({
+          hostVerification: "not_run",
+          workflow: null,
+          researchReport: null,
+          replay: false,
+          resume: false
+        }, cleanup);
+        current.lifecycleEvents = appendLifecycleEvent(current.lifecycleEvents, "blocked", current.error.message);
+        return current;
+      });
+      return;
+    }
+    // Spawn a detached research worker, record owned identity, then exit so
+    // --background returns immediately while wait mode polls durable state.
+    const child = spawn(
+      process.execPath,
+      [SCRIPT, "--deep-research-worker", id, "--cwd", root],
+      {
+        cwd: root,
+        detached: true,
+        shell: false,
+        stdio: "ignore",
+        env: workerEnvironment(nonce)
+      }
+    );
+    const identity = await captureSpawnIdentity(child);
+    updateJob(root, id, (current) => {
+      if (terminal(current)) return current;
+      current.workerAuthorization = null;
+      current.workerProcess = { ...identity, nonce, commandMarker: id };
+      current.status = "running";
+      current.phase = "starting";
+      current.startedAt = current.startedAt || now();
+      current.summary = "Deep-research worker started";
+      current.progress = current.summary;
+      return touchJob(current);
+    });
+    child.unref();
+    return;
+  }
+  if (command === "--deep-research-worker") {
+    const id = raw[0];
+    const cwdFlag = raw[1];
+    const cwd = raw[2];
+    if (raw.length !== 3 || cwdFlag !== "--cwd") {
+      throw new CompanionError("E_USAGE", "Invalid deep-research worker invocation.");
+    }
+    const root = workspaceRoot(cwd);
+    const nonce = process.env.GROK_COMPANION_WORKER_NONCE;
+    let authorized = false;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const record = readJob(root, id);
+      if (terminal(record)) return;
+      if (record.kind !== DEEP_RESEARCH_KIND || record.jobClass !== "research") {
+        throw new CompanionError("E_USAGE", "Deep-research worker requires a deep-research job.");
+      }
+      const identity = record.workerProcess;
+      const ownStartToken = processStartToken(process.pid);
+      if (
+        nonce
+        && identity?.nonce === nonce
+        && identity?.pid === process.pid
+        && identity?.startToken === ownStartToken
+        && identity?.commandMarker === id
+      ) {
+        authorized = true;
+        break;
+      }
+      // First registration window: launcher may still be recording identity.
+      if (nonce && (record.workerAuthorization === nonce || identity?.nonce === nonce)) {
+        if (!identity?.pid || identity.pid === process.pid) {
+          authorized = true;
+          break;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (!authorized) {
+      throw new CompanionError("E_RECURSION", "Unauthenticated deep-research worker invocation refused.");
+    }
+    await executeDeepResearch(root, id);
+    return;
+  }
   if (command === "setup") return handleSetup(raw);
   if (["review", "adversarial-review"].includes(command)) return handleReview(command, raw);
   if (command === "task") return handleTask(raw);
+  if (command === "deep-research") return handleDeepResearch(raw);
   if (command === "task-resume-candidate") {
     const { options } = parseArgs(argvFrom(raw), { values: ["cwd"], booleans: ["write", "json"] });
     const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd());

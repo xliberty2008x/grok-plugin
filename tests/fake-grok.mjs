@@ -108,10 +108,21 @@ function capabilities(config) {
   return {
     protocolVersion: config.protocolVersion ?? 1,
     agentCapabilities: {
-      loadSession: config.loadSession ?? true
+      loadSession: config.loadSession ?? true,
+      ...(config.deepResearch || config.workflowCapability
+        ? {
+            workflow: true,
+            tools: config.workflowTools ?? [{ name: "workflow" }]
+          }
+        : {})
     },
     authMethods: config.authMethods ?? [{ id: "local", name: "Local test auth" }],
-    _meta: { modelState: { availableModels: models } }
+    _meta: {
+      modelState: { availableModels: models },
+      ...(config.deepResearch || config.workflowCapability
+        ? { workflow: true }
+        : {})
+    }
   };
 }
 
@@ -119,6 +130,7 @@ async function serveAcp(binary, config) {
   process.stdin.setEncoding("utf8");
   let buffer = "";
   let currentSession = null;
+  let currentCwd = null;
   let heldPrompt = null;
 
   const handle = (message) => {
@@ -156,17 +168,47 @@ async function serveAcp(binary, config) {
 
     if (message.method === "session/new") {
       currentSession = config.sessionId ?? "fake-session-00000001";
+      currentCwd = message.params?.cwd || process.cwd();
       const response = {
         jsonrpc: "2.0",
         id: message.id,
         result: { sessionId: currentSession, models: {} }
       };
+      const emitSessionReady = () => {
+        send(response);
+        // Session-scoped command advertisement for deep-research capability gate.
+        if (config.deepResearch || config.availableCommandsUpdate) {
+          const commands = config.availableCommands
+            ?? [
+              { name: "/deep-research", description: "Built-in deep research" },
+              { name: "/workflow", description: "Built-in workflow management" }
+            ];
+          update(currentSession, {
+            sessionUpdate: "available_commands_update",
+            availableCommands: commands
+          });
+        }
+      };
       if (Number.isSafeInteger(config.sessionResponseDelayMs)
         && config.sessionResponseDelayMs > 0) {
-        setTimeout(() => send(response), config.sessionResponseDelayMs);
+        setTimeout(emitSessionReady, config.sessionResponseDelayMs);
       } else {
-        send(response);
+        emitSessionReady();
       }
+      return;
+    }
+
+    if (message.method === "x.ai/commands/list") {
+      const commands = config.availableCommands
+        ?? [
+          { name: "/deep-research", description: "Built-in deep research" },
+          { name: "/workflow", description: "Built-in workflow management" }
+        ];
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { availableCommands: commands, sessionId: message.params?.sessionId || currentSession }
+      });
       return;
     }
 
@@ -196,6 +238,138 @@ async function serveAcp(binary, config) {
         : config.promptError;
       if (promptError) {
         send({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: promptError } });
+        return;
+      }
+
+      // First-class deep-research: launch ack is non-terminal; workflow updates decide.
+      if (config.deepResearch && /^\/deep-research\b/.test(prompt.trim())) {
+        const runId = config.deepResearchRunId || "run-fake-deep-research-1";
+        const objective = prompt.trim().slice("/deep-research".length).trim();
+        appendLog(config, { event: "deep-research-launch", prompt, runId, sessionId: currentSession });
+        // Launch acknowledgement only.
+        send({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: { stopReason: "end_turn" }
+        });
+        const reportBody = config.deepResearchReport
+          || "# Deep research\n\nSources: https://example.com/a\nCoverage complete.\n";
+        const writeReport = () => {
+          const grokHome = process.env.GROK_HOME;
+          if (!grokHome || !currentSession) return;
+          const reportPath = path.join(
+            grokHome,
+            "sessions",
+            encodeURIComponent(fs.realpathSync(path.resolve(currentCwd || process.cwd()))),
+            currentSession,
+            "workflows",
+            runId,
+            "scratch",
+            "report.md"
+          );
+          fs.mkdirSync(path.dirname(reportPath), { recursive: true, mode: 0o700 });
+          fs.writeFileSync(reportPath, reportBody, { mode: 0o600 });
+        };
+        const emitWorkflow = (revision, status, activeAgents = 0) => {
+          send({
+            jsonrpc: "2.0",
+            method: "x.ai/session_notification",
+            params: {
+              sessionId: currentSession,
+              workflow_updated: {
+                kind: "deep-research",
+                name: "deep-research",
+                objective,
+                runId,
+                revision,
+                status,
+                activeAgents,
+                agentLaunches: Math.min(revision, 2),
+                ...(config.deepResearchReportStatus
+                  ? { reportStatus: config.deepResearchReportStatus }
+                  : {})
+              }
+            }
+          });
+        };
+        setTimeout(() => {
+          emitWorkflow(1, "running", 1);
+          if (config.deepResearchNoiseUpdates) {
+            emitWorkflow(0, "complete", 0);
+            send({
+              jsonrpc: "2.0",
+              method: "x.ai/session_notification",
+              params: {
+                sessionId: currentSession,
+                workflow_updated: {
+                  kind: "deep-research",
+                  runId: `${runId}-foreign`,
+                  revision: 99,
+                  status: "complete",
+                  activeAgents: 99,
+                  agentLaunches: 99
+                }
+              }
+            });
+          }
+          if (config.deepResearchCancelWait) return;
+          if (config.deepResearchNeverComplete) return;
+          setTimeout(() => {
+            const terminalStatus = config.deepResearchTerminalStatus || "complete";
+            if ((terminalStatus === "complete" || terminalStatus === "completed")
+              && !config.deepResearchOmitReport) {
+              writeReport();
+            }
+            emitWorkflow(2, terminalStatus, Number(config.deepResearchTerminalActiveAgents) || 0);
+          }, Number(config.deepResearchCompleteDelayMs) || 30);
+        }, Number(config.deepResearchStartDelayMs) || 10);
+        return;
+      }
+
+      if (config.deepResearch && /^\/workflow stop\b/.test(prompt.trim())) {
+        const runId = prompt.trim().slice("/workflow stop".length).trim()
+          || config.deepResearchRunId
+          || "run-fake-deep-research-1";
+        appendLog(config, { event: "deep-research-stop", runId, sessionId: currentSession });
+        send({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: { stopReason: "end_turn" }
+        });
+        setTimeout(() => {
+          send({
+            jsonrpc: "2.0",
+            method: "x.ai/session_notification",
+            params: {
+              sessionId: currentSession,
+              workflow_updated: {
+                kind: "deep-research",
+                runId,
+                revision: 98,
+                status: "cancelled",
+                activeAgents: 1,
+                agentLaunches: 1
+              }
+            }
+          });
+          setTimeout(() => {
+            send({
+              jsonrpc: "2.0",
+              method: "x.ai/session_notification",
+              params: {
+                sessionId: currentSession,
+                workflow_updated: {
+                  kind: "deep-research",
+                  runId,
+                  revision: 99,
+                  status: "cancelled",
+                  activeAgents: 0,
+                  agentLaunches: 1
+                }
+              }
+            });
+          }, Number(config.deepResearchCancelSettleDelayMs) || 20);
+        }, Number(config.deepResearchCancelDelayMs) || 20);
         return;
       }
 

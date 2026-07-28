@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grok Deep Research"
+  short_description: "Run first-class Grok /deep-research (background + public web by default)"
+  default_prompt: "Use $grok:deep-research to research this topic on the public web."
+policy:
+  allow_implicit_invocation: true

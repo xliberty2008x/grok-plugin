@@ -140,6 +140,22 @@ test("execution profiles keep reviews immutable and grant writes only to write r
   assert.match(reportRepair.agentProfileDigest, /^[a-f0-9]{64}$/);
   assert.deepEqual(reportRepair.allowedTools, ["todo_write"]);
   for (const denied of ["Bash", "Edit", "Write"]) assert.ok(reportRepair.deniedTools.includes(denied));
+
+  const deepResearch = profileFor("deep-research");
+  assert.equal(deepResearch.id, "deep-research-v1");
+  assert.equal(deepResearch.webSearch, true);
+  assert.equal(deepResearch.subagents, true);
+  assert.deepEqual(deepResearch.allowedTools, ["WebSearch", "Agent"]);
+  assert.ok(deepResearch.deniedTools.includes("WebFetch"));
+  assert.ok(deepResearch.deniedProviderToolIds.includes("GrokBuild:web_fetch"));
+  assert.ok(deepResearch.deniedTools.includes("Bash"));
+  assert.ok(deepResearch.deniedTools.includes("read_file"));
+  const deepResearchWorkspace = profileFor("deep-research-workspace");
+  assert.equal(deepResearchWorkspace.id, "deep-research-workspace-v1");
+  assert.ok(deepResearchWorkspace.allowedTools.includes("read_file"));
+  assert.ok(deepResearchWorkspace.deniedTools.includes("search_replace"));
+  assert.equal(readTask.webSearch, false);
+  assert.equal(writeTask.webSearch, false);
 });
 
 test("security-profile comparison ignores diagnostics but rejects privilege changes", () => {

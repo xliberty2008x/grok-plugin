@@ -40,14 +40,50 @@ const AGENT_PROFILE_BINDINGS = Object.freeze({
       "GrokBuild:search_replace",
       "GrokBuild:todo_write"
     ])
+  }),
+  "deep-research.md": Object.freeze({
+    promptMode: "full",
+    permissionMode: "dontAsk",
+    providerToolIds: Object.freeze([
+      "GrokBuild:web_search",
+      "GrokBuild:task",
+      "GrokBuild:get_task_output",
+      "GrokBuild:kill_task"
+    ])
+  }),
+  "deep-research-workspace.md": Object.freeze({
+    promptMode: "full",
+    permissionMode: "dontAsk",
+    providerToolIds: Object.freeze([
+      "GrokBuild:web_search",
+      "GrokBuild:task",
+      "GrokBuild:get_task_output",
+      "GrokBuild:kill_task",
+      "GrokBuild:read_file",
+      "GrokBuild:list_dir",
+      "GrokBuild:grep"
+    ])
   })
 });
 const BASE_DENIED_PROVIDER_TOOL_IDS = Object.freeze([
-  "GrokBuild:WebSearch",
-  "GrokBuild:WebFetch",
-  "GrokBuild:Agent",
+  "GrokBuild:web_search",
+  "GrokBuild:web_fetch",
+  "GrokBuild:task",
   "GrokBuild:mcp__*",
   "GrokBuild:run_terminal_cmd"
+]);
+const RESEARCH_DENIED_PROVIDER_TOOL_IDS = Object.freeze([
+  "GrokBuild:web_fetch",
+  "GrokBuild:mcp__*",
+  "GrokBuild:run_terminal_cmd",
+  "GrokBuild:search_replace",
+  "GrokBuild:todo_write"
+]);
+const RESEARCH_WEB_ONLY_DENIED_PROVIDER_TOOL_IDS = Object.freeze([
+  ...RESEARCH_DENIED_PROVIDER_TOOL_IDS,
+  "GrokBuild:read_file",
+  "GrokBuild:list_dir",
+  "GrokBuild:grep"
 ]);
 
 function leadingFrontmatter(text, name) {
@@ -161,6 +197,34 @@ export function profileFor(kind, write = false) {
       "GrokBuild:search_replace"
     ]
   };
+  if (kind === "deep-research" || kind === "deep-research-workspace") {
+    const workspace = kind === "deep-research-workspace";
+    const binding = agentProfileBinding(
+      workspace ? "deep-research-workspace.md" : "deep-research.md"
+    );
+    return {
+      ...taskBase,
+      id: workspace ? "deep-research-workspace-v1" : "deep-research-v1",
+      sandbox: "strict",
+      permissionMode: "dontAsk",
+      webSearch: true,
+      subagents: true,
+      ...binding,
+      allowedTools: workspace
+        ? ["WebSearch", "Agent", "read_file", "list_dir", "grep"]
+        : ["WebSearch", "Agent"],
+      deniedTools: workspace
+        ? ["Bash", "Edit", "Write", "WebFetch", "mcp__*", "search_replace", "todo_write"]
+        : ["Bash", "Edit", "Write", "WebFetch", "mcp__*", "read_file", "list_dir", "grep", "search_replace", "todo_write"],
+      deniedProviderToolIds: workspace
+        ? [...RESEARCH_DENIED_PROVIDER_TOOL_IDS]
+        : [...RESEARCH_WEB_ONLY_DENIED_PROVIDER_TOOL_IDS],
+      maxActiveAgents: 4,
+      maxAgentLaunches: 8,
+      researchTimeoutMs: 30 * 60 * 1000,
+      workspaceMode: workspace
+    };
+  }
   const binding = agentProfileBinding(write ? "rescue-write.md" : "rescue-read.md");
   return {
     ...taskBase,
