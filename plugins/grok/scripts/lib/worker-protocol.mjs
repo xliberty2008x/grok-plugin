@@ -547,9 +547,94 @@ function projectProviderClaims(value) {
   };
 }
 
+/** Public inventory ceilings mirrored from private shared-ref capture bounds. */
+const MAX_PUBLIC_SHARED_REFS = 10_000;
+const SHA256_HEX_DIGEST = /^[a-f0-9]{64}$/;
+
+/**
+ * Host-authoritative shared-ref identity summary.
+ * Rejects non-digests, unsafe/inconsistent counts, and impossible completeness.
+ * Malformed input must not project as a trusted claim.
+ */
+function projectSharedRefIdentitySummary(value) {
+  if (!isPlainObject(value)) return null;
+  if (value.schemaVersion !== 1) return null;
+  if (typeof value.complete !== "boolean") return null;
+  if (!Number.isSafeInteger(value.refCount) || value.refCount < 0) return null;
+  if (!Number.isSafeInteger(value.taskRelevantRefCount) || value.taskRelevantRefCount < 0) {
+    return null;
+  }
+  if (!Number.isSafeInteger(value.unrelatedRefCount) || value.unrelatedRefCount < 0) return null;
+  if (value.refCount > MAX_PUBLIC_SHARED_REFS
+    || value.taskRelevantRefCount > MAX_PUBLIC_SHARED_REFS
+    || value.unrelatedRefCount > MAX_PUBLIC_SHARED_REFS) {
+    return null;
+  }
+  if (value.taskRelevantRefCount + value.unrelatedRefCount !== value.refCount) return null;
+  // complete ⇒ inventory within the hard shared-ref budget.
+  if (value.complete && value.refCount > MAX_PUBLIC_SHARED_REFS) return null;
+  if (typeof value.taskRelevantRefIdentity !== "string"
+    || !SHA256_HEX_DIGEST.test(value.taskRelevantRefIdentity)) {
+    return null;
+  }
+  if (typeof value.unrelatedRefIdentity !== "string"
+    || !SHA256_HEX_DIGEST.test(value.unrelatedRefIdentity)) {
+    return null;
+  }
+  return {
+    schemaVersion: 1,
+    complete: value.complete,
+    refCount: value.refCount,
+    taskRelevantRefCount: value.taskRelevantRefCount,
+    unrelatedRefCount: value.unrelatedRefCount,
+    taskRelevantRefIdentity: value.taskRelevantRefIdentity,
+    unrelatedRefIdentity: value.unrelatedRefIdentity
+  };
+}
+
+/**
+ * Host-authoritative shared-ref observation.
+ * Requires exact booleans and classification/flag tuples emitted by the
+ * classifier; never Boolean-coerces malformed flags into trusted evidence.
+ */
+function projectSharedRefObservation(value) {
+  if (!isPlainObject(value)) return null;
+  if (value.schemaVersion !== 1) return null;
+  if (typeof value.classification !== "string") return null;
+  if (typeof value.toleratedUnrelatedSharedRefChurn !== "boolean") return null;
+  if (typeof value.taskRelevantMetadataDrift !== "boolean") return null;
+  const classification = value.classification;
+  const tolerated = value.toleratedUnrelatedSharedRefChurn;
+  const drift = value.taskRelevantMetadataDrift;
+  const validTuple = (
+    (classification === "unchanged"
+      && tolerated === false
+      && drift === false)
+    || (classification === "tolerated_unrelated_shared_refs"
+      && tolerated === true
+      && drift === false)
+    || (classification === "task_relevant_metadata_drift"
+      && tolerated === false
+      && drift === true)
+    || (classification === "legacy_metadata_drift"
+      && tolerated === false
+      && drift === true)
+    || (classification === "fail_closed"
+      && tolerated === false
+      && drift === true)
+  );
+  if (!validTuple) return null;
+  return {
+    schemaVersion: 1,
+    classification,
+    toleratedUnrelatedSharedRefChurn: tolerated,
+    taskRelevantMetadataDrift: drift
+  };
+}
+
 function projectContextIdentity(value) {
   if (!isPlainObject(value)) return null;
-  return {
+  const projected = {
     manifestId: nullableText(value.manifestId, 256),
     digest: nullableText(value.digest, 256),
     head: nullableText(value.head, 256),
@@ -559,6 +644,14 @@ function projectContextIdentity(value) {
     trackedTreeIdentity: nullableText(value.trackedTreeIdentity, 256),
     metadataIdentity: nullableText(value.metadataIdentity, 256)
   };
+  // Validate the raw value only; never trim/lowercase/sanitize into a digest.
+  if (typeof value.taskRelevantMetadataIdentity === "string"
+    && SHA256_HEX_DIGEST.test(value.taskRelevantMetadataIdentity)) {
+    projected.taskRelevantMetadataIdentity = value.taskRelevantMetadataIdentity;
+  }
+  const sharedRefIdentity = projectSharedRefIdentitySummary(value.sharedRefIdentity);
+  if (sharedRefIdentity) projected.sharedRefIdentity = sharedRefIdentity;
+  return projected;
 }
 
 function projectCommandOutcomes(value) {
@@ -583,6 +676,7 @@ function projectRuntimeEvidence(value, { trustHostAuthority = true } = {}) {
       at: nullableText(value.reconciler.at, 64)
     }
     : null;
+  const sharedRefObservation = projectSharedRefObservation(value.sharedRefObservation);
   return {
     schemaVersion: nullableInteger(value.schemaVersion),
     preContext: projectContextIdentity(value.preContext),
@@ -596,6 +690,7 @@ function projectRuntimeEvidence(value, { trustHostAuthority = true } = {}) {
       && ["not_run", "passed", "failed", "skipped"].includes(value.hostVerification)
       ? value.hostVerification
       : "not_run",
+    ...(sharedRefObservation ? { sharedRefObservation } : {}),
     ...(reconciler ? { reconciler } : {})
   };
 }
@@ -747,7 +842,7 @@ function projectMaterialization(value, { trustHostAuthority = true } = {}) {
 function projectContextManifest(value, { trustHostAuthority = true } = {}) {
   if (!isPlainObject(value)) return null;
   const git = isPlainObject(value.git) ? value.git : value;
-  return {
+  const projected = {
     schemaVersion: nullableInteger(value.schemaVersion),
     manifestId: nullableText(value.manifestId, 256),
     digest: nullableText(value.digest, 256),
@@ -770,6 +865,17 @@ function projectContextManifest(value, { trustHostAuthority = true } = {}) {
     projectMarkers: publicPathList(value.projectMarkers, 32),
     materialization: projectMaterialization(value.materialization, { trustHostAuthority })
   };
+  // Validate the raw value only; never trim/lowercase/sanitize into a digest.
+  if (trustHostAuthority
+    && typeof git.taskRelevantMetadataIdentity === "string"
+    && SHA256_HEX_DIGEST.test(git.taskRelevantMetadataIdentity)) {
+    projected.taskRelevantMetadataIdentity = git.taskRelevantMetadataIdentity;
+  }
+  const sharedRefIdentity = trustHostAuthority
+    ? projectSharedRefIdentitySummary(git.sharedRefIdentity)
+    : null;
+  if (sharedRefIdentity) projected.sharedRefIdentity = sharedRefIdentity;
+  return projected;
 }
 
 /**

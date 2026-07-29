@@ -230,6 +230,100 @@
         "observedFileAgreement": { "type": "boolean" }
       }
     },
+    "sharedRefIdentitySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion", "complete", "refCount", "taskRelevantRefCount",
+        "unrelatedRefCount", "taskRelevantRefIdentity", "unrelatedRefIdentity"
+      ],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "complete": { "type": "boolean" },
+        "refCount": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "taskRelevantRefCount": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "unrelatedRefCount": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "taskRelevantRefIdentity": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "unrelatedRefIdentity": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "sharedRefObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion", "classification", "toleratedUnrelatedSharedRefChurn",
+        "taskRelevantMetadataDrift"
+      ],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "classification": {
+          "type": "string",
+          "enum": [
+            "unchanged",
+            "tolerated_unrelated_shared_refs",
+            "task_relevant_metadata_drift",
+            "legacy_metadata_drift",
+            "fail_closed"
+          ]
+        },
+        "toleratedUnrelatedSharedRefChurn": { "type": "boolean" },
+        "taskRelevantMetadataDrift": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "classification": { "const": "unchanged" } },
+            "required": ["classification"]
+          },
+          "then": {
+            "properties": {
+              "toleratedUnrelatedSharedRefChurn": { "const": false },
+              "taskRelevantMetadataDrift": { "const": false }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "classification": { "const": "tolerated_unrelated_shared_refs" }
+            },
+            "required": ["classification"]
+          },
+          "then": {
+            "properties": {
+              "toleratedUnrelatedSharedRefChurn": { "const": true },
+              "taskRelevantMetadataDrift": { "const": false }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "classification": {
+                "enum": [
+                  "task_relevant_metadata_drift",
+                  "legacy_metadata_drift",
+                  "fail_closed"
+                ]
+              }
+            },
+            "required": ["classification"]
+          },
+          "then": {
+            "properties": {
+              "toleratedUnrelatedSharedRefChurn": { "const": false },
+              "taskRelevantMetadataDrift": { "const": true }
+            }
+          }
+        }
+      ]
+    },
     "contextIdentity": {
       "type": "object",
       "additionalProperties": false,
@@ -245,7 +339,13 @@
         "dirtyDigest": { "type": ["string", "null"], "maxLength": 256 },
         "ignoredDigest": { "type": ["string", "null"], "maxLength": 256 },
         "trackedTreeIdentity": { "type": ["string", "null"], "maxLength": 256 },
-        "metadataIdentity": { "type": ["string", "null"], "maxLength": 256 }
+        "metadataIdentity": { "type": ["string", "null"], "maxLength": 256 },
+        "taskRelevantMetadataIdentity": {
+          "type": ["string", "null"],
+          "maxLength": 256,
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "sharedRefIdentity": { "$ref": "#/$defs/sharedRefIdentitySummary" }
       }
     },
     "commandOutcome": {
@@ -286,6 +386,7 @@
         "scopeViolations": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/publicPath" } },
         "executionStatus": { "type": ["string", "null"], "maxLength": 64 },
         "hostVerification": { "type": "string", "enum": ["not_run", "passed", "failed", "skipped"] },
+        "sharedRefObservation": { "$ref": "#/$defs/sharedRefObservation" },
         "reconciler": { "$ref": "#/$defs/reconcilerEvidence" }
       }
     },
@@ -837,6 +938,12 @@
         "ignoredEntryCount": { "type": "integer", "minimum": 0 },
         "trackedTreeIdentity": { "type": ["string", "null"], "maxLength": 256 },
         "metadataIdentity": { "type": ["string", "null"], "maxLength": 256 },
+        "taskRelevantMetadataIdentity": {
+          "type": ["string", "null"],
+          "maxLength": 256,
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "sharedRefIdentity": { "$ref": "#/$defs/sharedRefIdentitySummary" },
         "insideWorktree": { "type": "boolean" },
         "linkedWorktree": { "type": "boolean" },
         "sparse": { "type": "boolean" },

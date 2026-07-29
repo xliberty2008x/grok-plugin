@@ -23,6 +23,19 @@ Status: hardening candidate; not release-qualified.
   stable Grok 0.2.112 build used for development did not advertise the
   workflow commands in an isolated ACP session, so real completion,
   cancellation, and crash/restart remain unqualified on that build.
+- Fixed linked-worktree ContextManifest Git-metadata comparison so provably
+  unrelated shared-ref churn (other local branches, unrelated remote-tracking
+  refs, and `refs/codex/turn-diffs/**`) no longer surfaces as out-of-scope
+  `[GIT_METADATA]` when every task-relevant identity is unchanged. Comparison
+  uses semantic ref name→OID/symref identity (loose↔packed equivalent) and
+  keeps current branch, configured upstream, `refs/replace/**`, unclassified
+  special refs, worktree-local Git controls, shared config/hooks/info,
+  shallow/grafts/alternates, and index/`trackedTreeIdentity` fail-closed.
+  Legacy manifests stay on full `metadataIdentity`; mixed, malformed, or
+  incomplete new identity support cannot downgrade to tolerant behavior.
+  Runtime/public evidence exposes a bounded `sharedRefObservation`
+  classification that distinguishes tolerated unrelated shared-ref churn from
+  task-relevant metadata drift without local paths or private runtime IDs.
 - Fixed `record-verification` scope reconciliation so host-created pytest and
   Python cache drift is excluded only for exact `.pytest_cache` and
   `__pycache__` path components. The runtime still stores the full exact

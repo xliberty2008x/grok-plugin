@@ -12,7 +12,15 @@ import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 import { CompanionError, attachTransferCleanupEvidence, asErrorPayload } from "../plugins/grok/scripts/lib/errors.mjs";
 import { redact } from "../plugins/grok/scripts/lib/redact.mjs";
 import { spawnReadOnlyWorker } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
-import { buildTaskEnvelope, scrubStoredJob } from "../plugins/grok/scripts/lib/task-contract.mjs";
+import {
+  assertContextCompatible,
+  buildRuntimeEvidence,
+  buildTaskEnvelope,
+  captureContextManifest,
+  evaluateScope,
+  observeChangedPaths,
+  scrubStoredJob
+} from "../plugins/grok/scripts/lib/task-contract.mjs";
 import { launchContractDigest } from "../plugins/grok/scripts/lib/worker-launch-contract.mjs";
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
@@ -23,6 +31,7 @@ import {
   CODEX_COMPANION,
   COMPANION,
   ROOT,
+  git,
   initRepo,
   runCodexCompanion,
   runCompanion,
@@ -77,6 +86,50 @@ function fixture(config = {}) {
   delete env.GROK_LEADER_SOCKET;
   return { fake, pluginData, env };
 }
+
+test("runtime evidence distinguishes tolerated linked-worktree ref churn from metadata drift (issue #34)", () => {
+  const root = initRepo();
+  const head = git(root, "rev-parse", "HEAD");
+  const linkedParent = tempDir("grok-runtime-linked-ref-");
+  const linkedRoot = path.join(linkedParent, "checkout");
+  git(root, "worktree", "add", "-b", "runtime-task", linkedRoot);
+
+  const pre = captureContextManifest(linkedRoot);
+  git(root, "branch", "unrelated-runtime", head);
+  git(root, "update-ref", "refs/codex/turn-diffs/runtime-1", head);
+  const postUnrelated = captureContextManifest(linkedRoot);
+  const unrelatedPaths = observeChangedPaths(pre, postUnrelated);
+  assert.equal(unrelatedPaths.includes("[GIT_METADATA]"), false);
+  assert.deepEqual(evaluateScope(unrelatedPaths, { include: ["tracked.txt"] }), []);
+  assert.doesNotThrow(() => assertContextCompatible(linkedRoot, pre, { mode: "execute" }));
+  const unrelatedEvidence = buildRuntimeEvidence({
+    preContext: pre,
+    postContext: postUnrelated,
+    changedPaths: unrelatedPaths
+  });
+  assert.equal(unrelatedEvidence.sharedRefObservation.toleratedUnrelatedSharedRefChurn, true);
+  assert.equal(unrelatedEvidence.sharedRefObservation.taskRelevantMetadataDrift, false);
+  assert.equal(unrelatedEvidence.sharedRefObservation.classification, "tolerated_unrelated_shared_refs");
+
+  const preHook = captureContextManifest(linkedRoot);
+  const hooksDir = path.join(root, ".git", "hooks");
+  fs.mkdirSync(hooksDir, { recursive: true });
+  fs.writeFileSync(path.join(hooksDir, "pre-commit"), "#!/bin/sh\nexit 0\n");
+  const postHook = captureContextManifest(linkedRoot);
+  const hookPaths = observeChangedPaths(preHook, postHook);
+  assert.ok(hookPaths.includes("[GIT_METADATA]"));
+  const hookEvidence = buildRuntimeEvidence({
+    preContext: preHook,
+    postContext: postHook,
+    changedPaths: hookPaths
+  });
+  assert.equal(hookEvidence.sharedRefObservation.toleratedUnrelatedSharedRefChurn, false);
+  assert.equal(hookEvidence.sharedRefObservation.taskRelevantMetadataDrift, true);
+  assert.equal(hookEvidence.sharedRefObservation.classification, "task_relevant_metadata_drift");
+  const serialized = JSON.stringify({ unrelatedEvidence, hookEvidence });
+  assert.equal(serialized.includes(linkedRoot), false);
+  assert.equal(serialized.includes(root), false);
+});
 
 test("setup validates headless isolation before enabling the stop gate", (t) => {
   const root = initRepo();

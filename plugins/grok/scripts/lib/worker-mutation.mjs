@@ -37,11 +37,18 @@ import {
 import {
   appendLifecycleEvent,
   assertContextCompatible,
+  assertContextManifestIntegrity,
   assertTaskEnvelope,
   bindTaskEnvelopeContext,
+  boundPathEvidence,
+  buildRuntimeEvidence,
   buildTaskEnvelope,
   captureContextManifest,
   composeProviderPrompt,
+  CONTEXT_MANIFEST_VERSION,
+  CONTEXT_METADATA_POLICIES,
+  evaluateScope,
+  observeChangedPaths,
   scrubStoredJob
 } from "./task-contract.mjs";
 import {
@@ -78,6 +85,7 @@ import {
   assertExactWriteVerticalScope,
   assertParentUnchanged,
   assertManagedWorkerWorktree,
+  assertRegisteredWorkerWorktreeIdentity,
   assertTrackedWriteVerticalTarget,
   classifyWorkerWorktreeEffect,
   captureParentFingerprint,
@@ -1845,11 +1853,14 @@ export function assertWorkerProviderLaunchPreparation(job, {
   providerGeneration = null,
   env = process.env
 } = {}) {
+  // Exhaustive split: every read job and every generation other than the
+  // exact write-repair generation returns before post-binding validation.
   if (job?.write !== true || providerGeneration !== 2) {
     return assertDurableSpawnRequestBinding(job, env);
   }
 
   assertDispatchContract(job);
+  assertManagedWritePostBindingContext(job, env);
   const spawn = job?.request?.spawn;
   const dispatch = spawn?.dispatch;
   const taskProfile = profileFor("task", true);
@@ -4030,6 +4041,78 @@ export function settleWriteArtifactAfterRuntimeCleanup({
   }
 }
 
+function reconcileProviderStartedWriteCompletion(job, pending, env) {
+  if (job?.write !== true || !hasManagedWritePostBinding(job)) {
+    return Object.freeze({ job, pending });
+  }
+  const providerCompletionContext = assertContextManifestIntegrity(
+    job.completionContextManifest
+  );
+  const providerRuntimeContext = job.result?.runtimeEvidence?.postContext;
+  if (!providerRuntimeContext
+    || providerRuntimeContext.manifestId !== providerCompletionContext.manifestId
+    || providerRuntimeContext.digest !== providerCompletionContext.digest) {
+    throw new CompanionError(
+      "E_STATE",
+      "Provider completion evidence is not bound to its stored ContextManifest."
+    );
+  }
+
+  // Capture again under the workspace transaction immediately before artifact
+  // and terminal publication. Provider evidence is informative, never the
+  // terminal authority for the live filesystem boundary.
+  const observed = captureManagedWritePostBindingContext(job, env);
+  const contextDrift = observed.coreReasons.length > 0
+    || observed.metadataMarkers.length > 0;
+  const scopeDrift = observed.scopeViolations.length > 0;
+  const rejected = contextDrift || scopeDrift;
+  const reconciledPending = rejected
+    ? Object.freeze({
+        status: "failed",
+        phase: contextDrift ? "context-rejected" : "scope-rejected",
+        completedAt: now(),
+        error: Object.freeze({
+          code: contextDrift ? "E_CONTEXT_DRIFT" : "E_SCOPE_VIOLATION",
+          message: contextDrift
+            ? "Worker output failed final execution-context reconciliation."
+            : "Worker output changed paths outside the delegated scope."
+        }),
+        summary: contextDrift
+          ? "Worker output failed final execution-context reconciliation."
+          : "Worker output changed paths outside the delegated scope."
+      })
+    : pending;
+  const runtimeEvidence = buildRuntimeEvidence({
+    preContext: observed.requestContextManifest,
+    postContext: observed.currentContextManifest,
+    changedPaths: observed.observedChangedPaths,
+    diffSummary: observed.observedChangedPaths.length
+      ? observed.observedChangedPaths.join("\n")
+      : "No workspace changes observed.",
+    commandOutcomes: job.commandOutcomes || [],
+    scopeViolations: observed.scopeViolations,
+    executionStatus: rejected
+      ? "failed"
+      : pending.status === "cancelled"
+        ? "cancelled"
+        : pending.status === "failed"
+          ? "failed"
+          : "completed"
+  });
+  return Object.freeze({
+    pending: reconciledPending,
+    job: {
+      ...job,
+      completionContextManifest: observed.currentContextManifest,
+      result: {
+        ...(job.result || {}),
+        runtimeEvidence,
+        hostVerification: "not_run"
+      }
+    }
+  });
+}
+
 export function settleProviderStartedWorkerFinalization({
   root,
   workerId,
@@ -4101,9 +4184,14 @@ export function settleProviderStartedWorkerFinalization({
         );
       }
       const intended = pendingIntent(latest);
+      const reconciled = reconcileProviderStartedWriteCompletion(
+        latest,
+        intended,
+        env
+      );
       const artifactSettlement = settleWriteArtifactAfterRuntimeCleanup({
-        job: latest,
-        pending: intended,
+        job: reconciled.job,
+        pending: reconciled.pending,
         runtimeCleanup,
         env
       });
@@ -4111,7 +4199,7 @@ export function settleProviderStartedWorkerFinalization({
       const writeArtifact = artifactSettlement.artifact;
       const settledAt = now();
       const result = {
-        ...(latest.result || {}),
+        ...(reconciled.job.result || {}),
         ...(writeArtifact ? { writeArtifact } : {}),
         hostVerification: latest.result?.hostVerification || "not_run",
         taskRuntimeCleaned: true,
@@ -4125,7 +4213,7 @@ export function settleProviderStartedWorkerFinalization({
       }
       delete result.privacyWarning;
       const terminalized = {
-        ...latest,
+        ...reconciled.job,
         status: pending.status,
         phase: pending.phase,
         completedAt: pending.completedAt,
@@ -4355,9 +4443,12 @@ export function settleStartedWorkerLoss({
       assertDispatchContract(latest);
       const latestDispatch = latest.request.spawn.dispatch;
       const intended = pendingIntent(latest);
+      const reconciled = intended
+        ? reconcileProviderStartedWriteCompletion(latest, intended, env)
+        : { job: latest, pending: intended };
       const artifactSettlement = settleWriteArtifactAfterRuntimeCleanup({
-        job: latest,
-        pending: intended,
+        job: reconciled.job,
+        pending: reconciled.pending,
         runtimeCleanup,
         env
       });
@@ -4371,16 +4462,18 @@ export function settleStartedWorkerLoss({
         : "Worker process exited before publishing a terminal result; the prompt was not replayed.";
       const status = effective?.status || "failed";
       const result = {
-        ...(latest.result || {}),
+        ...(reconciled.job.result || {}),
         ...(writeArtifact ? { writeArtifact } : {}),
         hostVerification: latest.result?.hostVerification || "not_run",
         taskRuntimeCleaned: true,
         ...(effective
-          ? (status === "cancelled" && !latest.result?.stopReason ? { stopReason: "cancelled" } : {})
+          ? (status === "cancelled" && !reconciled.job.result?.stopReason
+              ? { stopReason: "cancelled" }
+              : {})
           : { stopReason: "worker-runtime-lost" }),
         ...(reconciler ? {
           runtimeEvidence: {
-            ...(latest.result?.runtimeEvidence || {}),
+            ...(reconciled.job.result?.runtimeEvidence || {}),
             reconciler: {
               privilege: "host-trusted-reconciler",
               replayedPrompt: false,
@@ -4395,7 +4488,7 @@ export function settleStartedWorkerLoss({
       }
       delete result.privacyWarning;
       const terminalized = {
-        ...latest,
+        ...reconciled.job,
         status,
         phase: effective?.phase || "lost",
         summary: effective ? effective.summary : "Lost",
@@ -4575,13 +4668,16 @@ function resolveParentAdmission(parent, {
       "Follow-up cannot resume a provider session across different security profiles."
     );
   }
+  const parentRequestContext = assertContextManifestIntegrity(
+    parent.request?.contextManifest
+  );
   assertContextPacket(parent.request?.contextPacket, {
     envelope: parent.request?.envelope
   });
   assertContextReceipt(parent.request?.contextReceipt, {
     contextPacket: parent.request.contextPacket,
     rolePolicy: parent.request.runtimeRolePolicy,
-    contextManifest: parent.request.contextManifest,
+    contextManifest: parentRequestContext,
     lineageWorkerId: parent.request?.followup ? parent.id : parent.request.providerHomeId,
     effectivePromptDigest: parent.request.providerPromptDigest
   });
@@ -4598,7 +4694,7 @@ function resolveParentAdmission(parent, {
     parentRole: parent.role,
     parentRuntimeRolePolicy: parent.request.runtimeRolePolicy,
     parentProfile: parent.profile,
-    parentContextManifest: parent.request.contextManifest,
+    parentContextManifest: parentRequestContext,
     parentContextReceipt: parent.request.contextReceipt,
     providerPromptDigest: parent.request.providerPromptDigest,
     targetProfile
@@ -4606,8 +4702,10 @@ function resolveParentAdmission(parent, {
   const availableFinalContexts = [
     parent.verificationContextManifest,
     parent.completionContextManifest
-  ].filter(Boolean);
-  const childContext = child?.request?.contextManifest;
+  ].filter(Boolean).map((manifest) => assertContextManifestIntegrity(manifest));
+  const childContext = child?.request?.contextManifest
+    ? assertContextManifestIntegrity(child.request.contextManifest)
+    : null;
   const finalContextManifest = childContext
     ? availableFinalContexts.find((candidate) => (
         candidate.manifestId === childContext.manifestId
@@ -5724,10 +5822,20 @@ function assertWriteProvisioningRuntime(runtime, binding, journal) {
     if (runtime.executionContextManifestRecordDigest !== null) {
       writeProvisioningStateError("Execution ContextManifest digest exists without its record.");
     }
-  } else if (!SHA256_HEX.test(runtime.executionContextManifestRecordDigest || "")
-    || runtime.executionContextManifestRecordDigest
-      !== stableDigest(runtime.executionContextManifest)) {
-    writeProvisioningStateError("Execution ContextManifest private record digest is inconsistent.");
+  } else {
+    try {
+      assertContextManifestIntegrity(runtime.executionContextManifest);
+    } catch {
+      writeProvisioningStateError(
+        "Execution ContextManifest private record failed integrity validation.",
+        "E_CONTEXT_DRIFT"
+      );
+    }
+    if (!SHA256_HEX.test(runtime.executionContextManifestRecordDigest || "")
+      || runtime.executionContextManifestRecordDigest
+        !== stableDigest(runtime.executionContextManifest)) {
+      writeProvisioningStateError("Execution ContextManifest private record digest is inconsistent.");
+    }
   }
 
   if (journal.state === "planned") {
@@ -5789,6 +5897,13 @@ function assertWriteProvisioningRuntime(runtime, binding, journal) {
       || journal.executionContextManifestId !== runtime.executionContextManifest.manifestId
       || journal.executionContextManifestDigest !== runtime.executionContextManifest.digest) {
       writeProvisioningStateError("Ready write provisioning runtime is incomplete.");
+    }
+    if (runtime.executionContextManifest.schemaVersion
+      !== CONTEXT_MANIFEST_VERSION) {
+      writeProvisioningStateError(
+        "Ready write provisioning requires chronology-authenticated ContextManifest evidence.",
+        "E_CONTEXT_DRIFT"
+      );
     }
     for (const [timestamp, label] of [
       ...(receipt
@@ -5922,10 +6037,24 @@ export function assertWriteExecutionJob(job, env = process.env) {
     providerCapabilityDigest: job.request.spawn.writeLifecycleCapabilityDigest,
     ownerDigest
   });
+  // taskRelevantMetadataIdentity (issue #34) observes assume-unchanged /
+  // skip-worktree, so assertContextCompatible would surface E_CONTEXT_DRIFT.
+  // Prefer the established parent-fingerprint safety gate first: its
+  // captureParentFingerprint path fail-closes unsafe index structures/flags
+  // with E_SCOPE_VIOLATION and a privacy-safe message. Ordinary parent
+  // content/metadata drift remains E_INTEGRATION; remaining context mismatch
+  // stays E_CONTEXT_DRIFT.
+  assertParentUnchanged(binding.parentFingerprint, binding.controlRoot);
+  // Managed write: integrity-check immutable stored admission, then compare the
+  // live primary control root under SUPERVISORY_LINKED_WRITE so only complete
+  // attributable unrelated shared-ref churn is tolerated. Retain stored IDs.
   const admissionContextManifest = assertContextCompatible(
     binding.controlRoot,
     job.request?.admissionContextManifest,
-    { mode: "execute" }
+    {
+      mode: "execute",
+      metadataPolicy: CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE
+    }
   );
   assertExecutionBinding(binding, {
     admissionContextManifestId: admissionContextManifest.manifestId,
@@ -5952,11 +6081,6 @@ export function assertWriteExecutionJob(job, env = process.env) {
       "Write execution binding no longer matches its exact control workspace."
     );
   }
-
-  // A ContextManifest does not bind hidden index security flags such as
-  // assume-unchanged or skip-worktree. Preserve the stronger admission-time
-  // parent fingerprint until provisioning has produced an execution root.
-  assertParentUnchanged(binding.parentFingerprint, binding.controlRoot);
   const spawn = job.request.spawn;
   const requestKeys = Object.keys(job.request);
   const spawnKeys = Object.keys(spawn);
@@ -6063,17 +6187,19 @@ export function assertWriteExecutionJob(job, env = process.env) {
       || job.error !== null) {
       writeProvisioningStateError("Ready write worker has an inconsistent exact state.");
     }
+    // Linked execution root: DEFAULT tolerant-linked policy. Bind to the
+    // integrity-checked stored execution manifest (not a fresh capture).
     const executionContextManifest = assertContextCompatible(
       binding.expectedExecutionRoot,
       runtimeEvidence.runtime.executionContextManifest,
       { mode: "execute" }
     );
-    if (executionContextManifest.manifestId
+    if (executionContextManifest.git?.head !== binding.baseCommit
+      || executionContextManifest.workspaceRoot !== binding.expectedExecutionRoot
+      || executionContextManifest.manifestId
         !== runtimeEvidence.runtime.executionContextManifest.manifestId
       || executionContextManifest.digest
-        !== runtimeEvidence.runtime.executionContextManifest.digest
-      || executionContextManifest.git?.head !== binding.baseCommit
-      || executionContextManifest.workspaceRoot !== binding.expectedExecutionRoot) {
+        !== runtimeEvidence.runtime.executionContextManifest.digest) {
       writeProvisioningStateError(
         "Ready write worker execution ContextManifest is not bound to the exact base worktree."
       );
@@ -6226,6 +6352,8 @@ export function authorizeReadyWriteWorkerDispatch({
       workerId,
       env
     });
+    // Stored ready execution manifest is immutable authority; DEFAULT linked
+    // policy tolerates unrelated shared-ref churn without rebinding IDs.
     const executionContextManifest = assertContextCompatible(
       verified.binding.expectedExecutionRoot,
       verified.provisioningRuntime.runtime.executionContextManifest,
@@ -6237,7 +6365,11 @@ export function authorizeReadyWriteWorkerDispatch({
       || executionContextManifest.manifestId
         !== verified.journal.executionContextManifestId
       || executionContextManifest.digest
-        !== verified.journal.executionContextManifestDigest) {
+        !== verified.journal.executionContextManifestDigest
+      || executionContextManifest.manifestId
+        !== verified.provisioningRuntime.runtime.executionContextManifest.manifestId
+      || executionContextManifest.digest
+        !== verified.provisioningRuntime.runtime.executionContextManifest.digest) {
       throw new CompanionError(
         "E_CONTEXT_DRIFT",
         "Verified write execution context changed before dispatch authorization."
@@ -7614,17 +7746,18 @@ export function promoteWriteWorkerReady({
     }, { requireIntent: true });
     const runtime = verified.provisioningRuntime;
     const intent = runtime.intent;
+    // Admit the caller-provided execution capture after integrity + DEFAULT
+    // linked semantic recheck. Persist that stored object (not a fresh rebind).
     const currentManifest = assertContextCompatible(
       verified.binding.expectedExecutionRoot,
       executionContextManifest,
       { mode: "execute" }
     );
-    if (currentManifest.manifestId !== executionContextManifest?.manifestId
-      || currentManifest.digest !== executionContextManifest?.digest
+    if (currentManifest.schemaVersion !== CONTEXT_MANIFEST_VERSION
       || currentManifest.workspaceRoot !== verified.binding.expectedExecutionRoot
       || currentManifest.git?.head !== verified.binding.baseCommit) {
       writeProvisioningStateError(
-        "Execution ContextManifest is not exact for the verified worktree.",
+        "Execution ContextManifest is not chronology-authenticated and exact for the verified worktree.",
         "E_CONTEXT_DRIFT"
       );
     }
@@ -7660,13 +7793,17 @@ export function promoteWriteWorkerReady({
     }
 
     if (verified.journal.state === "ready") {
+      const storedExecutionContext = assertContextManifestIntegrity(
+        runtime.runtime.executionContextManifest
+      );
       if (verified.journal.previousJournalDigest !== expectedJournalDigest
         || intent.status !== "settled"
         || (requestedReadyAt !== null && intent.settledAt !== requestedReadyAt)
-        || runtime.runtime.executionContextManifest.manifestId !== currentManifest.manifestId
-        || runtime.runtime.executionContextManifest.digest !== currentManifest.digest
-        || stableDigest(runtime.runtime.executionContextManifest)
-          !== stableDigest(executionContextManifest)
+        || storedExecutionContext.schemaVersion !== CONTEXT_MANIFEST_VERSION
+        || storedExecutionContext.manifestId
+          !== verified.journal.executionContextManifestId
+        || storedExecutionContext.digest
+          !== verified.journal.executionContextManifestDigest
         || runtime.cleanupProof.proofDigest !== durableCleanup.proofDigest) {
         writeProvisioningStateError("Ready write-worker replay changed promotion evidence.");
       }
@@ -8035,6 +8172,7 @@ export function adoptWriteProvisioningEffect({
           "E_WORKTREE"
         );
       }
+      // Replay: semantic DEFAULT linked recheck against immutable stored capture.
       const currentManifest = assertContextCompatible(
         verified.binding.expectedExecutionRoot,
         runtime.runtime.executionContextManifest,
@@ -8043,7 +8181,9 @@ export function adoptWriteProvisioningEffect({
       if (currentManifest.manifestId
           !== runtime.runtime.executionContextManifest.manifestId
         || currentManifest.digest
-          !== runtime.runtime.executionContextManifest.digest) {
+          !== runtime.runtime.executionContextManifest.digest
+        || currentManifest.manifestId !== verified.journal.executionContextManifestId
+        || currentManifest.digest !== verified.journal.executionContextManifestDigest) {
         writeProvisioningStateError(
           "Host-adopted execution context changed before replay.",
           "E_CONTEXT_DRIFT"
@@ -8077,9 +8217,7 @@ export function adoptWriteProvisioningEffect({
       executionContextManifest,
       { mode: "execute" }
     );
-    if (currentManifest.manifestId !== executionContextManifest.manifestId
-      || currentManifest.digest !== executionContextManifest.digest
-      || currentManifest.workspaceRoot !== verified.binding.expectedExecutionRoot
+    if (currentManifest.workspaceRoot !== verified.binding.expectedExecutionRoot
       || currentManifest.git?.head !== verified.binding.baseCommit) {
       writeProvisioningStateError(
         "Host-adopted ContextManifest is not exact for the verified worktree.",
@@ -8194,8 +8332,10 @@ export function adoptWriteProvisioningEffect({
         executionContextManifest,
         { mode: "execute" }
       );
-      if (commitManifest.manifestId !== executionContextManifest.manifestId
-        || commitManifest.digest !== executionContextManifest.digest) {
+      if (commitManifest.manifestId !== currentManifest.manifestId
+        || commitManifest.digest !== currentManifest.digest
+        || commitManifest.workspaceRoot !== latestVerified.binding.expectedExecutionRoot
+        || commitManifest.git?.head !== latestVerified.binding.baseCommit) {
         writeProvisioningStateError(
           "Host-adoption context changed before publication.",
           "E_CONTEXT_DRIFT"
@@ -8586,8 +8726,9 @@ function assertWriteAdmissionReplayCandidate(job, expected, env = process.env) {
       || job?.request?.spawn?.ownerThreadId !== job?.host?.sessionId) {
       throw new CompanionError("E_STATE", "Write worker execution binding is malformed.");
     }
-    // Intentionally skip assertDurableSpawnRequestBinding: intended scoped
-    // provider edits make acceptance-time dirty digests invalid after dispatch.
+    // Immutable authority is checked first; the live boundary below remains
+    // exact before provider-started and becomes scope-aware only for the exact
+    // active/terminal provider generation.
     assertDispatchContract(job);
     const spawn = job.request.spawn;
     const binding = assertWriteAdmissionReplayMatches(job.executionBinding, {
@@ -8607,6 +8748,12 @@ function assertWriteAdmissionReplayCandidate(job, expected, env = process.env) {
       binding,
       journal
     );
+    const requestContextManifest = assertContextManifestIntegrity(
+      job.request?.contextManifest
+    );
+    const runtimeContextManifest = assertContextManifestIntegrity(
+      provisioningRuntime.runtime.executionContextManifest
+    );
     if (spawn.executionBindingDigest !== binding.bindingDigest
       || spawn.executionRoot !== binding.expectedExecutionRoot
       || spawn.writeLifecycleCapabilityDigest !== binding.providerCapabilityDigest
@@ -8618,10 +8765,16 @@ function assertWriteAdmissionReplayCandidate(job, expected, env = process.env) {
             !== binding.providerLaunchBindingDigest))
       || binding.controlWorkspaceId !== job.controlWorkspaceId
       || binding.workerId !== job.id
-      || provisioningRuntime.runtime.executionContextManifest?.manifestId
-        !== job.request?.contextManifest?.manifestId
-      || provisioningRuntime.runtime.executionContextManifest?.digest
-        !== job.request?.contextManifest?.digest) {
+      || runtimeContextManifest.manifestId
+        !== requestContextManifest.manifestId
+      || runtimeContextManifest.digest
+        !== requestContextManifest.digest
+      || stableDigest(runtimeContextManifest)
+        !== stableDigest(requestContextManifest)
+      || runtimeContextManifest.manifestId
+        !== journal.executionContextManifestId
+      || runtimeContextManifest.digest
+        !== journal.executionContextManifestDigest) {
       throw new CompanionError(
         "E_STATE",
         "Dispatched write worker identity or provisioning chain disagrees with its immutable execution binding."
@@ -8634,6 +8787,7 @@ function assertWriteAdmissionReplayCandidate(job, expected, env = process.env) {
     if (spawn.admissionRequestDigest !== expectedAdmissionDigest) {
       throw new CompanionError("E_STATE", "Write worker admission digest is inconsistent.");
     }
+    assertDurableSpawnRequestBinding(job, env);
     return Object.freeze({
       binding,
       dispatched: true,
@@ -8712,27 +8866,22 @@ export function admitWriteWorkerPlan({
       "Write worker admission must originate from the canonical control checkout."
     );
   }
-  const admissionContextManifest = contextManifest
-    ? assertContextCompatible(control.controlRoot, contextManifest, { mode: "execute" })
-    : captureContextManifest(control.controlRoot);
-  if (validatedEnvelope.contextManifestId != null
-    && validatedEnvelope.contextManifestId !== admissionContextManifest.manifestId) {
-    throw new CompanionError(
-      "E_CONTEXT_DRIFT",
-      "TaskEnvelope context identity does not match the trusted control checkout."
-    );
-  }
-  const admissionEnvelope = bindTaskEnvelopeContext(
-    validatedEnvelope,
-    admissionContextManifest.manifestId
-  );
+  // Fail closed on unsafe index flags/structures before ContextManifest
+  // identity (which now observes those flags) can preempt with E_CONTEXT_DRIFT.
+  captureParentFingerprint(control.controlRoot);
+  // Caller-provided admission captures are integrity-checked once up front.
+  // Fresh capture for new admissions stays deferred until the no-replay path so
+  // same-key replay can rebind exclusively to the job's stored admission IDs.
+  const callerAdmissionManifest = contextManifest == null
+    ? null
+    : assertContextManifestIntegrity(contextManifest);
   const requestOwner = spawnRequestOwner(principal);
   const ownerDigest = writeAdmissionOwnerDigest({
     kind: requestOwner.hostKind,
     sessionId: requestOwner.sessionId
   });
   const keyDigest = digestKey(idempotencyKey);
-  const replayExpected = Object.freeze({
+  const writeReplayExpected = (admissionContextManifest, admissionEnvelope) => Object.freeze({
     controlRoot: control.controlRoot,
     gitCommonDir: control.gitCommonDir,
     scope: admissionEnvelope.scope,
@@ -8748,6 +8897,27 @@ export function admitWriteWorkerPlan({
       : null,
     ownerDigest
   });
+  const rebindWriteAdmissionEnvelope = (storedAdmission) => {
+    // Integrity + supervisory primary-control recheck against immutable stored
+    // admission; never rebuild replayExpected from a fresh control capture.
+    assertContextCompatible(
+      control.controlRoot,
+      storedAdmission,
+      {
+        mode: "execute",
+        metadataPolicy: CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE
+      }
+    );
+    const admissionEnvelope = bindTaskEnvelopeContext(
+      validatedEnvelope,
+      storedAdmission.manifestId
+    );
+    return {
+      storedAdmission,
+      admissionEnvelope,
+      replayExpected: writeReplayExpected(storedAdmission, admissionEnvelope)
+    };
+  };
 
   const admitted = withWorkspaceStateTransaction(control.controlRoot, (transaction) => {
     const digestOwners = transaction.listJobs().filter((candidate) => (
@@ -8771,6 +8941,10 @@ export function admitWriteWorkerPlan({
       if (!committed || digestOwners.length !== 1 || digestOwners[0].id !== record.workerId) {
         spawnIdempotencyStateError("Write-spawn idempotency ownership is missing or ambiguous.");
       }
+      const storedAdmission = assertContextManifestIntegrity(
+        committed.request?.admissionContextManifest
+      );
+      const { replayExpected } = rebindWriteAdmissionEnvelope(storedAdmission);
       assertWriteAdmissionReplayCandidate(committed, replayExpected, env);
       if (record.admissionRequestDigest !== committed.request.spawn.admissionRequestDigest) {
         spawnIdempotencyStateError("Write-spawn idempotency record disagrees with its durable job.");
@@ -8810,6 +8984,10 @@ export function admitWriteWorkerPlan({
         || orphan.controlWorkspaceId !== control.controlWorkspaceId) {
         idempotencyConflict("idempotencyKey was reused with a different write-spawn request.");
       }
+      const storedAdmission = assertContextManifestIntegrity(
+        orphan.request?.admissionContextManifest
+      );
+      const { replayExpected } = rebindWriteAdmissionEnvelope(storedAdmission);
       assertWriteAdmissionReplayCandidate(orphan, replayExpected, env);
       assertMutationOwnership(orphan, principal);
       const captured = captureSpawnResponse({
@@ -8832,6 +9010,29 @@ export function admitWriteWorkerPlan({
       });
     }
 
+    // New managed write: integrity-check caller capture (or take one now) and
+    // supervisory-compare current control; persist that original stored object.
+    const admissionContextManifest = callerAdmissionManifest
+      ? assertContextCompatible(
+        control.controlRoot,
+        callerAdmissionManifest,
+        {
+          mode: "execute",
+          metadataPolicy: CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE
+        }
+      )
+      : captureContextManifest(control.controlRoot);
+    if (validatedEnvelope.contextManifestId != null
+      && validatedEnvelope.contextManifestId !== admissionContextManifest.manifestId) {
+      throw new CompanionError(
+        "E_CONTEXT_DRIFT",
+        "TaskEnvelope context identity does not match the trusted control checkout."
+      );
+    }
+    const admissionEnvelope = bindTaskEnvelopeContext(
+      validatedEnvelope,
+      admissionContextManifest.manifestId
+    );
     const parentFingerprint = captureParentFingerprint(control.controlRoot);
     if (!parentFingerprint.clean) {
       throw new CompanionError(
@@ -8842,7 +9043,10 @@ export function admitWriteWorkerPlan({
     assertContextCompatible(
       control.controlRoot,
       admissionContextManifest,
-      { mode: "execute" }
+      {
+        mode: "execute",
+        metadataPolicy: CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE
+      }
     );
     const id = generateId("task");
     const createdAt = now();
@@ -9146,8 +9350,7 @@ export function spawnReadOnlyWorker({
       if (record.owner.hostKind !== requestOwner.hostKind
         || record.owner.sessionId !== requestOwner.sessionId
         || record.controlWorkspaceId !== controlWorkspaceId
-        || record.executionRoot !== executionRoot
-        || record.requestDigest !== spawnDigest) {
+        || record.executionRoot !== executionRoot) {
         idempotencyConflict("idempotencyKey was reused with a different spawn owner or request.");
       }
       const committed = transaction.tryReadJob(record.workerId);
@@ -9161,6 +9364,19 @@ export function spawnReadOnlyWorker({
       assertDispatchContract(committed);
       assertDurableSpawnRequestBinding(committed, env);
       assertMutationOwnership(committed, principal);
+      const replayRequestDigest = storedSpawnReplayRequestDigest({
+        job: committed,
+        principal,
+        envelope: validatedEnvelope,
+        roleId,
+        write,
+        ...(admittedProviderBinding
+          ? { providerLaunchBindingDigest }
+          : {})
+      });
+      if (record.requestDigest !== replayRequestDigest) {
+        idempotencyConflict("idempotencyKey was reused with a different spawn owner or request.");
+      }
       if (providerCapabilityDigest !== null
         && committed.request?.spawn?.providerCapabilityDigest !== providerCapabilityDigest) {
         throw new CompanionError("E_CONTEXT_DRIFT", "Provider capability changed since durable worker admission.");
@@ -9208,13 +9424,25 @@ export function spawnReadOnlyWorker({
         || orphan.controlWorkspaceId !== controlWorkspaceId
         || orphan.request?.spawn?.executionRoot !== executionRoot
         || orphan.request?.spawn?.ownerThreadId !== principal.threadId
-        || orphan.request?.spawn?.requestDigest !== spawnDigest
       ) {
         idempotencyConflict("idempotencyKey was reused with a different spawn owner or request.");
       }
       assertDispatchContract(orphan);
       assertDurableSpawnRequestBinding(orphan, env);
       assertMutationOwnership(orphan, principal);
+      const replayRequestDigest = storedSpawnReplayRequestDigest({
+        job: orphan,
+        principal,
+        envelope: validatedEnvelope,
+        roleId,
+        write,
+        ...(admittedProviderBinding
+          ? { providerLaunchBindingDigest }
+          : {})
+      });
+      if (orphan.request?.spawn?.requestDigest !== replayRequestDigest) {
+        idempotencyConflict("idempotencyKey was reused with a different spawn owner or request.");
+      }
       if (providerCapabilityDigest !== null
         && orphan.request?.spawn?.providerCapabilityDigest !== providerCapabilityDigest) {
         throw new CompanionError("E_CONTEXT_DRIFT", "Provider capability changed since durable worker admission.");
@@ -9406,6 +9634,504 @@ function requestDigest({
   });
 }
 
+/**
+ * Rebuild only the caller-facing replay comparison from immutable stored
+ * authority. A fresh caller ContextManifest is integrity-checked and compared
+ * to the live workspace before this helper is reached, but its authenticated
+ * capturedAt necessarily gives it a new digest/ID. That capture identity must
+ * not rewrite the durable execution binding or turn an otherwise identical
+ * idempotent replay into a different request.
+ */
+function storedSpawnReplayRequestDigest({
+  job,
+  principal,
+  envelope,
+  roleId,
+  write,
+  providerLaunchBindingDigest = undefined
+}) {
+  const storedContextManifest = assertContextManifestIntegrity(
+    job?.request?.contextManifest
+  );
+  const storedEnvelope = bindTaskEnvelopeContext(
+    envelope,
+    storedContextManifest.manifestId
+  );
+  const storedContextBindingDigest = job?.request?.spawn?.contextBindingDigest;
+  const hasStoredContextBinding = storedContextBindingDigest !== undefined;
+  if (hasStoredContextBinding
+    && (!SHA256_HEX.test(storedContextBindingDigest || "")
+      || job.request?.contextBindingMode !== CONTEXT_BINDING_MODE)) {
+    spawnIdempotencyStateError(
+      "Durable worker replay context binding is malformed."
+    );
+  }
+  return requestDigest({
+    principal,
+    controlWorkspaceId: job.controlWorkspaceId,
+    executionRoot: job.request.spawn.executionRoot,
+    envelope: storedEnvelope,
+    contextManifest: storedContextManifest,
+    roleId,
+    write,
+    ...(hasStoredContextBinding
+      ? {
+          contextBinding: {
+            mode: CONTEXT_BINDING_MODE,
+            digest: storedContextBindingDigest
+          }
+        }
+      : {}),
+    ...(providerLaunchBindingDigest === undefined
+      ? {}
+      : { providerLaunchBindingDigest })
+  });
+}
+
+function hasManagedWriteAuthority(job) {
+  const dispatch = job?.request?.spawn?.dispatch;
+  if (job?.write !== true) {
+    return false;
+  }
+  const authorities = [
+    job.executionBinding,
+    job.provisioning,
+    job.provisioningRuntime,
+    job.request?.admissionContextManifest,
+    job.request?.contextManifest,
+    job.request?.spawn?.executionBindingDigest
+  ];
+  const present = authorities.map((value) => value !== undefined && value !== null);
+  const anyAuthority = present.some(Boolean);
+  const managedDispatch = isDispatchV2(dispatch);
+  if (!managedDispatch && !anyAuthority) {
+    return false;
+  }
+  if (!managedDispatch || !present.every(Boolean)) {
+    spawnIdempotencyStateError(
+      "Managed write dispatch requires a complete execution-context authority."
+    );
+  }
+  return true;
+}
+
+function hasManagedWritePostBinding(job) {
+  return hasManagedWriteAuthority(job)
+    && job.request.spawn.dispatch.state === "provider-started";
+}
+
+/**
+ * Validate the complete immutable managed-write authority before any provider
+ * generation may bootstrap. Live context policy is intentionally not selected
+ * here: generation 1 remains exact, while the exact provider-started state may
+ * later use scoped observation for intended provider output.
+ */
+function assertManagedWriteImmutableAuthority(job, env = process.env) {
+  if (!hasManagedWriteAuthority(job)) {
+    spawnIdempotencyStateError(
+      "Managed write verification requires a complete dispatch authority."
+    );
+  }
+  assertDispatchContract(job);
+  const spawn = job.request.spawn;
+  if (!SHA256_HEX.test(spawn.admissionRequestDigest || "")
+    || !SHA256_HEX.test(spawn.idempotencyKeyDigest || "")
+    || !SHA256_HEX.test(spawn.writeLifecycleCapabilityDigest || "")
+    || !SHA256_HEX.test(spawn.providerCapabilityDigest || "")) {
+    spawnIdempotencyStateError(
+      "Managed write retained admission or capability authority is malformed."
+    );
+  }
+  // Provider-started records deliberately scrub literal request text. Their
+  // envelope remains bound by its digest, launch contract, request digest, and
+  // context receipt, but it is no longer an executable assertTaskEnvelope input.
+  const envelope = job.request.envelope;
+  if (!isPlainRecord(envelope)
+    || envelope.mode !== "write"
+    || !SHA256_HEX.test(envelope.digest || "")) {
+    spawnIdempotencyStateError(
+      "Managed write durable envelope authority is malformed."
+    );
+  }
+  assertExactWriteVerticalScope(envelope.scope);
+  const role = assertRoleDigest(job.role);
+  const profile = profileFor("task", true);
+  const runtimeRolePolicy = job.request?.runtimeRolePolicy;
+  try {
+    assertRuntimeRolePolicy(runtimeRolePolicy, { role, profile });
+  } catch {
+    spawnIdempotencyStateError(
+      "Managed write runtime role authority is malformed."
+    );
+  }
+
+  let admissionContextManifest;
+  let requestContextManifest;
+  let runtimeContextManifest;
+  try {
+    admissionContextManifest = assertContextManifestIntegrity(
+      job.request.admissionContextManifest
+    );
+    requestContextManifest = assertContextManifestIntegrity(
+      job.request.contextManifest
+    );
+    runtimeContextManifest = assertContextManifestIntegrity(
+      job.provisioningRuntime.executionContextManifest
+    );
+  } catch (error) {
+    if (error instanceof CompanionError) throw error;
+    spawnIdempotencyStateError(
+      "Managed write ContextManifest authority failed integrity validation."
+    );
+  }
+  if (admissionContextManifest.schemaVersion !== CONTEXT_MANIFEST_VERSION
+    || requestContextManifest.schemaVersion !== CONTEXT_MANIFEST_VERSION
+    || runtimeContextManifest.schemaVersion !== CONTEXT_MANIFEST_VERSION) {
+    throw new CompanionError(
+      "E_CONTEXT_DRIFT",
+      "Managed write dispatch requires chronology-authenticated ContextManifest records.",
+      { code: "E_CONTEXT_DRIFT", reasons: ["manifestVersion"] }
+    );
+  }
+
+  const binding = assertExecutionBinding(job.executionBinding, {
+    workerId: job.id,
+    controlWorkspaceId: job.controlWorkspaceId,
+    expectedExecutionRoot: spawn.executionRoot,
+    bindingDigest: spawn.executionBindingDigest,
+    scope: envelope.scope,
+    roleDigest: role.digest,
+    profileDigest: stableDigest(profile),
+    runtimeRolePolicyDigest: runtimeRolePolicy.digest,
+    admissionContextManifestId: admissionContextManifest.manifestId,
+    admissionContextManifestDigest: admissionContextManifest.digest,
+    providerCapabilityDigest: spawn.providerCapabilityDigest,
+    ownerDigest: writeAdmissionOwnerDigest(job.host)
+  });
+  const journal = assertProvisioningJournal(binding, job.provisioning);
+  const provisioningRuntime = assertWriteProvisioningRuntime(
+    job.provisioningRuntime,
+    binding,
+    journal
+  );
+  let control;
+  try {
+    control = resolveControlWorkspace(binding.expectedExecutionRoot, env);
+  } catch {
+    spawnIdempotencyStateError(
+      "Managed write control workspace authority could not be resolved."
+    );
+  }
+  const retainedProviderLaunchBindingDigest =
+    Object.hasOwn(spawn, "providerLaunchBindingDigest")
+      ? spawn.providerLaunchBindingDigest
+      : null;
+  let observedProviderLaunchBindingDigest = null;
+  if (retainedProviderLaunchBindingDigest !== null) {
+    try {
+      observedProviderLaunchBindingDigest =
+        digestProviderLaunchBinding(spawn.providerLaunchBinding);
+    } catch {
+      spawnIdempotencyStateError(
+        "Managed write provider executable authority is malformed."
+      );
+    }
+  }
+  const providerStarted =
+    spawn.dispatch.state === "provider-started";
+  if (!providerStarted && typeof envelope.userRequest !== "string") {
+    spawnIdempotencyStateError(
+      "Managed write admission envelope was privacy-scrubbed before provider start."
+    );
+  }
+  let reconstructedAdmissionEnvelopeDigest = null;
+  if (typeof envelope.userRequest === "string") {
+    try {
+      reconstructedAdmissionEnvelopeDigest = bindTaskEnvelopeContext(
+        envelope,
+        admissionContextManifest.manifestId
+      ).digest;
+    } catch {
+      spawnIdempotencyStateError(
+        "Managed write admission envelope authority could not be reconstructed."
+      );
+    }
+  }
+  const expectedAdmissionRequestDigest = writeAdmissionRequestDigest({
+    binding,
+    idempotencyKeyDigest: spawn.idempotencyKeyDigest
+  });
+  if (journal.state !== "ready"
+    || binding.expectedExecutionRoot !== spawn.executionRoot
+    || binding.bindingDigest !== spawn.executionBindingDigest
+    || binding.controlWorkspaceId !== job.controlWorkspaceId
+    || control.executionRoot !== binding.expectedExecutionRoot
+    || control.controlWorkspaceId !== binding.controlWorkspaceId
+    || control.controlRoot !== binding.controlRoot
+    || control.gitCommonDir !== binding.gitCommonDir
+    || spawn.admissionRequestDigest !== expectedAdmissionRequestDigest
+    || spawn.writeLifecycleCapabilityDigest !== spawn.providerCapabilityDigest
+    || spawn.writeLifecycleCapabilityDigest !== binding.providerCapabilityDigest
+    || binding.providerCapabilityDigest !== spawn.providerCapabilityDigest
+    || retainedProviderLaunchBindingDigest
+      !== binding.providerLaunchBindingDigest
+    || (retainedProviderLaunchBindingDigest !== null
+      && observedProviderLaunchBindingDigest
+        !== retainedProviderLaunchBindingDigest)
+    || (reconstructedAdmissionEnvelopeDigest !== null
+      && binding.envelopeDigest !== reconstructedAdmissionEnvelopeDigest)
+    || requestContextManifest.workspaceRoot !== binding.expectedExecutionRoot
+    || requestContextManifest.git?.head !== binding.baseCommit
+    || requestContextManifest.manifestId
+      !== journal.executionContextManifestId
+    || requestContextManifest.digest
+      !== journal.executionContextManifestDigest
+    || runtimeContextManifest.manifestId
+      !== journal.executionContextManifestId
+    || runtimeContextManifest.digest
+      !== journal.executionContextManifestDigest
+    || stableDigest(requestContextManifest)
+      !== stableDigest(runtimeContextManifest)
+    || job.provisioningRuntime.executionContextManifestRecordDigest
+      !== stableDigest(runtimeContextManifest)) {
+    spawnIdempotencyStateError(
+      "Managed write request, runtime, journal, and execution binding disagree."
+    );
+  }
+
+  assertParentUnchanged(binding.parentFingerprint, binding.controlRoot);
+  assertContextCompatible(
+    binding.controlRoot,
+    admissionContextManifest,
+    {
+      mode: "execute",
+      metadataPolicy: CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE
+    }
+  );
+  assertRegisteredWorkerWorktreeIdentity({
+    controlRoot: binding.controlRoot,
+    executionRoot: binding.expectedExecutionRoot,
+    baseCommit: binding.baseCommit,
+    workerId: job.id,
+    env
+  });
+
+  return Object.freeze({
+    binding,
+    journal,
+    provisioningRuntime,
+    envelope,
+    admissionContextManifest,
+    requestContextManifest,
+    runtimeContextManifest
+  });
+}
+
+/**
+ * Verify immutable managed-write authority and independently observe the live
+ * linked execution root after dispatch. The stored execution ContextManifest is
+ * the request/runtime/journal authority; a fresh capture is only an observer.
+ *
+ * Intended provider dirtiness is not compared by digest here. Instead, every
+ * observed dirty/ignored path is evaluated against the already-bound exact
+ * vertical scope, while HEAD/branch/index/config/hooks/operational/upstream and
+ * task-relevant metadata continue to fail closed.
+ */
+function captureManagedWritePostBindingContext(
+  job,
+  env = process.env,
+  { observedContextManifest = null } = {}
+) {
+  if (!hasManagedWritePostBinding(job)) {
+    spawnIdempotencyStateError(
+      "Managed write post-binding verification requires provider-started authority."
+    );
+  }
+  const {
+    binding,
+    journal,
+    provisioningRuntime,
+    envelope,
+    admissionContextManifest,
+    requestContextManifest,
+    runtimeContextManifest
+  } = assertManagedWriteImmutableAuthority(job, env);
+  const currentContextManifest = observedContextManifest == null
+    ? captureContextManifest(binding.expectedExecutionRoot)
+    : assertContextManifestIntegrity(observedContextManifest);
+  const coreReasons = [];
+  if (currentContextManifest.workspaceRoot !== requestContextManifest.workspaceRoot) {
+    coreReasons.push("workspaceRoot");
+  }
+  if (Boolean(currentContextManifest.git?.linkedWorktree)
+    !== Boolean(requestContextManifest.git?.linkedWorktree)) {
+    coreReasons.push("linkedWorktree");
+  }
+  if (Boolean(currentContextManifest.git?.sparse)
+    !== Boolean(requestContextManifest.git?.sparse)) {
+    coreReasons.push("sparse");
+  }
+  if (Boolean(currentContextManifest.git?.shallow)
+    !== Boolean(requestContextManifest.git?.shallow)) {
+    coreReasons.push("shallow");
+  }
+  if ((currentContextManifest.git?.branch || null)
+    !== (requestContextManifest.git?.branch || null)) {
+    coreReasons.push("branch");
+  }
+  if (Boolean(currentContextManifest.git?.insideWorktree)
+    !== Boolean(requestContextManifest.git?.insideWorktree)) {
+    coreReasons.push("insideWorktree");
+  }
+  if (stableDigest(currentContextManifest.projectMarkers)
+    !== stableDigest(requestContextManifest.projectMarkers)) {
+    coreReasons.push("projectMarkers");
+  }
+  if ((currentContextManifest.git?.upstreamRef || null)
+      !== (requestContextManifest.git?.upstreamRef || null)
+    || (currentContextManifest.git?.upstreamCommit || null)
+      !== (requestContextManifest.git?.upstreamCommit || null)) {
+    coreReasons.push("upstream");
+  }
+  const observedChangedPaths = observeChangedPaths(
+    requestContextManifest,
+    currentContextManifest
+  );
+  const scopeViolations = evaluateScope(
+    observedChangedPaths,
+    envelope.scope
+  );
+  const metadataMarkers = scopeViolations.filter(
+    (item) => String(item).startsWith("[")
+  );
+  return Object.freeze({
+    binding,
+    journal,
+    provisioningRuntime,
+    envelope,
+    admissionContextManifest,
+    requestContextManifest,
+    runtimeContextManifest,
+    currentContextManifest,
+    observedChangedPaths,
+    scopeViolations,
+    coreReasons,
+    metadataMarkers
+  });
+}
+
+function assertManagedWritePostBindingObservation(observed) {
+  if (observed.coreReasons.length || observed.metadataMarkers.length) {
+    throw new CompanionError(
+      "E_CONTEXT_DRIFT",
+      "Managed write execution context drifted after provider binding; refusing to continue.",
+      {
+        code: "E_CONTEXT_DRIFT",
+        reasons: [
+          ...observed.coreReasons,
+          ...observed.metadataMarkers
+        ]
+      }
+    );
+  }
+  if (observed.scopeViolations.length) {
+    const paths = boundPathEvidence(
+      observed.scopeViolations,
+      { marker: "[SCOPE_VIOLATIONS_OVERFLOW]" }
+    );
+    throw new CompanionError(
+      "E_SCOPE_VIOLATION",
+      "Managed write execution produced changes outside its exact delegated scope.",
+      { paths }
+    );
+  }
+  return observed;
+}
+
+function assertManagedWritePostBindingContext(job, env = process.env) {
+  return assertManagedWritePostBindingObservation(
+    captureManagedWritePostBindingContext(job, env)
+  );
+}
+
+/**
+ * A verified terminal write may legitimately retain verification-tool cache
+ * paths excluded only by the verification observer. Validate the immutable
+ * completion against original scope, validate the stored verification
+ * transition under that observer, then compare live state to the stored
+ * verification baseline. Active and unverified terminal records always use
+ * the ordinary fresh post-binding verifier.
+ */
+function assertManagedWriteReplayContext(job, env = process.env) {
+  if (!terminalJob(job) || !job.verificationContextManifest) {
+    return assertManagedWritePostBindingContext(job, env);
+  }
+  const completionContextManifest = assertContextManifestIntegrity(
+    job.completionContextManifest
+  );
+  const runtimePostContext = job.result?.runtimeEvidence?.postContext;
+  if (!runtimePostContext
+    || runtimePostContext.manifestId !== completionContextManifest.manifestId
+    || runtimePostContext.digest !== completionContextManifest.digest) {
+    spawnIdempotencyStateError(
+      "Verified terminal write completion evidence is malformed."
+    );
+  }
+  const completionObservation = assertManagedWritePostBindingObservation(
+    captureManagedWritePostBindingContext(
+      job,
+      env,
+      { observedContextManifest: completionContextManifest }
+    )
+  );
+  const verificationContextManifest = assertContextManifestIntegrity(
+    job.verificationContextManifest
+  );
+  const verificationReasons = [];
+  if (verificationContextManifest.workspaceRoot
+      !== completionContextManifest.workspaceRoot) {
+    verificationReasons.push("workspaceRoot");
+  }
+  for (const field of [
+    "linkedWorktree",
+    "sparse",
+    "shallow",
+    "branch",
+    "insideWorktree",
+    "upstreamRef",
+    "upstreamCommit"
+  ]) {
+    if ((verificationContextManifest.git?.[field] ?? null)
+      !== (completionContextManifest.git?.[field] ?? null)) {
+      verificationReasons.push(field);
+    }
+  }
+  if (stableDigest(verificationContextManifest.projectMarkers)
+    !== stableDigest(completionContextManifest.projectMarkers)) {
+    verificationReasons.push("projectMarkers");
+  }
+  const verificationChangedPaths = observeChangedPaths(
+    completionContextManifest,
+    verificationContextManifest,
+    { observer: "verification" }
+  );
+  verificationReasons.push(...evaluateScope(
+    verificationChangedPaths,
+    completionObservation.envelope.scope
+  ));
+  if (verificationReasons.length) {
+    spawnIdempotencyStateError(
+      "Verified terminal write baseline disagrees with its completion context."
+    );
+  }
+  assertContextCompatible(
+    completionObservation.binding.expectedExecutionRoot,
+    verificationContextManifest,
+    { mode: "resume" }
+  );
+  return completionObservation;
+}
+
 export function assertDurableSpawnRequestBinding(job, env = process.env) {
   const spawn = job?.request?.spawn;
   const executionRoot = spawn?.executionRoot;
@@ -9436,11 +10162,25 @@ export function assertDurableSpawnRequestBinding(job, env = process.env) {
       || control.controlWorkspaceId !== job.controlWorkspaceId) {
       spawnIdempotencyStateError("Durable worker spawn execution root no longer matches its control workspace.");
     }
-    acceptedContext = assertContextCompatible(
-      executionRoot,
-      job.request?.contextManifest,
-      { mode: isGrantedFollowup ? "resume" : "execute" }
-    );
+    const managedWriteAuthority = hasManagedWriteAuthority(job);
+    if (managedWriteAuthority
+      && job.request.spawn.dispatch.state === "provider-started") {
+      acceptedContext =
+        assertManagedWriteReplayContext(job, env).requestContextManifest;
+    } else if (managedWriteAuthority) {
+      const authority = assertManagedWriteImmutableAuthority(job, env);
+      acceptedContext = assertContextCompatible(
+        executionRoot,
+        authority.requestContextManifest,
+        { mode: "execute" }
+      );
+    } else {
+      acceptedContext = assertContextCompatible(
+        executionRoot,
+        job.request?.contextManifest,
+        { mode: isGrantedFollowup ? "resume" : "execute" }
+      );
+    }
   } catch (error) {
     if (error instanceof CompanionError) throw error;
     spawnIdempotencyStateError("Durable worker spawn context could not be verified.");

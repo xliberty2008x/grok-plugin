@@ -69,6 +69,7 @@ import { codexTranscriptToClaude, createAnonymousTranscript, disposeConvertedTra
 import {
   appendLifecycleEvent,
   assertContextCompatible,
+  assertContextManifestIntegrity,
   assertTaskContextReady,
   boundPathEvidence,
   buildRuntimeEvidence,
@@ -553,7 +554,9 @@ async function terminateProviderCleanupTarget(root, job) {
 }
 
 function captureTerminalEvidence(root, job, executionStatus) {
-  const preContext = job.request?.contextManifest || null;
+  const preContext = job.request?.contextManifest
+    ? assertContextManifestIntegrity(job.request.contextManifest)
+    : null;
   let postContext = null;
   try { postContext = captureContextManifest(root); } catch {}
   const changedPaths = preContext && postContext ? observeChangedPaths(preContext, postContext) : [];
@@ -2850,7 +2853,13 @@ async function handleRecordVerification(raw) {
     if (job.jobClass !== "task") throw new CompanionError("E_USAGE", `Job ${job.id} is not a task job.`);
     if (!terminal(job)) throw new CompanionError("E_JOB_ACTIVE", `Job ${job.id} is still ${job.status}; wait before recording host verification.`);
     if (!job.completionContextManifest) throw new CompanionError("E_CONTEXT_DRIFT", `Job ${job.id} has no completion context to reconcile.`);
-    if (job.verificationContextManifest) throw new CompanionError("E_STATE", `Job ${job.id} already has a host verification baseline; record verification once per job.`);
+    const completionContextManifest = assertContextManifestIntegrity(
+      job.completionContextManifest
+    );
+    if (job.verificationContextManifest) {
+      assertContextManifestIntegrity(job.verificationContextManifest);
+      throw new CompanionError("E_STATE", `Job ${job.id} already has a host verification baseline; record verification once per job.`);
+    }
     const activeWriter = listJobs(root).find((candidate) => candidate.id !== job.id && !terminal(candidate) && candidate.write);
     if (activeWriter) throw new CompanionError("E_JOB_ACTIVE", `Cannot record verification while writer ${activeWriter.id} is active.`);
     const record = parseVerificationRecord(input, job.request?.envelope?.requiredVerification || []);
@@ -2859,7 +2868,7 @@ async function handleRecordVerification(raw) {
     // pytest/Python cache drift from host checks is not treated as out-of-scope.
     const verificationContextManifest = captureContextManifest(root);
     const observedChangedPaths = observeChangedPaths(
-      job.completionContextManifest,
+      completionContextManifest,
       verificationContextManifest,
       { observer: "verification" }
     );
@@ -4276,6 +4285,9 @@ async function main() {
       const postContext = (() => { try { return captureContextManifest(root); } catch { return null; } })();
       updateJob(root, id, (current) => {
         if (terminal(current)) return current;
+        const requestContextManifest = current.request?.contextManifest
+          ? assertContextManifestIntegrity(current.request.contextManifest)
+          : null;
         current.workerAuthorization = null;
         current.status = "cancelled";
         current.phase = "cancelled";
@@ -4289,10 +4301,10 @@ async function main() {
           ...(current.result || {}),
           hostVerification: "not_run",
           runtimeEvidence: buildRuntimeEvidence({
-            preContext: current.request?.contextManifest || null,
+            preContext: requestContextManifest,
             postContext,
-            changedPaths: postContext && current.request?.contextManifest
-              ? observeChangedPaths(current.request.contextManifest, postContext)
+            changedPaths: postContext && requestContextManifest
+              ? observeChangedPaths(requestContextManifest, postContext)
               : [],
             executionStatus: "cancelled"
           })

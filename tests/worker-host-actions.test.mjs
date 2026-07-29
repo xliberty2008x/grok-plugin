@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import crypto from "node:crypto";
 
 import {
+  assertContextCompatible,
   buildTaskEnvelope,
   buildWorkerReport,
   captureContextManifest
@@ -894,7 +895,14 @@ test("a granted role admits one child with a child-bound receipt and normal laun
   assert.equal(replay.handle.id, child.id);
   assert.equal(fs.existsSync(followupSidecar), true);
   const equivalentVerificationContext = captureContextManifest(fixture.root);
-  assert.equal(equivalentVerificationContext.digest, finalContext.digest);
+  assert.notEqual(equivalentVerificationContext.digest, finalContext.digest);
+  assert.doesNotThrow(
+    () => assertContextCompatible(
+      fixture.root,
+      finalContext,
+      { mode: "resume" }
+    )
+  );
   updateJob(fixture.root, fixture.workerId, (parent) => ({
     ...parent,
     verificationContextManifest: equivalentVerificationContext
