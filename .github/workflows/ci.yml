@@ -43,15 +43,47 @@ jobs:
         run: npm run test:pty-ingress
 
   validate-and-test:
-    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    name: ${{ matrix.os }} / Node ${{ matrix.node }} / shard ${{ matrix.shard }}/3
     runs-on: ${{ matrix.os }}
-    # The full 1,027-test zero-skip suite can exceed 30 minutes on hosted
-    # macOS Node 18 under load; keep the gate intact and give it bounded headroom.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [18.18.2, 22.x]
+        shard: [1, 2, 3]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Validate release structure
+        if: matrix.shard == 1
+        run: npm run validate
+
+      - name: Run deterministic zero-skip shard
+        # Includes three concurrently accepted structured read jobs, distinct
+        # isolated profile paths, terminal cleanup, and bounded exit diagnostics.
+        # Installed-host and authenticated-provider tests remain separate
+        # qualification boundaries and are not silently counted as skips.
+        run: npm run test:deterministic -- --shard=${{ matrix.shard }}/3
+
+  windows-neutral:
+    name: windows-latest / Node ${{ matrix.node }}
+    runs-on: windows-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
         node: [18.18.2, 22.x]
 
     steps:
@@ -70,19 +102,10 @@ jobs:
       - name: Validate release structure
         run: npm run validate
 
-      - name: Run deterministic zero-skip suite (Linux and macOS)
-        if: runner.os != 'Windows'
-        # Includes three concurrently accepted structured read jobs, distinct
-        # isolated profile paths, terminal cleanup, and bounded exit diagnostics.
-        # Installed-host and authenticated-provider tests remain separate
-        # qualification boundaries and are not silently counted as skips.
-        run: npm run test:deterministic
-
       # The fake Grok executable is a POSIX process fixture. Until a genuine
       # shell:false Windows fixture is added, Windows provider behavior remains
       # explicitly unverified rather than being simulated inaccurately.
       - name: Run provider-neutral tests (Windows; provider unverified)
-        if: runner.os == 'Windows'
         run: node --test tests/windows-neutral.test.mjs
 
   # Hosted GitHub runners do not provide the Codex plugin CLI. Repositories
@@ -160,17 +183,19 @@ jobs:
   ci-required:
     name: CI required
     if: always()
-    needs: [pty-ingress, validate-and-test]
+    needs: [pty-ingress, validate-and-test, windows-neutral]
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
     steps:
       - name: Require hosted CI job groups
+        env:
+          PTY_INGRESS_RESULT: ${{ needs['pty-ingress'].result }}
+          DETERMINISTIC_RESULT: ${{ needs['validate-and-test'].result }}
+          WINDOWS_RESULT: ${{ needs['windows-neutral'].result }}
         run: |
-          echo "pty-ingress: ${{ needs.pty-ingress.result }}"
-          echo "validate-and-test: ${{ needs.validate-and-test.result }}"
-          if [ "${{ needs.pty-ingress.result }}" != "success" ] || \
-             [ "${{ needs.validate-and-test.result }}" != "success" ]; then
-            echo "::error::CI required failed: pty-ingress and validate-and-test must both succeed"
+          if [ "$PTY_INGRESS_RESULT" != "success" ] ||
+             [ "$DETERMINISTIC_RESULT" != "success" ] ||
+             [ "$WINDOWS_RESULT" != "success" ]; then
             exit 1
           fi

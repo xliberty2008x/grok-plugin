@@ -245,6 +245,7 @@ test("deterministic runner executes files sequentially and aggregates exact zero
   let output = "";
   let diagnostic = "";
   const files = ["tests/first.test.mjs", "tests/second.test.mjs"];
+  const times = [100, 125, 200, 250];
   const status = runDeterministicTestFiles({
     files,
     root: "/exact/root",
@@ -261,6 +262,9 @@ test("deterministic runner executes files sequentially and aggregates exact zero
         stderr: ""
       };
     },
+    now() {
+      return times.shift();
+    },
     stdout: { write(value) { output += value; } },
     stderr: { write(value) {
       diagnostic += value;
@@ -270,13 +274,21 @@ test("deterministic runner executes files sequentially and aggregates exact zero
   assert.equal(status, 0);
   assert.equal(
     diagnostic,
-    "Deterministic test child 1 started.\nDeterministic test child 2 started.\n"
+    [
+      "Deterministic test child 1 started.",
+      "Deterministic test child 1 completed in 25 ms.",
+      "Deterministic test child 2 started.",
+      "Deterministic test child 2 completed in 50 ms.",
+      ""
+    ].join("\n")
   );
   assert.deepEqual(timeline, [
     "Deterministic test child 1 started.\n",
     "run-1",
+    "Deterministic test child 1 completed in 25 ms.\n",
     "Deterministic test child 2 started.\n",
-    "run-2"
+    "run-2",
+    "Deterministic test child 2 completed in 50 ms.\n"
   ]);
   assert.deepEqual(calls.map((call) => call.args), files.map((file) => [
     "--test",
