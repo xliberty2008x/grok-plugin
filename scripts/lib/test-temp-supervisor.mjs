@@ -15,6 +15,7 @@ const OUTPUT_LIMIT_EXIT_CODE = 125;
 const CONTAINMENT_FAILURE_EXIT_CODE = 126;
 const OWNERSHIP_TOKEN_ENV = "GROK_PLUGIN_TEST_SUPERVISOR_TOKEN";
 const PS_PATHS = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
+let provenLinuxVisibilityToken = null;
 
 function usage() {
   return "Usage: node test-temp-supervisor.mjs --timeout-ms <ms> -- <node> <args...>\n";
@@ -113,6 +114,9 @@ function ownedProcessIds(token, tempIdentity) {
   const entries = ownershipEnvironmentEntries(token, tempIdentity);
   if (process.platform === "win32") return [];
   if (process.platform === "linux") {
+    if (provenLinuxVisibilityToken !== token) {
+      throw new Error("Owned-process visibility is unavailable.");
+    }
     const ids = [];
     for (const entry of fs.readdirSync("/proc", { withFileTypes: true })) {
       if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
@@ -121,15 +125,9 @@ function ownedProcessIds(token, tempIdentity) {
         const pid = Number(entry.name);
         if (environmentProvesOwnership(environment, entries, { pid })) ids.push(pid);
       } catch {
-        // A vanished process is benign. An unreadable current-user process makes
-        // ownership visibility ambiguous and therefore fails containment closed.
-        try {
-          const status = fs.readFileSync(path.join("/proc", entry.name, "status"), "utf8");
-          const uid = Number(/^Uid:\s+(\d+)/mu.exec(status)?.[1]);
-          if (uid === process.getuid()) throw new Error("Owned-process visibility is unavailable.");
-        } catch (error) {
-          if (error?.message === "Owned-process visibility is unavailable.") throw error;
-        }
+        // A vanished or protected unrelated process is benign after the
+        // tagged-child probe below has proved that this supervisor can inspect
+        // the exact class of processes it owns.
       }
     }
     return ids;
@@ -161,6 +159,74 @@ function ownedProcessIds(token, tempIdentity) {
     .filter((line) => marker.test(line))
     .map((line) => Number(line.trim().match(/^(\d+)/u)?.[1]))
     .filter((pid) => Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid);
+}
+
+async function proveLinuxOwnedProcessVisibility(token, tempIdentity) {
+  if (process.platform !== "linux") return true;
+  const entries = ownershipEnvironmentEntries(token, tempIdentity);
+  let probe;
+  try {
+    probe = spawn(process.execPath, [
+      "--eval",
+      "setInterval(() => {}, 1000)"
+    ], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        [OWNERSHIP_TOKEN_ENV]: token,
+        ...(tempIdentity ? {
+          TMPDIR: tempIdentity,
+          TMP: tempIdentity,
+          TEMP: tempIdentity,
+          GROK_PLUGIN_TEST_TEMP_ROOT: tempIdentity
+        } : {})
+      },
+      shell: false,
+      detached: false,
+      stdio: "ignore"
+    });
+  } catch {
+    return false;
+  }
+
+  let probeErrored = false;
+  const probeClosed = new Promise((resolve) => {
+    probe.once("close", () => resolve(true));
+    probe.once("error", () => {
+      probeErrored = true;
+      resolve(false);
+    });
+  });
+  let visible = false;
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline && probe.pid && !probeErrored) {
+    try {
+      const environment = fs.readFileSync(path.join("/proc", String(probe.pid), "environ"));
+      if (environmentProvesOwnership(environment, entries, {
+        pid: probe.pid,
+        supervisorPid: process.pid
+      })) {
+        visible = true;
+        break;
+      }
+    } catch (error) {
+      if (error?.code === "ENOENT") break;
+    }
+    await wait(10);
+  }
+
+  try {
+    probe.kill("SIGKILL");
+  } catch (error) {
+    if (error?.code !== "ESRCH") visible = false;
+  }
+  const closed = await Promise.race([
+    probe.exitCode != null || probe.signalCode != null
+      ? Promise.resolve(true)
+      : probeClosed,
+    wait(1_000).then(() => false)
+  ]);
+  return visible && closed;
 }
 
 function signalOwnedProcesses(token, tempIdentity, signal) {
@@ -227,6 +293,12 @@ async function main() {
 
   const ownershipToken = randomUUID();
   const tempIdentity = privateTempIdentity();
+  if (!await proveLinuxOwnedProcessVisibility(ownershipToken, tempIdentity)) {
+    return CONTAINMENT_FAILURE_EXIT_CODE;
+  }
+  if (process.platform === "linux") {
+    provenLinuxVisibilityToken = ownershipToken;
+  }
   try {
     ownedProcessIds(ownershipToken, tempIdentity);
   } catch {
