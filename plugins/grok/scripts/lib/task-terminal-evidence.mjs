@@ -77,7 +77,7 @@ function boundedPrivateSecondaryDiagnostic(error) {
     code: String(payload.code || "E_PROVIDER_EXIT").slice(0, 64),
     message: redactText(
       payload.message || "Worker finalization failed."
-    ).slice(0, 500)
+    ).slice(0, 256)
   };
 }
 

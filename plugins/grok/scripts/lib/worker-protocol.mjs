@@ -1150,6 +1150,11 @@ function projectPublicErrorDetails(code, value, { error = null } = {}) {
   if (code === "E_CAPABILITY") {
     if (Array.isArray(value.available)) projected.available = publicStringList(value.available);
     if (Array.isArray(value.missing)) projected.missing = publicStringList(value.missing);
+  } else if (code === "E_PROCESS_IDENTITY") {
+    if (typeof value.workerId === "string"
+      && WORKER_ID_PATTERN.test(value.workerId)) {
+      projected.workerId = value.workerId;
+    }
   } else if (code === "E_PROVIDER_EXIT") {
     if (Number.isSafeInteger(value.code)) projected.code = value.code;
     if (PUBLIC_PROCESS_SIGNAL_NAMES.has(value.signal)) {

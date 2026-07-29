@@ -3088,7 +3088,10 @@ async function startJob(root, job, background, { announce = false } = {}) {
       finished.error?.code || "E_PROCESS_IDENTITY",
       finished.error?.message
         || "Worker launch cleanup remains unproven.",
-      finished.error?.details
+      {
+        ...(finished.error?.details || {}),
+        workerId: finished.id
+      }
     );
   }
   let lastRecovery = 0;
@@ -5222,6 +5225,12 @@ main().catch((error) => {
     process.stdout.write(`${JSON.stringify({ ok: false, error: payload }, null, 2)}\n`);
   } else {
     process.stderr.write(`${payload.code}: ${payload.message}\n`);
+    if (payload.details?.workerId) {
+      process.stderr.write(
+        `Job: ${payload.details.workerId}\n`
+        + `Check: ${hostCommand("status", payload.details.workerId)}\n`
+      );
+    }
   }
   process.exitCode = exitCodeFor(error);
 });

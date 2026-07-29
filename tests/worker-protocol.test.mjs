@@ -543,6 +543,43 @@ test("legacy cleanup diagnostics map selectively without swallowing ordinary inp
   });
 });
 
+test("foreground process-identity errors expose only a canonical recovery worker id", () => {
+  const workerId = `task-${"a".repeat(24)}`;
+  const projected = projectWorkerError({
+    code: "E_PROCESS_IDENTITY",
+    message: "kill EPERM for /private/tmp/provider",
+    details: {
+      workerId,
+      pid: 441001,
+      secondaryDiagnostic: {
+        code: "EPERM",
+        message: "kill EPERM for /private/tmp/provider"
+      }
+    }
+  });
+  assert.deepEqual(projected, {
+    code: "E_PROCESS_IDENTITY",
+    message: "Process ownership verification failed.",
+    details: { workerId }
+  });
+  assertConforms("WorkerError", {
+    workerProtocolVersion: WORKER_PROTOCOL_VERSION,
+    errorSchemaVersion: WORKER_ERROR_SCHEMA_VERSION,
+    ...projected
+  });
+  assert.deepEqual(projectWorkerError({
+    code: "E_PROCESS_IDENTITY",
+    message: "kill EPERM for /private/tmp/provider",
+    details: {
+      workerId: "../../private-worker-id",
+      pid: 441001
+    }
+  }), {
+    code: "E_PROCESS_IDENTITY",
+    message: "Process ownership verification failed."
+  });
+});
+
 test("current process uncertainty outranks a pending safety primary for sanitization", () => {
   const diagnostic =
     "Cleanup retry failed with EACCES for provider_pid='+441001'.";

@@ -25,6 +25,7 @@ import {
 import { launchContractDigest } from "../plugins/grok/scripts/lib/worker-launch-contract.mjs";
 import {
   captureTerminalEvidence,
+  normalizeTerminalProcessSignalError,
   selectTaskTerminalError
 } from "../plugins/grok/scripts/lib/task-terminal-evidence.mjs";
 
@@ -1438,6 +1439,109 @@ test("static human launch surfaces use public worker projections", () => {
     liveBlock,
     /sanitizeDisplayText\(String\(phase\)\)/
   );
+});
+
+test("foreground launch-unsettled failures retain a public durable job handle", (t) => {
+  const launcherHook = path.join(
+    tempDir("grok-launch-unsettled-hook-"),
+    "force-launcher-exit.cjs"
+  );
+  fs.writeFileSync(
+    launcherHook,
+    [
+      'if (process.argv.includes("--launch-worker")) {',
+      '  process.stderr.write("forced launcher exit\\n");',
+      "  process.exit(42);",
+      "}",
+      ""
+    ].join("\n"),
+    { mode: 0o600 }
+  );
+  const launchEnv = (env) => ({
+    ...env,
+    NODE_OPTIONS: [
+      env.NODE_OPTIONS,
+      `--require=${launcherHook}`
+    ].filter(Boolean).join(" ")
+  });
+  const forcedLauncherFixture = () => {
+    const runtime = fixture();
+    const pinned = installPinnedFakeCompanion(runtime.fake, runtime.env);
+    t.after(pinned.cleanup);
+    const source = fs.readFileSync(pinned.companionScript, "utf8");
+    const needle = "const allowed = new Set([";
+    assert.equal(source.split(needle).length - 1, 1);
+    fs.writeFileSync(
+      pinned.companionScript,
+      source.replace(needle, 'const allowed = new Set(["NODE_OPTIONS", '),
+      "utf8"
+    );
+    return {
+      ...runtime,
+      env: launchEnv(pinned.env),
+      companionScript: pinned.companionScript
+    };
+  };
+
+  const jsonRoot = initRepo();
+  const jsonFixture = forcedLauncherFixture();
+  const jsonFailure = runCompanion(
+    ["task", "--wait", "retain the unsettled JSON handle", "--json"],
+    {
+      cwd: jsonRoot,
+      env: jsonFixture.env,
+      companionScript: jsonFixture.companionScript
+    }
+  );
+  const jsonError = parseError(jsonFailure, "E_PROCESS_IDENTITY");
+  assert.match(jsonError.details.workerId, /^task-[a-f0-9]{16,64}$/);
+  const jsonStored = persistedJobs(jsonFixture.pluginData);
+  assert.equal(jsonStored.length, 1);
+  assert.equal(jsonStored[0].id, jsonError.details.workerId);
+  assert.equal(jsonStored[0].phase, "launch-unsettled");
+  assert.equal(jsonStored[0].terminal, undefined);
+
+  const humanRoot = initRepo();
+  const humanFixture = forcedLauncherFixture();
+  const humanFailure = runCompanion(
+    ["task", "--wait", "retain the unsettled human handle"],
+    {
+      cwd: humanRoot,
+      env: humanFixture.env,
+      companionScript: humanFixture.companionScript
+    }
+  );
+  assert.notEqual(humanFailure.status, 0);
+  const humanStored = persistedJobs(humanFixture.pluginData);
+  assert.equal(humanStored.length, 1);
+  assert.equal(humanStored[0].phase, "launch-unsettled");
+  assert.match(
+    humanFailure.stderr,
+    new RegExp(`Job: ${humanStored[0].id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)
+  );
+  assert.match(
+    humanFailure.stderr,
+    new RegExp(
+      `Check: /grok:status ${humanStored[0].id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`
+    )
+  );
+});
+
+test("terminal process secondary diagnostics use the authoritative 256-character cap", () => {
+  const normalized = normalizeTerminalProcessSignalError(
+    new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Verified owned process signalling could not be completed.",
+      {
+        secondaryDiagnostic: {
+          code: "EPERM",
+          message: "x".repeat(500)
+        }
+      }
+    )
+  );
+  assert.equal(normalized.details.secondaryDiagnostic.code, "EPERM");
+  assert.equal(normalized.details.secondaryDiagnostic.message, "x".repeat(256));
 });
 
 test("human CLI process diagnostics stay behind public status, result, review, and table projections", () => {
