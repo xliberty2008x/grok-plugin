@@ -214,26 +214,20 @@ export function runDeterministicTestFiles({
         }
       }
 
+      // A supervisor signal, outer timeout, or explicit containment failure is
+      // terminal: cleanup ownership is unproven and the fixed diagnostic above
+      // is the only safe detail to expose.
       if (containmentUnproven) break;
 
       // Never forward or interpolate raw child stderr, spawn error details, paths,
       // signals, or invalid stdout. Only fixed, ordinal diagnostics leave here.
-      if (result?.status === 124 || result?.error?.code === "ETIMEDOUT") {
+      if (result?.status === 124) {
         stderr.write(`Deterministic test child ${child} timed out.\n`);
-        failed = true;
-        continue;
-      }
-      if (result?.status === CONTAINMENT_FAILURE_EXIT_CODE) {
         failed = true;
         continue;
       }
       if (result?.error) {
         stderr.write(`Deterministic test child ${child} could not start.\n`);
-        failed = true;
-        continue;
-      }
-      if (result?.signal) {
-        stderr.write(`Deterministic test child ${child} ended by a signal.\n`);
         failed = true;
         continue;
       }
