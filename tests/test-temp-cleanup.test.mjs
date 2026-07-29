@@ -11,6 +11,7 @@ import { cleanupExitCode, parseCleanupArgs } from "../scripts/cleanup-test-temp.
 import { runDeterministicTestFiles } from "../scripts/lib/deterministic-test-runner.mjs";
 import {
   environmentProvesOwnership,
+  linuxKnownProcessIdentityMatches,
   linuxProcessGroupMemberFromStat,
   linuxProcessIdentityFromStat,
   linuxProcessProvesLiveOwnership
@@ -208,11 +209,13 @@ test("Linux fallback identities distinguish a live PID from exit or PID reuse", 
     `42 (owned worker) ${live.join(" ")}`
   );
   assert.equal(knownIdentity, "42:987654");
-  assert.notEqual(
-    linuxProcessIdentityFromStat(42, `42 (reused worker) ${reused.join(" ")}`),
-    knownIdentity
+  const reusedIdentity = linuxProcessIdentityFromStat(
+    42,
+    `42 (reused worker) ${reused.join(" ")}`
   );
-  assert.equal(linuxProcessIdentityFromStat(42, "gone"), null);
+  assert.equal(linuxKnownProcessIdentityMatches(knownIdentity, knownIdentity), true);
+  assert.equal(linuxKnownProcessIdentityMatches(knownIdentity, reusedIdentity), false);
+  assert.equal(linuxKnownProcessIdentityMatches(knownIdentity, null), false);
 });
 
 test("process start tokens use a stable C locale", () => {

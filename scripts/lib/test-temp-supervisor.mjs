@@ -175,6 +175,14 @@ export function linuxProcessProvesLiveOwnership(
   );
 }
 
+export function linuxKnownProcessIdentityMatches(knownIdentity, currentIdentity) {
+  return (
+    typeof knownIdentity === "string"
+    && knownIdentity.length > 0
+    && currentIdentity === knownIdentity
+  );
+}
+
 function linuxProcessIdentity(pid) {
   try {
     const stat = fs.readFileSync(path.join("/proc", String(pid), "stat"), "utf8");
@@ -261,8 +269,12 @@ function ownedProcessIds(token, tempIdentity) {
         const knownIdentity = knownLinuxOwnedProcesses.get(pid);
         if (knownIdentity) {
           const currentIdentity = linuxProcessIdentity(pid);
-          if (currentIdentity === knownIdentity) {
-            throw new Error("Owned-process visibility became unavailable.");
+          if (linuxKnownProcessIdentityMatches(knownIdentity, currentIdentity)) {
+            // This exact PID + start identity was already observed with the
+            // random ownership token. Keep treating it as owned if a live
+            // process later makes /proc/<pid>/environ unreadable.
+            ids.push(pid);
+            continue;
           }
           knownLinuxOwnedProcesses.delete(pid);
         }
