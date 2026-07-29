@@ -13,7 +13,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 
-import { CompanionError } from "./errors.mjs";
+import { CompanionError, asErrorPayload } from "./errors.mjs";
 import {
   assertExecutableAttestation,
   sameExecutableAttestation
@@ -99,6 +99,12 @@ import {
   createProvisioningJournal,
   transitionProvisioningJournal
 } from "./worker-execution-binding.mjs";
+import {
+  captureTerminalEvidence,
+  normalizeTerminalProcessSignalError,
+  selectTaskTerminalError,
+  terminalTaskProgress
+} from "./task-terminal-evidence.mjs";
 import {
   DEFAULT_DISPATCH_LEASE_MS,
   WORKER_DISPATCH_OUTBOX_SCHEMA_VERSION,
@@ -1056,11 +1062,11 @@ function normalizeCancellationReceipt(receipt, { workerId, keyDigest }) {
   if (!CANCELLATION_RECEIPT_STATUSES.has(receipt.status)) {
     cancellationStateError("Cancellation recovery receipt status is malformed.");
   }
-  if (typeof receipt.requestAcceptedAt !== "string") {
+  if (!validIsoTimestamp(receipt.requestAcceptedAt)) {
     cancellationStateError("Cancellation recovery receipt timestamp is malformed.");
   }
   for (const field of ["processGroupGoneAt", "terminalRecordCommittedAt"]) {
-    if (receipt[field] !== null && typeof receipt[field] !== "string") {
+    if (receipt[field] !== null && !validIsoTimestamp(receipt[field])) {
       cancellationStateError("Cancellation recovery receipt timestamp is malformed.");
     }
   }
@@ -3103,28 +3109,42 @@ export function transitionWorkerDispatch({
         return next;
       }
       const cancelled = error?.code === "E_CANCELLED";
-      return scrubStoredJob({
-        ...next,
-        status: cancelled ? "cancelled" : "failed",
-        phase: cancelled ? "cancelled" : "failed",
-        completedAt: latest.completedAt || transitionedAt,
-        summary: cancelled ? "Cancelled" : "Worker launch failed",
-        progress: cancelled ? "Cancellation was confirmed before provider startup." : "Worker launch failed before provider startup",
-        error: latest.error || error || {
-          code: "E_WORKER_LOST",
-          message: "Could not launch the isolated Grok worker."
+      const priorError = error || {
+        code: "E_WORKER_LOST",
+        message: "Could not launch the isolated Grok worker."
+      };
+      const observed = reconcileCleanupSafeTerminalObservation(
+        next,
+        {
+          status: cancelled ? "cancelled" : "failed",
+          phase: cancelled ? "cancelled" : "failed",
+          completedAt: latest.completedAt || transitionedAt,
+          error: priorError,
+          summary: cancelled ? "Cancelled" : "Worker launch failed"
         },
+        {
+          cleanupError: latest.error || null
+        }
+      );
+      const pending = observed.pending;
+      return scrubStoredJob({
+        ...observed.job,
+        status: pending.status,
+        phase: pending.phase,
+        completedAt: pending.completedAt,
+        summary: pending.summary,
+        progress: terminalTaskProgress(pending.status, pending.error),
+        error: pending.error || null,
         workerAuthorization: null,
         result: {
-          ...(latest.result || {}),
-          hostVerification: latest.result?.hostVerification || "not_run",
+          ...(observed.job.result || {}),
           taskRuntimeCleaned: runtimeCleanup.ok,
-          ...(cancelled ? { stopReason: "cancelled" } : {})
+          ...(pending.status === "cancelled" ? { stopReason: "cancelled" } : {})
         },
         lifecycleEvents: appendLifecycleEvent(
           latest.lifecycleEvents || [],
           "blocked",
-          error?.message || "Worker launch failed before provider startup"
+          pending.error?.message || "Worker launch failed before provider startup"
         )
       });
     });
@@ -3636,6 +3656,80 @@ export function recordWorkerProviderRotationNoChild({
   });
 }
 
+function cleanupSignalSecondaryDiagnostic(error) {
+  const diagnostic = error?.code === "E_PROCESS_IDENTITY"
+    && isPlainRecord(error.details?.secondaryDiagnostic)
+    ? error.details.secondaryDiagnostic
+    : null;
+  if (!diagnostic) return null;
+  const rawCode = String(diagnostic.code || "");
+  if (rawCode.toUpperCase() === "ESRCH") return null;
+  return Object.freeze({
+    code: /^[A-Z][A-Z0-9_]{0,63}$/.test(rawCode)
+      ? rawCode.slice(0, 64)
+      : "UNKNOWN",
+    message: String(
+      diagnostic.message || "Process signalling failed."
+    ).slice(0, 256)
+  });
+}
+
+function reconcileTerminalCleanupSignal(
+  terminalIntent,
+  cleanupError,
+  { completedAt = now(), priorErrors = [] } = {}
+) {
+  const signalErrors = [
+    terminalIntent?.error,
+    ...(Array.isArray(priorErrors) ? priorErrors : []),
+    cleanupError
+  ]
+    .map((error) => normalizeTerminalProcessSignalError(error))
+    // E_PROCESS_IDENTITY is also the fail-closed code for several ownership
+    // and runtime-cleanup blockers. Only a bounded secondary diagnostic proves
+    // this record came from an actual non-ESRCH signal failure and may therefore
+    // outrank the provider's prior terminal outcome.
+    .filter((error) => (
+      error?.code === "E_PROCESS_IDENTITY"
+      && cleanupSignalSecondaryDiagnostic(error) !== null
+    ));
+  const signalError = signalErrors[0];
+  if (!signalError) return terminalIntent;
+  const secondaryDiagnostic =
+    cleanupSignalSecondaryDiagnostic(signalError);
+  if (["E_CONTEXT_DRIFT", "E_SCOPE_VIOLATION"].includes(
+    terminalIntent?.error?.code
+  )) {
+    const priorDetails = isPlainRecord(terminalIntent.error.details)
+      ? terminalIntent.error.details
+      : {};
+    return Object.freeze({
+      ...terminalIntent,
+      error: Object.freeze({
+        ...terminalIntent.error,
+        details: Object.freeze({
+          ...priorDetails,
+          ...(secondaryDiagnostic ? { secondaryDiagnostic } : {})
+        })
+      })
+    });
+  }
+  const message = "Verified owned process signalling could not be completed.";
+  return Object.freeze({
+    status: "failed",
+    phase: "failed",
+    completedAt,
+    error: Object.freeze({
+      code: "E_PROCESS_IDENTITY",
+      message,
+      ...(secondaryDiagnostic
+        ? { details: Object.freeze({ secondaryDiagnostic }) }
+        : {})
+    }),
+    summary: message
+  });
+}
+
 /**
  * Atomically settle a dispatch that lost its exact controller/worker process
  * before durable provider startup. Recovery never invents or replays work.
@@ -3750,19 +3844,34 @@ export function settleUnstartedDispatchLoss({
       const completedCleanup = runSuccessfulRuntimeCleanup(runtimeCleanup, latest);
       const completedAt = now();
       const latestDispatch = latest.request.spawn.dispatch;
-      const message = explicitIntent?.error?.message
+      const observed = reconcileCleanupSafeTerminalObservation(
+        latest,
+        explicitIntent || {
+          status: "failed",
+          phase: "lost",
+          completedAt,
+          error: {
+            code: "E_WORKER_LOST",
+            message: "Worker dispatch process exited before provider startup; the prompt was not replayed."
+          },
+          summary: "Lost"
+        },
+        { cleanupError: latest.error }
+      );
+      const effectiveIntent = observed.pending;
+      const message = effectiveIntent?.error?.message
         || "Worker dispatch process exited before provider startup; the prompt was not replayed.";
-      const status = explicitIntent?.status || "failed";
-      const phase = explicitIntent?.phase || "lost";
+      const status = effectiveIntent.status;
+      const phase = effectiveIntent.phase;
       return scrubStoredJob({
-        ...latest,
+        ...observed.job,
         status,
         phase,
-        summary: explicitIntent?.summary || (status === "cancelled" ? "Cancelled" : "Lost"),
-        progress: message,
-        completedAt,
+        summary: effectiveIntent?.summary || (status === "cancelled" ? "Cancelled" : "Lost"),
+        progress: terminalTaskProgress(status, effectiveIntent.error),
+        completedAt: effectiveIntent.completedAt || completedAt,
         heartbeatAt: completedAt,
-        error: explicitIntent?.error || { code: "E_WORKER_LOST", message },
+        error: effectiveIntent.error || { code: "E_WORKER_LOST", message },
         workerAuthorization: null,
         pendingTerminal: undefined,
         request: {
@@ -3794,15 +3903,14 @@ export function settleUnstartedDispatchLoss({
           }
         },
         result: {
-          ...(latest.result || {}),
-          hostVerification: latest.result?.hostVerification || "not_run",
+          ...(observed.job.result || {}),
           stopReason: status === "cancelled" ? "cancelled" : "reconciler-lost",
           taskRuntimeCleaned: completedCleanup.ok,
           ...(completedCleanup.ok
             ? { privacyWarning: undefined }
             : { privacyWarning: completedCleanup.warning || "Runtime cleanup remained incomplete after dispatch loss." }),
           runtimeEvidence: {
-            ...(latest.result?.runtimeEvidence || {}),
+            ...(observed.job.result?.runtimeEvidence || {}),
             reconciler: {
               privilege: "host-trusted-reconciler",
               replayedPrompt: false,
@@ -3924,16 +4032,28 @@ export function settlePreProviderWorkerFinalization({
         )
       };
       if (runtimeCleanup.ok) {
+        const observed = reconcileCleanupSafeTerminalObservation(
+          next,
+          intendedTerminal,
+          { cleanupError: latest.error }
+        );
+        const pending = observed.pending;
         const terminalized = {
-          ...next,
-          status: intendedStatus,
-          phase: intendedTerminal.phase,
-          completedAt: intendedTerminal.completedAt,
-          error: intendedTerminal.error || null,
-          summary: intendedTerminal.summary || intendedTerminal.error?.message || null,
-          progress: intendedStatus === "cancelled"
-            ? "Cancellation completed before provider startup"
-            : "Worker failed before provider startup"
+          ...observed.job,
+          status: pending.status,
+          phase: pending.phase,
+          completedAt: pending.completedAt,
+          error: pending.error || null,
+          summary: pending.summary || pending.error?.message || null,
+          progress: terminalTaskProgress(pending.status, pending.error),
+          lifecycleEvents: appendLifecycleEvent(
+            latest.lifecycleEvents || [],
+            pending.status === "completed" ? "checkpoint" : "blocked",
+            pending.error?.message
+              || pending.summary
+              || "Task runtime cleanup completed before provider startup.",
+            { replayedPrompt: false }
+          )
         };
         delete terminalized.pendingTerminal;
         return scrubStoredJob(terminalized);
@@ -4041,31 +4161,345 @@ export function settleWriteArtifactAfterRuntimeCleanup({
   }
 }
 
-function reconcileProviderStartedWriteCompletion(job, pending, env) {
-  if (job?.write !== true || !hasManagedWritePostBinding(job)) {
-    return Object.freeze({ job, pending });
-  }
-  const providerCompletionContext = assertContextManifestIntegrity(
-    job.completionContextManifest
-  );
-  const providerRuntimeContext = job.result?.runtimeEvidence?.postContext;
-  if (!providerRuntimeContext
-    || providerRuntimeContext.manifestId !== providerCompletionContext.manifestId
-    || providerRuntimeContext.digest !== providerCompletionContext.digest) {
-    throw new CompanionError(
-      "E_STATE",
-      "Provider completion evidence is not bound to its stored ContextManifest."
+function unavailableManagedWriteTerminalObservation(job) {
+  let preContext = null;
+  try {
+    preContext = assertContextManifestIntegrity(
+      job.request?.contextManifest
     );
+  } catch {
+    // A missing or malformed stored pre-context is itself part of the
+    // unavailable final observation. Do not fabricate a replacement.
   }
+  const completedAt = now();
+  const message =
+    "Final managed-write context could not be observed after runtime cleanup.";
+  return Object.freeze({
+    pending: Object.freeze({
+      status: "failed",
+      phase: "context-rejected",
+      completedAt,
+      error: Object.freeze({
+        code: "E_CONTEXT_DRIFT",
+        message,
+        details: Object.freeze({
+          reasons: Object.freeze(["[final-context-unavailable]"])
+        })
+      }),
+      summary: message
+    }),
+    job: {
+      ...job,
+      completionContextManifest: null,
+      result: {
+        ...(job.result || {}),
+        runtimeEvidence: buildRuntimeEvidence({
+          preContext,
+          postContext: null,
+          changedPaths: [],
+          commandOutcomes: job.commandOutcomes || [],
+          scopeViolations: [],
+          executionStatus: "failed"
+        }),
+        hostVerification: "not_run"
+      }
+    }
+  });
+}
 
-  // Capture again under the workspace transaction immediately before artifact
-  // and terminal publication. Provider evidence is informative, never the
-  // terminal authority for the live filesystem boundary.
-  const observed = captureManagedWritePostBindingContext(job, env);
+function knownManagedWriteSafetyTerminalObservation(job, error) {
+  if (!["E_CONTEXT_DRIFT", "E_SCOPE_VIOLATION"].includes(error?.code)) {
+    return null;
+  }
+  let preContext = null;
+  try {
+    preContext = assertContextManifestIntegrity(
+      job.request?.contextManifest
+    );
+  } catch {
+    // The independently classified final safety error remains authoritative.
+    // Do not invent a replacement pre-context merely to populate evidence.
+  }
+  const contextMarkers = () => {
+    const reasons = Array.isArray(error.details?.reasons)
+      ? error.details.reasons.map((item) => String(item))
+      : [];
+    const markers = [];
+    if (reasons.some((reason) => ["head", "branch"].includes(reason))) {
+      markers.push("[HEAD]");
+    }
+    if (reasons.some((reason) => [
+      "taskRelevantMetadataIdentity",
+      "metadataIdentity",
+      "upstreamRef",
+      "upstreamCommit"
+    ].includes(reason))) {
+      markers.push("[GIT_METADATA]");
+    }
+    if (reasons.some((reason) => [
+      "trackedTreeIdentity",
+      "dirtyDigest",
+      "ignoredDigest"
+    ].includes(reason))) {
+      markers.push("[INDEX]");
+    }
+    if (reasons.some((reason) => reason === "projectMarkers")) {
+      markers.push("[PROJECT_MARKERS]");
+    }
+    if (markers.length === 0) {
+      if (/\b(?:HEAD|branch)\b/i.test(error.message || "")) {
+        markers.push("[HEAD]");
+      } else if (/\bindex\b/i.test(error.message || "")) {
+        markers.push("[INDEX]");
+      } else {
+        markers.push("[CONTEXT_DRIFT]");
+      }
+    }
+    return [...new Set(markers)].slice(0, 8);
+  };
+  const scopePaths = () => {
+    const provided = Array.isArray(error.details?.paths)
+      ? boundPathEvidence(error.details.paths, {
+          max: 64,
+          marker: "[SCOPE_VIOLATIONS_OVERFLOW]"
+        })
+      : [];
+    if (provided.length > 0) return provided;
+    return [
+      /\bindex\b/i.test(error.message || "")
+        ? "[INDEX]"
+        : "[SCOPE_VIOLATION]"
+    ];
+  };
+  const code = error.code;
+  const observedChangedPaths = code === "E_CONTEXT_DRIFT"
+    ? contextMarkers()
+    : scopePaths();
+  const scopeViolations = code === "E_SCOPE_VIOLATION"
+    ? observedChangedPaths
+    : [];
+  const details = code === "E_CONTEXT_DRIFT"
+    ? { reasons: Object.freeze(observedChangedPaths) }
+    : { paths: Object.freeze(scopeViolations) };
+  const completedAt = now();
+  const message = code === "E_CONTEXT_DRIFT"
+    ? "Final managed-write context drift was observed after runtime cleanup."
+    : "Final managed-write scope violation was observed after runtime cleanup.";
+  return Object.freeze({
+    pending: Object.freeze({
+      status: "failed",
+      phase: code === "E_CONTEXT_DRIFT"
+        ? "context-rejected"
+        : "scope-rejected",
+      completedAt,
+      error: Object.freeze({
+        code,
+        message,
+        details: Object.freeze(details)
+      }),
+      summary: message
+    }),
+    job: {
+      ...job,
+      completionContextManifest: null,
+      result: {
+        ...(job.result || {}),
+        runtimeEvidence: buildRuntimeEvidence({
+          preContext,
+          postContext: null,
+          changedPaths: observedChangedPaths,
+          commandOutcomes: job.commandOutcomes || [],
+          scopeViolations,
+          executionStatus: "failed"
+        }),
+        hostVerification: "not_run"
+      }
+    }
+  });
+}
+
+/**
+ * Publish one authoritative post-cleanup workspace observation for every task
+ * that does not yet have provider-started managed-write output authority.
+ * Exact runtime cleanup is a caller precondition; this helper only reconciles
+ * the fresh workspace boundary with the durable terminal intent.
+ */
+function reconcileCleanupSafeTerminalObservation(
+  job,
+  pending,
+  { cleanupError = null } = {}
+) {
+  const intendedStatus = pending?.status || null;
+  const executionStatus = intendedStatus === "completed"
+    ? "completed"
+    : intendedStatus === "cancelled"
+      ? "cancelled"
+      : "failed";
+  const executionRoot = job?.request?.spawn?.executionRoot
+    || job?.workspaceRoot;
+  let managedAuthorityUnavailable = false;
+  const dispatch = job?.request?.spawn?.dispatch;
+  const explicitManagedAuthority = [
+    job?.executionBinding,
+    job?.provisioning,
+    job?.provisioningRuntime,
+    job?.request?.admissionContextManifest,
+    job?.request?.spawn?.executionBindingDigest
+  ].some((value) => value !== undefined && value !== null);
+  if (job?.write === true
+    && (isDispatchV2(dispatch) || explicitManagedAuthority)) {
+    try {
+      hasManagedWriteAuthority(job);
+    } catch {
+      // Partial managed-write authority is not a legacy unmanaged write. It
+      // cannot be trusted as a final observation boundary even before provider
+      // startup, so force the same bounded unavailable-context terminal.
+      managedAuthorityUnavailable = true;
+    }
+  }
+  const evidence = captureTerminalEvidence(
+    executionRoot,
+    job,
+    executionStatus,
+    managedAuthorityUnavailable
+      ? {
+          captureContext() {
+            throw new CompanionError(
+              "E_CONTEXT_DRIFT",
+              "Managed-write terminal authority is incomplete."
+            );
+          }
+        }
+      : {}
+  );
+  const selectedTerminalError = selectTaskTerminalError(
+    evidence,
+    pending?.error || null,
+    cleanupError
+  );
+  // Error.message is non-enumerable on Error/CompanionError instances. Every
+  // terminal error must cross the durable JSON boundary as an ordinary record.
+  const selectedError = selectedTerminalError
+    ? Object.freeze(asErrorPayload(selectedTerminalError))
+    : null;
+  const safetyFailure = [
+    "E_CONTEXT_DRIFT",
+    "E_SCOPE_VIOLATION"
+  ].includes(selectedError?.code);
+  const selectedStatus = selectedError
+    ? (selectedError.code === "E_CANCELLED" ? "cancelled" : "failed")
+    : intendedStatus;
+  const statusChanged = selectedStatus !== intendedStatus;
+  const errorChanged = Boolean(
+    selectedError
+    && (
+      selectedError.code !== pending?.error?.code
+      || selectedError.message !== pending?.error?.message
+    )
+  );
+  const outcomeChanged = statusChanged || errorChanged;
+  const reconciledPending = selectedError
+    ? Object.freeze({
+        status: selectedStatus,
+        phase: selectedError.code === "E_CONTEXT_DRIFT"
+          ? "context-rejected"
+          : selectedError.code === "E_SCOPE_VIOLATION"
+            ? "scope-rejected"
+            : outcomeChanged
+              ? selectedStatus
+              : pending?.phase || selectedStatus,
+        completedAt: safetyFailure
+          ? now()
+          : pending?.completedAt || now(),
+        error: selectedError,
+        summary: safetyFailure || outcomeChanged
+          ? selectedError.message
+          : pending?.summary || selectedError.message
+      })
+    : pending;
+  const effectiveStatus = reconciledPending?.status || "failed";
+  const effectiveError = reconciledPending?.error || null;
+  evidence.runtimeEvidence.executionStatus = effectiveStatus === "completed"
+    ? "completed"
+    : effectiveStatus === "cancelled"
+      ? "cancelled"
+      : "failed";
+  const result = {
+    ...(job.result || {}),
+    runtimeEvidence: {
+      ...(job.result?.runtimeEvidence || {}),
+      ...evidence.runtimeEvidence
+    },
+    hostVerification: "not_run"
+  };
+  // Every caller reaches this helper only after exact runtime cleanup. A
+  // warning from an earlier failed cleanup attempt is therefore stale.
+  delete result.privacyWarning;
+  if (effectiveStatus !== "cancelled" && result.stopReason === "cancelled") {
+    delete result.stopReason;
+  }
+  return Object.freeze({
+    pending: reconciledPending,
+    job: {
+      ...job,
+      progress: terminalTaskProgress(effectiveStatus, effectiveError),
+      completionContextManifest: evidence.postContext,
+      result
+    }
+  });
+}
+
+function reconcileProviderStartedWriteCompletion(job, pending, env) {
+  let managedWritePostBinding;
+  try {
+    managedWritePostBinding = hasManagedWritePostBinding(job);
+  } catch {
+    // Runtime cleanup already succeeded before every caller reaches this
+    // function. A malformed partial managed-write authority must therefore
+    // become one terminal fail-closed observation, not abort the transaction
+    // and strand a cleaned task as active.
+    return unavailableManagedWriteTerminalObservation(job);
+  }
+  if (job?.write !== true || !managedWritePostBinding) {
+    return reconcileCleanupSafeTerminalObservation(job, pending);
+  }
+  let observed;
+  try {
+    if (pending) {
+      const providerCompletionContext = assertContextManifestIntegrity(
+        job.completionContextManifest
+      );
+      const providerRuntimeContext = job.result?.runtimeEvidence?.postContext;
+      if (!providerRuntimeContext
+        || providerRuntimeContext.manifestId !== providerCompletionContext.manifestId
+        || providerRuntimeContext.digest !== providerCompletionContext.digest) {
+        throw new CompanionError(
+          "E_STATE",
+          "Provider completion evidence is not bound to its stored ContextManifest."
+        );
+      }
+    }
+
+    // Capture again under the workspace transaction immediately before artifact
+    // and terminal publication. A worker that disappeared before publishing an
+    // intent still receives the same final safety observation. Provider evidence
+    // is informative, never the terminal authority for the live filesystem
+    // boundary.
+    observed = captureManagedWritePostBindingContext(job, env);
+  } catch (error) {
+    const safetyObservation =
+      knownManagedWriteSafetyTerminalObservation(job, error);
+    if (safetyObservation) return safetyObservation;
+    return unavailableManagedWriteTerminalObservation(job);
+  }
   const contextDrift = observed.coreReasons.length > 0
     || observed.metadataMarkers.length > 0;
   const scopeDrift = observed.scopeViolations.length > 0;
   const rejected = contextDrift || scopeDrift;
+  const contextReasons = [...new Set([
+    ...(observed.controlContextMarkers || []),
+    ...observed.metadataMarkers
+  ])].slice(0, 8);
   const reconciledPending = rejected
     ? Object.freeze({
         status: "failed",
@@ -4075,7 +4509,14 @@ function reconcileProviderStartedWriteCompletion(job, pending, env) {
           code: contextDrift ? "E_CONTEXT_DRIFT" : "E_SCOPE_VIOLATION",
           message: contextDrift
             ? "Worker output failed final execution-context reconciliation."
-            : "Worker output changed paths outside the delegated scope."
+            : "Worker output changed paths outside the delegated scope.",
+          ...(contextDrift && contextReasons.length
+            ? {
+                details: Object.freeze({
+                  reasons: Object.freeze(contextReasons)
+                })
+              }
+            : {})
         }),
         summary: contextDrift
           ? "Worker output failed final execution-context reconciliation."
@@ -4093,11 +4534,13 @@ function reconcileProviderStartedWriteCompletion(job, pending, env) {
     scopeViolations: observed.scopeViolations,
     executionStatus: rejected
       ? "failed"
-      : pending.status === "cancelled"
+      : pending?.status === "cancelled"
         ? "cancelled"
-        : pending.status === "failed"
+        : pending?.status === "failed"
           ? "failed"
-          : "completed"
+          : pending?.status === "completed"
+            ? "completed"
+            : "failed"
   });
   return Object.freeze({
     pending: reconciledPending,
@@ -4184,15 +4627,27 @@ export function settleProviderStartedWorkerFinalization({
         );
       }
       const intended = pendingIntent(latest);
+      const completedCleanup = runSuccessfulRuntimeCleanup(
+        runtimeCleanup,
+        latest
+      );
       const reconciled = reconcileProviderStartedWriteCompletion(
         latest,
         intended,
         env
       );
+      const signalReconciled = reconcileTerminalCleanupSignal(
+        reconciled.pending,
+        latest.error,
+        {
+          completedAt: now(),
+          priorErrors: [intended.error]
+        }
+      );
       const artifactSettlement = settleWriteArtifactAfterRuntimeCleanup({
         job: reconciled.job,
-        pending: reconciled.pending,
-        runtimeCleanup,
+        pending: signalReconciled,
+        runtimeCleanup: completedCleanup,
         env
       });
       const pending = artifactSettlement.pending;
@@ -4210,6 +4665,16 @@ export function settleProviderStartedWorkerFinalization({
       if (artifactSettlement.rejected) {
         delete result.writeArtifact;
         result.stopReason = "write-artifact-rejected";
+      }
+      if (result.runtimeEvidence) {
+        result.runtimeEvidence = {
+          ...result.runtimeEvidence,
+          executionStatus: pending.status === "completed"
+            ? "completed"
+            : pending.status === "cancelled"
+              ? "cancelled"
+              : "failed"
+        };
       }
       delete result.privacyWarning;
       const terminalized = {
@@ -4312,14 +4777,19 @@ export function settleFailedDispatchCleanup({
       }
       runSuccessfulRuntimeCleanup(runtimeCleanup, latest);
       const settledAt = now();
-      const pending = latest.pendingTerminal;
+      const observed = reconcileCleanupSafeTerminalObservation(
+        latest,
+        latest.pendingTerminal,
+        { cleanupError: latest.error }
+      );
+      const pending = observed.pending;
       const result = {
-        ...(latest.result || {}),
+        ...(observed.job.result || {}),
         taskRuntimeCleaned: true,
-        hostVerification: latest.result?.hostVerification || "not_run",
+        hostVerification: "not_run",
         ...(reconciler ? {
           runtimeEvidence: {
-            ...(latest.result?.runtimeEvidence || {}),
+            ...(observed.job.result?.runtimeEvidence || {}),
             reconciler: {
               privilege: "host-trusted-reconciler",
               replayedPrompt: false,
@@ -4328,15 +4798,25 @@ export function settleFailedDispatchCleanup({
           }
         } : {})
       };
+      if (result.runtimeEvidence) {
+        result.runtimeEvidence = {
+          ...result.runtimeEvidence,
+          executionStatus: pending.status === "completed"
+            ? "completed"
+            : pending.status === "cancelled"
+              ? "cancelled"
+              : "failed"
+        };
+      }
       delete result.privacyWarning;
       const terminalized = {
-        ...latest,
+        ...observed.job,
         status: pending.status,
         phase: pending.phase,
         completedAt: pending.completedAt || settledAt,
         error: pending.error || null,
         summary: pending.summary || pending.error?.message || latest.summary,
-        progress: pending.status === "cancelled" ? "Cancellation completed" : "Worker finalization completed",
+        progress: terminalTaskProgress(pending.status, pending.error),
         result,
         heartbeatAt: settledAt,
         request: {
@@ -4443,13 +4923,24 @@ export function settleStartedWorkerLoss({
       assertDispatchContract(latest);
       const latestDispatch = latest.request.spawn.dispatch;
       const intended = pendingIntent(latest);
-      const reconciled = intended
-        ? reconcileProviderStartedWriteCompletion(latest, intended, env)
-        : { job: latest, pending: intended };
+      const completedCleanup = runSuccessfulRuntimeCleanup(
+        runtimeCleanup,
+        latest
+      );
+      const reconciled = reconcileProviderStartedWriteCompletion(
+        latest,
+        intended,
+        env
+      );
+      const recoveredPending = reconcileTerminalCleanupSignal(
+        reconciled.pending,
+        latest.error,
+        { priorErrors: [intended?.error] }
+      );
       const artifactSettlement = settleWriteArtifactAfterRuntimeCleanup({
         job: reconciled.job,
-        pending: reconciled.pending,
-        runtimeCleanup,
+        pending: recoveredPending,
+        runtimeCleanup: completedCleanup,
         env
       });
       const effective = artifactSettlement.pending;
@@ -4485,6 +4976,16 @@ export function settleStartedWorkerLoss({
       if (artifactSettlement.rejected) {
         delete result.writeArtifact;
         result.stopReason = "write-artifact-rejected";
+      }
+      if (result.runtimeEvidence) {
+        result.runtimeEvidence = {
+          ...result.runtimeEvidence,
+          executionStatus: status === "completed"
+            ? "completed"
+            : status === "cancelled"
+              ? "cancelled"
+              : "failed"
+        };
       }
       delete result.privacyWarning;
       const terminalized = {
@@ -9726,7 +10227,11 @@ function hasManagedWritePostBinding(job) {
  * here: generation 1 remains exact, while the exact provider-started state may
  * later use scoped observation for intended provider output.
  */
-function assertManagedWriteImmutableAuthority(job, env = process.env) {
+function assertManagedWriteImmutableAuthority(
+  job,
+  env = process.env,
+  { allowFinalControlContextDrift = false } = {}
+) {
   if (!hasManagedWriteAuthority(job)) {
     spawnIdempotencyStateError(
       "Managed write verification requires a complete dispatch authority."
@@ -9899,15 +10404,31 @@ function assertManagedWriteImmutableAuthority(job, env = process.env) {
     );
   }
 
-  assertParentUnchanged(binding.parentFingerprint, binding.controlRoot);
-  assertContextCompatible(
-    binding.controlRoot,
-    admissionContextManifest,
-    {
-      mode: "execute",
-      metadataPolicy: CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE
+  let parentFingerprintError = null;
+  try {
+    assertParentUnchanged(binding.parentFingerprint, binding.controlRoot);
+  } catch (error) {
+    if (!allowFinalControlContextDrift || error?.code !== "E_INTEGRATION") {
+      throw error;
     }
-  );
+    parentFingerprintError = error;
+  }
+  let controlContextError = null;
+  try {
+    assertContextCompatible(
+      binding.controlRoot,
+      admissionContextManifest,
+      {
+        mode: "execute",
+        metadataPolicy: CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE
+      }
+    );
+  } catch (error) {
+    if (!allowFinalControlContextDrift || error?.code !== "E_CONTEXT_DRIFT") {
+      throw error;
+    }
+    controlContextError = error;
+  }
   assertRegisteredWorkerWorktreeIdentity({
     controlRoot: binding.controlRoot,
     executionRoot: binding.expectedExecutionRoot,
@@ -9923,7 +10444,9 @@ function assertManagedWriteImmutableAuthority(job, env = process.env) {
     envelope,
     admissionContextManifest,
     requestContextManifest,
-    runtimeContextManifest
+    runtimeContextManifest,
+    controlContextError,
+    parentFingerprintError
   });
 }
 
@@ -9954,12 +10477,55 @@ function captureManagedWritePostBindingContext(
     envelope,
     admissionContextManifest,
     requestContextManifest,
-    runtimeContextManifest
-  } = assertManagedWriteImmutableAuthority(job, env);
+    runtimeContextManifest,
+    controlContextError,
+    parentFingerprintError
+  } = assertManagedWriteImmutableAuthority(
+    job,
+    env,
+    { allowFinalControlContextDrift: true }
+  );
   const currentContextManifest = observedContextManifest == null
     ? captureContextManifest(binding.expectedExecutionRoot)
     : assertContextManifestIntegrity(observedContextManifest);
-  const coreReasons = [];
+  const controlReasons = Array.isArray(controlContextError?.details?.reasons)
+    ? [...controlContextError.details.reasons]
+    : controlContextError
+      ? ["controlContext"]
+      : [];
+  const coreReasons = [
+    ...controlReasons,
+    ...(parentFingerprintError && controlReasons.length === 0
+      ? ["parentFingerprint"]
+      : [])
+  ];
+  const controlContextMarkers = [];
+  if (controlReasons.some((reason) => [
+    "head",
+    "branch"
+  ].includes(reason))) {
+    controlContextMarkers.push("[HEAD]");
+  }
+  if (controlReasons.some((reason) => [
+    "taskRelevantMetadataIdentity",
+    "metadataIdentity",
+    "upstreamRef",
+    "upstreamCommit"
+  ].includes(reason))) {
+    controlContextMarkers.push("[GIT_METADATA]");
+  }
+  if (controlReasons.some((reason) => [
+    "trackedTreeIdentity",
+    "dirtyDigest",
+    "ignoredDigest"
+  ].includes(reason))) {
+    controlContextMarkers.push("[INDEX]");
+  }
+  if (parentFingerprintError
+    && controlContextMarkers.length === 0
+    && /\bHEAD\b/i.test(parentFingerprintError.message || "")) {
+    controlContextMarkers.push("[HEAD]");
+  }
   if (currentContextManifest.workspaceRoot !== requestContextManifest.workspaceRoot) {
     coreReasons.push("workspaceRoot");
   }
@@ -9993,10 +10559,13 @@ function captureManagedWritePostBindingContext(
       !== (requestContextManifest.git?.upstreamCommit || null)) {
     coreReasons.push("upstream");
   }
-  const observedChangedPaths = observeChangedPaths(
-    requestContextManifest,
-    currentContextManifest
-  );
+  const observedChangedPaths = [...new Set([
+    ...observeChangedPaths(
+      requestContextManifest,
+      currentContextManifest
+    ),
+    ...controlContextMarkers
+  ])];
   const scopeViolations = evaluateScope(
     observedChangedPaths,
     envelope.scope
@@ -10016,6 +10585,7 @@ function captureManagedWritePostBindingContext(
     observedChangedPaths,
     scopeViolations,
     coreReasons,
+    controlContextMarkers,
     metadataMarkers
   });
 }
@@ -10592,20 +11162,41 @@ export function cancelWorker({
               }
             }
           };
+        const observed = reconcileCleanupSafeTerminalObservation(
+          {
+            ...current,
+            request: settledRequest,
+            workerAuthorization: null,
+            lifecycleEvents: nextEvents,
+            result: persistCancellation(current, {
+              taskRuntimeCleaned: true
+            })
+          },
+          {
+            status: "cancelled",
+            phase: "cancelled",
+            completedAt: terminalRecordCommittedAt,
+            error: null,
+            summary: "Cancelled"
+          }
+        );
+        const pending = observed.pending;
         const terminal = scrubStoredJob({
-          ...current,
-          status: "cancelled",
-          phase: "cancelled",
-          summary: "Cancelled",
-          progress: "Cancellation request accepted and terminal state confirmed.",
-          completedAt: terminalRecordCommittedAt,
-          request: settledRequest,
+          ...observed.job,
+          status: pending.status,
+          phase: pending.phase,
+          summary: pending.summary || pending.error?.message || "Cancelled",
+          progress: terminalTaskProgress(pending.status, pending.error),
+          completedAt: pending.completedAt || terminalRecordCommittedAt,
+          error: pending.error || null,
           workerAuthorization: null,
           lifecycleEvents: nextEvents,
-          result: persistCancellation(current, {
-            stopReason: "cancelled",
-            taskRuntimeCleaned: true
-          })
+          result: {
+            ...(observed.job.result || {}),
+            ...(pending.status === "cancelled"
+              ? { stopReason: "cancelled" }
+              : {})
+          }
         });
         assertDispatchContract(terminal);
         return terminal;
@@ -10656,13 +11247,18 @@ export function cancelWorker({
 
 export function projectCancellationReceipt(receipt) {
   if (!receipt) return null;
+  const projectedTimestamp = (value) => (
+    validIsoTimestamp(value) ? value : null
+  );
   return {
     receiptId: receipt.receiptId,
     workerId: receipt.workerId,
     status: receipt.status,
-    requestAcceptedAt: receipt.requestAcceptedAt,
-    processGroupGoneAt: receipt.processGroupGoneAt || null,
-    terminalRecordCommittedAt: receipt.terminalRecordCommittedAt || null,
+    requestAcceptedAt: projectedTimestamp(receipt.requestAcceptedAt),
+    processGroupGoneAt: projectedTimestamp(receipt.processGroupGoneAt),
+    terminalRecordCommittedAt: projectedTimestamp(
+      receipt.terminalRecordCommittedAt
+    ),
     idempotencyKeyDigest: receipt.idempotencyKeyDigest || null,
     cancellationRequestSequence: receipt.cancellationRequestSequence ?? null
   };

@@ -39,11 +39,15 @@ import {
   prepareDispatchProcessSpawn,
   persistCompletedWriteArtifact,
   promoteWriteWorkerReady,
+  projectCancellationReceipt,
   recordOfficialWorktreeReceipt,
   recordWriteProvisionerNoChild,
   retainWriteProvisioningCleanupPending,
+  settleFailedDispatchCleanup,
+  settlePreProviderWorkerFinalization,
   settleProviderStartedWorkerFinalization,
   settleStartedWorkerLoss,
+  settleUnstartedDispatchLoss,
   settleWriteArtifactAfterRuntimeCleanup,
   spawnReadOnlyWorker,
   SPAWN_SUCCESS_DEFINITION,
@@ -232,6 +236,16 @@ function stableDigest(value) {
     .digest("hex");
 }
 
+function rebindWorkerLaunchAuthorization(job) {
+  return {
+    ...job,
+    workerAuthorization: {
+      ...job.workerAuthorization,
+      launchContractDigest: launchContractDigest(job)
+    }
+  };
+}
+
 function legacyContextManifest(manifest) {
   const body = structuredClone(manifest);
   const capturedAt = body.capturedAt;
@@ -373,6 +387,151 @@ async function detachedProvisioner(t, workerId) {
   return { child, identity };
 }
 
+async function detachedDispatchProcess(t, {
+  workerId,
+  attemptId,
+  fence,
+  nonce,
+  processKind
+}) {
+  const child = spawnProcess(
+    process.execPath,
+    [
+      "-e",
+      "setInterval(() => {}, 1000)",
+      workerId,
+      processKind
+    ],
+    { detached: true, stdio: "ignore" }
+  );
+  const identity = {
+    pid: child.pid,
+    startToken: await waitFor(() => processStartToken(child.pid), {
+      timeoutMs: 5_000,
+      intervalMs: 25
+    }),
+    nonce,
+    processGroupId: child.pid,
+    commandMarker: workerId,
+    dispatchAttemptId: attemptId,
+    dispatchFence: fence
+  };
+  t.after(async () => {
+    try { process.kill(-child.pid, "SIGKILL"); } catch {}
+    try {
+      await waitFor(() => processGroupGone(identity), {
+        timeoutMs: 5_000,
+        intervalMs: 25
+      });
+    } catch {}
+  });
+  return { child, identity };
+}
+
+function claimedReadDispatchFixture(label) {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const envelope = buildTaskEnvelope({
+    userRequest: `Observe pre-provider terminal workspace for ${label}`,
+    mode: "read",
+    scope: { include: ["tracked.txt"], exclude: [] }
+  });
+  const spawned = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey: `terminal-observation-${label}-spawn-0001`,
+    env
+  });
+  const workerId = spawned.handle.id;
+  const claim = claimWorkerDispatch({
+    root,
+    principal: principal(root),
+    workerId,
+    env
+  });
+  return { root, env, envelope, workerId, claim };
+}
+
+async function workerStartedReadDispatchFixture(t, label) {
+  const fixture = claimedReadDispatchFixture(label);
+  const controllerIntent = prepareDispatchProcessSpawn({
+    root: fixture.root,
+    workerId: fixture.workerId,
+    attemptId: fixture.claim.attemptId,
+    processKind: "controller",
+    nonce: fixture.claim.nonce,
+    fence: fixture.claim.fence,
+    env: fixture.env
+  });
+  const controller = await detachedDispatchProcess(t, {
+    workerId: fixture.workerId,
+    attemptId: fixture.claim.attemptId,
+    fence: fixture.claim.fence,
+    nonce: fixture.claim.nonce,
+    processKind: "controller"
+  });
+  transitionWorkerDispatch({
+    root: fixture.root,
+    workerId: fixture.workerId,
+    attemptId: fixture.claim.attemptId,
+    fence: fixture.claim.fence,
+    state: "controller-started",
+    controllerProcess: controller.identity,
+    spawnIntentId: controllerIntent.intent.intentId,
+    env: fixture.env
+  });
+  const workerIntent = prepareDispatchProcessSpawn({
+    root: fixture.root,
+    workerId: fixture.workerId,
+    attemptId: fixture.claim.attemptId,
+    processKind: "worker",
+    nonce: fixture.claim.nonce,
+    fence: fixture.claim.fence,
+    env: fixture.env
+  });
+  const worker = await detachedDispatchProcess(t, {
+    workerId: fixture.workerId,
+    attemptId: fixture.claim.attemptId,
+    fence: fixture.claim.fence,
+    nonce: fixture.claim.nonce,
+    processKind: "worker"
+  });
+  transitionWorkerDispatch({
+    root: fixture.root,
+    workerId: fixture.workerId,
+    attemptId: fixture.claim.attemptId,
+    fence: fixture.claim.fence,
+    state: "worker-started",
+    workerProcess: worker.identity,
+    spawnIntentId: workerIntent.intent.intentId,
+    env: fixture.env
+  });
+  return { ...fixture, controller, worker };
+}
+
+async function providerStartedReadDispatchFixture(t, label) {
+  const fixture = await workerStartedReadDispatchFixture(t, label);
+  const provider = await detachedDispatchProcess(t, {
+    workerId: fixture.workerId,
+    attemptId: fixture.claim.attemptId,
+    fence: fixture.claim.fence,
+    nonce: fixture.claim.nonce,
+    processKind: "provider"
+  });
+  provider.identity.providerGeneration = 1;
+  transitionWorkerDispatch({
+    root: fixture.root,
+    workerId: fixture.workerId,
+    attemptId: fixture.claim.attemptId,
+    fence: fixture.claim.fence,
+    state: "provider-started",
+    providerProcess: provider.identity,
+    env: fixture.env
+  });
+  return { ...fixture, provider };
+}
+
 function prepareProvisioningIntent(fixture) {
   return prepareWriteProvisionerIntent({
     root: fixture.root,
@@ -429,6 +588,103 @@ async function activateRegisteredProvisioning(t, fixture) {
     activated,
     registered,
     registeredAt
+  };
+}
+
+async function readyManagedWriteDispatchFixture(t, label) {
+  const fixture = plannedWriteVerticalFixture(label);
+  const active = await activateRegisteredProvisioning(t, fixture);
+  const official = createWorkerWorktree({
+    controlRoot: fixture.root,
+    baseCommit: fixture.binding.baseCommit,
+    workerId: fixture.workerId,
+    env: fixture.env
+  });
+  t.after(() => {
+    try {
+      git(
+        fixture.root,
+        "worktree",
+        "remove",
+        "--force",
+        official.executionRoot
+      );
+    } catch {}
+  });
+  const receivedAt = new Date(
+    Math.max(Date.now(), Date.parse(active.registeredAt) + 1)
+  ).toISOString();
+  const recorded = recordOfficialWorktreeReceipt({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    officialReceipt: {
+      status: "created",
+      sessionId: active.prepared.intent.operationId,
+      worktreePath: official.executionRoot,
+      sourceGitRoot: fixture.binding.controlRoot,
+      commit: fixture.binding.baseCommit
+    },
+    receivedAt,
+    env: fixture.env
+  });
+  process.kill(-active.child.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(active.identity), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  const executionContextManifest = captureContextManifest(
+    official.executionRoot
+  );
+  const observedAt = new Date(
+    Math.max(Date.now(), Date.parse(receivedAt) + 1)
+  ).toISOString();
+  const readyAt = new Date(Math.max(
+    Date.now(),
+    Date.parse(recorded.receipt.hostVerification.verifiedAt) + 1,
+    Date.parse(executionContextManifest.capturedAt) + 1,
+    Date.parse(observedAt) + 1
+  )).toISOString();
+  promoteWriteWorkerReady({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    executionContextManifest,
+    cleanupProof: {
+      processIdentity: active.identity,
+      processGroupGone: true,
+      providerGuardAbsent: true,
+      observedAt
+    },
+    readyAt,
+    env: fixture.env
+  });
+  const authority = brokerPrincipal(fixture.root);
+  const authorized = authorizeReadyWriteWorkerDispatch({
+    root: fixture.root,
+    principal: authority,
+    workerId: fixture.workerId,
+    writeLifecycleCapabilityDigest: "c".repeat(64),
+    validateWriteLifecycleCapability: () => "c".repeat(64),
+    env: fixture.env
+  });
+  assert.equal(authorized.authorized, true);
+  assert.equal(authorized.job.request.spawn.dispatch.state, "pending");
+  return {
+    ...fixture,
+    active,
+    official,
+    executionContextManifest,
+    authority,
+    authorized
   };
 }
 
@@ -4553,8 +4809,14 @@ test("issue #34 lifecycle exact write spawn replay returns the original handle a
       completedAt: null,
       summary: "Awaiting recovery finalization",
       error: {
-        code: "E_STATE",
-        message: "Task finished, but transient runtime cleanup is incomplete."
+        code: "E_PROCESS_IDENTITY",
+        message: "Worker recovery is blocked because exact runtime cleanup could not be verified.",
+        details: {
+          secondaryDiagnostic: {
+            code: "EPERM",
+            message: "kill EPERM"
+          }
+        }
       },
       pendingTerminal: {
         status: "completed",
@@ -4581,18 +4843,47 @@ test("issue #34 lifecycle exact write spawn replay returns the original handle a
     workerId,
     lifecycleEnv
   );
-  const recoverySettled = settleStartedWorkerLoss({
-    root: fixture.root,
-    workerId,
-    attemptId: recoveryInput.request.spawn.dispatch.attemptId,
-    controllerProcess: recoveryInput.controllerProcess,
-    workerProcess: recoveryInput.workerProcess,
-    providerProcess: recoveryInput.providerProcess,
-    reconciler: true,
-    runtimeCleanup: { ok: true },
-    env: lifecycleEnv
-  });
-  assert.equal(recoverySettled.status, "completed");
+  const recoveryConfig = path.join(fixture.root, ".git", "config");
+  const recoveryConfigBefore = fs.readFileSync(recoveryConfig);
+  let recoveryCleanupCalls = 0;
+  let recoverySettled;
+  try {
+    recoverySettled = settleStartedWorkerLoss({
+      root: fixture.root,
+      workerId,
+      attemptId: recoveryInput.request.spawn.dispatch.attemptId,
+      controllerProcess: recoveryInput.controllerProcess,
+      workerProcess: recoveryInput.workerProcess,
+      providerProcess: recoveryInput.providerProcess,
+      reconciler: true,
+      runtimeCleanup: () => {
+        recoveryCleanupCalls += 1;
+        fs.appendFileSync(
+          recoveryConfig,
+          "\n[grok-issue49-recovery]\n\tvalue = context-drift\n"
+        );
+        return { ok: true };
+      },
+      env: lifecycleEnv
+    });
+  } finally {
+    fs.writeFileSync(recoveryConfig, recoveryConfigBefore);
+  }
+  assert.equal(recoveryCleanupCalls, 1);
+  assert.equal(recoverySettled.status, "failed");
+  assert.equal(recoverySettled.phase, "context-rejected");
+  assert.equal(recoverySettled.error.code, "E_CONTEXT_DRIFT");
+  assert.equal(
+    recoverySettled.error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+  assert.equal(recoverySettled.result.taskRuntimeCleaned, true);
+  assert.equal(recoverySettled.progress.includes("pending"), false);
+  assert.ok(
+    recoverySettled.result.runtimeEvidence.observedChangedPaths.includes(
+      "[GIT_METADATA]"
+    )
+  );
   assert.equal(
     recoverySettled.result.runtimeEvidence.reconciler.replayedPrompt,
     false
@@ -4610,6 +4901,547 @@ test("issue #34 lifecycle exact write spawn replay returns the original handle a
       "target.txt"
     )
   );
+  const publicRecovery = projectWorkerSnapshot(recoverySettled);
+  assert.equal(publicRecovery.error.code, "E_CONTEXT_DRIFT");
+  assert.equal(JSON.stringify(publicRecovery).includes("EPERM"), false);
+  assert.equal(JSON.stringify(publicRecovery).includes("kill"), false);
+
+  // A task-relevant control HEAD change during exact cleanup must be attributed
+  // to the observed control boundary, not collapsed into an unavailable final
+  // observation. Unrelated linked-worktree refs above remain tolerated.
+  updateJob(fixture.root, workerId, (job) => {
+    const completedAt = new Date().toISOString();
+    return {
+      ...job,
+      status: "running",
+      phase: "cleanup-blocked",
+      completedAt: null,
+      summary: "Awaiting control-HEAD recovery finalization",
+      progress: "Task finished; runtime cleanup is still pending",
+      error: {
+        code: "E_PROCESS_IDENTITY",
+        message: "Worker recovery is blocked because exact runtime cleanup could not be verified.",
+        details: {
+          secondaryDiagnostic: {
+            code: "EPERM",
+            message: "kill EPERM"
+          }
+        }
+      },
+      pendingTerminal: {
+        status: "completed",
+        phase: "done",
+        completedAt,
+        error: null,
+        summary: "Provider reported completion"
+      },
+      result: {
+        ...job.result,
+        hostVerification: "not_run",
+        taskRuntimeCleaned: false
+      }
+    };
+  }, lifecycleEnv);
+  const headDriftInput = tryReadJob(
+    fixture.root,
+    workerId,
+    lifecycleEnv
+  );
+  const controlHeadBeforeFinalization = git(
+    fixture.root,
+    "rev-parse",
+    "HEAD"
+  );
+  let headDriftCleanupCalls = 0;
+  let headDriftSettled;
+  try {
+    headDriftSettled = settleStartedWorkerLoss({
+      root: fixture.root,
+      workerId,
+      attemptId: headDriftInput.request.spawn.dispatch.attemptId,
+      controllerProcess: headDriftInput.controllerProcess,
+      workerProcess: headDriftInput.workerProcess,
+      providerProcess: headDriftInput.providerProcess,
+      reconciler: true,
+      runtimeCleanup: () => {
+        headDriftCleanupCalls += 1;
+        git(
+          fixture.root,
+          "commit",
+          "--allow-empty",
+          "-m",
+          "issue49 final control head drift"
+        );
+        return { ok: true };
+      },
+      env: lifecycleEnv
+    });
+  } finally {
+    git(
+      fixture.root,
+      "reset",
+      "--hard",
+      controlHeadBeforeFinalization
+    );
+  }
+  assert.equal(headDriftCleanupCalls, 1);
+  assert.equal(headDriftSettled.status, "failed");
+  assert.equal(headDriftSettled.phase, "context-rejected");
+  assert.equal(headDriftSettled.error.code, "E_CONTEXT_DRIFT");
+  assert.ok(headDriftSettled.error.details.reasons.includes("[HEAD]"));
+  assert.ok(
+    headDriftSettled.error.details.reasons.includes("[GIT_METADATA]")
+  );
+  assert.equal(
+    headDriftSettled.error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+  assert.ok(
+    headDriftSettled.result.runtimeEvidence.observedChangedPaths.includes(
+      "[HEAD]"
+    )
+  );
+  assert.ok(
+    headDriftSettled.result.runtimeEvidence.observedChangedPaths.includes(
+      "[GIT_METADATA]"
+    )
+  );
+  assert.equal(
+    headDriftSettled.result.runtimeEvidence.executionStatus,
+    "failed"
+  );
+  assert.equal(headDriftSettled.result.taskRuntimeCleaned, true);
+  assert.equal(headDriftSettled.progress.includes("pending"), false);
+  assert.ok(headDriftSettled.completionContextManifest);
+  assert.notDeepEqual(
+    headDriftSettled.error.details.reasons,
+    ["[final-context-unavailable]"]
+  );
+
+  // Loss before pendingTerminal publication still receives the same
+  // post-cleanup safety observation. A cleanup callback that creates an
+  // out-of-scope path must not fall through to E_PROCESS_IDENTITY/E_WORKER_LOST.
+  updateJob(fixture.root, workerId, (job) => {
+    const revived = {
+      ...job,
+      status: "running",
+      phase: "cleanup-blocked",
+      completedAt: null,
+      summary: "Awaiting no-intent recovery finalization",
+      progress: "Worker lost; provider cleanup could not be verified",
+      error: {
+        code: "E_PROCESS_IDENTITY",
+        message: "Worker recovery is blocked because exact runtime cleanup could not be verified.",
+        details: {
+          secondaryDiagnostic: {
+            code: "EPERM",
+            message: "kill EPERM"
+          }
+        }
+      },
+      result: {
+        ...job.result,
+        hostVerification: "not_run",
+        taskRuntimeCleaned: false
+      }
+    };
+    delete revived.pendingTerminal;
+    return revived;
+  }, lifecycleEnv);
+  const noIntentInput = tryReadJob(
+    fixture.root,
+    workerId,
+    lifecycleEnv
+  );
+  const recoveryOutOfScope = path.join(
+    official.executionRoot,
+    "outside-after-cleanup.txt"
+  );
+  let noIntentCleanupCalls = 0;
+  let noIntentSettled;
+  try {
+    noIntentSettled = settleStartedWorkerLoss({
+      root: fixture.root,
+      workerId,
+      attemptId: noIntentInput.request.spawn.dispatch.attemptId,
+      controllerProcess: noIntentInput.controllerProcess,
+      workerProcess: noIntentInput.workerProcess,
+      providerProcess: noIntentInput.providerProcess,
+      reconciler: true,
+      runtimeCleanup: () => {
+        noIntentCleanupCalls += 1;
+        fs.writeFileSync(recoveryOutOfScope, "out of scope\n", "utf8");
+        return { ok: true };
+      },
+      env: lifecycleEnv
+    });
+  } finally {
+    if (fs.existsSync(recoveryOutOfScope)) {
+      fs.unlinkSync(recoveryOutOfScope);
+    }
+  }
+  assert.equal(noIntentCleanupCalls, 1);
+  assert.equal(noIntentSettled.status, "failed");
+  assert.equal(noIntentSettled.phase, "scope-rejected");
+  assert.equal(noIntentSettled.error.code, "E_SCOPE_VIOLATION");
+  assert.equal(
+    noIntentSettled.error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+  assert.equal(noIntentSettled.result.taskRuntimeCleaned, true);
+  assert.ok(
+    noIntentSettled.result.runtimeEvidence.scopeViolations.includes(
+      "outside-after-cleanup.txt"
+    )
+  );
+  const publicNoIntent = projectWorkerSnapshot(noIntentSettled);
+  assert.equal(publicNoIntent.error.code, "E_SCOPE_VIOLATION");
+  assert.equal(JSON.stringify(publicNoIntent).includes("EPERM"), false);
+
+  // A later generic cleanup-blocked record must not erase the original
+  // signalling uncertainty, and the final runtime evidence must describe the
+  // effective failed result rather than the provider's earlier completion.
+  updateJob(fixture.root, workerId, (job) => {
+    const completedAt = new Date().toISOString();
+    return {
+      ...job,
+      status: "running",
+      phase: "cleanup-blocked",
+      completedAt: null,
+      summary: "Awaiting signal-precedence finalization",
+      progress: "Task finished; runtime cleanup is still pending",
+      error: {
+        code: "E_PROCESS_IDENTITY",
+        message: "Worker recovery is blocked because exact runtime cleanup could not be verified.",
+        details: {
+          secondaryDiagnostic: {
+            code: "EIO",
+            message: "signal failed with EIO"
+          }
+        }
+      },
+      pendingTerminal: {
+        status: "completed",
+        phase: "done",
+        completedAt,
+        error: null,
+        summary: "Provider reported completion"
+      },
+      result: {
+        ...job.result,
+        hostVerification: "not_run",
+        taskRuntimeCleaned: false
+      }
+    };
+  }, lifecycleEnv);
+  const signalInput = tryReadJob(fixture.root, workerId, lifecycleEnv);
+  const signalSettled = settleStartedWorkerLoss({
+    root: fixture.root,
+    workerId,
+    attemptId: signalInput.request.spawn.dispatch.attemptId,
+    controllerProcess: signalInput.controllerProcess,
+    workerProcess: signalInput.workerProcess,
+    providerProcess: signalInput.providerProcess,
+    reconciler: true,
+    runtimeCleanup: { ok: true },
+    env: lifecycleEnv
+  });
+  assert.equal(signalSettled.status, "failed");
+  assert.equal(signalSettled.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(
+    signalSettled.error.details.secondaryDiagnostic.code,
+    "EIO"
+  );
+  assert.equal(
+    signalSettled.result.runtimeEvidence.executionStatus,
+    "failed"
+  );
+  const publicSignal = projectWorkerSnapshot(signalSettled);
+  assert.equal(publicSignal.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(JSON.stringify(publicSignal).includes("EIO"), false);
+
+  // If the linked execution root becomes unobservable only during exact
+  // cleanup, terminal publication must fail closed instead of throwing after
+  // cleanup and leaving the job active.
+  updateJob(fixture.root, workerId, (job) => {
+    const completedAt = new Date().toISOString();
+    return {
+      ...job,
+      status: "running",
+      phase: "cleanup-blocked",
+      completedAt: null,
+      summary: "Awaiting unavailable-observation finalization",
+      progress: "Task finished; runtime cleanup is still pending",
+      error: {
+        code: "E_PROCESS_IDENTITY",
+        message: "Worker recovery is blocked because exact runtime cleanup could not be verified.",
+        details: {
+          secondaryDiagnostic: {
+            code: "EPERM",
+            message: "kill EPERM"
+          }
+        }
+      },
+      pendingTerminal: {
+        status: "completed",
+        phase: "done",
+        completedAt,
+        error: null,
+        summary: "Provider reported completion"
+      },
+      result: {
+        ...job.result,
+        hostVerification: "not_run",
+        taskRuntimeCleaned: false
+      }
+    };
+  }, lifecycleEnv);
+  const unavailableInput = tryReadJob(
+    fixture.root,
+    workerId,
+    lifecycleEnv
+  );
+  const executionGitFile = path.join(official.executionRoot, ".git");
+  const hiddenExecutionGitFile = path.join(
+    official.executionRoot,
+    ".git.issue49-hidden"
+  );
+  let unavailableSettled;
+  try {
+    unavailableSettled = settleStartedWorkerLoss({
+      root: fixture.root,
+      workerId,
+      attemptId: unavailableInput.request.spawn.dispatch.attemptId,
+      controllerProcess: unavailableInput.controllerProcess,
+      workerProcess: unavailableInput.workerProcess,
+      providerProcess: unavailableInput.providerProcess,
+      reconciler: true,
+      runtimeCleanup: () => {
+        fs.renameSync(executionGitFile, hiddenExecutionGitFile);
+        return { ok: true };
+      },
+      env: lifecycleEnv
+    });
+  } finally {
+    if (fs.existsSync(hiddenExecutionGitFile)) {
+      fs.renameSync(hiddenExecutionGitFile, executionGitFile);
+    }
+  }
+  assert.equal(unavailableSettled.status, "failed");
+  assert.equal(unavailableSettled.phase, "context-rejected");
+  assert.equal(unavailableSettled.error.code, "E_CONTEXT_DRIFT");
+  assert.deepEqual(
+    unavailableSettled.error.details.reasons,
+    ["[final-context-unavailable]"]
+  );
+  assert.equal(
+    unavailableSettled.error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+  assert.equal(unavailableSettled.completionContextManifest, null);
+  assert.equal(unavailableSettled.result.taskRuntimeCleaned, true);
+  assert.equal(
+    unavailableSettled.result.runtimeEvidence.postContext,
+    null
+  );
+  assert.deepEqual(
+    unavailableSettled.result.runtimeEvidence.observedChangedPaths,
+    []
+  );
+  assert.deepEqual(
+    unavailableSettled.result.runtimeEvidence.scopeViolations,
+    []
+  );
+  assert.equal(
+    unavailableSettled.result.runtimeEvidence.executionStatus,
+    "failed"
+  );
+  const publicUnavailable = projectWorkerSnapshot(unavailableSettled);
+  assert.equal(publicUnavailable.error.code, "E_CONTEXT_DRIFT");
+  assert.equal(JSON.stringify(publicUnavailable).includes("EPERM"), false);
+  assert.equal(
+    JSON.stringify(publicUnavailable).includes(official.executionRoot),
+    false
+  );
+
+  // A known final scope classification must remain attributable after exact
+  // cleanup. Unsafe control-index state is E_SCOPE_VIOLATION, not an
+  // unavailable context observation, and still outranks signal uncertainty.
+  updateJob(fixture.root, workerId, (job) => {
+    const completedAt = new Date().toISOString();
+    return {
+      ...job,
+      status: "running",
+      phase: "cleanup-blocked",
+      completedAt: null,
+      completionContextManifest: recoveryBase.completionContextManifest,
+      summary: "Awaiting unsafe-index finalization",
+      progress: "Task finished; runtime cleanup is still pending",
+      error: {
+        code: "E_PROCESS_IDENTITY",
+        message: "Verified owned process signalling could not be completed.",
+        details: {
+          secondaryDiagnostic: {
+            code: "EPERM",
+            message: "kill EPERM"
+          }
+        }
+      },
+      pendingTerminal: {
+        status: "completed",
+        phase: "done",
+        completedAt,
+        error: null,
+        summary: "Provider reported completion"
+      },
+      result: {
+        ...job.result,
+        hostVerification: "not_run",
+        taskRuntimeCleaned: false,
+        runtimeEvidence: recoveryBase.result.runtimeEvidence
+      }
+    };
+  }, lifecycleEnv);
+  const unsafeIndexInput = tryReadJob(
+    fixture.root,
+    workerId,
+    lifecycleEnv
+  );
+  let unsafeIndexCleanupCalls = 0;
+  let unsafeIndexSettled;
+  try {
+    unsafeIndexSettled = settleStartedWorkerLoss({
+      root: fixture.root,
+      workerId,
+      attemptId: unsafeIndexInput.request.spawn.dispatch.attemptId,
+      controllerProcess: unsafeIndexInput.controllerProcess,
+      workerProcess: unsafeIndexInput.workerProcess,
+      providerProcess: unsafeIndexInput.providerProcess,
+      reconciler: true,
+      runtimeCleanup: () => {
+        unsafeIndexCleanupCalls += 1;
+        git(
+          fixture.root,
+          "update-index",
+          "--assume-unchanged",
+          "target.txt"
+        );
+        return { ok: true };
+      },
+      env: lifecycleEnv
+    });
+  } finally {
+    git(
+      fixture.root,
+      "update-index",
+      "--no-assume-unchanged",
+      "target.txt"
+    );
+  }
+  assert.equal(unsafeIndexCleanupCalls, 1);
+  assert.equal(unsafeIndexSettled.status, "failed");
+  assert.equal(unsafeIndexSettled.phase, "scope-rejected");
+  assert.equal(unsafeIndexSettled.error.code, "E_SCOPE_VIOLATION");
+  assert.deepEqual(unsafeIndexSettled.error.details.paths, ["[INDEX]"]);
+  assert.equal(
+    unsafeIndexSettled.error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+  assert.equal(unsafeIndexSettled.completionContextManifest, null);
+  assert.deepEqual(
+    unsafeIndexSettled.result.runtimeEvidence.observedChangedPaths,
+    ["[INDEX]"]
+  );
+  assert.deepEqual(
+    unsafeIndexSettled.result.runtimeEvidence.scopeViolations,
+    ["[INDEX]"]
+  );
+  assert.equal(
+    unsafeIndexSettled.result.runtimeEvidence.executionStatus,
+    "failed"
+  );
+  assert.equal(unsafeIndexSettled.result.taskRuntimeCleaned, true);
+  assert.equal(unsafeIndexSettled.progress.includes("pending"), false);
+  assert.notDeepEqual(
+    unsafeIndexSettled.error.details.paths,
+    ["[final-context-unavailable]"]
+  );
+
+  // A partial managed-write authority discovered only after successful cleanup
+  // must terminalize fail-closed. It must not abort the transaction and leave
+  // the already-cleaned job active.
+  updateJob(fixture.root, workerId, (job) => {
+    const completedAt = new Date().toISOString();
+    const revived = {
+      ...job,
+      status: "running",
+      phase: "cleanup-blocked",
+      completedAt: null,
+      summary: "Awaiting partial-authority finalization",
+      progress: "Task finished; runtime cleanup is still pending",
+      error: {
+        code: "E_STATE",
+        message: "Task finished, but transient runtime cleanup is incomplete."
+      },
+      pendingTerminal: {
+        status: "completed",
+        phase: "done",
+        completedAt,
+        error: null,
+        summary: "Provider reported completion"
+      },
+      result: {
+        ...job.result,
+        hostVerification: "not_run",
+        taskRuntimeCleaned: false
+      }
+    };
+    delete revived.provisioningRuntime;
+    return revived;
+  }, lifecycleEnv);
+  const partialAuthorityInput = tryReadJob(
+    fixture.root,
+    workerId,
+    lifecycleEnv
+  );
+  let partialAuthorityCleanupCalls = 0;
+  const partialAuthoritySettled = settleStartedWorkerLoss({
+    root: fixture.root,
+    workerId,
+    attemptId: partialAuthorityInput.request.spawn.dispatch.attemptId,
+    controllerProcess: partialAuthorityInput.controllerProcess,
+    workerProcess: partialAuthorityInput.workerProcess,
+    providerProcess: partialAuthorityInput.providerProcess,
+    reconciler: true,
+    runtimeCleanup: () => {
+      partialAuthorityCleanupCalls += 1;
+      return { ok: true };
+    },
+    env: lifecycleEnv
+  });
+  assert.equal(partialAuthorityCleanupCalls, 1);
+  assert.equal(partialAuthoritySettled.status, "failed");
+  assert.equal(partialAuthoritySettled.phase, "context-rejected");
+  assert.equal(partialAuthoritySettled.error.code, "E_CONTEXT_DRIFT");
+  assert.deepEqual(
+    partialAuthoritySettled.error.details.reasons,
+    ["[final-context-unavailable]"]
+  );
+  assert.equal(partialAuthoritySettled.completionContextManifest, null);
+  assert.equal(partialAuthoritySettled.result.taskRuntimeCleaned, true);
+  assert.equal(
+    partialAuthoritySettled.result.runtimeEvidence.postContext,
+    null
+  );
+  assert.equal(
+    partialAuthoritySettled.result.runtimeEvidence.executionStatus,
+    "failed"
+  );
+  assert.equal(
+    partialAuthoritySettled.progress.includes("pending"),
+    false
+  );
+  assert.equal(partialAuthoritySettled.pendingTerminal, undefined);
 });
 
 test("issue #34 lifecycle rejects task-relevant control/execution drift and retained stored IDs", {
@@ -5342,6 +6174,578 @@ test("spawn binds role capability, envelope mode, and job write flag", () => {
   );
 });
 
+test("all cleanup-safe pre-provider terminal paths observe final HEAD drift", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const cancellationIntent = () => ({
+    status: "cancelled",
+    phase: "cancelled",
+    completedAt: new Date().toISOString(),
+    error: {
+      code: "E_CANCELLED",
+      message: "Cancellation completed before provider startup."
+    },
+    summary: "Cancelled"
+  });
+  const cases = [
+    {
+      name: "failed dispatch transition",
+      async run(subtest) {
+        const fixture = claimedReadDispatchFixture(
+          "head-drift-transition-failed"
+        );
+        updateJob(fixture.root, fixture.workerId, (job) => ({
+          ...job,
+          error: {
+            code: "E_PROCESS_IDENTITY",
+            message: "Verified owned process signalling could not be completed.",
+            details: {
+              secondaryDiagnostic: {
+                code: "EPERM",
+                message: `kill EPERM ${fixture.root}/private-auth.json`
+              }
+            }
+          }
+        }), fixture.env);
+        git(
+          fixture.root,
+          "commit",
+          "--allow-empty",
+          "-m",
+          "terminal observation transition drift"
+        );
+        return {
+          fixture,
+          privateSignalCode: "EPERM",
+          job: transitionWorkerDispatch({
+            root: fixture.root,
+            workerId: fixture.workerId,
+            attemptId: fixture.claim.attemptId,
+            fence: fixture.claim.fence,
+            state: "failed",
+            error: cancellationIntent().error,
+            runtimeCleanup: { ok: true },
+            env: fixture.env
+          })
+        };
+      }
+    },
+    {
+      name: "unstarted dispatch loss",
+      async run(subtest) {
+        const fixture = claimedReadDispatchFixture(
+          "head-drift-unstarted-loss"
+        );
+        return {
+          fixture,
+          job: settleUnstartedDispatchLoss({
+            root: fixture.root,
+            workerId: fixture.workerId,
+            attemptId: fixture.claim.attemptId,
+            dispatchState: "claimed",
+            terminalIntent: cancellationIntent(),
+            runtimeCleanup: () => {
+              git(
+                fixture.root,
+                "commit",
+                "--allow-empty",
+                "-m",
+                "terminal observation unstarted drift"
+              );
+              return { ok: true };
+            },
+            env: fixture.env
+          })
+        };
+      }
+    },
+    {
+      name: "live pre-provider finalization",
+      async run(subtest) {
+        const fixture = await workerStartedReadDispatchFixture(
+          subtest,
+          "head-drift-live-finalization"
+        );
+        git(
+          fixture.root,
+          "commit",
+          "--allow-empty",
+          "-m",
+          "terminal observation live pre-provider drift"
+        );
+        return {
+          fixture,
+          job: settlePreProviderWorkerFinalization({
+            root: fixture.root,
+            workerId: fixture.workerId,
+            attemptId: fixture.claim.attemptId,
+            workerProcess: fixture.worker.identity,
+            intendedTerminal: cancellationIntent(),
+            runtimeCleanup: { ok: true },
+            env: fixture.env
+          })
+        };
+      }
+    },
+    {
+      name: "failed dispatch cleanup recovery",
+      async run(subtest) {
+        const fixture = await workerStartedReadDispatchFixture(
+          subtest,
+          "head-drift-failed-cleanup"
+        );
+        const blocked = settlePreProviderWorkerFinalization({
+          root: fixture.root,
+          workerId: fixture.workerId,
+          attemptId: fixture.claim.attemptId,
+          workerProcess: fixture.worker.identity,
+          intendedTerminal: cancellationIntent(),
+          runtimeCleanup: {
+            ok: false,
+            warning: "Runtime cleanup is pending."
+          },
+          env: fixture.env
+        });
+        assert.equal(blocked.status, "running");
+        assert.equal(blocked.phase, "cleanup-blocked");
+        process.kill(-fixture.controller.child.pid, "SIGKILL");
+        process.kill(-fixture.worker.child.pid, "SIGKILL");
+        await waitFor(() => (
+          processGroupGone(fixture.controller.identity)
+          && processGroupGone(fixture.worker.identity)
+        ), { timeoutMs: 5_000, intervalMs: 25 });
+        return {
+          fixture,
+          job: settleFailedDispatchCleanup({
+            root: fixture.root,
+            workerId: fixture.workerId,
+            attemptId: fixture.claim.attemptId,
+            controllerProcess: fixture.controller.identity,
+            workerProcess: fixture.worker.identity,
+            runtimeCleanup: () => {
+              git(
+                fixture.root,
+                "commit",
+                "--allow-empty",
+                "-m",
+                "terminal observation failed cleanup drift"
+              );
+              return { ok: true };
+            },
+            reconciler: true,
+            env: fixture.env
+          })
+        };
+      }
+    },
+    {
+      name: "broker-only queued cancellation",
+      async run(subtest) {
+        const root = initRepo();
+        const { env } = envFor(root);
+        const spawned = spawnReadOnlyWorker({
+          root,
+          principal: principal(root),
+          envelope: buildTaskEnvelope({
+            userRequest: "Observe queued cancellation terminal drift",
+            mode: "read",
+            scope: { include: ["tracked.txt"], exclude: [] }
+          }),
+          idempotencyKey: "terminal-observation-cancel-spawn-0001",
+          env
+        });
+        git(
+          root,
+          "commit",
+          "--allow-empty",
+          "-m",
+          "terminal observation queued cancellation drift"
+        );
+        cancelWorker({
+          root,
+          principal: principal(root),
+          workerId: spawned.handle.id,
+          idempotencyKey: "terminal-observation-cancel-0001",
+          env
+        });
+        return {
+          fixture: { root, env, workerId: spawned.handle.id },
+          job: tryReadJob(root, spawned.handle.id, env)
+        };
+      }
+    }
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async (subtest) => {
+      const { fixture, job, privateSignalCode = null } =
+        await entry.run(subtest);
+      const persisted = tryReadJob(
+        fixture.root,
+        fixture.workerId,
+        fixture.env
+      );
+      assert.equal(job.status, "failed");
+      assert.equal(job.phase, "context-rejected");
+      assert.equal(job.error.code, "E_CONTEXT_DRIFT");
+      assert.equal(typeof persisted.error.message, "string");
+      assert.ok(persisted.error.message.length > 0);
+      const publicSnapshot = projectWorkerSnapshot(persisted);
+      assert.equal(publicSnapshot.error.code, "E_CONTEXT_DRIFT");
+      assert.equal(typeof publicSnapshot.error.message, "string");
+      assert.notEqual(publicSnapshot.error.message, "undefined");
+      assert.ok(job.error.details.reasons.includes("[HEAD]"));
+      assert.equal(job.result.taskRuntimeCleaned, true);
+      assert.equal(job.result.hostVerification, "not_run");
+      assert.equal(job.result.runtimeEvidence.executionStatus, "failed");
+      assert.ok(
+        job.result.runtimeEvidence.observedChangedPaths.includes("[HEAD]")
+      );
+      assert.ok(job.completionContextManifest);
+      assert.equal(
+        job.result.runtimeEvidence.postContext.digest,
+        job.completionContextManifest.digest
+      );
+      assert.equal(
+        job.progress,
+        "Task runtime cleanup completed; workspace safety review is required"
+      );
+      assert.equal(job.pendingTerminal, undefined);
+      assert.notEqual(job.result.stopReason, "cancelled");
+      assert.equal(job.request.spawn.dispatch.state, "failed");
+      assert.doesNotThrow(() => assertDispatchContract(job));
+      if (entry.name === "live pre-provider finalization") {
+        assert.equal(
+          persisted.lifecycleEvents.at(-1).summary,
+          persisted.error.message
+        );
+      }
+      if (privateSignalCode) {
+        assert.equal(
+          job.error.details.secondaryDiagnostic.code,
+          privateSignalCode
+        );
+        const projected = projectWorkerSnapshot(job);
+        assert.equal(
+          JSON.stringify(projected).includes(privateSignalCode),
+          false
+        );
+        assert.equal(
+          JSON.stringify(projected).includes(fixture.root),
+          false
+        );
+      }
+    });
+  }
+});
+
+test("provider-started cleanup reconciliation treats mixed-case ESRCH as benign", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = await providerStartedReadDispatchFixture(
+    t,
+    "benign-mixed-case-esrch"
+  );
+  const completedAt = new Date().toISOString();
+  updateJob(fixture.root, fixture.workerId, (job) => ({
+    ...job,
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "Verified owned process signalling could not be completed.",
+      details: {
+        secondaryDiagnostic: {
+          code: "eSrCh",
+          message: "signal ESRCH"
+        }
+      }
+    },
+    pendingTerminal: {
+      status: "completed",
+      phase: "done",
+      completedAt,
+      error: null,
+      summary: "Provider completed"
+    }
+  }), fixture.env);
+  process.kill(-fixture.provider.child.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(fixture.provider.identity), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+
+  const settled = settleProviderStartedWorkerFinalization({
+    root: fixture.root,
+    workerId: fixture.workerId,
+    attemptId: fixture.claim.attemptId,
+    workerProcess: fixture.worker.identity,
+    providerProcess: fixture.provider.identity,
+    runtimeCleanup: { ok: true },
+    env: fixture.env
+  });
+  assert.equal(settled.status, "completed");
+  assert.equal(settled.phase, "done");
+  assert.equal(settled.error, null);
+  assert.equal(settled.completedAt, completedAt);
+  assert.equal(settled.result.taskRuntimeCleaned, true);
+  assert.equal(settled.result.runtimeEvidence.executionStatus, "completed");
+  assert.ok(settled.completionContextManifest);
+  assert.equal(settled.progress, "Task runtime cleanup completed");
+  assert.equal(JSON.stringify(settled).includes("eSrCh"), false);
+});
+
+test("pre-provider final observation fails closed for scope and unavailable context", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const terminalIntent = () => ({
+    status: "cancelled",
+    phase: "cancelled",
+    completedAt: new Date().toISOString(),
+    error: {
+      code: "E_CANCELLED",
+      message: "Cancellation completed before provider startup."
+    },
+    summary: "Cancelled"
+  });
+  const cases = [
+    {
+      name: "out-of-scope change",
+      expectedCode: "E_SCOPE_VIOLATION",
+      expectedPath: "outside-terminal-scope.txt",
+      prepare() {},
+      cleanup(fixture) {
+        fs.writeFileSync(
+          path.join(fixture.root, "outside-terminal-scope.txt"),
+          "outside scope\n",
+          "utf8"
+        );
+        return { ok: true };
+      }
+    },
+    {
+      name: "missing pre-context",
+      expectedCode: "E_CONTEXT_DRIFT",
+      unavailable: true,
+      prepare(fixture) {
+        updateJob(fixture.root, fixture.workerId, (job) => (
+          rebindWorkerLaunchAuthorization({
+            ...job,
+            request: {
+              ...job.request,
+              contextManifest: null
+            }
+          })
+        ), fixture.env);
+      },
+      cleanup() {
+        return { ok: true };
+      }
+    },
+    {
+      name: "malformed pre-context",
+      expectedCode: "E_CONTEXT_DRIFT",
+      unavailable: true,
+      prepare(fixture) {
+        updateJob(fixture.root, fixture.workerId, (job) => (
+          rebindWorkerLaunchAuthorization({
+            ...job,
+            request: {
+              ...job.request,
+              contextManifest: {
+                ...job.request.contextManifest,
+                digest: "0".repeat(64)
+              }
+            }
+          })
+        ), fixture.env);
+      },
+      cleanup() {
+        return { ok: true };
+      }
+    },
+    {
+      name: "final capture unavailable",
+      expectedCode: "E_CONTEXT_DRIFT",
+      unavailable: true,
+      prepare(fixture) {
+        updateJob(fixture.root, fixture.workerId, (job) => (
+          rebindWorkerLaunchAuthorization({
+            ...job,
+            request: {
+              ...job.request,
+              spawn: {
+                ...job.request.spawn,
+                executionRoot: path.join(fixture.root, "tracked.txt")
+              }
+            }
+          })
+        ), fixture.env);
+      },
+      cleanup() {
+        return { ok: true };
+      }
+    }
+  ];
+
+  for (const [index, entry] of cases.entries()) {
+    await t.test(entry.name, () => {
+      const fixture = claimedReadDispatchFixture(
+        `unavailable-${index}-${entry.name.replaceAll(" ", "-")}`
+      );
+      entry.prepare(fixture);
+      let settled;
+      try {
+        settled = settleUnstartedDispatchLoss({
+          root: fixture.root,
+          workerId: fixture.workerId,
+          attemptId: fixture.claim.attemptId,
+          dispatchState: "claimed",
+          terminalIntent: terminalIntent(),
+          runtimeCleanup: () => entry.cleanup(fixture),
+          env: fixture.env
+        });
+      } finally {
+        fixture.restoreRoot?.();
+      }
+      assert.equal(settled.status, "failed");
+      assert.equal(settled.error.code, entry.expectedCode);
+      assert.equal(settled.result.taskRuntimeCleaned, true);
+      assert.equal(settled.result.hostVerification, "not_run");
+      assert.equal(settled.result.runtimeEvidence.executionStatus, "failed");
+      assert.equal(
+        settled.progress,
+        "Task runtime cleanup completed; workspace safety review is required"
+      );
+      assert.equal(settled.pendingTerminal, undefined);
+      assert.notEqual(settled.result.stopReason, "cancelled");
+      if (entry.unavailable) {
+        assert.deepEqual(
+          settled.error.details.reasons,
+          ["[final-context-unavailable]"]
+        );
+        assert.equal(settled.completionContextManifest, null);
+        assert.equal(settled.result.runtimeEvidence.postContext, null);
+      } else {
+        assert.ok(settled.completionContextManifest);
+        assert.ok(
+          settled.error.details.paths.includes(entry.expectedPath)
+        );
+        assert.ok(
+          settled.result.runtimeEvidence.scopeViolations.includes(
+            entry.expectedPath
+          )
+        );
+      }
+    });
+  }
+});
+
+test("managed pre-provider cancellation uses its bound linked-worktree observation", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  await t.test("unrelated shared refs remain tolerated", async (subtest) => {
+    const fixture = await readyManagedWriteDispatchFixture(
+      subtest,
+      "terminal-observation-linked-refs"
+    );
+    const controlHead = git(fixture.root, "rev-parse", "HEAD");
+    git(
+      fixture.root,
+      "update-ref",
+      "refs/heads/terminal-observation-unrelated",
+      controlHead
+    );
+    git(
+      fixture.root,
+      "update-ref",
+      "refs/codex/turn-diffs/terminal-observation-unrelated",
+      controlHead
+    );
+    const cancellation = cancelWorker({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      idempotencyKey: "terminal-observation-linked-cancel-0001",
+      env: fixture.env
+    });
+    const settled = tryReadJob(
+      fixture.root,
+      fixture.workerId,
+      fixture.env
+    );
+    assert.equal(cancellation.receipt.terminalRecordCommittedAt !== null, true);
+    assert.equal(settled.status, "cancelled");
+    assert.equal(settled.phase, "cancelled");
+    assert.equal(settled.error, null);
+    assert.equal(settled.result.stopReason, "cancelled");
+    assert.equal(settled.result.taskRuntimeCleaned, true);
+    assert.equal(settled.result.hostVerification, "not_run");
+    assert.equal(
+      settled.result.runtimeEvidence.executionStatus,
+      "cancelled"
+    );
+    assert.deepEqual(settled.result.runtimeEvidence.scopeViolations, []);
+    assert.deepEqual(settled.result.runtimeEvidence.sharedRefObservation, {
+      schemaVersion: 1,
+      classification: "tolerated_unrelated_shared_refs",
+      toleratedUnrelatedSharedRefChurn: true,
+      taskRelevantMetadataDrift: false
+    });
+    assert.equal(
+      settled.completionContextManifest.workspaceRoot,
+      fixture.official.executionRoot
+    );
+    assert.equal(
+      settled.result.runtimeEvidence.postContext.digest,
+      settled.completionContextManifest.digest
+    );
+    assert.equal(settled.progress, "Cancellation completed");
+    assert.doesNotThrow(() => assertDispatchContract(settled));
+  });
+
+  await t.test("partial managed authority fails closed", async (subtest) => {
+    const fixture = await readyManagedWriteDispatchFixture(
+      subtest,
+      "terminal-observation-partial-authority"
+    );
+    updateJob(fixture.root, fixture.workerId, (job) => {
+      const corrupted = { ...job };
+      delete corrupted.provisioningRuntime;
+      return corrupted;
+    }, fixture.env);
+    cancelWorker({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      idempotencyKey: "terminal-observation-partial-cancel-0001",
+      env: fixture.env
+    });
+    const settled = tryReadJob(
+      fixture.root,
+      fixture.workerId,
+      fixture.env
+    );
+    assert.equal(settled.status, "failed");
+    assert.equal(settled.phase, "context-rejected");
+    assert.equal(settled.error.code, "E_CONTEXT_DRIFT");
+    assert.deepEqual(
+      settled.error.details.reasons,
+      ["[final-context-unavailable]"]
+    );
+    assert.equal(settled.completionContextManifest, null);
+    assert.equal(settled.result.taskRuntimeCleaned, true);
+    assert.equal(settled.result.hostVerification, "not_run");
+    assert.equal(settled.result.runtimeEvidence.executionStatus, "failed");
+    assert.equal(settled.result.runtimeEvidence.postContext, null);
+    assert.notEqual(settled.result.stopReason, "cancelled");
+    assert.equal(
+      settled.progress,
+      "Task runtime cleanup completed; workspace safety review is required"
+    );
+    assert.equal(settled.request.spawn.dispatch.state, "failed");
+    assert.doesNotThrow(() => assertDispatchContract(settled));
+  });
+});
+
 test("cancel is idempotent with exactly one cancellation-request event", () => {
   const root = initRepo();
   const { env } = envFor(root);
@@ -5437,6 +6841,135 @@ test("cancel is idempotent with exactly one cancellation-request event", () => {
   assert.equal(replayedJob.workerAuthorization, null);
   assert.equal(replayedJob.request.spawn.dispatch.state, "failed");
   assert.doesNotThrow(() => assertDispatchContract(replayedJob));
+});
+
+test("queued cancellation retry clears a stale runtime-cleanup warning", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const spawned = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope: buildTaskEnvelope({
+      userRequest: "Retry queued cancellation cleanup",
+      mode: "read"
+    }),
+    idempotencyKey: "spawn-cancel-cleanup-retry-0001",
+    env
+  });
+  const runtimeAuth = path.join(
+    workspaceState(root, env),
+    "task-homes",
+    spawned.handle.id,
+    ".grok",
+    "auth.json"
+  );
+  fs.mkdirSync(runtimeAuth, { recursive: true, mode: 0o700 });
+
+  cancelWorker({
+    root,
+    principal: principal(root),
+    workerId: spawned.handle.id,
+    idempotencyKey: "cancel-cleanup-retry-first-0001",
+    env
+  });
+  const blocked = tryReadJob(root, spawned.handle.id, env);
+  assert.equal(blocked.status, "queued");
+  assert.equal(blocked.phase, "cancellation-requested");
+  assert.equal(blocked.result.taskRuntimeCleaned, false);
+  assert.equal(typeof blocked.result.privacyWarning, "string");
+
+  fs.rmdirSync(runtimeAuth);
+  cancelWorker({
+    root,
+    principal: principal(root),
+    workerId: spawned.handle.id,
+    idempotencyKey: "cancel-cleanup-retry-second-0001",
+    env
+  });
+  const settled = tryReadJob(root, spawned.handle.id, env);
+  assert.equal(settled.status, "cancelled");
+  assert.equal(settled.error, null);
+  assert.equal(settled.result.taskRuntimeCleaned, true);
+  assert.equal(settled.result.privacyWarning, undefined);
+  assert.equal(settled.progress, "Cancellation completed");
+  assert.equal(settled.result.stopReason, "cancelled");
+  assert.doesNotThrow(() => assertDispatchContract(settled));
+});
+
+test("cancellation receipts reject impossible durable dates and project invalid dates as null", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const spawned = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope: buildTaskEnvelope({
+      userRequest: "Reject impossible cancellation dates",
+      mode: "read"
+    }),
+    idempotencyKey: "spawn-cancel-impossible-date-0001",
+    env
+  });
+  const key = "cancel-impossible-date-0001";
+  const first = cancelWorker({
+    root,
+    principal: principal(root),
+    workerId: spawned.handle.id,
+    idempotencyKey: key,
+    env
+  });
+  const file = cancelIdempotencyFile(root, key, env);
+  const original = JSON.parse(fs.readFileSync(file, "utf8"));
+  const impossible = "2026-02-31T00:00:00.000Z";
+
+  for (const field of [
+    "requestAcceptedAt",
+    "processGroupGoneAt",
+    "terminalRecordCommittedAt"
+  ]) {
+    const corrupted = structuredClone(original);
+    corrupted.receipt[field] = impossible;
+    if (field === "requestAcceptedAt") {
+      corrupted.committedAt = impossible;
+    }
+    fs.writeFileSync(file, `${JSON.stringify(corrupted)}\n`, {
+      mode: 0o600
+    });
+    assert.throws(
+      () => cancelWorker({
+        root,
+        principal: principal(root),
+        workerId: spawned.handle.id,
+        idempotencyKey: key,
+        env
+      }),
+      (error) => error?.code === "E_STATE"
+        && /receipt timestamp is malformed/i.test(error.message)
+    );
+  }
+  fs.writeFileSync(file, `${JSON.stringify(original)}\n`, {
+    mode: 0o600
+  });
+  assert.equal(cancelWorker({
+    root,
+    principal: principal(root),
+    workerId: spawned.handle.id,
+    idempotencyKey: key,
+    env
+  }).replayed, true);
+
+  const projected = projectCancellationReceipt({
+    ...first.receipt,
+    requestAcceptedAt: impossible,
+    processGroupGoneAt: impossible,
+    terminalRecordCommittedAt: impossible
+  });
+  assert.equal(projected.requestAcceptedAt, null);
+  assert.equal(projected.processGroupGoneAt, null);
+  assert.equal(projected.terminalRecordCommittedAt, null);
+  assert.equal(
+    projectCancellationReceipt(first.receipt).requestAcceptedAt,
+    first.receipt.requestAcceptedAt
+  );
 });
 
 test("queued cancellation never terminalizes a claimed dispatch with a pending spawn intent", () => {

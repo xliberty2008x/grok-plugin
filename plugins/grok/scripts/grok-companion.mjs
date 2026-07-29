@@ -56,7 +56,7 @@ import { admitJob, appendJobLog, config, setConfig, generateId, writeJob, update
 import { resolveControlWorkspace, workspaceRoot, workspaceState } from "./lib/workspace.mjs";
 import { redact, redactText, sanitizeDisplayText } from "./lib/redact.mjs";
 import { readBoundedStdin, STDIN_READY_MARKER } from "./lib/stdin.mjs";
-import { hasGrokAncestor, identityMatches, processGroupAlive, processGroupGone, processIsZombie, terminateOwnedProcess } from "./lib/process-control.mjs";
+import { hasGrokAncestor, identityMatches, processGroupAlive, processGroupGone, processIsZombie, signalOwnedProcess, terminateOwnedProcess } from "./lib/process-control.mjs";
 import {
   hasForeignActiveProvider,
   registerProviderGuard,
@@ -84,7 +84,13 @@ import {
   parseTaskEnvelopeInput,
   scrubStoredJob
 } from "./lib/task-contract.mjs";
-import { projectWorkerSnapshot } from "./lib/worker-protocol.mjs";
+import {
+  projectWorkerDiagnosticText,
+  projectWorkerHandle,
+  projectWorkerError,
+  projectWorkerPublicText,
+  projectWorkerSnapshot
+} from "./lib/worker-protocol.mjs";
 import { CONTEXT_BINDING_MODE, verifyJobEffectivePrompt } from "./lib/worker-context.mjs";
 import {
   assertDispatchContract,
@@ -105,6 +111,12 @@ import {
 } from "./lib/worker-mutation.mjs";
 import { providerLaunchCleanupBlocked } from "./lib/worker-reconcile.mjs";
 import { reconcileBrokerWorkers, recoverLostProviderStartedWorker } from "./lib/worker-recovery.mjs";
+import {
+  captureTerminalEvidence,
+  normalizeTerminalProcessSignalError,
+  selectTaskTerminalError,
+  terminalTaskProgress
+} from "./lib/task-terminal-evidence.mjs";
 import {
   assertWorkerAuthorization,
   createDispatchOutbox,
@@ -241,17 +253,79 @@ function publicJob(job, options = {}) {
   return projectWorkerSnapshot(job, options);
 }
 function publicJson(value, options = {}) { return Array.isArray(value) ? value.map((job) => publicJob(job, options)) : publicJob(value, options); }
+
+const TRANSFER_SESSION_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function projectTransferCliError(error) {
+  const projected = projectWorkerError(error);
+  if (!projected
+    || !["E_IMPORT_RESULT", "E_STATE"].includes(error?.code)
+    || projected.code !== error.code
+    || !error.details
+    || typeof error.details !== "object"
+    || Array.isArray(error.details)) {
+    return projected;
+  }
+  const details = { ...(projected.details || {}) };
+  const sessionId = typeof error.details.sessionId === "string"
+    && TRANSFER_SESSION_ID_PATTERN.test(error.details.sessionId)
+    ? error.details.sessionId
+    : null;
+  if (sessionId) {
+    details.sessionId = sessionId;
+    const resumeSuffix = ` --resume ${sessionId}`;
+    const resume = typeof error.details.resume === "string"
+      && error.details.resume.length <= 512
+      && error.details.resume.endsWith(resumeSuffix)
+      ? error.details.resume.slice(0, -resumeSuffix.length)
+      : null;
+    if (resume
+      && /^grok --model [A-Za-z0-9._:/-]{1,128}(?: --reasoning-effort [A-Za-z0-9._-]{1,64})?$/.test(resume)) {
+      details.resume = projectWorkerPublicText(
+        `${resume}${resumeSuffix}`,
+        { maxBytes: 512 }
+      );
+    }
+    const deleteCommand = `grok sessions delete ${sessionId}`;
+    if (error.details.delete === deleteCommand) {
+      details.delete = deleteCommand;
+    }
+  }
+  if (Array.isArray(error.details.sessionIds)) {
+    const sessionIds = [...new Set(error.details.sessionIds)]
+      .filter((value) => (
+        typeof value === "string"
+        && TRANSFER_SESSION_ID_PATTERN.test(value)
+      ))
+      .slice(0, 64);
+    if (sessionIds.length) details.sessionIds = sessionIds;
+  }
+  return {
+    ...projected,
+    ...(Object.keys(details).length ? { details } : {})
+  };
+}
+
 function researchResultJson(job) {
   const projected = publicJob(job);
   const markdown = job?.result?.researchReport?.markdown || job?.result?.researchReport?.text || null;
-  if (job?.jobClass !== "research" || typeof markdown !== "string") return projected;
+  if (job?.jobClass !== "research"
+    || typeof markdown !== "string"
+    || resultRequiresPublicOnlyProjection(job, projected)) {
+    return projected;
+  }
+  const publicMarkdown = projectWorkerDiagnosticText(markdown, {
+    job,
+    maxBytes: 512 * 1024
+  });
   return {
     ...projected,
     result: {
       ...(projected.result || {}),
       researchReport: {
         ...(projected.result?.researchReport || {}),
-        markdown
+        markdown: publicMarkdown
       }
     }
   };
@@ -494,6 +568,14 @@ function applyTaskPrivacy(result, cleanup, retentionNote = null) {
   return next;
 }
 
+function reconcileTerminalStopReason(result, status) {
+  const next = { ...(result || {}) };
+  if (status !== "cancelled" && next.stopReason === "cancelled") {
+    delete next.stopReason;
+  }
+  return next;
+}
+
 function recheckCancelLaunchSettlement(root, id) {
   let retained = false;
   const job = updateJob(root, id, (current) => {
@@ -551,27 +633,6 @@ async function terminateProviderCleanupTarget(root, job) {
     });
   }
   return identity;
-}
-
-function captureTerminalEvidence(root, job, executionStatus) {
-  const preContext = job.request?.contextManifest
-    ? assertContextManifestIntegrity(job.request.contextManifest)
-    : null;
-  let postContext = null;
-  try { postContext = captureContextManifest(root); } catch {}
-  const changedPaths = preContext && postContext ? observeChangedPaths(preContext, postContext) : [];
-  const scopeViolations = evaluateScope(changedPaths, job.request?.envelope?.scope);
-  return {
-    postContext,
-    runtimeEvidence: buildRuntimeEvidence({
-      preContext,
-      postContext,
-      changedPaths,
-      commandOutcomes: job.commandOutcomes || [],
-      scopeViolations,
-      executionStatus
-    })
-  };
 }
 
 async function recoverActiveJobs(root) {
@@ -679,8 +740,69 @@ async function recoverActiveJobs(root) {
         return;
       }
       cleanup = includeGuardCleanup(root, currentJob.id, cleanup, { inWorkspaceTransaction: true });
+      if (!cleanup.ok) {
+        updateJob(root, currentJob.id, (current) => {
+          current.pendingTerminal ||= {
+            status: current.status,
+            phase: current.phase,
+            completedAt: current.completedAt,
+            error: current.error || null,
+            summary: current.summary || null
+          };
+          current.status = "running";
+          current.phase = "cleanup-blocked";
+          current.completedAt = null;
+          current.progress = "Task finished; runtime cleanup is still pending";
+          current.result = applyTaskPrivacy(current.result, cleanup);
+          return current;
+        });
+        return;
+      }
       updateJob(root, currentJob.id, (current) => {
-        current.result = applyTaskPrivacy(current.result, cleanup);
+        const executionStatus = current.status === "completed"
+          ? "completed"
+          : current.status === "cancelled"
+            ? "cancelled"
+            : "failed";
+        const evidence = captureTerminalEvidence(root, current, executionStatus);
+        const normalizedCurrentError = normalizeTerminalProcessSignalError(
+          current.error
+        );
+        const cleanupSignalError =
+          normalizedCurrentError?.code === "E_PROCESS_IDENTITY"
+            && normalizedCurrentError.details?.secondaryDiagnostic != null
+            ? current.error
+            : null;
+        const selectedError = selectTaskTerminalError(
+          evidence,
+          cleanupSignalError ? null : current.error,
+          cleanupSignalError
+        );
+        const finalStatus = selectedError
+          ? (selectedError.code === "E_CANCELLED" ? "cancelled" : "failed")
+          : current.status;
+        current.status = finalStatus;
+        current.phase = selectedError?.code === "E_CONTEXT_DRIFT"
+          ? "context-rejected"
+          : selectedError?.code === "E_SCOPE_VIOLATION"
+            ? "scope-rejected"
+            : selectedError
+              ? finalStatus
+              : current.phase;
+        current.error = selectedError ? redact(asErrorPayload(selectedError)) : null;
+        if (current.error?.message) current.summary = current.error.message;
+        current.progress = terminalTaskProgress(finalStatus, current.error);
+        evidence.runtimeEvidence.executionStatus = finalStatus === "completed"
+          ? "completed"
+          : finalStatus === "cancelled"
+            ? "cancelled"
+            : "failed";
+        current.completionContextManifest = evidence.postContext;
+        current.result = reconcileTerminalStopReason({
+          ...applyTaskPrivacy(current.result, cleanup),
+          runtimeEvidence: evidence.runtimeEvidence,
+          hostVerification: current.result?.hostVerification || "not_run"
+        }, finalStatus);
         return current;
       });
     });
@@ -735,9 +857,20 @@ async function recoverActiveJobs(root) {
     if (cleanupError) {
       updateJob(root, job.id, (current) => {
         if (terminal(current)) return current;
+        const priorSignalError = normalizeTerminalProcessSignalError(
+          current.error
+        );
+        const nextCleanupError = normalizeTerminalProcessSignalError(
+          cleanupError
+        );
+        const retainedCleanupError =
+          priorSignalError?.code === "E_PROCESS_IDENTITY"
+            && priorSignalError.details?.secondaryDiagnostic
+            ? priorSignalError
+            : nextCleanupError;
         current.phase = "cleanup-blocked";
         current.progress = "Worker lost; provider cleanup could not be verified";
-        current.error = redact(asErrorPayload(cleanupError));
+        current.error = redact(asErrorPayload(retainedCleanupError));
         current.summary = current.error.message;
         current.heartbeatAt = now();
         if (current.jobClass === "review") {
@@ -761,15 +894,6 @@ async function recoverActiveJobs(root) {
     }
     let cleanup = !cleanupError && job.jobClass === "review" ? cleanupReviewEnvironment(stateDir(root), job.id) : null;
     if (cleanup) cleanup = includeGuardCleanup(root, job.id, cleanup);
-    const pendingExecutionStatus = job.pendingTerminal?.status === "completed"
-      ? "completed"
-      : job.pendingTerminal?.status === "cancelled"
-        ? "cancelled"
-        : "failed";
-    // Research jobs never use TaskEnvelope evidence paths.
-    const evidence = job.jobClass === "research"
-      ? { postContext: null, runtimeEvidence: null }
-      : captureTerminalEvidence(root, job, pendingExecutionStatus);
     updateJob(root, job.id, (current) => {
       // The worker can finish between the liveness check above and this locked
       // update. Never turn that freshly completed record into E_WORKER_LOST.
@@ -779,21 +903,70 @@ async function recoverActiveJobs(root) {
       if (providerLaunchCleanupBlocked(current)) return current;
       Object.assign(current, scrubStoredJob(current));
       const pending = current.pendingTerminal || null;
-      current.status = pending?.status || "failed";
-      current.phase = pending?.phase || (current.status === "completed" ? "done" : current.status);
+      const pendingExecutionStatus = pending?.status === "completed"
+        ? "completed"
+        : pending?.status === "cancelled"
+          ? "cancelled"
+          : "failed";
+      // Research jobs never use TaskEnvelope evidence paths. Task evidence is
+      // captured from the authoritative locked record only after cleanup was
+      // proven, so a stale outer snapshot cannot mask final workspace drift.
+      const evidence = current.jobClass === "research"
+        ? { postContext: null, runtimeEvidence: null }
+        : captureTerminalEvidence(root, current, pendingExecutionStatus);
+      const interruptedError = {
+        code: current.jobClass === "research"
+          ? "E_WORKFLOW_INCOMPLETE"
+          : "E_WORKER_LOST",
+        message: current.jobClass === "research"
+          ? "The deep-research workflow was interrupted when its worker disappeared; it was not replayed."
+          : "The background worker disappeared; the prompt was not replayed."
+      };
+      const taskError = current.jobClass === "task"
+        ? selectTaskTerminalError(
+            evidence,
+            pending ? pending.error || null : interruptedError,
+            current.error || null
+          )
+        : null;
+      const intendedStatus = current.jobClass === "task"
+        ? (
+            taskError
+              ? (taskError.code === "E_CANCELLED" ? "cancelled" : "failed")
+              : pending?.status || "failed"
+          )
+        : pending?.status || "failed";
+      current.status = intendedStatus;
+      current.phase = taskError
+        ? (
+            taskError.code === "E_CONTEXT_DRIFT"
+              ? "context-rejected"
+              : taskError.code === "E_SCOPE_VIOLATION"
+                ? "scope-rejected"
+                : current.status
+          )
+        : pending?.phase || (current.status === "completed" ? "done" : current.status);
       current.completedAt = pending?.completedAt || now();
-      if (pending) {
+      if (current.jobClass === "task") {
+        current.error = taskError ? redact(asErrorPayload(taskError)) : null;
+        if (current.error?.message) {
+          current.summary = current.error.message;
+        } else if (pending?.summary) {
+          current.summary = pending.summary;
+        }
+        current.progress = terminalTaskProgress(current.status, current.error);
+        if (evidence.runtimeEvidence) {
+          evidence.runtimeEvidence.executionStatus = current.status === "completed"
+            ? "completed"
+            : current.status === "cancelled"
+              ? "cancelled"
+              : "failed";
+        }
+      } else if (pending) {
         current.error = pending.error || null;
         if (pending.summary) current.summary = pending.summary;
       } else {
-        current.error = {
-          code: current.jobClass === "research"
-            ? "E_WORKFLOW_INCOMPLETE"
-            : "E_WORKER_LOST",
-          message: current.jobClass === "research"
-            ? "The deep-research workflow was interrupted when its worker disappeared; it was not replayed."
-            : "The background worker disappeared; the prompt was not replayed."
-        };
+        current.error = interruptedError;
         if (current.jobClass === "research") {
           current.workflow = {
             ...(current.workflow || {}),
@@ -819,6 +992,10 @@ async function recoverActiveJobs(root) {
       } else if (current.jobClass === "research") {
         current.result = applyResearchPrivacy(current.result, researchCleanup || { ok: true });
       }
+      current.result = reconcileTerminalStopReason(
+        current.result,
+        current.status
+      );
       delete current.pendingTerminal;
       current.lifecycleEvents = appendLifecycleEvent(
         current.lifecycleEvents,
@@ -893,8 +1070,12 @@ function recordLifecycle(root, id, type, summary, detail = undefined) {
 }
 
 function renderReviewSession(job) {
-  if (job.grokSessionId) {
-    return `Grok session: ${job.grokSessionId}${job.result?.providerSessionDeleted ? " (deleted after review)" : ""}`;
+  const sessionLabel = projectWorkerDiagnosticText(job?.grokSessionId, {
+    job,
+    maxBytes: 256
+  });
+  if (sessionLabel.trim()) {
+    return `Grok session: ${sessionLabel}${job.result?.providerSessionDeleted ? " (deleted after review)" : ""}`;
   }
   if (job.result?.skipped && job.result?.skipReason === "empty-target") {
     return "Grok session: not started (empty target)";
@@ -906,34 +1087,66 @@ function renderReviewSession(job) {
 }
 
 function renderReview(job) {
-  const review = job.result?.review;
+  const projected = publicJob(job);
+  const review = projected.result?.review;
   if (!review) return renderJob(job);
-  const lines = [`Grok ${job.kind} ${job.id}`, `Verdict: ${review.verdict}`, "", review.summary];
+  const lines = [
+    `Grok ${projected.kind} ${projected.id}`,
+    `Verdict: ${review.verdict}`,
+    "",
+    review.summary
+  ];
   for (const f of review.findings) lines.push("", `[${f.severity.toUpperCase()}] ${f.title}${f.file ? ` (${f.file}${f.line ? `:${f.line}` : ""})` : ""}`, f.body);
   lines.push("", renderReviewSession(job));
   return lines.join("\n");
 }
 
+const HUMAN_PUBLIC_ONLY_ERROR_CODES = new Set([
+  "E_CONTEXT_DRIFT",
+  "E_SCOPE_VIOLATION",
+  "E_PROCESS_IDENTITY"
+]);
+
+function resultRequiresPublicOnlyProjection(job, projected) {
+  const publicErrors = [
+    projectWorkerError(job?.pendingTerminal?.error),
+    projectWorkerError(job?.error)
+  ].filter(Boolean);
+  if (publicErrors.some((error) => HUMAN_PUBLIC_ONLY_ERROR_CODES.has(error.code))) {
+    return true;
+  }
+  const storedWarning = job?.result?.privacyWarning;
+  return typeof storedWarning === "string"
+    && storedWarning !== projected?.result?.privacyWarning;
+}
+
 function renderJob(job, { includeResearchReport = false } = {}) {
+  const projected = publicJob(job);
+  const result = projected.result;
+  const publicOnlyResult = resultRequiresPublicOnlyProjection(job, projected);
+  const sessionLabel = projectWorkerDiagnosticText(job?.grokSessionId, {
+    job,
+    maxBytes: 256
+  });
   const lines = [
-    `Job: ${job.id}`,
-    `Kind: ${job.kind}`,
-    `Status: ${job.status}`,
-    `Phase: ${job.phase}`,
-    `Summary: ${job.summary || "-"}`
+    `Job: ${projected.id}`,
+    `Kind: ${projected.kind}`,
+    `Status: ${projected.status}`,
+    `Phase: ${projected.phase}`,
+    `Summary: ${projected.summary || "-"}`
   ];
-  if (job.progress) lines.push(`Progress: ${job.progress}`);
-  if (job.heartbeatAt) lines.push(`Heartbeat: ${job.heartbeatAt}`);
-  if (job.createdAt) lines.push(`Created: ${job.createdAt}`);
-  if (job.updatedAt) lines.push(`Updated: ${job.updatedAt}`);
-  if (job.grokSessionId) {
-    lines.push(`Grok session: ${job.grokSessionId}`);
-    if (job.jobClass !== "research") {
-      lines.push(`Resume through this host: ${hostCommand("rescue", `--resume --job-id ${job.id} <next task>`)}`);
+  if (projected.progress) lines.push(`Progress: ${projected.progress}`);
+  if (projected.heartbeatAt) lines.push(`Heartbeat: ${projected.heartbeatAt}`);
+  if (projected.createdAt) lines.push(`Created: ${projected.createdAt}`);
+  if (projected.updatedAt) lines.push(`Updated: ${projected.updatedAt}`);
+  if (sessionLabel.trim()) {
+    lines.push(`Grok session: ${sessionLabel}`);
+    if (projected.jobClass !== "research") {
+      lines.push(`Resume through this host: ${hostCommand("rescue", `--resume --job-id ${projected.id} <next task>`)}`);
     }
   }
-  if (job.result?.workerReport) {
-    const report = job.result.workerReport;
+  if (result?.workerReport) {
+    const report = result.workerReport;
     lines.push("", `Outcome: ${report.outcome}`, report.summary);
     if (report.changedFiles?.length) lines.push(`Changed files: ${report.changedFiles.join(", ")}`);
     if (report.checksClaimed?.length) lines.push(`Checks claimed: ${report.checksClaimed.join(", ")}`);
@@ -947,33 +1160,66 @@ function renderJob(job, { includeResearchReport = false } = {}) {
     if (Array.isArray(report.validationIssues) && report.validationIssues.length) {
       lines.push("Report validation:", ...report.validationIssues.map((item) => `- ${item}`));
     }
-    if (job.result.hostVerification) lines.push(`Host verification: ${job.result.hostVerification}`);
-    if (job.result.runtimeEvidence?.observedChangedPaths?.length) {
-      lines.push(`Runtime-observed paths: ${job.result.runtimeEvidence.observedChangedPaths.join(", ")}`);
+    if (result.hostVerification) lines.push(`Host verification: ${result.hostVerification}`);
+    if (result.runtimeEvidence?.observedChangedPaths?.length) {
+      lines.push(`Runtime-observed paths: ${result.runtimeEvidence.observedChangedPaths.join(", ")}`);
     }
-  } else if (job.jobClass === "research" && job.result?.researchReport) {
-    const report = job.result.researchReport;
+  } else if (projected.jobClass === "research" && result?.researchReport) {
+    const report = result.researchReport;
     lines.push(
-      `Workflow: ${job.result.workflow?.runId || "-"} (${job.result.workflow?.status || "-"})`,
-      `Report status: ${report.status || report.assessment || "partial"}`,
+      `Workflow: ${result.workflow?.runId || "-"} (${result.workflow?.status || "-"})`,
+      `Report status: ${report.status || "partial"}`,
       `Sources: ${report.sourceCount ?? 0}`,
-      `Host verification: ${job.result.hostVerification || "not_run"}`
+      `Host verification: ${result.hostVerification || "not_run"}`
     );
     if (report.coverageNotes?.length) {
       lines.push("Coverage notes:", ...report.coverageNotes.map((item) => `- ${item}`));
     }
-    if (includeResearchReport && (report.markdown || report.text)) {
+    const fullResearchReport =
+      job.result?.researchReport?.markdown
+      || job.result?.researchReport?.text
+      || null;
+    if (includeResearchReport
+      && !publicOnlyResult
+      && typeof fullResearchReport === "string") {
       lines.push(
         "",
         "[Untrusted provider research report]",
-        sanitizeDisplayText(report.markdown || report.text).slice(0, 512 * 1024)
+        projectWorkerDiagnosticText(fullResearchReport, {
+          job,
+          maxBytes: 512 * 1024
+        })
+      );
+    } else if (includeResearchReport && report.textPreview) {
+      lines.push(
+        "",
+        "[Untrusted provider research report]",
+        report.textPreview
       );
     }
-  } else if (job.result?.text) {
-    lines.push("", job.result.text);
+  } else if (!publicOnlyResult && typeof job.result?.text === "string") {
+    lines.push("", projectWorkerDiagnosticText(job.result.text, {
+      job,
+      maxBytes: 512 * 1024
+    }));
   }
-  if (job.error) lines.push("", `${job.error.code}: ${job.error.message}`);
+  if (projected.error) {
+    lines.push("", `${projected.error.code}: ${projected.error.message}`);
+  }
   return lines.join("\n");
+}
+
+function renderStatusTable(jobs) {
+  const handles = jobs.map((job) => projectWorkerHandle(job));
+  return [
+    "| Job | Kind | Status | Phase | Progress | Heartbeat |",
+    "|---|---|---|---|---|---|",
+    ...handles.map((handle) => (
+      `| ${handle.id} | ${handle.kind} | ${handle.status} | ${handle.phase} | ${
+        String(handle.progress || handle.summary || "").replace(/\|/g, "\\|")
+      } | ${handle.heartbeatAt || handle.updatedAt || "-"} |`
+    ))
+  ];
 }
 
 function eventUpdater(root, id, dispatchAttemptId = null, providerGeneration = null, dispatchFence = null) {
@@ -2531,7 +2777,11 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
     }
     updateJob(root, id, (current) => {
       if (terminal(current)) return current;
-      const intendedStatus = terminalError ? (terminalError.code === "E_CANCELLED" ? "cancelled" : "failed") : "completed";
+      const pending = current.pendingTerminal || null;
+      const intendedStatus = pending?.status
+        || (terminalError
+          ? (terminalError.code === "E_CANCELLED" ? "cancelled" : "failed")
+          : "completed");
       const intendedPhase = intendedStatus === "completed" ? "done" : intendedStatus;
       const completedAt = now();
       if (current.jobClass === "task" && taskCleanup && !taskCleanup.ok) {
@@ -2555,8 +2805,55 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
           current.summary = current.error.message;
         }
       } else {
-        current.status = intendedStatus;
-        current.phase = intendedPhase;
+        let finalStatus = intendedStatus;
+        let finalPhase = intendedPhase;
+        if (current.jobClass === "task") {
+          const evidence = captureTerminalEvidence(
+            root,
+            current,
+            intendedStatus === "completed"
+              ? "completed"
+              : intendedStatus === "cancelled"
+                ? "cancelled"
+                : "failed"
+          );
+          const selectedError = selectTaskTerminalError(
+            evidence,
+            pending ? pending.error || null : current.error || terminalError,
+            current.error || terminalError
+          );
+          if (selectedError) {
+            finalStatus = selectedError.code === "E_CANCELLED"
+              ? "cancelled"
+              : "failed";
+            finalPhase = selectedError.code === "E_CONTEXT_DRIFT"
+              ? "context-rejected"
+              : selectedError.code === "E_SCOPE_VIOLATION"
+                ? "scope-rejected"
+                : finalStatus;
+            current.error = redact(asErrorPayload(selectedError));
+            current.summary = current.error.message;
+            terminalError = selectedError;
+          } else {
+            current.error = null;
+            if (pending?.summary) current.summary = pending.summary;
+            terminalError = null;
+          }
+          evidence.runtimeEvidence.executionStatus = finalStatus === "completed"
+            ? "completed"
+            : finalStatus === "cancelled"
+              ? "cancelled"
+              : "failed";
+          current.completionContextManifest = evidence.postContext;
+          current.result = reconcileTerminalStopReason({
+            ...(current.result || {}),
+            hostVerification: current.result?.hostVerification || "not_run",
+            runtimeEvidence: evidence.runtimeEvidence
+          }, finalStatus);
+          current.progress = terminalTaskProgress(finalStatus, current.error);
+        }
+        current.status = finalStatus;
+        current.phase = finalPhase;
         current.completedAt = completedAt;
         delete current.pendingTerminal;
       }
@@ -2691,29 +2988,109 @@ async function startJob(root, job, background, { announce = false } = {}) {
     }
   }
   if (launcherCode !== 0) {
-    const cleanup = job.jobClass === "review" ? cleanupReviewEnvironment(stateDir(root), job.id) : null;
-    const evidence = captureTerminalEvidence(root, job, "failed");
-    updateJob(root, job.id, (current) => {
-      Object.assign(current, scrubStoredJob(current));
-      current.status = "failed"; current.phase = "failed"; current.completedAt = now(); current.error = { code: "E_WORKER_LOST", message: redactText(diagnostic) || "Could not launch the isolated Grok worker." }; current.summary = current.error.message;
-      current.completionContextManifest = evidence.postContext;
-      current.result = { ...(current.result || {}), hostVerification: "not_run", runtimeEvidence: evidence.runtimeEvidence };
-      current.lifecycleEvents = appendLifecycleEvent(current.lifecycleEvents, "blocked", current.error.message);
-      if (cleanup) { current.result = { ...(current.result || {}), providerSessionDeleted: cleanup.ok }; if (cleanup.warning) current.result.privacyWarning = cleanup.warning; }
-      return current;
-    });
+    if (job.jobClass === "task") {
+      // A failed nonce launcher does not prove that no detached child crossed
+      // the spawn boundary. Keep task terminal intent durable but nonterminal;
+      // an exact recovery owner must prove process/runtime cleanup before final
+      // workspace observation and publication.
+      updateJob(root, job.id, (current) => {
+        if (terminal(current)
+          || isSupportedWorkerDispatch(current.request?.spawn?.dispatch)) {
+          return current;
+        }
+        const intendedMessage =
+          redactText(diagnostic) || "Could not launch the isolated Grok worker.";
+        const blockedMessage =
+          "Worker launch failed, but detached process and runtime cleanup are not yet proven.";
+        current.status = "running";
+        current.phase = "launch-unsettled";
+        current.completedAt = null;
+        current.pendingTerminal = {
+          status: "failed",
+          phase: "failed",
+          completedAt: now(),
+          error: {
+            code: "E_WORKER_LOST",
+            message: intendedMessage
+          },
+          summary: intendedMessage
+        };
+        current.error = {
+          code: "E_PROCESS_IDENTITY",
+          message: blockedMessage
+        };
+        current.summary = blockedMessage;
+        current.progress =
+          "Worker launch failed; exact process and runtime cleanup remain pending";
+        current.result = applyTaskPrivacy(
+          current.result,
+          null,
+          "Task runtime artifacts retained until failed-launch cleanup is proven."
+        );
+        current.lifecycleEvents = appendLifecycleEvent(
+          current.lifecycleEvents || [],
+          "blocked",
+          blockedMessage
+        );
+        return scrubStoredJob(current);
+      });
+    } else {
+      const cleanup = job.jobClass === "review"
+        ? cleanupReviewEnvironment(stateDir(root), job.id)
+        : null;
+      updateJob(root, job.id, (current) => {
+        Object.assign(current, scrubStoredJob(current));
+        current.status = "failed";
+        current.phase = "failed";
+        current.completedAt = now();
+        current.error = {
+          code: "E_WORKER_LOST",
+          message: redactText(diagnostic)
+            || "Could not launch the isolated Grok worker."
+        };
+        current.summary = current.error.message;
+        current.result = {
+          ...(current.result || {}),
+          hostVerification: "not_run"
+        };
+        current.lifecycleEvents = appendLifecycleEvent(
+          current.lifecycleEvents,
+          "blocked",
+          current.error.message
+        );
+        if (cleanup) {
+          current.result = {
+            ...(current.result || {}),
+            providerSessionDeleted: cleanup.ok
+          };
+          if (cleanup.warning) {
+            current.result.privacyWarning = cleanup.warning;
+          }
+        }
+        return current;
+      });
+    }
   }
   if (launcherCode === 0 && !background && announce) {
     const accepted = readJob(root, job.id);
+    const acceptedHandle = projectWorkerHandle(accepted);
     process.stderr.write(`GROK_JOB_ACCEPTED ${JSON.stringify({
-      id: accepted.id,
-      status: accepted.status,
-      phase: accepted.phase,
-      progress: accepted.progress || accepted.summary || "Worker started"
+      id: acceptedHandle.id,
+      status: acceptedHandle.status,
+      phase: acceptedHandle.phase,
+      progress: acceptedHandle.progress || acceptedHandle.summary || "Worker started"
     })}\n`);
   }
   if (background) return readJob(root, job.id);
   let finished = readJob(root, job.id);
+  if (launcherCode !== 0 && !terminal(finished)) {
+    throw new CompanionError(
+      finished.error?.code || "E_PROCESS_IDENTITY",
+      finished.error?.message
+        || "Worker launch cleanup remains unproven.",
+      finished.error?.details
+    );
+  }
   let lastRecovery = 0;
   while (!terminal(finished)) {
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -3016,11 +3393,12 @@ async function handleTask(raw) {
   const finished = await startJob(root, job, Boolean(options.background), {
     announce: !options.background && !options.json
   });
+  const finishedHandle = projectWorkerHandle(finished);
   out(
     options.json
       ? publicJson(finished)
       : options.background
-        ? `Grok task started in the background.\nJob: ${id}\nPhase: ${finished.phase}\nProgress: ${finished.progress || "Task accepted"}\nCheck: ${hostCommand("status", id)}`
+        ? `Grok task started in the background.\nJob: ${finishedHandle.id}\nPhase: ${finishedHandle.phase || "unknown"}\nProgress: ${finishedHandle.progress || finishedHandle.summary || "Task accepted"}\nCheck: ${hostCommand("status", finishedHandle.id)}`
         : renderJob(finished),
     options.json
   );
@@ -3100,11 +3478,12 @@ async function handleDeepResearch(raw) {
     cleanupResearchRuntimeArtifacts(stateDir(root), id, []);
     throw error;
   }
+  const finishedHandle = projectWorkerHandle(finished);
   out(
     options.json
       ? (researchOptions.background ? publicJson(finished) : researchResultJson(finished))
       : researchOptions.background
-        ? `Grok deep-research started in the background.\nJob: ${id}\nPhase: ${finished.phase}\nProgress: ${finished.progress || "Deep-research accepted"}\nCheck: ${hostCommand("status", id)}`
+        ? `Grok deep-research started in the background.\nJob: ${finishedHandle.id}\nPhase: ${finishedHandle.phase || "unknown"}\nProgress: ${finishedHandle.progress || finishedHandle.summary || "Deep-research accepted"}\nCheck: ${hostCommand("status", finishedHandle.id)}`
         : renderJob(finished, { includeResearchReport: true }),
     options.json
   );
@@ -3196,14 +3575,18 @@ async function startDeepResearchJob(root, job, background, { announce = false } 
       ]);
       if (signature !== lastProgressSignature) {
         lastProgressSignature = signature;
-        const phase = finished.workflow?.currentPhase
+        const rawPhase = finished.workflow?.currentPhase
           || finished.workflow?.status
           || finished.phase
           || "running";
+        const phase = projectWorkerDiagnosticText(String(rawPhase), {
+          job: finished,
+          maxBytes: 160
+        }) || "running";
         const agents = Number.isSafeInteger(finished.workflow?.activeAgents)
           ? `; active agents ${finished.workflow.activeAgents}`
           : "";
-        process.stderr.write(`Deep-research: ${sanitizeDisplayText(String(phase)).slice(0, 160)}${agents}\n`);
+        process.stderr.write(`Deep-research: ${phase}${agents}\n`);
       }
     }
   }
@@ -3477,11 +3860,7 @@ async function handleStatus(raw) {
       }
       return;
     }
-    const table = [
-      "| Job | Kind | Status | Phase | Progress | Heartbeat |",
-      "|---|---|---|---|---|---|",
-      ...value.map((j) => `| ${j.id} | ${j.kind} | ${j.status} | ${j.phase} | ${sanitizeDisplayText(j.progress || j.summary || "").replace(/\|/g, "\\|")} | ${j.heartbeatAt || j.updatedAt || "-"} |`)
-    ];
+    const table = renderStatusTable(value);
     if (options.all && migrationRequired) {
       table.push("", "migrationRequired: true (valid legacy state is pending; pure preflight did not migrate)");
     }
@@ -3504,7 +3883,13 @@ async function handleStatus(raw) {
     if (!host.sessionId) throw new CompanionError("E_JOB_NOT_FOUND", "Current host session identity is unavailable; provide an explicit job ID or pass --all.");
     value = listJobs(root).filter((job) => sameHostSession(job, host));
   }
-  if (options.json) out(publicJson(value, { detail: !options.all }), true); else if (Array.isArray(value)) out(["| Job | Kind | Status | Phase | Progress | Heartbeat |", "|---|---|---|---|---|---|", ...value.map((j) => `| ${j.id} | ${j.kind} | ${j.status} | ${j.phase} | ${sanitizeDisplayText(j.progress || j.summary || "").replace(/\|/g, "\\|")} | ${j.heartbeatAt || j.updatedAt || "-"} |`)].join("\n")); else out(renderJob(value));
+  if (options.json) {
+    out(publicJson(value, { detail: !options.all }), true);
+  } else if (Array.isArray(value)) {
+    out(renderStatusTable(value).join("\n"));
+  } else {
+    out(renderJob(value));
+  }
 }
 
 async function handleResult(raw) {
@@ -3576,7 +3961,8 @@ async function handleCancel(raw) {
       await terminateVerified(current.workerProcess, current.id, "worker");
     } catch (error) {
       const payload = redact(asErrorPayload(error));
-      updateJob(root, current.id, (value) => {
+      const blocked = updateJob(root, current.id, (value) => {
+        if (terminal(value)) return value;
         value.pendingTerminal = forcedTerminal;
         value.status = "running";
         value.phase = "cleanup-blocked";
@@ -3593,6 +3979,15 @@ async function handleCancel(raw) {
         }
         return value;
       });
+      if (terminal(blocked)) {
+        out(
+          options.json
+            ? publicJson(blocked)
+            : `Cancellation requested.\n${renderJob(blocked)}`,
+          options.json
+        );
+        return;
+      }
       throw error;
     }
     let taskCleanup = current.jobClass === "task"
@@ -3604,7 +3999,8 @@ async function handleCancel(raw) {
       : null;
     if (taskCleanup) taskCleanup = includeGuardCleanup(root, current.id, taskCleanup);
     if (taskCleanup && !taskCleanup.ok) {
-      updateJob(root, current.id, (value) => {
+      const blocked = updateJob(root, current.id, (value) => {
+        if (terminal(value)) return value;
         value.pendingTerminal = forcedTerminal;
         value.status = "running";
         value.phase = "cleanup-blocked";
@@ -3614,6 +4010,15 @@ async function handleCancel(raw) {
         value.result = applyTaskPrivacy(value.result, taskCleanup);
         return value;
       });
+      if (terminal(blocked)) {
+        out(
+          options.json
+            ? publicJson(blocked)
+            : `Cancellation requested.\n${renderJob(blocked)}`,
+          options.json
+        );
+        return;
+      }
       throw new CompanionError("E_STATE", "Task was stopped, but transient runtime cleanup is incomplete.", { privacyWarning: taskCleanup.warning });
     }
     let researchCleanup = current.jobClass === "research"
@@ -3625,7 +4030,8 @@ async function handleCancel(raw) {
       : null;
     if (researchCleanup) researchCleanup = includeGuardCleanup(root, current.id, researchCleanup);
     if (researchCleanup && !researchCleanup.ok) {
-      updateJob(root, current.id, (value) => {
+      const blocked = updateJob(root, current.id, (value) => {
+        if (terminal(value)) return value;
         value.pendingTerminal = forcedTerminal;
         value.status = "running";
         value.phase = "cleanup-blocked";
@@ -3639,6 +4045,15 @@ async function handleCancel(raw) {
         value.result = applyResearchPrivacy(value.result, researchCleanup);
         return value;
       });
+      if (terminal(blocked)) {
+        out(
+          options.json
+            ? publicJson(blocked)
+            : `Cancellation requested.\n${renderJob(blocked)}`,
+          options.json
+        );
+        return;
+      }
       throw new CompanionError(
         "E_STATE",
         "Deep-research was stopped, but transient runtime cleanup is incomplete.",
@@ -3647,14 +4062,52 @@ async function handleCancel(raw) {
     }
     let cleanup = current.jobClass === "review" ? cleanupReviewEnvironment(stateDir(root), current.id) : null;
     if (cleanup) cleanup = includeGuardCleanup(root, current.id, cleanup);
-    const evidence = current.jobClass === "research"
-      ? { postContext: null, runtimeEvidence: null }
-      : captureTerminalEvidence(root, current, "cancelled");
     current = updateJob(root, current.id, (value) => {
-      value.status = "cancelled"; value.phase = "cancelled"; value.completedAt = now(); value.error = { code: "E_CANCELLED", message: "Grok job was force-cancelled after the graceful timeout." }; value.summary = value.error.message;
+      // A worker may publish its terminal result while force-cancel is
+      // completing exact process/runtime cleanup. The locked terminal record
+      // is authoritative and must never be replaced by a stale cancellation
+      // snapshot.
+      if (terminal(value)) return value;
+      const forcedError = {
+        code: "E_CANCELLED",
+        message: "Grok job was force-cancelled after the graceful timeout."
+      };
+      // Final evidence is captured only after exact process/runtime cleanup and
+      // under terminal publication authority. A stale pre-lock observation
+      // cannot mask task-relevant drift that occurs during cleanup.
+      const evidence = value.jobClass === "research"
+        ? { postContext: null, runtimeEvidence: null }
+        : captureTerminalEvidence(root, value, "cancelled");
+      const selectedError = value.jobClass === "task"
+        ? selectTaskTerminalError(
+            evidence,
+            forcedError,
+            value.error || null
+          )
+        : forcedError;
+      const finalStatus = selectedError?.code === "E_CANCELLED"
+        ? "cancelled"
+        : "failed";
+      value.status = finalStatus;
+      value.phase = selectedError?.code === "E_CONTEXT_DRIFT"
+        ? "context-rejected"
+        : selectedError?.code === "E_SCOPE_VIOLATION"
+          ? "scope-rejected"
+          : finalStatus;
+      value.completedAt = now();
+      value.error = redact(asErrorPayload(selectedError || forcedError));
+      value.summary = value.error.message;
+      value.progress = value.jobClass === "task"
+        ? terminalTaskProgress(finalStatus, value.error)
+        : value.progress;
       Object.assign(value, scrubStoredJob(value));
       if (value.jobClass !== "research") {
         value.completionContextManifest = evidence.postContext;
+      }
+      if (evidence.runtimeEvidence) {
+        evidence.runtimeEvidence.executionStatus = finalStatus === "cancelled"
+          ? "cancelled"
+          : "failed";
       }
       value.result = {
         ...(value.result || {}),
@@ -3668,6 +4121,7 @@ async function handleCancel(raw) {
       if (cleanup) value.result = applyReviewPrivacy(value.result, cleanup);
       if (taskCleanup) value.result = applyTaskPrivacy(value.result, taskCleanup);
       if (researchCleanup) value.result = applyResearchPrivacy(value.result, researchCleanup);
+      value.result = reconcileTerminalStopReason(value.result, finalStatus);
       return value;
     });
   }
@@ -3726,18 +4180,39 @@ async function runImportProcess({ binary, root, transcriptFd, alias, leaderSocke
     stdio: ["ignore", "pipe", "pipe", transcriptFd]
   });
   const identity = { pid: child.pid, startToken: processStartToken(child.pid), processGroupId: process.platform === "win32" ? null : child.pid };
-  try { registerProviderGuard(root, marker, identity, sessionId(), "import"); }
+  let guardRecord;
+  try { guardRecord = registerProviderGuard(root, marker, identity, sessionId(), "import"); }
   catch (error) { await ensureChildExit(child, identity); throw error; }
-  let stdout = "", stdoutBytes = 0, stderr = "", terminationReason = null, forceTimer = null;
+  let stdout = "", stdoutBytes = 0, stderr = "", terminationReason = null, forceTimer = null, terminationSignalError = null;
+  let rejectTerminationSignalFailure;
+  const terminationSignalFailure = new Promise((_, reject) => {
+    rejectTerminationSignalFailure = reject;
+  });
+  const completion = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (exitCode, closedBy) => resolve([exitCode, closedBy]));
+  });
   const terminate = (name) => {
-    try { process.kill(identity.processGroupId && process.platform !== "win32" ? -identity.processGroupId : identity.pid, name); }
-    catch (error) { if (error.code !== "ESRCH") throw error; }
+    try {
+      return signalOwnedProcess(
+        identity.processGroupId && process.platform !== "win32"
+          ? -identity.processGroupId
+          : identity.pid,
+        name
+      );
+    } catch (error) {
+      if (!terminationSignalError) {
+        terminationSignalError = error;
+        rejectTerminationSignalFailure(error);
+      }
+      return false;
+    }
   };
   const beginTermination = (reason) => {
     if (terminationReason) return;
     terminationReason = reason;
-    terminate("SIGTERM");
-    forceTimer = setTimeout(() => { try { terminate("SIGKILL"); } catch {} }, 2000);
+    if (!terminate("SIGTERM")) return;
+    forceTimer = setTimeout(() => { terminate("SIGKILL"); }, 2000);
   };
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
@@ -3757,16 +4232,13 @@ async function runImportProcess({ binary, root, transcriptFd, alias, leaderSocke
   const timeout = setTimeout(() => beginTermination("timeout"), timeoutMs);
   let code, exitSignal;
   try {
-    [code, exitSignal] = await new Promise((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", (exitCode, closedBy) => resolve([exitCode, closedBy]));
-    });
+    [code, exitSignal] = await Promise.race([completion, terminationSignalFailure]);
   } finally {
     clearTimeout(timeout);
     if (forceTimer) clearTimeout(forceTimer);
     if (signal) signal.removeEventListener("abort", onAbort);
     await ensureChildExit(child, identity);
-    unregisterProviderGuard(root, marker);
+    unregisterProviderGuard(root, marker, guardRecord);
   }
   if (terminationReason === "cancel") throw new CompanionError("E_CANCELLED", "Grok transcript import was cancelled.");
   if (terminationReason === "timeout") throw new CompanionError("E_TIMEOUT", "Grok transcript import timed out.");
@@ -4282,35 +4754,142 @@ async function main() {
     if (!nonce || record.workerAuthorization !== nonce) throw new CompanionError("E_RECURSION", "Unauthenticated Grok Companion launcher invocation refused.");
     if (terminal(record)) return;
     if (isCancelRequested(root, id, nonce)) {
-      const postContext = (() => { try { return captureContextManifest(root); } catch { return null; } })();
-      updateJob(root, id, (current) => {
-        if (terminal(current)) return current;
-        const requestContextManifest = current.request?.contextManifest
-          ? assertContextManifestIntegrity(current.request.contextManifest)
-          : null;
-        current.workerAuthorization = null;
-        current.status = "cancelled";
-        current.phase = "cancelled";
-        current.completedAt = now();
-        current.heartbeatAt = current.completedAt;
-        current.completionContextManifest = postContext;
-        current.error = { code: "E_CANCELLED", message: "Grok job was cancelled before worker launch." };
-        current.summary = current.error.message;
-        Object.assign(current, scrubStoredJob(current));
-        current.result = {
-          ...(current.result || {}),
-          hostVerification: "not_run",
-          runtimeEvidence: buildRuntimeEvidence({
-            preContext: requestContextManifest,
-            postContext,
-            changedPaths: postContext && requestContextManifest
-              ? observeChangedPaths(requestContextManifest, postContext)
-              : [],
-            executionStatus: "cancelled"
-          })
+      withWorkspaceStateTransaction(root, (transaction) => {
+        const current = transaction.tryReadJob(id);
+        if (!current || terminal(current)) return current;
+        if (current.workerAuthorization !== nonce) {
+          throw new CompanionError(
+            "E_RECURSION",
+            "Worker launch authorization changed before cancellation cleanup."
+          );
+        }
+        const cancelledAt = now();
+        const intendedTerminal = {
+          status: "cancelled",
+          phase: "cancelled",
+          completedAt: cancelledAt,
+          error: {
+            code: "E_CANCELLED",
+            message: "Grok job was cancelled before worker launch."
+          },
+          summary: "Grok job was cancelled before worker launch."
         };
-        current.lifecycleEvents = appendLifecycleEvent(current.lifecycleEvents, "blocked", current.error.message);
-        return current;
+        const cleanup = cleanupTaskRuntimeArtifacts(
+          stateDir(root),
+          current.request?.providerHomeId || current.id,
+          []
+        );
+        return transaction.updateJob(id, (latest) => {
+          if (terminal(latest)) return latest;
+          if (latest.workerAuthorization !== nonce) {
+            throw new CompanionError(
+              "E_RECURSION",
+              "Worker launch authorization changed before cancellation publication."
+            );
+          }
+          const settledAt = now();
+          const base = {
+            ...latest,
+            workerAuthorization: null,
+            heartbeatAt: settledAt,
+            request: {
+              ...latest.request,
+              spawn: {
+                ...(latest.request?.spawn || {}),
+                providerLaunchPending: false,
+                providerLaunchInFlight: false,
+                providerLaunchOutcome: "not-launched",
+                providerLaunchCompletedAt: settledAt
+              }
+            }
+          };
+          if (!cleanup.ok) {
+            const message =
+              "Cancellation is durable, but task runtime cleanup is incomplete.";
+            return scrubStoredJob({
+              ...base,
+              status: "running",
+              phase: "cleanup-blocked",
+              completedAt: null,
+              pendingTerminal: intendedTerminal,
+              error: {
+                code: "E_RUNTIME_CLEANUP",
+                message,
+                details: {
+                  privacyWarning:
+                    cleanup.warning || "Task runtime cleanup remained incomplete."
+                }
+              },
+              summary: message,
+              progress: "Cancellation accepted; runtime cleanup is still pending",
+              result: applyTaskPrivacy(latest.result, cleanup),
+              lifecycleEvents: appendLifecycleEvent(
+                latest.lifecycleEvents || [],
+                "blocked",
+                message
+              )
+            });
+          }
+
+          const evidence = captureTerminalEvidence(
+            latest.request?.spawn?.executionRoot || root,
+            base,
+            "cancelled"
+          );
+          const selectedTerminalError = selectTaskTerminalError(
+            evidence,
+            intendedTerminal.error
+          );
+          const selectedError = selectedTerminalError
+            ? redact(asErrorPayload(selectedTerminalError))
+            : null;
+          const finalStatus = selectedError
+            ? (selectedError.code === "E_CANCELLED" ? "cancelled" : "failed")
+            : "cancelled";
+          const finalPhase = selectedError?.code === "E_CONTEXT_DRIFT"
+            ? "context-rejected"
+            : selectedError?.code === "E_SCOPE_VIOLATION"
+              ? "scope-rejected"
+              : finalStatus;
+          evidence.runtimeEvidence.executionStatus =
+            finalStatus === "cancelled" ? "cancelled" : "failed";
+          const result = {
+            ...applyTaskPrivacy(latest.result, cleanup),
+            hostVerification: latest.result?.hostVerification || "not_run",
+            runtimeEvidence: {
+              ...(latest.result?.runtimeEvidence || {}),
+              ...evidence.runtimeEvidence
+            },
+            ...(finalStatus === "cancelled"
+              ? { stopReason: "cancelled" }
+              : {})
+          };
+          if (finalStatus !== "cancelled"
+            && result.stopReason === "cancelled") {
+            delete result.stopReason;
+          }
+          const summary = selectedError?.message
+            || intendedTerminal.summary;
+          return scrubStoredJob({
+            ...base,
+            status: finalStatus,
+            phase: finalPhase,
+            completedAt: selectedError?.code === "E_CONTEXT_DRIFT"
+              || selectedError?.code === "E_SCOPE_VIOLATION"
+              ? settledAt
+              : intendedTerminal.completedAt,
+            completionContextManifest: evidence.postContext,
+            error: selectedError,
+            summary,
+            progress: terminalTaskProgress(finalStatus, selectedError),
+            result,
+            lifecycleEvents: appendLifecycleEvent(
+              latest.lifecycleEvents || [],
+              finalStatus === "cancelled" ? "checkpoint" : "blocked",
+              summary
+            )
+          });
+        });
       });
       return;
     }
@@ -4629,4 +5208,20 @@ async function main() {
   throw new CompanionError("E_USAGE", `Unknown command ${command}.\n${usage()}`);
 }
 
-main().catch((error) => { const payload = redact(asErrorPayload(error)); if (process.argv.includes("--json")) process.stdout.write(`${JSON.stringify({ ok: false, error: payload }, null, 2)}\n`); else process.stderr.write(`${payload.code}: ${payload.message}\n`); process.exitCode = exitCodeFor(error); });
+main().catch((error) => {
+  const privatePayload = asErrorPayload(error);
+  const payload = (
+    process.argv[2] === "transfer"
+      ? projectTransferCliError(privatePayload)
+      : projectWorkerError(privatePayload)
+  ) || {
+    code: "E_BROKER",
+    message: "Worker failed."
+  };
+  if (process.argv.includes("--json")) {
+    process.stdout.write(`${JSON.stringify({ ok: false, error: payload }, null, 2)}\n`);
+  } else {
+    process.stderr.write(`${payload.code}: ${payload.message}\n`);
+  }
+  process.exitCode = exitCodeFor(error);
+});

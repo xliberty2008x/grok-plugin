@@ -4,6 +4,7 @@ import path from "node:path";
 import process from "node:process";
 import test from "node:test";
 
+import { CompanionError } from "../plugins/grok/scripts/lib/errors.mjs";
 import { reconcileBrokerWorkers } from "../plugins/grok/scripts/lib/worker-recovery.mjs";
 import {
   cancelWorker,
@@ -12,7 +13,14 @@ import {
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import { createWorkerService } from "../plugins/grok/scripts/lib/worker-service.mjs";
 import { tryReadJob, updateJob } from "../plugins/grok/scripts/lib/state.mjs";
-import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
+import {
+  buildTaskEnvelope,
+  captureContextManifest
+} from "../plugins/grok/scripts/lib/task-contract.mjs";
+import {
+  captureTerminalEvidence,
+  selectTaskTerminalError
+} from "../plugins/grok/scripts/lib/task-terminal-evidence.mjs";
 import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 
 import { initRepo, tempDir } from "./helpers.mjs";
@@ -203,6 +211,300 @@ for (const intent of terminalIntents) {
     assert.equal(restored.result.runtimeEvidence.reconciler.replayedPrompt, false);
   });
 }
+
+test("terminal evidence requires valid pre- and post-context comparison authority", () => {
+  const root = initRepo();
+  const context = captureContextManifest(root);
+  const envelope = buildTaskEnvelope({
+    userRequest: "Require exact terminal comparison authority",
+    mode: "read"
+  });
+  const job = (contextManifest, { omit = false } = {}) => ({
+    request: {
+      ...(!omit ? { contextManifest } : {}),
+      envelope
+    },
+    commandOutcomes: []
+  });
+  const assertUnavailable = (evidence) => {
+    assert.equal(evidence.finalObservationUnavailable, true);
+    assert.equal(evidence.postContext, null);
+    assert.equal(evidence.runtimeEvidence.executionStatus, "failed");
+    const selected = selectTaskTerminalError(evidence);
+    assert.equal(selected.code, "E_CONTEXT_DRIFT");
+    assert.deepEqual(
+      selected.details.reasons,
+      ["[final-context-unavailable]"]
+    );
+  };
+
+  assertUnavailable(captureTerminalEvidence(
+    root,
+    job(null, { omit: true }),
+    "completed",
+    { captureContext: () => context }
+  ));
+  assertUnavailable(captureTerminalEvidence(
+    root,
+    job({ ...context, digest: "0".repeat(64) }),
+    "completed",
+    { captureContext: () => context }
+  ));
+  assertUnavailable(captureTerminalEvidence(
+    root,
+    job(context),
+    "completed",
+    { captureContext: () => null }
+  ));
+  assertUnavailable(captureTerminalEvidence(
+    root,
+    job(context),
+    "completed",
+    {
+      captureContext: () => ({
+        ...context,
+        manifestId: "ctx-000000000000000000000000"
+      })
+    }
+  ));
+
+  const stable = captureTerminalEvidence(
+    root,
+    job(context),
+    "completed",
+    { captureContext: () => context }
+  );
+  assert.equal(stable.finalObservationUnavailable, false);
+  assert.equal(stable.postContext.manifestId, context.manifestId);
+  assert.deepEqual(stable.changedPaths, []);
+  assert.deepEqual(stable.scopeViolations, []);
+  assert.equal(stable.runtimeEvidence.executionStatus, "completed");
+  assert.equal(selectTaskTerminalError(stable), null);
+});
+
+test("provider-started recovery lets a cleanup signal failure outrank a completed intent", {
+  skip: process.platform === "win32"
+}, () => {
+  const fixture = providerStartedFixture(structuredClone(terminalIntents[0]));
+  updateJob(fixture.root, fixture.workerId, (job) => ({
+    ...job,
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "Worker recovery is blocked because exact runtime cleanup could not be verified.",
+      details: {
+        secondaryDiagnostic: {
+          code: "EPERM",
+          message: "kill EPERM"
+        }
+      }
+    }
+  }), fixture.env);
+
+  const settled = settleStartedWorkerLoss({
+    root: fixture.root,
+    workerId: fixture.workerId,
+    attemptId: fixture.attemptId,
+    controllerProcess: fixture.controllerProcess,
+    workerProcess: fixture.workerProcess,
+    providerProcess: fixture.providerProcess,
+    runtimeCleanup: { ok: true },
+    env: fixture.env
+  });
+
+  assert.equal(settled.status, "failed");
+  assert.equal(settled.phase, "failed");
+  assert.equal(settled.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(settled.error.details.secondaryDiagnostic.code, "EPERM");
+  assert.equal(settled.result.taskRuntimeCleaned, true);
+  assert.equal(settled.progress.includes("pending"), false);
+  assert.equal(settled.pendingTerminal, undefined);
+});
+
+test("provider-started read recovery lets final cleanup-time drift outrank a signal failure", {
+  skip: process.platform === "win32"
+}, () => {
+  const fixture = providerStartedFixture(
+    structuredClone(terminalIntents[0])
+  );
+  updateJob(fixture.root, fixture.workerId, (job) => ({
+    ...job,
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "Worker recovery is blocked because exact runtime cleanup could not be verified.",
+      details: {
+        secondaryDiagnostic: {
+          code: "EPERM",
+          message: "kill EPERM"
+        }
+      }
+    }
+  }), fixture.env);
+  const configPath = path.join(fixture.root, ".git", "config");
+  const configBefore = fs.readFileSync(configPath);
+  let settled;
+  try {
+    settled = settleStartedWorkerLoss({
+      root: fixture.root,
+      workerId: fixture.workerId,
+      attemptId: fixture.attemptId,
+      controllerProcess: fixture.controllerProcess,
+      workerProcess: fixture.workerProcess,
+      providerProcess: fixture.providerProcess,
+      runtimeCleanup: () => {
+        fs.appendFileSync(
+          configPath,
+          "\n[grok-issue49-read-final]\n\tvalue = drift\n"
+        );
+        return { ok: true };
+      },
+      env: fixture.env
+    });
+  } finally {
+    fs.writeFileSync(configPath, configBefore);
+  }
+
+  assert.equal(settled.status, "failed");
+  assert.equal(settled.phase, "context-rejected");
+  assert.equal(settled.error.code, "E_CONTEXT_DRIFT");
+  assert.equal(
+    settled.error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+  assert.ok(
+    settled.result.runtimeEvidence.observedChangedPaths.includes(
+      "[GIT_METADATA]"
+    )
+  );
+  assert.equal(settled.result.runtimeEvidence.executionStatus, "failed");
+  assert.equal(settled.result.taskRuntimeCleaned, true);
+  assert.equal(settled.progress.includes("pending"), false);
+  assert.ok(settled.completionContextManifest);
+  assert.equal(settled.pendingTerminal, undefined);
+});
+
+test("broker recovery durably carries bounded signal evidence through a later retry", {
+  skip: process.platform === "win32"
+}, async () => {
+  const fixture = providerStartedFixture(structuredClone(terminalIntents[0]));
+  const first = await reconcileBrokerWorkers({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    dispatchStartupGraceMs: 0,
+    testHooks: {
+      beforeCleanupSignal() {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          "Verified owned process signalling could not be completed.",
+          {
+            secondaryDiagnostic: {
+              code: "EPERM",
+              message: "kill EPERM"
+            }
+          }
+        );
+      }
+    },
+    env: fixture.env
+  });
+  assert.equal(first.results[0].action, "cleanup-blocked");
+  const blocked = tryReadJob(fixture.root, fixture.workerId, fixture.env);
+  assert.equal(blocked.status, "running");
+  assert.equal(blocked.phase, "cleanup-blocked");
+  assert.equal(
+    blocked.error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+  assert.equal(blocked.result.taskRuntimeCleaned, false);
+
+  const genericallyBlocked = await reconcileBrokerWorkers({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    dispatchStartupGraceMs: 0,
+    testHooks: {
+      beforeCleanupSignal() {
+        throw new CompanionError(
+          "E_RUNTIME_CLEANUP",
+          "Runtime cleanup remained incomplete."
+        );
+      }
+    },
+    env: fixture.env
+  });
+  assert.equal(genericallyBlocked.results[0].action, "cleanup-blocked");
+  const stillBlocked = tryReadJob(
+    fixture.root,
+    fixture.workerId,
+    fixture.env
+  );
+  assert.equal(
+    stillBlocked.error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+
+  const retried = await reconcileBrokerWorkers({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    dispatchStartupGraceMs: 0,
+    env: fixture.env
+  });
+  assert.equal(retried.results[0].action, "terminalized");
+  const settled = tryReadJob(fixture.root, fixture.workerId, fixture.env);
+  assert.equal(settled.status, "failed");
+  assert.equal(settled.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(settled.error.details.secondaryDiagnostic.code, "EPERM");
+  assert.equal(settled.result.taskRuntimeCleaned, true);
+  assert.equal(settled.progress.includes("pending"), false);
+});
+
+test("broker recovery does not promote a generic cleanup blocker over completed intent", {
+  skip: process.platform === "win32"
+}, async () => {
+  const fixture = providerStartedFixture(structuredClone(terminalIntents[0]));
+  const blocked = await reconcileBrokerWorkers({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    dispatchStartupGraceMs: 0,
+    testHooks: {
+      beforeCleanupSignal() {
+        throw new CompanionError(
+          "E_RUNTIME_CLEANUP",
+          "Runtime cleanup remained incomplete."
+        );
+      }
+    },
+    env: fixture.env
+  });
+  assert.equal(blocked.results[0].action, "cleanup-blocked");
+  const blockedJob = tryReadJob(
+    fixture.root,
+    fixture.workerId,
+    fixture.env
+  );
+  assert.equal(blockedJob.status, "running");
+  assert.equal(blockedJob.phase, "cleanup-blocked");
+  assert.equal(blockedJob.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(blockedJob.error.details?.secondaryDiagnostic, undefined);
+
+  const retried = await reconcileBrokerWorkers({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    dispatchStartupGraceMs: 0,
+    env: fixture.env
+  });
+  assert.equal(retried.results[0].action, "terminalized");
+  const settled = tryReadJob(
+    fixture.root,
+    fixture.workerId,
+    fixture.env
+  );
+  assert.equal(settled.status, "completed");
+  assert.equal(settled.phase, "done");
+  assert.equal(settled.error, null);
+  assert.equal(settled.summary, terminalIntents[0].summary);
+  assert.equal(settled.result.taskRuntimeCleaned, true);
+  assert.equal(settled.progress.includes("pending"), false);
+  assert.equal(settled.pendingTerminal, undefined);
+});
 
 test("pending terminal settlement rejects missing controller proof or a changed provider identity", {
   skip: process.platform === "win32"

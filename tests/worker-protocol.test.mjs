@@ -33,11 +33,14 @@ import {
   projectLifecycleEvent,
   projectLifecycleEventsAfterCursor,
   projectWorkerHandle,
+  projectWorkerDiagnosticText,
+  projectWorkerError,
   projectWorkerLifecycleCursor,
   projectWorkerPublicText,
   projectWorkerSnapshot,
   projectWriteArtifactMetadata
 } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
+import { presentWorker } from "../plugins/grok/scripts/lib/worker-presentation.mjs";
 import { initRepo, runCompanion, tempDir } from "./helpers.mjs";
 
 const PROTOCOL_SCHEMA = JSON.parse(fs.readFileSync(
@@ -440,6 +443,2524 @@ test("public projections bound text and map unknown errors fail closed", () => {
   assertConforms("WorkerError", providerExit.error);
 });
 
+test("active legacy signal failures project generic process identity evidence only", () => {
+  const rawMessage = "kill EPERM";
+  const privateJob = job({
+    status: "running",
+    phase: "cleanup-blocked",
+    summary: rawMessage,
+    progress: `Cancellation cleanup failed: ${rawMessage}`,
+    lifecycleEvents: [
+      {
+        ...lifecycle("blocked", rawMessage, 1),
+        detail: {
+          status: rawMessage,
+          questions: [`Why did ${rawMessage}?`]
+        }
+      },
+      lifecycle("checkpoint", "Cleanup retry scheduled", 2)
+    ],
+    error: {
+      code: "EPERM",
+      message: rawMessage
+    }
+  });
+
+  const handle = projectWorkerHandle(privateJob);
+  const snapshot = projectWorkerSnapshot(privateJob);
+  const cursor = projectWorkerLifecycleCursor(privateJob);
+  const directEvent = projectLifecycleEvent(privateJob.lifecycleEvents[0], {
+    error: privateJob.error
+  });
+  for (const projection of [handle, snapshot, cursor, directEvent]) {
+    const serialized = JSON.stringify(projection);
+    assert.equal(serialized.includes("EPERM"), false);
+    assert.equal(serialized.includes("kill"), false);
+  }
+  for (const projection of [handle, snapshot]) {
+    assert.equal(projection.summary, "Process ownership verification failed.");
+    assert.equal(
+      projection.progress,
+      "Cancellation cleanup failed: Process ownership verification failed."
+    );
+  }
+  assert.equal(Object.hasOwn(handle, "error"), false);
+  assert.deepEqual(snapshot.error, {
+    workerProtocolVersion: WORKER_PROTOCOL_VERSION,
+    errorSchemaVersion: WORKER_ERROR_SCHEMA_VERSION,
+    code: "E_PROCESS_IDENTITY",
+    message: "Process ownership verification failed."
+  });
+  assert.equal(snapshot.lifecycleEvents[0].summary, "Process ownership verification failed.");
+  assert.equal(
+    snapshot.lifecycleEvents[0].detail.status,
+    "Process ownership verification failed."
+  );
+  assert.deepEqual(
+    snapshot.lifecycleEvents[0].detail.questions,
+    ["Why did Process ownership verification failed.?"]
+  );
+  assert.equal(snapshot.lifecycleEvents[1].summary, "Cleanup retry scheduled");
+  assert.equal(cursor.events[0].summary, "Process ownership verification failed.");
+  assert.equal(cursor.events[1].summary, "Cleanup retry scheduled");
+  assert.equal(directEvent.summary, "Process ownership verification failed.");
+  assertConforms("WorkerHandle", handle);
+  assertConforms("WorkerSnapshot", snapshot);
+  assertConforms("WorkerEventPage", cursor);
+  assertConforms("WorkerEvent", directEvent);
+});
+
+test("legacy cleanup diagnostics map selectively without swallowing ordinary input errors", () => {
+  for (const error of [
+    {
+      code: "EACCES",
+      message: "Cleanup retry failed with EACCES"
+    },
+    {
+      code: "E_BROKER",
+      message: "Cleanup retry failed with EACCES"
+    }
+  ]) {
+    assert.deepEqual(projectWorkerError(error), {
+      code: "E_PROCESS_IDENTITY",
+      message: "Process ownership verification failed."
+    });
+  }
+
+  assert.deepEqual(projectWorkerError({
+    code: "E_INPUT_READ",
+    message: "Could not read the requested input: ENOENT."
+  }), {
+    code: "E_INPUT_READ",
+    message: "Could not read the requested input: ENOENT."
+  });
+  assert.deepEqual(projectWorkerError({
+    code: "ENOENT",
+    message: "Could not read the requested input: ENOENT."
+  }), {
+    code: "E_BROKER",
+    message: "Could not read the requested input: ENOENT."
+  });
+});
+
+test("current process uncertainty outranks a pending safety primary for sanitization", () => {
+  const diagnostic =
+    "Cleanup retry failed with EACCES for provider_pid='+441001'.";
+  const privateJob = job({
+    status: "running",
+    phase: "cleanup-blocked",
+    summary: diagnostic,
+    progress: [
+      '{"provider_pid":"+441002"}',
+      '"worker_process_id": "-441003"',
+      "controller_pid_t=+441004",
+      'signal_target: "-441005"',
+      "child_process_identifier +441006",
+      "pid_t(-441007)",
+      "ordinary build number +441008"
+    ].join("; "),
+    pendingTerminal: {
+      status: "failed",
+      phase: "context-rejected",
+      error: {
+        code: "E_CONTEXT_DRIFT",
+        message: "Final context changed.",
+        details: { reasons: ["[GIT_METADATA]"] }
+      }
+    },
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "Verified owned process signalling could not be completed.",
+      details: {
+        secondaryDiagnostic: {
+          code: "EACCES",
+          message: diagnostic
+        }
+      }
+    }
+  });
+
+  const handle = projectWorkerHandle(privateJob);
+  const snapshot = projectWorkerSnapshot(privateJob);
+  for (const projection of [
+    handle,
+    snapshot,
+    projectWorkerLifecycleCursor(privateJob)
+  ]) {
+    const serialized = JSON.stringify(projection);
+    for (const privateValue of [
+      "EACCES",
+      "441001",
+      "441002",
+      "441003",
+      "441004",
+      "441005",
+      "441006",
+      "441007"
+    ]) {
+      assert.equal(serialized.includes(privateValue), false, `${privateValue} leaked`);
+    }
+  }
+  assert.equal(JSON.stringify(handle).includes("441008"), true);
+  assert.equal(JSON.stringify(snapshot).includes("441008"), true);
+  assert.equal(snapshot.summary, "Process ownership verification failed.");
+  assert.equal(snapshot.error.code, "E_PROCESS_IDENTITY");
+  assert.match(snapshot.progress, /ordinary build number \+441008/);
+});
+
+test("lifecycle diagnostics are classified per field and malformed timestamps are dropped", () => {
+  const diagnostic =
+    "Cleanup retry failed with EACCES for provider_pid='+442001'.";
+  const documentary =
+    "Historical fixture: cleanup failed with EACCES for provider_pid='+442002'.";
+  const ordinary = "Could not read the requested input: ENOENT.";
+  const detail = {
+    envelopeId: diagnostic,
+    resumeJobId: diagnostic,
+    spawnSuccessDefinition: diagnostic,
+    requestAcceptedAt: diagnostic,
+    reconciler: diagnostic,
+    messageId: diagnostic,
+    parentWorkerId: diagnostic,
+    version: documentary,
+    name: `${diagnostic} historical example fixture`,
+    status: ordinary,
+    plan: [diagnostic, documentary, ordinary],
+    questions: [diagnostic, documentary, ordinary],
+    validationIssues: [diagnostic, documentary, ordinary],
+    observedChangedPaths: [
+      "src/safe.mjs",
+      "[IGNORED_WORKTREE]",
+      "cleanup/EIO-provider_pid=+442003"
+    ]
+  };
+  const privateJob = job({
+    status: "failed",
+    phase: "context-rejected",
+    latestPlan: [diagnostic, documentary, ordinary],
+    lifecycleEvents: [
+      {
+        type: "blocked",
+        at: "not-an-iso-date EIO provider_pid=442099",
+        summary: diagnostic,
+        sequence: 1,
+        detail
+      },
+      {
+        type: "checkpoint",
+        at: "2026-07-28T00:00:00.000Z",
+        summary: documentary,
+        sequence: 2,
+        detail: {
+          contentDigest: diagnostic,
+          status: ordinary
+        }
+      }
+    ],
+    error: {
+      code: "E_CONTEXT_DRIFT",
+      message: diagnostic,
+      details: {
+        reasons: [diagnostic, ordinary],
+        secondaryDiagnostic: {
+          code: "EPERM",
+          message: "Final observation cleanup failed with EPERM."
+        }
+      }
+    },
+    result: {
+      review: {
+        verdict: "needs_changes",
+        summary: diagnostic,
+        findings: [{
+          severity: "high",
+          title: documentary,
+          body: ordinary
+        }]
+      },
+      workerReport: {
+        schemaVersion: 1,
+        structured: true,
+        valid: false,
+        outcome: "blocked",
+        summary: diagnostic,
+        changedFiles: ["src/safe.mjs"],
+        checksClaimed: [documentary, ordinary],
+        acceptanceResults: [],
+        risks: [diagnostic],
+        questions: [ordinary],
+        validationIssues: [documentary]
+      },
+      privacyWarning: diagnostic
+    }
+  });
+
+  const handle = projectWorkerHandle(privateJob);
+  const snapshot = projectWorkerSnapshot(privateJob);
+  const cursor = projectWorkerLifecycleCursor(privateJob);
+  const direct = projectLifecycleEvent(privateJob.lifecycleEvents[0], {
+    error: privateJob.error
+  });
+  const foreground = projectWorkerError(privateJob.error);
+  for (const projection of [handle, snapshot, cursor, direct, foreground]) {
+    const serialized = JSON.stringify(projection);
+    for (const privateValue of [
+      "EPERM",
+      "442001",
+      "442003",
+      "442099"
+    ]) {
+      assert.equal(serialized.includes(privateValue), false, `${privateValue} leaked`);
+    }
+  }
+  assert.equal(snapshot.error.code, "E_CONTEXT_DRIFT");
+  assert.equal(snapshot.lifecycleEvents[0].at, null);
+  assert.equal(snapshot.lifecycleEvents[0].detail.version, documentary);
+  assert.equal(
+    snapshot.lifecycleEvents[0].detail.name.includes("historical example fixture"),
+    true
+  );
+  assert.equal(snapshot.lifecycleEvents[0].detail.name.includes("EACCES"), false);
+  assert.equal(snapshot.lifecycleEvents[0].detail.status, ordinary);
+  for (const field of ["plan", "questions", "validationIssues"]) {
+    assert.equal(snapshot.lifecycleEvents[0].detail[field][1], documentary);
+    assert.equal(snapshot.lifecycleEvents[0].detail[field][2], ordinary);
+  }
+  assert.deepEqual(
+    snapshot.lifecycleEvents[0].detail.observedChangedPaths.slice(0, 2),
+    ["src/safe.mjs", "[IGNORED_WORKTREE]"]
+  );
+  assert.equal(
+    JSON.stringify(snapshot.lifecycleEvents[0].detail.observedChangedPaths)
+      .includes("442003"),
+    false
+  );
+  assert.equal(snapshot.lifecycleEvents[1].summary, documentary);
+  assert.equal(snapshot.lifecycleEvents[1].detail.status, ordinary);
+  assert.equal(snapshot.result.review.findings[0].title, documentary);
+  assert.equal(snapshot.result.review.findings[0].body, ordinary);
+  assert.equal(snapshot.result.workerReport.changedFiles[0], "src/safe.mjs");
+  assertConforms("WorkerSnapshot", snapshot);
+  assertConforms("WorkerEventPage", cursor);
+  assertConforms("WorkerEvent", direct);
+
+  for (const type of ["blocked", "checkpoint"]) {
+    const standalone = projectLifecycleEvent({
+      type,
+      at: "2026-07-28T00:00:00Z",
+      summary: diagnostic,
+      sequence: 1,
+      detail: {
+        status: "Waiting for PGID(-442004) after terminal cleanup.",
+        questions: [ordinary]
+      }
+    });
+    const serialized = JSON.stringify(standalone);
+    assert.equal(serialized.includes("EACCES"), false);
+    assert.equal(serialized.includes("442001"), false);
+    assert.equal(serialized.includes("442004"), false);
+    assert.equal(standalone.detail.questions[0], ordinary);
+    assertConforms("WorkerEvent", standalone);
+  }
+  assert.equal(projectLifecycleEvent({
+    type: "checkpoint",
+    at: "2026-02-31T00:00:00Z",
+    summary: "Impossible calendar date",
+    sequence: 1
+  }).at, null);
+});
+
+test("safety normalization and presentation scrub result-only diagnostics", () => {
+  for (const code of ["E_CONTEXT_DRIFT", "E_SCOPE_VIOLATION"]) {
+    const base = projectWorkerSnapshot(job({
+      status: "failed",
+      phase: code === "E_CONTEXT_DRIFT" ? "context-rejected" : "scope-rejected",
+      error: {
+        code,
+        message: code === "E_CONTEXT_DRIFT"
+          ? "Final context changed."
+          : "Final scope changed.",
+        details: code === "E_CONTEXT_DRIFT"
+          ? { reasons: ["[GIT_METADATA]"] }
+          : { paths: ["src/safe.mjs"] }
+      }
+    }));
+    const diagnostic =
+      "Terminal cleanup failed with EBUSY for PGID(-443001) at /Users/alice/private/runtime.";
+    const forged = structuredClone(base);
+    forged.result = {
+      workerProtocolVersion: WORKER_PROTOCOL_VERSION,
+      resultSchemaVersion: WORKER_RESULT_SCHEMA_VERSION,
+      workerReport: {
+        schemaVersion: 1,
+        structured: true,
+        valid: false,
+        outcome: "blocked",
+        summary: diagnostic,
+        changedFiles: ["src/safe.mjs"],
+        checksClaimed: [],
+        acceptanceResults: [],
+        risks: [diagnostic],
+        questions: [],
+        validationIssues: []
+      },
+      privacyWarning: diagnostic,
+      hostVerification: "not_run"
+    };
+
+    for (const projection of [
+      normalizeWorkerSnapshot(forged),
+      presentWorker(forged)
+    ]) {
+      const serialized = JSON.stringify(projection);
+      for (const privateValue of ["EBUSY", "443001", "/Users/alice"]) {
+        assert.equal(
+          serialized.includes(privateValue),
+          false,
+          `${code}: ${privateValue} leaked`
+        );
+      }
+      assert.equal(projection.error.code, code);
+    }
+  }
+});
+
+test("root worker timestamps reject diagnostics and impossible calendar dates on every public surface", () => {
+  const diagnostic = "EPERM for provider_pid='+444001'";
+  const invalidTimestamps = {
+    createdAt: diagnostic,
+    startedAt: `Cleanup ${diagnostic}`,
+    updatedAt: `Recovery ${diagnostic}`,
+    completedAt: "2026-02-31T00:00:00Z",
+    heartbeatAt: `Terminal observation ${diagnostic}`
+  };
+  const raw = job(invalidTimestamps);
+  const handle = projectWorkerHandle(raw);
+  const snapshot = projectWorkerSnapshot(raw);
+  for (const projection of [handle, snapshot]) {
+    for (const field of Object.keys(invalidTimestamps)) {
+      assert.equal(projection[field], null, `${field} was not dropped`);
+    }
+    assert.equal(JSON.stringify(projection).includes("EPERM"), false);
+    assert.equal(JSON.stringify(projection).includes("444001"), false);
+  }
+
+  const forged = {
+    ...projectWorkerSnapshot(job()),
+    ...invalidTimestamps
+  };
+  const normalized = normalizeWorkerSnapshot(forged);
+  const presented = presentWorker(forged);
+  for (const field of Object.keys(invalidTimestamps)) {
+    assert.equal(normalized[field], null, `${field} survived normalization`);
+  }
+  for (const projection of [normalized, presented]) {
+    const serialized = JSON.stringify(projection);
+    assert.equal(serialized.includes("EPERM"), false);
+    assert.equal(serialized.includes("444001"), false);
+    assert.equal(serialized.includes("2026-02-31"), false);
+  }
+  assert.equal(presented.heartbeatAt, null);
+  assertConforms("WorkerHandle", handle);
+  assertConforms("WorkerSnapshot", snapshot);
+  assertConforms("WorkerSnapshot", normalized);
+});
+
+test("complete worker trees self-detect operational diagnostics without a stored error", () => {
+  const diagnostic =
+    "Terminal cleanup kill EPERM for providerPid=443001 at /Users/alice/private/runtime.";
+  const killProcess =
+    "Recovery cleanup could not kill process -441001 after EACCES.";
+  const documentary =
+    "Historical: the retry behavior remains documented for this fixture.";
+  const ordinary = "Could not read the requested input: ENOENT.";
+  const privateJob = job({
+    kind: diagnostic,
+    jobClass: killProcess,
+    phase: diagnostic,
+    summary: diagnostic,
+    progress: killProcess,
+    profile: {
+      id: diagnostic,
+      contractVersion: 3,
+      agentProfileDigest: diagnostic
+    },
+    model: killProcess,
+    effort: diagnostic,
+    controlWorkspaceId: diagnostic,
+    role: { id: killProcess },
+    latestPlan: [diagnostic, killProcess, documentary, ordinary],
+    request: {
+      resumeJobId: diagnostic,
+      providerHomeId: killProcess,
+      publicObjective: diagnostic,
+      envelope: {
+        schemaVersion: 1,
+        envelopeId: diagnostic,
+        digest: killProcess,
+        objective: diagnostic,
+        mode: "read",
+        scope: { include: ["src/safe.mjs"], exclude: [] },
+        nonGoals: [diagnostic, documentary, ordinary],
+        acceptanceCriteria: [
+          { id: "AC-01", text: diagnostic },
+          { id: "AC-02", text: ordinary }
+        ],
+        requiredVerification: [killProcess, ordinary],
+        expectedReturnFormat: diagnostic,
+        context: {
+          facts: [diagnostic, documentary, ordinary],
+          constraints: [killProcess],
+          expectedProjectMarkers: ["package.json"],
+          requiredPaths: ["src/safe.mjs"],
+          workspaceState: "unknown",
+          upstreamFreshness: "not_checked"
+        },
+        contextManifestId: diagnostic
+      },
+      contextManifest: {
+        schemaVersion: 1,
+        manifestId: diagnostic,
+        digest: killProcess,
+        capturedAt: diagnostic,
+        git: {
+          branch: diagnostic,
+          head: killProcess,
+          dirtyDigest: diagnostic,
+          ignoredDigest: killProcess,
+          trackedTreeIdentity: diagnostic,
+          metadataIdentity: killProcess,
+          insideWorktree: true,
+          linkedWorktree: false,
+          sparse: false,
+          shallow: false,
+          upstreamRef: diagnostic,
+          upstreamCommit: killProcess,
+          upstreamFreshness: "not_checked"
+        },
+        projectMarkers: ["package.json"],
+        materialization: {
+          state: "unknown",
+          reasons: [diagnostic, documentary, ordinary],
+          submodules: [killProcess],
+          upstreamFreshness: "not_checked"
+        }
+      }
+    },
+    result: {
+      review: {
+        verdict: "needs_changes",
+        summary: diagnostic,
+        findings: [{
+          severity: "high",
+          title: killProcess,
+          body: ordinary,
+          file: "src/safe.mjs",
+          line: 1
+        }]
+      },
+      workerReport: {
+        schemaVersion: 1,
+        structured: true,
+        valid: false,
+        outcome: "blocked",
+        summary: diagnostic,
+        changedFiles: ["src/safe.mjs"],
+        checksClaimed: [killProcess, ordinary],
+        acceptanceResults: [{
+          id: "AC-01",
+          status: "unmet",
+          note: diagnostic
+        }],
+        risks: [diagnostic],
+        questions: [documentary, ordinary],
+        validationIssues: [killProcess]
+      },
+      cancellation: {
+        requestAcceptedAt: diagnostic,
+        processGroupGoneAt: killProcess,
+        terminalRecordCommittedAt: diagnostic,
+        receiptId: killProcess
+      },
+      workflow: {
+        runId: diagnostic,
+        revision: 1,
+        status: "paused",
+        phases: [{
+          id: "cleanup",
+          name: diagnostic,
+          status: "blocked",
+          summary: killProcess
+        }],
+        currentPhase: diagnostic,
+        pauseMessage: killProcess
+      },
+      stopReason: diagnostic,
+      hostVerification: "not_run"
+    },
+    error: null
+  });
+
+  const handle = projectWorkerHandle(privateJob);
+  const snapshot = projectWorkerSnapshot(privateJob);
+  for (const projection of [handle, snapshot]) {
+    const serialized = JSON.stringify(projection);
+    for (const privateValue of [
+      "EPERM",
+      "EACCES",
+      "443001",
+      "441001",
+      "/Users/alice"
+    ]) {
+      assert.equal(serialized.includes(privateValue), false, `${privateValue} leaked`);
+    }
+  }
+  assert.equal(snapshot.error, null);
+  assert.equal(snapshot.latestPlan[2], documentary);
+  assert.equal(snapshot.latestPlan[3], ordinary);
+  assert.equal(snapshot.taskContract.context.facts[1], documentary);
+  assert.equal(snapshot.taskContract.context.facts[2], ordinary);
+  assert.equal(snapshot.result.workerReport.questions[0], documentary);
+  assert.equal(snapshot.result.workerReport.questions[1], ordinary);
+  assert.match(snapshot.progress, /kill process \[REDACTED\]/);
+  assertConforms("WorkerHandle", handle);
+
+  const forged = {
+    ...projectWorkerSnapshot(job()),
+    phase: diagnostic,
+    summary: diagnostic,
+    progress: killProcess,
+    profileId: diagnostic,
+    model: killProcess,
+    effort: diagnostic,
+    parentWorkerId: diagnostic,
+    lineageWorkerId: killProcess,
+    resumeJobId: diagnostic,
+    controlWorkspaceId: killProcess,
+    roleId: diagnostic,
+    securityProfile: {
+      id: diagnostic,
+      contractVersion: 3,
+      agentProfileDigest: killProcess
+    },
+    latestPlan: [diagnostic, documentary, ordinary],
+    taskContract: {
+      schemaVersion: 1,
+      envelopeId: diagnostic,
+      digest: killProcess,
+      objective: diagnostic,
+      mode: "read",
+      scope: { include: ["src/safe.mjs"], exclude: [] },
+      nonGoals: [diagnostic, documentary, ordinary],
+      acceptanceCriteria: [{ id: "AC-01", text: diagnostic }],
+      requiredVerification: [killProcess, ordinary],
+      expectedReturnFormat: diagnostic,
+      context: {
+        facts: [diagnostic, documentary, ordinary],
+        constraints: [killProcess],
+        expectedProjectMarkers: ["package.json"],
+        requiredPaths: ["src/safe.mjs"],
+        workspaceState: "unknown",
+        upstreamFreshness: "not_checked"
+      },
+      contextManifestId: diagnostic
+    },
+    context: {
+      schemaVersion: 1,
+      manifestId: diagnostic,
+      digest: killProcess,
+      branch: diagnostic,
+      head: killProcess,
+      projectMarkers: ["package.json"],
+      materialization: {
+        state: "unknown",
+        reasons: [diagnostic, documentary, ordinary],
+        submodules: [killProcess],
+        upstreamFreshness: "not_checked"
+      }
+    },
+    result: {
+      workerProtocolVersion: WORKER_PROTOCOL_VERSION,
+      resultSchemaVersion: WORKER_RESULT_SCHEMA_VERSION,
+      workerReport: {
+        schemaVersion: 1,
+        structured: true,
+        valid: false,
+        outcome: "blocked",
+        summary: diagnostic,
+        changedFiles: ["src/safe.mjs"],
+        checksClaimed: [killProcess],
+        acceptanceResults: [],
+        risks: [diagnostic],
+        questions: [documentary, ordinary],
+        validationIssues: []
+      },
+      hostVerification: "not_run"
+    },
+    error: null
+  };
+  for (const projection of [
+    normalizeWorkerSnapshot(forged),
+    presentWorker(forged)
+  ]) {
+    const serialized = JSON.stringify(projection);
+    for (const privateValue of [
+      "EPERM",
+      "EACCES",
+      "443001",
+      "441001",
+      "/Users/alice"
+    ]) {
+      assert.equal(serialized.includes(privateValue), false, `${privateValue} leaked`);
+    }
+    assert.equal(serialized.includes(documentary), true);
+    assert.equal(serialized.includes(ordinary), true);
+  }
+});
+
+test("warning-only uncertainty sanitizes the whole job while retaining independent documentary text", () => {
+  const warning =
+    "Terminal cleanup kill EPERM for providerPid=443011 at /private/provider/runtime.";
+  const documentary =
+    "Historical fixture: kill ENOSPC for providerPid=449998.";
+  const privateJob = job({
+    summary: warning,
+    progress: warning,
+    latestPlan: [warning, documentary],
+    result: {
+      review: {
+        verdict: "needs_changes",
+        summary: warning,
+        findings: []
+      },
+      privacyWarning: warning,
+      hostVerification: "not_run"
+    },
+    error: null
+  });
+  const handle = projectWorkerHandle(privateJob);
+  const snapshot = projectWorkerSnapshot(privateJob);
+  for (const projection of [handle, snapshot]) {
+    const serialized = JSON.stringify(projection);
+    for (const privateValue of ["EPERM", "443011", "/private/provider"]) {
+      assert.equal(serialized.includes(privateValue), false, `${privateValue} leaked`);
+    }
+  }
+  assert.equal(handle.summary, "Process ownership verification failed.");
+  assert.equal(snapshot.error, null);
+  assert.equal(
+    snapshot.result.privacyWarning,
+    "Process ownership verification failed."
+  );
+  assert.equal(snapshot.latestPlan[1], documentary);
+});
+
+test("authoritative secondary diagnostics override a documentary-looking prefix", () => {
+  const actual =
+    "Example: kill EPERM for providerPid=444001";
+  const independent =
+    "Example: kill ENOSPC for providerPid=444002";
+  for (const error of [
+    {
+      code: "E_PROCESS_IDENTITY",
+      message: "Verified owned process signalling could not be completed.",
+      details: {
+        secondaryDiagnostic: {
+          code: "EPERM",
+          message: actual
+        }
+      }
+    },
+    {
+      code: "E_CONTEXT_DRIFT",
+      message: "Final context changed.",
+      details: {
+        reasons: [actual],
+        secondaryDiagnostic: {
+          code: "EPERM",
+          message: actual
+        }
+      }
+    }
+  ]) {
+    const privateJob = job({
+      status: "failed",
+      phase: "cleanup-blocked",
+      summary: actual,
+      progress: actual,
+      profile: {
+        id: actual,
+        contractVersion: 3,
+        agentProfileDigest: actual
+      },
+      model: actual,
+      effort: actual,
+      controlWorkspaceId: actual,
+      role: { id: actual },
+      latestPlan: [actual, independent],
+      lifecycleEvents: [{
+        ...lifecycle("blocked", actual, 1),
+        detail: {
+          plan: [actual, independent],
+          status: actual
+        }
+      }],
+      result: {
+        review: {
+          verdict: "needs_changes",
+          summary: actual,
+          findings: [{
+            severity: "high",
+            title: actual,
+            body: independent
+          }]
+        },
+        privacyWarning: actual,
+        hostVerification: "not_run"
+      },
+      request: {
+        resumeJobId: actual,
+        providerHomeId: actual,
+        publicObjective: actual,
+        envelope: {
+          schemaVersion: 1,
+          envelopeId: actual,
+          digest: actual,
+          mode: "read",
+          scope: { include: ["src/safe.mjs"], exclude: [] },
+          nonGoals: [actual, independent],
+          acceptanceCriteria: [{ id: "AC-01", text: actual }],
+          requiredVerification: [actual],
+          expectedReturnFormat: actual,
+          context: {
+            facts: [actual, independent],
+            constraints: [actual],
+            expectedProjectMarkers: ["package.json"],
+            requiredPaths: ["src/safe.mjs"],
+            workspaceState: "unknown",
+            upstreamFreshness: "not_checked"
+          },
+          contextManifestId: actual
+        },
+        contextManifest: {
+          schemaVersion: 1,
+          manifestId: actual,
+          digest: actual,
+          git: {
+            branch: actual,
+            head: actual,
+            insideWorktree: true
+          },
+          projectMarkers: ["package.json"]
+        }
+      },
+      error
+    });
+    const handle = projectWorkerHandle(privateJob);
+    const snapshot = projectWorkerSnapshot(privateJob);
+    const cursor = projectWorkerLifecycleCursor(privateJob);
+    const foreground = projectWorkerError(error);
+    for (const projection of [handle, snapshot, cursor, foreground]) {
+      const serialized = JSON.stringify(projection);
+      assert.equal(serialized.includes("EPERM"), false);
+      assert.equal(serialized.includes("444001"), false);
+    }
+    assert.equal(handle.summary, "Process ownership verification failed.");
+    assert.equal(handle.profileId, "Process ownership verification failed.");
+    assert.equal(handle.model, "Process ownership verification failed.");
+    assert.equal(snapshot.taskContract.objective, "Process ownership verification failed.");
+    assert.equal(
+      snapshot.taskContract.context.facts[0],
+      "Process ownership verification failed."
+    );
+    assert.equal(
+      snapshot.taskContract.context.facts[1],
+      independent
+    );
+    assert.equal(snapshot.latestPlan[0], "Process ownership verification failed.");
+    assert.equal(snapshot.latestPlan[1], independent);
+    assert.equal(
+      snapshot.lifecycleEvents[0].detail.plan[0],
+      "Process ownership verification failed."
+    );
+    assert.equal(snapshot.lifecycleEvents[0].detail.plan[1], independent);
+    assert.equal(
+      snapshot.result.privacyWarning,
+      "Process ownership verification failed."
+    );
+    assert.equal(snapshot.error.code, error.code);
+  }
+});
+
+test("bounded diagnostic text projection preserves clean and documentary text", () => {
+  const diagnostic =
+    "Terminal cleanup signal process -445001 failed with EBUSY at /home/alice/runtime.";
+  const documentary =
+    "Example: the historical retry behavior remains documented.";
+  const spoofedDocumentary =
+    "Example: signal process -445002 failed with ENOSPC.";
+  const ordinary = "Could not read the requested input: ENOENT.";
+  const projected = projectWorkerDiagnosticText(diagnostic, {
+    maxBytes: 512 * 1024
+  });
+  assert.equal(projected.includes("EBUSY"), false);
+  assert.equal(projected.includes("445001"), false);
+  assert.equal(projected.includes("/home/alice"), false);
+  assert.match(projected, /signal process \[REDACTED\]/);
+  assert.equal(projectWorkerDiagnosticText(documentary), documentary);
+  assert.equal(
+    projectWorkerDiagnosticText(spoofedDocumentary).includes("445002"),
+    false
+  );
+  assert.equal(
+    projectWorkerDiagnosticText(spoofedDocumentary).includes("ENOSPC"),
+    false
+  );
+  assert.equal(projectWorkerDiagnosticText(ordinary), ordinary);
+  assert.equal(
+    Buffer.byteLength(projectWorkerDiagnosticText("x".repeat(600_000), {
+      maxBytes: 900_000
+    })),
+    512 * 1024
+  );
+});
+
+test("mixed documentary text preserves clean segments and scrubs later process diagnostics", () => {
+  const documentary = "Historical: ordinary note.";
+  const diagnostic =
+    "Final cleanup kill EPERM for providerPid=457101 at /Users/alice/private/runtime.";
+  const mixed = `${documentary}\n${diagnostic}`;
+  const privateJob = job({
+    summary: mixed,
+    progress: mixed,
+    lifecycleEvents: [
+      lifecycle("checkpoint", mixed, 1)
+    ],
+    error: null
+  });
+  const projections = [
+    projectWorkerDiagnosticText(mixed),
+    projectWorkerHandle(privateJob),
+    projectWorkerSnapshot(privateJob),
+    projectWorkerLifecycleCursor(privateJob)
+  ];
+  for (const projection of projections) {
+    const serialized = typeof projection === "string"
+      ? projection
+      : JSON.stringify(projection);
+    assert.equal(serialized.includes(documentary), true);
+    for (const privateValue of ["EPERM", "457101", "/Users/alice"]) {
+      assert.equal(
+        serialized.includes(privateValue),
+        false,
+        `${privateValue} leaked from ${serialized}`
+      );
+    }
+  }
+
+  const actual =
+    "Example: final cleanup kill EACCES for providerPid=457102";
+  const unrelatedDocumentary =
+    "Example: kill ENOSPC for providerPid=457103 is a historical fixture.";
+  const authoritative = {
+    code: "E_CONTEXT_DRIFT",
+    message: "Final workspace context changed.",
+    details: {
+      reasons: ["[GIT_METADATA]"],
+      secondaryDiagnostic: {
+        code: "EACCES",
+        message: actual
+      }
+    }
+  };
+  const trusted = projectWorkerSnapshot(job({
+    status: "failed",
+    phase: "context-rejected",
+    summary: actual,
+    latestPlan: [actual, unrelatedDocumentary],
+    error: authoritative
+  }));
+  assert.equal(trusted.summary, "Process ownership verification failed.");
+  assert.equal(trusted.latestPlan[1], unrelatedDocumentary);
+
+  const forged = structuredClone(trusted);
+  forged.summary = actual;
+  forged.latestPlan = [actual, unrelatedDocumentary];
+  for (const projection of [
+    normalizeWorkerSnapshot(forged),
+    presentWorker(forged)
+  ]) {
+    const serialized = JSON.stringify(projection);
+    for (const privateValue of [
+      "EACCES",
+      "ENOSPC",
+      "457102",
+      "457103"
+    ]) {
+      assert.equal(serialized.includes(privateValue), false);
+    }
+  }
+
+  for (const prefixed of [
+    "Test failed: final cleanup signal EPERM for providerPid=457104",
+    "Testing cleanup signal EBUSY for providerPid=457105",
+    "Fixture teardown failed: terminate process 457106 after EIO"
+  ]) {
+    const projected = projectWorkerDiagnosticText(prefixed);
+    assert.equal(projected.includes("45710"), false);
+    assert.equal(
+      ["EPERM", "EBUSY", "EIO"].some((code) => projected.includes(code)),
+      false
+    );
+  }
+  const activeError = projectWorkerError({
+    code: "E_SCOPE_VIOLATION",
+    message: "Example: final cleanup kill EPERM for providerPid=457107",
+    details: { paths: ["src/safe.mjs"] }
+  });
+  assert.equal(activeError.message.includes("EPERM"), false);
+  assert.equal(activeError.message.includes("457107"), false);
+});
+
+test("nested report-repair errors authorize whole-tree process sanitization", () => {
+  const actual =
+    "Example: kill EPERM for providerPid=457201";
+  const nestedError = {
+    code: "E_PROCESS_IDENTITY",
+    message: "Verified owned process signalling could not be completed.",
+    details: {
+      secondaryDiagnostic: {
+        code: "EPERM",
+        message: actual
+      }
+    }
+  };
+  const privateJob = job({
+    status: "completed",
+    phase: "done",
+    summary: actual,
+    progress: actual,
+    latestPlan: [actual],
+    lifecycleEvents: [lifecycle("checkpoint", actual, 1)],
+    result: {
+      hostVerification: "not_run",
+      reportRepair: {
+        attempted: true,
+        valid: false,
+        validationIssues: [actual],
+        error: nestedError
+      }
+    },
+    error: null
+  });
+  const handle = projectWorkerHandle(privateJob);
+  const snapshot = projectWorkerSnapshot(privateJob);
+  const cursor = projectWorkerLifecycleCursor(privateJob);
+  for (const projection of [handle, snapshot, cursor]) {
+    const serialized = JSON.stringify(projection);
+    assert.equal(serialized.includes("EPERM"), false);
+    assert.equal(serialized.includes("457201"), false);
+  }
+  assert.equal(snapshot.error, null);
+  assert.equal(
+    snapshot.result.reportRepair.error.message,
+    "Process ownership verification failed."
+  );
+
+  const forged = projectWorkerSnapshot(job());
+  forged.summary = actual;
+  forged.latestPlan = [actual];
+  forged.result = {
+    workerProtocolVersion: WORKER_PROTOCOL_VERSION,
+    resultSchemaVersion: WORKER_RESULT_SCHEMA_VERSION,
+    reportRepair: {
+      attempted: true,
+      valid: false,
+      validationIssues: [actual],
+      error: {
+        code: "E_PROCESS_IDENTITY",
+        message: "Process ownership verification failed."
+      }
+    },
+    hostVerification: "not_run"
+  };
+  for (const projection of [
+    normalizeWorkerSnapshot(forged),
+    presentWorker(forged)
+  ]) {
+    const serialized = JSON.stringify(projection);
+    assert.equal(serialized.includes("EPERM"), false);
+    assert.equal(serialized.includes("457201"), false);
+  }
+});
+
+test("operational PID variants scrub without corrupting clean numeric prose", () => {
+  const diagnostics = [
+    "Final cleanup kill -- -460003 failed with EPERM",
+    "Final cleanup kill process with id 460007 failed with EACCES",
+    "Final cleanup signal process number 460008 failed with EBUSY",
+    "Final cleanup terminate process #460009 after EIO",
+    "Final cleanup sent SIGTERM to process 460019",
+    "Final cleanup waiting for process #460023 to exit",
+    "Final cleanup provider process 460025 remains",
+    "signal group 481001",
+    "kill group 481002",
+    "waiting for group 481004 to exit",
+    "sent SIGKILL to 481006",
+    "signal to process number 481007",
+    "sent SIGTERM to 456704 but got EPERM",
+    "signal to process number 456705 failed with EACCES"
+  ];
+  for (const diagnostic of diagnostics) {
+    const projected = projectWorkerDiagnosticText(diagnostic);
+    for (const identifier of diagnostic.match(/\b\d{6}\b/g) || []) {
+      assert.equal(
+        projected.includes(identifier),
+        false,
+        `${identifier} leaked from ${projected}`
+      );
+    }
+    assert.equal(
+      ["EPERM", "EACCES", "EBUSY", "EIO"].some(
+        (code) => projected.includes(code)
+      ),
+      false
+    );
+    assert.match(projected, /\[REDACTED\]/);
+  }
+
+  const clean = [
+    "Target 500 customers by Q4.",
+    "Group 500 users into cohorts.",
+    "Group ID 500 ordinary prose.",
+    "Signal 500 customers about the migration.",
+    "Kill 10 flaky tests after review.",
+    "Terminate 20 subscriptions at renewal.",
+    "Cleanup ENABLED."
+  ];
+  for (const text of clean) {
+    assert.equal(projectWorkerDiagnosticText(text), text);
+  }
+  assert.equal(
+    projectWorkerDiagnosticText("pid 460031 is recorded").includes("460031"),
+    false
+  );
+
+  const activeError = {
+    code: "E_PROCESS_IDENTITY",
+    message: "Process ownership verification failed."
+  };
+  assert.equal(
+    projectWorkerDiagnosticText("Target 500 customers", {
+      error: activeError
+    }),
+    "Target [REDACTED] customers"
+  );
+});
+
+test("operation-qualified weak targets self-sanitize across error-null worker trees", () => {
+  const diagnostics = [
+    "signal group 481101",
+    "kill group 481102",
+    "waiting for group 481104 to exit",
+    "sent SIGKILL to 481106",
+    "signal to process number 481107",
+    "sent SIGTERM to 456714 but got EPERM",
+    "signal to process number 456715 failed with EACCES"
+  ];
+  const clean = "Cleanup ENABLED.";
+  const privateJob = job({
+    summary: diagnostics[0],
+    progress: diagnostics[1],
+    latestPlan: diagnostics.slice(2, 5),
+    lifecycleEvents: [{
+      ...lifecycle("blocked", diagnostics[5], 1),
+      detail: {
+        status: diagnostics[6],
+        questions: [clean]
+      }
+    }],
+    result: {
+      hostVerification: "not_run",
+      workerReport: {
+        schemaVersion: 1,
+        structured: true,
+        valid: false,
+        outcome: "blocked",
+        summary: diagnostics[5],
+        changedFiles: [],
+        checksClaimed: [diagnostics[6]],
+        acceptanceResults: [],
+        risks: [diagnostics[4]],
+        questions: [clean],
+        validationIssues: []
+      }
+    },
+    error: null
+  });
+  const projections = [
+    ...diagnostics.map((diagnostic) => projectWorkerDiagnosticText(diagnostic)),
+    projectWorkerHandle(privateJob),
+    projectWorkerSnapshot(privateJob),
+    projectWorkerLifecycleCursor(privateJob)
+  ];
+  for (const projection of projections) {
+    const serialized = typeof projection === "string"
+      ? projection
+      : JSON.stringify(projection);
+    for (const privateValue of [
+      "481101",
+      "481102",
+      "481104",
+      "481106",
+      "481107",
+      "456714",
+      "456715",
+      "EPERM",
+      "EACCES"
+    ]) {
+      assert.equal(
+        serialized.includes(privateValue),
+        false,
+        `${privateValue} leaked from ${serialized}`
+      );
+    }
+  }
+  const snapshot = projections.at(-2);
+  assert.equal(snapshot.error, null);
+  assert.equal(snapshot.lifecycleEvents[0].detail.questions[0], clean);
+  assert.equal(snapshot.result.workerReport.questions[0], clean);
+  assert.match(snapshot.summary, /group \[REDACTED\]/);
+  assert.match(
+    snapshot.result.workerReport.checksClaimed[0],
+    /process number \[REDACTED\]/
+  );
+});
+
+test("every public evidence timestamp rejects impossible calendar dates", () => {
+  const impossible = "2026-02-31T00:00:00.000Z";
+  const snapshot = projectWorkerSnapshot(job({
+    request: {
+      contextManifest: {
+        schemaVersion: 1,
+        manifestId: `ctx-${"a".repeat(24)}`,
+        digest: "b".repeat(64),
+        capturedAt: impossible,
+        git: { insideWorktree: true },
+        projectMarkers: []
+      }
+    },
+    lifecycleEvents: [{
+      ...lifecycle("checkpoint", "Cancellation requested", 1),
+      detail: { requestAcceptedAt: impossible }
+    }],
+    result: {
+      hostVerification: "not_run",
+      runtimeEvidence: {
+        schemaVersion: 1,
+        commandOutcomes: [],
+        reconciler: {
+          privilege: "owner",
+          replayedPrompt: false,
+          at: impossible
+        }
+      },
+      verification: {
+        outcome: "passed",
+        authority: "host_asserted",
+        recordedAt: impossible,
+        observedChangedPaths: []
+      },
+      cancellation: {
+        requestAcceptedAt: impossible,
+        processGroupGoneAt: impossible,
+        terminalRecordCommittedAt: impossible,
+        receiptId: "cancel-safe"
+      }
+    }
+  }));
+  assert.equal(snapshot.context.capturedAt, null);
+  assert.equal(snapshot.result.runtimeEvidence.reconciler.at, null);
+  assert.equal(snapshot.result.verification.recordedAt, null);
+  assert.deepEqual(snapshot.result.cancellation, {
+    requestAcceptedAt: null,
+    processGroupGoneAt: null,
+    terminalRecordCommittedAt: null,
+    receiptId: "cancel-safe"
+  });
+  assert.equal(
+    Object.hasOwn(snapshot.lifecycleEvents[0], "detail"),
+    false
+  );
+  assert.equal(JSON.stringify(snapshot).includes(impossible), false);
+  assertConforms("WorkerSnapshot", snapshot);
+
+  const artifact = {
+    schemaVersion: 1,
+    path: "target.txt",
+    baseCommit: "a".repeat(40),
+    manifestDigest: "b".repeat(64),
+    securityDigest: "c".repeat(64),
+    patchDigest: "d".repeat(64),
+    contentDigest: "e".repeat(64),
+    contentBytes: 1,
+    createdAt: impossible
+  };
+  assert.equal(projectWriteArtifactMetadata(artifact), null);
+});
+
+test("provider-exit signals expose only legitimate signal names", () => {
+  assert.deepEqual(
+    projectWorkerError({
+      code: "E_PROVIDER_EXIT",
+      message: "Provider exited.",
+      details: { signal: "EPERM" }
+    }),
+    {
+      code: "E_PROVIDER_EXIT",
+      message: "Provider exited."
+    }
+  );
+  assert.deepEqual(
+    projectWorkerError({
+      code: "E_PROVIDER_EXIT",
+      message: "Provider exited.",
+      details: { signal: "SIGTERM" }
+    }),
+    {
+      code: "E_PROVIDER_EXIT",
+      message: "Provider exited.",
+      details: { signal: "SIGTERM" }
+    }
+  );
+});
+
+test("process-error scrubbing preserves absent public status text as null", () => {
+  const privateJob = job({
+    summary: null,
+    progress: null,
+    error: { code: "EPERM", message: "kill EPERM" }
+  });
+  const handle = projectWorkerHandle(privateJob);
+  const snapshot = projectWorkerSnapshot(privateJob);
+  assert.equal(handle.summary, null);
+  assert.equal(handle.progress, null);
+  assert.equal(snapshot.summary, null);
+  assert.equal(snapshot.progress, null);
+});
+
+test("process-error scrubbing is error-bound and removes process identifiers", () => {
+  const privateJob = job({
+    summary: "provider pid 424242: kill EPERM",
+    progress: "target=-424242 signal failed EPERM",
+    error: { code: "EPERM", message: "kill EPERM" }
+  });
+  for (const projection of [
+    projectWorkerHandle(privateJob),
+    projectWorkerSnapshot(privateJob)
+  ]) {
+    const serialized = JSON.stringify(projection);
+    assert.equal(serialized.includes("424242"), false);
+    assert.equal(serialized.includes("EPERM"), false);
+    assert.match(projection.summary, /pid \[REDACTED\]/);
+  }
+
+  const completed = projectWorkerSnapshot(job({
+    status: "completed",
+    phase: "done",
+    summary: "Example: documented retry handling",
+    progress: "Documentation complete",
+    error: null
+  }));
+  assert.equal(completed.summary, "Example: documented retry handling");
+  assert.equal(completed.progress, "Documentation complete");
+  assert.equal(completed.error, null);
+
+  const genericIdentityMismatch = projectWorkerSnapshot(job({
+    status: "failed",
+    phase: "failed",
+    summary: "Recovery process authority changed before provider cleanup.",
+    progress: "Recovery stopped safely",
+    lifecycleEvents: [
+      lifecycle(
+        "checkpoint",
+        "Historical documentation example: kill EPERM handling for pid 424243",
+        1
+      )
+    ],
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "Recovery process authority changed before provider cleanup."
+    }
+  }));
+  assert.equal(
+    genericIdentityMismatch.error.message,
+    "Process ownership verification failed."
+  );
+  assert.equal(
+    genericIdentityMismatch.lifecycleEvents[0].summary.includes("EPERM"),
+    false
+  );
+  assert.match(
+    genericIdentityMismatch.lifecycleEvents[0].summary,
+    /pid \[REDACTED\]/
+  );
+
+  const genericCleanupFailure = job({
+    status: "failed",
+    phase: "cleanup-blocked",
+    summary: "cleanup still owns providerPid=424242 after kill EPERM",
+    progress: "waiting for PGID(424243) under /Users/alice/private/runtime",
+    result: {
+      privacyWarning: "signal EACCES for childPid=424244 at /private/provider/state"
+    },
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "Verified owned process cleanup did not complete."
+    }
+  });
+  const genericCleanupHandle = projectWorkerHandle(genericCleanupFailure);
+  const genericCleanupSnapshot = projectWorkerSnapshot(genericCleanupFailure);
+  for (const projection of [genericCleanupHandle, genericCleanupSnapshot]) {
+    const serialized = JSON.stringify(projection);
+    for (const privateValue of [
+      "EPERM",
+      "EACCES",
+      "424242",
+      "424243",
+      "424244",
+      "/Users/alice",
+      "/private/provider"
+    ]) {
+      assert.equal(serialized.includes(privateValue), false, `${privateValue} leaked`);
+    }
+  }
+  assert.match(genericCleanupHandle.summary, /providerPid=\[REDACTED\]/);
+  assert.match(genericCleanupHandle.progress, /PGID\(\[REDACTED\]\)/);
+  assert.equal(
+    genericCleanupSnapshot.result.privacyWarning,
+    "Process ownership verification failed."
+  );
+
+  const codeOnlySignalFailure = job({
+    status: "failed",
+    phase: "cleanup-blocked",
+    summary: "signal failed for providerPid=424244 at /Users/bob/runtime",
+    progress: "cleanup still owns PGID(424245) under /private/provider/state",
+    lifecycleEvents: [
+      lifecycle(
+        "checkpoint",
+        "Historical example of signal EALREADY failure for providerPid=424246 remains documented",
+        1
+      ),
+      {
+        ...lifecycle(
+          "checkpoint",
+          "Cleanup retry failed with EACCES for providerPid=424247 at /Users/bob/runtime",
+          2
+        ),
+        detail: {
+          status: "Cleanup still blocked after ENOTSUP for PGID(424248)",
+          plan: [
+            "Retry E2BIG for workerPid=424253 at /Users/bob/worker"
+          ],
+          questions: [
+            "Could not terminate EWOULDBLOCK for childPid=424249"
+          ]
+        }
+      },
+      {
+        ...lifecycle(
+          "checkpoint",
+          "Cleanup still owns providerPid=424250",
+          3
+        ),
+        detail: {
+          status: "Waiting for PGID(424251) to exit"
+        }
+      }
+    ],
+    error: {
+      code: "EIO",
+      message: "signal failed for providerPid=424242 at /Users/alice/runtime"
+    }
+  });
+  const codeOnlyHandle = projectWorkerHandle(codeOnlySignalFailure);
+  const codeOnlySnapshot = projectWorkerSnapshot(codeOnlySignalFailure);
+  const codeOnlyCursor = projectWorkerLifecycleCursor(codeOnlySignalFailure);
+  for (const projection of [codeOnlyHandle, codeOnlySnapshot, codeOnlyCursor]) {
+    const serialized = JSON.stringify(projection);
+    for (const privateCode of [
+      "EIO",
+      "EACCES",
+      "ENOTSUP",
+      "EWOULDBLOCK",
+      "E2BIG"
+    ]) {
+      assert.equal(serialized.includes(privateCode), false);
+    }
+    for (const privateIdentifier of [
+      "424242",
+      "424244",
+      "424245",
+      "424247",
+      "424248",
+      "424249",
+      "424250",
+      "424251",
+      "424253"
+    ]) {
+      assert.equal(serialized.includes(privateIdentifier), false);
+    }
+    assert.equal(serialized.includes("/Users/alice"), false);
+    assert.equal(serialized.includes("/Users/bob"), false);
+    assert.equal(serialized.includes("/private/provider"), false);
+  }
+  assert.equal(codeOnlySnapshot.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(
+    codeOnlySnapshot.error.message,
+    "Process ownership verification failed."
+  );
+  assert.match(codeOnlyHandle.summary, /providerPid=\[REDACTED\]/);
+  assert.match(codeOnlyHandle.progress, /PGID\(\[REDACTED\]\)/);
+  assert.equal(
+    codeOnlySnapshot.lifecycleEvents[0].summary,
+    "Historical example of signal EALREADY failure for providerPid=424246 remains documented"
+  );
+  assert.equal(
+    codeOnlyCursor.events[0].summary,
+    "Historical example of signal EALREADY failure for providerPid=424246 remains documented"
+  );
+  assert.match(
+    codeOnlySnapshot.lifecycleEvents[1].summary,
+    /providerPid=\[REDACTED\]/
+  );
+  assert.match(
+    codeOnlySnapshot.lifecycleEvents[1].detail.status,
+    /Process ownership verification failed\./
+  );
+  assert.match(
+    codeOnlySnapshot.lifecycleEvents[1].detail.plan[0],
+    /workerPid=\[REDACTED\]/
+  );
+  assert.match(
+    codeOnlyCursor.events[1].detail.questions[0],
+    /Process ownership verification failed\./
+  );
+  assert.match(
+    codeOnlySnapshot.lifecycleEvents[2].summary,
+    /providerPid=\[REDACTED\]/
+  );
+  assert.match(
+    codeOnlyCursor.events[2].detail.status,
+    /PGID\(\[REDACTED\]\)/
+  );
+  assert.deepEqual(
+    projectWorkerError(codeOnlySignalFailure.error),
+    {
+      code: "E_PROCESS_IDENTITY",
+      message: "Process ownership verification failed."
+    }
+  );
+
+  const boundCheckpoint = projectLifecycleEvent(
+    lifecycle(
+      "checkpoint",
+      "Cleanup retry failed with EACCES for providerPid=424247 at /Users/bob/runtime",
+      2
+    ),
+    { error: codeOnlySignalFailure.error }
+  );
+  assert.equal(JSON.stringify(boundCheckpoint).includes("EACCES"), false);
+  assert.equal(JSON.stringify(boundCheckpoint).includes("424247"), false);
+  assert.equal(JSON.stringify(boundCheckpoint).includes("/Users/bob"), false);
+  assert.match(boundCheckpoint.summary, /providerPid=\[REDACTED\]/);
+
+  const boundPidOnlyCheckpoint = projectLifecycleEvent(
+    {
+      ...lifecycle(
+        "checkpoint",
+        "Cleanup still owns providerPid=424250",
+        3
+      ),
+      detail: {
+        status: "Waiting for PGID(424251) to exit"
+      }
+    },
+    { error: codeOnlySignalFailure.error }
+  );
+  assert.equal(JSON.stringify(boundPidOnlyCheckpoint).includes("424250"), false);
+  assert.equal(JSON.stringify(boundPidOnlyCheckpoint).includes("424251"), false);
+  assert.match(boundPidOnlyCheckpoint.summary, /providerPid=\[REDACTED\]/);
+
+  const documentaryPidOnlyCheckpoint = projectLifecycleEvent(
+    lifecycle(
+      "checkpoint",
+      "Historical providerPid=424252 ownership investigation remains documented",
+      4
+    ),
+    { error: codeOnlySignalFailure.error }
+  );
+  assert.equal(
+    documentaryPidOnlyCheckpoint.summary,
+    "Historical providerPid=424252 ownership investigation remains documented"
+  );
+
+  const identityCheckpointJob = job({
+    status: "failed",
+    phase: "cleanup-blocked",
+    lifecycleEvents: [
+      lifecycle(
+        "checkpoint",
+        "Cleanup still owns providerPid=424254",
+        1
+      ),
+      lifecycle(
+        "checkpoint",
+        "Historical providerPid=424255 ownership investigation remains documented",
+        2
+      ),
+      {
+        ...lifecycle("checkpoint", "Reconciliation metadata recorded", 3),
+        detail: {
+          name: "Cleanup failed with EACCES for providerPid=424256"
+        }
+      },
+      {
+        ...lifecycle("checkpoint", "Spawn contract recorded", 4),
+        detail: {
+          spawnSuccessDefinition: "Cleanup still owns providerPid=424257"
+        }
+      },
+      {
+        ...lifecycle("checkpoint", "Reconciler recorded", 5),
+        detail: {
+          reconciler: "signal ENOTSUP for controllerPid=424258"
+        }
+      },
+      lifecycle(
+        "checkpoint",
+        "Cleanup failed with EBUSY for providerPid=424259; documented in retry log",
+        6
+      )
+    ],
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "Verified owned process cleanup did not complete."
+    }
+  });
+  const identitySnapshot = projectWorkerSnapshot(identityCheckpointJob);
+  const identityCursor = projectWorkerLifecycleCursor(identityCheckpointJob);
+  const identityDirect = projectLifecycleEvent(
+    identityCheckpointJob.lifecycleEvents[0],
+    { error: identityCheckpointJob.error }
+  );
+  for (const projection of [identitySnapshot, identityCursor, identityDirect]) {
+    assert.equal(JSON.stringify(projection).includes("424254"), false);
+  }
+  assert.match(identitySnapshot.lifecycleEvents[0].summary, /providerPid=\[REDACTED\]/);
+  assert.match(identityCursor.events[0].summary, /providerPid=\[REDACTED\]/);
+  assert.match(identityDirect.summary, /providerPid=\[REDACTED\]/);
+  assert.match(
+    identitySnapshot.lifecycleEvents[1].summary,
+    /providerPid=\[REDACTED\]/
+  );
+  assert.match(
+    identityCursor.events[1].summary,
+    /providerPid=\[REDACTED\]/
+  );
+  for (const privateValue of [
+    "EACCES",
+    "ENOTSUP",
+    "EBUSY",
+    "424256",
+    "424257",
+    "424258",
+    "424259"
+  ]) {
+    assert.equal(JSON.stringify(identitySnapshot).includes(privateValue), false);
+    assert.equal(JSON.stringify(identityCursor).includes(privateValue), false);
+  }
+  const classifiedDirectEvents = identityCheckpointJob.lifecycleEvents
+    .slice(2)
+    .map((event) => projectLifecycleEvent(event, {
+      error: identityCheckpointJob.error
+    }));
+  for (const projection of classifiedDirectEvents) {
+    const serialized = JSON.stringify(projection);
+    for (const privateValue of [
+      "EACCES",
+      "ENOTSUP",
+      "EBUSY",
+      "424256",
+      "424257",
+      "424258",
+      "424259"
+    ]) {
+      assert.equal(serialized.includes(privateValue), false);
+    }
+  }
+  assert.match(identitySnapshot.lifecycleEvents[2].detail.name, /providerPid=\[REDACTED\]/);
+  assert.match(
+    identitySnapshot.lifecycleEvents[3].detail.spawnSuccessDefinition,
+    /providerPid=\[REDACTED\]/
+  );
+  assert.match(
+    identitySnapshot.lifecycleEvents[4].detail.reconciler,
+    /controllerPid=\[REDACTED\]/
+  );
+  assert.match(identitySnapshot.lifecycleEvents[5].summary, /providerPid=\[REDACTED\]/);
+});
+
+test("drift and scope primaries scrub process diagnostics while preserving precedence", () => {
+  for (const primary of [
+    {
+      code: "E_CONTEXT_DRIFT",
+      message: "Context changed while cleanup retry failed with EACCES for providerPid=431001.",
+      details: {
+        reasons: [
+          "Final observation followed EWOULDBLOCK for childPid=431002."
+        ],
+        secondaryDiagnostic: {
+          code: "EPERM",
+          message: "Permission was denied during cleanup."
+        }
+      }
+    },
+    {
+      code: "E_SCOPE_VIOLATION",
+      message: "Scope changed while cleanup retry failed with EACCES for providerPid=431001.",
+      details: {
+        paths: ["src/safe.mjs"],
+        secondaryDiagnostic: {
+          code: "EPERM",
+          message: "Permission was denied during cleanup."
+        }
+      }
+    }
+  ]) {
+    const snapshot = projectWorkerSnapshot(job({
+      status: "failed",
+      phase: "context-rejected",
+      error: primary
+    }));
+    const foreground = projectWorkerError(primary);
+    for (const projection of [snapshot.error, foreground]) {
+      assert.equal(projection.code, primary.code);
+      const serialized = JSON.stringify(projection);
+      for (const privateValue of [
+        "EACCES",
+        "EWOULDBLOCK",
+        "EPERM",
+        "431001",
+        "431002"
+      ]) {
+        assert.equal(serialized.includes(privateValue), false, `${privateValue} leaked`);
+      }
+    }
+    if (primary.code === "E_CONTEXT_DRIFT") {
+      assert.match(snapshot.error.details.reasons[0], /childPid=\[REDACTED\]/);
+      assert.match(foreground.details.reasons[0], /childPid=\[REDACTED\]/);
+    } else {
+      assert.deepEqual(snapshot.error.details.paths, ["src/safe.mjs"]);
+      assert.deepEqual(foreground.details.paths, ["src/safe.mjs"]);
+    }
+    assertConforms("WorkerError", snapshot.error);
+    assertConforms("WorkerSnapshot", snapshot);
+  }
+});
+
+test("latest and lifecycle plans scrub process diagnostics only under uncertainty", () => {
+  const privateJob = job({
+    status: "failed",
+    phase: "context-rejected",
+    latestPlan: [
+      "Retry EACCES for providerPid=432001 at /Users/alice/private/runtime"
+    ],
+    lifecycleEvents: [{
+      ...lifecycle(
+        "checkpoint",
+        "Cleanup still owns providerPid=432002",
+        1
+      ),
+      detail: {
+        plan: [
+          "Wait for PGID(432003) after ENOTSUP at /private/provider/runtime"
+        ]
+      }
+    }],
+    error: {
+      code: "E_CONTEXT_DRIFT",
+      message: "Final context changed.",
+      details: {
+        reasons: ["[GIT_METADATA]"],
+        secondaryDiagnostic: {
+          code: "EPERM",
+          message: "Permission was denied during cleanup."
+        }
+      }
+    }
+  });
+  const snapshot = projectWorkerSnapshot(privateJob);
+  const cursor = projectWorkerLifecycleCursor(privateJob);
+  const direct = projectLifecycleEvent(privateJob.lifecycleEvents[0], {
+    error: privateJob.error
+  });
+  for (const projection of [snapshot, cursor, direct]) {
+    const serialized = JSON.stringify(projection);
+    for (const privateValue of [
+      "EACCES",
+      "ENOTSUP",
+      "432001",
+      "432002",
+      "432003",
+      "/Users/alice",
+      "/private/provider"
+    ]) {
+      assert.equal(serialized.includes(privateValue), false, `${privateValue} leaked`);
+    }
+  }
+  assert.match(snapshot.latestPlan[0], /providerPid=\[REDACTED\]/);
+  assert.match(snapshot.latestPlan[0], /\[PRIVATE_PATH\]/);
+  assert.match(snapshot.lifecycleEvents[0].detail.plan[0], /PGID\(\[REDACTED\]\)/);
+  assert.match(cursor.events[0].detail.plan[0], /PGID\(\[REDACTED\]\)/);
+  assert.match(direct.detail.plan[0], /PGID\(\[REDACTED\]\)/);
+
+  const ordinary = projectWorkerSnapshot(job({
+    latestPlan: [
+      "Document ENOENT handling before retrying input reads"
+    ],
+    error: null
+  }));
+  assert.deepEqual(
+    ordinary.latestPlan,
+    ["Document ENOENT handling before retrying input reads"]
+  );
+  assertConforms("WorkerSnapshot", snapshot);
+  assertConforms("WorkerEventPage", cursor);
+  assertConforms("WorkerEvent", direct);
+});
+
+test("process uncertainty scrubs every nested public result text surface", () => {
+  const nestedDiagnostic =
+    "signal EACCES failed for providerPid=430001 at /Users/alice/private/runtime";
+  const privateJob = job({
+    status: "failed",
+    phase: "cleanup-blocked",
+    result: {
+      review: {
+        verdict: "needs_changes",
+        summary: nestedDiagnostic,
+        findings: [{
+          severity: "high",
+          title: nestedDiagnostic,
+          body: nestedDiagnostic
+        }]
+      },
+      workerReport: {
+        schemaVersion: 1,
+        structured: true,
+        valid: false,
+        outcome: "blocked",
+        summary: nestedDiagnostic,
+        checksClaimed: [nestedDiagnostic],
+        acceptanceResults: [{
+          id: "AC-01",
+          status: "unmet",
+          note: nestedDiagnostic
+        }],
+        risks: [nestedDiagnostic],
+        questions: [nestedDiagnostic],
+        validationIssues: [nestedDiagnostic]
+      },
+      reportRepair: {
+        attempted: true,
+        valid: false,
+        validationIssues: [nestedDiagnostic],
+        error: {
+          code: "E_STATE",
+          message: nestedDiagnostic
+        }
+      },
+      providerClaims: {
+        success: false,
+        outcome: "blocked",
+        summary: nestedDiagnostic,
+        checksClaimed: [nestedDiagnostic],
+        observedFileAgreement: false
+      },
+      runtimeEvidence: {
+        schemaVersion: 1,
+        diffSummary: nestedDiagnostic,
+        commandOutcomes: [{
+          command: nestedDiagnostic,
+          status: "failed",
+          exitCode: 1
+        }],
+        executionStatus: "failed",
+        hostVerification: "not_run"
+      },
+      researchReport: {
+        valid: false,
+        path: "workflows/nested-scrub/scratch/report.md",
+        bytes: 1,
+        sha256: "a".repeat(64),
+        sourceCount: 0,
+        coverageNotes: [nestedDiagnostic],
+        status: "partial",
+        textPreview: nestedDiagnostic
+      },
+      workflow: {
+        runId: "workflow-nested-scrub",
+        revision: 1,
+        status: "paused",
+        phases: [
+          nestedDiagnostic,
+          {
+            id: "cleanup",
+            name: nestedDiagnostic,
+            status: "blocked",
+            summary: nestedDiagnostic
+          }
+        ],
+        currentPhase: nestedDiagnostic,
+        pauseMessage: nestedDiagnostic
+      },
+      stopReason: nestedDiagnostic,
+      skipped: true,
+      skipReason: nestedDiagnostic,
+      privacyWarning: nestedDiagnostic
+    },
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "Verified owned process signalling could not be completed.",
+      details: {
+        secondaryDiagnostic: {
+          code: "EPERM",
+          message: "kill EPERM for providerPid=430000 at /Users/root/private/runtime"
+        }
+      }
+    }
+  });
+
+  const snapshot = projectWorkerSnapshot(privateJob);
+  const serialized = JSON.stringify(snapshot.result);
+  for (const privateValue of [
+    "EACCES",
+    "EPERM",
+    "430000",
+    "430001",
+    "/Users/alice",
+    "/Users/root"
+  ]) {
+    assert.equal(serialized.includes(privateValue), false, `${privateValue} leaked`);
+  }
+  assert.match(snapshot.result.workerReport.summary, /providerPid=\[REDACTED\]/);
+  assert.match(snapshot.result.workerReport.risks[0], /providerPid=\[REDACTED\]/);
+  assert.match(snapshot.result.providerClaims.summary, /providerPid=\[REDACTED\]/);
+  assert.match(snapshot.result.workflow.phases[1].summary, /providerPid=\[REDACTED\]/);
+  assert.match(snapshot.result.stopReason, /providerPid=\[REDACTED\]/);
+  assertConforms("WorkerSnapshot", snapshot);
+});
+
+test("process diagnostics scrub identifier variants and public warning surfaces", () => {
+  const privateJob = job({
+    status: "running",
+    phase: "cleanup-blocked",
+    summary: [
+      "pid 410001, PGID=410002, process-group 410003, process group ID 410004,",
+      "processGroupId=410015, childPid:410016, leaderPid=410017"
+    ].join(" "),
+    progress: [
+      "process-group-id=410005, group identifiers #410006, target -410007:",
+      "PID[410018], PGID(410019), pid(410020): kill EACCES"
+    ].join(" "),
+    lifecycleEvents: [
+      {
+        ...lifecycle(
+          "blocked",
+          "process group identifier 410008 could not be signalled: ENOTSUP",
+          1
+        ),
+        detail: {
+          status: "group id 410009 signal EWOULDBLOCK",
+          questions: [
+            "Did kill(410010, SIGTERM) fail with EPERM?",
+            "Durable E_STATE and benign ESRCH remain recognizable."
+          ]
+        }
+      }
+    ],
+    result: {
+      privacyWarning: [
+        "signal EACCES left PGID 410011 under /Users/alice/private/runtime;",
+        "ESRCH is benign and E_STATE is durable."
+      ].join(" ")
+    },
+    error: {
+      code: "E_STATE",
+      message: "Cleanup is incomplete.",
+      details: {
+        warning: "signal ENOTSUP for process-group-id 410012 at /private/worker/state.",
+        privacyWarning: "kill EWOULDBLOCK left group identifier 410013 in /home/alice/task."
+      }
+    }
+  });
+
+  const handle = projectWorkerHandle(privateJob);
+  const snapshot = projectWorkerSnapshot(privateJob);
+  const cursor = projectWorkerLifecycleCursor(privateJob);
+  const directEvent = projectLifecycleEvent(privateJob.lifecycleEvents[0], {
+    error: privateJob.error
+  });
+  for (const projection of [handle, snapshot, cursor, directEvent]) {
+    const serialized = JSON.stringify(projection);
+    for (const privateCode of ["E2BIG", "EACCES", "ENOTSUP", "EWOULDBLOCK", "EPERM"]) {
+      assert.equal(serialized.includes(privateCode), false, `${privateCode} leaked`);
+    }
+    for (let identifier = 410001; identifier <= 410020; identifier += 1) {
+      assert.equal(serialized.includes(String(identifier)), false, `${identifier} leaked`);
+    }
+    assert.equal(serialized.includes("/Users/alice"), false);
+    assert.equal(serialized.includes("/private/worker"), false);
+    assert.equal(serialized.includes("/home/alice"), false);
+  }
+  assert.match(handle.summary, /pid \[REDACTED\]/i);
+  assert.match(handle.summary, /PGID=\[REDACTED\]/);
+  assert.match(handle.summary, /process-group \[REDACTED\]/);
+  assert.match(handle.summary, /process group ID \[REDACTED\]/);
+  assert.match(handle.progress, /process-group-id=\[REDACTED\]/);
+  assert.match(handle.progress, /group identifiers #\[REDACTED\]/);
+  assert.match(snapshot.lifecycleEvents[0].summary, /process group identifier \[REDACTED\]/);
+  assert.match(snapshot.lifecycleEvents[0].detail.status, /group id \[REDACTED\]/);
+  assert.match(snapshot.lifecycleEvents[0].detail.questions[0], /kill\(\[REDACTED\]/);
+  assert.equal(
+    snapshot.result.privacyWarning,
+    "Process ownership verification failed."
+  );
+  assert.equal(
+    snapshot.error.details.warning,
+    "Process ownership verification failed."
+  );
+  assert.match(snapshot.error.details.privacyWarning, /\[PRIVATE_PATH\]/);
+  assertConforms("WorkerHandle", handle);
+  assertConforms("WorkerSnapshot", snapshot);
+  assertConforms("WorkerEventPage", cursor);
+  assertConforms("WorkerEvent", directEvent);
+
+  const warningOnly = projectWorkerSnapshot(job({
+    error: null,
+    result: {
+      privacyWarning: "kill EPERM left process-group 410014 at /Users/alice/private."
+    }
+  }));
+  assert.equal(JSON.stringify(warningOnly).includes("EPERM"), false);
+  assert.equal(JSON.stringify(warningOnly).includes("410014"), false);
+  assert.equal(JSON.stringify(warningOnly).includes("/Users/alice"), false);
+
+  const standaloneBlocked = {
+    type: "blocked",
+    at: "2026-07-28T00:00:00.000Z",
+    summary: "kill EPERM for PID[410021]",
+    sequence: 1,
+    detail: {
+      status: "signal EACCES target=410022"
+    }
+  };
+  const standaloneProjection = projectLifecycleEvent(standaloneBlocked);
+  const standaloneSerialized = JSON.stringify(standaloneProjection);
+  assert.equal(standaloneSerialized.includes("EPERM"), false);
+  assert.equal(standaloneSerialized.includes("EACCES"), false);
+  assert.equal(standaloneSerialized.includes("410021"), false);
+  assert.equal(standaloneSerialized.includes("410022"), false);
+
+  const normalizedStandalone = normalizeWorkerSnapshot({
+    ...projectWorkerSnapshot(job()),
+    lifecycleEvents: [standaloneBlocked],
+    error: null
+  });
+  const normalizedSerialized = JSON.stringify(normalizedStandalone);
+  assert.equal(normalizedSerialized.includes("EPERM"), false);
+  assert.equal(normalizedSerialized.includes("EACCES"), false);
+  assert.equal(normalizedSerialized.includes("410021"), false);
+  assert.equal(normalizedSerialized.includes("410022"), false);
+
+  const standaloneIdentityOnly = projectLifecycleEvent({
+    type: "blocked",
+    at: "2026-07-28T00:00:00.000Z",
+    summary: "cleanup still owns providerPid=410024",
+    sequence: 1,
+    detail: {
+      status: "waiting for PGID(410025) to exit"
+    }
+  });
+  const standaloneIdentitySerialized = JSON.stringify(standaloneIdentityOnly);
+  assert.equal(standaloneIdentitySerialized.includes("410024"), false);
+  assert.equal(standaloneIdentitySerialized.includes("410025"), false);
+  assert.match(standaloneIdentityOnly.summary, /providerPid=\[REDACTED\]/);
+  assert.match(standaloneIdentityOnly.detail.status, /PGID\(\[REDACTED\]\)/);
+
+  const historicalCheckpoint = projectLifecycleEvent({
+    type: "checkpoint",
+    at: "2026-07-28T00:00:00.000Z",
+    summary: "Historical providerPid=410026 investigation remains documented",
+    sequence: 1
+  });
+  assert.match(
+    historicalCheckpoint.summary,
+    /providerPid=\[REDACTED\]/
+  );
+});
+
+test("foreground public error projection strips private cleanup diagnostics", () => {
+  const projected = projectWorkerError({
+    code: "E_PROCESS_IDENTITY",
+    message: "Verified owned process signalling could not be completed.",
+    details: {
+      secondaryDiagnostic: {
+        code: "EPERM",
+        message: "kill EPERM for childPid=410023 at /Users/alice/private/runtime"
+      }
+    }
+  });
+  assert.deepEqual(projected, {
+    code: "E_PROCESS_IDENTITY",
+    message: "Process ownership verification failed."
+  });
+  const serialized = JSON.stringify(projected);
+  assert.equal(serialized.includes("EPERM"), false);
+  assert.equal(serialized.includes("410023"), false);
+  assert.equal(serialized.includes("/Users/alice"), false);
+});
+
+test("transfer primary errors retain bounded sanitized cleanup warnings", () => {
+  const cleanWarning = `injected unlink failure ${"x".repeat(4_000)}`;
+  const privateWarning = [
+    "Final transfer cleanup failed with EPERM",
+    "for providerPid=498001",
+    "at /private/var/folders/grok-transfer/import.jsonl."
+  ].join(" ");
+  const primaries = [
+    {
+      code: "E_TIMEOUT",
+      message: "Grok transcript import timed out."
+    },
+    {
+      code: "E_CANCELLED",
+      message: "Grok transcript import was cancelled."
+    },
+    {
+      code: "E_OUTPUT_LIMIT",
+      message: "Grok transcript import output exceeded 4096 bytes.",
+      limitBytes: 4096
+    },
+    {
+      code: "E_PROCESS_IDENTITY",
+      message: "Verified owned process signalling could not be completed."
+    }
+  ];
+
+  for (const primary of primaries) {
+    const clean = projectWorkerError({
+      code: primary.code,
+      message: primary.message,
+      details: {
+        warning: cleanWarning,
+        privacyWarning: cleanWarning,
+        ...(primary.limitBytes === undefined
+          ? {}
+          : { limitBytes: primary.limitBytes })
+      }
+    });
+    assert.equal(clean.code, primary.code);
+    assert.equal(
+      clean.message,
+      primary.code === "E_PROCESS_IDENTITY"
+        ? "Process ownership verification failed."
+        : primary.message
+    );
+    for (const key of ["warning", "privacyWarning"]) {
+      assert.match(clean.details[key], /^injected unlink failure/);
+      assert.ok(Buffer.byteLength(clean.details[key], "utf8") <= 2_000);
+    }
+    if (primary.limitBytes !== undefined) {
+      assert.equal(clean.details.limitBytes, primary.limitBytes);
+    }
+
+    const sanitized = projectWorkerError({
+      code: primary.code,
+      message: primary.message,
+      details: {
+        warning: privateWarning,
+        privacyWarning: privateWarning,
+        ...(primary.limitBytes === undefined
+          ? {}
+          : { limitBytes: primary.limitBytes })
+      }
+    });
+    assert.equal(sanitized.code, primary.code);
+    assert.equal(
+      sanitized.message,
+      primary.code === "E_PROCESS_IDENTITY"
+        ? "Process ownership verification failed."
+        : primary.message
+    );
+    for (const key of ["warning", "privacyWarning"]) {
+      assert.equal(
+        sanitized.details[key],
+        "Process ownership verification failed."
+      );
+    }
+    const serialized = JSON.stringify(sanitized);
+    for (const privateValue of [
+      "EPERM",
+      "498001",
+      "/private/var",
+      "grok-transfer"
+    ]) {
+      assert.equal(
+        serialized.includes(privateValue),
+        false,
+        `${primary.code} leaked ${privateValue}`
+      );
+    }
+  }
+});
+
+test("authoritative asynchronous signal diagnostics fail closed across projections", () => {
+  const secondaryMessage =
+    "Process signalling callback did not complete synchronously.";
+  const reattached = [
+    `E_ASYNC_SIGNAL: ${secondaryMessage}`,
+    "Cleanup remained blocked at /private/provider/runtime",
+    "for providerPid=498101."
+  ].join(" ");
+  const identityError = {
+    code: "E_PROCESS_IDENTITY",
+    message: "Verified owned process signalling could not be completed.",
+    details: {
+      warning: reattached,
+      privacyWarning: reattached,
+      secondaryDiagnostic: {
+        code: "E_ASYNC_SIGNAL",
+        message: secondaryMessage
+      }
+    }
+  };
+  const privateJob = job({
+    status: "failed",
+    phase: "cleanup-blocked",
+    summary: reattached,
+    progress: reattached,
+    latestPlan: [reattached],
+    lifecycleEvents: [lifecycle("blocked", reattached, 1)],
+    result: {
+      hostVerification: "not_run",
+      privacyWarning: reattached
+    },
+    error: identityError
+  });
+
+  const trustedSnapshot = projectWorkerSnapshot(privateJob);
+  const direct = projectWorkerError(identityError);
+  const projections = [
+    projectWorkerDiagnosticText(reattached, { error: identityError }),
+    direct,
+    projectWorkerHandle(privateJob),
+    trustedSnapshot,
+    projectWorkerLifecycleCursor(privateJob)
+  ];
+  assert.equal(direct.code, "E_PROCESS_IDENTITY");
+  assert.equal(
+    direct.message,
+    "Process ownership verification failed."
+  );
+  assert.ok(direct.details.warning);
+  assert.ok(direct.details.privacyWarning);
+  assert.equal(
+    Object.hasOwn(
+      trustedSnapshot.error.details || {},
+      "secondaryDiagnostic"
+    ),
+    false
+  );
+
+  const forged = structuredClone(trustedSnapshot);
+  forged.summary = reattached;
+  forged.progress = reattached;
+  forged.latestPlan = [reattached];
+  forged.lifecycleEvents[0].summary = reattached;
+  forged.result.privacyWarning = reattached;
+  projections.push(
+    normalizeWorkerSnapshot(forged),
+    presentWorker(forged)
+  );
+
+  for (const projection of projections) {
+    const serialized = typeof projection === "string"
+      ? projection
+      : JSON.stringify(projection);
+    assert.match(serialized, /Process ownership verification failed/);
+    for (const privateValue of [
+      "E_ASYNC_SIGNAL",
+      secondaryMessage,
+      "498101",
+      "/private/provider"
+    ]) {
+      assert.equal(
+        serialized.includes(privateValue),
+        false,
+        `${privateValue} leaked from ${serialized}`
+      );
+    }
+  }
+
+  const clean =
+    "Cleanup ENABLED. Document E_ASYNC_SIGNAL callback behavior.";
+  assert.equal(projectWorkerDiagnosticText(clean), clean);
+  const documentary =
+    `Historical: E_ASYNC_SIGNAL: ${secondaryMessage}`;
+  assert.equal(projectWorkerDiagnosticText(documentary), documentary);
+});
+
+test("safety primaries sanitize authoritative asynchronous signal diagnostics without over-redaction", () => {
+  const secondaryMessage =
+    "Process signalling callback did not complete synchronously.";
+  const reattached = [
+    `E_ASYNC_SIGNAL: ${secondaryMessage}`,
+    "Final cleanup remained blocked at /private/safety/runtime",
+    "for providerPid=498201."
+  ].join(" ");
+
+  for (const code of ["E_CONTEXT_DRIFT", "E_SCOPE_VIOLATION"]) {
+    const message = code === "E_CONTEXT_DRIFT"
+      ? `Final workspace context changed. ${reattached}`
+      : `Observed changes exceeded the allowed scope. ${reattached}`;
+    const safetyError = {
+      code,
+      message,
+      details: {
+        ...(code === "E_CONTEXT_DRIFT"
+          ? { reasons: [reattached] }
+          : { paths: ["src/safe.mjs"] }),
+        secondaryDiagnostic: {
+          code: "E_ASYNC_SIGNAL",
+          message: secondaryMessage
+        }
+      }
+    };
+    const privateJob = job({
+      status: "failed",
+      phase: "context-rejected",
+      summary: reattached,
+      progress: reattached,
+      latestPlan: [reattached],
+      lifecycleEvents: [lifecycle("blocked", reattached, 1)],
+      result: {
+        hostVerification: "not_run",
+        privacyWarning: reattached
+      },
+      error: safetyError
+    });
+    const trustedSnapshot = projectWorkerSnapshot(privateJob);
+    const direct = projectWorkerError(safetyError);
+    const strippedError = structuredClone(trustedSnapshot.error);
+    strippedError.message = message;
+    const projections = [
+      projectWorkerDiagnosticText(reattached, { error: safetyError }),
+      direct,
+      projectWorkerError(strippedError),
+      projectWorkerHandle(privateJob),
+      trustedSnapshot,
+      projectWorkerLifecycleCursor(privateJob)
+    ];
+    assert.equal(direct.code, code);
+    assert.equal(trustedSnapshot.error.code, code);
+    assert.equal(
+      Object.hasOwn(
+        trustedSnapshot.error.details || {},
+        "secondaryDiagnostic"
+      ),
+      false
+    );
+
+    const forged = structuredClone(trustedSnapshot);
+    forged.summary = reattached;
+    forged.progress = reattached;
+    forged.latestPlan = [reattached];
+    forged.lifecycleEvents[0].summary = reattached;
+    forged.result.privacyWarning = reattached;
+    projections.push(
+      normalizeWorkerSnapshot(forged),
+      presentWorker(forged)
+    );
+
+    for (const projection of projections) {
+      const serialized = typeof projection === "string"
+        ? projection
+        : JSON.stringify(projection);
+      assert.match(serialized, /Process ownership verification failed/);
+      for (const privateValue of [
+        "E_ASYNC_SIGNAL",
+        secondaryMessage,
+        "498201",
+        "/private/safety"
+      ]) {
+        assert.equal(
+          serialized.includes(privateValue),
+          false,
+          `${code} leaked ${privateValue} from ${serialized}`
+        );
+      }
+    }
+  }
+
+  const cleanMessage =
+    "Context changed while documenting E_RELEASE_PLAN. Cleanup ENABLED.";
+  const clean = projectWorkerError({
+    code: "E_CONTEXT_DRIFT",
+    message: cleanMessage,
+    details: {
+      reasons: [
+        "E_RELEASE_PLAN is ordinary context metadata. Cleanup ENABLED."
+      ]
+    }
+  });
+  assert.equal(clean.message, cleanMessage);
+  assert.deepEqual(clean.details.reasons, [
+    "E_RELEASE_PLAN is ordinary context metadata. Cleanup ENABLED."
+  ]);
+});
+
+test("stripped nested process errors sanitize reattached asynchronous signal result text", () => {
+  const secondaryMessage =
+    "Process signalling callback did not complete synchronously.";
+  const reattached = [
+    `E_ASYNC_SIGNAL: ${secondaryMessage}`,
+    "Cleanup remained blocked at /private/nested/runtime",
+    "for providerPid=498301."
+  ].join(" ");
+  const nestedError = {
+    code: "E_PROCESS_IDENTITY",
+    message: "Verified owned process signalling could not be completed.",
+    details: {
+      secondaryDiagnostic: {
+        code: "E_ASYNC_SIGNAL",
+        message: secondaryMessage
+      }
+    }
+  };
+  const trusted = projectWorkerSnapshot(job({
+    status: "completed",
+    phase: "done",
+    summary: "Completed with a report repair warning.",
+    result: {
+      hostVerification: "not_run",
+      workerReport: {
+        schemaVersion: 1,
+        structured: true,
+        valid: false,
+        outcome: "blocked",
+        summary: reattached,
+        changedFiles: [],
+        checksClaimed: [reattached],
+        acceptanceResults: [],
+        risks: [reattached],
+        questions: [],
+        validationIssues: []
+      },
+      reportRepair: {
+        attempted: true,
+        valid: false,
+        validationIssues: [reattached],
+        error: nestedError
+      }
+    },
+    error: null
+  }));
+  assert.equal(trusted.error, null);
+  assert.equal(
+    trusted.result.reportRepair.error.message,
+    "Process ownership verification failed."
+  );
+  assert.equal(
+    Object.hasOwn(
+      trusted.result.reportRepair.error,
+      "details"
+    ),
+    false
+  );
+
+  const forged = structuredClone(trusted);
+  forged.result.workerReport.summary = reattached;
+  forged.result.workerReport.checksClaimed = [reattached];
+  forged.result.workerReport.risks = [reattached];
+  forged.result.reportRepair.validationIssues = [reattached];
+  for (const projection of [
+    normalizeWorkerSnapshot(forged),
+    presentWorker(forged)
+  ]) {
+    const serialized = JSON.stringify(projection);
+    assert.match(serialized, /Process ownership verification failed/);
+    for (const privateValue of [
+      "E_ASYNC_SIGNAL",
+      secondaryMessage,
+      "498301",
+      "/private/nested"
+    ]) {
+      assert.equal(
+        serialized.includes(privateValue),
+        false,
+        `${privateValue} leaked from ${serialized}`
+      );
+    }
+  }
+});
+
+test("foreground public error projection preserves stable non-protocol codes", () => {
+  for (const code of [
+    "E_STORAGE_READONLY",
+    "E_CONTEXT_INCOMPLETE",
+    "E_INPUT_READ",
+    "E_INPUT_TIMEOUT"
+  ]) {
+    const projected = projectWorkerError({
+      code,
+      message: `kill EPERM for providerPid=410027 at /Users/alice/private/${code}.`,
+      details: {
+        workspaceRoot: "/Users/alice/private",
+        providerPid: 410027,
+        diagnostic: "private provider state"
+      }
+    });
+    assert.equal(projected.code, code);
+    assert.equal(Object.hasOwn(projected, "details"), false);
+    const serialized = JSON.stringify(projected);
+    assert.equal(serialized.includes("EPERM"), false);
+    assert.equal(serialized.includes("/Users/alice"), false);
+    assert.equal(serialized.includes("410027"), false);
+    assert.match(projected.message, /providerPid=\[REDACTED\]/);
+    assert.match(projected.message, /\[PRIVATE_PATH\]/);
+    assert.equal(PUBLIC_WORKER_ERROR_CODES.includes(code), false);
+  }
+
+  const ordinaryReadFailure = projectWorkerError({
+    code: "E_INPUT_READ",
+    message: "Could not read the requested input: ENOENT."
+  });
+  assert.deepEqual(ordinaryReadFailure, {
+    code: "E_INPUT_READ",
+    message: "Could not read the requested input: ENOENT."
+  });
+
+  const identifierOnly = projectWorkerError({
+    code: "E_CONTEXT_INCOMPLETE",
+    message: "Cleanup still owns providerPid=410028."
+  });
+  assert.equal(identifierOnly.code, "E_CONTEXT_INCOMPLETE");
+  assert.equal(identifierOnly.message, "Cleanup still owns providerPid=[REDACTED].");
+});
+
 test("public mailbox lifecycle projection exposes no replay or content equality digests", () => {
   const contentCanary = "c".repeat(64);
   const idempotencyCanary = "d".repeat(64);
@@ -534,6 +3055,93 @@ test("purported public snapshots are re-projected instead of trusted by version 
   assert.equal(Object.hasOwn(normalized.context, "sharedRefIdentity"), false);
   assert.equal(normalized.context.materialization.upstreamFreshness, "not_checked");
   assertConforms("WorkerSnapshot", normalized);
+});
+
+test("normalization and presentation retain stripped safety sanitization context", () => {
+  for (const code of ["E_CONTEXT_DRIFT", "E_SCOPE_VIOLATION"]) {
+    const projected = projectWorkerSnapshot(job({
+      status: "failed",
+      phase: "context-rejected",
+      error: {
+        code,
+        message: code === "E_CONTEXT_DRIFT"
+          ? "Final context changed."
+          : "Final scope changed.",
+        details: {
+          ...(code === "E_CONTEXT_DRIFT"
+            ? { reasons: ["[GIT_METADATA]"] }
+            : { paths: ["src/safe.mjs"] }),
+          secondaryDiagnostic: {
+            code: "EPERM",
+            message: "Permission was denied during cleanup."
+          }
+        }
+      }
+    }));
+    assert.equal(Object.hasOwn(projected.error.details || {}, "secondaryDiagnostic"), false);
+    const forged = structuredClone(projected);
+    forged.latestPlan = [
+      "Retry signal EACCES for providerPid=433001 at /Users/alice/private/runtime",
+      "Document ENOENT handling for ordinary input reads"
+    ];
+    forged.lifecycleEvents = [
+      {
+        ...lifecycle("checkpoint", "Lifecycle plan recorded", 1),
+        detail: {
+          plan: [
+            "Wait for PGID(433002) after signal ENOTSUP at /private/provider/runtime"
+          ]
+        }
+      },
+      lifecycle(
+        "checkpoint",
+        "Historical example of signal EALREADY for providerPid=433003",
+        2
+      )
+    ];
+
+    const normalized = normalizeWorkerSnapshot(forged);
+    const presented = presentWorker(forged);
+    for (const projection of [normalized, presented]) {
+      const serialized = JSON.stringify(projection);
+      for (const privateValue of [
+        "EACCES",
+        "ENOTSUP",
+        "EALREADY",
+        "433001",
+        "433002",
+        "433003",
+        "/Users/alice",
+        "/private/provider"
+      ]) {
+        assert.equal(serialized.includes(privateValue), false, `${code}: ${privateValue} leaked`);
+      }
+      assert.equal(projection.error.code, code);
+    }
+    assert.match(normalized.latestPlan[0], /providerPid=\[REDACTED\]/);
+    assert.equal(
+      normalized.latestPlan[1],
+      "Document ENOENT handling for ordinary input reads"
+    );
+    assert.match(
+      normalized.lifecycleEvents[0].detail.plan[0],
+      /PGID\(\[REDACTED\]\)/
+    );
+    assert.equal(
+      normalized.lifecycleEvents[1].summary.includes("EALREADY"),
+      false
+    );
+    assert.match(
+      normalized.lifecycleEvents[1].summary,
+      /providerPid=\[REDACTED\]/
+    );
+    assert.match(presented.plan[0], /providerPid=\[REDACTED\]/);
+    assert.equal(
+      presented.plan[1],
+      "Document ENOENT handling for ordinary input reads"
+    );
+    assertConforms("WorkerSnapshot", normalized);
+  }
 });
 
 test("untrusted context receipts must cross-bind every public worker identity", () => {

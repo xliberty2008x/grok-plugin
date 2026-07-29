@@ -9,7 +9,10 @@ import {
   cleanupTaskRuntimeArtifacts,
   processStartToken
 } from "./grok-provider.mjs";
-import { runSystemPs } from "./process-control.mjs";
+import {
+  runSystemPs,
+  signalOwnedProcess
+} from "./process-control.mjs";
 import { pluginDataRoot } from "./host.mjs";
 import { loadProviderGuard } from "./recursion-guard.mjs";
 import {
@@ -79,11 +82,47 @@ function signalDetachedProcess(child, signal) {
   if (!Number.isInteger(pid) || pid <= 0) {
     throw new CompanionError("E_PROCESS_IDENTITY", "Controller process handle has no valid PID.");
   }
-  try {
-    process.kill(process.platform === "win32" ? pid : -pid, signal);
-  } catch (error) {
-    if (error?.code !== "ESRCH") throw error;
-  }
+  return process.kill(process.platform === "win32" ? pid : -pid, signal);
+}
+
+function signalControllerProcess(child, signal, signalProcess) {
+  return signalOwnedProcess(
+    child,
+    signal,
+    (target, requestedSignal) => {
+      try {
+        return signalProcess(target, requestedSignal);
+      } catch (error) {
+        if (error?.code !== "E_PROCESS_IDENTITY") throw error;
+        // Re-project an already-normalized signal failure through the shared
+        // boundary so even an injected callback cannot smuggle unbounded
+        // diagnostics into durable controller teardown evidence.
+        const diagnostic = error?.details?.secondaryDiagnostic;
+        const projected = new Error(
+          diagnostic?.message
+          || error?.message
+          || "Process signalling failed."
+        );
+        const rawCode = String(diagnostic?.code || "");
+        projected.code = /^[A-Z][A-Z0-9_]{0,63}$/.test(rawCode)
+          ? rawCode
+          : "UNKNOWN";
+        throw projected;
+      }
+    }
+  );
+}
+
+function controllerSignalDiagnostic(error) {
+  const diagnostic = error?.details?.secondaryDiagnostic;
+  const rawCode = String(diagnostic?.code || "");
+  const code = /^[A-Z][A-Z0-9_]{0,63}$/.test(rawCode)
+    ? rawCode.slice(0, 64)
+    : "UNKNOWN";
+  const message = String(
+    diagnostic?.message || "Process signalling failed."
+  ).slice(0, 256);
+  return Object.freeze({ code, message });
 }
 
 /*
@@ -209,8 +248,9 @@ export function terminateControllerProcess(child, {
   }
 
   try {
-    signalProcess(child, "SIGTERM");
-    evidence.signals.push("SIGTERM");
+    const termSignalled =
+      signalControllerProcess(child, "SIGTERM", signalProcess);
+    if (termSignalled) evidence.signals.push("SIGTERM");
     if (!waitForControllerGroupExit(processGroupId, termTimeoutMs)) {
       // Re-check a captured birth token before escalating. A non-empty mismatch
       // is PID reuse and is never permission to signal the group.
@@ -228,8 +268,9 @@ export function terminateControllerProcess(child, {
           warning: "Controller SIGKILL was refused because the unregistered child handle exited without group-exit proof."
         };
       }
-      signalProcess(child, "SIGKILL");
-      evidence.signals.push("SIGKILL");
+      const killSignalled =
+        signalControllerProcess(child, "SIGKILL", signalProcess);
+      if (killSignalled) evidence.signals.push("SIGKILL");
       if (!waitForControllerGroupExit(processGroupId, killTimeoutMs)) {
         return {
           ...evidence,
@@ -241,7 +282,8 @@ export function terminateControllerProcess(child, {
   } catch (error) {
     return {
       ...evidence,
-      warning: `Controller process-group cleanup could not be verified (${error?.code || "unknown"}).`
+      warning: "Controller process-group cleanup could not be verified after signalling failed.",
+      secondaryDiagnostic: controllerSignalDiagnostic(error)
     };
   }
 }
@@ -391,6 +433,10 @@ function prepareControllerFailureSettlement({
     const message = cleanup.ok
       ? "Controller process-group exit was verified before launch failure publication."
       : "Worker controller cleanup is blocked because exact process-group exit could not be verified.";
+    const secondaryDiagnostic = !cleanup.ok
+      && controllerCleanup.secondaryDiagnostic
+      ? controllerCleanup.secondaryDiagnostic
+      : null;
     const next = transaction.updateJob(workerId, (latest) => {
       const latestDispatch = latest.request?.spawn?.dispatch;
       const latestControllerIntent = latest.request?.spawn?.controllerSpawnIntent;
@@ -422,7 +468,14 @@ function prepareControllerFailureSettlement({
           completedAt: null,
           error: {
             code: "E_PROCESS_IDENTITY",
-            message
+            message,
+            ...(secondaryDiagnostic
+              ? {
+                  details: {
+                    secondaryDiagnostic
+                  }
+                }
+              : {})
           },
           pendingTerminal: pendingTerminalFor(error, recordedAt)
         } : {}),

@@ -123,8 +123,16 @@ export function presentWorker(jobOrSnapshot, {
   // presentation boundary never treats caller-supplied host-verification fields
   // as authoritative, including when a forged snapshot omits its version flags
   // to resemble a private job record.
-  const snapshot = jobOrSnapshot?.workerProtocolVersion
-    && jobOrSnapshot?.snapshotSchemaVersion
+  const purportedPublicSnapshot = Boolean(
+    jobOrSnapshot
+    && typeof jobOrSnapshot === "object"
+    && (
+      Object.hasOwn(jobOrSnapshot, "contextBindingMode")
+      || Object.hasOwn(jobOrSnapshot, "workerProtocolVersion")
+      || Object.hasOwn(jobOrSnapshot, "snapshotSchemaVersion")
+    )
+  );
+  const snapshot = purportedPublicSnapshot
     ? normalizeWorkerSnapshot(jobOrSnapshot)
     : projectWorkerSnapshot(jobOrSnapshot, { trustHostAuthority: false });
 

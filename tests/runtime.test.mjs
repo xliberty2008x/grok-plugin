@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { spawn } from "node:child_process";
@@ -22,6 +23,10 @@ import {
   scrubStoredJob
 } from "../plugins/grok/scripts/lib/task-contract.mjs";
 import { launchContractDigest } from "../plugins/grok/scripts/lib/worker-launch-contract.mjs";
+import {
+  captureTerminalEvidence,
+  selectTaskTerminalError
+} from "../plugins/grok/scripts/lib/task-terminal-evidence.mjs";
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import {
@@ -498,6 +503,93 @@ function transferFixture(config = {}) {
   const source = path.join(projects, "session.jsonl");
   fs.writeFileSync(source, '{"type":"user"}\n', "utf8");
   return { root, source, home, ...runtime, env: { ...runtime.env, HOME: home } };
+}
+
+function injectedImportSignalEnv(env, mode, privatePath) {
+  const directory = tempDir("grok-import-signal-injection-");
+  const preload = path.join(directory, "signal-injection.cjs");
+  const logFile = path.join(directory, "signal-events.jsonl");
+  fs.writeFileSync(preload, [
+    '"use strict";',
+    'const fs = require("node:fs");',
+    'const processModule = require("node:process");',
+    "const originalKill = processModule.kill.bind(processModule);",
+    "const append = (event) => fs.appendFileSync(process.env.GROK_TEST_IMPORT_SIGNAL_LOG, `${JSON.stringify(event)}\\n`);",
+    'append({ type: "loaded", pid: process.pid });',
+    "let injected = false;",
+    "processModule.kill = (target, signal) => {",
+    "  const numericTarget = Number(target);",
+    '  if (!injected && signal === "SIGTERM" && Number.isSafeInteger(numericTarget) && numericTarget < 0) {',
+    "    injected = true;",
+    '    append({ type: "signal", target: numericTarget, signal });',
+    "    const failure = () => {",
+    "      const error = new Error(`signal denied for providerPid=${Math.abs(numericTarget)} at ${process.env.GROK_TEST_IMPORT_SIGNAL_PRIVATE_PATH}`);",
+    '      error.code = "EPERM";',
+    "      return error;",
+    "    };",
+    '    if (process.env.GROK_TEST_IMPORT_SIGNAL_MODE === "EPERM") throw failure();',
+    '    if (process.env.GROK_TEST_IMPORT_SIGNAL_MODE === "ESRCH") {',
+    '      try { originalKill(numericTarget, "SIGKILL"); } catch {}',
+    '      const error = new Error("process group is already gone");',
+    '      error.code = "ESRCH";',
+    "      throw error;",
+    "    }",
+    '    if (process.env.GROK_TEST_IMPORT_SIGNAL_MODE === "THENABLE") {',
+    "      return { then(resolve) { setTimeout(() => resolve(true), 25); } };",
+    "    }",
+    '    if (process.env.GROK_TEST_IMPORT_SIGNAL_MODE === "ASYNC_REJECT") {',
+    "      return new Promise((resolve, reject) => setTimeout(() => reject(failure()), 25));",
+    "    }",
+    "  }",
+    "  return originalKill(target, signal);",
+    "};"
+  ].join("\n"), { mode: 0o600 });
+  return {
+    env: {
+      ...env,
+      NODE_OPTIONS: [
+        env.NODE_OPTIONS,
+        `--require=${preload}`
+      ].filter(Boolean).join(" "),
+      GROK_TEST_IMPORT_SIGNAL_LOG: logFile,
+      GROK_TEST_IMPORT_SIGNAL_MODE: mode,
+      GROK_TEST_IMPORT_SIGNAL_PRIVATE_PATH: privatePath
+    },
+    directory,
+    preload,
+    logFile
+  };
+}
+
+function transferGuardDirectories(root) {
+  const guardRoot = path.join(
+    os.tmpdir(),
+    `grok-companion-guards-${typeof process.getuid === "function" ? process.getuid() : "user"}`
+  );
+  const common = fs.realpathSync(
+    git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+  );
+  return [...new Set([common, fs.realpathSync(root)].map((scope) => (
+    path.join(guardRoot, crypto.createHash("sha256").update(scope).digest("hex"))
+  )))];
+}
+
+function assertTransferRuntimeArtifactsGone(root, env) {
+  const imports = path.join(workspaceState(root, env), "imports");
+  assert.deepEqual(
+    fs.existsSync(imports) ? fs.readdirSync(imports) : [],
+    [],
+    "transfer left a descriptor alias or converted transcript artifact"
+  );
+  for (const directory of transferGuardDirectories(root)) {
+    assert.deepEqual(
+      fs.existsSync(directory)
+        ? fs.readdirSync(directory).filter((name) => name.endsWith(".json"))
+        : [],
+      [],
+      "transfer left a canonical or legacy provider guard"
+    );
+  }
 }
 
 test("transfer helpers format model-qualified resume and parse non-isolated models text", async () => {
@@ -1287,6 +1379,540 @@ function writeSeededJob(stateRoot, job) {
   fs.writeFileSync(job.logFile, "", { mode: 0o600 });
 }
 
+test("static human launch surfaces use public worker projections", () => {
+  const source = fs.readFileSync(COMPANION, "utf8");
+  const acceptedStart = source.indexOf(
+    "if (launcherCode === 0 && !background && announce)"
+  );
+  const acceptedBlock = source.slice(
+    acceptedStart,
+    source.indexOf("if (background) return readJob(root, job.id);", acceptedStart)
+  );
+  assert.match(
+    acceptedBlock,
+    /const acceptedHandle = projectWorkerHandle\(accepted\)/
+  );
+  assert.doesNotMatch(
+    acceptedBlock,
+    /accepted\.(?:id|status|phase|progress|summary)/
+  );
+
+  const taskStart = source.indexOf("const finished = await startJob(root, job");
+  const taskBlock = source.slice(
+    taskStart,
+    source.indexOf("async function handleDeepResearch", taskStart)
+  );
+  assert.match(
+    taskBlock,
+    /const finishedHandle = projectWorkerHandle\(finished\)/
+  );
+  assert.doesNotMatch(
+    taskBlock,
+    /\$\{finished\.(?:id|phase|progress|summary)\}/
+  );
+
+  const researchStart = source.indexOf("async function handleDeepResearch");
+  const researchBlock = source.slice(
+    researchStart,
+    source.indexOf("async function startDeepResearchJob", researchStart)
+  );
+  assert.match(
+    researchBlock,
+    /const finishedHandle = projectWorkerHandle\(finished\)/
+  );
+  assert.doesNotMatch(
+    researchBlock,
+    /\$\{finished\.(?:id|phase|progress|summary)\}/
+  );
+
+  const liveStart = source.indexOf("if (announce) {", researchStart);
+  const liveBlock = source.slice(
+    liveStart,
+    source.indexOf("if (finished.status ===", liveStart)
+  );
+  assert.match(
+    liveBlock,
+    /projectWorkerDiagnosticText\(String\(rawPhase\), \{/
+  );
+  assert.doesNotMatch(
+    liveBlock,
+    /sanitizeDisplayText\(String\(phase\)\)/
+  );
+});
+
+test("human CLI process diagnostics stay behind public status, result, review, and table projections", () => {
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const stamped = new Date().toISOString();
+  const taskId = generateId("task");
+  const reviewId = generateId("review");
+  const normalTaskId = generateId("task");
+  const researchId = generateId("deep-research");
+  const privateResearchId = generateId("deep-research");
+  const errorNullTaskId = generateId("task");
+  const errorNullResearchId = generateId("deep-research");
+  const normalResultText = `NORMAL_RESULT_START ${"n".repeat(2_200)} NORMAL_RESULT_END`;
+  const fullResearchText =
+    `NORMAL_RESEARCH_START ${"r".repeat(900)} NORMAL_RESEARCH_END`;
+  const errorNullDiagnostic =
+    "Terminal cleanup kill process -451005 failed with EIO at /home/alice/private/error-null.";
+  const rawSessionDiagnostic =
+    "Terminal cleanup kill EPERM for providerPid=451004";
+  const documentaryDiagnostic =
+    "Historical: the retry behavior remains documented for this fixture.";
+  const ordinaryMissingInput =
+    "Could not read the requested input: ENOENT.";
+  const privateResearchDiagnostic = [
+    "Recovery cleanup failed with EIO",
+    "for worker_process_id='+451003'",
+    "at /home/alice/private/research."
+  ].join(" ");
+  const contextDiagnostic = [
+    "Final observation cleanup failed with EACCES",
+    "for provider_pid='+451001'",
+    "at /Users/alice/private/runtime."
+  ].join(" ");
+  const processDiagnostic = [
+    "Terminal cleanup failed with EBUSY",
+    'for controller_pid_t="-451002"',
+    "at /private/provider/runtime."
+  ].join(" ");
+  const base = (id, kind, jobClass) => ({
+    schemaVersion: 3,
+    id,
+    kind,
+    jobClass,
+    title: `${kind}: human privacy fixture`,
+    summary: "Terminal worker fixture",
+    write: false,
+    status: "failed",
+    phase: "failed",
+    workspaceRoot: root,
+    host: {
+      kind: "claude-code",
+      sessionId: env.GROK_COMPANION_HOST_SESSION_ID
+    },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    completedAt: stamped,
+    heartbeatAt: stamped,
+    workerAuthorization: null,
+    workerProcess: null,
+    providerProcess: null,
+    profile: { id: jobClass === "review" ? "review" : "rescue-read-v3" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    latestPlan: [],
+    lifecycleEvents: [],
+    request: { prompt: null },
+    result: null,
+    error: null
+  });
+
+  writeSeededJob(stateRoot, {
+    ...base(taskId, "task", "task"),
+    phase: "context-rejected",
+    summary: contextDiagnostic,
+    progress: `Waiting after ${contextDiagnostic}`,
+    grokSessionId: "human-context-session",
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: true,
+      workerReport: {
+        schemaVersion: 1,
+        structured: true,
+        valid: false,
+        outcome: "blocked",
+        summary: contextDiagnostic,
+        changedFiles: ["src/safe.mjs"],
+        checksClaimed: ["Could not read the requested input: ENOENT."],
+        acceptanceResults: [],
+        risks: [contextDiagnostic],
+        questions: [],
+        validationIssues: []
+      },
+      privacyWarning: contextDiagnostic
+    },
+    error: {
+      code: "E_CONTEXT_DRIFT",
+      message: contextDiagnostic,
+      details: {
+        reasons: ["[GIT_METADATA]"],
+        secondaryDiagnostic: {
+          code: "EPERM",
+          message: "Recovery cleanup failed with EPERM."
+        }
+      }
+    }
+  });
+  writeSeededJob(stateRoot, {
+    ...base(reviewId, "review", "review"),
+    phase: "cleanup-blocked",
+    summary: processDiagnostic,
+    progress: `Still waiting: ${processDiagnostic}`,
+    grokSessionId: rawSessionDiagnostic,
+    result: {
+      hostVerification: "not_run",
+      review: {
+        verdict: "needs_changes",
+        summary: processDiagnostic,
+        findings: [{
+          severity: "high",
+          title: processDiagnostic,
+          body: "Could not read the requested input: ENOENT.",
+          file: "src/safe.mjs",
+          line: 7
+        }]
+      },
+      providerSessionDeleted: true,
+      privacyWarning: processDiagnostic
+    },
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "Verified owned process signalling could not be completed.",
+      details: {
+        secondaryDiagnostic: {
+          code: "EBUSY",
+          message: processDiagnostic
+        }
+      }
+    }
+  });
+  writeSeededJob(stateRoot, {
+    ...base(normalTaskId, "task", "task"),
+    status: "completed",
+    phase: "done",
+    summary: "Normal task completed",
+    progress: "Normal task completed",
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: true,
+      text: normalResultText
+    }
+  });
+  writeSeededJob(stateRoot, {
+    ...base(researchId, "deep-research", "research"),
+    status: "completed",
+    phase: "done",
+    summary: "Normal research completed",
+    progress: "Normal research completed",
+    profile: { id: "deep-research-v1" },
+    result: {
+      hostVerification: "not_run",
+      researchRuntimeCleaned: true,
+      workflow: {
+        runId: "normal-research-workflow",
+        revision: 1,
+        status: "completed",
+        phases: [],
+        currentPhase: "done"
+      },
+      researchReport: {
+        valid: true,
+        path: "workflows/normal-research-workflow/scratch/report.md",
+        bytes: Buffer.byteLength(fullResearchText),
+        sha256: "a".repeat(64),
+        sourceCount: 2,
+        coverageNotes: [],
+        status: "verified",
+        textPreview: "NORMAL_RESEARCH_START projected preview",
+        markdown: fullResearchText
+      }
+    }
+  });
+  writeSeededJob(stateRoot, {
+    ...base(privateResearchId, "deep-research", "research"),
+    phase: "scope-rejected",
+    summary: privateResearchDiagnostic,
+    progress: privateResearchDiagnostic,
+    profile: { id: "deep-research-v1" },
+    result: {
+      hostVerification: "not_run",
+      researchRuntimeCleaned: true,
+      workflow: {
+        runId: "private-research-workflow",
+        revision: 1,
+        status: "paused",
+        phases: [],
+        currentPhase: "cleanup"
+      },
+      researchReport: {
+        valid: false,
+        path: "workflows/private-research-workflow/scratch/report.md",
+        bytes: Buffer.byteLength(privateResearchDiagnostic),
+        sha256: "b".repeat(64),
+        sourceCount: 0,
+        coverageNotes: [privateResearchDiagnostic],
+        status: "partial",
+        textPreview: privateResearchDiagnostic,
+        markdown: privateResearchDiagnostic
+      },
+      privacyWarning: privateResearchDiagnostic
+    },
+    error: {
+      code: "E_SCOPE_VIOLATION",
+      message: privateResearchDiagnostic,
+      details: {
+        paths: ["src/safe.mjs"],
+        secondaryDiagnostic: {
+          code: "EIO",
+          message: privateResearchDiagnostic
+        }
+      }
+    }
+  });
+  writeSeededJob(stateRoot, {
+    ...base(errorNullTaskId, "task", "task"),
+    status: "completed",
+    phase: "done",
+    summary: errorNullDiagnostic,
+    progress: errorNullDiagnostic,
+    grokSessionId: rawSessionDiagnostic,
+    latestPlan: [
+      errorNullDiagnostic,
+      documentaryDiagnostic,
+      ordinaryMissingInput
+    ],
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: true,
+      text: errorNullDiagnostic
+    }
+  });
+  writeSeededJob(stateRoot, {
+    ...base(errorNullResearchId, "deep-research", "research"),
+    status: "completed",
+    phase: "done",
+    summary: errorNullDiagnostic,
+    progress: errorNullDiagnostic,
+    grokSessionId: rawSessionDiagnostic,
+    profile: { id: "deep-research-v1" },
+    result: {
+      hostVerification: "not_run",
+      researchRuntimeCleaned: true,
+      workflow: {
+        runId: "error-null-research-workflow",
+        revision: 1,
+        status: "completed",
+        phases: [],
+        currentPhase: "done"
+      },
+      researchReport: {
+        valid: true,
+        path: "workflows/error-null-research-workflow/scratch/report.md",
+        bytes: Buffer.byteLength(errorNullDiagnostic),
+        sha256: "c".repeat(64),
+        sourceCount: 1,
+        coverageNotes: [
+          errorNullDiagnostic,
+          documentaryDiagnostic,
+          ordinaryMissingInput
+        ],
+        status: "verified",
+        textPreview: errorNullDiagnostic,
+        markdown: errorNullDiagnostic
+      }
+    }
+  });
+
+  const taskStatus = runCompanion(["status", taskId], { cwd: root, env });
+  const taskReadonlyStatus = runCompanion(
+    ["status", taskId, "--readonly"],
+    { cwd: root, env }
+  );
+  const taskResult = runCompanion(["result", taskId], { cwd: root, env });
+  const reviewStatus = runCompanion(["status", reviewId], { cwd: root, env });
+  const reviewResult = runCompanion(["result", reviewId], { cwd: root, env });
+  const normalTaskResult = runCompanion(
+    ["result", normalTaskId],
+    { cwd: root, env }
+  );
+  const normalResearchResult = runCompanion(
+    ["result", researchId],
+    { cwd: root, env }
+  );
+  const normalResearchJson = runCompanion(
+    ["result", researchId, "--json"],
+    { cwd: root, env }
+  );
+  const privateResearchResult = runCompanion(
+    ["result", privateResearchId],
+    { cwd: root, env }
+  );
+  const privateResearchJson = runCompanion(
+    ["result", privateResearchId, "--json"],
+    { cwd: root, env }
+  );
+  const errorNullTaskStatus = runCompanion(
+    ["status", errorNullTaskId],
+    { cwd: root, env }
+  );
+  const errorNullTaskStatusJson = runCompanion(
+    ["status", errorNullTaskId, "--json"],
+    { cwd: root, env }
+  );
+  const errorNullTaskResult = runCompanion(
+    ["result", errorNullTaskId],
+    { cwd: root, env }
+  );
+  const errorNullTaskResultJson = runCompanion(
+    ["result", errorNullTaskId, "--json"],
+    { cwd: root, env }
+  );
+  const errorNullResearchResult = runCompanion(
+    ["result", errorNullResearchId],
+    { cwd: root, env }
+  );
+  const errorNullResearchJson = runCompanion(
+    ["result", errorNullResearchId, "--json"],
+    { cwd: root, env }
+  );
+  const readonlyTable = runCompanion(
+    ["status", "--all", "--readonly"],
+    { cwd: root, env }
+  );
+  const recoveringTable = runCompanion(["status", "--all"], { cwd: root, env });
+  const results = [
+    taskStatus,
+    taskReadonlyStatus,
+    taskResult,
+    reviewStatus,
+    reviewResult,
+    normalTaskResult,
+    normalResearchResult,
+    normalResearchJson,
+    privateResearchResult,
+    privateResearchJson,
+    errorNullTaskStatus,
+    errorNullTaskStatusJson,
+    errorNullTaskResult,
+    errorNullTaskResultJson,
+    errorNullResearchResult,
+    errorNullResearchJson,
+    readonlyTable,
+    recoveringTable
+  ];
+  for (const result of results) {
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    for (const privateValue of [
+      "EACCES",
+      "EPERM",
+      "EBUSY",
+      "451001",
+      "451002",
+      "/Users/alice",
+      "/private/provider",
+      "451003",
+      "451004",
+      "451005",
+      "/home/alice",
+      "/home/alice/private/error-null"
+    ]) {
+      assert.equal(
+        result.stdout.includes(privateValue),
+        false,
+        `${privateValue} leaked from:\n${result.stdout}`
+      );
+    }
+  }
+
+  for (const result of [taskStatus, taskReadonlyStatus, taskResult]) {
+    assert.match(result.stdout, /E_CONTEXT_DRIFT:/);
+    assert.match(result.stdout, /human-context-session/);
+    assert.match(result.stdout, /Resume through this host:/);
+    assert.match(result.stdout, /provider_pid='\[REDACTED\]'/);
+  }
+  assert.match(taskResult.stdout, /Could not read the requested input: ENOENT\./);
+  assert.match(reviewStatus.stdout, /E_PROCESS_IDENTITY: Process ownership verification failed\./);
+  assert.match(reviewStatus.stdout, /providerPid=\[REDACTED\]/);
+  assert.match(reviewResult.stdout, new RegExp(`Grok review ${reviewId}`));
+  assert.match(reviewResult.stdout, /Verdict: needs_changes/);
+  assert.match(
+    reviewResult.stdout,
+    /Grok session: Terminal cleanup kill Process ownership verification failed\. for providerPid=\[REDACTED\] \(deleted after review\)/
+  );
+  assert.match(reviewResult.stdout, /controller_pid_t="\[REDACTED\]"/);
+  assert.match(normalTaskResult.stdout, /NORMAL_RESULT_START/);
+  assert.match(normalTaskResult.stdout, /NORMAL_RESULT_END/);
+  assert.match(normalResearchResult.stdout, /NORMAL_RESEARCH_START/);
+  assert.match(normalResearchResult.stdout, /NORMAL_RESEARCH_END/);
+  const normalResearchPayload = JSON.parse(normalResearchJson.stdout);
+  assert.match(
+    normalResearchPayload.result.researchReport.markdown,
+    /NORMAL_RESEARCH_END/
+  );
+  assert.match(privateResearchResult.stdout, /E_SCOPE_VIOLATION:/);
+  assert.match(privateResearchResult.stdout, /worker_process_id='\[REDACTED\]'/);
+  const privateResearchPayload = JSON.parse(privateResearchJson.stdout);
+  assert.equal(privateResearchPayload.error.code, "E_SCOPE_VIOLATION");
+  assert.equal(
+    Object.hasOwn(privateResearchPayload.result.researchReport, "markdown"),
+    false
+  );
+  assert.match(
+    privateResearchPayload.result.researchReport.textPreview,
+    /worker_process_id='\[REDACTED\]'/
+  );
+  for (const result of [
+    errorNullTaskStatus,
+    errorNullTaskResult,
+    errorNullResearchResult
+  ]) {
+    assert.match(result.stdout, /Grok session:/);
+    assert.match(result.stdout, /providerPid=\[REDACTED\]/);
+  }
+  assert.match(errorNullTaskResult.stdout, /kill process \[REDACTED\]/);
+  const errorNullTaskStatusPayload = JSON.parse(errorNullTaskStatusJson.stdout);
+  const errorNullTaskResultPayload = JSON.parse(errorNullTaskResultJson.stdout);
+  for (const payload of [
+    errorNullTaskStatusPayload,
+    errorNullTaskResultPayload
+  ]) {
+    assert.equal(payload.error, null);
+    assert.match(payload.summary, /kill process \[REDACTED\]/);
+    assert.equal(payload.latestPlan[1], documentaryDiagnostic);
+    assert.equal(payload.latestPlan[2], ordinaryMissingInput);
+  }
+  assert.match(errorNullResearchResult.stdout, /kill process \[REDACTED\]/);
+  assert.match(
+    errorNullResearchResult.stdout,
+    new RegExp(documentaryDiagnostic)
+  );
+  assert.match(
+    errorNullResearchResult.stdout,
+    new RegExp(ordinaryMissingInput)
+  );
+  const errorNullResearchPayload = JSON.parse(errorNullResearchJson.stdout);
+  assert.equal(errorNullResearchPayload.error, null);
+  assert.equal(
+    errorNullResearchPayload.result.researchReport.coverageNotes[1],
+    documentaryDiagnostic
+  );
+  assert.equal(
+    errorNullResearchPayload.result.researchReport.coverageNotes[2],
+    ordinaryMissingInput
+  );
+  assert.match(
+    errorNullResearchPayload.result.researchReport.markdown,
+    /kill process \[REDACTED\]/
+  );
+  for (const table of [readonlyTable, recoveringTable]) {
+    assert.match(table.stdout, /\| Job \| Kind \| Status \| Phase \| Progress \| Heartbeat \|/);
+    assert.match(table.stdout, new RegExp(taskId));
+    assert.match(table.stdout, new RegExp(reviewId));
+    assert.match(table.stdout, new RegExp(normalTaskId));
+    assert.match(table.stdout, new RegExp(researchId));
+    assert.match(table.stdout, new RegExp(privateResearchId));
+    assert.match(table.stdout, new RegExp(errorNullTaskId));
+    assert.match(table.stdout, new RegExp(errorNullResearchId));
+  }
+});
+
 function codexBrokerFixture() {
   const runtime = fixture();
   const threadId = "codex-broker-runtime-session";
@@ -1768,6 +2394,448 @@ test("force-cancel uses provider guard when providerProcess is missing", { skip:
   assert.equal(cancelled.result?.providerSessionDeleted, true);
 });
 
+test("force-cancel preserves a terminal result published during exact cleanup", {
+  skip: process.platform === "win32",
+  timeout: 25_000
+}, async (t) => {
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("review");
+  const isolatedHome = path.join(stateRoot, "review-homes", id);
+  fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(
+    path.join(isolatedHome, "marker"),
+    "terminal-publication-race\n",
+    { mode: 0o600 }
+  );
+  const signalMarker = path.join(
+    tempDir("grok-force-cancel-terminal-race-"),
+    "sigterm"
+  );
+  const worker = spawn(
+    process.execPath,
+    [
+      "-e",
+      [
+        "const fs=require('node:fs');",
+        "const marker=process.argv[1];",
+        "process.on('SIGTERM',()=>{",
+        "fs.writeFileSync(marker,'received\\n');",
+        "setTimeout(()=>process.exit(0),1000);",
+        "});",
+        "setInterval(()=>{},1000);"
+      ].join(""),
+      signalMarker,
+      "grok-companion.mjs",
+      "--worker",
+      id
+    ],
+    { detached: true, stdio: "ignore" }
+  );
+  t.after(() => {
+    try { process.kill(-worker.pid, "SIGKILL"); } catch {}
+  });
+  const workerStartToken = await waitFor(
+    () => processStartToken(worker.pid),
+    { timeoutMs: 5_000 }
+  );
+  const workerNonce = crypto.randomBytes(16).toString("hex");
+  const stamped = new Date().toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: force-cancel terminal publication race",
+    summary: "Queued",
+    write: false,
+    status: "queued",
+    phase: "queued",
+    workspaceRoot: root,
+    host: {
+      kind: "claude-code",
+      sessionId: env.GROK_COMPANION_HOST_SESSION_ID
+    },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    workerAuthorization: workerNonce,
+    workerProcess: {
+      pid: worker.pid,
+      startToken: workerStartToken,
+      nonce: workerNonce,
+      processGroupId: worker.pid,
+      commandMarker: id
+    },
+    providerProcess: null,
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: {
+      prompt: null,
+      target: { mode: "working-tree", label: "fixture", base: null }
+    },
+    result: null,
+    error: null
+  });
+
+  const cancellation = spawnCompanion(
+    ["cancel", id, "--json"],
+    { cwd: root, env }
+  );
+  await Promise.race([
+    waitFor(
+      () => fs.existsSync(signalMarker),
+      { timeoutMs: 15_000, intervalMs: 25 }
+    ),
+    cancellation.completed.then((result) => {
+      throw new Error(
+        `force-cancel ended before SIGTERM race checkpoint\nstdout: ${result.stdout}\nstderr: ${result.stderr}`
+      );
+    })
+  ]);
+  const publishedAt = new Date().toISOString();
+  updateJob(root, id, (job) => ({
+    ...job,
+    status: "completed",
+    phase: "done",
+    completedAt: publishedAt,
+    heartbeatAt: publishedAt,
+    summary: "Authoritative worker result",
+    progress: "Authoritative worker result",
+    error: null,
+    result: {
+      review: {
+        verdict: "pass",
+        summary: "Authoritative worker result",
+        findings: []
+      },
+      providerSessionDeleted: true,
+      hostVerification: "not_run"
+    }
+  }), env);
+
+  const completed = await cancellation.completed;
+  assert.equal(
+    completed.code,
+    0,
+    `force-cancel failed\nstdout: ${completed.stdout}\nstderr: ${completed.stderr}`
+  );
+  const projected = JSON.parse(completed.stdout);
+  assert.equal(projected.status, "completed");
+  assert.equal(projected.phase, "done");
+  assert.equal(projected.error, null);
+  assert.equal(projected.summary, "Authoritative worker result");
+  assert.equal(projected.result.review.verdict, "pass");
+  const stored = readJob(root, id, env);
+  assert.equal(stored.completedAt, publishedAt);
+  assert.equal(stored.status, "completed");
+  assert.equal(stored.error, null);
+  assert.equal(fs.existsSync(isolatedHome), false);
+});
+
+test("force-cancel preserves a terminal task result across cleanup failure", {
+  skip: process.platform === "win32",
+  timeout: 25_000
+}, async (t) => {
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("task");
+  const taskHome = path.join(stateRoot, "task-homes", id);
+  const authPath = path.join(taskHome, ".grok", "auth.json");
+  fs.mkdirSync(authPath, { recursive: true, mode: 0o700 });
+  t.after(() => {
+    try { fs.rmSync(taskHome, { recursive: true, force: true }); } catch {}
+  });
+  const signalMarker = path.join(
+    tempDir("grok-force-cancel-task-cleanup-race-"),
+    "sigterm"
+  );
+  const worker = spawn(
+    process.execPath,
+    [
+      "-e",
+      [
+        "const fs=require('node:fs');",
+        "const marker=process.argv[1];",
+        "process.on('SIGTERM',()=>{",
+        "fs.writeFileSync(marker,'received\\n');",
+        "setTimeout(()=>process.exit(0),1000);",
+        "});",
+        "setInterval(()=>{},1000);"
+      ].join(""),
+      signalMarker,
+      "grok-companion.mjs",
+      "--worker",
+      id
+    ],
+    { detached: true, stdio: "ignore" }
+  );
+  t.after(() => {
+    try { process.kill(-worker.pid, "SIGKILL"); } catch {}
+  });
+  const workerStartToken = await waitFor(
+    () => processStartToken(worker.pid),
+    { timeoutMs: 5_000 }
+  );
+  const preContext = captureContextManifest(root);
+  const envelope = buildTaskEnvelope({
+    userRequest: "Preserve the task result during failed cleanup",
+    objective: "Preserve the task result during failed cleanup",
+    mode: "read",
+    scope: { include: ["tracked.txt"], exclude: [] },
+    contextManifestId: preContext.manifestId,
+    context: {
+      facts: [],
+      constraints: [],
+      expectedProjectMarkers: [],
+      requiredPaths: ["tracked.txt"],
+      workspaceState: "task_scoped",
+      upstreamFreshness: "not_checked"
+    },
+    acceptanceCriteria: [{
+      id: "AC-01",
+      text: "A concurrent terminal result remains authoritative"
+    }]
+  });
+  const workerNonce = crypto.randomBytes(16).toString("hex");
+  const stamped = new Date().toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 3,
+    id,
+    kind: "task",
+    jobClass: "task",
+    title: "task: force-cancel cleanup failure race",
+    summary: "Queued",
+    write: false,
+    status: "queued",
+    phase: "queued",
+    workspaceRoot: root,
+    host: {
+      kind: "claude-code",
+      sessionId: env.GROK_COMPANION_HOST_SESSION_ID
+    },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    heartbeatAt: stamped,
+    workerAuthorization: workerNonce,
+    workerProcess: {
+      pid: worker.pid,
+      startToken: workerStartToken,
+      nonce: workerNonce,
+      processGroupId: worker.pid,
+      commandMarker: id
+    },
+    providerProcess: null,
+    profile: profileFor("task", false),
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: {
+      prompt: null,
+      providerHomeId: id,
+      contextManifest: preContext,
+      envelope
+    },
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: false,
+      stopReason: "cancelled"
+    },
+    error: null
+  });
+
+  const cancellation = spawnCompanion(
+    ["cancel", id, "--json"],
+    { cwd: root, env }
+  );
+  await Promise.race([
+    waitFor(
+      () => fs.existsSync(signalMarker),
+      { timeoutMs: 15_000, intervalMs: 25 }
+    ),
+    cancellation.completed.then((result) => {
+      throw new Error(
+        `force-cancel ended before task cleanup race checkpoint\nstdout: ${result.stdout}\nstderr: ${result.stderr}`
+      );
+    })
+  ]);
+  const publishedAt = new Date().toISOString();
+  updateJob(root, id, (job) => ({
+    ...job,
+    status: "completed",
+    phase: "done",
+    completedAt: publishedAt,
+    heartbeatAt: publishedAt,
+    summary: "Authoritative task result",
+    progress: "Authoritative task result",
+    error: null,
+    result: {
+      text: "Authoritative task result",
+      hostVerification: "not_run",
+      taskRuntimeCleaned: false,
+      replay: false
+    }
+  }), env);
+
+  const completed = await cancellation.completed;
+  assert.equal(
+    completed.code,
+    0,
+    `force-cancel failed\nstdout: ${completed.stdout}\nstderr: ${completed.stderr}`
+  );
+  const projected = JSON.parse(completed.stdout);
+  assert.equal(projected.status, "completed");
+  assert.equal(projected.phase, "done");
+  assert.equal(projected.error, null);
+  assert.equal(projected.summary, "Authoritative task result");
+  const stored = readJob(root, id, env);
+  assert.equal(stored.completedAt, publishedAt);
+  assert.equal(stored.status, "completed");
+  assert.equal(stored.phase, "done");
+  assert.equal(stored.error, null);
+  assert.equal(stored.pendingTerminal, undefined);
+  assert.equal(stored.result.text, "Authoritative task result");
+  assert.equal(stored.result.taskRuntimeCleaned, false);
+  assert.equal(fs.lstatSync(authPath).isDirectory(), true);
+});
+
+test("force-cancel publishes final task drift after exact runtime cleanup", {
+  skip: process.platform === "win32"
+}, () => {
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("task");
+  const taskHome = path.join(stateRoot, "task-homes", id, ".grok");
+  fs.mkdirSync(
+    path.join(taskHome, "agent-profiles"),
+    { recursive: true, mode: 0o700 }
+  );
+  fs.writeFileSync(
+    path.join(taskHome, "auth.json"),
+    "{}\n",
+    { mode: 0o600 }
+  );
+  fs.writeFileSync(
+    path.join(taskHome, "agent-profiles", "staged.md"),
+    "profile\n",
+    { mode: 0o600 }
+  );
+  const preContext = captureContextManifest(root);
+  const envelope = buildTaskEnvelope({
+    userRequest: "force-cancel with final context drift",
+    objective: "force-cancel with final context drift",
+    mode: "read",
+    scope: { include: ["tracked.txt"], exclude: [] },
+    contextManifestId: preContext.manifestId,
+    context: {
+      facts: [],
+      constraints: [],
+      expectedProjectMarkers: [],
+      requiredPaths: ["tracked.txt"],
+      workspaceState: "task_scoped",
+      upstreamFreshness: "not_checked"
+    },
+    acceptanceCriteria: [{
+      id: "AC-01",
+      text: "Final drift outranks force-cancellation"
+    }]
+  });
+  const workerNonce = crypto.randomBytes(16).toString("hex");
+  const stamped = new Date().toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 3,
+    id,
+    kind: "task",
+    jobClass: "task",
+    title: "task: force-cancel final evidence",
+    summary: "Queued",
+    write: false,
+    status: "queued",
+    phase: "queued",
+    workspaceRoot: root,
+    host: {
+      kind: "claude-code",
+      sessionId: env.GROK_COMPANION_HOST_SESSION_ID
+    },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    heartbeatAt: stamped,
+    workerAuthorization: workerNonce,
+    workerProcess: {
+      pid: 999999989,
+      startToken: "dead-worker-token",
+      nonce: workerNonce,
+      processGroupId: 999999989,
+      commandMarker: id
+    },
+    providerProcess: null,
+    profile: profileFor("task", false),
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: {
+      prompt: null,
+      providerHomeId: id,
+      contextManifest: preContext,
+      envelope
+    },
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: false
+    },
+    error: null
+  });
+  git(root, "config", "--local", "--add", "grok.issue49ForceCancel", "true");
+
+  const cancelled = parseJson(runCompanion(["cancel", id, "--json"], {
+    cwd: root,
+    env,
+    timeout: 20_000
+  }));
+  assert.equal(cancelled.status, "failed");
+  assert.equal(cancelled.phase, "context-rejected");
+  assert.equal(cancelled.error.code, "E_CONTEXT_DRIFT");
+  assert.deepEqual(cancelled.error.details.reasons, ["[GIT_METADATA]"]);
+  assert.equal(cancelled.result.taskRuntimeCleaned, true);
+  assert.equal(cancelled.result.stopReason, undefined);
+  assert.equal(cancelled.result.runtimeEvidence.executionStatus, "failed");
+  assert.ok(
+    cancelled.result.runtimeEvidence.observedChangedPaths.includes(
+      "[GIT_METADATA]"
+    )
+  );
+  assert.equal(
+    cancelled.progress,
+    "Task runtime cleanup completed; workspace safety review is required"
+  );
+  assert.equal(
+    fs.readFileSync(
+      path.join(stateRoot, "jobs", `${id}.cancel`),
+      "utf8"
+    ),
+    `${workerNonce}\n`
+  );
+  assert.equal(fs.existsSync(path.join(taskHome, "auth.json")), false);
+  assert.equal(fs.existsSync(path.join(taskHome, "agent-profiles")), false);
+  assert.equal(readJob(root, id, env).result.stopReason, undefined);
+});
+
 test("force-cancel successful home cleanup clears prior privacy warning", { skip: process.platform === "win32" }, async (t) => {
   // Force-cancel path must use applyReviewPrivacy: a successful later cleanup clears a stale
   // privacyWarning rather than leaving it on the cancelled job.
@@ -1898,9 +2966,17 @@ test("force-cancel failed home cleanup appends privacyWarning without erasing pr
     assert.match(cancelled.error.message, /force-cancelled/i);
     assert.equal(fs.existsSync(isolatedHome), true, "failed cleanup must retain the isolated review home");
     assert.equal(cancelled.result?.providerSessionDeleted, false);
-    assert.match(cancelled.result?.privacyWarning || "", /^prior-privacy-signal; /);
-    assert.ok((cancelled.result?.privacyWarning || "").length > "prior-privacy-signal; ".length);
+    assert.equal(
+      cancelled.result?.privacyWarning,
+      "Process ownership verification failed."
+    );
     assert.equal(cancelled.result?.review?.verdict, "pass", "prior review evidence must remain");
+    const stored = readJob(root, id, env);
+    assert.match(stored.result?.privacyWarning || "", /^prior-privacy-signal; /);
+    assert.ok(
+      (stored.result?.privacyWarning || "").length
+        > "prior-privacy-signal; ".length
+    );
   } finally {
     try { fs.chmodSync(nest, 0o700); } catch {}
   }
@@ -2172,10 +3248,11 @@ test("status recovers a background task whose worker crashes without replaying i
   assert.equal(fs.existsSync(path.join(taskHome, "agent-profiles")), false, "worker-crash recovery retained the staged profile");
 });
 
-test("cleanup-blocked task recovery preserves its completed outcome and evidence status", { skip: process.platform === "win32" }, () => {
+test("cleanup-blocked legacy SessionEnd recovery preserves its completed outcome and evidence status", { skip: process.platform === "win32" }, () => {
   const root = fs.realpathSync(initRepo());
   const { env } = fixture();
   const stateRoot = seedWorkspace(root, env);
+  const preContext = captureContextManifest(root);
   const id = generateId("task");
   const taskHome = path.join(stateRoot, "task-homes", id, ".grok");
   fs.mkdirSync(path.join(taskHome, "agent-profiles"), { recursive: true, mode: 0o700 });
@@ -2208,9 +3285,17 @@ test("cleanup-blocked task recovery preserves its completed outcome and evidence
     effort: null,
     logFile: path.join(stateRoot, "jobs", `${id}.log`),
     progress: "Task finished; runtime cleanup is still pending",
-    request: { prompt: null, providerHomeId: id, contextManifest: null, envelope: null },
+    request: {
+      prompt: null,
+      providerHomeId: id,
+      contextManifest: preContext,
+      envelope: null
+    },
     result: { hostVerification: "not_run", taskRuntimeCleaned: false, privacyWarning: "cleanup pending" },
-    error: { code: "E_STATE", message: "cleanup pending" },
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "SessionEnd could not verify complete process-group shutdown."
+    },
     pendingTerminal: { status: "completed", phase: "done", completedAt: stamped, error: null, summary: "Worker completed" }
   });
 
@@ -2223,6 +3308,688 @@ test("cleanup-blocked task recovery preserves its completed outcome and evidence
   assert.equal(recovered.result.runtimeEvidence.executionStatus, "completed");
   assert.equal(fs.existsSync(path.join(taskHome, "auth.json")), false);
   assert.equal(fs.existsSync(path.join(taskHome, "agent-profiles")), false);
+});
+
+test("final task evidence fails closed when post-cleanup context is unavailable", () => {
+  const root = fs.realpathSync(initRepo());
+  const preContext = captureContextManifest(root);
+  const evidence = captureTerminalEvidence(
+    root,
+    {
+      request: {
+        contextManifest: preContext,
+        envelope: {
+          scope: { include: ["tracked.txt"], exclude: [] }
+        }
+      },
+      commandOutcomes: []
+    },
+    "completed",
+    {
+      captureContext() {
+        throw new Error("private capture failure");
+      }
+    }
+  );
+  const selected = selectTaskTerminalError(
+    evidence,
+    null,
+    {
+      code: "E_PROCESS_IDENTITY",
+      message: "Verified owned process signalling could not be completed.",
+      details: {
+        secondaryDiagnostic: {
+          code: "EPERM",
+          message: "kill EPERM"
+        }
+      }
+    }
+  );
+
+  assert.equal(evidence.finalObservationUnavailable, true);
+  assert.equal(evidence.postContext, null);
+  assert.deepEqual(evidence.changedPaths, []);
+  assert.deepEqual(evidence.scopeViolations, []);
+  assert.equal(evidence.runtimeEvidence.postContext, null);
+  assert.equal(selected.code, "E_CONTEXT_DRIFT");
+  assert.deepEqual(selected.details.reasons, [
+    "[final-context-unavailable]"
+  ]);
+  assert.equal(selected.details.secondaryDiagnostic.code, "EPERM");
+  assert.equal(
+    JSON.stringify(evidence).includes("private capture failure"),
+    false
+  );
+
+  const malformedPreContext = {
+    ...preContext,
+    digest: "0".repeat(64)
+  };
+  const malformedEvidence = captureTerminalEvidence(
+    root,
+    {
+      request: {
+        contextManifest: malformedPreContext,
+        envelope: {
+          scope: { include: ["tracked.txt"], exclude: [] }
+        }
+      },
+      commandOutcomes: []
+    },
+    "completed"
+  );
+  const malformedSelected = selectTaskTerminalError(
+    malformedEvidence,
+    { code: "E_CANCELLED", message: "Cancellation completed." }
+  );
+  assert.equal(malformedEvidence.finalObservationUnavailable, true);
+  assert.equal(malformedEvidence.postContext, null);
+  assert.equal(malformedEvidence.runtimeEvidence.preContext, null);
+  assert.equal(malformedEvidence.runtimeEvidence.postContext, null);
+  assert.equal(malformedEvidence.runtimeEvidence.executionStatus, "failed");
+  assert.deepEqual(malformedEvidence.changedPaths, []);
+  assert.deepEqual(malformedEvidence.scopeViolations, []);
+  assert.equal(malformedSelected.code, "E_CONTEXT_DRIFT");
+  assert.deepEqual(
+    malformedSelected.details.reasons,
+    ["[final-context-unavailable]"]
+  );
+
+  const stableEvidence = {
+    finalObservationUnavailable: false,
+    changedPaths: [],
+    scopeViolations: [],
+    runtimeEvidence: {
+      observedChangedPaths: [],
+      scopeViolations: []
+    }
+  };
+  const genericOwnershipBlocker = selectTaskTerminalError(
+    stableEvidence,
+    { code: "E_CANCELLED", message: "Cancellation completed." },
+    {
+      code: "E_PROCESS_IDENTITY",
+      message: "SessionEnd could not verify complete process-group shutdown."
+    }
+  );
+  assert.equal(genericOwnershipBlocker.code, "E_CANCELLED");
+
+  const legacySignalFailure = selectTaskTerminalError(
+    stableEvidence,
+    null,
+    {
+      code: "E_PROCESS_IDENTITY",
+      message: "Provider kill failed with EPERM."
+    }
+  );
+  assert.equal(legacySignalFailure.code, "E_PROCESS_IDENTITY");
+  assert.equal(
+    legacySignalFailure.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+
+  const benignMissingProcess = selectTaskTerminalError(
+    stableEvidence,
+    { code: "E_CANCELLED", message: "Cancellation completed." },
+    {
+      code: "E_PROCESS_IDENTITY",
+      message: "Provider kill observed ESRCH.",
+      details: {
+        secondaryDiagnostic: {
+          code: "ESRCH",
+          message: "kill ESRCH"
+        }
+      }
+    }
+  );
+  assert.equal(benignMissingProcess.code, "E_CANCELLED");
+});
+
+test("cleanup-blocked recovery lets final context drift override a process signalling failure", {
+  skip: process.platform === "win32"
+}, () => {
+  const root = fs.realpathSync(initRepo());
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("task");
+  const taskHome = path.join(stateRoot, "task-homes", id, ".grok");
+  fs.mkdirSync(path.join(taskHome, "agent-profiles"), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(taskHome, "auth.json"), "{}\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(taskHome, "agent-profiles", "staged.md"), "profile\n", { mode: 0o600 });
+  const preContext = captureContextManifest(root);
+  const envelope = buildTaskEnvelope({
+    userRequest: "recover cleanup with final context drift",
+    objective: "recover cleanup with final context drift",
+    mode: "write",
+    scope: { include: ["tracked.txt"], exclude: [] },
+    contextManifestId: preContext.manifestId,
+    context: {
+      facts: [],
+      constraints: [],
+      expectedProjectMarkers: [],
+      requiredPaths: ["tracked.txt"],
+      workspaceState: "task_scoped",
+      upstreamFreshness: "not_checked"
+    },
+    acceptanceCriteria: [{ id: "AC-01", text: "Recover safely" }]
+  });
+  const stamped = new Date(Date.now() - 60_000).toISOString();
+  const processError = {
+    code: "EPERM",
+    message: "kill EPERM"
+  };
+  writeSeededJob(stateRoot, {
+    schemaVersion: 3,
+    id,
+    kind: "task",
+    jobClass: "task",
+    title: "task: cleanup signal precedence",
+    summary: processError.message,
+    write: true,
+    status: "running",
+    phase: "cleanup-blocked",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: "fake-session-cleanup-signal",
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    completedAt: null,
+    heartbeatAt: stamped,
+    controllerProcess: null,
+    workerProcess: {
+      pid: 999999995,
+      startToken: "dead-worker",
+      nonce: "n",
+      processGroupId: 999999995,
+      commandMarker: id
+    },
+    providerProcess: {
+      pid: 999999994,
+      startToken: "dead-provider",
+      processGroupId: 999999994
+    },
+    profile: profileFor("task", true),
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: "Task finished; runtime cleanup is still pending",
+    request: {
+      prompt: null,
+      providerHomeId: id,
+      contextManifest: preContext,
+      envelope
+    },
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: false,
+      privacyWarning: "cleanup pending",
+      stopReason: "cancelled"
+    },
+    error: processError,
+    pendingTerminal: {
+      status: "failed",
+      phase: "failed",
+      completedAt: stamped,
+      error: processError,
+      summary: processError.message
+    }
+  });
+  git(root, "config", "--local", "--add", "grok.issue49RecoveryDrift", "true");
+
+  const recovered = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
+  assert.equal(recovered.status, "failed");
+  assert.equal(recovered.phase, "context-rejected");
+  assert.equal(recovered.error.code, "E_CONTEXT_DRIFT");
+  assert.match(recovered.error.message, /workspace execution context changed/i);
+  assert.equal(recovered.result.taskRuntimeCleaned, true);
+  assert.equal(recovered.result.stopReason, undefined);
+  assert.equal(recovered.result.runtimeEvidence.executionStatus, "failed");
+  assert.ok(recovered.result.runtimeEvidence.observedChangedPaths.includes("[GIT_METADATA]"));
+  assert.equal(recovered.progress, "Task runtime cleanup completed; workspace safety review is required");
+  assert.equal(JSON.stringify(recovered).includes("secondaryDiagnostic"), false);
+  const stored = readJob(root, id, env);
+  assert.equal(stored.error.details.secondaryDiagnostic.code, "EPERM");
+  assert.equal(stored.result.stopReason, undefined);
+  assert.equal(fs.existsSync(path.join(taskHome, "auth.json")), false);
+  assert.equal(fs.existsSync(path.join(taskHome, "agent-profiles")), false);
+
+  const stableId = generateId("task");
+  const stableContext = captureContextManifest(root);
+  const stableEnvelope = buildTaskEnvelope({
+    userRequest: "recover cleanup without workspace drift",
+    objective: "recover cleanup without workspace drift",
+    mode: "write",
+    scope: { include: ["tracked.txt"], exclude: [] },
+    contextManifestId: stableContext.manifestId,
+    context: {
+      facts: [],
+      constraints: [],
+      expectedProjectMarkers: [],
+      requiredPaths: ["tracked.txt"],
+      workspaceState: "task_scoped",
+      upstreamFreshness: "not_checked"
+    },
+    acceptanceCriteria: [{ id: "AC-01", text: "Recover safely" }]
+  });
+  writeSeededJob(stateRoot, {
+    ...stored,
+    id: stableId,
+    title: "task: cleanup signal without drift",
+    summary: "signal failed: EIO",
+    status: "running",
+    phase: "cleanup-blocked",
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    completedAt: null,
+    heartbeatAt: stamped,
+    grokSessionId: "fake-session-cleanup-signal-stable",
+    workerProcess: {
+      ...stored.workerProcess,
+      commandMarker: stableId
+    },
+    completionContextManifest: null,
+    logFile: path.join(stateRoot, "jobs", `${stableId}.log`),
+    progress: "Task finished; runtime cleanup is still pending",
+    request: {
+      ...stored.request,
+      providerHomeId: stableId,
+      contextManifest: stableContext,
+      envelope: stableEnvelope
+    },
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: false,
+      privacyWarning: "cleanup pending",
+      stopReason: "cancelled"
+    },
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "Verified owned process signalling could not be completed.",
+      details: {
+        secondaryDiagnostic: {
+          code: "EIO",
+          message: "signal failed: EIO"
+        }
+      }
+    },
+    pendingTerminal: {
+      status: "completed",
+      phase: "done",
+      completedAt: stamped,
+      error: {
+        code: "E_PROCESS_IDENTITY",
+        message: "Process ownership verification failed."
+      },
+      summary: "Worker completed"
+    },
+    lifecycleEvents: []
+  });
+
+  const stable = parseJson(runCompanion(["status", stableId, "--json"], { cwd: root, env }));
+  assert.equal(stable.status, "failed");
+  assert.equal(stable.phase, "failed");
+  assert.equal(stable.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(stable.error.message, "Process ownership verification failed.");
+  assert.equal(stable.result.taskRuntimeCleaned, true);
+  assert.deepEqual(stable.result.runtimeEvidence.observedChangedPaths, []);
+  assert.equal(stable.progress, "Worker finalization completed");
+  assert.equal(JSON.stringify(stable).includes("EIO"), false);
+  assert.equal(readJob(root, stableId, env).error.details.secondaryDiagnostic.code, "EIO");
+
+  const priorErrorId = generateId("task");
+  writeSeededJob(stateRoot, {
+    ...readJob(root, stableId, env),
+    id: priorErrorId,
+    title: "task: cleanup signal outranks prior outcome",
+    summary: "invalid worker report",
+    status: "running",
+    phase: "cleanup-blocked",
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    completedAt: null,
+    heartbeatAt: stamped,
+    grokSessionId: "fake-session-cleanup-signal-prior-error",
+    workerProcess: {
+      ...stored.workerProcess,
+      commandMarker: priorErrorId
+    },
+    completionContextManifest: null,
+    logFile: path.join(stateRoot, "jobs", `${priorErrorId}.log`),
+    progress: "Task finished; runtime cleanup is still pending",
+    request: {
+      ...stored.request,
+      providerHomeId: priorErrorId,
+      contextManifest: stableContext,
+      envelope: stableEnvelope
+    },
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: false,
+      privacyWarning: "cleanup pending"
+    },
+    error: { code: "EPERM", message: "kill EPERM" },
+    pendingTerminal: {
+      status: "failed",
+      phase: "failed",
+      completedAt: stamped,
+      error: { code: "E_SCHEMA", message: "Invalid worker report." },
+      summary: "Invalid worker report."
+    },
+    lifecycleEvents: []
+  });
+
+  const priorError = parseJson(
+    runCompanion(["status", priorErrorId, "--json"], { cwd: root, env })
+  );
+  assert.equal(priorError.status, "failed");
+  assert.equal(priorError.phase, "failed");
+  assert.equal(priorError.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(JSON.stringify(priorError).includes("EPERM"), false);
+
+  const repeatedCleanupId = generateId("task");
+  const repeatedCleanupHome = path.join(
+    stateRoot,
+    "task-homes",
+    repeatedCleanupId,
+    ".grok"
+  );
+  fs.mkdirSync(
+    path.join(repeatedCleanupHome, "agent-profiles"),
+    { recursive: true, mode: 0o700 }
+  );
+  fs.writeFileSync(
+    path.join(repeatedCleanupHome, "auth.json"),
+    "{}\n",
+    { mode: 0o600 }
+  );
+  fs.writeFileSync(
+    path.join(repeatedCleanupHome, "agent-profiles", "staged.md"),
+    "profile\n",
+    { mode: 0o600 }
+  );
+  writeSeededJob(stateRoot, {
+    ...readJob(root, priorErrorId, env),
+    id: repeatedCleanupId,
+    title: "task: cleanup signal survives generic blocker",
+    summary: "Verified owned process signalling could not be completed.",
+    status: "running",
+    phase: "cleanup-blocked",
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    completedAt: null,
+    heartbeatAt: stamped,
+    grokSessionId: "fake-session-cleanup-signal-retry",
+    workerProcess: {
+      ...stored.workerProcess,
+      commandMarker: repeatedCleanupId
+    },
+    completionContextManifest: null,
+    logFile: path.join(
+      stateRoot,
+      "jobs",
+      `${repeatedCleanupId}.log`
+    ),
+    progress: "Worker lost; provider cleanup could not be verified",
+    request: {
+      ...stored.request,
+      providerHomeId: repeatedCleanupId,
+      contextManifest: stableContext,
+      envelope: stableEnvelope
+    },
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: false,
+      privacyWarning: "cleanup pending"
+    },
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "Verified owned process signalling could not be completed.",
+      details: {
+        secondaryDiagnostic: {
+          code: "EPERM",
+          message: "kill EPERM"
+        }
+      }
+    },
+    pendingTerminal: {
+      status: "completed",
+      phase: "done",
+      completedAt: stamped,
+      error: null,
+      summary: "Worker completed"
+    },
+    lifecycleEvents: []
+  });
+  let repeatedBlocked;
+  fs.chmodSync(repeatedCleanupHome, 0o500);
+  try {
+    repeatedBlocked = parseJson(
+      runCompanion(
+        ["status", repeatedCleanupId, "--json"],
+        { cwd: root, env }
+      )
+    );
+  } finally {
+    fs.chmodSync(repeatedCleanupHome, 0o700);
+  }
+  assert.equal(repeatedBlocked.status, "running");
+  assert.equal(repeatedBlocked.phase, "cleanup-blocked");
+  assert.equal(repeatedBlocked.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(
+    readJob(root, repeatedCleanupId, env)
+      .error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+  const repeatedSettled = parseJson(
+    runCompanion(
+      ["status", repeatedCleanupId, "--json"],
+      { cwd: root, env }
+    )
+  );
+  assert.equal(repeatedSettled.status, "failed");
+  assert.equal(repeatedSettled.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(repeatedSettled.result.taskRuntimeCleaned, true);
+  assert.equal(
+    readJob(root, repeatedCleanupId, env)
+      .error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+  assert.equal(JSON.stringify(repeatedSettled).includes("EPERM"), false);
+
+  const interruptedId = generateId("task");
+  writeSeededJob(stateRoot, {
+    ...readJob(root, priorErrorId, env),
+    id: interruptedId,
+    title: "task: cleanup error does not replace interruption",
+    summary: "Task provider exited, but transient runtime cleanup is incomplete.",
+    status: "running",
+    phase: "cleanup-blocked",
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    completedAt: null,
+    heartbeatAt: stamped,
+    grokSessionId: "fake-session-cleanup-generic-prior",
+    workerProcess: {
+      ...stored.workerProcess,
+      commandMarker: interruptedId
+    },
+    completionContextManifest: null,
+    logFile: path.join(stateRoot, "jobs", `${interruptedId}.log`),
+    progress: "Worker lost; provider cleanup could not be verified",
+    request: {
+      ...stored.request,
+      providerHomeId: interruptedId,
+      contextManifest: stableContext,
+      envelope: stableEnvelope
+    },
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: false,
+      privacyWarning: "cleanup pending"
+    },
+    error: {
+      code: "E_STATE",
+      message: "Task provider exited, but transient runtime cleanup is incomplete."
+    },
+    pendingTerminal: undefined,
+    lifecycleEvents: []
+  });
+
+  const interrupted = parseJson(
+    runCompanion(["status", interruptedId, "--json"], { cwd: root, env })
+  );
+  assert.equal(interrupted.status, "failed");
+  assert.equal(interrupted.phase, "failed");
+  assert.equal(interrupted.error.code, "E_WORKER_LOST");
+  assert.equal(interrupted.result.taskRuntimeCleaned, true);
+
+  const terminalId = generateId("task");
+  writeSeededJob(stateRoot, {
+    ...readJob(root, interruptedId, env),
+    id: terminalId,
+    title: "task: terminal re-clean final evidence",
+    summary: "kill EPERM",
+    status: "failed",
+    phase: "failed",
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    completedAt: stamped,
+    heartbeatAt: stamped,
+    grokSessionId: "fake-session-terminal-re-clean",
+    workerProcess: {
+      ...stored.workerProcess,
+      commandMarker: terminalId
+    },
+    completionContextManifest: null,
+    logFile: path.join(stateRoot, "jobs", `${terminalId}.log`),
+    progress: "Task finished; runtime cleanup is still pending",
+    request: {
+      ...stored.request,
+      providerHomeId: terminalId,
+      contextManifest: stableContext,
+      envelope: stableEnvelope
+    },
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: false,
+      privacyWarning: "cleanup pending"
+    },
+    error: { code: "E_BROKER", message: "kill EPERM" },
+    pendingTerminal: undefined,
+    lifecycleEvents: []
+  });
+  git(root, "config", "--local", "--add", "grok.issue49TerminalDrift", "true");
+
+  const terminalReclean = parseJson(
+    runCompanion(["status", terminalId, "--json"], { cwd: root, env })
+  );
+  assert.equal(terminalReclean.status, "failed");
+  assert.equal(terminalReclean.phase, "context-rejected");
+  assert.equal(terminalReclean.error.code, "E_CONTEXT_DRIFT");
+  assert.equal(terminalReclean.result.taskRuntimeCleaned, true);
+  assert.equal(terminalReclean.result.stopReason, undefined);
+  assert.equal(terminalReclean.progress.includes("pending"), false);
+  assert.ok(
+    terminalReclean.result.runtimeEvidence.observedChangedPaths.includes(
+      "[GIT_METADATA]"
+    )
+  );
+  assert.equal(JSON.stringify(terminalReclean).includes("EPERM"), false);
+  assert.equal(
+    readJob(root, terminalId, env).error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+  assert.equal(readJob(root, terminalId, env).result.stopReason, undefined);
+
+  const terminalGenericId = generateId("task");
+  const terminalGenericContext = captureContextManifest(root);
+  const terminalGenericEnvelope = buildTaskEnvelope({
+    userRequest: "preserve generic terminal ownership failure",
+    objective: "preserve generic terminal ownership failure",
+    mode: "read",
+    scope: { include: ["tracked.txt"], exclude: [] },
+    contextManifestId: terminalGenericContext.manifestId,
+    context: {
+      facts: [],
+      constraints: [],
+      expectedProjectMarkers: [],
+      requiredPaths: ["tracked.txt"],
+      workspaceState: "task_scoped",
+      upstreamFreshness: "not_checked"
+    },
+    acceptanceCriteria: [{
+      id: "AC-01",
+      text: "Keep the prior generic ownership outcome"
+    }]
+  });
+  writeSeededJob(stateRoot, {
+    ...readJob(root, terminalId, env),
+    id: terminalGenericId,
+    title: "task: terminal generic ownership re-clean",
+    summary: "Process ownership verification failed.",
+    status: "failed",
+    phase: "failed",
+    completedAt: stamped,
+    grokSessionId: "fake-session-terminal-generic-ownership",
+    workerProcess: {
+      ...stored.workerProcess,
+      commandMarker: terminalGenericId
+    },
+    completionContextManifest: null,
+    logFile: path.join(
+      stateRoot,
+      "jobs",
+      `${terminalGenericId}.log`
+    ),
+    progress: "Task finished; runtime cleanup is still pending",
+    request: {
+      ...stored.request,
+      providerHomeId: terminalGenericId,
+      contextManifest: terminalGenericContext,
+      envelope: terminalGenericEnvelope
+    },
+    result: {
+      hostVerification: "not_run",
+      taskRuntimeCleaned: false,
+      privacyWarning: "cleanup pending",
+      stopReason: "cancelled"
+    },
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "Process ownership verification failed."
+    },
+    pendingTerminal: undefined,
+    lifecycleEvents: []
+  });
+
+  const terminalGeneric = parseJson(
+    runCompanion(
+      ["status", terminalGenericId, "--json"],
+      { cwd: root, env }
+    )
+  );
+  assert.equal(terminalGeneric.status, "failed");
+  assert.equal(terminalGeneric.phase, "failed");
+  assert.equal(terminalGeneric.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(terminalGeneric.result.taskRuntimeCleaned, true);
+  assert.equal(terminalGeneric.result.stopReason, undefined);
+  assert.deepEqual(
+    terminalGeneric.result.runtimeEvidence.observedChangedPaths,
+    []
+  );
+  assert.equal(terminalGeneric.progress, "Worker finalization completed");
+  const storedTerminalGeneric = readJob(root, terminalGenericId, env);
+  assert.equal(
+    storedTerminalGeneric.error.message,
+    "Process ownership verification failed."
+  );
+  assert.equal(storedTerminalGeneric.result.stopReason, undefined);
 });
 
 test("terminal task cleanup defers while an active continuation owns the same lineage", { skip: process.platform === "win32" }, () => {
@@ -3250,6 +5017,89 @@ test("transfer primary import timeout preserves code when injected unlink cleanu
   assert.match(error.message, /timed out/i);
   assert.match(String(error.details?.warning || ""), /injected unlink failure/);
   assert.match(String(error.details?.privacyWarning || ""), /injected unlink failure/, "alias residual evidence must stay explicit");
+});
+
+test("transfer import timeout normalizes owned-process signal failures and proves cleanup", {
+  skip: process.platform === "win32"
+}, async () => {
+  for (const mode of ["EPERM", "ESRCH", "THENABLE", "ASYNC_REJECT"]) {
+    const { root, source, env } = transferFixture({ importHang: true });
+    const privatePath = path.join(
+      tempDir(`grok-import-private-${mode.toLowerCase()}-`),
+      "provider-auth.json"
+    );
+    const injected = injectedImportSignalEnv(env, mode, privatePath);
+    const runEnv = {
+      ...injected.env,
+      GROK_COMPANION_TEST_IMPORT_TIMEOUT_MS: "200"
+    };
+    let processGroupId = null;
+    try {
+      const result = runCompanion(
+        ["transfer", "--source", source, "--json"],
+        { cwd: root, env: runEnv, timeout: 15_000 }
+      );
+      const events = readFakeLog(injected.logFile);
+      const loaded = events.filter((event) => event.type === "loaded");
+      const injectedSignal = events.find((event) => event.type === "signal");
+      assert.equal(loaded.length, 1, `${mode}: NODE_OPTIONS preload escaped into a provider child`);
+      assert.ok(
+        Number.isSafeInteger(injectedSignal?.target) && injectedSignal.target < 0,
+        `${mode}: owned process-group SIGTERM was not intercepted`
+      );
+      processGroupId = Math.abs(injectedSignal.target);
+
+      assert.notEqual(result.status, 0, `${mode}: transfer unexpectedly succeeded`);
+      const payload = JSON.parse(result.stdout);
+      assert.equal(payload.ok, false);
+      assert.equal(
+        payload.error.code,
+        mode === "ESRCH" ? "E_TIMEOUT" : "E_PROCESS_IDENTITY",
+        `${mode}: wrong public terminal error`
+      );
+
+      const publicOutput = `${result.stdout}\n${result.stderr}`;
+      for (const privateValue of [
+        "EPERM",
+        "E_ASYNC_SIGNAL",
+        privatePath,
+        path.basename(privatePath),
+        injected.preload,
+        path.basename(injected.preload),
+        `providerPid=${processGroupId}`
+      ]) {
+        assert.equal(
+          publicOutput.includes(privateValue),
+          false,
+          `${mode}: public output leaked ${privateValue}`
+        );
+      }
+      assert.equal(
+        publicOutput.includes(String(processGroupId)),
+        false,
+        `${mode}: public output leaked the provider process group`
+      );
+      assert.doesNotMatch(
+        result.stderr,
+        /uncaught|unhandled|signal denied|signal-injection\.cjs/i,
+        `${mode}: callback failure escaped the shared boundary`
+      );
+
+      await waitFor(() => !processGroupAlive(processGroupId), {
+        timeoutMs: 5_000
+      });
+      assertTransferRuntimeArtifactsGone(root, runEnv);
+    } finally {
+      if (processGroupId && processGroupAlive(processGroupId)) {
+        try { process.kill(-processGroupId, "SIGKILL"); } catch {}
+        try {
+          await waitFor(() => !processGroupAlive(processGroupId), {
+            timeoutMs: 5_000
+          });
+        } catch {}
+      }
+    }
+  }
 });
 
 test("transfer attaches cleanup evidence when importedSessionId throws after unlink fault", () => {

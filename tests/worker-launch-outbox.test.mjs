@@ -40,6 +40,7 @@ import {
 } from "../plugins/grok/scripts/lib/task-contract.mjs";
 import {
   listJobsReadonly,
+  requestCancel,
   tryReadJob,
   updateJob
 } from "../plugins/grok/scripts/lib/state.mjs";
@@ -752,6 +753,99 @@ test("the Codex CLI task entrypoint uses the shared versioned launcher", {
     readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length,
     2
   );
+});
+
+test("the direct Codex nonce launcher applies post-cleanup terminal precedence to cancellation", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  for (const drift of [false, true]) {
+    await t.test(drift ? "final HEAD drift wins" : "stable context stays cancelled", () => {
+      const state = fixture(
+        drift
+          ? "direct-nonce-cancel-drift"
+          : "direct-nonce-cancel-stable"
+      );
+      const nonce = drift
+        ? "direct-nonce-cancel-drift-49"
+        : "direct-nonce-cancel-stable-49";
+      updateJob(state.root, state.workerId, (job) => {
+        const spawn = { ...job.request.spawn };
+        delete spawn.dispatch;
+        return {
+          ...job,
+          status: "queued",
+          phase: "accepted",
+          workerAuthorization: nonce,
+          request: {
+            ...job.request,
+            spawn: {
+              ...spawn,
+              providerLaunchPending: false,
+              providerLaunchInFlight: false,
+              providerLaunchOutcome: "not-launched"
+            }
+          }
+        };
+      }, state.env);
+      requestCancel(state.root, state.workerId, nonce, state.env);
+      if (drift) {
+        git(
+          state.root,
+          "commit",
+          "--allow-empty",
+          "-m",
+          "move HEAD after direct nonce admission"
+        );
+      }
+
+      const launched = runCompanion(
+        ["--launch-worker", state.workerId, "--cwd", state.root],
+        {
+          cwd: state.root,
+          env: {
+            ...state.env,
+            GROK_COMPANION_WORKER_NONCE: nonce
+          }
+        }
+      );
+      assert.equal(launched.status, 0, launched.stderr || launched.stdout);
+      const stored = tryReadJob(state.root, state.workerId, state.env);
+      assert.equal(stored.result.taskRuntimeCleaned, true);
+      assert.equal(stored.request.spawn.providerLaunchOutcome, "not-launched");
+      assert.equal(stored.completionContextManifest?.digest,
+        stored.result.runtimeEvidence.postContext?.digest);
+      assert.equal(typeof stored.error?.message, "string");
+      assert.equal(
+        stored.lifecycleEvents.at(-1).summary,
+        stored.error.message
+      );
+      assert.doesNotMatch(stored.progress, /pending/i);
+      if (drift) {
+        assert.equal(stored.status, "failed");
+        assert.equal(stored.phase, "context-rejected");
+        assert.equal(stored.error.code, "E_CONTEXT_DRIFT");
+        assert.ok(
+          stored.result.runtimeEvidence.observedChangedPaths.includes("[HEAD]")
+        );
+        assert.ok(
+          stored.result.runtimeEvidence.observedChangedPaths.includes(
+            "[GIT_METADATA]"
+          )
+        );
+        assert.equal(
+          stored.progress,
+          "Task runtime cleanup completed; workspace safety review is required"
+        );
+        assert.equal(stored.result.stopReason, undefined);
+      } else {
+        assert.equal(stored.status, "cancelled");
+        assert.equal(stored.phase, "cancelled");
+        assert.equal(stored.error.code, "E_CANCELLED");
+        assert.equal(stored.progress, "Cancellation completed");
+        assert.equal(stored.result.stopReason, "cancelled");
+      }
+    });
+  }
 });
 
 test("the Codex CLI task entrypoint refuses missing or tampered setup capability before admission", {

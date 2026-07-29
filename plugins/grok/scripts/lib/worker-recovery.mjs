@@ -61,10 +61,34 @@ function dispatchAgeMs(job, clock) {
   return Number.isFinite(timestamp) ? Math.max(0, clock() - timestamp) : Infinity;
 }
 
-function cleanupBlocked(root, workerId, warning, env) {
+function boundedCleanupSignalDiagnostic(error) {
+  const diagnostic = error?.code === "E_PROCESS_IDENTITY"
+    && error.details?.secondaryDiagnostic
+    && typeof error.details.secondaryDiagnostic === "object"
+    && !Array.isArray(error.details.secondaryDiagnostic)
+    ? error.details.secondaryDiagnostic
+    : null;
+  if (!diagnostic) return null;
+  const rawCode = String(diagnostic.code || "");
+  return {
+    code: /^[A-Z][A-Z0-9_]{0,63}$/.test(rawCode)
+      ? rawCode.slice(0, 64)
+      : "UNKNOWN",
+    message: String(
+      diagnostic.message || "Process signalling failed."
+    ).slice(0, 256)
+  };
+}
+
+function cleanupBlocked(root, workerId, warning, env, cleanupError = null) {
   const message = "Worker recovery is blocked because exact runtime cleanup could not be verified.";
+  const incomingSecondaryDiagnostic = boundedCleanupSignalDiagnostic(
+    cleanupError
+  );
   return updateJob(root, workerId, (current) => {
     if (terminal(current)) return current;
+    const secondaryDiagnostic = boundedCleanupSignalDiagnostic(current.error)
+      || incomingSecondaryDiagnostic;
     const priorEvents = current.lifecycleEvents || [];
     const alreadyRecorded = priorEvents.some((event) => (
       event.type === "blocked" && event.summary === message
@@ -73,7 +97,11 @@ function cleanupBlocked(root, workerId, warning, env) {
       ...current,
       phase: "cleanup-blocked",
       progress: message,
-      error: { code: "E_PROCESS_IDENTITY", message },
+      error: {
+        code: "E_PROCESS_IDENTITY",
+        message,
+        ...(secondaryDiagnostic ? { details: { secondaryDiagnostic } } : {})
+      },
       result: {
         ...(current.result || {}),
         hostVerification: current.result?.hostVerification || "not_run",
@@ -625,8 +653,14 @@ export async function recoverLostProviderStartedWorker({
       testHooks
     });
     providerIdentity = cleanupAuthority.processIdentity;
-  } catch {
-    cleanupBlocked(root, workerId, "Provider process-group cleanup could not be verified.", env);
+  } catch (error) {
+    cleanupBlocked(
+      root,
+      workerId,
+      "Provider process-group cleanup could not be verified.",
+      env,
+      error
+    );
     return { action: "cleanup-blocked", reason: "provider-cleanup-unverified" };
   }
 
@@ -727,8 +761,14 @@ export async function reconcileBrokerWorkers({
           env,
           testHooks
         });
-      } catch {
-        cleanupBlocked(root, snapshot.id, "Controller process-group cleanup could not be verified.", env);
+      } catch (error) {
+        cleanupBlocked(
+          root,
+          snapshot.id,
+          "Controller process-group cleanup could not be verified.",
+          env,
+          error
+        );
         results.push({ workerId: snapshot.id, action: "cleanup-blocked", reason: "controller-cleanup-unverified" });
         continue;
       }
@@ -802,7 +842,7 @@ export async function reconcileBrokerWorkers({
             testHooks
           });
           providerIdentity = cleanupAuthority.processIdentity;
-        } catch {
+        } catch (error) {
           const unsettledLive = providerIdentity?.startToken === null && !processGroupGone(providerIdentity);
           cleanupBlocked(
             root,
@@ -810,7 +850,8 @@ export async function reconcileBrokerWorkers({
             unsettledLive
               ? "Provider group is still live without a verified birth token; it was not signalled."
               : "Provider process-group cleanup could not be verified.",
-            env
+            env,
+            error
           );
           results.push({
             workerId: snapshot.id,
@@ -965,8 +1006,14 @@ export async function reconcileBrokerWorkers({
             env,
             testHooks
           });
-        } catch {
-          cleanupBlocked(root, snapshot.id, "Worker child process-group cleanup could not be verified.", env);
+        } catch (error) {
+          cleanupBlocked(
+            root,
+            snapshot.id,
+            "Worker child process-group cleanup could not be verified.",
+            env,
+            error
+          );
           results.push({ workerId: snapshot.id, action: "cleanup-blocked", reason: "worker-child-cleanup-unverified" });
           continue;
         }
@@ -1076,7 +1123,7 @@ export async function reconcileBrokerWorkers({
             testHooks
           });
           providerIdentity = cleanupAuthority.processIdentity;
-        } catch {
+        } catch (error) {
           const unsettledLive = providerIdentity?.startToken === null && !processGroupGone(providerIdentity);
           cleanupBlocked(
             root,
@@ -1084,7 +1131,8 @@ export async function reconcileBrokerWorkers({
             unsettledLive
               ? "Provider group is still live without a verified birth token; it was not signalled."
               : "Provider process-group cleanup could not be verified.",
-            env
+            env,
+            error
           );
           results.push({
             workerId: snapshot.id,

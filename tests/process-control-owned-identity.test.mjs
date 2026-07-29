@@ -9,6 +9,7 @@ import {
   processCommand,
   processGroupAlive,
   processStartToken,
+  signalOwnedProcess,
   systemPsBinary,
   terminateOwnedProcess
 } from "../plugins/grok/scripts/lib/process-control.mjs";
@@ -160,4 +161,73 @@ test("owned cleanup retains verified TERM-to-KILL escalation for a valid detache
   }), true);
   await waitFor(() => !processGroupAlive(child.pid), { timeoutMs: 5_000, intervalMs: 20 });
   assert.equal(processStartToken(child.pid), null);
+});
+
+test("owned cleanup normalizes non-ESRCH signal failures to process identity", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const marker = "owned-signal-failure-normalization";
+  const child = spawn(process.execPath, [
+    "-e",
+    "setInterval(() => {}, 1000);",
+    "agent",
+    marker,
+    "stdio"
+  ], { detached: true, stdio: "ignore" });
+  t.after(() => stopGroup(child));
+  const startToken = await waitFor(() => processStartToken(child.pid));
+  const raw = Object.assign(
+    new Error(
+      "kill EPERM pid 424242 at /Users/private/worktree "
+      + "token=xai-12345678901234567890 "
+      + "x".repeat(400)
+    ),
+    { code: "EPERM" }
+  );
+  let failure;
+
+  try {
+    await terminateOwnedProcess(
+      { pid: child.pid, startToken, processGroupId: child.pid },
+      marker,
+      "provider",
+      { signalProcess: () => { throw raw; } }
+    );
+  } catch (error) {
+    failure = error;
+  }
+  assert.equal(failure?.code, "E_PROCESS_IDENTITY");
+  assert.equal(
+    failure?.message,
+    "Verified owned process signalling could not be completed."
+  );
+  assert.equal(failure?.details?.secondaryDiagnostic?.code, "EPERM");
+  assert.match(failure?.details?.secondaryDiagnostic?.message || "", /^kill EPERM/);
+  assert.equal(failure?.details?.secondaryDiagnostic?.message.includes("424242"), false);
+  assert.equal(failure?.details?.secondaryDiagnostic?.message.includes("/Users/private"), false);
+  assert.equal(failure?.details?.secondaryDiagnostic?.message.includes("xai-"), false);
+  assert.ok(failure?.details?.secondaryDiagnostic?.message.length <= 256);
+  assert.equal(processStartToken(child.pid), startToken);
+  assert.equal(processGroupAlive(child.pid), true);
+});
+
+test("owned signaling keeps ESRCH benign", () => {
+  const raw = Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+  assert.equal(signalOwnedProcess(-123, "SIGTERM", () => { throw raw; }), false);
+});
+
+test("owned signaling fails closed for asynchronous signal callbacks", async () => {
+  const raw = Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+  assert.throws(
+    () => signalOwnedProcess(
+      -123,
+      "SIGTERM",
+      () => Promise.reject(raw)
+    ),
+    (error) => (
+      error?.code === "E_PROCESS_IDENTITY"
+      && error?.details?.secondaryDiagnostic?.code === "E_ASYNC_SIGNAL"
+    )
+  );
+  await new Promise((resolve) => setImmediate(resolve));
 });
