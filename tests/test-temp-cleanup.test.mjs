@@ -32,6 +32,7 @@ import {
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
+const REMOVE_HELPER = path.join(ROOT, "scripts/lib/test-temp-remove-helper.cjs");
 const OLD_MS = 2 * 60 * 60_000;
 
 function sandbox(t) {
@@ -554,6 +555,72 @@ test("apply removes verified old trees with restricted descendants without follo
   assert.equal(fs.readFileSync(path.join(outside, "keep"), "utf8"), "keep");
 });
 
+test("recursive permission repair cannot chmod through a raced symlink", (t) => {
+  if (process.platform === "win32") return;
+  const root = sandbox(t);
+  const target = legacy(root);
+  const restricted = path.join(target, "restricted");
+  const moved = path.join(target, "restricted-original");
+  const outside = fs.mkdtempSync(path.join(root, "outside-mode-canary-"));
+  const preload = path.join(root, "swap-before-open.cjs");
+  fs.mkdirSync(restricted);
+  fs.chmodSync(restricted, 0o000);
+  fs.chmodSync(outside, 0o500);
+  fs.writeFileSync(preload, [
+    '"use strict";',
+    'const fs = require("node:fs");',
+    'const path = require("node:path");',
+    `const restricted = ${JSON.stringify(restricted)};`,
+    `const moved = ${JSON.stringify(moved)};`,
+    `const outside = ${JSON.stringify(outside)};`,
+    "const originalOpenSync = fs.openSync;",
+    "const originalChmodSync = fs.chmodSync;",
+    "const originalLchmodSync = fs.lchmodSync;",
+    "const originalRenameSync = fs.renameSync;",
+    "const originalSymlinkSync = fs.symlinkSync;",
+    "let swapped = false;",
+    "function swap(targetPath) {",
+    "  if (swapped || path.resolve(String(targetPath)) !== restricted) return;",
+    "  swapped = true;",
+    "  originalRenameSync(restricted, moved);",
+    "  originalSymlinkSync(outside, restricted);",
+    "}",
+    "fs.openSync = function(targetPath, ...args) {",
+    "  swap(targetPath);",
+    "  return originalOpenSync.call(fs, targetPath, ...args);",
+    "};",
+    "fs.chmodSync = function(targetPath, ...args) {",
+    "  swap(targetPath);",
+    "  return originalChmodSync.call(fs, targetPath, ...args);",
+    "};",
+    "if (typeof originalLchmodSync === \"function\") {",
+    "  fs.lchmodSync = function(targetPath, ...args) {",
+    "    swap(targetPath);",
+    "    return originalLchmodSync.call(fs, targetPath, ...args);",
+    "  };",
+    "}",
+    ""
+  ].join("\n"));
+  const identity = fs.lstatSync(target);
+  const result = spawnSync(process.execPath, [
+    REMOVE_HELPER,
+    String(identity.dev),
+    String(identity.ino)
+  ], {
+    cwd: target,
+    env: {
+      GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1",
+      NODE_OPTIONS: `--require=${preload}`
+    },
+    encoding: "utf8",
+    shell: false
+  });
+  assert.notEqual(result.status, 0);
+  assert.equal(fs.statSync(outside).mode & 0o777, 0o500);
+  fs.chmodSync(moved, 0o700);
+  fs.chmodSync(outside, 0o700);
+});
+
 test("stale manifest-backed crash roots are reaped while an active owner sibling is preserved", (t) => {
   const root = sandbox(t);
   const token = processStartToken(process.pid) || "active-fixture-start-token";
@@ -848,6 +915,43 @@ test("supervisor reaps a detached Node descendant that requests an empty environ
   assert.equal(status, 0, diagnostics);
   const pid = Number(fs.readFileSync(pidFile, "utf8"));
   assert.equal(await pidIsGone(pid), true);
+  assert.equal(fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)), false);
+});
+
+test("Linux supervisor retains a proven detached PID across an environment-scrubbing re-exec", async (t) => {
+  if (process.platform !== "linux") return;
+  const root = sandbox(t);
+  const pidFile = path.join(root, "scrubbed-reexec-descendant.pid");
+  const fixture = path.join(root, "scrubbed-reexec.test.mjs");
+  fs.writeFileSync(fixture, [
+    'import fs from "node:fs";',
+    'import { spawn } from "node:child_process";',
+    `const child = spawn("/bin/sh", ["-c", "sleep 0.2; exec /usr/bin/env -i /bin/sleep 30"], {`,
+    '  detached: true, stdio: "ignore"',
+    "});",
+    "child.unref();",
+    `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+    "await new Promise((resolve) => setTimeout(resolve, 600));",
+    ""
+  ].join("\n"));
+  let descendantPid = null;
+  t.after(() => {
+    if (!descendantPid) return;
+    try { process.kill(descendantPid, "SIGKILL"); } catch {}
+  });
+  let diagnostics = "";
+  const status = runDeterministicTestFiles({
+    files: [fixture],
+    root: ROOT,
+    reporter: REPORTER,
+    tempRoot: root,
+    timeoutMs: 5_000,
+    stdout: { write() {} },
+    stderr: { write(value) { diagnostics += value; } }
+  });
+  descendantPid = Number(fs.readFileSync(pidFile, "utf8"));
+  assert.equal(status, 0, diagnostics);
+  assert.equal(await pidIsGone(descendantPid), true);
   assert.equal(fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)), false);
 });
 

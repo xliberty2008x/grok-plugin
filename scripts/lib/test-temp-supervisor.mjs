@@ -272,8 +272,21 @@ function ownedProcessIds(token, tempIdentity) {
         }
         const environment = fs.readFileSync(path.join("/proc", entry.name, "environ"));
         if (linuxProcessProvesLiveOwnership(pid, stat, environment, entries)) {
-          rememberLinuxOwnedProcess(pid);
+          const identity = linuxProcessIdentityFromStat(pid, stat);
+          if (identity) knownLinuxOwnedProcesses.set(pid, identity);
           ids.push(pid);
+          continue;
+        }
+        const knownIdentity = knownLinuxOwnedProcesses.get(pid);
+        const currentIdentity = linuxProcessIdentityFromStat(pid, stat);
+        if (knownIdentity) {
+          if (linuxKnownProcessIdentityMatches(knownIdentity, currentIdentity)) {
+            // Once an exact PID + start identity is proven owned, retain it
+            // across a re-exec that scrubs the inherited environment.
+            ids.push(pid);
+            continue;
+          }
+          knownLinuxOwnedProcesses.delete(pid);
         }
       } catch (error) {
         if (error?.code === "ENOENT") {

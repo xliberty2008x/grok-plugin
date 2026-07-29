@@ -4,6 +4,76 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
+const LINUX_O_PATH = 0o10000000;
+
+function sameDirectoryIdentity(stat, expected) {
+  return (
+    stat.dev === expected.dev
+    && stat.ino === expected.ino
+    && stat.isDirectory()
+    && !stat.isSymbolicLink()
+  );
+}
+
+function openVerifiedDirectory(entry, expected, allowPermissionRepair = true) {
+  if (!Number.isInteger(fs.constants.O_NOFOLLOW) || fs.constants.O_NOFOLLOW === 0) {
+    throw new Error("Safe no-follow directory access is unavailable.");
+  }
+  const readFlags = fs.constants.O_RDONLY
+    | (fs.constants.O_DIRECTORY || 0)
+    | fs.constants.O_NOFOLLOW;
+  try {
+    const descriptor = fs.openSync(entry, readFlags);
+    const opened = fs.fstatSync(descriptor);
+    if (!sameDirectoryIdentity(opened, expected)) {
+      fs.closeSync(descriptor);
+      process.exit(43);
+    }
+    return descriptor;
+  } catch (error) {
+    if (error?.code !== "EACCES" && error?.code !== "EPERM") throw error;
+    if (!allowPermissionRepair) throw error;
+  }
+
+  if (process.platform === "linux") {
+    const descriptor = fs.openSync(
+      entry,
+      LINUX_O_PATH
+        | (fs.constants.O_DIRECTORY || 0)
+        | fs.constants.O_NOFOLLOW
+    );
+    const opened = fs.fstatSync(descriptor);
+    if (!sameDirectoryIdentity(opened, expected)) {
+      fs.closeSync(descriptor);
+      process.exit(43);
+    }
+    // O_PATH pins the verified inode without requiring read permission.
+    // chmod through that descriptor cannot follow a raced replacement path.
+    fs.chmodSync(`/proc/self/fd/${descriptor}`, 0o700);
+    fs.closeSync(descriptor);
+    return openVerifiedDirectory(entry, expected, false);
+  }
+
+  if (process.platform === "darwin") {
+    // macOS chmod -h changes the directory itself but never follows a raced
+    // symlink. Revalidate the exact identity before recursive traversal.
+    const repaired = spawnSync("/bin/chmod", ["-h", "700", entry], {
+      env: { GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1" },
+      encoding: "utf8",
+      shell: false,
+      maxBuffer: 8 * 1024
+    });
+    if (repaired.status !== 0 || repaired.error || repaired.signal) {
+      throw new Error("Safe permission repair failed.");
+    }
+    const writable = fs.lstatSync(entry);
+    if (!sameDirectoryIdentity(writable, expected)) process.exit(43);
+    return openVerifiedDirectory(entry, expected, false);
+  }
+
+  throw new Error("Safe permission repair is unavailable.");
+}
+
 const [expectedDev, expectedIno] = process.argv.slice(2);
 const original = fs.lstatSync(".");
 if (
@@ -22,25 +92,10 @@ for (const entry of fs.readdirSync(".")) {
     continue;
   }
 
-  fs.chmodSync(entry, 0o700);
-  const writable = fs.lstatSync(entry);
-  if (
-    writable.dev !== stat.dev
-    || writable.ino !== stat.ino
-    || !writable.isDirectory()
-    || writable.isSymbolicLink()
-  ) {
-    process.exit(43);
-  }
-  const descriptor = fs.openSync(
-    entry,
-    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
-  );
+  const descriptor = openVerifiedDirectory(entry, stat);
   try {
     const opened = fs.fstatSync(descriptor);
-    if (opened.dev !== stat.dev || opened.ino !== stat.ino || !opened.isDirectory()) {
-      process.exit(43);
-    }
+    if (!sameDirectoryIdentity(opened, stat)) process.exit(43);
     fs.fchmodSync(descriptor, 0o700);
   } finally {
     fs.closeSync(descriptor);
