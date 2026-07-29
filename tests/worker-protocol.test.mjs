@@ -105,6 +105,13 @@ function schemaErrors(schema, value, path = "$") {
     const matches = schema.oneOf.filter((candidate) => schemaErrors(candidate, value, path).length === 0).length;
     return matches === 1 ? [] : [`${path} matched ${matches} oneOf branches`];
   }
+  if (schema.if !== undefined) {
+    const applies = schemaErrors(schema.if, value, path).length === 0;
+    if (applies) {
+      return schema.then ? schemaErrors(schema.then, value, path) : [];
+    }
+    return schema.else ? schemaErrors(schema.else, value, path) : [];
+  }
   if (schema.const !== undefined && value !== schema.const) return [`${path} must equal ${schema.const}`];
   if (schema.enum && !schema.enum.includes(value)) return [`${path} is not in enum`];
 
@@ -120,8 +127,9 @@ function schemaErrors(schema, value, path = "$") {
     if (schema.maxLength != null && value.length > schema.maxLength) errors.push(`${path} is too long`);
     if (schema.pattern && !new RegExp(schema.pattern).test(value)) errors.push(`${path} does not match pattern`);
   }
-  if (typeof value === "number" && schema.minimum != null && value < schema.minimum) {
-    errors.push(`${path} is below minimum`);
+  if (typeof value === "number") {
+    if (schema.minimum != null && value < schema.minimum) errors.push(`${path} is below minimum`);
+    if (schema.maximum != null && value > schema.maximum) errors.push(`${path} is above maximum`);
   }
   if (Array.isArray(value)) {
     if (schema.maxItems != null && value.length > schema.maxItems) errors.push(`${path} has too many items`);
@@ -139,6 +147,11 @@ function schemaErrors(schema, value, path = "$") {
     }
     for (const [key, childSchema] of Object.entries(schema.properties || {})) {
       if (Object.hasOwn(value, key)) errors.push(...schemaErrors(childSchema, value[key], `${path}.${key}`));
+    }
+  }
+  if (schema.allOf) {
+    for (const candidate of schema.allOf) {
+      errors.push(...schemaErrors(candidate, value, path));
     }
   }
   return errors;
@@ -1042,6 +1055,663 @@ test("public nested result shapes are exact, bounded, and display-safe", () => {
   assertConforms("WorkerSnapshot", snapshot);
   assertConforms("WorkerResult", snapshot.result);
   assertConforms("WorkerError", snapshot.error);
+});
+
+test("public runtime evidence projects shared-ref observation without private paths (issue #34)", () => {
+  const privatePath = "/Users/alice/private/linked-worktree";
+  const snapshot = projectWorkerSnapshot(job({
+    status: "completed",
+    phase: "done",
+    result: {
+      hostVerification: "not_run",
+      runtimeEvidence: {
+        schemaVersion: 1,
+        preContext: {
+          manifestId: "ctx-before",
+          digest: "a".repeat(64),
+          head: "b".repeat(40),
+          branch: "task-branch",
+          dirtyDigest: "c".repeat(64),
+          ignoredDigest: "d".repeat(64),
+          trackedTreeIdentity: "e".repeat(64),
+          metadataIdentity: "f".repeat(64),
+          taskRelevantMetadataIdentity: "1".repeat(64),
+          sharedRefIdentity: {
+            schemaVersion: 1,
+            complete: true,
+            refCount: 4,
+            taskRelevantRefCount: 2,
+            unrelatedRefCount: 2,
+            taskRelevantRefIdentity: "2".repeat(64),
+            unrelatedRefIdentity: "3".repeat(64)
+          },
+          workspaceRoot: privatePath
+        },
+        postContext: {
+          manifestId: "ctx-after",
+          digest: "g".repeat(64),
+          head: "b".repeat(40),
+          branch: "task-branch",
+          dirtyDigest: "c".repeat(64),
+          ignoredDigest: "d".repeat(64),
+          trackedTreeIdentity: "e".repeat(64),
+          metadataIdentity: "h".repeat(64),
+          taskRelevantMetadataIdentity: "1".repeat(64),
+          sharedRefIdentity: {
+            schemaVersion: 1,
+            complete: true,
+            refCount: 5,
+            taskRelevantRefCount: 2,
+            unrelatedRefCount: 3,
+            taskRelevantRefIdentity: "2".repeat(64),
+            unrelatedRefIdentity: "4".repeat(64)
+          },
+          workspaceRoot: privatePath
+        },
+        observedChangedPaths: [],
+        diffSummary: null,
+        commandOutcomes: [],
+        scopeViolations: [],
+        executionStatus: "completed",
+        hostVerification: "not_run",
+        sharedRefObservation: {
+          schemaVersion: 1,
+          classification: "tolerated_unrelated_shared_refs",
+          toleratedUnrelatedSharedRefChurn: true,
+          taskRelevantMetadataDrift: false,
+          diagnosticPath: privatePath
+        }
+      }
+    }
+  }));
+
+  const evidence = snapshot.result.runtimeEvidence;
+  assert.deepEqual(evidence.sharedRefObservation, {
+    schemaVersion: 1,
+    classification: "tolerated_unrelated_shared_refs",
+    toleratedUnrelatedSharedRefChurn: true,
+    taskRelevantMetadataDrift: false
+  });
+  assert.equal(evidence.preContext.taskRelevantMetadataIdentity, "1".repeat(64));
+  assert.deepEqual(evidence.preContext.sharedRefIdentity, {
+    schemaVersion: 1,
+    complete: true,
+    refCount: 4,
+    taskRelevantRefCount: 2,
+    unrelatedRefCount: 2,
+    taskRelevantRefIdentity: "2".repeat(64),
+    unrelatedRefIdentity: "3".repeat(64)
+  });
+  assert.equal(evidence.postContext.sharedRefIdentity.unrelatedRefCount, 3);
+  const serialized = JSON.stringify(snapshot);
+  assert.equal(serialized.includes(privatePath), false);
+  assert.equal(serialized.includes("diagnosticPath"), false);
+  assert.equal(serialized.includes("workspaceRoot"), false);
+  assertConforms("WorkerSnapshot", snapshot);
+  assertConforms("WorkerResult", snapshot.result);
+
+  // Task-relevant drift classification also projects cleanly.
+  const drift = projectWorkerSnapshot(job({
+    status: "failed",
+    phase: "failed",
+    result: {
+      hostVerification: "failed",
+      runtimeEvidence: {
+        schemaVersion: 1,
+        preContext: { manifestId: "ctx-a", digest: "a".repeat(64) },
+        postContext: { manifestId: "ctx-b", digest: "b".repeat(64) },
+        observedChangedPaths: ["[GIT_METADATA]"],
+        diffSummary: null,
+        commandOutcomes: [],
+        scopeViolations: ["[GIT_METADATA]"],
+        executionStatus: "failed",
+        hostVerification: "failed",
+        sharedRefObservation: {
+          schemaVersion: 1,
+          classification: "task_relevant_metadata_drift",
+          toleratedUnrelatedSharedRefChurn: false,
+          taskRelevantMetadataDrift: true
+        }
+      }
+    }
+  }));
+  assert.deepEqual(drift.result.runtimeEvidence.sharedRefObservation, {
+    schemaVersion: 1,
+    classification: "task_relevant_metadata_drift",
+    toleratedUnrelatedSharedRefChurn: false,
+    taskRelevantMetadataDrift: true
+  });
+  assertConforms("WorkerResult", drift.result);
+});
+
+test("public shared-ref projections reject malformed identity and observation (issue #34 re-review)", () => {
+  const baseIdentity = {
+    schemaVersion: 1,
+    complete: true,
+    refCount: 2,
+    taskRelevantRefCount: 1,
+    unrelatedRefCount: 1,
+    taskRelevantRefIdentity: "a".repeat(64),
+    unrelatedRefIdentity: "b".repeat(64)
+  };
+  const baseObservation = {
+    schemaVersion: 1,
+    classification: "tolerated_unrelated_shared_refs",
+    toleratedUnrelatedSharedRefChurn: true,
+    taskRelevantMetadataDrift: false
+  };
+
+  const projectEvidence = (runtimeEvidence) => projectWorkerSnapshot(job({
+    status: "completed",
+    phase: "done",
+    result: {
+      hostVerification: "not_run",
+      runtimeEvidence: {
+        schemaVersion: 1,
+        preContext: {
+          manifestId: "ctx-before",
+          digest: "c".repeat(64),
+          head: "d".repeat(40),
+          branch: "task-branch",
+          dirtyDigest: "e".repeat(64),
+          ignoredDigest: "f".repeat(64),
+          trackedTreeIdentity: "1".repeat(64),
+          metadataIdentity: "2".repeat(64),
+          taskRelevantMetadataIdentity: "3".repeat(64),
+          sharedRefIdentity: baseIdentity
+        },
+        postContext: {
+          manifestId: "ctx-after",
+          digest: "g".repeat(64),
+          head: "d".repeat(40),
+          branch: "task-branch",
+          dirtyDigest: "e".repeat(64),
+          ignoredDigest: "f".repeat(64),
+          trackedTreeIdentity: "1".repeat(64),
+          metadataIdentity: "4".repeat(64),
+          taskRelevantMetadataIdentity: "3".repeat(64),
+          sharedRefIdentity: baseIdentity
+        },
+        observedChangedPaths: [],
+        diffSummary: null,
+        commandOutcomes: [],
+        scopeViolations: [],
+        executionStatus: "completed",
+        hostVerification: "not_run",
+        sharedRefObservation: baseObservation,
+        ...runtimeEvidence
+      }
+    }
+  })).result.runtimeEvidence;
+
+  // Non-digest identity strings must not project.
+  const nonDigest = projectEvidence({
+    preContext: {
+      manifestId: "ctx-before",
+      digest: "c".repeat(64),
+      head: "d".repeat(40),
+      branch: "task-branch",
+      dirtyDigest: "e".repeat(64),
+      ignoredDigest: "f".repeat(64),
+      trackedTreeIdentity: "1".repeat(64),
+      metadataIdentity: "2".repeat(64),
+      sharedRefIdentity: {
+        ...baseIdentity,
+        taskRelevantRefIdentity: "not-a-digest",
+        unrelatedRefIdentity: "also-not-a-digest"
+      }
+    }
+  });
+  assert.equal(Object.hasOwn(nonDigest.preContext, "sharedRefIdentity"), false);
+  assert.equal(
+    schemaErrors(PROTOCOL_SCHEMA.$defs.sharedRefIdentitySummary, {
+      ...baseIdentity,
+      taskRelevantRefIdentity: "not-a-digest"
+    }).length > 0,
+    true
+  );
+
+  // Inconsistent counts must not project.
+  const inconsistent = projectEvidence({
+    preContext: {
+      manifestId: "ctx-before",
+      digest: "c".repeat(64),
+      head: "d".repeat(40),
+      branch: "task-branch",
+      dirtyDigest: "e".repeat(64),
+      ignoredDigest: "f".repeat(64),
+      trackedTreeIdentity: "1".repeat(64),
+      metadataIdentity: "2".repeat(64),
+      sharedRefIdentity: {
+        ...baseIdentity,
+        refCount: 9,
+        taskRelevantRefCount: 1,
+        unrelatedRefCount: 1
+      }
+    }
+  });
+  assert.equal(Object.hasOwn(inconsistent.preContext, "sharedRefIdentity"), false);
+
+  // Unsafe oversize counts must not project; schema maxima reject them too.
+  const oversize = {
+    ...baseIdentity,
+    refCount: 10_001,
+    taskRelevantRefCount: 10_001,
+    unrelatedRefCount: 0
+  };
+  const oversizeEvidence = projectEvidence({
+    preContext: {
+      manifestId: "ctx-before",
+      digest: "c".repeat(64),
+      head: "d".repeat(40),
+      branch: "task-branch",
+      dirtyDigest: "e".repeat(64),
+      ignoredDigest: "f".repeat(64),
+      trackedTreeIdentity: "1".repeat(64),
+      metadataIdentity: "2".repeat(64),
+      sharedRefIdentity: oversize
+    }
+  });
+  assert.equal(Object.hasOwn(oversizeEvidence.preContext, "sharedRefIdentity"), false);
+  assert.ok(schemaErrors(PROTOCOL_SCHEMA.$defs.sharedRefIdentitySummary, oversize).length > 0);
+
+  // Non-boolean flags must not coerce into trusted observation evidence.
+  for (const malformed of [
+    { toleratedUnrelatedSharedRefChurn: 1, taskRelevantMetadataDrift: false },
+    { toleratedUnrelatedSharedRefChurn: "true", taskRelevantMetadataDrift: false },
+    { toleratedUnrelatedSharedRefChurn: true, taskRelevantMetadataDrift: 0 },
+    { toleratedUnrelatedSharedRefChurn: null, taskRelevantMetadataDrift: false }
+  ]) {
+    const projected = projectEvidence({
+      sharedRefObservation: {
+        schemaVersion: 1,
+        classification: "tolerated_unrelated_shared_refs",
+        ...malformed
+      }
+    });
+    assert.equal(Object.hasOwn(projected, "sharedRefObservation"), false, JSON.stringify(malformed));
+  }
+
+  // Impossible classification/flag tuples must not project; schema rejects them too.
+  const badTuples = [
+    {
+      classification: "unchanged",
+      toleratedUnrelatedSharedRefChurn: true,
+      taskRelevantMetadataDrift: false
+    },
+    {
+      classification: "tolerated_unrelated_shared_refs",
+      toleratedUnrelatedSharedRefChurn: false,
+      taskRelevantMetadataDrift: false
+    },
+    {
+      classification: "task_relevant_metadata_drift",
+      toleratedUnrelatedSharedRefChurn: true,
+      taskRelevantMetadataDrift: true
+    },
+    {
+      classification: "fail_closed",
+      toleratedUnrelatedSharedRefChurn: false,
+      taskRelevantMetadataDrift: false
+    },
+    {
+      classification: "legacy_metadata_drift",
+      toleratedUnrelatedSharedRefChurn: true,
+      taskRelevantMetadataDrift: false
+    }
+  ];
+  for (const tuple of badTuples) {
+    const projected = projectEvidence({
+      sharedRefObservation: { schemaVersion: 1, ...tuple }
+    });
+    assert.equal(Object.hasOwn(projected, "sharedRefObservation"), false, JSON.stringify(tuple));
+    assert.ok(
+      schemaErrors(PROTOCOL_SCHEMA.$defs.sharedRefObservation, { schemaVersion: 1, ...tuple }).length > 0,
+      `schema should reject ${JSON.stringify(tuple)}`
+    );
+  }
+
+  // Valid tuples still project and conform.
+  for (const tuple of [
+    {
+      classification: "unchanged",
+      toleratedUnrelatedSharedRefChurn: false,
+      taskRelevantMetadataDrift: false
+    },
+    {
+      classification: "tolerated_unrelated_shared_refs",
+      toleratedUnrelatedSharedRefChurn: true,
+      taskRelevantMetadataDrift: false
+    },
+    {
+      classification: "task_relevant_metadata_drift",
+      toleratedUnrelatedSharedRefChurn: false,
+      taskRelevantMetadataDrift: true
+    },
+    {
+      classification: "legacy_metadata_drift",
+      toleratedUnrelatedSharedRefChurn: false,
+      taskRelevantMetadataDrift: true
+    },
+    {
+      classification: "fail_closed",
+      toleratedUnrelatedSharedRefChurn: false,
+      taskRelevantMetadataDrift: true
+    }
+  ]) {
+    const projected = projectEvidence({
+      sharedRefObservation: { schemaVersion: 1, ...tuple }
+    });
+    assert.deepEqual(projected.sharedRefObservation, { schemaVersion: 1, ...tuple });
+    assert.deepEqual(
+      schemaErrors(PROTOCOL_SCHEMA.$defs.sharedRefObservation, { schemaVersion: 1, ...tuple }),
+      []
+    );
+  }
+  assert.deepEqual(schemaErrors(PROTOCOL_SCHEMA.$defs.sharedRefIdentitySummary, baseIdentity), []);
+});
+
+test("task-relevant metadata identity public projections require lowercase SHA-256 (issue #34)", () => {
+  const validDigest = "a1b2c3d4e5f67890".repeat(4); // 64 lowercase hex chars
+  assert.equal(validDigest.length, 64);
+  assert.match(validDigest, /^[a-f0-9]{64}$/);
+
+  const baseContextIdentity = {
+    manifestId: "ctx-before",
+    digest: "c".repeat(64),
+    head: "d".repeat(40),
+    branch: "task-branch",
+    dirtyDigest: "e".repeat(64),
+    ignoredDigest: "f".repeat(64),
+    trackedTreeIdentity: "1".repeat(64),
+    metadataIdentity: "2".repeat(64)
+  };
+
+  // AC-1: valid lowercase digest projects unchanged on both public surfaces.
+  const validSnapshot = projectWorkerSnapshot(job({
+    status: "completed",
+    phase: "done",
+    request: {
+      publicObjective: "Public objective",
+      envelope: {
+        schemaVersion: 1,
+        envelopeId: "env-public",
+        digest: "a".repeat(64),
+        mode: "read",
+        scope: { include: [], exclude: [] },
+        nonGoals: [],
+        acceptanceCriteria: [],
+        requiredVerification: [],
+        expectedReturnFormat: "worker report",
+        contextManifestId: "ctx-public"
+      },
+      contextManifest: {
+        schemaVersion: 1,
+        manifestId: "ctx-public",
+        digest: "b".repeat(64),
+        capturedAt: "2026-07-15T00:00:00.000Z",
+        git: {
+          branch: "main",
+          head: "d".repeat(40),
+          dirtyDigest: "e".repeat(64),
+          dirtyEntryCount: 0,
+          ignoredDigest: "f".repeat(64),
+          ignoredEntryCount: 0,
+          trackedTreeIdentity: "1".repeat(64),
+          metadataIdentity: "2".repeat(64),
+          taskRelevantMetadataIdentity: validDigest,
+          insideWorktree: false,
+          linkedWorktree: false,
+          sparse: false,
+          shallow: false,
+          upstreamRef: null,
+          upstreamCommit: null,
+          upstreamFreshness: "not_checked"
+        },
+        projectMarkers: ["package.json"],
+        materialization: { state: "local_complete", reasons: [], submodules: [] }
+      }
+    },
+    result: {
+      hostVerification: "not_run",
+      runtimeEvidence: {
+        schemaVersion: 1,
+        preContext: {
+          ...baseContextIdentity,
+          taskRelevantMetadataIdentity: validDigest
+        },
+        postContext: {
+          ...baseContextIdentity,
+          manifestId: "ctx-after",
+          metadataIdentity: "4".repeat(64),
+          taskRelevantMetadataIdentity: validDigest
+        },
+        observedChangedPaths: [],
+        diffSummary: null,
+        commandOutcomes: [],
+        scopeViolations: [],
+        executionStatus: "completed",
+        hostVerification: "not_run"
+      }
+    }
+  }));
+
+  assert.equal(
+    validSnapshot.result.runtimeEvidence.preContext.taskRelevantMetadataIdentity,
+    validDigest
+  );
+  assert.equal(
+    validSnapshot.result.runtimeEvidence.postContext.taskRelevantMetadataIdentity,
+    validDigest
+  );
+  assert.equal(validSnapshot.context.taskRelevantMetadataIdentity, validDigest);
+  assert.equal(validSnapshot.context.metadataIdentity, "2".repeat(64));
+  assertConforms("WorkerSnapshot", validSnapshot);
+  assertConforms("WorkerResult", validSnapshot.result);
+  assertConforms("contextIdentity", validSnapshot.result.runtimeEvidence.preContext);
+  assertConforms("contextManifest", validSnapshot.context);
+  assert.deepEqual(
+    schemaErrors(PROTOCOL_SCHEMA.$defs.contextIdentity, {
+      ...baseContextIdentity,
+      taskRelevantMetadataIdentity: validDigest
+    }),
+    []
+  );
+  assert.deepEqual(
+    schemaErrors(PROTOCOL_SCHEMA.$defs.contextManifest, validSnapshot.context),
+    []
+  );
+
+  // AC-3: both schema defs require the digest pattern while remaining optional/nullable.
+  for (const definition of ["contextIdentity", "contextManifest"]) {
+    const property = PROTOCOL_SCHEMA.$defs[definition].properties.taskRelevantMetadataIdentity;
+    assert.equal(property.pattern, "^[a-f0-9]{64}$", `${definition} pattern`);
+    assert.deepEqual(property.type, ["string", "null"]);
+    assert.equal(
+      PROTOCOL_SCHEMA.$defs[definition].required.includes("taskRelevantMetadataIdentity"),
+      false,
+      `${definition} must keep the field optional`
+    );
+    assert.ok(
+      schemaErrors(PROTOCOL_SCHEMA.$defs[definition].properties.taskRelevantMetadataIdentity, null).length === 0,
+      `${definition} must accept null`
+    );
+    assert.ok(
+      schemaErrors(
+        PROTOCOL_SCHEMA.$defs[definition].properties.taskRelevantMetadataIdentity,
+        "NOT-A-DIGEST"
+      ).length > 0,
+      `${definition} must reject non-digest strings`
+    );
+    assert.ok(
+      schemaErrors(
+        PROTOCOL_SCHEMA.$defs[definition].properties.taskRelevantMetadataIdentity,
+        "A".repeat(64)
+      ).length > 0,
+      `${definition} must reject uppercase digests`
+    );
+  }
+
+  // AC-2: malformed values are omitted from both surfaces without post-sanitize promotion.
+  const malformedValues = [
+    "A".repeat(64), // uppercase
+    "not-a-digest",
+    "a".repeat(63),
+    "a".repeat(65),
+    `${"a".repeat(64)}\u0000`, // control-suffixed; sanitize would strip, raw must not promote
+    `${"a".repeat(64)} `, // trailing whitespace
+    ` ${"a".repeat(64)}`, // leading whitespace
+    12345, // non-string
+    null,
+    { digest: "a".repeat(64) },
+    true
+  ];
+
+  for (const malformed of malformedValues) {
+    const projected = projectWorkerSnapshot(job({
+      status: "completed",
+      phase: "done",
+      request: {
+        publicObjective: "Public objective",
+        envelope: {
+          schemaVersion: 1,
+          envelopeId: "env-public",
+          digest: "a".repeat(64),
+          mode: "read",
+          scope: { include: [], exclude: [] },
+          nonGoals: [],
+          acceptanceCriteria: [],
+          requiredVerification: [],
+          expectedReturnFormat: "worker report",
+          contextManifestId: "ctx-public"
+        },
+        contextManifest: {
+          schemaVersion: 1,
+          manifestId: "ctx-public",
+          digest: "b".repeat(64),
+          git: {
+            branch: "main",
+            head: "d".repeat(40),
+            dirtyDigest: "e".repeat(64),
+            dirtyEntryCount: 0,
+            ignoredDigest: "f".repeat(64),
+            ignoredEntryCount: 0,
+            trackedTreeIdentity: "1".repeat(64),
+            metadataIdentity: "2".repeat(64),
+            taskRelevantMetadataIdentity: malformed,
+            insideWorktree: false,
+            linkedWorktree: false,
+            sparse: false,
+            shallow: false
+          },
+          projectMarkers: ["package.json"],
+          materialization: { state: "local_complete" }
+        }
+      },
+      result: {
+        hostVerification: "not_run",
+        runtimeEvidence: {
+          schemaVersion: 1,
+          preContext: {
+            ...baseContextIdentity,
+            taskRelevantMetadataIdentity: malformed
+          },
+          postContext: {
+            ...baseContextIdentity,
+            manifestId: "ctx-after",
+            taskRelevantMetadataIdentity: malformed
+          },
+          observedChangedPaths: [],
+          diffSummary: null,
+          commandOutcomes: [],
+          scopeViolations: [],
+          executionStatus: "completed",
+          hostVerification: "not_run"
+        }
+      }
+    }));
+
+    const label = JSON.stringify(malformed);
+    assert.equal(
+      Object.hasOwn(projected.result.runtimeEvidence.preContext, "taskRelevantMetadataIdentity"),
+      false,
+      `preContext must omit malformed ${label}`
+    );
+    assert.equal(
+      Object.hasOwn(projected.result.runtimeEvidence.postContext, "taskRelevantMetadataIdentity"),
+      false,
+      `postContext must omit malformed ${label}`
+    );
+    assert.equal(
+      Object.hasOwn(projected.context, "taskRelevantMetadataIdentity"),
+      false,
+      `snapshot context must omit malformed ${label}`
+    );
+    // Legacy metadataIdentity still projects when present as text.
+    assert.equal(projected.context.metadataIdentity, "2".repeat(64));
+    assertConforms("WorkerSnapshot", projected);
+    assertConforms("WorkerResult", projected.result);
+  }
+
+  // Absence remains optional: legacy snapshots without the field still project cleanly.
+  const legacy = projectWorkerSnapshot(job({
+    status: "completed",
+    phase: "done",
+    request: {
+      publicObjective: "Public objective",
+      envelope: {
+        schemaVersion: 1,
+        envelopeId: "env-public",
+        digest: "a".repeat(64),
+        mode: "read",
+        scope: { include: [], exclude: [] },
+        nonGoals: [],
+        acceptanceCriteria: [],
+        requiredVerification: [],
+        expectedReturnFormat: "worker report",
+        contextManifestId: "ctx-public"
+      },
+      contextManifest: {
+        schemaVersion: 1,
+        manifestId: "ctx-public",
+        digest: "b".repeat(64),
+        git: {
+          branch: "main",
+          head: "d".repeat(40),
+          dirtyDigest: "e".repeat(64),
+          dirtyEntryCount: 0,
+          ignoredDigest: "f".repeat(64),
+          ignoredEntryCount: 0,
+          trackedTreeIdentity: "1".repeat(64),
+          metadataIdentity: "2".repeat(64),
+          insideWorktree: false,
+          linkedWorktree: false,
+          sparse: false,
+          shallow: false
+        },
+        projectMarkers: ["package.json"],
+        materialization: { state: "local_complete" }
+      }
+    },
+    result: {
+      hostVerification: "not_run",
+      runtimeEvidence: {
+        schemaVersion: 1,
+        preContext: { ...baseContextIdentity },
+        postContext: { ...baseContextIdentity, manifestId: "ctx-after" },
+        observedChangedPaths: [],
+        diffSummary: null,
+        commandOutcomes: [],
+        scopeViolations: [],
+        executionStatus: "completed",
+        hostVerification: "not_run"
+      }
+    }
+  }));
+  assert.equal(Object.hasOwn(legacy.result.runtimeEvidence.preContext, "taskRelevantMetadataIdentity"), false);
+  assert.equal(Object.hasOwn(legacy.context, "taskRelevantMetadataIdentity"), false);
+  assert.equal(legacy.context.metadataIdentity, "2".repeat(64));
+  assertConforms("WorkerSnapshot", legacy);
 });
 
 test("public path projections reject URI-shaped and absolute path disguises", () => {

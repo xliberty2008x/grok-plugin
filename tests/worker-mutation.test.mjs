@@ -8,9 +8,15 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
+  assertContextCompatible,
+  assertContextManifestIntegrity,
   assertTaskEnvelope,
+  buildRuntimeEvidence,
   buildTaskEnvelope,
-  captureContextManifest
+  captureContextManifest,
+  CONTEXT_METADATA_POLICIES,
+  evaluateScope,
+  observeChangedPaths
 } from "../plugins/grok/scripts/lib/task-contract.mjs";
 import {
   createWorkerAuthorization,
@@ -22,6 +28,7 @@ import {
   activateWriteProvisioningAttempt,
   authorizeReadyWriteWorkerDispatch,
   assertDurableSpawnRequestBinding,
+  assertWorkerProviderLaunchPreparation,
   assertWriteExecutionJob,
   adoptWriteProvisioningEffect,
   cancelWorker,
@@ -36,6 +43,7 @@ import {
   recordWriteProvisionerNoChild,
   retainWriteProvisioningCleanupPending,
   settleProviderStartedWorkerFinalization,
+  settleStartedWorkerLoss,
   settleWriteArtifactAfterRuntimeCleanup,
   spawnReadOnlyWorker,
   SPAWN_SUCCESS_DEFINITION,
@@ -53,6 +61,7 @@ import {
 } from "../plugins/grok/scripts/lib/worker-context.mjs";
 import { reconcileOwnedWorkers } from "../plugins/grok/scripts/lib/worker-reconcile.mjs";
 import { createWorkerService } from "../plugins/grok/scripts/lib/worker-service.mjs";
+import { launchCommittedWorker } from "../plugins/grok/scripts/lib/worker-runtime.mjs";
 import {
   callWorkerTool,
   createMcpBrokerRuntime,
@@ -92,10 +101,20 @@ import {
   workspaceStateSegment
 } from "../plugins/grok/scripts/lib/workspace.mjs";
 import {
-  createWorkerWorktree
+  createWorkerWorktree,
+  workerWorktreeSlug
 } from "../plugins/grok/scripts/lib/worker-worktree.mjs";
 import { provisionWriteWorkerWorktree } from "../plugins/grok/scripts/lib/worker-provisioner.mjs";
-import { git, initRepo, tempDir, waitFor } from "./helpers.mjs";
+import { installFakeGrok } from "./fake-grok.mjs";
+import {
+  git,
+  initRepo,
+  run,
+  runCompanion,
+  tempDir,
+  testEnvironment,
+  waitFor
+} from "./helpers.mjs";
 
 const THREAD = "019f666a-6469-7cc1-9a8d-8c1adf61e103";
 const THREAD_B = "019f666b-1e72-74b1-b27c-9d186d7f1016";
@@ -213,6 +232,26 @@ function stableDigest(value) {
     .digest("hex");
 }
 
+function legacyContextManifest(manifest) {
+  const body = structuredClone(manifest);
+  const capturedAt = body.capturedAt;
+  delete body.manifestId;
+  delete body.digest;
+  delete body.capturedAt;
+  body.schemaVersion = 1;
+  // Genuine historical v1 records predate issue #34's task-relevant/shared-ref
+  // identity split. Keeping these fields would only relabel a v2 record.
+  delete body.git.taskRelevantMetadataIdentity;
+  delete body.git.sharedRefIdentity;
+  const digest = stableDigest(body);
+  return {
+    ...body,
+    manifestId: `ctx-${digest.slice(0, 24)}`,
+    digest,
+    capturedAt
+  };
+}
+
 function spawnResponseWitnessBody(witness) {
   const { witnessId: _witnessId, ...body } = witness;
   return body;
@@ -278,7 +317,8 @@ function plannedWriteVerticalFixture(label) {
   const envelope = buildTaskEnvelope({
     userRequest: `Edit target.txt for ${label}`,
     mode: "write",
-    scope: { include: ["target.txt"], exclude: [] }
+    scope: { include: ["target.txt"], exclude: [] },
+    requiredVerification: ["git diff --check"]
   });
   const admitted = admitWriteWorkerPlan({
     root,
@@ -3360,23 +3400,31 @@ test("official worktree receipt and cleanup proof promote only verified-worktree
   );
   fs.unlinkSync(guardFile);
 
-  git(fixture.root, "update-index", "--assume-unchanged", "tracked.txt");
-  assert.throws(
-    () => promoteWriteWorkerReady({
-      root: fixture.root,
-      principal: principal(fixture.root),
-      workerId: fixture.workerId,
-      executionBindingDigest: fixture.binding.bindingDigest,
-      expectedJournalDigest: activated.job.provisioning.journalDigest,
-      ...fixture.actor,
-      providerSpawnIntentId: prepared.intent.intentId,
-      executionContextManifest,
-      cleanupProof,
-      env: fixture.env
-    }),
-    (error) => ["E_SCOPE_VIOLATION", "E_INTEGRATION"].includes(error?.code)
-  );
-  git(fixture.root, "update-index", "--no-assume-unchanged", "tracked.txt");
+  const unsafeIndexPromoteArgs = {
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId: fixture.workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: prepared.intent.intentId,
+    executionContextManifest,
+    cleanupProof,
+    env: fixture.env
+  };
+  for (const [enable, disable] of [
+    ["--assume-unchanged", "--no-assume-unchanged"],
+    ["--skip-worktree", "--no-skip-worktree"]
+  ]) {
+    git(fixture.root, "update-index", enable, "tracked.txt");
+    assert.throws(
+      () => promoteWriteWorkerReady(unsafeIndexPromoteArgs),
+      (error) => error?.code === "E_SCOPE_VIOLATION"
+        && /unsafe Git index state/i.test(error.message)
+        && !/tracked\.txt|assume-unchanged|skip-worktree/i.test(error.message)
+    );
+    git(fixture.root, "update-index", disable, "tracked.txt");
+  }
 
   const parentTracked = path.join(fixture.root, "tracked.txt");
   const parentContents = fs.readFileSync(parentTracked, "utf8");
@@ -3395,6 +3443,8 @@ test("official worktree receipt and cleanup proof promote only verified-worktree
       env: fixture.env
     }),
     (error) => ["E_CONTEXT_DRIFT", "E_INTEGRATION"].includes(error?.code)
+      && error?.code !== "E_SCOPE_VIOLATION"
+      && !/unsafe Git index state/i.test(error.message)
   );
   fs.writeFileSync(parentTracked, parentContents);
 
@@ -3465,6 +3515,17 @@ test("official worktree receipt and cleanup proof promote only verified-worktree
   ]) assert.equal(Object.hasOwn(promoted.job.request, field), false, field);
   assert.doesNotThrow(() => assertWriteExecutionJob(promoted.job, fixture.env));
 
+  // Ready replay retains the immutable stored execution authority while a
+  // fresh, semantically compatible capture can include unrelated shared-ref
+  // churn and a different authenticated capture time/identity.
+  git(
+    fixture.root,
+    "update-ref",
+    "refs/codex/turn-diffs/ready-replay-fresh-capture",
+    fixture.binding.baseCommit
+  );
+  const freshReplayContext = captureContextManifest(official.executionRoot);
+  assert.notEqual(freshReplayContext.digest, executionContextManifest.digest);
   const replay = promoteWriteWorkerReady({
     root: fixture.root,
     principal: principal(fixture.root),
@@ -3473,7 +3534,7 @@ test("official worktree receipt and cleanup proof promote only verified-worktree
     expectedJournalDigest: activated.job.provisioning.journalDigest,
     ...fixture.actor,
     providerSpawnIntentId: prepared.intent.intentId,
-    executionContextManifest,
+    executionContextManifest: freshReplayContext,
     cleanupProof,
     readyAt,
     env: fixture.env
@@ -3550,7 +3611,7 @@ test("write artifact rejection runs cleanup first and becomes one bounded failur
   assert.equal(persisted, false);
 });
 
-test("verified target.txt worktree atomically gains one exact dispatch-v2 authorization", {
+test("generation-1 immutable authority rejects corruption; verified target.txt worktree rejects legacy capturedAt and gains one exact dispatch-v2 authorization", {
   skip: process.platform === "win32"
 }, async (t) => {
   const fixture = plannedWriteVerticalFixture("ready-dispatch");
@@ -3602,6 +3663,30 @@ test("verified target.txt worktree atomically gains one exact dispatch-v2 author
     Date.parse(executionContextManifest.capturedAt) + 1,
     Date.parse(observedAt) + 1
   )).toISOString();
+  const cleanupProof = {
+    processIdentity: active.identity,
+    processGroupGone: true,
+    providerGuardAbsent: true,
+    observedAt
+  };
+  assert.throws(
+    () => promoteWriteWorkerReady({
+      root: fixture.root,
+      principal: principal(fixture.root),
+      workerId: fixture.workerId,
+      executionBindingDigest: fixture.binding.bindingDigest,
+      expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+      ...fixture.actor,
+      providerSpawnIntentId: active.prepared.intent.intentId,
+      executionContextManifest: legacyContextManifest(
+        executionContextManifest
+      ),
+      cleanupProof,
+      readyAt,
+      env: fixture.env
+    }),
+    (error) => error?.code === "E_CONTEXT_DRIFT"
+  );
   promoteWriteWorkerReady({
     root: fixture.root,
     principal: principal(fixture.root),
@@ -3611,12 +3696,7 @@ test("verified target.txt worktree atomically gains one exact dispatch-v2 author
     ...fixture.actor,
     providerSpawnIntentId: active.prepared.intent.intentId,
     executionContextManifest,
-    cleanupProof: {
-      processIdentity: active.identity,
-      processGroupGone: true,
-      providerGuardAbsent: true,
-      observedAt
-    },
+    cleanupProof,
     readyAt,
     env: fixture.env
   });
@@ -3657,6 +3737,155 @@ test("verified target.txt worktree atomically gains one exact dispatch-v2 author
   assert.doesNotThrow(() => (
     assertDurableSpawnRequestBinding(authorized.job, fixture.env)
   ));
+
+  for (const { name, mutate } of [
+    {
+      name: "executionBinding.scope",
+      mutate(job) {
+        job.executionBinding.scope = {
+          include: ["outside.txt"],
+          exclude: []
+        };
+      }
+    },
+    {
+      name: "provisioning.state",
+      mutate(job) {
+        job.provisioning.state = "planned";
+      }
+    },
+    {
+      name: "provisioningRuntime manifest-record digest",
+      mutate(job) {
+        job.provisioningRuntime.executionContextManifestRecordDigest =
+          "0".repeat(64);
+      }
+    },
+    {
+      name: "partial managed authority",
+      mutate(job) {
+        delete job.provisioningRuntime;
+      }
+    },
+    {
+      name: "dispatch downgrade with retained authority",
+      mutate(job) {
+        job.request.spawn.dispatch.schemaVersion = 1;
+      }
+    },
+    {
+      name: "missing admissionRequestDigest",
+      mutate(job) {
+        delete job.request.spawn.admissionRequestDigest;
+      }
+    },
+    {
+      name: "mismatched admissionRequestDigest",
+      mutate(job) {
+        job.request.spawn.admissionRequestDigest = "0".repeat(64);
+      }
+    },
+    {
+      name: "missing writeLifecycleCapabilityDigest",
+      mutate(job) {
+        delete job.request.spawn.writeLifecycleCapabilityDigest;
+      }
+    },
+    {
+      name: "mismatched write lifecycle capability",
+      mutate(job) {
+        job.request.spawn.writeLifecycleCapabilityDigest = "d".repeat(64);
+      }
+    },
+    {
+      name: "missing provider capability",
+      mutate(job) {
+        delete job.request.spawn.providerCapabilityDigest;
+      }
+    },
+    {
+      name: "mismatched retained control workspace",
+      mutate(job) {
+        job.controlWorkspaceId = `cws-${"0".repeat(32)}`;
+      }
+    },
+    {
+      name: "mismatched provider launch binding digest",
+      mutate(job) {
+        job.request.spawn.providerLaunchBindingDigest = "0".repeat(64);
+      }
+    },
+    {
+      name: "mismatched retained admission envelope",
+      mutate(job) {
+        job.request.envelope.digest = "0".repeat(64);
+      }
+    },
+    {
+      name: "prematurely privacy-scrubbed admission envelope",
+      mutate(job) {
+        const literal = job.request.envelope.userRequest;
+        const userRequestDigest = crypto
+          .createHash("sha256")
+          .update(literal)
+          .digest("hex");
+        job.request.envelope.userRequest = null;
+        job.request.envelope.userRequestDigest = userRequestDigest;
+        if (job.request.envelope.objective === literal) {
+          job.request.envelope.objective = userRequestDigest;
+        }
+        if (job.request.publicObjective === literal) {
+          job.request.publicObjective = null;
+        }
+      }
+    }
+  ]) {
+    const corrupted = structuredClone(authorized.job);
+    mutate(corrupted);
+    assert.throws(
+      () => assertWorkerProviderLaunchPreparation(
+        corrupted,
+        {
+          providerGeneration: 1,
+          env: fixture.env
+        }
+      ),
+      (error) => error?.code !== undefined
+        && !String(error.message).includes(official.executionRoot),
+      name
+    );
+  }
+
+  // Dispatch-v2 alone is not provider authority. Before the exact generation
+  // reaches provider-started, intended-scope dirtiness is still untrusted.
+  const executionTarget = path.join(official.executionRoot, "target.txt");
+  const executionTargetBefore = fs.readFileSync(executionTarget);
+  fs.writeFileSync(executionTarget, "pre-provider mutation\n", "utf8");
+  try {
+    assert.throws(
+      () => authorizeReadyWriteWorkerDispatch({
+        root: fixture.root,
+        principal: authority,
+        workerId: fixture.workerId,
+        writeLifecycleCapabilityDigest: capability,
+        validateWriteLifecycleCapability: () => capability,
+        env: fixture.env
+      }),
+      (error) => error?.code === "E_CONTEXT_DRIFT"
+    );
+    assert.throws(
+      () => assertWorkerProviderLaunchPreparation(
+        tryReadJob(fixture.root, fixture.workerId, fixture.env),
+        {
+          providerGeneration: 1,
+          env: fixture.env
+        }
+      ),
+      (error) => error?.code === "E_CONTEXT_DRIFT"
+    );
+  } finally {
+    fs.writeFileSync(executionTarget, executionTargetBefore);
+  }
 
   const authorizationId = authorized.job.workerAuthorization.authorizationId;
   const dispatchDigest = stableDigest(authorized.job.request.spawn.dispatch);
@@ -3708,7 +3937,7 @@ test("verified target.txt worktree atomically gains one exact dispatch-v2 author
   );
 });
 
-test("exact write spawn replay returns the original handle after dispatch and terminal state", {
+test("issue #34 lifecycle exact write spawn replay returns the original handle after dispatch and terminal state", {
   skip: process.platform === "win32"
 }, async (t) => {
   const fixture = plannedWriteVerticalFixture("dispatched-spawn-replay");
@@ -3726,6 +3955,9 @@ test("exact write spawn replay returns the original handle after dispatch and te
     env: fixture.env
   };
   const workerId = fixture.workerId;
+  const storedAdmissionBefore = assertContextManifestIntegrity(
+    tryReadJob(fixture.root, workerId, fixture.env).request.admissionContextManifest
+  );
   const active = await activateRegisteredProvisioning(t, fixture);
   const official = createWorkerWorktree({
     controlRoot: fixture.root,
@@ -3765,6 +3997,7 @@ test("exact write spawn replay returns the original handle after dispatch and te
     intervalMs: 25
   });
   const executionContextManifest = captureContextManifest(official.executionRoot);
+  const storedExecutionBefore = assertContextManifestIntegrity(executionContextManifest);
   const observedAt = new Date(
     Math.max(Date.now(), Date.parse(receivedAt) + 1)
   ).toISOString();
@@ -3793,6 +4026,10 @@ test("exact write spawn replay returns the original handle after dispatch and te
     env: fixture.env
   });
 
+  // AC-4: unrelated control local branch churn after ready, before authorization.
+  const controlHead = git(fixture.root, "rev-parse", "HEAD");
+  git(fixture.root, "branch", "issue34-unrelated-control", controlHead);
+
   const authority = brokerPrincipal(fixture.root);
   const authorized = authorizeReadyWriteWorkerDispatch({
     root: fixture.root,
@@ -3805,10 +4042,41 @@ test("exact write spawn replay returns the original handle after dispatch and te
   assert.equal(authorized.authorized, true);
   assert.equal(authorized.job.request.spawn.dispatch.schemaVersion, 2);
   assert.equal(authorized.job.request.spawn.dispatch.state, "pending");
+  assert.equal(
+    authorized.job.request.admissionContextManifest.manifestId,
+    storedAdmissionBefore.manifestId
+  );
+  assert.equal(
+    authorized.job.request.admissionContextManifest.digest,
+    storedAdmissionBefore.digest
+  );
+  assert.equal(
+    authorized.job.request.contextManifest.manifestId,
+    storedExecutionBefore.manifestId
+  );
+  assert.equal(
+    authorized.job.request.contextManifest.digest,
+    storedExecutionBefore.digest
+  );
+  assert.equal(
+    authorized.job.provisioning.executionContextManifestId,
+    storedExecutionBefore.manifestId
+  );
   const journalDigestBeforeReplay = authorized.job.provisioning.journalDigest;
   const lifecycleBeforeReplay = authorized.job.lifecycleEvents.length;
 
   // A pre-provider dispatch replay remains exact without changing launch state.
+  const preProviderTarget = path.join(official.executionRoot, "target.txt");
+  const preProviderTargetBefore = fs.readFileSync(preProviderTarget);
+  fs.writeFileSync(preProviderTarget, "untrusted pre-provider edit\n", "utf8");
+  try {
+    assert.throws(
+      () => spawnReadOnlyWorker(spawnRequest),
+      (error) => error?.code === "E_CONTEXT_DRIFT"
+    );
+  } finally {
+    fs.writeFileSync(preProviderTarget, preProviderTargetBefore);
+  }
   const dispatchedReplay = spawnReadOnlyWorker(spawnRequest);
   assert.equal(dispatchedReplay.replayed, true);
   assert.equal(dispatchedReplay.handle.id, workerId);
@@ -3820,146 +4088,196 @@ test("exact write spawn replay returns the original handle after dispatch and te
   assert.equal(afterDispatchedReplay.request.spawn.dispatch.state, "pending");
   assert.doesNotThrow(() => assertDispatchContract(afterDispatchedReplay));
 
-  const claim = claimWorkerDispatch({
+  const workerReport = `GROK_WORKER_REPORT: ${JSON.stringify({
+    outcome: "complete",
+    summary: "Write vertical completed",
+    changedFiles: ["target.txt"],
+    checksClaimed: [],
+    acceptanceResults: fixture.envelope.acceptanceCriteria.map(
+      ({ id }) => ({ id, status: "met" })
+    ),
+    risks: [],
+    questions: []
+  })}`;
+  const fake = installFakeGrok(
+    tempDir("grok-issue34-real-vertical-"),
+    {
+      taskText: workerReport,
+      taskMutatePath: path.join(official.executionRoot, "target.txt"),
+      taskMutation: "after\n",
+      delayMs: 20_000
+    }
+  );
+  const lifecycleEnv = testEnvironment({
+    fake,
+    pluginData: fixture.env.GROK_COMPANION_PLUGIN_DATA,
+    sessionId: THREAD,
+    extra: {
+      ...fixture.env,
+      GROK_COMPANION_HOST: "codex",
+      GROK_COMPANION_HOST_SESSION_ID: THREAD,
+      CODEX_THREAD_ID: THREAD,
+      GROK_COMPANION_PLUGIN_DATA:
+        fixture.env.GROK_COMPANION_PLUGIN_DATA
+    }
+  });
+  delete lifecycleEnv.GROK_COMPANION_CHILD;
+  delete lifecycleEnv.GROK_COMPANION_JOB_MARKER;
+  delete lifecycleEnv.GROK_AGENT;
+  delete lifecycleEnv.GROK_LEADER_SOCKET;
+
+  const launched = launchCommittedWorker({
+    root: fixture.root,
+    workerId,
+    principal: { hostKind: "codex", threadId: THREAD },
+    env: lifecycleEnv
+  });
+  assert.equal(launched.claimed, true);
+  await waitFor(() => {
+    const current = tryReadJob(fixture.root, workerId, lifecycleEnv);
+    return current?.request?.spawn?.dispatch?.state === "provider-started"
+      ? current
+      : null;
+  }, { timeoutMs: 20_000, intervalMs: 25 });
+
+  // Mutate unrelated shared refs only after the provider generation starts.
+  git(
+    fixture.root,
+    "update-ref",
+    "refs/heads/issue34-provider-local",
+    controlHead
+  );
+  git(
+    fixture.root,
+    "update-ref",
+    "refs/remotes/origin/issue34-provider-remote",
+    controlHead
+  );
+  git(
+    fixture.root,
+    "update-ref",
+    "refs/codex/turn-diffs/issue34-provider-started",
+    controlHead
+  );
+  await waitFor(
+    () => fs.readFileSync(
+      path.join(official.executionRoot, "target.txt"),
+      "utf8"
+    ) === "after\n",
+    { timeoutMs: 10_000, intervalMs: 25 }
+  );
+
+  const activeProviderReplay = authorizeReadyWriteWorkerDispatch({
     root: fixture.root,
     principal: authority,
     workerId,
-    env: fixture.env
+    writeLifecycleCapabilityDigest,
+    validateWriteLifecycleCapability: () => writeLifecycleCapabilityDigest,
+    env: lifecycleEnv
   });
-  const dispatchChildren = [];
-  const startDispatchProcess = async (kind, extra = {}) => {
-    const child = spawnProcess(
-      process.execPath,
-      ["-e", "setInterval(() => {}, 1000)", workerId, kind],
-      { detached: true, stdio: "ignore" }
-    );
-    dispatchChildren.push(child);
-    return {
-      pid: child.pid,
-      startToken: await waitFor(() => processStartToken(child.pid), {
-        timeoutMs: 5_000,
-        intervalMs: 25
-      }),
-      processGroupId: child.pid,
-      nonce: claim.nonce,
-      commandMarker: workerId,
-      dispatchAttemptId: claim.attemptId,
-      dispatchFence: claim.fence,
-      ...extra
-    };
-  };
-  t.after(async () => {
-    for (const child of dispatchChildren) {
-      try { process.kill(-child.pid, "SIGKILL"); } catch {}
-    }
-  });
-  const controllerProcess = await startDispatchProcess("controller");
-  const workerProcess = await startDispatchProcess("worker");
-  const providerProcess = await startDispatchProcess("provider", {
-    providerGeneration: 1
-  });
-  const controllerIntent = prepareDispatchProcessSpawn({
-    root: fixture.root,
-    workerId,
-    attemptId: claim.attemptId,
-    fence: claim.fence,
-    processKind: "controller",
-    nonce: claim.nonce,
-    env: fixture.env
-  }).intent;
-  transitionWorkerDispatch({
-    root: fixture.root,
-    workerId,
-    attemptId: claim.attemptId,
-    fence: claim.fence,
-    state: "controller-started",
-    controllerProcess,
-    spawnIntentId: controllerIntent.intentId,
-    env: fixture.env
-  });
-  const workerIntent = prepareDispatchProcessSpawn({
-    root: fixture.root,
-    workerId,
-    attemptId: claim.attemptId,
-    fence: claim.fence,
-    processKind: "worker",
-    nonce: claim.nonce,
-    env: fixture.env
-  }).intent;
-  transitionWorkerDispatch({
-    root: fixture.root,
-    workerId,
-    attemptId: claim.attemptId,
-    fence: claim.fence,
-    state: "worker-started",
-    workerProcess,
-    spawnIntentId: workerIntent.intentId,
-    env: fixture.env
-  });
-  transitionWorkerDispatch({
-    root: fixture.root,
-    workerId,
-    attemptId: claim.attemptId,
-    fence: claim.fence,
-    state: "provider-started",
-    providerProcess,
-    env: fixture.env
-  });
-  const completedAt = new Date().toISOString();
-  updateJob(fixture.root, workerId, (job) => ({
-    ...job,
-    status: "running",
-    phase: "finalizing",
-    grokSessionId: "77777777-7777-4777-8777-777777777777",
-    workerAuthorization: null,
-    pendingTerminal: {
-      status: "completed",
-      phase: "done",
-      completedAt,
-      error: null,
-      summary: "Write vertical completed"
-    },
-    result: {
-      ...(job.result || {}),
-      hostVerification: "not_run",
-      taskRuntimeCleaned: false
-    },
-    request: {
-      ...job.request,
-      spawn: {
-        ...job.request.spawn,
-        consumedLaunchContractDigest:
-          job.workerAuthorization.launchContractDigest,
-        launchContractConsumedAt: new Date().toISOString()
-      }
-    }
-  }), fixture.env);
-  // From this point the live provider owns the scoped worktree. Its intended
-  // edit must not trigger acceptance-time context recomputation on replay.
-  fs.writeFileSync(
-    path.join(official.executionRoot, "target.txt"),
-    "after\n",
-    "utf8"
-  );
-  const activeProviderReplay = spawnReadOnlyWorker(spawnRequest);
+  assert.equal(activeProviderReplay.authorized, false);
   assert.equal(activeProviderReplay.replayed, true);
-  assert.equal(activeProviderReplay.handle.id, workerId);
-  assert.equal(activeProviderReplay.handle.status, "running");
-  assert.equal(activeProviderReplay.providerLaunched, false);
-  process.kill(-dispatchChildren.at(-1).pid, "SIGKILL");
-  await waitFor(() => processGroupGone(providerProcess), {
-    timeoutMs: 5_000,
-    intervalMs: 25
-  });
-  const terminalJob = settleProviderStartedWorkerFinalization({
+  assert.equal(activeProviderReplay.job.id, workerId);
+
+  const replayAuthorization = () => authorizeReadyWriteWorkerDispatch({
     root: fixture.root,
+    principal: authority,
     workerId,
-    attemptId: claim.attemptId,
-    workerProcess,
-    providerProcess,
-    runtimeCleanup: () => ({ ok: true }),
-    env: fixture.env
+    writeLifecycleCapabilityDigest,
+    validateWriteLifecycleCapability: () => writeLifecycleCapabilityDigest,
+    env: lifecycleEnv
   });
+  const expectRejectedReplay = (mutate, restore, acceptedCodes) => {
+    mutate();
+    try {
+      assert.throws(
+        replayAuthorization,
+        (error) => acceptedCodes.includes(error?.code)
+      );
+      assert.throws(
+        () => spawnReadOnlyWorker(spawnRequest),
+        (error) => acceptedCodes.includes(error?.code)
+      );
+    } finally {
+      restore();
+    }
+  };
+
+  const sharedConfig = path.join(fixture.root, ".git", "config");
+  const sharedConfigBefore = fs.readFileSync(sharedConfig);
+  expectRejectedReplay(
+    () => fs.appendFileSync(
+      sharedConfig,
+      "\n[grok-issue34-post-provider]\n\tvalue = reject\n"
+    ),
+    () => fs.writeFileSync(sharedConfig, sharedConfigBefore),
+    ["E_CONTEXT_DRIFT", "E_INTEGRATION"]
+  );
+
+  const sharedHooks = path.join(fixture.root, ".git", "hooks");
+  fs.mkdirSync(sharedHooks, { recursive: true });
+  const postProviderHook = path.join(sharedHooks, "pre-commit");
+  const hookExisted = fs.existsSync(postProviderHook);
+  const hookBefore = hookExisted ? fs.readFileSync(postProviderHook) : null;
+  const hookMode = hookExisted ? fs.statSync(postProviderHook).mode & 0o777 : null;
+  expectRejectedReplay(
+    () => fs.writeFileSync(
+      postProviderHook,
+      "#!/bin/sh\nexit 1\n",
+      { mode: 0o755 }
+    ),
+    () => {
+      if (hookExisted) {
+        fs.writeFileSync(postProviderHook, hookBefore, { mode: hookMode });
+      } else {
+        fs.unlinkSync(postProviderHook);
+      }
+    },
+    ["E_CONTEXT_DRIFT", "E_INTEGRATION"]
+  );
+
+  const baseParent = git(
+    official.executionRoot,
+    "rev-parse",
+    `${controlHead}^`
+  );
+  expectRejectedReplay(
+    () => git(official.executionRoot, "update-ref", "HEAD", baseParent),
+    () => git(official.executionRoot, "update-ref", "HEAD", controlHead),
+    ["E_CONTEXT_DRIFT", "E_WORKTREE"]
+  );
+
+  expectRejectedReplay(
+    () => git(official.executionRoot, "add", "target.txt"),
+    () => git(official.executionRoot, "reset", "HEAD", "--", "target.txt"),
+    ["E_CONTEXT_DRIFT", "E_SCOPE_VIOLATION"]
+  );
+
+  const executionGitDir = path.resolve(
+    official.executionRoot,
+    git(official.executionRoot, "rev-parse", "--git-dir")
+  );
+  const mergeRr = path.join(executionGitDir, "MERGE_RR");
+  expectRejectedReplay(
+    () => fs.writeFileSync(mergeRr, "post-provider-operational-state\n"),
+    () => fs.unlinkSync(mergeRr),
+    ["E_CONTEXT_DRIFT"]
+  );
+
+  const outOfScope = path.join(official.executionRoot, "outside.txt");
+  expectRejectedReplay(
+    () => fs.writeFileSync(outOfScope, "outside\n"),
+    () => fs.unlinkSync(outOfScope),
+    ["E_SCOPE_VIOLATION"]
+  );
+  assert.equal(replayAuthorization().replayed, true);
+
+  const terminalJob = await waitFor(() => {
+    const current = tryReadJob(fixture.root, workerId, lifecycleEnv);
+    return ["completed", "failed", "cancelled"].includes(current?.status)
+      ? current
+      : null;
+  }, { timeoutMs: 30_000, intervalMs: 50 });
   assert.equal(terminalJob.status, "completed");
   assert.equal(
     terminalJob.request.spawn.dispatch.state,
@@ -3970,8 +4288,104 @@ test("exact write spawn replay returns the original handle after dispatch and te
     terminalJob.result.writeArtifact.contentDigest,
     crypto.createHash("sha256").update("after\n").digest("hex")
   );
+  assert.equal(terminalJob.result.writeArtifact.path, "target.txt");
+  assert.ok(terminalJob.completionContextManifest);
+  assert.equal(terminalJob.result.runtimeEvidence.scopeViolations.length, 0);
+  assert.ok(
+    terminalJob.result.runtimeEvidence.observedChangedPaths.includes(
+      "target.txt"
+    )
+  );
+  assert.deepEqual(terminalJob.result.runtimeEvidence.sharedRefObservation, {
+    schemaVersion: 1,
+    classification: "tolerated_unrelated_shared_refs",
+    toleratedUnrelatedSharedRefChurn: true,
+    taskRelevantMetadataDrift: false
+  });
+  assert.equal(
+    terminalJob.result.hostVerification,
+    "not_run",
+    "runtime never self-attests host verification"
+  );
+  assert.equal(
+    fs.readFileSync(path.join(official.executionRoot, "target.txt"), "utf8"),
+    "after\n"
+  );
+  assert.equal(
+    terminalJob.request.admissionContextManifest.manifestId,
+    storedAdmissionBefore.manifestId
+  );
+  assert.equal(
+    terminalJob.request.contextManifest.manifestId,
+    storedExecutionBefore.manifestId
+  );
   assert.doesNotThrow(() => assertDispatchContract(terminalJob));
 
+  // Host verification may legitimately generate or adjust an in-scope tracked
+  // file. The stored verification baseline, not the older completion capture,
+  // becomes the live terminal-replay baseline after scope validation.
+  fs.writeFileSync(
+    path.join(official.executionRoot, "target.txt"),
+    "verification-adjusted\n",
+    "utf8"
+  );
+  const diffCheck = run(
+    "git",
+    ["diff", "--check"],
+    { cwd: official.executionRoot, env: lifecycleEnv }
+  );
+  assert.equal(diffCheck.status, 0, diffCheck.stderr);
+  const verificationRun = runCompanion(
+    [
+      "record-verification",
+      workerId,
+      "--verification-stdin",
+      "--json"
+    ],
+    {
+      cwd: official.executionRoot,
+      env: lifecycleEnv,
+      input: JSON.stringify({
+        commandOutcomes: [{
+          command: "git diff --check",
+          status: "passed",
+          exitCode: 0
+        }]
+      })
+    }
+  );
+  assert.equal(
+    verificationRun.status,
+    0,
+    `record-verification failed\nstdout: ${verificationRun.stdout}\nstderr: ${verificationRun.stderr}`
+  );
+  const verifiedTerminalJob = tryReadJob(
+    fixture.root,
+    workerId,
+    lifecycleEnv
+  );
+  assert.equal(verifiedTerminalJob.result.hostVerification, "passed");
+  assert.ok(verifiedTerminalJob.verificationContextManifest);
+  assert.deepEqual(
+    verifiedTerminalJob.result.verification.observedChangedPaths,
+    ["target.txt"]
+  );
+  assert.deepEqual(verifiedTerminalJob.commandOutcomes, [{
+    command: "git diff --check",
+    status: "passed",
+    exitCode: 0
+  }]);
+
+  fs.writeFileSync(outOfScope, "terminal replay drift\n", "utf8");
+  try {
+    assert.throws(
+      () => spawnReadOnlyWorker(spawnRequest),
+      (error) => error?.code === "E_CONTEXT_DRIFT"
+        || error?.code === "E_SCOPE_VIOLATION"
+    );
+  } finally {
+    fs.unlinkSync(outOfScope);
+  }
   const terminalReplay = spawnReadOnlyWorker(spawnRequest);
   assert.equal(terminalReplay.replayed, true);
   assert.equal(terminalReplay.handle.id, workerId);
@@ -3981,6 +4395,14 @@ test("exact write spawn replay returns the original handle after dispatch and te
   assert.equal(afterTerminalReplay.status, "completed");
   assert.equal(afterTerminalReplay.provisioning.journalDigest, journalDigestBeforeReplay);
   assert.equal(listJobs(fixture.root, fixture.env).length, 1);
+  assert.equal(
+    afterTerminalReplay.request.admissionContextManifest.digest,
+    storedAdmissionBefore.digest
+  );
+  assert.equal(
+    afterTerminalReplay.request.contextManifest.digest,
+    storedExecutionBefore.digest
+  );
 
   const recordFile = spawnIdempotencyFile(fixture.root, idempotencyKey, fixture.env);
   fs.unlinkSync(recordFile);
@@ -4095,6 +4517,332 @@ test("exact write spawn replay returns the original handle after dispatch and te
   }
   fs.writeFileSync(jobFile, `${JSON.stringify(originalJob)}\n`, { mode: 0o600 });
   assert.equal(spawnReadOnlyWorker(spawnRequest).handle.id, workerId);
+
+  // Recovery finalization must retain the independently reconciled fresh
+  // runtime evidence, then append its reconciler marker. It must not spread
+  // the stale provider evidence back over the reconciled result.
+  const recoveryBase = tryReadJob(fixture.root, workerId, lifecycleEnv);
+  assert.ok(recoveryBase.controllerProcess);
+  assert.ok(recoveryBase.workerProcess);
+  assert.ok(recoveryBase.providerProcess);
+  await waitFor(() => (
+    processGroupGone(recoveryBase.controllerProcess)
+    && processGroupGone(recoveryBase.workerProcess)
+    && processGroupGone(recoveryBase.providerProcess)
+  ), { timeoutMs: 10_000, intervalMs: 25 });
+  const stalePostDigest = recoveryBase.result.runtimeEvidence.postContext.digest;
+  const recoveryArtifactDirectory = path.join(
+    workspaceState(fixture.root, lifecycleEnv),
+    "artifacts",
+    workerWorktreeSlug(workerId)
+  );
+  for (const entry of fs.readdirSync(recoveryArtifactDirectory)) {
+    fs.unlinkSync(path.join(recoveryArtifactDirectory, entry));
+  }
+  fs.writeFileSync(
+    path.join(official.executionRoot, "target.txt"),
+    "recovery-final\n",
+    "utf8"
+  );
+  updateJob(fixture.root, workerId, (job) => {
+    const recoveredAt = new Date().toISOString();
+    const revived = {
+      ...job,
+      status: "running",
+      phase: "cleanup-blocked",
+      completedAt: null,
+      summary: "Awaiting recovery finalization",
+      error: {
+        code: "E_STATE",
+        message: "Task finished, but transient runtime cleanup is incomplete."
+      },
+      pendingTerminal: {
+        status: "completed",
+        phase: "done",
+        completedAt: recoveredAt,
+        error: null,
+        summary: "Recovered provider completion"
+      },
+      completionContextManifest: recoveryBase.completionContextManifest,
+      verificationContextManifest: null,
+      commandOutcomes: [],
+      result: {
+        ...job.result,
+        hostVerification: "not_run",
+        taskRuntimeCleaned: false,
+        runtimeEvidence: recoveryBase.result.runtimeEvidence
+      }
+    };
+    delete revived.result.writeArtifact;
+    return revived;
+  }, lifecycleEnv);
+  const recoveryInput = tryReadJob(
+    fixture.root,
+    workerId,
+    lifecycleEnv
+  );
+  const recoverySettled = settleStartedWorkerLoss({
+    root: fixture.root,
+    workerId,
+    attemptId: recoveryInput.request.spawn.dispatch.attemptId,
+    controllerProcess: recoveryInput.controllerProcess,
+    workerProcess: recoveryInput.workerProcess,
+    providerProcess: recoveryInput.providerProcess,
+    reconciler: true,
+    runtimeCleanup: { ok: true },
+    env: lifecycleEnv
+  });
+  assert.equal(recoverySettled.status, "completed");
+  assert.equal(
+    recoverySettled.result.runtimeEvidence.reconciler.replayedPrompt,
+    false
+  );
+  assert.equal(
+    recoverySettled.result.runtimeEvidence.postContext.digest,
+    recoverySettled.completionContextManifest.digest
+  );
+  assert.notEqual(
+    recoverySettled.result.runtimeEvidence.postContext.digest,
+    stalePostDigest
+  );
+  assert.ok(
+    recoverySettled.result.runtimeEvidence.observedChangedPaths.includes(
+      "target.txt"
+    )
+  );
+});
+
+test("issue #34 lifecycle rejects task-relevant control/execution drift and retained stored IDs", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = plannedWriteVerticalFixture("issue34-negatives");
+  const writeLifecycleCapabilityDigest = "c".repeat(64);
+  const workerId = fixture.workerId;
+  const active = await activateRegisteredProvisioning(t, fixture);
+  const official = createWorkerWorktree({
+    controlRoot: fixture.root,
+    baseCommit: fixture.binding.baseCommit,
+    workerId,
+    env: fixture.env
+  });
+  t.after(() => {
+    try {
+      git(fixture.root, "worktree", "remove", "--force", official.executionRoot);
+    } catch {}
+  });
+  const receivedAt = new Date(
+    Math.max(Date.now(), Date.parse(active.registeredAt) + 1)
+  ).toISOString();
+  const recorded = recordOfficialWorktreeReceipt({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    officialReceipt: {
+      status: "created",
+      sessionId: active.prepared.intent.operationId,
+      worktreePath: official.executionRoot,
+      sourceGitRoot: fixture.binding.controlRoot,
+      commit: fixture.binding.baseCommit
+    },
+    receivedAt,
+    env: fixture.env
+  });
+  process.kill(-active.child.pid, "SIGKILL");
+  await waitFor(() => processGroupGone(active.identity), {
+    timeoutMs: 5_000,
+    intervalMs: 25
+  });
+  const executionContextManifest = captureContextManifest(official.executionRoot);
+  const observedAt = new Date(
+    Math.max(Date.now(), Date.parse(receivedAt) + 1)
+  ).toISOString();
+  const readyAt = new Date(Math.max(
+    Date.now(),
+    Date.parse(recorded.receipt.hostVerification.verifiedAt) + 1,
+    Date.parse(executionContextManifest.capturedAt) + 1,
+    Date.parse(observedAt) + 1
+  )).toISOString();
+  promoteWriteWorkerReady({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    workerId,
+    executionBindingDigest: fixture.binding.bindingDigest,
+    expectedJournalDigest: active.activated.job.provisioning.journalDigest,
+    ...fixture.actor,
+    providerSpawnIntentId: active.prepared.intent.intentId,
+    executionContextManifest,
+    cleanupProof: {
+      processIdentity: active.identity,
+      processGroupGone: true,
+      providerGuardAbsent: true,
+      observedAt
+    },
+    readyAt,
+    env: fixture.env
+  });
+
+  const authority = brokerPrincipal(fixture.root);
+  const jobFile = path.join(
+    workspaceState(fixture.root, fixture.env),
+    "jobs",
+    `${workerId}.json`
+  );
+  const readyBytes = fs.readFileSync(jobFile);
+  const authorize = () => authorizeReadyWriteWorkerDispatch({
+    root: fixture.root,
+    principal: authority,
+    workerId,
+    writeLifecycleCapabilityDigest,
+    validateWriteLifecycleCapability: () => writeLifecycleCapabilityDigest,
+    env: fixture.env
+  });
+
+  // Active control branch/HEAD target change.
+  const controlHead = git(fixture.root, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(fixture.root, "control-branch-move.txt"), "x\n");
+  git(fixture.root, "add", "control-branch-move.txt");
+  git(fixture.root, "commit", "-m", "control branch move");
+  assert.throws(
+    authorize,
+    (error) => error?.code === "E_CONTEXT_DRIFT" || error?.code === "E_INTEGRATION"
+  );
+  assert.equal(fs.readFileSync(jobFile).equals(readyBytes), true);
+  git(fixture.root, "reset", "--hard", controlHead);
+
+  // Linked execution HEAD/branch target change.
+  fs.writeFileSync(path.join(official.executionRoot, "exec-branch-move.txt"), "y\n");
+  git(official.executionRoot, "add", "exec-branch-move.txt");
+  git(official.executionRoot, "commit", "-m", "execution branch move");
+  assert.throws(
+    authorize,
+    (error) => error?.code === "E_CONTEXT_DRIFT" || error?.code === "E_WORKTREE"
+  );
+  assert.equal(fs.readFileSync(jobFile).equals(readyBytes), true);
+  git(official.executionRoot, "reset", "--hard", controlHead);
+
+  // Shared config drift.
+  const configPath = path.join(fixture.root, ".git", "config");
+  const previousConfig = fs.readFileSync(configPath);
+  fs.appendFileSync(configPath, "\n[grok-issue34]\n\tvalue = reject\n");
+  assert.throws(authorize, (error) => error?.code === "E_CONTEXT_DRIFT");
+  assert.equal(fs.readFileSync(jobFile).equals(readyBytes), true);
+  fs.writeFileSync(configPath, previousConfig);
+
+  // Shared hook drift under default hooks path.
+  const hooksDir = path.join(fixture.root, ".git", "hooks");
+  fs.mkdirSync(hooksDir, { recursive: true });
+  const hookPath = path.join(hooksDir, "pre-commit");
+  const hadHook = fs.existsSync(hookPath);
+  const previousHook = hadHook ? fs.readFileSync(hookPath) : null;
+  fs.writeFileSync(hookPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  assert.throws(authorize, (error) => error?.code === "E_CONTEXT_DRIFT");
+  assert.equal(fs.readFileSync(jobFile).equals(readyBytes), true);
+  if (hadHook) fs.writeFileSync(hookPath, previousHook, { mode: 0o755 });
+  else fs.unlinkSync(hookPath);
+
+  // Stored admission-manifest tamper with stale digest/id.
+  const readyJob = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  readyJob.request.admissionContextManifest = {
+    ...readyJob.request.admissionContextManifest,
+    git: {
+      ...readyJob.request.admissionContextManifest.git,
+      branch: "tampered-branch"
+    }
+  };
+  fs.writeFileSync(jobFile, `${JSON.stringify(readyJob)}\n`, { mode: 0o600 });
+  assert.throws(
+    authorize,
+    (error) => error?.code === "E_CONTEXT_DRIFT"
+      && /integrity|tampered|malformed|drift/i.test(error.message)
+  );
+  fs.writeFileSync(jobFile, readyBytes, { mode: 0o600 });
+
+  // Task-relevant shared ref (current control branch tip) remains fail-closed.
+  const beforeTip = captureContextManifest(fixture.root);
+  fs.writeFileSync(path.join(fixture.root, "tip-move.txt"), "tip\n");
+  git(fixture.root, "add", "tip-move.txt");
+  git(fixture.root, "commit", "-m", "tip move");
+  assert.notEqual(
+    captureContextManifest(fixture.root).git.taskRelevantMetadataIdentity,
+    beforeTip.git.taskRelevantMetadataIdentity
+  );
+  assert.throws(authorize, (error) => error?.code === "E_CONTEXT_DRIFT" || error?.code === "E_INTEGRATION");
+  assert.equal(fs.readFileSync(jobFile).equals(readyBytes), true);
+  git(fixture.root, "reset", "--hard", controlHead);
+
+  // Unrelated control ref churn alone is authorized and retains stored IDs.
+  git(fixture.root, "branch", "issue34-negative-unrelated", controlHead);
+  const authorized = authorize();
+  assert.equal(authorized.authorized, true);
+  assert.equal(
+    authorized.job.request.admissionContextManifest.manifestId,
+    JSON.parse(readyBytes.toString("utf8")).request.admissionContextManifest.manifestId
+  );
+  assert.equal(
+    authorized.job.request.contextManifest.manifestId,
+    executionContextManifest.manifestId
+  );
+});
+
+test("issue #34 lifecycle primary read-worker replay rejects unrelated ref churn", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const head = git(root, "rev-parse", "HEAD");
+  const envelope = buildTaskEnvelope({
+    userRequest: "Read-only issue #34 confinement",
+    mode: "read",
+    scope: { include: ["tracked.txt"], exclude: [] }
+  });
+  const request = {
+    root,
+    principal: principal(root),
+    envelope,
+    idempotencyKey: "issue34-read-unrelated-ref-0001",
+    roleId: "explorer",
+    write: false,
+    env
+  };
+  const first = spawnReadOnlyWorker(request);
+  assert.equal(first.replayed, false);
+  const job = tryReadJob(root, first.handle.id, env);
+  const stored = assertContextManifestIntegrity(job.request.contextManifest);
+  assert.equal(stored.git.linkedWorktree, false);
+
+  git(root, "branch", "read-unrelated-local", head);
+  git(root, "update-ref", "refs/codex/turn-diffs/read-1", head);
+  // Passing the stored primary capture forces DEFAULT compatibility (strict).
+  assert.throws(
+    () => spawnReadOnlyWorker({ ...request, contextManifest: stored }),
+    (error) => error?.code === "E_CONTEXT_DRIFT"
+  );
+  // Same-key replay without an explicit capture rebuilds request digests from a
+  // fresh primary capture and fail-closes against the durable admission.
+  assert.throws(
+    () => spawnReadOnlyWorker(request),
+    (error) => error?.code === "E_IDEMPOTENCY_CONFLICT"
+      || error?.code === "E_CONTEXT_DRIFT"
+  );
+  // Explicit DEFAULT policy confinement: supervisory is not used on read paths.
+  assert.throws(
+    () => assertContextCompatible(root, stored, {
+      mode: "execute",
+      metadataPolicy: CONTEXT_METADATA_POLICIES.DEFAULT
+    }),
+    (error) => error?.code === "E_CONTEXT_DRIFT"
+  );
+  // Supervisory would tolerate the same primary unrelated churn, proving the
+  // read path does not opt into managed-write policy.
+  assert.doesNotThrow(() => assertContextCompatible(root, stored, {
+    mode: "execute",
+    metadataPolicy: CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE
+  }));
+  const after = tryReadJob(root, first.handle.id, env);
+  assert.equal(after.request.contextManifest.manifestId, stored.manifestId);
+  assert.equal(after.request.contextManifest.digest, stored.digest);
 });
 
 test("write admission durably binds one planned journal without creating launch authority", () => {
@@ -4223,13 +4971,19 @@ test("write admission durably binds one planned journal without creating launch 
   assert.equal(tryReadJob(root, first.handle.id, env).provisioning.journalRevision, 0);
   assert.equal(listJobs(root, env).length, 1);
 
-  git(root, "update-index", "--assume-unchanged", "tracked.txt");
-  assert.throws(
-    () => spawnReadOnlyWorker(request),
-    (error) => error?.code === "E_SCOPE_VIOLATION"
-      && /unsafe Git index state/i.test(error.message)
-  );
-  git(root, "update-index", "--no-assume-unchanged", "tracked.txt");
+  for (const [enable, disable] of [
+    ["--assume-unchanged", "--no-assume-unchanged"],
+    ["--skip-worktree", "--no-skip-worktree"]
+  ]) {
+    git(root, "update-index", enable, "tracked.txt");
+    assert.throws(
+      () => spawnReadOnlyWorker(request),
+      (error) => error?.code === "E_SCOPE_VIOLATION"
+        && /unsafe Git index state/i.test(error.message)
+        && !/tracked\.txt|assume-unchanged|skip-worktree/i.test(error.message)
+    );
+    git(root, "update-index", disable, "tracked.txt");
+  }
   assert.equal(spawnReadOnlyWorker(request).handle.id, first.handle.id);
 });
 
@@ -5339,10 +6093,22 @@ test("service restart replays an unchanged spawn despite a fresh context capture
   const { env } = envFor(root);
   const stableManifest = captureContextManifest(root);
   let captures = 0;
-  const captureContext = () => ({
-    ...stableManifest,
-    capturedAt: new Date(Date.parse(stableManifest.capturedAt) + (++captures * 1000)).toISOString()
-  });
+  const captureContext = () => {
+    const body = {
+      ...stableManifest,
+      capturedAt: new Date(
+        Date.parse(stableManifest.capturedAt) + (++captures * 1000)
+      ).toISOString()
+    };
+    delete body.manifestId;
+    delete body.digest;
+    const digest = stableDigest(body);
+    return {
+      ...body,
+      manifestId: `ctx-${digest.slice(0, 24)}`,
+      digest
+    };
+  };
   const launchWorker = () => ({ providerLaunchState: "pending", providerLaunched: false });
   const firstService = createWorkerService({
     root,
@@ -5373,6 +6139,66 @@ test("service restart replays an unchanged spawn despite a fresh context capture
   });
   assert.equal(replay.replayed, true);
   assert.equal(replay.handle.id, first.handle.id);
+});
+
+test("read spawn replay accepts a fresh v2 capture for genuine stored ContextManifest v1 authority", () => {
+  const root = initRepo();
+  const { env } = envFor(root);
+  const idempotencyKey = "spawn-genuine-context-v1-0001";
+  const userRequest = "Replay a historical context record";
+  const legacy = legacyContextManifest(captureContextManifest(root));
+  const first = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope: buildTaskEnvelope({
+      userRequest,
+      mode: "read",
+      contextManifestId: legacy.manifestId
+    }),
+    contextManifest: legacy,
+    idempotencyKey,
+    env
+  });
+  assert.equal(
+    tryReadJob(root, first.handle.id, env).request.contextManifest.schemaVersion,
+    1
+  );
+
+  const current = captureContextManifest(root);
+  assert.equal(current.schemaVersion, 2);
+  const replay = spawnReadOnlyWorker({
+    root,
+    principal: principal(root),
+    envelope: buildTaskEnvelope({
+      userRequest,
+      mode: "read",
+      contextManifestId: current.manifestId
+    }),
+    contextManifest: current,
+    idempotencyKey,
+    env
+  });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.handle.id, first.handle.id);
+
+  const head = git(root, "rev-parse", "HEAD");
+  git(root, "update-ref", "refs/heads/legacy-replay-drift", head);
+  const drifted = captureContextManifest(root);
+  assert.throws(
+    () => spawnReadOnlyWorker({
+      root,
+      principal: principal(root),
+      envelope: buildTaskEnvelope({
+        userRequest,
+        mode: "read",
+        contextManifestId: drifted.manifestId
+      }),
+      contextManifest: drifted,
+      idempotencyKey,
+      env
+    }),
+    (error) => error?.code === "E_CONTEXT_DRIFT"
+  );
 });
 
 test("MCP worker_spawn and worker_cancel drive real service functions", async () => {

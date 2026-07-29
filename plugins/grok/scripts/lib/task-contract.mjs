@@ -17,8 +17,26 @@ import { validateProviderHostActionRequest } from "./worker-host-actions.mjs";
 const timestamp = () => new Date().toISOString();
 
 export const TASK_ENVELOPE_VERSION = 1;
-export const CONTEXT_MANIFEST_VERSION = 1;
+// v2 authenticates capturedAt. v1 remains an explicitly legacy integrity
+// format whose timestamp must never be used as chronology authority.
+export const CONTEXT_MANIFEST_VERSION = 2;
+const LEGACY_CONTEXT_MANIFEST_VERSION = 1;
 export const WORKER_REPORT_VERSION = 1;
+/**
+ * Explicit ContextManifest metadata comparison policies.
+ * Unknown policy names fail closed at assertContextCompatible.
+ *
+ * DEFAULT: strict primary worktrees; linked worktrees may tolerate only
+ * positively classified unrelated shared-ref identity churn.
+ * SUPERVISORY_LINKED_WRITE: managed write primary-control rechecks only —
+ * tolerate unrelated-ref / full metadataIdentity representation drift when
+ * task-relevant metadata and refs remain identical, complete, and attributable.
+ */
+export const CONTEXT_METADATA_POLICIES = Object.freeze({
+  DEFAULT: "default",
+  SUPERVISORY_LINKED_WRITE: "supervisory-linked-write"
+});
+const CONTEXT_METADATA_POLICY_VALUES = new Set(Object.values(CONTEXT_METADATA_POLICIES));
 const WORKER_REPORT_REQUIRED_FIELDS = Object.freeze([
   "outcome",
   "summary",
@@ -51,6 +69,114 @@ const MAX_ITEM = 2 * 1024;
 const MAX_IGNORED_PATHS = 500_000;
 const MAX_IGNORED_ATTRIBUTABLE = 2_000;
 const MAX_IGNORED_HASH_BYTES = 64 * 1024 * 1024;
+/** Cap for semantic shared-ref inventory; beyond this, identity is incomplete (fail closed). */
+const MAX_SHARED_REFS = 10_000;
+/** Cap for attributable ref snapshots retained on the manifest for evidence. */
+const MAX_SHARED_REF_ATTRIBUTABLE = 2_000;
+/**
+ * Parser / private-evidence bound for semantic shared-ref names and targets.
+ * Must stay collision-safe: do not truncate below this when retaining snapshots.
+ */
+const MAX_SHARED_REF_FIELD_BYTES = 512;
+/** Cap for worktree operational / effective-hooks metadata entries before fail-closed truncation. */
+const MAX_GIT_METADATA_ENTRIES = 10_000;
+/** Shared byte budget for hashing operational, non-ref, hooks, and config target contents. */
+const MAX_METADATA_HASH_BYTES = 4 * 1024 * 1024;
+const MAX_HOOKS_HASH_BYTES = MAX_METADATA_HASH_BYTES;
+const MAX_HOOKS_DEPTH = 8;
+/** Max symlink hops when resolving metadata targets (cycle/bound safety). */
+const MAX_METADATA_SYMLINK_HOPS = 8;
+const MAX_HOOKS_SYMLINK_HOPS = MAX_METADATA_SYMLINK_HOPS;
+/**
+ * Bound for lexical hooksPath path components (ordinary dirs + symlink hops).
+ * Higher than symlink-only hop limits so deep absolute temp paths remain observable.
+ */
+const MAX_LEXICAL_PATH_COMPONENTS = 64;
+/** Max depth when walking operational / non-ref metadata trees behind symlinks. */
+const MAX_METADATA_DEPTH = 8;
+/**
+ * Accepted body size for loose ref files and reftable compatibility markers.
+ * Reads use this limit + 1 byte so oversize bodies fail closed without unbounded I/O.
+ */
+const MAX_LOOSE_REF_BODY_BYTES = MAX_SHARED_REF_FIELD_BYTES;
+/** Cap for effective local/worktree config key/value pairs before fail-closed truncation. */
+const MAX_CONFIG_ENTRIES = 10_000;
+/** Cap for total effective config value bytes before fail-closed truncation. */
+const MAX_CONFIG_VALUE_BYTES = MAX_METADATA_HASH_BYTES;
+const SHARED_REF_IDENTITY_SCHEMA_VERSION = 1;
+const SHARED_REF_OBSERVATION_SCHEMA_VERSION = 1;
+const SHARED_REF_CLASS_TASK_RELEVANT = "task_relevant";
+const SHARED_REF_CLASS_UNRELATED = "unrelated";
+const GIT_METADATA_CLASSIFICATIONS = Object.freeze({
+  UNCHANGED: "unchanged",
+  TOLERATED_UNRELATED_SHARED_REFS: "tolerated_unrelated_shared_refs",
+  TASK_RELEVANT_METADATA_DRIFT: "task_relevant_metadata_drift",
+  LEGACY_METADATA_DRIFT: "legacy_metadata_drift",
+  FAIL_CLOSED: "fail_closed"
+});
+/**
+ * Worktree-local operational pseudorefs and multi-step sequencer/rebase state.
+ * Hashed from the effective worktree Git directory (not the shared common dir).
+ *
+ * Audited task-relevant controls (issue #34):
+ * - Merge: MERGE_HEAD, MERGE_MODE, MERGE_MSG, MERGE_AUTOSTASH, MERGE_RR
+ * - Cherry-pick / revert / rebase heads and directories
+ * - AUTO_MERGE conflict materialization, bisect state, sequencer
+ * - SQUASH_MSG (squash-merge in progress)
+ *
+ * Audited standard bisect controls (behavior-bearing only — not arbitrary
+ * unbounded BISECT_* enumeration). Includes every control path Git writes for
+ * interactive / scripted / first-parent bisect that affects resume semantics:
+ *   BISECT_LOG, BISECT_EXPECTED_REV, BISECT_START, BISECT_TERMS, BISECT_RUN,
+ *   BISECT_HEAD, BISECT_NAMES, BISECT_FIRST_PARENT, BISECT_ANCESTORS_OK
+ *
+ * OID-bearing root pseudorefs are also resolved via Git exactly (backend-aware
+ * include-root-refs / non-DWIM rev-parse) so reftable repositories cannot hide
+ * BISECT_HEAD / MERGE_HEAD drift that has no loose file, and refs/tags/BISECT_HEAD
+ * cannot masquerade as the root. Volatile logs (FETCH_HEAD, ORIG_HEAD, logs/**,
+ * COMMIT_EDITMSG) are intentionally omitted — they change on routine fetch/commit
+ * without representing multi-step operation state.
+ */
+const WORKTREE_OPERATIONAL_PATHS = Object.freeze([
+  "MERGE_HEAD",
+  "MERGE_MODE",
+  "MERGE_MSG",
+  "MERGE_AUTOSTASH",
+  "MERGE_RR",
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+  "REBASE_HEAD",
+  "AUTO_MERGE",
+  "BISECT_LOG",
+  "BISECT_EXPECTED_REV",
+  "BISECT_START",
+  "BISECT_TERMS",
+  "BISECT_RUN",
+  "BISECT_HEAD",
+  "BISECT_NAMES",
+  "BISECT_FIRST_PARENT",
+  "BISECT_ANCESTORS_OK",
+  "SQUASH_MSG",
+  "sequencer",
+  "rebase-apply",
+  "rebase-merge"
+]);
+/**
+ * Fixed OID-bearing root pseudorefs resolved through Git so loose-file and
+ * reftable backends both observe create/change/remove. Not an open-ended
+ * BISECT_* enumeration — only the audited operational set.
+ */
+const WORKTREE_OPERATIONAL_PSEUDOREFS = Object.freeze([
+  "MERGE_HEAD",
+  "MERGE_AUTOSTASH",
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+  "REBASE_HEAD",
+  "AUTO_MERGE",
+  "BISECT_HEAD"
+]);
+/** Cap for special index-flag entries (assume-unchanged / skip-worktree) before fail-closed. */
+const MAX_INDEX_FLAG_ENTRIES = MAX_GIT_METADATA_ENTRIES;
 const TASK_ENVELOPE_INPUT_KEYS = new Set([
   "schemaVersion",
   "userRequest",
@@ -547,11 +673,42 @@ export function captureContextManifest(root) {
     ? String(shallowRun.stdout || "").trim() === "true"
     : fs.existsSync(path.join(path.resolve(workspaceRoot, commonDir || gitDir || ".git"), "shallow"));
   const upstreamRefRun = git(workspaceRoot, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], { allowFailure: true });
-  const upstreamRef = upstreamRefRun.status === 0 ? String(upstreamRefRun.stdout || "").trim() : null;
+  const upstreamRef = upstreamRefRun.status === 0 ? String(upstreamRefRun.stdout || "").trim() || null : null;
+  const upstreamFullRefRun = git(workspaceRoot, ["rev-parse", "--symbolic-full-name", "@{upstream}"], { allowFailure: true });
+  const upstreamFullRef = upstreamFullRefRun.status === 0
+    ? String(upstreamFullRefRun.stdout || "").trim() || null
+    : null;
   const upstreamCommitRun = upstreamRef
     ? git(workspaceRoot, ["rev-parse", "@{upstream}"], { allowFailure: true })
     : { status: 1, stdout: "" };
   const upstreamCommit = upstreamCommitRun.status === 0 ? String(upstreamCommitRun.stdout || "").trim() : null;
+  const currentBranchRef = branch && branch !== "HEAD" ? `refs/heads/${branch}` : null;
+  // Branch config may declare an upstream even when @{upstream} cannot resolve
+  // (missing remote-tracking ref). That still counts as configured upstream.
+  let upstreamConfiguredFromConfig = false;
+  if (branch && branch !== "HEAD") {
+    const remoteRun = git(workspaceRoot, ["config", "--get", `branch.${branch}.remote`], { allowFailure: true });
+    const mergeRun = git(workspaceRoot, ["config", "--get", `branch.${branch}.merge`], { allowFailure: true });
+    const remoteName = remoteRun.status === 0 ? String(remoteRun.stdout || "").trim() : "";
+    const mergeName = mergeRun.status === 0 ? String(mergeRun.stdout || "").trim() : "";
+    upstreamConfiguredFromConfig = Boolean(remoteName && mergeName);
+  }
+  // Positively resolved full upstream only: abbreviated/config names are not
+  // enough to classify remote-tracking refs as task-relevant vs unrelated.
+  const resolvedUpstreamFullRef = upstreamFullRef && upstreamFullRef.startsWith("refs/")
+    ? upstreamFullRef
+    : null;
+  const upstreamConfigured = Boolean(upstreamRef) || upstreamConfiguredFromConfig;
+  const taskMetadata = captureTaskRelevantGitMetadata(
+    absoluteGitDir,
+    absoluteCommonDir,
+    workspaceRoot,
+    {
+      currentBranchRef,
+      upstreamFullRef: resolvedUpstreamFullRef,
+      upstreamConfigured
+    }
+  );
   const projectMarkers = [
     "package.json",
     "pyproject.toml",
@@ -598,6 +755,12 @@ export function captureContextManifest(root) {
       verificationIgnoredInventoryComplete: ignoredSnapshot.verificationComplete,
       trackedTreeIdentity: trackedTree,
       metadataIdentity,
+      // Explicit task-relevant / semantic shared-ref identity (issue #34).
+      // Legacy metadataIdentity remains the full file-tree hash for mixed/legacy
+      // comparisons; these fields enable tolerating only positively classified
+      // unrelated shared refs when both sides are structurally valid.
+      taskRelevantMetadataIdentity: taskMetadata.taskRelevantMetadataIdentity,
+      sharedRefIdentity: taskMetadata.sharedRefIdentity,
       insideWorktree,
       linkedWorktree: isLinkedWorktree,
       sparse,
@@ -614,12 +777,19 @@ export function captureContextManifest(root) {
       upstreamFreshness: "not_checked"
     }
   };
-  const digest = sha(canonicalJson(body));
-  return {
+  // capturedAt participates in the authenticated representation. Chronology is
+  // security-relevant for ready promotion and replay, so a timestamp must never
+  // be mutable while retaining the same manifest identity.
+  const capturedAt = timestamp();
+  const authenticatedBody = {
     ...body,
+    capturedAt
+  };
+  const digest = sha(canonicalJson(authenticatedBody));
+  return {
+    ...authenticatedBody,
     manifestId: `ctx-${digest.slice(0, 24)}`,
-    digest,
-    capturedAt: timestamp()
+    digest
   };
 }
 
@@ -889,35 +1059,3599 @@ function ignoredWorktreeSnapshot(root) {
   };
 }
 
+/**
+ * Legacy full Git-metadata file-tree identity (includes packed-refs + refs/).
+ * Retained for pure-legacy and mixed-manifest comparisons. Uses the same hard
+ * entry/byte/depth bounds and descriptor-bound hashing as task-relevant capture
+ * so default hooks/refs/config cannot unboundedly readdir/sort/hash.
+ */
 function gitMetadataIdentity(gitDir, commonDir) {
   const entries = [];
+  const state = {
+    hashedBytes: 0,
+    truncated: false,
+    unreadable: false,
+    depthExceeded: false
+  };
   const roots = [
     [gitDir, ["HEAD", "commondir", "gitdir"]],
     [commonDir, ["config", "packed-refs", "refs", "hooks", "info/exclude", "info/attributes"]]
   ];
-  const visit = (base, relative, depth = 0) => {
-    if (entries.length >= 10_000 || depth > 32) return;
-    const absolute = path.join(base, relative);
+  visitGitMetadataEntries(entries, gitDir, commonDir, roots, state);
+  entries.sort((left, right) => left.path.localeCompare(right.path));
+  const truncated = state.truncated
+    || state.unreadable
+    || state.depthExceeded
+    || entries.length >= MAX_GIT_METADATA_ENTRIES;
+  return sha(canonicalJson({ entries, truncated }));
+}
+
+/**
+ * Bigint-capable identity for a symlink hop (device/inode/mode/size/times).
+ * Used only in transient private structures — never serialized publicly.
+ */
+function metadataSymlinkStatSignature(stat) {
+  return [
+    String(stat.dev),
+    String(stat.ino),
+    String(stat.mode),
+    String(stat.size),
+    String(stat.mtimeNs),
+    String(stat.ctimeNs)
+  ].join(":");
+}
+
+/**
+ * Bigint-capable identity for the final non-symlink node after hop resolution.
+ * Matches the file-stability fields so retarget/replace races fail closed.
+ */
+function metadataResolvedNodeStatSignature(stat) {
+  return [
+    String(stat.dev),
+    String(stat.ino),
+    String(stat.mode),
+    String(stat.size),
+    String(stat.mtimeNs),
+    String(stat.ctimeNs)
+  ].join(":");
+}
+
+/**
+ * Follow a symlink chain with explicit hop bounds and cycle detection.
+ * Returns private digests of each link text plus the final non-symlink node.
+ * Also retains transient per-hop absolute path, bigint lstat identity, and
+ * link-text digest so callers can revalidate after target capture.
+ * Absolute paths and raw link text never leave this helper except as
+ * transient locals (never serialized into entry records).
+ * Shared by effective-hooks, operational, and non-ref metadata capture.
+ */
+function resolveMetadataSymlinkChain(startAbsolute, inheritedChain, maxHops = MAX_METADATA_SYMLINK_HOPS) {
+  const linkDigests = [];
+  /** @type {{ absolute: string, linkDigest: string, signature: string }[]} */
+  const hops = [];
+  const chain = new Set(inheritedChain);
+  let current = startAbsolute;
+
+  for (let hopCount = 0; hopCount < maxHops; hopCount += 1) {
+    const resolvedCurrent = path.resolve(current);
+    if (chain.has(resolvedCurrent)) {
+      return { ok: false, reason: "cycle", linkDigests, hops };
+    }
+    chain.add(resolvedCurrent);
+
     let stat;
-    try { stat = fs.lstatSync(absolute); } catch { return; }
-    const key = `${base === gitDir ? "git" : "common"}/${relative.replace(/\\/g, "/")}`;
-    if (stat.isSymbolicLink()) {
-      entries.push({ path: key, kind: "symlink", mode: stat.mode & 0o7777, digest: sha(fs.readlinkSync(absolute)) });
+    try {
+      stat = fs.lstatSync(current, { bigint: true });
+    } catch {
+      return { ok: false, reason: "broken", linkDigests, hops };
+    }
+
+    if (!stat.isSymbolicLink()) {
+      return {
+        ok: true,
+        linkDigests,
+        hops,
+        finalAbsolute: current,
+        finalStat: stat,
+        finalSignature: metadataResolvedNodeStatSignature(stat),
+        chain
+      };
+    }
+
+    let linkText;
+    try {
+      linkText = fs.readlinkSync(current);
+    } catch {
+      return { ok: false, reason: "unreadable", linkDigests, hops };
+    }
+    // Digest only — never retain raw link text (may be absolute).
+    const linkDigest = sha(String(linkText));
+    linkDigests.push(linkDigest);
+    // Private hop identity for post-capture revalidation only.
+    hops.push({
+      absolute: current,
+      linkDigest,
+      signature: metadataSymlinkStatSignature(stat)
+    });
+    current = path.resolve(path.dirname(current), String(linkText));
+  }
+
+  return { ok: false, reason: "hop-limit", linkDigests, hops };
+}
+
+/**
+ * Re-lstat/readlink every original hop after target hashing or directory
+ * traversal. Requires identical symlink identity and link-text digest, then
+ * revalidates final target path identity. Missing, replaced, retargeted,
+ * unreadable, or non-symlink hops fail closed. Private absolute paths and raw
+ * link text never leave this helper.
+ */
+function revalidateMetadataSymlinkHops(hops, finalAbsolute, finalSignature, maxHops = MAX_METADATA_SYMLINK_HOPS) {
+  if (!Array.isArray(hops) || hops.length === 0) {
+    return { ok: false, reason: "broken" };
+  }
+  if (hops.length > maxHops) {
+    return { ok: false, reason: "hop-limit" };
+  }
+
+  for (const hop of hops) {
+    if (!hop || typeof hop.absolute !== "string" || typeof hop.linkDigest !== "string") {
+      return { ok: false, reason: "unreadable" };
+    }
+    let stat;
+    try {
+      stat = fs.lstatSync(hop.absolute, { bigint: true });
+    } catch {
+      return { ok: false, reason: "broken" };
+    }
+    if (!stat.isSymbolicLink()) {
+      return { ok: false, reason: "replaced" };
+    }
+    if (metadataSymlinkStatSignature(stat) !== hop.signature) {
+      return { ok: false, reason: "replaced" };
+    }
+    let linkText;
+    try {
+      linkText = fs.readlinkSync(hop.absolute);
+    } catch {
+      return { ok: false, reason: "unreadable" };
+    }
+    if (sha(String(linkText)) !== hop.linkDigest) {
+      return { ok: false, reason: "retargeted" };
+    }
+  }
+
+  if (typeof finalAbsolute === "string" && typeof finalSignature === "string") {
+    let finalStat;
+    try {
+      finalStat = fs.lstatSync(finalAbsolute, { bigint: true });
+    } catch {
+      return { ok: false, reason: "broken" };
+    }
+    // Resolved final must remain a non-symlink node with the same identity
+    // observed at hop resolution (no silent target replace/swap).
+    if (finalStat.isSymbolicLink()) {
+      return { ok: false, reason: "retargeted" };
+    }
+    if (metadataResolvedNodeStatSignature(finalStat) !== finalSignature) {
+      return { ok: false, reason: "replaced" };
+    }
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Map hop revalidation / chain failure reasons onto visit state flags.
+ */
+function applyMetadataSymlinkFailure(state, reason) {
+  if (reason === "cycle") state.cyclic = true;
+  else if (reason === "hop-limit") state.depthExceeded = true;
+  else state.unreadable = true;
+}
+
+/**
+ * Bigint-capable identity for an ordinary (non-symlink) directory node.
+ * Used to bind enumeration/traversal snapshots so post-EOF growth, child
+ * removal, and replace races fail closed without serializing paths.
+ * Within-capture only — includes nlink/size/mtime/ctime that move when
+ * unrelated children appear or disappear under the directory.
+ */
+function metadataDirectoryStatSignature(stat) {
+  return [
+    String(stat.dev),
+    String(stat.ino),
+    String(stat.mode),
+    String(stat.nlink),
+    String(stat.size),
+    String(stat.mtimeNs),
+    String(stat.ctimeNs)
+  ].join(":");
+}
+
+/**
+ * Stable identity for a lexical path component (directory, file, or symlink
+ * node). Binds replacement (dev/ino) and type/chmod (mode) without directory
+ * enumeration volatility (nlink/size/mtime/ctime) that changes when unrelated
+ * siblings are created, modified, or removed under an ancestor.
+ * Used for both cross-capture hooks hop digests and same-capture lexical hop
+ * revalidation. Full metadataDirectoryStatSignature / file / symlink signatures
+ * remain for metadata tree enumeration and content hashing race checks only.
+ * Digested into hooks identity only — never serialized raw.
+ */
+function metadataLexicalNodeStableSignature(stat) {
+  return [
+    String(stat.dev),
+    String(stat.ino),
+    String(stat.mode)
+  ].join(":");
+}
+
+/**
+ * True when both stats describe the same ordinary directory identity snapshot.
+ */
+function sameMetadataDirectoryStat(left, right) {
+  return Boolean(
+    left
+    && right
+    && left.isDirectory()
+    && right.isDirectory()
+    && !left.isSymbolicLink()
+    && !right.isSymbolicLink()
+    && metadataDirectoryStatSignature(left) === metadataDirectoryStatSignature(right)
+  );
+}
+
+/**
+ * Descriptor-bound directory listing capped at remaining entry capacity + 1.
+ * Captures bigint directory identity before open and re-checks it after EOF so
+ * mid-list mutation fails closed. Stops immediately on overflow without
+ * materializing the full directory. Within-bound names are sorted for
+ * deterministic walks. Absolute paths never enter returned records.
+ */
+function listDirectoryNamesBounded(dirAbsolute, maxNames) {
+  const capacity = Number.isSafeInteger(maxNames) && maxNames > 0 ? maxNames : 0;
+  const limit = capacity + 1;
+  let beforeStat;
+  try {
+    beforeStat = fs.lstatSync(dirAbsolute, { bigint: true });
+  } catch (error) {
+    const err = new Error("directory-unreadable");
+    err.cause = error;
+    throw err;
+  }
+  if (!beforeStat.isDirectory() || beforeStat.isSymbolicLink()) {
+    const err = new Error("directory-not-directory");
+    throw err;
+  }
+  const directorySignature = metadataDirectoryStatSignature(beforeStat);
+  const names = [];
+  let handle = null;
+  try {
+    handle = fs.opendirSync(dirAbsolute);
+    for (;;) {
+      const entry = handle.readSync();
+      if (entry === null) break;
+      const name = entry?.name;
+      if (typeof name !== "string" || !name || name === "." || name === "..") continue;
+      names.push(name);
+      if (names.length >= limit) break;
+    }
+  } finally {
+    if (handle != null) {
+      try { handle.closeSync(); } catch { /* ignore close races */ }
+    }
+  }
+  // Re-bind directory identity immediately after enumeration closes so
+  // mid-list additions/removals that change directory metadata fail closed.
+  let afterStat;
+  try {
+    afterStat = fs.lstatSync(dirAbsolute, { bigint: true });
+  } catch {
+    const err = new Error("directory-mutated");
+    throw err;
+  }
+  if (!sameMetadataDirectoryStat(beforeStat, afterStat)) {
+    const err = new Error("directory-mutated");
+    throw err;
+  }
+  if (names.length > capacity) {
+    return { names: [], truncated: true, directorySignature };
+  }
+  names.sort((left, right) => left.localeCompare(right));
+  return {
+    names,
+    truncated: false,
+    directorySignature,
+    stableSignature: metadataLexicalNodeStableSignature(beforeStat)
+  };
+}
+
+/**
+ * After child traversal (or immediately after a stable empty listing), confirm
+ * the ordinary directory still has the same bigint identity and the same
+ * bounded name set. Detects post-EOF growth and listed-child disappearance
+ * without unbounded re-listing (at most expectedNames.length + 1 reads).
+ * Absolute paths never leave this helper.
+ */
+function revalidateBoundedDirectorySnapshot(dirAbsolute, directorySignature, expectedNames) {
+  if (typeof directorySignature !== "string" || !Array.isArray(expectedNames)) {
+    return { ok: false, reason: "unreadable" };
+  }
+  let stat;
+  try {
+    stat = fs.lstatSync(dirAbsolute, { bigint: true });
+  } catch {
+    return { ok: false, reason: "disappeared" };
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    return { ok: false, reason: "replaced" };
+  }
+  if (metadataDirectoryStatSignature(stat) !== directorySignature) {
+    return { ok: false, reason: "mutated" };
+  }
+
+  // Bounded re-list: capacity = prior name count; one extra name ⇒ growth.
+  const capacity = expectedNames.length;
+  const limit = capacity + 1;
+  const names = [];
+  let handle = null;
+  try {
+    handle = fs.opendirSync(dirAbsolute);
+    for (;;) {
+      const entry = handle.readSync();
+      if (entry === null) break;
+      const name = entry?.name;
+      if (typeof name !== "string" || !name || name === "." || name === "..") continue;
+      names.push(name);
+      if (names.length >= limit) break;
+    }
+  } catch {
+    return { ok: false, reason: "unreadable" };
+  } finally {
+    if (handle != null) {
+      try { handle.closeSync(); } catch { /* ignore close races */ }
+    }
+  }
+  if (names.length > capacity) {
+    return { ok: false, reason: "grown" };
+  }
+  names.sort((left, right) => left.localeCompare(right));
+  if (names.length !== expectedNames.length) {
+    return { ok: false, reason: "mutated" };
+  }
+  for (let index = 0; index < names.length; index += 1) {
+    if (names[index] !== expectedNames[index]) {
+      return { ok: false, reason: "mutated" };
+    }
+  }
+
+  // Final identity bind after the verification listing.
+  let finalStat;
+  try {
+    finalStat = fs.lstatSync(dirAbsolute, { bigint: true });
+  } catch {
+    return { ok: false, reason: "disappeared" };
+  }
+  if (!sameMetadataDirectoryStat(stat, finalStat)
+    || metadataDirectoryStatSignature(finalStat) !== directorySignature) {
+    return { ok: false, reason: "mutated" };
+  }
+  return { ok: true };
+}
+
+/**
+ * Bigint-capable identity for metadata file stability checks.
+ * Compares device, inode, mode, size, and high-resolution mtime/ctime so
+ * same-size in-place mutation and typical metadata churn fail closed.
+ */
+function metadataFileStatSignature(stat) {
+  return [
+    String(stat.dev),
+    String(stat.ino),
+    String(stat.mode),
+    String(stat.size),
+    String(stat.mtimeNs),
+    String(stat.ctimeNs)
+  ].join(":");
+}
+
+/**
+ * True when both stats describe the same regular-file identity snapshot.
+ * Uses lstat-friendly checks (symlink is never accepted as the captured file).
+ */
+function sameMetadataFileStat(left, right) {
+  return Boolean(
+    left
+    && right
+    && left.isFile()
+    && right.isFile()
+    && !left.isSymbolicLink()
+    && !right.isSymbolicLink()
+    && metadataFileStatSignature(left) === metadataFileStatSignature(right)
+  );
+}
+
+/**
+ * Descriptor-bound file content digest for private metadata identity.
+ *
+ * Reads at most the remaining byte budget + 1 from a stable open descriptor.
+ * Before accepting a digest, re-validates full bigint metadata on the descriptor
+ * and re-lstats the original path without following a newly introduced symlink
+ * so path replacement, disappearance, symlink swap, or same-size mutation
+ * (timestamp/mode/size identity drift) fails closed. Never retains path or raw
+ * bytes beyond the local hash computation.
+ */
+function hashBoundedMetadataFile(absolute, state, maxBytes = MAX_METADATA_HASH_BYTES) {
+  let descriptor;
+  try {
+    const openFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+    descriptor = fs.openSync(absolute, openFlags);
+    const before = fs.fstatSync(descriptor, { bigint: true });
+    if (!before.isFile()) {
+      state.unreadable = true;
+      return { kind: "unobservable", reason: "unreadable" };
+    }
+    // Path must name this same regular file at open time (no symlink/path swap).
+    let pathBefore;
+    try {
+      pathBefore = fs.lstatSync(absolute, { bigint: true });
+    } catch {
+      state.unreadable = true;
+      return { kind: "unobservable", reason: "unreadable" };
+    }
+    if (!sameMetadataFileStat(before, pathBefore)) {
+      state.unreadable = true;
+      return { kind: "unobservable", reason: "unreadable" };
+    }
+
+    const size = Number(before.size);
+    if (!Number.isSafeInteger(size) || size < 0) {
+      state.unreadable = true;
+      return { kind: "unobservable", reason: "unreadable" };
+    }
+    const modeBits = Number(before.mode & 0o7777n);
+
+    const remaining = maxBytes - state.hashedBytes;
+    if (!Number.isSafeInteger(remaining) || remaining < 0) {
+      state.truncated = true;
+      return { kind: "file", mode: modeBits, size, digest: null };
+    }
+
+    // Cap at remaining+1 so oversize content is detected without reading past budget+1.
+    const readLimit = remaining + 1;
+    const hash = crypto.createHash("sha256");
+    const chunkSize = Math.min(64 * 1024, Math.max(readLimit, 1));
+    const buffer = Buffer.allocUnsafe(chunkSize);
+    let totalRead = 0;
+    while (totalRead < readLimit) {
+      const want = Math.min(buffer.length, readLimit - totalRead);
+      const count = fs.readSync(descriptor, buffer, 0, want, totalRead);
+      if (count === 0) break;
+      if (totalRead < remaining) {
+        const withinBudget = Math.min(count, remaining - totalRead);
+        if (withinBudget > 0) hash.update(buffer.subarray(0, withinBudget));
+      }
+      totalRead += count;
+    }
+
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    if (!sameMetadataFileStat(before, after)) {
+      state.unreadable = true;
+      return { kind: "unobservable", reason: "unreadable" };
+    }
+
+    // Re-lstat the original path without following a newly introduced symlink.
+    // Path replacement leaves the descriptor on the detached old inode; this
+    // check requires the path still names that same regular-file identity.
+    let pathAfter;
+    try {
+      pathAfter = fs.lstatSync(absolute, { bigint: true });
+    } catch {
+      state.unreadable = true;
+      return { kind: "unobservable", reason: "unreadable" };
+    }
+    if (!sameMetadataFileStat(before, pathAfter)) {
+      state.unreadable = true;
+      return { kind: "unobservable", reason: "unreadable" };
+    }
+
+    // Content exceeds remaining budget (observed via remaining+1 probe or size claim).
+    if (totalRead > remaining || size > remaining) {
+      state.truncated = true;
+      return { kind: "file", mode: modeBits, size, digest: null };
+    }
+
+    // Short read against a stable size, or extra bytes beyond the size claim.
+    if (totalRead !== size) {
+      state.unreadable = true;
+      return { kind: "unobservable", reason: "unreadable" };
+    }
+
+    state.hashedBytes += size;
+    return {
+      kind: "file",
+      mode: modeBits,
+      size,
+      digest: hash.digest("hex")
+    };
+  } catch {
+    state.unreadable = true;
+    return { kind: "unobservable", reason: "unreadable" };
+  } finally {
+    if (descriptor != null) {
+      try { fs.closeSync(descriptor); } catch { /* ignore close races */ }
+    }
+  }
+}
+
+/**
+ * Public-safe file identity fields from a bounded hash result (no paths).
+ */
+function publicMetadataFileTarget(fileIdentity) {
+  if (!fileIdentity || fileIdentity.kind === "unobservable") {
+    return fileIdentity || { kind: "unobservable", reason: "unreadable" };
+  }
+  return {
+    kind: "file",
+    mode: fileIdentity.mode,
+    size: fileIdentity.size,
+    digest: fileIdentity.digest
+  };
+}
+
+/**
+ * Descriptor-bound nofollow text read capped at maxBytes + 1.
+ *
+ * Used for loose refs and reftable markers so oversize bodies fail closed without
+ * unbounded I/O. Revalidates path/stat identity around the read. Never follows
+ * symlinks (O_NOFOLLOW when available). Absolute paths stay local.
+ *
+ * @returns {{ ok: true, body: string } | { ok: false, reason: string }}
+ */
+function readBoundedNofollowTextFile(absolute, maxBytes = MAX_LOOSE_REF_BODY_BYTES) {
+  if (typeof absolute !== "string" || !absolute || !path.isAbsolute(absolute)) {
+    return { ok: false, reason: "invalid" };
+  }
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    return { ok: false, reason: "bound" };
+  }
+  let descriptor = null;
+  try {
+    const openFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+    descriptor = fs.openSync(absolute, openFlags);
+    const before = fs.fstatSync(descriptor, { bigint: true });
+    if (!before.isFile() || before.isSymbolicLink()) {
+      return { ok: false, reason: "not-file" };
+    }
+    let pathBefore;
+    try {
+      pathBefore = fs.lstatSync(absolute, { bigint: true });
+    } catch {
+      return { ok: false, reason: "unreadable" };
+    }
+    if (!sameMetadataFileStat(before, pathBefore)) {
+      return { ok: false, reason: "replaced" };
+    }
+    const size = Number(before.size);
+    if (!Number.isSafeInteger(size) || size < 0) {
+      return { ok: false, reason: "unreadable" };
+    }
+    // Always probe at most accepted body limit + 1 byte. Never trust size alone
+    // to skip the capped read (size can race), and never read past the bound
+    // even when size claims to be huge.
+    const readLimit = maxBytes + 1;
+    const chunks = [];
+    let totalRead = 0;
+    const chunkSize = Math.min(64 * 1024, Math.max(readLimit, 1));
+    const buffer = Buffer.allocUnsafe(chunkSize);
+    while (totalRead < readLimit) {
+      const want = Math.min(buffer.length, readLimit - totalRead);
+      const count = fs.readSync(descriptor, buffer, 0, want, totalRead);
+      if (count === 0) break;
+      chunks.push(Buffer.from(buffer.subarray(0, count)));
+      totalRead += count;
+    }
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    if (!sameMetadataFileStat(before, after)) {
+      return { ok: false, reason: "mutated" };
+    }
+    let pathAfter;
+    try {
+      pathAfter = fs.lstatSync(absolute, { bigint: true });
+    } catch {
+      return { ok: false, reason: "unreadable" };
+    }
+    if (!sameMetadataFileStat(before, pathAfter)) {
+      return { ok: false, reason: "replaced" };
+    }
+    if (totalRead > maxBytes || size > maxBytes) {
+      return { ok: false, reason: "oversize" };
+    }
+    // Stable within-bound size must match bytes actually read.
+    if (totalRead !== size) {
+      return { ok: false, reason: "short-read" };
+    }
+    const contents = Buffer.concat(chunks, totalRead);
+    return {
+      ok: true,
+      body: contents.toString("utf8"),
+      bodyDigest: sha(contents),
+      fileSignature: metadataFileStatSignature(before),
+      mode: Number(before.mode & 0o7777n),
+      size
+    };
+  } catch {
+    return { ok: false, reason: "unreadable" };
+  } finally {
+    if (descriptor != null) {
+      try { fs.closeSync(descriptor); } catch { /* ignore close races */ }
+    }
+  }
+}
+
+/**
+ * Re-hash a previously captured ordinary file and require identical
+ * descriptor-validated mode/size/digest. Uses an isolated byte budget equal to
+ * the captured size so parent hashedBytes is not double-counted and I/O stays
+ * proportional to prior capture (not unbounded).
+ */
+function revalidateCapturedFileSnapshot(snapshot) {
+  if (
+    !snapshot
+    || snapshot.kind !== "file"
+    || typeof snapshot.absolute !== "string"
+    || !Number.isSafeInteger(snapshot.mode)
+    || !Number.isSafeInteger(snapshot.size)
+    || snapshot.size < 0
+  ) {
+    return { ok: false, reason: "unreadable" };
+  }
+  const probe = { hashedBytes: 0, unreadable: false, truncated: false };
+  const result = hashBoundedMetadataFile(snapshot.absolute, probe, snapshot.size);
+  if (probe.unreadable || result.kind === "unobservable") {
+    return { ok: false, reason: "unreadable" };
+  }
+  if (probe.truncated || result.digest == null) {
+    // Grew past captured size, or captured was truncated — either is drift.
+    if (snapshot.digest == null && probe.truncated && result.size === snapshot.size) {
+      return { ok: true };
+    }
+    return { ok: false, reason: "mutated" };
+  }
+  if (
+    result.mode !== snapshot.mode
+    || result.size !== snapshot.size
+    || result.digest !== snapshot.digest
+  ) {
+    return { ok: false, reason: "mutated" };
+  }
+  return { ok: true };
+}
+
+/**
+ * Revalidate private snapshots for already-captured directory children so
+ * sibling-after-hash content/mode/hop drift fails closed. Runs in O(children)
+ * per directory (at most one re-hash per captured file along each ancestor
+ * path, depth-capped). Absolute paths stay transient.
+ */
+function revalidateCapturedChildSnapshots(snapshots) {
+  if (!Array.isArray(snapshots)) return { ok: true };
+  for (const snapshot of snapshots) {
+    if (!snapshot || typeof snapshot !== "object") continue;
+    if (snapshot.kind === "file") {
+      const fileCheck = revalidateCapturedFileSnapshot(snapshot);
+      if (!fileCheck.ok) return fileCheck;
+      continue;
+    }
+    if (snapshot.kind === "symlink") {
+      const hopCheck = revalidateMetadataSymlinkHops(
+        snapshot.hops,
+        snapshot.finalAbsolute,
+        snapshot.finalSignature,
+        snapshot.maxHops
+      );
+      if (!hopCheck.ok) return { ok: false, reason: hopCheck.reason || "retargeted" };
+      if (snapshot.targetKind === "file") {
+        const fileCheck = revalidateCapturedFileSnapshot({
+          kind: "file",
+          absolute: snapshot.finalAbsolute,
+          mode: snapshot.targetMode,
+          size: snapshot.targetSize,
+          digest: snapshot.targetDigest
+        });
+        if (!fileCheck.ok) return fileCheck;
+      } else if (snapshot.targetKind === "directory") {
+        const dirCheck = revalidateBoundedDirectorySnapshot(
+          snapshot.finalAbsolute,
+          snapshot.directorySignature,
+          snapshot.names
+        );
+        if (!dirCheck.ok) return dirCheck;
+        const childCheck = revalidateCapturedChildSnapshots(snapshot.children);
+        if (!childCheck.ok) return childCheck;
+      }
+      continue;
+    }
+    if (snapshot.kind === "directory") {
+      const dirCheck = revalidateBoundedDirectorySnapshot(
+        snapshot.absolute,
+        snapshot.directorySignature,
+        snapshot.names
+      );
+      if (!dirCheck.ok) return dirCheck;
+      const childCheck = revalidateCapturedChildSnapshots(snapshot.children);
+      if (!childCheck.ok) return childCheck;
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * Revalidate top-level optional root witnesses after a fixed capture batch.
+ *
+ * Stable absence is valid and remains complete, but every absent root must be
+ * re-lstat'd so a root that appears after its early ENOENT fails closed.
+ * Present roots re-use the same bounded child/file/symlink revalidation so
+ * disappearance, replace, or mutation while later siblings are hashed also
+ * fails closed. Absolute paths stay transient and never enter public records.
+ */
+function revalidateOptionalRootWitnesses(witnesses, state) {
+  if (!Array.isArray(witnesses)) {
+    state.unreadable = true;
+    return;
+  }
+  for (const witness of witnesses) {
+    if (!witness || typeof witness !== "object" || typeof witness.kind !== "string") {
+      state.unreadable = true;
       return;
+    }
+    if (witness.kind === "absent") {
+      if (typeof witness.absolute !== "string" || !witness.absolute) {
+        state.unreadable = true;
+        return;
+      }
+      try {
+        fs.lstatSync(witness.absolute);
+        // Optional root appeared after its batch-start absence witness.
+        state.unreadable = true;
+        return;
+      } catch (error) {
+        if (error?.code === "ENOENT") continue;
+        state.unreadable = true;
+        return;
+      }
+    }
+    if (witness.kind === "file" || witness.kind === "directory" || witness.kind === "symlink") {
+      const check = revalidateCapturedChildSnapshots([witness]);
+      if (!check.ok) {
+        state.unreadable = true;
+        return;
+      }
+      continue;
+    }
+    if (witness.kind === "other-root") {
+      if (typeof witness.absolute !== "string" || !witness.absolute) {
+        state.unreadable = true;
+        return;
+      }
+      let stat;
+      try {
+        stat = fs.lstatSync(witness.absolute);
+      } catch {
+        state.unreadable = true;
+        return;
+      }
+      // Type replacement (became file/dir/symlink) is drift.
+      if (stat.isFile() || stat.isDirectory() || stat.isSymbolicLink()) {
+        state.unreadable = true;
+        return;
+      }
+      continue;
+    }
+    if (witness.kind === "legacy-present") {
+      if (typeof witness.absolute !== "string" || !witness.absolute) {
+        state.unreadable = true;
+        return;
+      }
+      let stat;
+      try {
+        stat = fs.lstatSync(witness.absolute, { bigint: true });
+      } catch {
+        state.unreadable = true;
+        return;
+      }
+      if (witness.nodeKind === "file") {
+        if (!stat.isFile() || stat.isSymbolicLink()) {
+          state.unreadable = true;
+          return;
+        }
+        const fileCheck = revalidateCapturedFileSnapshot({
+          kind: "file",
+          absolute: witness.absolute,
+          mode: witness.mode,
+          size: witness.size,
+          digest: witness.digest
+        });
+        if (!fileCheck.ok) {
+          state.unreadable = true;
+          return;
+        }
+        continue;
+      }
+      if (witness.nodeKind === "symlink") {
+        if (!stat.isSymbolicLink()) {
+          state.unreadable = true;
+          return;
+        }
+        if (metadataSymlinkStatSignature(stat) !== witness.signature) {
+          state.unreadable = true;
+          return;
+        }
+        let linkText;
+        try {
+          linkText = fs.readlinkSync(witness.absolute);
+        } catch {
+          state.unreadable = true;
+          return;
+        }
+        if (sha(String(linkText)) !== witness.linkDigest) {
+          state.unreadable = true;
+          return;
+        }
+        continue;
+      }
+      if (witness.nodeKind === "directory") {
+        const dirCheck = revalidateBoundedDirectorySnapshot(
+          witness.absolute,
+          witness.directorySignature,
+          witness.names
+        );
+        if (!dirCheck.ok) {
+          state.unreadable = true;
+          return;
+        }
+        continue;
+      }
+      if (witness.nodeKind === "other") {
+        if (stat.isFile() || stat.isDirectory() || stat.isSymbolicLink()) {
+          state.unreadable = true;
+          return;
+        }
+        continue;
+      }
+      state.unreadable = true;
+      return;
+    }
+    state.unreadable = true;
+    return;
+  }
+}
+
+/**
+ * Walk a metadata path tree binding symlink link-text digests and target
+ * contents with entry/byte/depth/hop bounds and cycle detection. After file
+ * target hashing and after directory traversal, every original symlink hop is
+ * re-lstat/readlink-validated (identity + link digest) and the final target
+ * path identity is rechecked so retarget/mutation races fail closed. Ordinary
+ * (non-symlink) directories bind bigint identity around enumeration and
+ * revalidate the bounded name set after traversal so post-EOF growth and
+ * listed-child disappearance fail closed. After a directory subtree is
+ * captured, already-captured child identities (ordinary files and symlink
+ * hops/final targets) are revalidated so sibling-after-hash drift fails closed.
+ * Ordinary file entries serialize only descriptor-validated mode/size/digest.
+ * Optional top-level roots that were absent before capture still treat ENOENT
+ * as normal absence (returning a private absent witness for post-batch
+ * revalidation); children already present in a bounded listing are required.
+ * Absolute paths and raw link text never enter the returned entry records.
+ * Returns a transient private child/root snapshot for parent/batch revalidation
+ * (or null when the visit failed without a reusable witness).
+ */
+function visitBoundedMetadataTree(absolute, relativeKey, depth, chain, state, {
+  maxDepth = MAX_METADATA_DEPTH,
+  maxBytes = MAX_METADATA_HASH_BYTES,
+  maxEntries = MAX_GIT_METADATA_ENTRIES,
+  maxHops = MAX_METADATA_SYMLINK_HOPS,
+  // When true, ENOENT means a listed child disappeared mid-capture (fail closed)
+  // rather than an optional metadata root that was absent before listing.
+  required = false
+} = {}) {
+  if (state.entries.length >= maxEntries) {
+    state.truncated = true;
+    return null;
+  }
+  if (depth > maxDepth) {
+    state.depthExceeded = true;
+    return null;
+  }
+  let stat;
+  try {
+    stat = fs.lstatSync(absolute);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      if (required) {
+        state.unreadable = true;
+        return null;
+      }
+      // Optional root absence is valid; caller rechecks after the full batch.
+      return { kind: "absent", absolute };
+    }
+    state.unreadable = true;
+    return null;
+  }
+  const key = relativeKey || ".";
+  const childVisitOptions = {
+    maxDepth,
+    maxBytes,
+    maxEntries,
+    maxHops,
+    required: true
+  };
+  try {
+    if (stat.isSymbolicLink()) {
+      const mode = stat.mode & 0o7777;
+      const resolved = resolveMetadataSymlinkChain(absolute, chain, maxHops);
+      if (!resolved.ok) {
+        applyMetadataSymlinkFailure(state, resolved.reason);
+        state.entries.push({
+          path: key,
+          kind: "symlink",
+          mode,
+          linkDigests: resolved.linkDigests,
+          target: { kind: "unobservable", reason: resolved.reason }
+        });
+        return null;
+      }
+      const {
+        linkDigests,
+        hops,
+        finalAbsolute,
+        finalStat,
+        finalSignature,
+        chain: nextChain
+      } = resolved;
+      const finalMode = Number(finalStat.mode & 0o7777n);
+      if (finalStat.isFile()) {
+        // Hash the resolved target first, then revalidate every hop so an
+        // atomic retarget at open/hash boundaries cannot bind old link digests
+        // to a target that is no longer live.
+        const target = hashBoundedMetadataFile(finalAbsolute, state, maxBytes);
+        const recheck = revalidateMetadataSymlinkHops(
+          hops,
+          finalAbsolute,
+          finalSignature,
+          maxHops
+        );
+        if (!recheck.ok) {
+          applyMetadataSymlinkFailure(state, recheck.reason);
+          state.entries.push({
+            path: key,
+            kind: "symlink",
+            mode,
+            linkDigests,
+            target: { kind: "unobservable", reason: recheck.reason }
+          });
+          return null;
+        }
+        if (target.kind === "unobservable") {
+          state.entries.push({
+            path: key,
+            kind: "symlink",
+            mode,
+            linkDigests,
+            target
+          });
+          return null;
+        }
+        const publicTarget = publicMetadataFileTarget(target);
+        state.entries.push({
+          path: key,
+          kind: "symlink",
+          mode,
+          linkDigests,
+          target: publicTarget
+        });
+        return {
+          kind: "symlink",
+          hops,
+          finalAbsolute,
+          finalSignature,
+          maxHops,
+          targetKind: "file",
+          targetMode: target.mode,
+          targetSize: target.size,
+          targetDigest: target.digest
+        };
+      }
+      if (finalStat.isDirectory()) {
+        const directoryEntryIndex = state.entries.length;
+        state.entries.push({
+          path: key,
+          kind: "symlink",
+          mode,
+          linkDigests,
+          target: { kind: "directory", mode: finalMode }
+        });
+        const finalResolved = path.resolve(finalAbsolute);
+        if (chain.has(finalResolved)) {
+          state.cyclic = true;
+          return null;
+        }
+        let listed;
+        try {
+          listed = listDirectoryNamesBounded(
+            finalAbsolute,
+            maxEntries - state.entries.length
+          );
+        } catch {
+          state.unreadable = true;
+          return null;
+        }
+        if (listed.truncated) {
+          state.truncated = true;
+          return null;
+        }
+        const childSnapshots = [];
+        for (const name of listed.names) {
+          if (state.entries.length >= maxEntries || state.truncated) {
+            state.truncated = true;
+            break;
+          }
+          const childKey = relativeKey ? `${relativeKey}/${name}` : name;
+          const childSnap = visitBoundedMetadataTree(
+            path.join(finalAbsolute, name),
+            childKey,
+            depth + 1,
+            nextChain,
+            state,
+            childVisitOptions
+          );
+          if (childSnap) childSnapshots.push(childSnap);
+        }
+        // Revalidate membership, already-captured children, then symlink hops.
+        if (!state.truncated) {
+          const dirRecheck = revalidateBoundedDirectorySnapshot(
+            finalAbsolute,
+            listed.directorySignature,
+            listed.names
+          );
+          if (!dirRecheck.ok) {
+            state.unreadable = true;
+            const entry = state.entries[directoryEntryIndex];
+            if (entry && entry.kind === "symlink" && entry.path === key) {
+              entry.target = { kind: "unobservable", reason: dirRecheck.reason };
+            }
+          } else {
+            const childRecheck = revalidateCapturedChildSnapshots(childSnapshots);
+            if (!childRecheck.ok) {
+              state.unreadable = true;
+              const entry = state.entries[directoryEntryIndex];
+              if (entry && entry.kind === "symlink" && entry.path === key) {
+                entry.target = { kind: "unobservable", reason: childRecheck.reason };
+              }
+            }
+          }
+        }
+        const recheck = revalidateMetadataSymlinkHops(
+          hops,
+          finalAbsolute,
+          finalSignature,
+          maxHops
+        );
+        if (!recheck.ok) {
+          applyMetadataSymlinkFailure(state, recheck.reason);
+          // Mark the symlink entry itself unobservable; children may already
+          // be recorded from the pre-retarget target — fail closed via flags.
+          const entry = state.entries[directoryEntryIndex];
+          if (entry && entry.kind === "symlink" && entry.path === key) {
+            entry.target = { kind: "unobservable", reason: recheck.reason };
+          }
+          return null;
+        }
+        return {
+          kind: "symlink",
+          hops,
+          finalAbsolute,
+          finalSignature,
+          maxHops,
+          targetKind: "directory",
+          directorySignature: listed.directorySignature,
+          names: listed.names,
+          children: childSnapshots
+        };
+      }
+      // Non-file/dir final nodes: still revalidate hops so retarget races
+      // cannot freeze a stale other-node snapshot as complete.
+      const recheckOther = revalidateMetadataSymlinkHops(
+        hops,
+        finalAbsolute,
+        finalSignature,
+        maxHops
+      );
+      if (!recheckOther.ok) {
+        applyMetadataSymlinkFailure(state, recheckOther.reason);
+        state.entries.push({
+          path: key,
+          kind: "symlink",
+          mode,
+          linkDigests,
+          target: { kind: "unobservable", reason: recheckOther.reason }
+        });
+        return null;
+      }
+      state.entries.push({
+        path: key,
+        kind: "symlink",
+        mode,
+        linkDigests,
+        target: { kind: "other", mode: finalMode }
+      });
+      return {
+        kind: "symlink",
+        hops,
+        finalAbsolute,
+        finalSignature,
+        maxHops,
+        targetKind: "other"
+      };
     }
     if (stat.isFile()) {
-      entries.push({ path: key, kind: "file", mode: stat.mode & 0o7777, size: stat.size, digest: hashFile(absolute) });
-      return;
+      // Serialize only descriptor-validated identity — never pre-open lstat mode.
+      const fileIdentity = hashBoundedMetadataFile(absolute, state, maxBytes);
+      if (fileIdentity.kind === "unobservable") {
+        state.entries.push({
+          path: key,
+          kind: "file",
+          target: fileIdentity
+        });
+        return null;
+      }
+      state.entries.push({
+        path: key,
+        kind: "file",
+        mode: fileIdentity.mode,
+        size: fileIdentity.size,
+        digest: fileIdentity.digest
+      });
+      return {
+        kind: "file",
+        absolute,
+        mode: fileIdentity.mode,
+        size: fileIdentity.size,
+        digest: fileIdentity.digest
+      };
     }
     if (!stat.isDirectory()) {
-      entries.push({ path: key, kind: "other", mode: stat.mode & 0o7777 });
-      return;
+      state.entries.push({ path: key, kind: "other", mode: stat.mode & 0o7777 });
+      // Top-level optional "other" nodes still need a batch presence witness.
+      return { kind: "other-root", absolute };
     }
-    for (const name of fs.readdirSync(absolute).sort()) visit(base, path.join(relative, name), depth + 1);
+    if (relativeKey !== "") {
+      state.entries.push({ path: key, kind: "directory", mode: stat.mode & 0o7777 });
+    }
+    const dirResolved = path.resolve(absolute);
+    if (chain.has(dirResolved)) {
+      state.cyclic = true;
+      return null;
+    }
+    const nextChain = new Set(chain);
+    nextChain.add(dirResolved);
+    let listed;
+    try {
+      listed = listDirectoryNamesBounded(absolute, maxEntries - state.entries.length);
+    } catch {
+      state.unreadable = true;
+      return null;
+    }
+    if (listed.truncated) {
+      state.truncated = true;
+      return null;
+    }
+    const childSnapshots = [];
+    for (const name of listed.names) {
+      if (state.entries.length >= maxEntries || state.truncated) {
+        state.truncated = true;
+        break;
+      }
+      const childKey = relativeKey ? `${relativeKey}/${name}` : name;
+      const childSnap = visitBoundedMetadataTree(
+        path.join(absolute, name),
+        childKey,
+        depth + 1,
+        nextChain,
+        state,
+        childVisitOptions
+      );
+      if (childSnap) childSnapshots.push(childSnap);
+    }
+    // Ordinary non-symlink directories: re-bind identity/membership, then
+    // revalidate already-captured children so sibling-after-hash content/mode
+    // drift fails closed even when parent dir stat/name set is unchanged.
+    if (!state.truncated) {
+      const dirRecheck = revalidateBoundedDirectorySnapshot(
+        absolute,
+        listed.directorySignature,
+        listed.names
+      );
+      if (!dirRecheck.ok) {
+        state.unreadable = true;
+      } else {
+        const childRecheck = revalidateCapturedChildSnapshots(childSnapshots);
+        if (!childRecheck.ok) {
+          state.unreadable = true;
+        }
+      }
+    }
+    return {
+      kind: "directory",
+      absolute,
+      directorySignature: listed.directorySignature,
+      names: listed.names,
+      children: childSnapshots
+    };
+  } catch {
+    state.unreadable = true;
+    return null;
+  }
+}
+
+function createMetadataVisitState() {
+  return {
+    entries: [],
+    hashedBytes: 0,
+    depthExceeded: false,
+    unreadable: false,
+    truncated: false,
+    cyclic: false
   };
-  for (const [base, relatives] of roots) for (const relative of relatives) visit(base, relative);
-  entries.sort((left, right) => left.path.localeCompare(right.path));
-  return sha(canonicalJson({ entries, truncated: entries.length >= 10_000 }));
+}
+
+/**
+ * Task-relevant non-ref metadata: worktree-local Git controls, shared config/
+ * info, and semantic controls (shallow/grafts/alternates). Symlink entries bind
+ * both link identity and target contents (cycle/bound safe). Refs are not
+ * hashed as files; they are classified semantically via for-each-ref. Effective
+ * hooks and effective included config are captured separately.
+ *
+ * Includes the effective worktree `info/sparse-checkout` control file so
+ * linked/primary sparse pattern drift changes task-relevant identity. Cone and
+ * index sparse settings bind through the separately captured effective config.
+ * Top-level optional roots (present and absent) are revalidated after the full
+ * batch so mid-capture appearance/disappearance fails closed.
+ */
+function captureTaskRelevantNonRefEntries(gitDir, commonDir) {
+  const state = createMetadataVisitState();
+  const roots = [
+    [gitDir, [
+      "HEAD",
+      "commondir",
+      "gitdir",
+      "config.worktree",
+      // Effective worktree sparse-checkout patterns (private digest only).
+      "info/sparse-checkout"
+    ]],
+    [commonDir, [
+      "config",
+      "info/exclude",
+      "info/attributes",
+      "info/grafts",
+      "shallow",
+      "objects/info/alternates"
+    ]]
+  ];
+  const rootWitnesses = [];
+  for (const [base, relatives] of roots) {
+    if (!base) {
+      state.unreadable = true;
+      continue;
+    }
+    for (const relative of relatives) {
+      const key = `${base === gitDir ? "git" : "common"}/${relative.replace(/\\/g, "/")}`;
+      const witness = visitBoundedMetadataTree(
+        path.join(base, relative),
+        key,
+        0,
+        new Set(),
+        state
+      );
+      if (witness) rootWitnesses.push(witness);
+    }
+  }
+  // Final present/absent revalidation of the complete non-ref root set.
+  if (!state.truncated && !state.depthExceeded) {
+    revalidateOptionalRootWitnesses(rootWitnesses, state);
+  }
+  state.entries.sort((left, right) => left.path.localeCompare(right.path));
+  const failClosed = state.truncated
+    || state.depthExceeded
+    || state.unreadable
+    || state.cyclic
+    || state.entries.length >= MAX_GIT_METADATA_ENTRIES;
+  return {
+    entries: state.entries,
+    truncated: failClosed,
+    observable: !failClosed,
+    identity: sha(canonicalJson({
+      schema: "nonref-v2",
+      entries: state.entries,
+      truncated: failClosed,
+      depthExceeded: state.depthExceeded,
+      unreadable: state.unreadable,
+      cyclic: state.cyclic
+    }))
+  };
+}
+
+/**
+ * Resolve a fixed OID-bearing operational root pseudoref exactly.
+ *
+ * Never accepts DWIM tag/branch resolution and never ignores ambiguity stderr.
+ * Prefer `for-each-ref --include-root-refs` (exact root inventory, backend-aware
+ * for reftable and files). Fall back to rev-parse without --quiet plus
+ * symbolic-full-name === name so refs/tags/BISECT_HEAD cannot masquerade as the
+ * root. Status non-zero / empty include-root inventory is stable absence.
+ *
+ * @returns {{ kind: "absent" } | { kind: "oid", oidDigest: string } | { kind: "unobservable" }}
+ */
+function resolveExactRootPseudoref(workspaceRoot, name) {
+  if (!workspaceRoot || typeof name !== "string" || !name) {
+    return { kind: "unobservable" };
+  }
+
+  // Exact root-ref inventory when Git supports it (reftable + files).
+  const includeRun = git(
+    workspaceRoot,
+    [
+      "for-each-ref",
+      "--include-root-refs",
+      "--format=%(refname)%00%(objectname)%0a",
+      "--",
+      name
+    ],
+    { allowFailure: true }
+  );
+  const includeStderr = String(includeRun.stderr || "");
+  const includeUnsupported = Boolean(includeRun.error)
+    || includeRun.status === 129
+    || /unknown option|include-root-refs/i.test(includeStderr);
+  if (!includeUnsupported) {
+    // Hard command failure or any diagnostic is unobservable. In particular,
+    // never reinterpret a malformed root pseudoref warning as stable absence.
+    if (includeRun.status !== 0 && includeRun.status !== 1) {
+      return { kind: "unobservable" };
+    }
+    if (includeStderr.trim()) {
+      return { kind: "unobservable" };
+    }
+    let matchedOid = null;
+    for (const line of String(includeRun.stdout || "").split("\n")) {
+      if (!line) continue;
+      const parts = line.split("\0");
+      const refname = parts[0] || "";
+      const objectname = String(parts[1] || "").trim().toLowerCase();
+      if (refname !== name) {
+        // An exact root-name query must not surface a different ref.
+        return { kind: "unobservable" };
+      }
+      if (!/^[a-f0-9]{40,64}$/.test(objectname)) {
+        return { kind: "unobservable" };
+      }
+      if (matchedOid && matchedOid !== objectname) {
+        return { kind: "unobservable" };
+      }
+      matchedOid = objectname;
+    }
+    if (matchedOid) {
+      return { kind: "oid", oidDigest: sha(matchedOid) };
+    }
+    return { kind: "absent" };
+  }
+
+  // Fallback: rev-parse without --quiet so ambiguity diagnostics surface.
+  const run = git(
+    workspaceRoot,
+    ["rev-parse", "--verify", "--end-of-options", name],
+    { allowFailure: true }
+  );
+  if (run.error) return { kind: "unobservable" };
+  if (run.status !== 0) {
+    // Missing root pseudoref is normal. Do not interpret fatal stderr as a race.
+    return { kind: "absent" };
+  }
+  // Present resolves must be quiet and unambiguous.
+  if (String(run.stderr || "").trim()) {
+    return { kind: "unobservable" };
+  }
+  const oid = String(run.stdout || "").trim().toLowerCase();
+  if (!/^[a-f0-9]{40,64}$/.test(oid)) {
+    return { kind: "unobservable" };
+  }
+  // Confirm Git resolved the root name, not refs/tags/NAME (DWIM).
+  const fullRun = git(
+    workspaceRoot,
+    ["rev-parse", "--verify", "--symbolic-full-name", "--end-of-options", name],
+    { allowFailure: true }
+  );
+  if (fullRun.error) return { kind: "unobservable" };
+  if (String(fullRun.stderr || "").trim()) {
+    return { kind: "unobservable" };
+  }
+  if (fullRun.status !== 0) {
+    // OID resolved but full name did not — untrustworthy for exact root capture.
+    return { kind: "unobservable" };
+  }
+  const fullName = String(fullRun.stdout || "").trim();
+  if (fullName !== name) {
+    // DWIM to refs/tags/BISECT_HEAD (etc.) — root pseudoref is absent.
+    return { kind: "absent" };
+  }
+  return { kind: "oid", oidDigest: sha(oid) };
+}
+
+/**
+ * Backend-aware capture of fixed OID-bearing operational root pseudorefs.
+ * Uses exact Git resolution so reftable backends (no loose BISECT_HEAD file)
+ * still observe create/change/remove, and DWIM tag resolution / ambiguity
+ * stderr cannot hide root create or remove. Stable absence is valid. Results
+ * are private digests only — never raw paths. Revalidates after the batch so
+ * mid-capture races fail closed.
+ */
+function captureOperationalPseudorefIdentity(workspaceRoot) {
+  if (!workspaceRoot) {
+    return { records: [], complete: false, observable: false };
+  }
+  const records = [];
+  let unreadable = false;
+  for (const name of WORKTREE_OPERATIONAL_PSEUDOREFS) {
+    const resolved = resolveExactRootPseudoref(workspaceRoot, name);
+    if (resolved.kind === "unobservable") {
+      unreadable = true;
+      records.push({ name, kind: "unobservable" });
+      continue;
+    }
+    if (resolved.kind === "absent") {
+      records.push({ name, kind: "absent" });
+      continue;
+    }
+    // Digest only — identity structure stays private via outer hash.
+    records.push({ name, kind: "oid", oidDigest: resolved.oidDigest });
+  }
+  // Revalidate the complete fixed set after capture (appear/disappear/mutate/DWIM).
+  if (!unreadable) {
+    for (const record of records) {
+      const resolved = resolveExactRootPseudoref(workspaceRoot, record.name);
+      if (resolved.kind === "unobservable") {
+        unreadable = true;
+        break;
+      }
+      if (record.kind === "absent") {
+        if (resolved.kind !== "absent") {
+          unreadable = true;
+          break;
+        }
+        continue;
+      }
+      if (record.kind === "oid") {
+        if (resolved.kind !== "oid" || resolved.oidDigest !== record.oidDigest) {
+          unreadable = true;
+          break;
+        }
+        continue;
+      }
+      unreadable = true;
+      break;
+    }
+  }
+  records.sort((left, right) => left.name.localeCompare(right.name));
+  const failClosed = unreadable;
+  return {
+    records,
+    complete: !failClosed,
+    observable: !failClosed,
+    identity: sha(canonicalJson({
+      schema: "operational-pseudorefs-v2",
+      records,
+      unreadable: failClosed
+    }))
+  };
+}
+
+/**
+ * Hash task-relevant worktree operational state (MERGE_HEAD, MERGE_AUTOSTASH,
+ * sequencer/rebase, and related controls) from the effective worktree Git
+ * directory plus backend-aware Git resolution of OID-bearing root pseudorefs.
+ * Symlinks bind link text and target contents. Changes must surface as
+ * task-relevant metadata drift even when unrelated shared refs also change.
+ * Present and absent top-level operational roots are witnessed and revalidated
+ * after the full fixed inventory so mid-batch create/remove/replace races fail
+ * closed without treating stable absence as an error.
+ */
+function captureWorktreeOperationalIdentity(gitDir, workspaceRoot = null) {
+  if (!gitDir) {
+    return {
+      identity: sha("operational-v2:unavailable"),
+      truncated: true,
+      observable: false
+    };
+  }
+  const state = createMetadataVisitState();
+  const rootWitnesses = [];
+  for (const relative of WORKTREE_OPERATIONAL_PATHS) {
+    const witness = visitBoundedMetadataTree(
+      path.join(gitDir, relative),
+      relative.replace(/\\/g, "/"),
+      0,
+      new Set(),
+      state
+    );
+    if (witness) rootWitnesses.push(witness);
+  }
+  // Final present/absent revalidation of the complete operational root set.
+  if (!state.truncated && !state.depthExceeded) {
+    revalidateOptionalRootWitnesses(rootWitnesses, state);
+  }
+  state.entries.sort((left, right) => left.path.localeCompare(right.path));
+  const pseudorefs = captureOperationalPseudorefIdentity(workspaceRoot || null);
+  const failClosed = state.truncated
+    || state.depthExceeded
+    || state.unreadable
+    || state.cyclic
+    || state.entries.length >= MAX_GIT_METADATA_ENTRIES
+    || !pseudorefs.observable
+    || !pseudorefs.complete;
+  return {
+    identity: sha(canonicalJson({
+      schema: "operational-v3",
+      entries: state.entries,
+      pseudorefIdentity: pseudorefs.identity,
+      truncated: failClosed,
+      depthExceeded: state.depthExceeded,
+      unreadable: state.unreadable,
+      cyclic: state.cyclic
+    })),
+    truncated: failClosed,
+    observable: !failClosed
+  };
+}
+
+/**
+ * Private digest of effective repository/worktree Git config with includes
+ * resolved by Git (`--includes`). Only key/value digests are retained — never
+ * raw values, origins, absolute paths, credentials, or included file
+ * contents/paths. Entry and byte budgets are enforced across the combined
+ * local+worktree inventory. Fail closed on resolution, read, parse, size, or
+ * observability errors.
+ */
+function captureEffectiveGitConfigIdentity(workspaceRoot) {
+  const scopes = [];
+  let totalEntries = 0;
+  let totalValueBytes = 0;
+  let truncated = false;
+  let unreadable = false;
+
+  const parseNullConfigList = (stdout) => {
+    const pairs = [];
+    if (truncated) return pairs;
+    const raw = String(stdout || "");
+    if (!raw) return pairs;
+    // git config --list --null: each record is "key\nvalue\0"
+    for (const record of raw.split("\0")) {
+      if (!record) continue;
+      const nl = record.indexOf("\n");
+      if (nl < 0) {
+        unreadable = true;
+        continue;
+      }
+      const key = record.slice(0, nl);
+      const value = record.slice(nl + 1);
+      if (!key || key.length > 1024) {
+        unreadable = true;
+        continue;
+      }
+      const valueBytes = Buffer.byteLength(value, "utf8");
+      // One total bounded inventory across local + worktree scopes.
+      if (totalEntries >= MAX_CONFIG_ENTRIES || totalValueBytes + valueBytes > MAX_CONFIG_VALUE_BYTES) {
+        truncated = true;
+        break;
+      }
+      totalEntries += 1;
+      totalValueBytes += valueBytes;
+      // Digest only — keys may embed includeIf gitdir absolute paths; values may
+      // hold credentials or absolute include targets.
+      pairs.push({
+        index: totalEntries - 1,
+        keyDigest: sha(key),
+        valueDigest: sha(value)
+      });
+    }
+    return pairs;
+  };
+
+  // Local (repository) config with includes explicitly resolved. Required.
+  const localRun = git(
+    workspaceRoot,
+    ["config", "--local", "--includes", "--list", "--null"],
+    { allowFailure: true, maxBuffer: 16 * 1024 * 1024 }
+  );
+  if (localRun.error || localRun.status !== 0) {
+    return {
+      identity: sha("config-v1:local-resolution-failed"),
+      observable: false,
+      truncated: true
+    };
+  }
+  scopes.push({
+    scope: "local",
+    pairs: parseNullConfigList(localRun.stdout)
+  });
+
+  // Worktree config only when extensions.worktreeConfig is enabled.
+  let worktreeEnabled = false;
+  const worktreeFlag = git(
+    workspaceRoot,
+    ["config", "--local", "--bool", "extensions.worktreeConfig"],
+    { allowFailure: true }
+  );
+  if (!worktreeFlag.error && worktreeFlag.status === 0) {
+    worktreeEnabled = String(worktreeFlag.stdout || "").trim() === "true";
+  } else if (worktreeFlag.error) {
+    return {
+      identity: sha("config-v1:worktree-flag-unreadable"),
+      observable: false,
+      truncated: true
+    };
+  }
+
+  if (worktreeEnabled) {
+    const worktreeRun = git(
+      workspaceRoot,
+      ["config", "--worktree", "--includes", "--list", "--null"],
+      { allowFailure: true, maxBuffer: 16 * 1024 * 1024 }
+    );
+    if (worktreeRun.error || worktreeRun.status !== 0) {
+      return {
+        identity: sha("config-v1:worktree-resolution-failed"),
+        observable: false,
+        truncated: true
+      };
+    }
+    scopes.push({
+      scope: "worktree",
+      pairs: parseNullConfigList(worktreeRun.stdout)
+    });
+  } else {
+    scopes.push({ scope: "worktree", pairs: [], enabled: false });
+  }
+
+  const failClosed = truncated || unreadable;
+  return {
+    identity: sha(canonicalJson({
+      schema: "config-v1",
+      scopes,
+      totalEntries,
+      truncated: failClosed,
+      unreadable
+    })),
+    observable: !failClosed,
+    truncated: failClosed
+  };
+}
+
+/**
+ * Bind every lexical component along a configured absolute path (ancestors and
+ * final): ordinary directories, regular files, and symlinks. Used for
+ * core.hooksPath so swapping an ordinary ancestor to a symlink (or retargeting
+ * a symlink) changes identity even when final hook bytes are identical.
+ * Each hop keeps a stable node signature (dev/ino/mode) for same-capture
+ * revalidation and cross-capture identity so unrelated sibling activity under
+ * an ancestor (nlink/size/mtime/ctime) cannot fail-close or drift hooks.
+ * Symlink hops also bind linkDigest for retarget detection.
+ * Bounded by maxComponents; absolute paths and raw link text stay private.
+ */
+function captureLexicalPathSymlinkHops(absolutePath, maxComponents = MAX_LEXICAL_PATH_COMPONENTS) {
+  if (typeof absolutePath !== "string" || !absolutePath || !path.isAbsolute(absolutePath)) {
+    return { ok: false, reason: "invalid", hops: [] };
+  }
+  const hops = [];
+  // Walk progressive absolute prefixes: /a, /a/b, /a/b/c ...
+  const normalized = path.resolve(absolutePath);
+  const parts = normalized.split(path.sep).filter((part) => part.length > 0);
+  let current = path.sep;
+  // Windows drive roots keep their prefix; path.resolve already normalized.
+  if (path.sep !== "/" && /^[A-Za-z]:/.test(normalized)) {
+    current = `${parts.shift()}${path.sep}`;
+  }
+  for (let index = 0; index < parts.length; index += 1) {
+    current = index === 0 && current === path.sep
+      ? path.sep + parts[index]
+      : path.join(current, parts[index]);
+    if (hops.length >= maxComponents) {
+      return { ok: false, reason: "hop-limit", hops };
+    }
+    let stat;
+    try {
+      stat = fs.lstatSync(current, { bigint: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        // Missing intermediate is recorded as absence of further hops.
+        break;
+      }
+      return { ok: false, reason: "unreadable", hops };
+    }
+    if (stat.isSymbolicLink()) {
+      let linkText;
+      try {
+        linkText = fs.readlinkSync(current);
+      } catch {
+        return { ok: false, reason: "unreadable", hops };
+      }
+      hops.push({
+        // Private absolute for revalidation only — never serialized publicly.
+        kind: "symlink",
+        absolute: current,
+        linkDigest: sha(String(linkText)),
+        // Stable node identity for same-capture revalidation and cross-capture digests.
+        stableSignature: metadataLexicalNodeStableSignature(stat)
+      });
+      continue;
+    }
+    if (stat.isDirectory()) {
+      hops.push({
+        kind: "directory",
+        absolute: current,
+        // Stable node identity only: sibling nlink/mtime/ctime under this
+        // ancestor must not fail-close same-capture revalidation.
+        stableSignature: metadataLexicalNodeStableSignature(stat)
+      });
+      continue;
+    }
+    if (stat.isFile()) {
+      hops.push({
+        kind: "file",
+        absolute: current,
+        stableSignature: metadataLexicalNodeStableSignature(stat)
+      });
+      continue;
+    }
+    return { ok: false, reason: "other", hops };
+  }
+  return { ok: true, hops };
+}
+
+/**
+ * Re-lstat/readlink every lexical component so ordinary→symlink swaps, ancestor
+ * replacement, chmod/mode changes, and symlink retarget races fail closed.
+ *
+ * Lexical witnesses deliberately use stable dev/ino/mode (+ symlink linkDigest)
+ * rather than full directory/file/symlink enumeration signatures. Unrelated
+ * sibling create/change/remove under an ordinary ancestor changes nlink/size/
+ * mtime/ctime without replacing the node and must not mark hooks unreadable.
+ */
+function revalidateLexicalPathSymlinkHops(hops, maxComponents = MAX_LEXICAL_PATH_COMPONENTS) {
+  if (!Array.isArray(hops)) return { ok: false, reason: "unreadable" };
+  if (hops.length > maxComponents) return { ok: false, reason: "hop-limit" };
+  for (const hop of hops) {
+    if (!hop || typeof hop.absolute !== "string" || typeof hop.kind !== "string") {
+      return { ok: false, reason: "unreadable" };
+    }
+    if (typeof hop.stableSignature !== "string") {
+      return { ok: false, reason: "unreadable" };
+    }
+    let stat;
+    try {
+      stat = fs.lstatSync(hop.absolute, { bigint: true });
+    } catch {
+      return { ok: false, reason: "broken" };
+    }
+    if (hop.kind === "symlink") {
+      if (typeof hop.linkDigest !== "string") return { ok: false, reason: "unreadable" };
+      if (!stat.isSymbolicLink()) return { ok: false, reason: "replaced" };
+      if (metadataLexicalNodeStableSignature(stat) !== hop.stableSignature) {
+        return { ok: false, reason: "replaced" };
+      }
+      let linkText;
+      try {
+        linkText = fs.readlinkSync(hop.absolute);
+      } catch {
+        return { ok: false, reason: "unreadable" };
+      }
+      if (sha(String(linkText)) !== hop.linkDigest) {
+        return { ok: false, reason: "retargeted" };
+      }
+      continue;
+    }
+    if (hop.kind === "directory") {
+      // Ordinary directory swapped to a symlink (even same content) fails closed.
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        return { ok: false, reason: "replaced" };
+      }
+      if (metadataLexicalNodeStableSignature(stat) !== hop.stableSignature) {
+        return { ok: false, reason: "replaced" };
+      }
+      continue;
+    }
+    if (hop.kind === "file") {
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        return { ok: false, reason: "replaced" };
+      }
+      if (metadataLexicalNodeStableSignature(stat) !== hop.stableSignature) {
+        return { ok: false, reason: "replaced" };
+      }
+      continue;
+    }
+    return { ok: false, reason: "unreadable" };
+  }
+  return { ok: true };
+}
+
+/**
+ * Choose the private hooks-tree walk root.
+ *
+ * `rev-parse --git-path hooks` is authoritative for Git's effective hooks
+ * directory, but it may canonicalize a final directory symlink and drop the
+ * configured hop. When `core.hooksPath` is set (absolute, relative, or
+ * include-derived), build an unresolved candidate from the configured value:
+ * absolute values are used as-is; relative values are resolved against the
+ * worktree root (cwd for the git helper) without realpathing the final hop.
+ * Walk that candidate when its realpath matches the effective directory so hop
+ * digests observe final-component retarget races. Ancestor symlink components
+ * of the configured path are always bound separately (see lexical hops).
+ * Absolute paths never leave this helper publicly.
+ */
+function resolveHooksWalkRoot(workspaceRoot, effectiveHooksPath) {
+  const configuredRun = git(
+    workspaceRoot,
+    // Explicit includes so include-derived core.hooksPath is observed the same
+    // way Git resolves effective configuration for hooks.
+    ["config", "--includes", "--path", "--get", "core.hooksPath"],
+    { allowFailure: true }
+  );
+  // Unset / not found: Git uses the rev-parse effective path alone.
+  if (configuredRun.error || configuredRun.status !== 0) {
+    return { ok: true, hooksPath: effectiveHooksPath, configuredCandidate: null };
+  }
+  const configured = String(configuredRun.stdout || "").trim();
+  if (!configured) {
+    return { ok: true, hooksPath: effectiveHooksPath, configuredCandidate: null };
+  }
+
+  // Absolute: keep unresolved string (may be a symlink hop). Relative: join to
+  // the worktree root without realpath — matches Git cwd/worktree semantics for
+  // this helper's git() invocations — so a relative directory symlink remains
+  // observable. Never use raw relative strings as the walk root.
+  const configuredCandidate = path.isAbsolute(configured)
+    ? configured
+    : path.resolve(workspaceRoot, configured);
+  if (!configuredCandidate || !path.isAbsolute(configuredCandidate)) {
+    return { ok: true, hooksPath: effectiveHooksPath, configuredCandidate: null };
+  }
+
+  let configuredStat;
+  try {
+    configuredStat = fs.lstatSync(configuredCandidate);
+  } catch {
+    // Missing/unreadable configured path: keep effective (may also be missing).
+    return { ok: true, hooksPath: effectiveHooksPath, configuredCandidate };
+  }
+
+  // Non-symlink final component: walk the effective path for content, but still
+  // return configuredCandidate so ancestor lexical hops can be bound.
+  if (!configuredStat.isSymbolicLink()) {
+    return { ok: true, hooksPath: effectiveHooksPath, configuredCandidate };
+  }
+
+  // Configured directory (or multi-hop) symlink: retain the unresolved hop
+  // only when it realpath-matches Git's effective hooks root.
+  try {
+    const configuredReal = fs.realpathSync(configuredCandidate);
+    const effectiveReal = fs.realpathSync(effectiveHooksPath);
+    if (path.resolve(configuredReal) !== path.resolve(effectiveReal)) {
+      return { ok: true, hooksPath: effectiveHooksPath, configuredCandidate };
+    }
+    return { ok: true, hooksPath: configuredCandidate, configuredCandidate };
+  } catch {
+    // Dangling / partially unreadable symlink: if the single-hop logical
+    // target agrees with the effective path string, still walk the unresolved
+    // hop so broken/retargeted roots fail closed via the bounded walker.
+    try {
+      const linkText = fs.readlinkSync(configuredCandidate);
+      const logicalTarget = path.resolve(
+        path.dirname(configuredCandidate),
+        String(linkText)
+      );
+      if (path.resolve(logicalTarget) === path.resolve(effectiveHooksPath)) {
+        return { ok: true, hooksPath: configuredCandidate, configuredCandidate };
+      }
+    } catch {
+      // ignore readlink races
+    }
+    return { ok: true, hooksPath: effectiveHooksPath, configuredCandidate };
+  }
+}
+
+/**
+ * Resolve the effective hooks directory with Git semantics (respects
+ * core.hooksPath) and hash bounded contents under a private digest only.
+ * Symlink link-text and resolved target contents are both bound into the
+ * identity so unchanged symlink paths cannot hide target drift. Absolute hook
+ * paths never enter public/runtime evidence.
+ * Missing after resolution failure, unreadable, cyclic, excessive-depth, or
+ * truncated inventories fail closed via observable=false.
+ */
+function captureEffectiveHooksIdentity(workspaceRoot) {
+  const run = git(
+    workspaceRoot,
+    ["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
+    { allowFailure: true }
+  );
+  if (run.status !== 0 || run.error) {
+    return {
+      identity: sha("hooks-v2:resolution-failed"),
+      observable: false,
+      truncated: true
+    };
+  }
+  const effectiveHooksPath = String(run.stdout || "").trim();
+  if (!effectiveHooksPath || !path.isAbsolute(effectiveHooksPath)) {
+    return {
+      identity: sha("hooks-v2:resolution-failed"),
+      observable: false,
+      truncated: true
+    };
+  }
+
+  const walkRoot = resolveHooksWalkRoot(workspaceRoot, effectiveHooksPath);
+  if (!walkRoot.ok) {
+    return {
+      identity: sha(`hooks-v2:${walkRoot.reason || "walk-root-failed"}`),
+      observable: false,
+      truncated: true
+    };
+  }
+  const hooksPath = walkRoot.hooksPath;
+  if (!hooksPath || !path.isAbsolute(hooksPath)) {
+    return {
+      identity: sha("hooks-v2:resolution-failed"),
+      observable: false,
+      truncated: true
+    };
+  }
+
+  // Bind every lexical component along the configured path (ordinary dirs,
+  // files, and symlink hops) so ordinary→symlink ancestor swaps and symlink
+  // retargets change identity even when hook tree bytes are identical.
+  let lexicalHops = [];
+  let lexicalHopFailure = null;
+  const hopSource = walkRoot.configuredCandidate || null;
+  if (hopSource) {
+    const hopCapture = captureLexicalPathSymlinkHops(hopSource, MAX_LEXICAL_PATH_COMPONENTS);
+    if (!hopCapture.ok) {
+      lexicalHopFailure = hopCapture.reason || "unreadable";
+    } else {
+      lexicalHops = hopCapture.hops;
+    }
+  }
+
+  // Reuse the shared bounded walker so hooks, operational, and non-ref capture
+  // enforce the same hard entry/byte/descriptor bounds without path leakage.
+  const state = createMetadataVisitState();
+  let missing = false;
+  /** @type {object[]} */
+  const rootWitnesses = [];
+  try {
+    fs.lstatSync(hooksPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      missing = true;
+      // Witness absence so a hooks root that appears mid-capture fails closed.
+      rootWitnesses.push({ kind: "absent", absolute: hooksPath });
+    } else {
+      return {
+        identity: sha("hooks-v2:unreadable-root"),
+        observable: false,
+        truncated: true
+      };
+    }
+  }
+  if (!missing) {
+    const witness = visitBoundedMetadataTree(hooksPath, "", 0, new Set(), state, {
+      maxDepth: MAX_HOOKS_DEPTH,
+      maxBytes: MAX_HOOKS_HASH_BYTES,
+      maxEntries: MAX_GIT_METADATA_ENTRIES,
+      maxHops: MAX_HOOKS_SYMLINK_HOPS
+    });
+    if (witness) rootWitnesses.push(witness);
+  }
+  // Final present/absent validation of the effective hooks root.
+  if (!state.truncated && !state.depthExceeded) {
+    revalidateOptionalRootWitnesses(rootWitnesses, state);
+    // If the missing witness flipped to present, revalidation already set
+    // unreadable. Keep the missing flag consistent with the final witness.
+    if (missing && state.unreadable) {
+      missing = false;
+    }
+  }
+  // Revalidate configured lexical ancestor/final components after content capture.
+  if (!lexicalHopFailure && lexicalHops.length > 0) {
+    const hopRecheck = revalidateLexicalPathSymlinkHops(lexicalHops, MAX_LEXICAL_PATH_COMPONENTS);
+    if (!hopRecheck.ok) {
+      lexicalHopFailure = hopRecheck.reason || "retargeted";
+      state.unreadable = true;
+    }
+  } else if (lexicalHopFailure) {
+    state.unreadable = true;
+  }
+  state.entries.sort((left, right) => left.path.localeCompare(right.path));
+  // Public-safe hop digests only (no absolute paths, raw stats, or link text).
+  // kind is retained so ordinary→symlink type swaps change identity.
+  // Cross-capture and same-capture lexical witnesses both use stable
+  // dev/ino/mode (+ symlink linkDigest). Full enumeration signatures remain
+  // for metadata tree hashing only — not lexical hop revalidation.
+  const publicLexicalHops = lexicalHops.map((hop) => {
+    const stable = hop.stableSignature;
+    if (hop.kind === "symlink") {
+      return {
+        kind: "symlink",
+        linkDigest: hop.linkDigest,
+        signatureDigest: sha(stable)
+      };
+    }
+    return {
+      kind: hop.kind,
+      signatureDigest: sha(stable)
+    };
+  });
+  // A completely missing hooks directory is normal (empty effective hooks).
+  // Unreadable, cyclic, depth-limited, or truncated inventories fail closed.
+  const failClosed = state.unreadable
+    || state.depthExceeded
+    || state.truncated
+    || state.cyclic
+    || state.entries.length >= MAX_GIT_METADATA_ENTRIES
+    || Boolean(lexicalHopFailure);
+  return {
+    identity: sha(canonicalJson({
+      schema: "hooks-v4",
+      entries: state.entries,
+      lexicalHops: publicLexicalHops,
+      lexicalHopFailure: lexicalHopFailure || null,
+      missing,
+      truncated: failClosed,
+      depthExceeded: state.depthExceeded,
+      unreadable: state.unreadable,
+      cyclic: state.cyclic
+    })),
+    observable: !failClosed,
+    truncated: failClosed
+  };
+}
+
+/**
+ * Bounded legacy metadata tree walk for gitMetadataIdentity.
+ * Hard entry/byte/depth caps and descriptor-bound file hashing; directory
+ * listings use listDirectoryNamesBounded (no unbounded readdirSync().sort()).
+ * Optional missing roots stay silent (stable absence is valid) but are
+ * witnessed and revalidated after the full root batch so mid-capture
+ * appearance/disappearance/replace fails closed via state.
+ */
+function visitGitMetadataEntries(entries, gitDir, commonDir, roots, state) {
+  const visit = (base, relative, depth = 0) => {
+    if (!state || state.truncated || state.unreadable || state.depthExceeded) {
+      return null;
+    }
+    if (entries.length >= MAX_GIT_METADATA_ENTRIES) {
+      state.truncated = true;
+      return null;
+    }
+    if (depth > MAX_METADATA_DEPTH) {
+      state.depthExceeded = true;
+      return null;
+    }
+    const absolute = path.join(base, relative);
+    let stat;
+    try {
+      // Top-level roots use bigint so present witnesses can revalidate identity.
+      stat = depth === 0
+        ? fs.lstatSync(absolute, { bigint: true })
+        : fs.lstatSync(absolute);
+    } catch (error) {
+      // Optional legacy roots may be absent (e.g. missing hooks).
+      if (error?.code === "ENOENT") {
+        if (depth === 0) return { kind: "absent", absolute };
+        // Listed child disappeared mid-walk.
+        state.unreadable = true;
+        return null;
+      }
+      state.unreadable = true;
+      return null;
+    }
+    const key = `${base === gitDir ? "git" : "common"}/${relative.replace(/\\/g, "/")}`;
+    if (stat.isSymbolicLink()) {
+      let linkText;
+      try {
+        linkText = fs.readlinkSync(absolute);
+      } catch {
+        state.unreadable = true;
+        return null;
+      }
+      const linkDigest = sha(String(linkText));
+      entries.push({
+        path: key,
+        kind: "symlink",
+        mode: Number(stat.mode & (depth === 0 ? 0o7777n : 0o7777)),
+        digest: linkDigest
+      });
+      if (depth === 0) {
+        return {
+          kind: "legacy-present",
+          absolute,
+          nodeKind: "symlink",
+          signature: metadataSymlinkStatSignature(stat),
+          linkDigest
+        };
+      }
+      return null;
+    }
+    if (stat.isFile()) {
+      // Descriptor-validated mode/size/digest only — same hard byte bound.
+      const fileIdentity = hashBoundedMetadataFile(absolute, state, MAX_METADATA_HASH_BYTES);
+      if (fileIdentity.kind === "unobservable") {
+        state.unreadable = true;
+        return null;
+      }
+      entries.push({
+        path: key,
+        kind: "file",
+        mode: fileIdentity.mode,
+        size: fileIdentity.size,
+        digest: fileIdentity.digest
+      });
+      if (depth === 0) {
+        return {
+          kind: "legacy-present",
+          absolute,
+          nodeKind: "file",
+          mode: fileIdentity.mode,
+          size: fileIdentity.size,
+          digest: fileIdentity.digest
+        };
+      }
+      return null;
+    }
+    if (!stat.isDirectory()) {
+      entries.push({
+        path: key,
+        kind: "other",
+        mode: Number(stat.mode & (depth === 0 ? 0o7777n : 0o7777))
+      });
+      if (depth === 0) {
+        return { kind: "legacy-present", absolute, nodeKind: "other" };
+      }
+      return null;
+    }
+    let listed;
+    try {
+      listed = listDirectoryNamesBounded(absolute, MAX_GIT_METADATA_ENTRIES - entries.length);
+    } catch {
+      state.unreadable = true;
+      return null;
+    }
+    if (listed.truncated) {
+      state.truncated = true;
+      return null;
+    }
+    for (const name of listed.names) {
+      if (entries.length >= MAX_GIT_METADATA_ENTRIES || state.truncated || state.unreadable) {
+        state.truncated = true;
+        break;
+      }
+      visit(base, path.join(relative, name), depth + 1);
+    }
+    // Membership revalidation after children (post-EOF growth / shrink).
+    if (!state.truncated && !state.unreadable) {
+      const dirRecheck = revalidateBoundedDirectorySnapshot(
+        absolute,
+        listed.directorySignature,
+        listed.names
+      );
+      if (!dirRecheck.ok) state.unreadable = true;
+    }
+    if (depth === 0) {
+      return {
+        kind: "legacy-present",
+        absolute,
+        nodeKind: "directory",
+        directorySignature: listed.directorySignature,
+        names: listed.names
+      };
+    }
+    return null;
+  };
+  const rootWitnesses = [];
+  for (const [base, relatives] of roots) {
+    if (!base) {
+      state.unreadable = true;
+      continue;
+    }
+    for (const relative of relatives) {
+      const witness = visit(base, relative, 0);
+      if (witness) rootWitnesses.push(witness);
+    }
+  }
+  // Final present/absent validation of the complete legacy root set.
+  if (!state.truncated && !state.depthExceeded) {
+    revalidateOptionalRootWitnesses(rootWitnesses, state);
+  }
+}
+
+/**
+ * Positively classify a shared ref name.
+ * Unrelated (tolerated only when both manifests are linked worktrees and only
+ * these change): other local branches, unrelated remote-tracking refs, and
+ * refs/codex/turn-diffs/**.
+ * Task-relevant (fail closed): current branch, configured upstream,
+ * refs/replace/**, and any unclassified/special ref.
+ */
+function classifySharedRef(refname, { currentBranchRef = null, upstreamFullRef = null } = {}) {
+  const name = String(refname || "");
+  if (!name.startsWith("refs/")) return SHARED_REF_CLASS_TASK_RELEVANT;
+  if (currentBranchRef && name === currentBranchRef) return SHARED_REF_CLASS_TASK_RELEVANT;
+  if (upstreamFullRef && name === upstreamFullRef) return SHARED_REF_CLASS_TASK_RELEVANT;
+  if (name.startsWith("refs/replace/")) return SHARED_REF_CLASS_TASK_RELEVANT;
+  if (name.startsWith("refs/codex/turn-diffs/")) return SHARED_REF_CLASS_UNRELATED;
+  if (name.startsWith("refs/heads/")) return SHARED_REF_CLASS_UNRELATED;
+  if (name.startsWith("refs/remotes/")) return SHARED_REF_CLASS_UNRELATED;
+  return SHARED_REF_CLASS_TASK_RELEVANT;
+}
+
+/**
+ * Exact Git reftable compatibility marker written as a regular file where a
+ * loose-ref directory would otherwise live (e.g. refs/heads, refs/tags).
+ * Content and relative locations are Git-defined; only ignore when the
+ * repository backend is reftable (git rev-parse --show-ref-format).
+ */
+const REFTABLE_REFS_MARKER_BODY = "this repository uses the reftable format\n";
+const REFTABLE_REFS_MARKER_RELATIVE = Object.freeze(new Set([
+  "heads",
+  "tags"
+]));
+const WORKTREE_PRIVATE_REF_NAMESPACES = Object.freeze([
+  "bisect",
+  "worktree",
+  "rewritten"
+]);
+
+/**
+ * Bounded loose-ref scan under refs/ to catch broken files and dangling
+ * symbolic refs that for-each-ref/show-ref may silently omit with status 0.
+ *
+ * When the authoritative ref backend is reftable, Git may place exact
+ * compatibility marker *files* at refs/heads and refs/tags (not directories)
+ * with body "this repository uses the reftable format\\n". Those markers are
+ * not refs and must not fail closed. Any other loose file, arbitrary symlink,
+ * or marker-like content on a files backend remains fail-closed.
+ * Hard entry/depth bounds; absolute paths stay private.
+ */
+function validateLooseRefsInventory(workspaceRoot, knownNames) {
+  const commonDirRun = git(
+    workspaceRoot,
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    { allowFailure: true }
+  );
+  if (commonDirRun.error || commonDirRun.status !== 0) {
+    return { ok: false, reason: "common-dir" };
+  }
+  const gitDirRun = git(
+    workspaceRoot,
+    ["rev-parse", "--path-format=absolute", "--git-dir"],
+    { allowFailure: true }
+  );
+  if (gitDirRun.error || gitDirRun.status !== 0) {
+    return { ok: false, reason: "git-dir" };
+  }
+  let commonDir;
+  let gitDir;
+  try {
+    const commonCandidate = String(commonDirRun.stdout || "").trim();
+    const gitCandidate = String(gitDirRun.stdout || "").trim();
+    if (!commonCandidate
+      || !gitCandidate
+      || !path.isAbsolute(commonCandidate)
+      || !path.isAbsolute(gitCandidate)) {
+      return { ok: false, reason: "git-dir" };
+    }
+    commonDir = fs.realpathSync(commonCandidate);
+    gitDir = fs.realpathSync(gitCandidate);
+  } catch {
+    return { ok: false, reason: "common-dir" };
+  }
+
+  // Authoritative backend detection — only reftable may use the marker exception.
+  const formatRun = git(
+    workspaceRoot,
+    ["rev-parse", "--show-ref-format"],
+    { allowFailure: true }
+  );
+  const isReftable = !formatRun.error
+    && formatRun.status === 0
+    && String(formatRun.stdout || "").trim() === "reftable";
+
+  const linkedWorktree = gitDir !== commonDir;
+  const privateNamespaces = new Set(WORKTREE_PRIVATE_REF_NAMESPACES);
+  const rootSpecs = [{
+    absolute: path.join(commonDir, "refs"),
+    refPrefix: "refs",
+    source: "common",
+    excludeTopLevel: linkedWorktree ? privateNamespaces : new Set(),
+    allowReftableMarkers: true
+  }];
+  if (linkedWorktree) {
+    for (const namespace of WORKTREE_PRIVATE_REF_NAMESPACES) {
+      rootSpecs.push({
+        absolute: path.join(gitDir, "refs", namespace),
+        refPrefix: `refs/${namespace}`,
+        source: `worktree:${namespace}`,
+        excludeTopLevel: new Set(),
+        allowReftableMarkers: false
+      });
+    }
+  }
+
+  let seenNodes = 0;
+  let refCount = 0;
+  const observedRefNames = new Set();
+  const snapshotRecords = [];
+  const directoryWitnesses = [];
+  const fileWitnesses = [];
+  const absentRootWitnesses = [];
+
+  const snapshotFile = (spec, relativeKey, bodyRead, kind) => {
+    snapshotRecords.push({
+      kind,
+      sourceDigest: sha(spec.source),
+      pathDigest: sha(`${spec.refPrefix}/${relativeKey}`),
+      fileSignature: bodyRead.fileSignature,
+      mode: bodyRead.mode,
+      size: bodyRead.size,
+      bodyDigest: bodyRead.bodyDigest
+    });
+    fileWitnesses.push({
+      absolute: path.join(spec.absolute, ...relativeKey.split("/")),
+      fileSignature: bodyRead.fileSignature,
+      mode: bodyRead.mode,
+      size: bodyRead.size,
+      bodyDigest: bodyRead.bodyDigest
+    });
+  };
+
+  const visit = (spec, absolute, relative, depth, isRoot = false) => {
+    if (seenNodes >= MAX_SHARED_REFS || depth > MAX_METADATA_DEPTH) {
+      return { ok: false, reason: "bound" };
+    }
+    let stat;
+    try {
+      stat = fs.lstatSync(absolute, { bigint: true });
+    } catch (error) {
+      if (error?.code === "ENOENT" && isRoot) {
+        absentRootWitnesses.push(absolute);
+        snapshotRecords.push({
+          kind: "absent-root",
+          sourceDigest: sha(spec.source)
+        });
+        return { ok: true };
+      }
+      return { ok: false, reason: "unreadable" };
+    }
+    seenNodes += 1;
+    // Arbitrary symlink nodes under refs/ always fail closed (no silent skip).
+    if (stat.isSymbolicLink()) {
+      return { ok: false, reason: "symlink-ref" };
+    }
+    if (stat.isDirectory()) {
+      let listed;
+      try {
+        listed = listDirectoryNamesBounded(
+          absolute,
+          Math.max(0, MAX_SHARED_REFS - seenNodes)
+        );
+      } catch {
+        return { ok: false, reason: "unreadable" };
+      }
+      if (listed.truncated) {
+        return { ok: false, reason: "bound" };
+      }
+      const effectiveNames = relative === ""
+        ? listed.names.filter((name) => !spec.excludeTopLevel.has(name))
+        : listed.names;
+      snapshotRecords.push({
+        kind: "directory",
+        sourceDigest: sha(spec.source),
+        pathDigest: sha(`${spec.refPrefix}/${relative}`),
+        stableSignature: listed.stableSignature,
+        memberDigests: effectiveNames.map((name) => sha(name))
+      });
+      directoryWitnesses.push({
+        absolute,
+        directorySignature: listed.directorySignature,
+        names: listed.names
+      });
+      for (const name of effectiveNames) {
+        const child = visit(
+          spec,
+          path.join(absolute, name),
+          relative ? `${relative}/${name}` : name,
+          depth + 1
+        );
+        if (!child.ok) return child;
+      }
+      const directoryCheck = revalidateBoundedDirectorySnapshot(
+        absolute,
+        listed.directorySignature,
+        listed.names
+      );
+      if (!directoryCheck.ok) {
+        return { ok: false, reason: "mutated" };
+      }
+      return { ok: true };
+    }
+    if (!stat.isFile()) {
+      // Non-file/non-dir nodes under refs/ are not valid loose refs.
+      return { ok: false, reason: "other" };
+    }
+    // relative must be a non-empty path under refs/ (never the refs root itself).
+    if (!relative) return { ok: false, reason: "name" };
+    const relativeKey = relative.replace(/\\/g, "/");
+
+    // Exact reftable compatibility marker only (backend + path + body).
+    // Descriptor-bound nofollow read of accepted body limit + 1 byte.
+    if (
+      spec.allowReftableMarkers
+      &&
+      isReftable
+      && REFTABLE_REFS_MARKER_RELATIVE.has(relativeKey)
+      && !relativeKey.includes("/")
+    ) {
+      const markerRead = readBoundedNofollowTextFile(absolute, MAX_LOOSE_REF_BODY_BYTES);
+      if (!markerRead.ok) {
+        return { ok: false, reason: markerRead.reason === "oversize" ? "oversize" : "unreadable" };
+      }
+      if (markerRead.body === REFTABLE_REFS_MARKER_BODY) {
+        // Not a ref — skip without counting toward inventory incompleteness.
+        snapshotFile(spec, relativeKey, markerRead, "reftable-marker");
+        return { ok: true };
+      }
+      // Same path but wrong body: fall through as a broken/malformed plant.
+    }
+
+    refCount += 1;
+    if (refCount > MAX_SHARED_REFS) return { ok: false, reason: "bound" };
+    const refname = `${spec.refPrefix}/${relativeKey}`;
+    if (refname.length > MAX_SHARED_REF_FIELD_BYTES || refname.includes("//")) {
+      return { ok: false, reason: "name" };
+    }
+    // Descriptor-bound nofollow read; never unbounded readFileSync of ref bodies.
+    const bodyRead = readBoundedNofollowTextFile(absolute, MAX_LOOSE_REF_BODY_BYTES);
+    if (!bodyRead.ok) {
+      return {
+        ok: false,
+        reason: bodyRead.reason === "oversize" ? "oversize" : "unreadable"
+      };
+    }
+    snapshotFile(spec, relativeKey, bodyRead, "loose-ref");
+    const trimmed = String(bodyRead.body || "").trim();
+    if (!trimmed || trimmed.length > MAX_SHARED_REF_FIELD_BYTES) {
+      return { ok: false, reason: "body" };
+    }
+    if (trimmed.startsWith("ref:")) {
+      const target = trimmed.slice(4).trim();
+      if (
+        !target
+        || !target.startsWith("refs/")
+        || target.length > MAX_SHARED_REF_FIELD_BYTES
+      ) {
+        return { ok: false, reason: "symref" };
+      }
+      // Dangling or broken symbolic ref: must resolve to an object.
+      const resolveRun = git(
+        workspaceRoot,
+        ["rev-parse", "--verify", "--quiet", "--end-of-options", `${refname}^{object}`],
+        { allowFailure: true }
+      );
+      if (resolveRun.error || resolveRun.status !== 0 || String(resolveRun.stderr || "").trim()) {
+        return { ok: false, reason: "dangling" };
+      }
+    } else if (!/^[a-f0-9]{40,64}$/i.test(trimmed.split(/\s+/)[0] || "")) {
+      // Broken loose OID file (includes marker-like content on files backend).
+      return { ok: false, reason: "broken-oid" };
+    }
+    if (observedRefNames.has(refname)) {
+      return { ok: false, reason: "duplicate" };
+    }
+    observedRefNames.add(refname);
+    // Loose ref present but omitted from semantic inventory → incomplete.
+    if (knownNames && !knownNames.has(refname) && knownNames.size <= MAX_SHARED_REFS) {
+      return { ok: false, reason: "omitted" };
+    }
+    return { ok: true };
+  };
+
+  for (const spec of rootSpecs) {
+    const result = visit(spec, spec.absolute, "", 0, true);
+    if (!result.ok) return result;
+  }
+
+  // Each scan is independently stable: after all roots have been traversed,
+  // revalidate every captured directory membership, every descriptor-bound
+  // file identity/body, and every optional absent root.
+  for (const witness of directoryWitnesses) {
+    const check = revalidateBoundedDirectorySnapshot(
+      witness.absolute,
+      witness.directorySignature,
+      witness.names
+    );
+    if (!check.ok) return { ok: false, reason: "mutated" };
+  }
+  for (const witness of fileWitnesses) {
+    const reread = readBoundedNofollowTextFile(
+      witness.absolute,
+      MAX_LOOSE_REF_BODY_BYTES
+    );
+    if (!reread.ok
+      || reread.fileSignature !== witness.fileSignature
+      || reread.mode !== witness.mode
+      || reread.size !== witness.size
+      || reread.bodyDigest !== witness.bodyDigest) {
+      return { ok: false, reason: "mutated" };
+    }
+  }
+  for (const absolute of absentRootWitnesses) {
+    try {
+      fs.lstatSync(absolute);
+      return { ok: false, reason: "mutated" };
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        return { ok: false, reason: "unreadable" };
+      }
+    }
+  }
+
+  snapshotRecords.sort((left, right) => (
+    canonicalJson(left).localeCompare(canonicalJson(right))
+  ));
+  return {
+    ok: true,
+    refCount,
+    identity: sha(canonicalJson({
+      schema: "loose-refs-v2",
+      records: snapshotRecords
+    }))
+  };
+}
+
+const SEMANTIC_REF_INVENTORY_ARGS = Object.freeze([
+  "for-each-ref",
+  "--sort=refname",
+  "--format=%(refname)%00%(objectname)%00%(symref)%0a"
+]);
+
+/**
+ * Parse a validated for-each-ref inventory run into sorted name/target records.
+ * Caller must already enforce status 0, no error, and empty stderr.
+ */
+function parseSemanticRefInventoryStdout(stdout, workspaceRoot) {
+  const refs = [];
+  let unattributable = false;
+  let malformed = false;
+  const seenNames = new Set();
+  let duplicates = false;
+  for (const line of String(stdout || "").split("\n")) {
+    if (!line) continue;
+    const parts = line.split("\0");
+    if (parts.length < 2) {
+      malformed = true;
+      unattributable = true;
+      continue;
+    }
+    const name = parts[0] || "";
+    const objectname = parts[1] || "";
+    const symref = parts[2] || "";
+    if (!name.startsWith("refs/") || name.length > MAX_SHARED_REF_FIELD_BYTES) {
+      malformed = true;
+      unattributable = true;
+      continue;
+    }
+    if (seenNames.has(name)) {
+      duplicates = true;
+      unattributable = true;
+      continue;
+    }
+    seenNames.add(name);
+    const target = symref || objectname;
+    if (!target
+      || target.length > MAX_SHARED_REF_FIELD_BYTES
+      || !/^[a-f0-9]{40,64}$/i.test(objectname)) {
+      malformed = true;
+      unattributable = true;
+      continue;
+    }
+    // Reject absolute paths / private material in targets.
+    if (/^(?:\/|[A-Za-z]:[\\/]|~\/)/.test(target)) {
+      malformed = true;
+      unattributable = true;
+      continue;
+    }
+    // Dangling symbolic refs: symref target must resolve to an object.
+    if (symref) {
+      const resolveRun = git(
+        workspaceRoot,
+        ["rev-parse", "--verify", "--quiet", "--end-of-options", `${name}^{object}`],
+        { allowFailure: true }
+      );
+      if (resolveRun.error || resolveRun.status !== 0 || String(resolveRun.stderr || "").trim()) {
+        malformed = true;
+        unattributable = true;
+        continue;
+      }
+    }
+    // Preserve both symbolic topology and the resolved object. A symbolic ref
+    // can keep the same target name while that target advances.
+    refs.push({
+      name,
+      target,
+      resolvedOid: objectname.toLowerCase()
+    });
+    if (refs.length > MAX_SHARED_REFS) break;
+  }
+  refs.sort((left, right) => left.name.localeCompare(right.name));
+  return { refs, unattributable, malformed, duplicates };
+}
+
+/**
+ * True when two sorted semantic ref inventories have identical name+target pairs.
+ */
+function semanticRefInventoriesEqual(leftRefs, rightRefs) {
+  if (!Array.isArray(leftRefs) || !Array.isArray(rightRefs)) return false;
+  if (leftRefs.length !== rightRefs.length) return false;
+  for (let index = 0; index < leftRefs.length; index += 1) {
+    const left = leftRefs[index];
+    const right = rightRefs[index];
+    if (!left
+      || !right
+      || left.name !== right.name
+      || left.target !== right.target
+      || left.resolvedOid !== right.resolvedOid) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Capture semantic shared refs (name → OID or symref target) so loose↔packed
+ * rewrites with identical semantics produce the same identity.
+ *
+ * Status-0 enumerations with stderr/warnings, malformed entries, duplicates,
+ * dangling symbolic targets, or cross-check disagreement with `show-ref` /
+ * bounded loose refs are incomplete/unavailable and never eligible for
+ * linked-worktree tolerance.
+ *
+ * After all cross-checks, a second bounded exact name-and-target inventory pass
+ * must match the first exactly (validated status and empty stderr) so mid-capture
+ * same-name target mutations cannot publish a stale complete identity.
+ */
+function captureSemanticSharedRefs(workspaceRoot) {
+  // Once Git's authoritative semantic inventory is untrusted, fail immediately.
+  // A second loose-tree walk cannot restore attribution and would add needless
+  // filesystem work to an already fail-closed capture.
+  const failUntrustedInventory = () => (
+    { refs: [], complete: false, available: false }
+  );
+
+  // One record per line: refname\0objectname\0symref. Newline separates records
+  // so empty symref fields cannot merge adjacent refs.
+  const run = git(
+    workspaceRoot,
+    [...SEMANTIC_REF_INVENTORY_ARGS],
+    { allowFailure: true, maxBuffer: 64 * 1024 * 1024 }
+  );
+  if (run.status !== 0 || run.error) {
+    return failUntrustedInventory();
+  }
+  // Any warning/diagnostic on stderr means the inventory is not trustworthy
+  // (broken loose refs, reftable issues, etc.) even when status is 0.
+  if (String(run.stderr || "").trim()) {
+    return failUntrustedInventory();
+  }
+  const parsed = parseSemanticRefInventoryStdout(run.stdout, workspaceRoot);
+  let { refs, unattributable, malformed, duplicates } = parsed;
+
+  // Cross-check against show-ref so silently omitted dangling/broken refs
+  // cannot publish a complete inventory (for-each-ref may drop them with status 0).
+  const showRun = git(
+    workspaceRoot,
+    ["show-ref", "--head"],
+    { allowFailure: true, maxBuffer: 64 * 1024 * 1024 }
+  );
+  // show-ref exits 1 when the repository has no refs at all; treat other
+  // failures, stderr, or parse errors as incomplete.
+  if (showRun.error) {
+    return failUntrustedInventory();
+  }
+  if (String(showRun.stderr || "").trim()) {
+    return failUntrustedInventory();
+  }
+  const showNames = new Set();
+  let showMalformed = false;
+  for (const line of String(showRun.stdout || "").split("\n")) {
+    if (!line) continue;
+    // Format: <oid> SP <refname>
+    const sp = line.indexOf(" ");
+    if (sp <= 0) {
+      showMalformed = true;
+      continue;
+    }
+    const refname = line.slice(sp + 1).trim();
+    if (!refname || refname.length > MAX_SHARED_REF_FIELD_BYTES) {
+      showMalformed = true;
+      continue;
+    }
+    // Compare only refs/** — HEAD is not in for-each-ref output.
+    if (refname.startsWith("refs/")) showNames.add(refname);
+  }
+  // When show-ref exits non-zero with empty stdout and no refs expected, allow
+  // empty agreement; any partial/non-empty disagreement fails closed.
+  if (showRun.status !== 0 && showNames.size > 0) {
+    return { refs: [], complete: false, available: false };
+  }
+  if (showMalformed) {
+    return { refs: [], complete: false, available: false };
+  }
+  const forEachNames = new Set(refs.map((entry) => entry.name));
+  // Names only in show-ref (omitted by for-each-ref) or only in for-each-ref
+  // indicate incomplete inventory. Truncation over MAX_SHARED_REFS is handled
+  // separately via overBudget; still treat show-ref exclusives as omissions.
+  if (refs.length <= MAX_SHARED_REFS) {
+    for (const name of showNames) {
+      if (!forEachNames.has(name)) {
+        unattributable = true;
+        malformed = true;
+        break;
+      }
+    }
+    if (!malformed) {
+      for (const name of forEachNames) {
+        if (!showNames.has(name)) {
+          unattributable = true;
+          malformed = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // Bounded loose refs/ walk catches broken OID files and dangling symrefs that
+  // both for-each-ref and show-ref may omit without non-zero status.
+  let firstLooseSnapshot = null;
+  if (!malformed && !duplicates && refs.length <= MAX_SHARED_REFS) {
+    firstLooseSnapshot = validateLooseRefsInventory(
+      workspaceRoot,
+      forEachNames
+    );
+    if (!firstLooseSnapshot.ok) {
+      malformed = true;
+      unattributable = true;
+    }
+  }
+
+  // Second exact name-and-target inventory after all cross-checks. Same-name
+  // target mutations between passes must fail closed rather than return the
+  // first-pass complete identity (show-ref name-only cross-check is insufficient).
+  if (!malformed && !duplicates && !unattributable && refs.length <= MAX_SHARED_REFS) {
+    const secondRun = git(
+      workspaceRoot,
+      [...SEMANTIC_REF_INVENTORY_ARGS],
+      { allowFailure: true, maxBuffer: 64 * 1024 * 1024 }
+    );
+    if (
+      secondRun.error
+      || secondRun.status !== 0
+      || String(secondRun.stderr || "").trim()
+    ) {
+      malformed = true;
+      unattributable = true;
+    } else {
+      const second = parseSemanticRefInventoryStdout(secondRun.stdout, workspaceRoot);
+      if (
+        second.malformed
+        || second.duplicates
+        || second.unattributable
+        || !semanticRefInventoriesEqual(refs, second.refs)
+      ) {
+        malformed = true;
+        unattributable = true;
+      } else {
+        // The second semantic pass is bracketed by two independently
+        // race-stable bounded loose inventories. Membership or descriptor-bound
+        // file identity/body changes after the first scan fail closed even when
+        // both Git semantic passes happen to agree.
+        const secondLooseSnapshot = validateLooseRefsInventory(
+          workspaceRoot,
+          new Set(second.refs.map((entry) => entry.name))
+        );
+        if (!firstLooseSnapshot?.ok
+          || !secondLooseSnapshot.ok
+          || secondLooseSnapshot.refCount !== firstLooseSnapshot.refCount
+          || secondLooseSnapshot.identity !== firstLooseSnapshot.identity) {
+          malformed = true;
+          unattributable = true;
+        }
+      }
+    }
+  }
+
+  const overBudget = refs.length > MAX_SHARED_REFS;
+  const complete = !unattributable
+    && !malformed
+    && !duplicates
+    && !overBudget
+    && refs.length <= MAX_SHARED_REFS;
+  // Malformed/dangling/warning inventories are unavailable so they can never
+  // receive linked-worktree unrelated-ref tolerance.
+  const available = !malformed && !duplicates && !String(run.stderr || "").trim();
+  return {
+    refs: refs.slice(0, MAX_SHARED_REFS),
+    complete,
+    available
+  };
+}
+
+function buildSharedRefIdentity(semanticRefs, { currentBranchRef = null, upstreamFullRef = null } = {}) {
+  const taskRelevant = [];
+  const unrelated = [];
+  for (const entry of semanticRefs.refs) {
+    const classification = classifySharedRef(entry.name, { currentBranchRef, upstreamFullRef });
+    const record = {
+      name: entry.name,
+      target: entry.target,
+      resolvedOid: entry.resolvedOid,
+      class: classification
+    };
+    if (classification === SHARED_REF_CLASS_UNRELATED) unrelated.push(record);
+    else taskRelevant.push(record);
+  }
+  taskRelevant.sort((left, right) => left.name.localeCompare(right.name));
+  unrelated.sort((left, right) => left.name.localeCompare(right.name));
+  const refCount = taskRelevant.length + unrelated.length;
+  const complete = Boolean(semanticRefs.complete) && refCount <= MAX_SHARED_REFS;
+  const attributable = complete && refCount <= MAX_SHARED_REF_ATTRIBUTABLE;
+  const taskRelevantRefIdentity = sha(canonicalJson(
+    taskRelevant.map((entry) => ({
+      name: entry.name,
+      target: entry.target,
+      resolvedOid: entry.resolvedOid
+    }))
+  ));
+  const unrelatedRefIdentity = sha(canonicalJson(
+    unrelated.map((entry) => ({
+      name: entry.name,
+      target: entry.target,
+      resolvedOid: entry.resolvedOid
+    }))
+  ));
+  // Private evidence only (public protocol projection omits these arrays).
+  // Keep full parser-bounded names/targets (≤512) so long-ref prefixes cannot
+  // collide and self-observation cannot spuriously fail closed.
+  const privateRecord = (entry) => ({
+    name: entry.name,
+    target: entry.target,
+    resolvedOid: entry.resolvedOid,
+    class: entry.class
+  });
+  return {
+    schemaVersion: SHARED_REF_IDENTITY_SCHEMA_VERSION,
+    complete,
+    attributable,
+    refCount,
+    taskRelevantRefCount: taskRelevant.length,
+    unrelatedRefCount: unrelated.length,
+    taskRelevantRefIdentity,
+    unrelatedRefIdentity,
+    taskRelevantRefs: attributable ? taskRelevant.map(privateRecord) : [],
+    unrelatedRefs: attributable ? unrelated.map(privateRecord) : []
+  };
+}
+
+/**
+ * Observe assume-unchanged / skip-worktree index flags and the actual worktree
+ * bytes they would otherwise hide from `status` / `ls-files --stage`.
+ *
+ * Does not mutate the index. Paths are digested only. Absence of a
+ * skip-worktree path is valid (legitimate sparse-checkout); presence binds
+ * content. Assume-unchanged always binds worktree content and an absent path
+ * fails closed, so pre-flagged out-of-scope changes cannot hide. Hard
+ * entry/byte bounds apply.
+ */
+function captureIndexFlagObservation(workspaceRoot) {
+  const flagRun = git(
+    workspaceRoot,
+    ["ls-files", "-v", "-z"],
+    { allowFailure: true, maxBuffer: 64 * 1024 * 1024 }
+  );
+  if (flagRun.error || flagRun.status !== 0) {
+    return {
+      identity: sha("index-flags-v2:unavailable"),
+      observable: false,
+      truncated: true
+    };
+  }
+  if (String(flagRun.stderr || "").trim()) {
+    return {
+      identity: sha("index-flags-v2:stderr"),
+      observable: false,
+      truncated: true
+    };
+  }
+
+  const flagged = [];
+  let truncated = false;
+  let unreadable = false;
+  const flagRaw = String(flagRun.stdout || "");
+  // Exact Git format for `ls-files -v -z`: <tag><SP><path>\0
+  // (tag is one character, then a single ASCII space, then the path bytes).
+  // Do not treat the separator as part of the path — that hashes a wrong
+  // absent path and misses assume-unchanged / skip-worktree overwrites.
+  for (const record of flagRaw.split("\0")) {
+    if (!record) continue;
+    if (record.length < 3 || record[1] !== " ") {
+      unreadable = true;
+      continue;
+    }
+    const tag = record[0];
+    const relativePath = record.slice(2);
+    if (!tag || !relativePath || relativePath.length > 4096) {
+      unreadable = true;
+      continue;
+    }
+    // Reject NUL/control separators already split; keep arbitrary valid path
+    // bytes for private digest only (never published).
+    if (relativePath.includes("\0")) {
+      unreadable = true;
+      continue;
+    }
+    // Normalize flag class without retaining raw path text in the identity
+    // record beyond a private digest.
+    const pathDigest = sha(relativePath.replace(/\\/g, "/"));
+    // Git ls-files -v tags (common):
+    //   H = cached normal, S = skip-worktree, h = assume-unchanged,
+    //   lowercase variants mark assume-unchanged combinations.
+    const isSkipWorktree = tag === "S" || tag === "s";
+    const isAssumeUnchanged = tag === "h"
+      || (tag !== "H" && tag !== "S" && tag === tag.toLowerCase());
+    if (!isSkipWorktree && !isAssumeUnchanged) {
+      // Ordinary cached entries are covered by trackedTreeIdentity; skip.
+      continue;
+    }
+    if (flagged.length >= MAX_INDEX_FLAG_ENTRIES) {
+      truncated = true;
+      break;
+    }
+    const flagClass = isSkipWorktree
+      ? (isAssumeUnchanged
+          ? "skip-worktree+assume-unchanged"
+          : "skip-worktree")
+      : "assume-unchanged";
+    flagged.push({
+      tag,
+      flagClass,
+      isSkipWorktree,
+      relativePath,
+      pathDigest
+    });
+  }
+
+  const stageRun = flagged.length === 0
+    ? { status: 0, stdout: "", stderr: "", error: null }
+    : git(
+        workspaceRoot,
+        ["ls-files", "--stage", "-z"],
+        { allowFailure: true, maxBuffer: 64 * 1024 * 1024 }
+      );
+  if (stageRun.error
+    || stageRun.status !== 0
+    || String(stageRun.stderr || "").trim()) {
+    unreadable = true;
+  }
+
+  // Bind flagged paths to their exact stage-0 index mode and object ID.
+  // Multiple stages, malformed records, or a flag/index inventory race are
+  // unobservable rather than being guessed from the worktree node type.
+  const flaggedPaths = new Set(flagged.map((entry) => entry.relativePath));
+  const stageEntries = new Map();
+  const stageRaw = String(stageRun.stdout || "");
+  if (!unreadable) {
+    for (const record of stageRaw.split("\0")) {
+      if (!record) continue;
+      const separator = record.indexOf("\t");
+      if (separator <= 0) {
+        unreadable = true;
+        continue;
+      }
+      const header = record.slice(0, separator);
+      const relativePath = record.slice(separator + 1);
+      const match = /^([0-7]{6}) ([a-fA-F0-9]{40,64}) ([0-3])$/.exec(header);
+      if (!match || !relativePath) {
+        unreadable = true;
+        continue;
+      }
+      if (!flaggedPaths.has(relativePath)) continue;
+      const records = stageEntries.get(relativePath) || [];
+      records.push({
+        indexMode: match[1],
+        indexOid: match[2].toLowerCase(),
+        stage: Number(match[3])
+      });
+      stageEntries.set(relativePath, records);
+    }
+  }
+
+  const entries = [];
+  let hashedBytes = 0;
+  for (const flaggedEntry of flagged) {
+    const {
+      tag,
+      flagClass,
+      isSkipWorktree,
+      relativePath,
+      pathDigest
+    } = flaggedEntry;
+    const indexed = stageEntries.get(relativePath) || [];
+    const indexEntry = indexed.length === 1 && indexed[0].stage === 0
+      ? indexed[0]
+      : null;
+    if (!indexEntry) {
+      unreadable = true;
+      entries.push({
+        pathDigest,
+        flag: tag,
+        flagClass,
+        indexMode: null,
+        indexOid: null,
+        worktreeKind: "unreadable",
+        worktreeDigest: null
+      });
+      continue;
+    }
+    const { indexMode, indexOid } = indexEntry;
+    let worktreeDigest = null;
+    let worktreeKind = "absent";
+    const absolute = path.resolve(workspaceRoot, relativePath);
+    // Refuse path escape.
+    if (absolute !== workspaceRoot && !absolute.startsWith(`${workspaceRoot}${path.sep}`)) {
+      unreadable = true;
+      entries.push({
+        pathDigest,
+        flag: tag,
+        flagClass,
+        indexMode,
+        indexOid,
+        worktreeKind: "outside",
+        worktreeDigest: null
+      });
+      continue;
+    }
+
+    // A 160000 entry is a gitlink, not an ordinary directory. The context
+    // manifest does not attempt to authenticate a nested repository lifecycle;
+    // detect it from the exact index mode and fail closed.
+    if (indexMode === "160000") {
+      unreadable = true;
+      entries.push({
+        pathDigest,
+        flag: tag,
+        flagClass,
+        indexMode,
+        indexOid,
+        worktreeKind: "gitlink",
+        worktreeDigest: sha(canonicalJson({
+          schema: "flagged-gitlink-v1",
+          indexMode,
+          indexOid
+        }))
+      });
+      continue;
+    }
+
+    let stat;
+    try {
+      stat = fs.lstatSync(absolute, { bigint: true });
+    } catch (error) {
+      if (error?.code === "ENOENT" && isSkipWorktree) {
+        // skip-worktree absence is normal for sparse-checkout cones.
+        worktreeKind = "absent";
+      } else {
+        unreadable = true;
+        worktreeKind = "unreadable";
+      }
+      entries.push({
+        pathDigest,
+        flag: tag,
+        flagClass,
+        indexMode,
+        indexOid,
+        worktreeKind,
+        worktreeDigest: null
+      });
+      continue;
+    }
+    if (stat.isSymbolicLink()) {
+      worktreeKind = "symlink";
+      try {
+        if (indexMode !== "120000") {
+          throw new Error("Index/worktree type mismatch.");
+        }
+        const beforeSignature = metadataSymlinkStatSignature(stat);
+        const targetDigest = sha(String(fs.readlinkSync(absolute)));
+        const after = fs.lstatSync(absolute, { bigint: true });
+        if (!after.isSymbolicLink()
+          || metadataSymlinkStatSignature(after) !== beforeSignature) {
+          throw new Error("Symlink changed during observation.");
+        }
+        worktreeDigest = sha(canonicalJson({
+          schema: "flagged-symlink-v1",
+          statSignature: beforeSignature,
+          targetDigest
+        }));
+      } catch {
+        unreadable = true;
+        worktreeKind = "unreadable";
+        worktreeDigest = null;
+      }
+    } else if (stat.isFile()) {
+      worktreeKind = "file";
+      if (!/^100[0-7]{3}$/.test(indexMode)) {
+        unreadable = true;
+        worktreeKind = "unreadable";
+      }
+      // Bound content hashing; oversize files truncate the inventory.
+      const remaining = MAX_METADATA_HASH_BYTES - hashedBytes;
+      if (worktreeKind === "unreadable") {
+        worktreeDigest = null;
+      } else if (remaining <= 0) {
+        truncated = true;
+        worktreeDigest = null;
+      } else {
+        const probe = { hashedBytes: 0, unreadable: false, truncated: false };
+        const fileIdentity = hashBoundedMetadataFile(absolute, probe, remaining);
+        hashedBytes += probe.hashedBytes;
+        if (probe.unreadable || fileIdentity.kind === "unobservable") {
+          unreadable = true;
+          worktreeKind = "unreadable";
+          worktreeDigest = null;
+        } else if (probe.truncated || fileIdentity.digest == null) {
+          truncated = true;
+          worktreeDigest = null;
+        } else {
+          worktreeDigest = sha(canonicalJson({
+            schema: "flagged-file-v1",
+            mode: fileIdentity.mode,
+            size: fileIdentity.size,
+            contentDigest: fileIdentity.digest
+          }));
+        }
+      }
+    } else if (stat.isDirectory()) {
+      // Non-gitlink index entries cannot legitimately be directories.
+      unreadable = true;
+      worktreeKind = "unreadable";
+      worktreeDigest = null;
+    } else {
+      unreadable = true;
+      worktreeKind = "unreadable";
+      worktreeDigest = null;
+    }
+    entries.push({
+      pathDigest,
+      flag: tag,
+      flagClass,
+      indexMode,
+      indexOid,
+      worktreeKind,
+      worktreeDigest
+    });
+  }
+
+  if (flagged.length > 0) {
+    const flagReread = git(
+      workspaceRoot,
+      ["ls-files", "-v", "-z"],
+      { allowFailure: true, maxBuffer: 64 * 1024 * 1024 }
+    );
+    const stageReread = git(
+      workspaceRoot,
+      ["ls-files", "--stage", "-z"],
+      { allowFailure: true, maxBuffer: 64 * 1024 * 1024 }
+    );
+    if (flagReread.error
+      || flagReread.status !== 0
+      || String(flagReread.stderr || "").trim()
+      || String(flagReread.stdout || "") !== flagRaw
+      || stageReread.error
+      || stageReread.status !== 0
+      || String(stageReread.stderr || "").trim()
+      || String(stageReread.stdout || "") !== stageRaw) {
+      unreadable = true;
+    }
+  }
+  entries.sort((left, right) => {
+    const byPath = left.pathDigest.localeCompare(right.pathDigest);
+    if (byPath !== 0) return byPath;
+    return left.flag.localeCompare(right.flag);
+  });
+  const failClosed = truncated || unreadable || entries.length >= MAX_INDEX_FLAG_ENTRIES;
+  return {
+    identity: sha(canonicalJson({
+      schema: "index-flags-v2",
+      entries,
+      truncated: failClosed,
+      unreadable
+    })),
+    observable: !failClosed,
+    truncated: failClosed
+  };
+}
+
+function captureTaskRelevantGitMetadata(gitDir, commonDir, workspaceRoot, {
+  currentBranchRef = null,
+  upstreamFullRef = null,
+  upstreamConfigured = false
+} = {}) {
+  const nonRef = captureTaskRelevantNonRefEntries(gitDir, commonDir);
+  const operational = captureWorktreeOperationalIdentity(gitDir, workspaceRoot);
+  const hooks = captureEffectiveHooksIdentity(workspaceRoot);
+  const config = captureEffectiveGitConfigIdentity(workspaceRoot);
+  const indexFlags = captureIndexFlagObservation(workspaceRoot);
+  const semanticRefs = captureSemanticSharedRefs(workspaceRoot);
+  const sharedRefIdentity = buildSharedRefIdentity(semanticRefs, { currentBranchRef, upstreamFullRef });
+  // Fail closed when non-ref / operational / effective-hooks / effective-config
+  // inventory is truncated or unobservable, refs are unavailable, or a
+  // configured upstream cannot be positively resolved to a full refs/ name.
+  // Without a full upstream ref, remote-tracking refs must not be treated as
+  // unrelated (which would incorrectly tolerate upstream target churn).
+  const upstreamUnresolved = Boolean(upstreamConfigured) && !upstreamFullRef;
+  if (
+    nonRef.truncated
+    || !nonRef.observable
+    || operational.truncated
+    || !operational.observable
+    || !hooks.observable
+    || hooks.truncated
+    || !config.observable
+    || config.truncated
+    || !indexFlags.observable
+    || indexFlags.truncated
+    || !semanticRefs.available
+    || upstreamUnresolved
+  ) {
+    sharedRefIdentity.complete = false;
+    sharedRefIdentity.attributable = false;
+    sharedRefIdentity.taskRelevantRefs = [];
+    sharedRefIdentity.unrelatedRefs = [];
+  }
+  // Private digests only: operational/hooks/config absolute paths and raw
+  // config values never appear here.
+  const taskRelevantMetadataIdentity = sha(canonicalJson({
+    nonRefIdentity: nonRef.identity,
+    nonRefTruncated: nonRef.truncated,
+    nonRefObservable: nonRef.observable,
+    operationalIdentity: operational.identity,
+    operationalObservable: operational.observable,
+    hooksIdentity: hooks.identity,
+    hooksObservable: hooks.observable,
+    configIdentity: config.identity,
+    configObservable: config.observable,
+    indexFlagIdentity: indexFlags.identity,
+    indexFlagObservable: indexFlags.observable,
+    taskRelevantRefIdentity: sharedRefIdentity.taskRelevantRefIdentity,
+    sharedRefComplete: sharedRefIdentity.complete,
+    sharedRefAttributable: sharedRefIdentity.attributable,
+    upstreamUnresolved
+  }));
+  return { taskRelevantMetadataIdentity, sharedRefIdentity };
+}
+
+function isSha256Hex(value) {
+  return typeof value === "string" && SHA256_HEX.test(value);
+}
+
+function isPublicRefSnapshotEntry(entry) {
+  return entry
+    && typeof entry === "object"
+    && !Array.isArray(entry)
+    && typeof entry.name === "string"
+    && entry.name.startsWith("refs/")
+    && entry.name.length > 0
+    && entry.name.length <= MAX_SHARED_REF_FIELD_BYTES
+    && typeof entry.target === "string"
+    && entry.target.length > 0
+    && entry.target.length <= MAX_SHARED_REF_FIELD_BYTES
+    && typeof entry.resolvedOid === "string"
+    && /^[a-f0-9]{40,64}$/.test(entry.resolvedOid)
+    && (entry.class === SHARED_REF_CLASS_TASK_RELEVANT || entry.class === SHARED_REF_CLASS_UNRELATED)
+    && !entry.name.includes("\0")
+    && !entry.target.includes("\0")
+    && (entry.target.startsWith("refs/")
+      || entry.target.toLowerCase() === entry.resolvedOid)
+    && !/^(?:\/|[A-Za-z]:[\\/]|~\/)/.test(entry.target);
+}
+
+/**
+ * Inspect explicit task-relevant metadata support on a stored git manifest.
+ * Returns "absent" | "valid" | "malformed".
+ */
+function inspectTaskRelevantMetadataSupport(gitManifest) {
+  if (!gitManifest || typeof gitManifest !== "object") return "absent";
+  const hasTaskIdentity = Object.hasOwn(gitManifest, "taskRelevantMetadataIdentity");
+  const hasShared = Object.hasOwn(gitManifest, "sharedRefIdentity");
+  if (!hasTaskIdentity && !hasShared) return "absent";
+  if (!hasTaskIdentity || !hasShared) return "malformed";
+  if (!isSha256Hex(gitManifest.taskRelevantMetadataIdentity)) return "malformed";
+  const identity = gitManifest.sharedRefIdentity;
+  if (!identity || typeof identity !== "object" || Array.isArray(identity)) return "malformed";
+  if (identity.schemaVersion !== SHARED_REF_IDENTITY_SCHEMA_VERSION) return "malformed";
+  if (typeof identity.complete !== "boolean" || typeof identity.attributable !== "boolean") return "malformed";
+  if (!Number.isInteger(identity.refCount) || identity.refCount < 0) return "malformed";
+  if (!Number.isInteger(identity.taskRelevantRefCount) || identity.taskRelevantRefCount < 0) return "malformed";
+  if (!Number.isInteger(identity.unrelatedRefCount) || identity.unrelatedRefCount < 0) return "malformed";
+  if (identity.taskRelevantRefCount + identity.unrelatedRefCount !== identity.refCount) return "malformed";
+  if (!isSha256Hex(identity.taskRelevantRefIdentity) || !isSha256Hex(identity.unrelatedRefIdentity)) {
+    return "malformed";
+  }
+  if (!Array.isArray(identity.taskRelevantRefs) || !Array.isArray(identity.unrelatedRefs)) return "malformed";
+  // complete ⇒ within inventory budget; attributable ⇒ complete and within
+  // per-entry evidence budget. Reject impossible combinations.
+  if (identity.complete && identity.refCount > MAX_SHARED_REFS) return "malformed";
+  if (identity.attributable !== (identity.complete && identity.refCount <= MAX_SHARED_REF_ATTRIBUTABLE)) {
+    return "malformed";
+  }
+  if (identity.taskRelevantRefs.length !== (identity.attributable ? identity.taskRelevantRefCount : 0)) {
+    return "malformed";
+  }
+  if (identity.unrelatedRefs.length !== (identity.attributable ? identity.unrelatedRefCount : 0)) {
+    return "malformed";
+  }
+  const names = new Set();
+  for (const entry of [...identity.taskRelevantRefs, ...identity.unrelatedRefs]) {
+    if (!isPublicRefSnapshotEntry(entry) || names.has(entry.name)) return "malformed";
+    names.add(entry.name);
+  }
+  for (const entry of identity.taskRelevantRefs) {
+    if (entry.class !== SHARED_REF_CLASS_TASK_RELEVANT) return "malformed";
+  }
+  for (const entry of identity.unrelatedRefs) {
+    if (entry.class !== SHARED_REF_CLASS_UNRELATED) return "malformed";
+  }
+  return "valid";
+}
+
+/**
+ * Compare Git metadata between two manifests.
+ *
+ * DEFAULT policy:
+ * Both sides valid + complete + attributable + linkedWorktree=true: tolerate only
+ * unrelated shared-ref identity changes (issue #34 linked-worktree scope).
+ * Both sides valid with linkedWorktree=false: strict full metadataIdentity
+ * comparison (no unrelated-ref tolerance); task-relevant identity still fails
+ * closed for operational/hooks/config drift the legacy tree may omit.
+ * Attribution is required only for linked-worktree unrelated-ref tolerance.
+ * Primary complete-but-unattributable inventories with identical strict digests
+ * pass; any primary full/task/ref identity drift fails.
+ * Mismatched or missing linkedWorktree when new support is claimed: fail closed.
+ * Both sides absent (pure legacy): full metadataIdentity comparison; equal digests pass.
+ * Mixed or malformed claims: fail closed unconditionally (even when legacy digests match).
+ * Incomplete inventories always fail closed. Linked unattributable inventories
+ * fail closed (no unrelated-ref tolerance without attribution).
+ *
+ * SUPERVISORY_LINKED_WRITE policy (managed write primary-control rechecks only):
+ * both sides must be valid, complete, attributable primary worktrees with identical
+ * taskRelevantMetadataIdentity and taskRelevantRefIdentity; only unrelatedRefIdentity
+ * and full metadataIdentity representation drift is tolerated. Linked, mixed,
+ * incomplete, unattributable, or malformed inventories fail closed.
+ */
+function classifyGitMetadataObservation(
+  preGit,
+  postGit,
+  metadataPolicy = CONTEXT_METADATA_POLICIES.DEFAULT
+) {
+  const empty = {
+    schemaVersion: SHARED_REF_OBSERVATION_SCHEMA_VERSION,
+    classification: GIT_METADATA_CLASSIFICATIONS.UNCHANGED,
+    toleratedUnrelatedSharedRefChurn: false,
+    taskRelevantMetadataDrift: false
+  };
+  const failClosed = {
+    schemaVersion: SHARED_REF_OBSERVATION_SCHEMA_VERSION,
+    classification: GIT_METADATA_CLASSIFICATIONS.FAIL_CLOSED,
+    toleratedUnrelatedSharedRefChurn: false,
+    taskRelevantMetadataDrift: true
+  };
+  const taskRelevantDrift = {
+    schemaVersion: SHARED_REF_OBSERVATION_SCHEMA_VERSION,
+    classification: GIT_METADATA_CLASSIFICATIONS.TASK_RELEVANT_METADATA_DRIFT,
+    toleratedUnrelatedSharedRefChurn: false,
+    taskRelevantMetadataDrift: true
+  };
+  const toleratedUnrelated = {
+    schemaVersion: SHARED_REF_OBSERVATION_SCHEMA_VERSION,
+    classification: GIT_METADATA_CLASSIFICATIONS.TOLERATED_UNRELATED_SHARED_REFS,
+    toleratedUnrelatedSharedRefChurn: true,
+    taskRelevantMetadataDrift: false
+  };
+  if (!preGit || !postGit) return empty;
+  const preSupport = inspectTaskRelevantMetadataSupport(preGit);
+  const postSupport = inspectTaskRelevantMetadataSupport(postGit);
+
+  if (metadataPolicy === CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE) {
+    // Supervisory policy never degrades to legacy/mixed acceptance.
+    if (preSupport !== "valid" || postSupport !== "valid") return failClosed;
+    if (!preGit.sharedRefIdentity.complete || !postGit.sharedRefIdentity.complete) {
+      return failClosed;
+    }
+    if (!preGit.sharedRefIdentity.attributable || !postGit.sharedRefIdentity.attributable) {
+      return failClosed;
+    }
+    const preLinked = preGit.linkedWorktree;
+    const postLinked = postGit.linkedWorktree;
+    // Primary-vs-primary only: managed control-root rechecks.
+    if (preLinked !== false || postLinked !== false) return failClosed;
+    if (preGit.taskRelevantMetadataIdentity !== postGit.taskRelevantMetadataIdentity) {
+      return taskRelevantDrift;
+    }
+    if (preGit.sharedRefIdentity.taskRelevantRefIdentity
+      !== postGit.sharedRefIdentity.taskRelevantRefIdentity) {
+      return taskRelevantDrift;
+    }
+    // Allow only unrelated-ref / full metadataIdentity representation drift.
+    if (preGit.sharedRefIdentity.unrelatedRefIdentity
+        !== postGit.sharedRefIdentity.unrelatedRefIdentity
+      || (preGit.metadataIdentity || null) !== (postGit.metadataIdentity || null)) {
+      return toleratedUnrelated;
+    }
+    return empty;
+  }
+
+  if (preSupport === "valid" && postSupport === "valid") {
+    // Incomplete inventories cannot safely classify refs.
+    if (!preGit.sharedRefIdentity.complete || !postGit.sharedRefIdentity.complete) {
+      return failClosed;
+    }
+    // Linked-worktree tolerance requires explicit boolean linkedWorktree on both
+    // sides. Missing or mismatched identity fails closed when new support is claimed.
+    const preLinked = preGit.linkedWorktree;
+    const postLinked = postGit.linkedWorktree;
+    if (typeof preLinked !== "boolean" || typeof postLinked !== "boolean") {
+      return failClosed;
+    }
+    if (preLinked !== postLinked) {
+      return failClosed;
+    }
+
+    // Primary worktree: strict digest comparison; attribution not required.
+    // complete-but-unattributable (>attributable cap, <=inventory cap) identical
+    // manifests pass. Any full/task/ref identity drift still fails.
+    if (!preLinked) {
+      if (preGit.taskRelevantMetadataIdentity !== postGit.taskRelevantMetadataIdentity) {
+        return taskRelevantDrift;
+      }
+      if ((preGit.metadataIdentity || null) !== (postGit.metadataIdentity || null)) {
+        return taskRelevantDrift;
+      }
+      if (preGit.sharedRefIdentity.taskRelevantRefIdentity
+        !== postGit.sharedRefIdentity.taskRelevantRefIdentity) {
+        return taskRelevantDrift;
+      }
+      if (preGit.sharedRefIdentity.unrelatedRefIdentity
+        !== postGit.sharedRefIdentity.unrelatedRefIdentity) {
+        return taskRelevantDrift;
+      }
+      return empty;
+    }
+
+    // Linked worktree: attribution is required before unrelated-ref tolerance.
+    if (!preGit.sharedRefIdentity.attributable || !postGit.sharedRefIdentity.attributable) {
+      return failClosed;
+    }
+
+    // Linked worktree: tolerate only unrelated shared-ref identity changes.
+    if (preGit.taskRelevantMetadataIdentity !== postGit.taskRelevantMetadataIdentity) {
+      return taskRelevantDrift;
+    }
+    if (preGit.sharedRefIdentity.unrelatedRefIdentity !== postGit.sharedRefIdentity.unrelatedRefIdentity) {
+      return toleratedUnrelated;
+    }
+    return empty;
+  }
+
+  // Pure legacy: both sides claim neither new field. Equal full metadataIdentity passes.
+  if (preSupport === "absent" && postSupport === "absent") {
+    if ((preGit.metadataIdentity || null) !== (postGit.metadataIdentity || null)) {
+      return {
+        schemaVersion: SHARED_REF_OBSERVATION_SCHEMA_VERSION,
+        classification: GIT_METADATA_CLASSIFICATIONS.LEGACY_METADATA_DRIFT,
+        toleratedUnrelatedSharedRefChurn: false,
+        taskRelevantMetadataDrift: true
+      };
+    }
+    return empty;
+  }
+
+  // Mixed (only one side has valid new identity) or any malformed claim:
+  // fail closed unconditionally — never treat equal legacy digests as unchanged.
+  return failClosed;
+}
+
+function observeGitMetadataDrift(preGit, postGit, changed) {
+  const observation = classifyGitMetadataObservation(preGit, postGit);
+  if (observation.taskRelevantMetadataDrift) changed.add("[GIT_METADATA]");
+  return observation;
+}
+
+/**
+ * ContextManifest v1 predates the split task-relevant/shared-ref identities.
+ * When either side is a genuine v1 record, compare the retained full metadata
+ * identity strictly. This permits an unchanged historical record to cross the
+ * v1 -> v2 reader boundary without granting v2's linked-worktree ref-churn
+ * tolerance to legacy evidence that cannot attribute that churn safely.
+ */
+function classifyContextGitMetadataObservation(
+  preContext,
+  postContext,
+  metadataPolicy = CONTEXT_METADATA_POLICIES.DEFAULT
+) {
+  const legacyBoundary = preContext?.schemaVersion === LEGACY_CONTEXT_MANIFEST_VERSION
+    || postContext?.schemaVersion === LEGACY_CONTEXT_MANIFEST_VERSION;
+  if (!legacyBoundary) {
+    return classifyGitMetadataObservation(
+      preContext?.git,
+      postContext?.git,
+      metadataPolicy
+    );
+  }
+  const unchanged = {
+    schemaVersion: SHARED_REF_OBSERVATION_SCHEMA_VERSION,
+    classification: GIT_METADATA_CLASSIFICATIONS.UNCHANGED,
+    toleratedUnrelatedSharedRefChurn: false,
+    taskRelevantMetadataDrift: false
+  };
+  const failClosed = {
+    schemaVersion: SHARED_REF_OBSERVATION_SCHEMA_VERSION,
+    classification: GIT_METADATA_CLASSIFICATIONS.FAIL_CLOSED,
+    toleratedUnrelatedSharedRefChurn: false,
+    taskRelevantMetadataDrift: true
+  };
+  const legacyDrift = {
+    schemaVersion: SHARED_REF_OBSERVATION_SCHEMA_VERSION,
+    classification: GIT_METADATA_CLASSIFICATIONS.LEGACY_METADATA_DRIFT,
+    toleratedUnrelatedSharedRefChurn: false,
+    taskRelevantMetadataDrift: true
+  };
+  if (metadataPolicy !== CONTEXT_METADATA_POLICIES.DEFAULT) return failClosed;
+  const preMetadataIdentity = preContext?.git?.metadataIdentity;
+  const postMetadataIdentity = postContext?.git?.metadataIdentity;
+  if (!isSha256Hex(preMetadataIdentity) || !isSha256Hex(postMetadataIdentity)) {
+    return failClosed;
+  }
+  return preMetadataIdentity === postMetadataIdentity
+    ? unchanged
+    : legacyDrift;
+}
+
+function observeContextGitMetadataDrift(preContext, postContext, changed) {
+  const observation = classifyContextGitMetadataObservation(
+    preContext,
+    postContext
+  );
+  if (observation.taskRelevantMetadataDrift) changed.add("[GIT_METADATA]");
+  return observation;
 }
 
 function worktreePathIdentity(root, relativePath) {
@@ -951,39 +4685,141 @@ function worktreePathIdentity(root, relativePath) {
   return { fileKind: "other", fileMode, worktreeHash: null };
 }
 
+function isCanonicalIsoTimestamp(value) {
+  if (typeof value !== "string" || !value) return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
+function contextManifestIntegrityError(message = "Stored context manifest integrity check failed; refusing to continue with a tampered or malformed identity.") {
+  throw new CompanionError("E_CONTEXT_DRIFT", message, {
+    code: "E_CONTEXT_DRIFT",
+    reasons: ["manifestIntegrity"]
+  });
+}
+
+/**
+ * Validate a stored ContextManifest's immutable body/digest/id/capturedAt binding.
+ * Recomputes sha(canonicalJson(body)) after excluding only manifestId and digest.
+ * capturedAt is chronology-bearing authority and therefore remains authenticated.
+ * Returns the unchanged stored object on success; never rebinds identity.
+ * Failures are privacy-safe E_CONTEXT_DRIFT (no private path/config/hook leakage).
+ */
+export function assertContextManifestIntegrity(manifest) {
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+    contextManifestIntegrityError();
+  }
+  if (manifest.schemaVersion !== CONTEXT_MANIFEST_VERSION
+    && manifest.schemaVersion !== LEGACY_CONTEXT_MANIFEST_VERSION) {
+    contextManifestIntegrityError();
+  }
+  if (typeof manifest.workspaceRoot !== "string" || !manifest.workspaceRoot) {
+    contextManifestIntegrityError();
+  }
+  if (!manifest.git || typeof manifest.git !== "object" || Array.isArray(manifest.git)) {
+    contextManifestIntegrityError();
+  }
+  if (!Array.isArray(manifest.projectMarkers)) {
+    contextManifestIntegrityError();
+  }
+  if (!manifest.materialization || typeof manifest.materialization !== "object"
+    || Array.isArray(manifest.materialization)) {
+    contextManifestIntegrityError();
+  }
+  if (typeof manifest.digest !== "string" || !SHA256_HEX.test(manifest.digest)) {
+    contextManifestIntegrityError();
+  }
+  if (typeof manifest.manifestId !== "string"
+    || !CONTEXT_MANIFEST_ID.test(manifest.manifestId)
+    || manifest.manifestId !== `ctx-${manifest.digest.slice(0, 24)}`) {
+    contextManifestIntegrityError();
+  }
+  if (!isCanonicalIsoTimestamp(manifest.capturedAt)) {
+    contextManifestIntegrityError();
+  }
+  const body = {};
+  for (const [key, value] of Object.entries(manifest)) {
+    if (key === "manifestId" || key === "digest") continue;
+    if (manifest.schemaVersion === LEGACY_CONTEXT_MANIFEST_VERSION
+      && key === "capturedAt") continue;
+    body[key] = value;
+  }
+  const recomputed = sha(canonicalJson(body));
+  if (recomputed !== manifest.digest
+    || `ctx-${recomputed.slice(0, 24)}` !== manifest.manifestId) {
+    contextManifestIntegrityError();
+  }
+  return manifest;
+}
+
 /**
  * Validate current workspace still matches a stored ContextManifest.
  * Throws E_CONTEXT_DRIFT rather than executing in the wrong checkout.
+ *
+ * Integrity-checks the stored expected manifest first and returns that unchanged
+ * object on success so callers retain immutable stored ID/digest bindings.
  *
  * mode:
  * Both execute and explicit resume require the exact recorded checkout state. Resume callers
  * must pass the previous job's completion manifest, not its acceptance-time manifest.
  * "legacy-resume" exists only for schema-v2 jobs that did not retain a completion manifest.
+ *
+ * metadataPolicy:
+ * DEFAULT keeps strict-primary / tolerant-linked classification.
+ * SUPERVISORY_LINKED_WRITE is only for managed write primary-control rechecks and is
+ * rejected under legacy-resume. Unknown policies fail closed.
  */
-export function assertContextCompatible(root, expected, { mode = "execute" } = {}) {
-  if (!expected || typeof expected !== "object") {
-    throw new CompanionError("E_CONTEXT_DRIFT", "Stored context manifest is missing; refusing to continue in an unverified workspace.", {
-      code: "E_CONTEXT_DRIFT"
-    });
+export function assertContextCompatible(root, expected, {
+  mode = "execute",
+  metadataPolicy = CONTEXT_METADATA_POLICIES.DEFAULT
+} = {}) {
+  if (!CONTEXT_METADATA_POLICY_VALUES.has(metadataPolicy)) {
+    throw new CompanionError(
+      "E_CONTEXT_DRIFT",
+      "Unknown context metadata policy; refusing to continue with an unverified workspace identity.",
+      { code: "E_CONTEXT_DRIFT", reasons: ["metadataPolicy"] }
+    );
   }
+  if (mode === "legacy-resume"
+    && metadataPolicy === CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE) {
+    throw new CompanionError(
+      "E_CONTEXT_DRIFT",
+      "Supervisory linked-write context policy is unavailable for legacy resume.",
+      { code: "E_CONTEXT_DRIFT", reasons: ["metadataPolicy"] }
+    );
+  }
+  const stored = assertContextManifestIntegrity(expected);
   const current = captureContextManifest(root);
   const reasons = [];
-  if (current.workspaceRoot !== expected.workspaceRoot) reasons.push("workspaceRoot");
-  if (Boolean(current.git?.linkedWorktree) !== Boolean(expected.git?.linkedWorktree)) reasons.push("linkedWorktree");
-  if (Boolean(current.git?.sparse) !== Boolean(expected.git?.sparse)) reasons.push("sparse");
-  if (Boolean(current.git?.shallow) !== Boolean(expected.git?.shallow)) reasons.push("shallow");
-  if ((current.git?.branch || null) !== (expected.git?.branch || null)) reasons.push("branch");
-  if (Boolean(current.git?.insideWorktree) !== Boolean(expected.git?.insideWorktree)) reasons.push("insideWorktree");
-  if (Array.isArray(expected.projectMarkers)
-    && canonicalJson(current.projectMarkers) !== canonicalJson(expected.projectMarkers)) reasons.push("projectMarkers");
+  if (current.workspaceRoot !== stored.workspaceRoot) reasons.push("workspaceRoot");
+  if (Boolean(current.git?.linkedWorktree) !== Boolean(stored.git?.linkedWorktree)) reasons.push("linkedWorktree");
+  if (Boolean(current.git?.sparse) !== Boolean(stored.git?.sparse)) reasons.push("sparse");
+  if (Boolean(current.git?.shallow) !== Boolean(stored.git?.shallow)) reasons.push("shallow");
+  if ((current.git?.branch || null) !== (stored.git?.branch || null)) reasons.push("branch");
+  if (Boolean(current.git?.insideWorktree) !== Boolean(stored.git?.insideWorktree)) reasons.push("insideWorktree");
+  if (Array.isArray(stored.projectMarkers)
+    && canonicalJson(current.projectMarkers) !== canonicalJson(stored.projectMarkers)) reasons.push("projectMarkers");
   if (mode !== "legacy-resume") {
-    if ((current.git?.head || null) !== (expected.git?.head || null)) reasons.push("head");
-    if ((current.git?.trackedTreeIdentity || null) !== (expected.git?.trackedTreeIdentity || null)) reasons.push("trackedTreeIdentity");
-    if ((current.git?.metadataIdentity || null) !== (expected.git?.metadataIdentity || null)) reasons.push("metadataIdentity");
-    if ((current.git?.dirtyDigest || null) !== (expected.git?.dirtyDigest || null)) reasons.push("dirtyDigest");
-    if ((current.git?.ignoredDigest || null) !== (expected.git?.ignoredDigest || null)) reasons.push("ignoredDigest");
-    if ((current.git?.upstreamRef || null) !== (expected.git?.upstreamRef || null)) reasons.push("upstreamRef");
-    if ((current.git?.upstreamCommit || null) !== (expected.git?.upstreamCommit || null)) reasons.push("upstreamCommit");
+    if ((current.git?.head || null) !== (stored.git?.head || null)) reasons.push("head");
+    if ((current.git?.trackedTreeIdentity || null) !== (stored.git?.trackedTreeIdentity || null)) reasons.push("trackedTreeIdentity");
+    const metadataObservation = classifyContextGitMetadataObservation(
+      stored,
+      current,
+      metadataPolicy
+    );
+    if (metadataObservation.taskRelevantMetadataDrift) {
+      const currentSupport = inspectTaskRelevantMetadataSupport(current.git);
+      const expectedSupport = inspectTaskRelevantMetadataSupport(stored.git);
+      if (currentSupport === "valid" && expectedSupport === "valid") {
+        reasons.push("taskRelevantMetadataIdentity");
+      } else {
+        reasons.push("metadataIdentity");
+      }
+    }
+    if ((current.git?.dirtyDigest || null) !== (stored.git?.dirtyDigest || null)) reasons.push("dirtyDigest");
+    if ((current.git?.ignoredDigest || null) !== (stored.git?.ignoredDigest || null)) reasons.push("ignoredDigest");
+    if ((current.git?.upstreamRef || null) !== (stored.git?.upstreamRef || null)) reasons.push("upstreamRef");
+    if ((current.git?.upstreamCommit || null) !== (stored.git?.upstreamCommit || null)) reasons.push("upstreamCommit");
   }
   if (reasons.length) {
     throw new CompanionError(
@@ -993,11 +4829,11 @@ export function assertContextCompatible(root, expected, { mode = "execute" } = {
         code: "E_CONTEXT_DRIFT",
         reasons,
         expected: {
-          manifestId: expected.manifestId || null,
-          digest: expected.digest || null,
-          workspaceRoot: expected.workspaceRoot || null,
-          head: expected.git?.head || null,
-          branch: expected.git?.branch || null
+          manifestId: stored.manifestId || null,
+          digest: stored.digest || null,
+          workspaceRoot: stored.workspaceRoot || null,
+          head: stored.git?.head || null,
+          branch: stored.git?.branch || null
         },
         current: {
           manifestId: current.manifestId,
@@ -1009,7 +4845,8 @@ export function assertContextCompatible(root, expected, { mode = "execute" } = {
       }
     );
   }
-  return current;
+  // Immutable stored authority: never rebind callers to a fresh capture.
+  return stored;
 }
 
 /**
@@ -1376,6 +5213,35 @@ function extractFirstJsonObject(text) {
  * Observe runtime evidence independent of provider claims.
  * hostVerification is always not_run from the Grok runtime.
  */
+function projectRuntimeContextIdentity(context) {
+  if (!context) return null;
+  const identity = {
+    manifestId: context.manifestId || null,
+    digest: context.digest || null,
+    head: context.git?.head || null,
+    branch: context.git?.branch || null,
+    dirtyDigest: context.git?.dirtyDigest || null,
+    ignoredDigest: context.git?.ignoredDigest || null,
+    trackedTreeIdentity: context.git?.trackedTreeIdentity || null,
+    metadataIdentity: context.git?.metadataIdentity || null
+  };
+  if (isSha256Hex(context.git?.taskRelevantMetadataIdentity)) {
+    identity.taskRelevantMetadataIdentity = context.git.taskRelevantMetadataIdentity;
+  }
+  if (inspectTaskRelevantMetadataSupport(context.git) === "valid") {
+    identity.sharedRefIdentity = {
+      schemaVersion: context.git.sharedRefIdentity.schemaVersion,
+      complete: context.git.sharedRefIdentity.complete,
+      refCount: context.git.sharedRefIdentity.refCount,
+      taskRelevantRefCount: context.git.sharedRefIdentity.taskRelevantRefCount,
+      unrelatedRefCount: context.git.sharedRefIdentity.unrelatedRefCount,
+      taskRelevantRefIdentity: context.git.sharedRefIdentity.taskRelevantRefIdentity,
+      unrelatedRefIdentity: context.git.sharedRefIdentity.unrelatedRefIdentity
+    };
+  }
+  return identity;
+}
+
 export function buildRuntimeEvidence({
   preContext = null,
   postContext = null,
@@ -1385,32 +5251,13 @@ export function buildRuntimeEvidence({
   scopeViolations = null,
   executionStatus = "completed"
 } = {}) {
+  const sharedRefObservation = preContext?.git && postContext?.git
+    ? classifyContextGitMetadataObservation(preContext, postContext)
+    : null;
   return {
     schemaVersion: 1,
-    preContext: preContext
-      ? {
-          manifestId: preContext.manifestId || null,
-          digest: preContext.digest || null,
-          head: preContext.git?.head || null,
-          branch: preContext.git?.branch || null,
-          dirtyDigest: preContext.git?.dirtyDigest || null,
-          ignoredDigest: preContext.git?.ignoredDigest || null,
-          trackedTreeIdentity: preContext.git?.trackedTreeIdentity || null,
-          metadataIdentity: preContext.git?.metadataIdentity || null
-        }
-      : null,
-    postContext: postContext
-      ? {
-          manifestId: postContext.manifestId || null,
-          digest: postContext.digest || null,
-          head: postContext.git?.head || null,
-          branch: postContext.git?.branch || null,
-          dirtyDigest: postContext.git?.dirtyDigest || null,
-          ignoredDigest: postContext.git?.ignoredDigest || null,
-          trackedTreeIdentity: postContext.git?.trackedTreeIdentity || null,
-          metadataIdentity: postContext.git?.metadataIdentity || null
-        }
-      : null,
+    preContext: projectRuntimeContextIdentity(preContext),
+    postContext: projectRuntimeContextIdentity(postContext),
     observedChangedPaths: boundPathEvidence(changedPaths),
     diffSummary: diffSummary ? clip(String(diffSummary), 4000) : null,
     commandOutcomes: Array.isArray(commandOutcomes)
@@ -1422,7 +5269,10 @@ export function buildRuntimeEvidence({
       : [],
     scopeViolations: boundPathEvidence(scopeViolations, { marker: "[SCOPE_VIOLATIONS_OVERFLOW]" }),
     executionStatus: clip(String(executionStatus || "completed"), 64),
-    hostVerification: "not_run"
+    hostVerification: "not_run",
+    // Bounded public-safe classification distinguishing tolerated unrelated
+    // shared-ref churn from task-relevant Git metadata/ref drift (issue #34).
+    ...(sharedRefObservation ? { sharedRefObservation } : {})
   };
 }
 
@@ -1501,7 +5351,7 @@ export function observeChangedPaths(preContext, postContext, { observer = "full"
   observeIgnoredDrift(preContext.git, postContext.git, changed, { observer });
   if ((preContext.git.head || null) !== (postContext.git.head || null)) changed.add("[HEAD]");
   if ((preContext.git.trackedTreeIdentity || null) !== (postContext.git.trackedTreeIdentity || null)) changed.add("[INDEX]");
-  if ((preContext.git.metadataIdentity || null) !== (postContext.git.metadataIdentity || null)) changed.add("[GIT_METADATA]");
+  observeContextGitMetadataDrift(preContext, postContext, changed);
   // Keep the complete internally attributable set for scope evaluation. Public/runtime
   // projections apply boundPathEvidence separately and expose an explicit overflow marker.
   return [...changed];
