@@ -672,13 +672,20 @@ test("deterministic runner preserves one manifest-backed run root when containme
     tempRoot: root,
     run: () => {
       launches += 1;
-      return { status: 126, signal: null, stderr: "", stdout: "" };
+      return {
+        status: 126,
+        signal: null,
+        stderr: "private detail\ngrok-plugin-containment-v1:termination-incomplete-owned\n",
+        stdout: ""
+      };
     },
     stdout: { write() {} },
     stderr: { write(value) { diagnostics += value; } }
   });
   assert.equal(status, 1);
   assert.match(diagnostics, /containment could not be proven/);
+  assert.match(diagnostics, /containment reason: termination-incomplete-owned/);
+  assert.doesNotMatch(diagnostics, /private detail/);
   assert.match(diagnostics, /preserved for stale reaping/);
   assert.equal(launches, 1);
   const entries = fs.readdirSync(root);

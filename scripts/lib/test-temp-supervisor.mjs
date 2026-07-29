@@ -19,9 +19,25 @@ const PS_PATHS = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
 const CHILD_HOOK = fileURLToPath(new URL("./test-temp-child-hook.cjs", import.meta.url));
 let provenLinuxVisibilityToken = null;
 const knownLinuxOwnedProcesses = new Map();
+const CONTAINMENT_DIAGNOSTIC_PREFIX = "grok-plugin-containment-v1:";
+const CONTAINMENT_REASONS = new Set([
+  "unsupported-platform",
+  "startup-visibility",
+  "visibility-monitor",
+  "post-close-inspection",
+  "termination-incomplete-group",
+  "termination-incomplete-owned",
+  "termination-incomplete-unknown"
+]);
 
 function usage() {
   return "Usage: node test-temp-supervisor.mjs --timeout-ms <ms> -- <node> <args...>\n";
+}
+
+function containmentFailure(reason) {
+  const safeReason = CONTAINMENT_REASONS.has(reason) ? reason : "termination-incomplete-unknown";
+  process.stderr.write(`${CONTAINMENT_DIAGNOSTIC_PREFIX}${safeReason}\n`);
+  return CONTAINMENT_FAILURE_EXIT_CODE;
 }
 
 function parseArgs(argv) {
@@ -510,9 +526,9 @@ async function main() {
   // Node does not expose Windows Job Objects. A PID/PPID snapshot is not a
   // sufficient containment boundary after an intermediate process exits, so
   // fail closed instead of launching an uncontained deterministic test.
-  if (process.platform === "win32") return CONTAINMENT_FAILURE_EXIT_CODE;
+  if (process.platform === "win32") return containmentFailure("unsupported-platform");
   if (!await proveLinuxOwnedProcessVisibility(ownershipToken, tempIdentity)) {
-    return CONTAINMENT_FAILURE_EXIT_CODE;
+    return containmentFailure("startup-visibility");
   }
   if (process.platform === "linux") {
     provenLinuxVisibilityToken = ownershipToken;
@@ -520,7 +536,7 @@ async function main() {
   try {
     ownedProcessIds(ownershipToken, tempIdentity);
   } catch {
-    return CONTAINMENT_FAILURE_EXIT_CODE;
+    return containmentFailure("startup-visibility");
   }
 
   let child;
@@ -575,6 +591,7 @@ async function main() {
     resolveInterrupt = resolve;
   });
   let resolveContainmentFailure;
+  let containmentReason = null;
   const containmentFailed = new Promise((resolve) => {
     resolveContainmentFailure = resolve;
   });
@@ -584,6 +601,7 @@ async function main() {
       try {
         ownedProcessIds(ownershipToken, tempIdentity);
       } catch {
+        containmentReason = "visibility-monitor";
         resolveContainmentFailure("containment-failure");
       }
     }, 25);
@@ -614,12 +632,18 @@ async function main() {
     contained = await terminate(child, ownershipToken, tempIdentity);
   } else {
     try {
-      if (ownedProcessesAlive(child, ownershipToken, tempIdentity)) {
-    // A test file can exit while an unref'ed or detached descendant remains.
+      const groupAlive = processGroupAlive(child);
+      const ownedAlive = ownedProcessIds(ownershipToken, tempIdentity).length > 0;
+      if (groupAlive || ownedAlive) {
+        containmentReason = groupAlive
+          ? "termination-incomplete-group"
+          : "termination-incomplete-owned";
+        // A test file can exit while an unref'ed or detached descendant remains.
         // Reap only processes that retain the random token or private temp root.
         contained = await terminate(child, ownershipToken, tempIdentity);
       }
     } catch {
+      containmentReason = "post-close-inspection";
       contained = false;
     }
   }
@@ -628,8 +652,8 @@ async function main() {
   if (containmentMonitor) clearInterval(containmentMonitor);
 
   if (!overflow && chunks.length) fs.writeSync(process.stdout.fd, Buffer.concat(chunks));
-  if (!contained) return CONTAINMENT_FAILURE_EXIT_CODE;
-  if (outcome === "containment-failure") return CONTAINMENT_FAILURE_EXIT_CODE;
+  if (!contained) return containmentFailure(containmentReason);
+  if (outcome === "containment-failure") return containmentFailure("visibility-monitor");
   if (overflow) return OUTPUT_LIMIT_EXIT_CODE;
   if (outcome === "timeout") return TIMEOUT_EXIT_CODE;
   if (interrupted) return 130;

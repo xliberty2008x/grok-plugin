@@ -28,6 +28,8 @@ const REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
 const SUPERVISOR = path.join(ROOT, "scripts/lib/test-temp-supervisor.mjs");
 export const DETERMINISTIC_TEST_FILE_TIMEOUT_MS = 10 * 60_000;
 const CONTAINMENT_FAILURE_EXIT_CODE = 126;
+const CONTAINMENT_REASON_PATTERN =
+  /(?:^|\n)grok-plugin-containment-v1:(unsupported-platform|startup-visibility|visibility-monitor|post-close-inspection|termination-incomplete-group|termination-incomplete-owned|termination-incomplete-unknown)(?:\n|$)/u;
 const WORKER_BROKER_EVIDENCE_TEST =
   "tests/worker-broker-evidence.test.mjs";
 const WORKER_BROKER_EVIDENCE_PARTITION_ENV =
@@ -212,6 +214,12 @@ export function runDeterministicTestFiles({
         if (containmentUnproven) {
           preserveRunRoot = true;
           stderr.write(`Deterministic test child ${child} containment could not be proven.\n`);
+          const containmentReason = CONTAINMENT_REASON_PATTERN.exec(
+            String(result?.stderr || "")
+          )?.[1];
+          if (containmentReason) {
+            stderr.write(`Deterministic containment reason: ${containmentReason}.\n`);
+          }
           failed = true;
         } else if (fileRoot) {
           try {
