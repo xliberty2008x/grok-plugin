@@ -122,12 +122,13 @@ const WORKER_BROKER_EVIDENCE_PARTITION_KEY = Symbol.for(
 );
 const WORKER_BROKER_EVIDENCE_PARTITION_ENV =
   "GROK_PLUGIN_WORKER_BROKER_EVIDENCE_PARTITION";
-const WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARY = 90;
+const WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES = Object.freeze([90, 102, 115]);
+const WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT = 125;
 const configuredWorkerBrokerEvidencePartition =
   globalThis[WORKER_BROKER_EVIDENCE_PARTITION_KEY]
   ?? process.env[WORKER_BROKER_EVIDENCE_PARTITION_ENV];
 // Direct `node --test` runs register the complete file. The deterministic
-// runner and the part-2 entrypoint opt into disjoint registration ranges so
+// runner and the support entrypoints opt into disjoint registration ranges so
 // each supervised file remains below the fixed ten-minute limit.
 const workerBrokerEvidencePartition = configuredWorkerBrokerEvidencePartition == null
   ? null
@@ -136,6 +137,8 @@ if (
   workerBrokerEvidencePartition !== null
   && workerBrokerEvidencePartition !== 1
   && workerBrokerEvidencePartition !== 2
+  && workerBrokerEvidencePartition !== 3
+  && workerBrokerEvidencePartition !== 4
 ) {
   throw new Error("Worker broker evidence test partition is invalid.");
 }
@@ -143,9 +146,16 @@ let workerBrokerEvidenceTestOrdinal = 0;
 function test(...args) {
   workerBrokerEvidenceTestOrdinal += 1;
   const inPartition = workerBrokerEvidencePartition === null
-    || (workerBrokerEvidencePartition === 1
-      ? workerBrokerEvidenceTestOrdinal < WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARY
-      : workerBrokerEvidenceTestOrdinal >= WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARY);
+    || (
+      workerBrokerEvidenceTestOrdinal
+        >= (WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[
+          workerBrokerEvidencePartition - 2
+        ] ?? 1)
+      && workerBrokerEvidenceTestOrdinal
+        < (WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[
+          workerBrokerEvidencePartition - 1
+        ] ?? Number.POSITIVE_INFINITY)
+    );
   return inPartition ? nodeTest(...args) : undefined;
 }
 
@@ -228,6 +238,8 @@ test("deterministic zero-skip runner excludes only explicit external boundaries"
     !EXTERNAL_BOUNDARY_TESTS.includes(path.basename(relative))
   ));
   expected.push("tests/worker-broker-evidence_part2.mjs");
+  expected.push("tests/worker-broker-evidence_part3.mjs");
+  expected.push("tests/worker-broker-evidence_part4.mjs");
   expected.sort();
   assert.deepEqual(listDeterministicTestFiles(), expected);
 });
@@ -366,7 +378,9 @@ test("deterministic runner owns the evidence partition environment", () => {
   const status = runDeterministicTestFiles({
     files: [
       "tests/worker-broker-evidence.test.mjs",
-      "tests/worker-broker-evidence_part2.mjs"
+      "tests/worker-broker-evidence_part2.mjs",
+      "tests/worker-broker-evidence_part3.mjs",
+      "tests/worker-broker-evidence_part4.mjs"
     ],
     root: ROOT,
     reporter: ZERO_SKIP_REPORTER,
@@ -391,10 +405,9 @@ test("deterministic runner owns the evidence partition environment", () => {
     calls[0].options.env[WORKER_BROKER_EVIDENCE_PARTITION_ENV],
     "1"
   );
-  assert.equal(
-    Object.hasOwn(calls[1].options.env, WORKER_BROKER_EVIDENCE_PARTITION_ENV),
-    false
-  );
+  assert.ok(calls.slice(1).every((call) => (
+    !Object.hasOwn(call.options.env, WORKER_BROKER_EVIDENCE_PARTITION_ENV)
+  )));
 });
 
 test("Phase 1 focused runner executes its fixed inventory in exact serial order", () => {
@@ -8809,3 +8822,9 @@ test("qualify CLI fails closed when it only records skipped live work", () => {
     release: "not_run"
   });
 });
+
+if (workerBrokerEvidenceTestOrdinal !== WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT) {
+  throw new Error(
+    `Worker broker evidence partitions must be rebalanced after ${workerBrokerEvidenceTestOrdinal} registrations.`
+  );
+}

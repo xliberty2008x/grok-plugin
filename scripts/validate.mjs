@@ -315,6 +315,8 @@ if (!versionsOnly) {
     "tests/deterministic-sharding.test.mjs",
     "tests/worker-broker-evidence.test.mjs",
     "tests/worker-broker-evidence_part2.mjs",
+    "tests/worker-broker-evidence_part3.mjs",
+    "tests/worker-broker-evidence_part4.mjs",
     "tests/worker-broker-protected-review.test.mjs",
     "tests/worker-protocol.test.mjs",
     "tests/nonblocking-stdin-child.mjs",

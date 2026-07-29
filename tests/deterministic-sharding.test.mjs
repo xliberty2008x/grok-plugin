@@ -40,16 +40,20 @@ test("deterministic shard manifest is an exact nonempty partition of the invento
 
 test("deterministic-only evidence harness is explicit and excluded from ordinary test discovery", () => {
   assert.deepEqual(DETERMINISTIC_SUPPORT_TEST_FILES, [
-    "tests/worker-broker-evidence_part2.mjs"
+    "tests/worker-broker-evidence_part2.mjs",
+    "tests/worker-broker-evidence_part3.mjs",
+    "tests/worker-broker-evidence_part4.mjs"
   ]);
   const ordinary = fs.readdirSync(path.join(ROOT, "tests"))
     .filter((name) => name.endsWith(".test.mjs"))
     .map((name) => `tests/${name}`);
   assert.equal(ordinary.includes("tests/worker-broker-evidence.test.mjs"), true);
-  assert.equal(ordinary.includes(DETERMINISTIC_SUPPORT_TEST_FILES[0]), false);
-  assert.equal(listDeterministicTestFiles().filter(
-    (file) => file === DETERMINISTIC_SUPPORT_TEST_FILES[0]
-  ).length, 1);
+  for (const supportFile of DETERMINISTIC_SUPPORT_TEST_FILES) {
+    assert.equal(ordinary.includes(supportFile), false);
+    assert.equal(listDeterministicTestFiles().filter(
+      (file) => file === supportFile
+    ).length, 1);
+  }
 });
 
 test("deterministic shard CLI accepts only one exact three-way shard specification", () => {

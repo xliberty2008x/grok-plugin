@@ -1,6 +1,8 @@
 export const DETERMINISTIC_TEST_SHARD_COUNT = 3;
 export const DETERMINISTIC_SUPPORT_TEST_FILES = Object.freeze([
-  "tests/worker-broker-evidence_part2.mjs"
+  "tests/worker-broker-evidence_part2.mjs",
+  "tests/worker-broker-evidence_part3.mjs",
+  "tests/worker-broker-evidence_part4.mjs"
 ]);
 
 // Duration-balanced with longest-processing-time assignment from the
@@ -49,6 +51,8 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/test-temp-cleanup.test.mjs",
     "tests/worker-broker-evidence.test.mjs",
     "tests/worker-broker-evidence_part2.mjs",
+    "tests/worker-broker-evidence_part3.mjs",
+    "tests/worker-broker-evidence_part4.mjs",
     "tests/worker-context-roles.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
     "tests/worker-presentation.test.mjs",
