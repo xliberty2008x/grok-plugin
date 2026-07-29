@@ -200,6 +200,21 @@ test("Linux terminal process states cannot retain a live ownership identity", ()
   }
 });
 
+test("Linux fallback identities distinguish a live PID from exit or PID reuse", () => {
+  const live = ["S", ...Array.from({ length: 18 }, (_, index) => String(index + 1)), "987654"];
+  const reused = [...live.slice(0, 19), "987655"];
+  const knownIdentity = linuxProcessIdentityFromStat(
+    42,
+    `42 (owned worker) ${live.join(" ")}`
+  );
+  assert.equal(knownIdentity, "42:987654");
+  assert.notEqual(
+    linuxProcessIdentityFromStat(42, `42 (reused worker) ${reused.join(" ")}`),
+    knownIdentity
+  );
+  assert.equal(linuxProcessIdentityFromStat(42, "gone"), null);
+});
+
 test("process start tokens use a stable C locale", () => {
   let invocation = null;
   const token = processStartToken(process.pid, {

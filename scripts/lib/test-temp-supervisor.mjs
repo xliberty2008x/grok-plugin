@@ -258,8 +258,13 @@ function ownedProcessIds(token, tempIdentity) {
           knownLinuxOwnedProcesses.delete(pid);
           continue;
         }
-        if (knownLinuxOwnedProcesses.has(pid)) {
-          throw new Error("Owned-process visibility became unavailable.");
+        const knownIdentity = knownLinuxOwnedProcesses.get(pid);
+        if (knownIdentity) {
+          const currentIdentity = linuxProcessIdentity(pid);
+          if (currentIdentity === knownIdentity) {
+            throw new Error("Owned-process visibility became unavailable.");
+          }
+          knownLinuxOwnedProcesses.delete(pid);
         }
         // A vanished or protected unrelated process is benign after the
         // tagged detached-child probe below has proved that this supervisor can
