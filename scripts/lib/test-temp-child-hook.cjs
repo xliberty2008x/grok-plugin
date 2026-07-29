@@ -1,16 +1,32 @@
 "use strict";
 
 const childProcess = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const { syncBuiltinESMExports } = require("node:module");
 const path = require("node:path");
 
 const BYPASS_ENVIRONMENT_KEY = "GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS";
 const PID_REGISTRY_ENVIRONMENT_KEY = "GROK_PLUGIN_TEST_PID_REGISTRY";
+const PID_REGISTRY_SECRET_ENVIRONMENT_KEY = "GROK_PLUGIN_TEST_PID_REGISTRY_SECRET";
+const SUPERVISOR_PID_ENVIRONMENT_KEY = "GROK_PLUGIN_TEST_SUPERVISOR_PID";
+const SUPERVISOR_AUTHORITY_SYMBOL = Symbol.for(
+  "grok-plugin.testSupervisorAuthority"
+);
+const REMOVE_HELPER = path.resolve(__dirname, "test-temp-remove-helper.cjs");
+const DIRECT_TEMP_FALLBACK_HELPER = path.resolve(
+  __dirname,
+  "../../tests/direct-temp-fallback-child.mjs"
+);
+const SUPERVISOR_HELPER = path.resolve(__dirname, "test-temp-supervisor.mjs");
+const REGISTRATION_ACK_TIMEOUT_MS = 5_000;
+const REGISTRATION_ACK_POLL_MS = 5;
+const registrationAckWaitBuffer = new Int32Array(new SharedArrayBuffer(4));
 const FORCED_ENVIRONMENT_KEYS = Object.freeze([
   PID_REGISTRY_ENVIRONMENT_KEY,
   "GROK_PLUGIN_TEST_SUPERVISOR_TOKEN",
   "GROK_PLUGIN_TEST_TEMP_ROOT",
+  SUPERVISOR_PID_ENVIRONMENT_KEY,
   "NODE_OPTIONS"
 ]);
 const FALLBACK_ENVIRONMENT_KEYS = Object.freeze([
@@ -18,9 +34,142 @@ const FALLBACK_ENVIRONMENT_KEYS = Object.freeze([
   "TMP",
   "TMPDIR"
 ]);
+const originalSpawnSync = childProcess.spawnSync;
+const capturedForcedEnvironment = Object.freeze(
+  selectedEnvironment(FORCED_ENVIRONMENT_KEYS)
+);
+const capturedFallbackEnvironment = Object.freeze(
+  selectedEnvironment(FALLBACK_ENVIRONMENT_KEYS)
+);
+const capturedRegistrySecret =
+  process.env[PID_REGISTRY_SECRET_ENVIRONMENT_KEY] || null;
+const capturedBypass = process.env[BYPASS_ENVIRONMENT_KEY] === "1";
+const capturedSupervisorEntrypoint =
+  path.resolve(String(process.argv[1] || "")) === SUPERVISOR_HELPER;
+delete process.env[PID_REGISTRY_SECRET_ENVIRONMENT_KEY];
 
-function linuxProcessRegistration(pid, expectedParentPid = null) {
-  if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 1) return null;
+function activeAuthority() {
+  const rebound = globalThis[SUPERVISOR_AUTHORITY_SYMBOL];
+  if (
+    capturedSupervisorEntrypoint
+    &&
+    rebound
+    && Number(rebound[SUPERVISOR_PID_ENVIRONMENT_KEY]) === process.pid
+  ) {
+    return rebound;
+  }
+  return capturedForcedEnvironment;
+}
+
+function activeRegistrySecret() {
+  const rebound = globalThis[SUPERVISOR_AUTHORITY_SYMBOL];
+  const supervisorSecret = rebound?.[PID_REGISTRY_SECRET_ENVIRONMENT_KEY];
+  if (
+    capturedSupervisorEntrypoint
+    &&
+    Number(rebound?.[SUPERVISOR_PID_ENVIRONMENT_KEY]) === process.pid
+    && typeof supervisorSecret === "string"
+  ) return supervisorSecret;
+  return capturedRegistrySecret;
+}
+
+function isDirectNodeLaunch(file) {
+  return path.resolve(String(file || "")) === path.resolve(process.execPath);
+}
+
+function forcedEnvironment({
+  nestedSupervisor = false,
+  includeRegistrySecret = false
+} = {}) {
+  const selected = { ...activeAuthority() };
+  if (nestedSupervisor) {
+    delete selected[PID_REGISTRY_ENVIRONMENT_KEY];
+    delete selected.GROK_PLUGIN_TEST_TEMP_ROOT;
+    delete selected[SUPERVISOR_PID_ENVIRONMENT_KEY];
+  }
+  const registrySecret = activeRegistrySecret();
+  if (registrySecret && !nestedSupervisor && includeRegistrySecret) {
+    selected[PID_REGISTRY_SECRET_ENVIRONMENT_KEY] = registrySecret;
+  }
+  return selected;
+}
+
+function isNestedSupervisorLaunch(file, args) {
+  return (
+    file === process.execPath
+    && Array.isArray(args)
+    && path.resolve(String(args[0] || "")) === SUPERVISOR_HELPER
+  );
+}
+
+function syncBypassAuthorized(file, args, options) {
+  if (options?.env?.[BYPASS_ENVIRONMENT_KEY] !== "1") return false;
+  return (
+    file === process.execPath
+    && Array.isArray(args)
+    && (
+      (
+        args.length === 3
+        && path.resolve(String(args[0] || "")) === REMOVE_HELPER
+      )
+      || (
+        args.length === 1
+        && path.resolve(String(args[0] || "")) === DIRECT_TEMP_FALLBACK_HELPER
+      )
+    )
+  );
+}
+
+function rejectDetachedSync(file, options) {
+  if (options?.detached !== true) return;
+  if (
+    (file === "/bin/ps" || file === "/usr/bin/ps")
+    && options.shell !== true
+    && Number.isFinite(options.timeout)
+    && options.timeout <= 2_000
+  ) {
+    return;
+  }
+  const error = new Error("Detached synchronous children are not safely containable.");
+  error.code = "E_TEST_TEMP_DETACHED_SYNC";
+  throw error;
+}
+
+function processRegistration(pid, expectedParentPid = null) {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  if (process.platform === "darwin") {
+    const result = originalSpawnSync("/bin/ps", [
+      "-p",
+      String(pid),
+      "-o",
+      "ppid=,state=,lstart="
+    ], {
+      env: { LC_ALL: "C", [BYPASS_ENVIRONMENT_KEY]: "1" },
+      encoding: "utf8",
+      shell: false,
+      timeout: 1_000,
+      maxBuffer: 8 * 1024
+    });
+    const match = /^\s*(\d+)\s+(\S+)\s+(.+?)\s*$/u.exec(String(result.stdout || ""));
+    const parentPid = Number(match?.[1]);
+    const state = match?.[2];
+    const startToken = match?.[3];
+    if (
+      result.status !== 0
+      || result.error
+      || result.signal
+      || state?.includes("Z")
+      || !startToken
+      || (
+        Number.isSafeInteger(expectedParentPid)
+        && parentPid !== expectedParentPid
+      )
+    ) {
+      return null;
+    }
+    return `${pid}:m${Buffer.from(startToken, "utf8").toString("hex")}`;
+  }
+  if (process.platform !== "linux") return null;
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
     const commandEnd = stat.lastIndexOf(")");
@@ -46,19 +195,51 @@ function linuxProcessRegistration(pid, expectedParentPid = null) {
   }
 }
 
-function appendLinuxProcessRegistration(pid, expectedParentPid = null) {
-  const registry = process.env[PID_REGISTRY_ENVIRONMENT_KEY];
-  const tempRoot = process.env.GROK_PLUGIN_TEST_TEMP_ROOT;
+function waitForRegistrationAcknowledgement(registry, registration, registrySecret) {
+  if (capturedSupervisorEntrypoint) return;
+  const expected = `ack:${registration}:${crypto
+    .createHmac("sha256", registrySecret)
+    .update(`ack:${registration}`)
+    .digest("hex")}`;
+  const deadline = Date.now() + REGISTRATION_ACK_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const contents = fs.readFileSync(registry, "utf8");
+      if (contents.split("\n").includes(expected)) return;
+    } catch {
+      // The supervisor will fail containment if the registry becomes unreadable.
+    }
+    Atomics.wait(
+      registrationAckWaitBuffer,
+      0,
+      0,
+      REGISTRATION_ACK_POLL_MS
+    );
+  }
+  const error = new Error("The test supervisor did not acknowledge child ownership.");
+  error.code = "E_TEST_TEMP_REGISTRATION_ACK";
+  throw error;
+}
+
+function appendProcessRegistration(pid, expectedParentPid = null) {
+  const authority = activeAuthority();
+  const registry = authority[PID_REGISTRY_ENVIRONMENT_KEY];
+  const tempRoot = authority.GROK_PLUGIN_TEST_TEMP_ROOT;
   if (
-    process.platform !== "linux"
+    (process.platform !== "linux" && process.platform !== "darwin")
     || !path.isAbsolute(registry || "")
     || !path.isAbsolute(tempRoot || "")
     || path.dirname(registry) !== path.resolve(tempRoot)
   ) {
     return;
   }
-  const registration = linuxProcessRegistration(pid, expectedParentPid);
-  if (!registration) return;
+  const registration = processRegistration(pid, expectedParentPid);
+  const registrySecret = activeRegistrySecret();
+  if (!registration || !registrySecret) return;
+  const signature = crypto
+    .createHmac("sha256", registrySecret)
+    .update(registration)
+    .digest("hex");
   let descriptor;
   try {
     const before = fs.lstatSync(registry);
@@ -77,12 +258,13 @@ function appendLinuxProcessRegistration(pid, expectedParentPid = null) {
     ) {
       return;
     }
-    fs.writeSync(descriptor, `${registration}\n`, null, "utf8");
+    fs.writeSync(descriptor, `${registration}:${signature}\n`, null, "utf8");
   } catch {
     // The supervisor still has process-group and environment visibility.
   } finally {
     if (Number.isInteger(descriptor)) fs.closeSync(descriptor);
   }
+  waitForRegistrationAcknowledgement(registry, registration, registrySecret);
 }
 
 function selectedEnvironment(keys) {
@@ -91,60 +273,84 @@ function selectedEnvironment(keys) {
     .map((key) => [key, process.env[key]]));
 }
 
-function injectObjectEnvironment(options = {}) {
+function injectObjectEnvironment(
+  options = {},
+  { nestedSupervisor = false, file = null } = {}
+) {
   const provided = options.env || process.env;
   const fallback = Object.fromEntries(Object.entries(
-    selectedEnvironment(FALLBACK_ENVIRONMENT_KEYS)
+    capturedFallbackEnvironment
   ).filter(([key]) => typeof provided[key] !== "string"));
+  const environment = {
+    ...provided,
+    ...fallback,
+    ...forcedEnvironment({
+      nestedSupervisor,
+      includeRegistrySecret: isDirectNodeLaunch(file)
+    })
+  };
+  if (nestedSupervisor || !isDirectNodeLaunch(file)) {
+    delete environment[PID_REGISTRY_SECRET_ENVIRONMENT_KEY];
+  }
+  if (nestedSupervisor) {
+    delete environment[PID_REGISTRY_ENVIRONMENT_KEY];
+    delete environment[SUPERVISOR_PID_ENVIRONMENT_KEY];
+  }
   return {
     ...options,
-    env: {
-      ...provided,
-      ...fallback,
-      ...selectedEnvironment(FORCED_ENVIRONMENT_KEYS)
-    }
+    env: environment
   };
+}
+
+function environmentPairKey(entry) {
+  const text = String(entry);
+  const separator = text.indexOf("=");
+  return separator === -1 ? text : text.slice(0, separator);
 }
 
 const originalSpawn = childProcess.ChildProcess.prototype.spawn;
 childProcess.ChildProcess.prototype.spawn = function spawnWithTestOwnership(options) {
-  if (
-    Array.isArray(options?.envPairs)
-    && options.envPairs.includes(`${BYPASS_ENVIRONMENT_KEY}=1`)
-  ) {
-    return originalSpawn.call(this, options);
-  }
-  const forced = selectedEnvironment(FORCED_ENVIRONMENT_KEYS);
-  const fallback = selectedEnvironment(FALLBACK_ENVIRONMENT_KEYS);
-  const forcedKeys = new Set(Object.keys(forced));
+  const forced = forcedEnvironment({
+    includeRegistrySecret: isDirectNodeLaunch(options?.file)
+  });
+  const fallback = capturedFallbackEnvironment;
+  const forcedKeys = new Set([
+    ...Object.keys(forced),
+    PID_REGISTRY_SECRET_ENVIRONMENT_KEY
+  ]);
   const providedKeys = new Set((options?.envPairs || [])
-    .map((entry) => String(entry).split("=", 1)[0]));
+    .map(environmentPairKey));
   const envPairs = Array.isArray(options?.envPairs)
-    ? options.envPairs.filter((entry) => !forcedKeys.has(String(entry).split("=", 1)[0]))
+    ? options.envPairs.filter((entry) => !forcedKeys.has(environmentPairKey(entry)))
     : [];
   for (const [key, value] of Object.entries(fallback)) {
     if (!providedKeys.has(key)) envPairs.push(`${key}=${value}`);
   }
   for (const [key, value] of Object.entries(forced)) envPairs.push(`${key}=${value}`);
   const result = originalSpawn.call(this, { ...options, envPairs });
-  appendLinuxProcessRegistration(this.pid, process.pid);
+  if (process.platform === "linux" || process.platform === "darwin") {
+    appendProcessRegistration(this.pid, process.pid);
+  }
   return result;
 };
 
-const originalSpawnSync = childProcess.spawnSync;
 childProcess.spawnSync = function spawnSyncWithTestOwnership(file, args, options) {
   const hasArgs = Array.isArray(args);
   const selectedOptions = hasArgs ? options : args;
-  if (selectedOptions?.env?.[BYPASS_ENVIRONMENT_KEY] === "1") {
+  if (syncBypassAuthorized(file, hasArgs ? args : [], selectedOptions)) {
     return hasArgs
       ? originalSpawnSync.call(this, file, args, selectedOptions)
       : originalSpawnSync.call(this, file, selectedOptions);
   }
-  const injected = injectObjectEnvironment(selectedOptions);
+  rejectDetachedSync(file, selectedOptions);
+  const injected = injectObjectEnvironment(selectedOptions, {
+    nestedSupervisor: isNestedSupervisorLaunch(file, hasArgs ? args : []),
+    file
+  });
   const result = hasArgs
     ? originalSpawnSync.call(this, file, args, injected)
     : originalSpawnSync.call(this, file, injected);
-  appendLinuxProcessRegistration(result?.pid, process.pid);
+  appendProcessRegistration(result?.pid, process.pid);
   return result;
 };
 
@@ -152,7 +358,8 @@ const originalExecFileSync = childProcess.execFileSync;
 childProcess.execFileSync = function execFileSyncWithTestOwnership(file, args, options) {
   const hasArgs = Array.isArray(args);
   const selectedOptions = hasArgs ? options : args;
-  const injected = injectObjectEnvironment(selectedOptions);
+  rejectDetachedSync(file, selectedOptions);
+  const injected = injectObjectEnvironment(selectedOptions, { file });
   return hasArgs
     ? originalExecFileSync.call(this, file, args, injected)
     : originalExecFileSync.call(this, file, injected);
@@ -160,11 +367,15 @@ childProcess.execFileSync = function execFileSyncWithTestOwnership(file, args, o
 
 const originalExecSync = childProcess.execSync;
 childProcess.execSync = function execSyncWithTestOwnership(command, options) {
+  rejectDetachedSync(null, options);
   return originalExecSync.call(this, command, injectObjectEnvironment(options));
 };
 
-if (process.env[BYPASS_ENVIRONMENT_KEY] !== "1") {
-  appendLinuxProcessRegistration(process.pid);
+if (
+  process.platform === "linux"
+  && !capturedBypass
+) {
+  appendProcessRegistration(process.pid);
 }
 
 syncBuiltinESMExports();

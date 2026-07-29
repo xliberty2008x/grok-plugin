@@ -14,7 +14,8 @@ import {
   linuxKnownProcessIdentityMatches,
   linuxProcessGroupMemberFromStat,
   linuxProcessIdentityFromStat,
-  linuxProcessProvesLiveOwnership
+  linuxProcessProvesLiveOwnership,
+  signalOwnedGroup
 } from "../scripts/lib/test-temp-supervisor.mjs";
 import {
   LEGACY_REPOSITORY_PREFIX,
@@ -24,7 +25,6 @@ import {
 } from "../scripts/lib/test-temp-cleanup.mjs";
 import {
   TEST_TEMP_PROCESS_PREFIX,
-  TEST_TEMP_ROOT_ENV,
   TEST_TEMP_RUN_PREFIX,
   createOwnedTestTempRoot,
   processStartToken
@@ -35,6 +35,15 @@ const REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
 const REMOVE_HELPER = path.join(ROOT, "scripts/lib/test-temp-remove-helper.cjs");
 const PIDFD_SIGNAL_HELPER = path.join(ROOT, "scripts/lib/test-temp-pidfd-signal.py");
 const OLD_MS = 2 * 60 * 60_000;
+const TEST_OWNERSHIP_ENVIRONMENT_KEYS = Object.freeze([
+  "GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS",
+  "GROK_PLUGIN_TEST_PID_REGISTRY",
+  "GROK_PLUGIN_TEST_PID_REGISTRY_SECRET",
+  "GROK_PLUGIN_TEST_SUPERVISOR_PID",
+  "GROK_PLUGIN_TEST_SUPERVISOR_TOKEN",
+  "GROK_PLUGIN_TEST_TEMP_ROOT",
+  "NODE_OPTIONS"
+]);
 
 function sandbox(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "grok-test-cleanup-sandbox-"));
@@ -203,6 +212,18 @@ test("Linux terminal process states cannot retain a live ownership identity", ()
   }
 });
 
+test("macOS never signals a bare stale or reused process-group identity", () => {
+  const signals = [];
+  const child = {
+    pid: 42_424,
+    kill(signal) {
+      signals.push(signal);
+    }
+  };
+  assert.equal(signalOwnedGroup(child, "SIGKILL", { platform: "darwin" }), false);
+  assert.deepEqual(signals, []);
+});
+
 test("Linux fallback identities distinguish a live PID from exit or PID reuse", () => {
   const live = ["S", ...Array.from({ length: 18 }, (_, index) => String(index + 1)), "987654"];
   const reused = [...live.slice(0, 19), "987655"];
@@ -281,6 +302,7 @@ test("legacy allowlist exactly covers checked-in literal system-temp allocation 
     "grok-installed-worker-mcp-",
     "grok-mcp-client-",
     "grok-mcp-reflection-secret-",
+    "grok-plugin-test-",
     "grok-worker-proof-"
   ]);
   for (const prefix of [
@@ -533,6 +555,80 @@ test("apply preserves a replacement swapped after the final path identity check"
     fs.readdirSync(root).some((name) => name.startsWith(".grok-plugin-cleanup-quarantine-")),
     false
   );
+});
+
+test("apply restores a quarantined candidate when a fresh snapshot finds activity", (t) => {
+  const root = sandbox(t);
+  const target = legacy(root);
+  fs.writeFileSync(path.join(target, "payload"), "payload");
+  age(target);
+  let snapshots = 0;
+  const result = cleanupTestTemp(options(root, {
+    apply: true,
+    openPathsProvider() {
+      snapshots += 1;
+      if (snapshots < 3) return closedPaths();
+      const quarantine = fs.readdirSync(root)
+        .find((name) => name.startsWith(".grok-plugin-cleanup-quarantine-"));
+      return quarantine
+        ? {
+            available: true,
+            paths: [path.join(root, quarantine, "payload")],
+            commands: []
+          }
+        : closedPaths();
+    }
+  }));
+  const candidate = record(result, target);
+  assert.ok(candidate.reasons.includes("active-process-reference"));
+  assert.equal(candidate.removed, undefined);
+  assert.equal(fs.readFileSync(path.join(target, "payload"), "utf8"), "payload");
+  assert.equal(
+    fs.readdirSync(root).some((name) => name.startsWith(".grok-plugin-cleanup-quarantine-")),
+    false
+  );
+});
+
+test("apply aborts and restores quarantine when post-rename visibility is lost", (t) => {
+  const root = sandbox(t);
+  const target = legacy(root);
+  fs.writeFileSync(path.join(target, "payload"), "payload");
+  age(target);
+  let snapshots = 0;
+  const result = cleanupTestTemp(options(root, {
+    apply: true,
+    openPathsProvider() {
+      snapshots += 1;
+      return snapshots < 3
+        ? closedPaths()
+        : { available: false, paths: [], commands: [], reason: "fixture" };
+    }
+  }));
+  assert.equal(result.aborted, true);
+  assert.equal(result.reason, "active-process-visibility-unavailable");
+  assert.ok(record(result, target).reasons.includes("remove-failed"));
+  assert.equal(fs.readFileSync(path.join(target, "payload"), "utf8"), "payload");
+});
+
+test("apply restores quarantine when a fresh worktree snapshot registers the candidate", (t) => {
+  const root = sandbox(t);
+  const target = legacy(root);
+  fs.writeFileSync(path.join(target, "payload"), "payload");
+  age(target);
+  let snapshots = 0;
+  const result = cleanupTestTemp(options(root, {
+    apply: true,
+    worktreeProvider() {
+      snapshots += 1;
+      return {
+        available: true,
+        paths: snapshots < 3 ? [] : [target]
+      };
+    }
+  }));
+  assert.equal(result.aborted, false);
+  assert.ok(record(result, target).reasons.includes("registered-worktree"));
+  assert.equal(fs.readFileSync(path.join(target, "payload"), "utf8"), "payload");
 });
 
 test("verified recursive removal has no timeout that can orphan a descendant helper", (t) => {
@@ -796,14 +892,17 @@ test("opaque owner tokens preserve a managed root while the owner PID remains li
 
 test("direct node --test helper fallback removes its one process-owned container on normal exit", (t) => {
   const root = sandbox(t);
-  const helper = path.join(ROOT, "tests", "helpers.mjs");
-  const environment = { ...process.env, TMPDIR: root, TMP: root, TEMP: root };
-  delete environment[TEST_TEMP_ROOT_ENV];
-  const result = spawnSync(process.execPath, [
-    "--input-type=module",
-    "--eval",
-    `import { tempDir } from ${JSON.stringify(new URL(`file://${helper}`).href)}; process.stdout.write(tempDir("grok-plugin-repo-"));`
-  ], {
+  const helper = path.join(ROOT, "tests", "direct-temp-fallback-child.mjs");
+  const environment = {
+    ...process.env,
+    TMPDIR: root,
+    TMP: root,
+    TEMP: root,
+    GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1"
+  };
+  for (const key of TEST_OWNERSHIP_ENVIRONMENT_KEYS) delete environment[key];
+  environment.GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS = "1";
+  const result = spawnSync(process.execPath, [helper], {
     cwd: ROOT,
     env: environment,
     encoding: "utf8",
@@ -838,6 +937,52 @@ test("deterministic runner cleans run and file roots after pass, failure, and ti
       false
     );
   }
+});
+
+test("deterministic runner preserves an outside canary swapped into an owned file-root path", (t) => {
+  if (process.platform === "win32") return;
+  const root = sandbox(t);
+  const canary = path.join(root, "outside-runner-canary");
+  const marker = path.join(canary, "must-survive.txt");
+  const controlFile = path.join(root, "swapped-file-root.txt");
+  const fixture = path.join(root, "swap-owned-root.test.mjs");
+  fs.mkdirSync(canary);
+  fs.writeFileSync(marker, "outside\n");
+  fs.writeFileSync(fixture, [
+    'import fs from "node:fs";',
+    'import path from "node:path";',
+    'import process from "node:process";',
+    'import test from "node:test";',
+    'test("swap owned root", () => {',
+    "  const ownedRoot = process.env.TMPDIR;",
+    '  const registryName = ".grok-plugin-owned-pids";',
+    "  const originalRoot = `${ownedRoot}-original`;",
+    `  fs.writeFileSync(${JSON.stringify(controlFile)}, ownedRoot);`,
+    `  fs.linkSync(path.join(ownedRoot, registryName), path.join(${JSON.stringify(canary)}, registryName));`,
+    "  fs.renameSync(ownedRoot, originalRoot);",
+    `  fs.renameSync(${JSON.stringify(canary)}, ownedRoot);`,
+    "});",
+    ""
+  ].join("\n"));
+  let diagnostics = "";
+  const status = runDeterministicTestFiles({
+    files: [fixture],
+    root: ROOT,
+    reporter: REPORTER,
+    tempRoot: root,
+    timeoutMs: 5_000,
+    stdout: { write() {} },
+    stderr: { write(value) { diagnostics += value; } }
+  });
+  const swappedRoot = fs.readFileSync(controlFile, "utf8");
+  assert.equal(status, 1);
+  assert.match(diagnostics, /temp cleanup failed/);
+  assert.match(diagnostics, /run temp root was preserved/);
+  assert.equal(fs.readFileSync(path.join(swappedRoot, "must-survive.txt"), "utf8"), "outside\n");
+  assert.equal(
+    fs.readdirSync(root).filter((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)).length,
+    1
+  );
 });
 
 test("deterministic runner preserves one manifest-backed run root when containment is unproven", (t) => {
@@ -1022,7 +1167,7 @@ test("supervisor interruption promptly kills a TERM-resistant group and runner c
   assert.equal(fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)), false);
 });
 
-test("supervisor reaps a detached Node descendant that requests an empty environment", async (t) => {
+test("supervisor replaces async-spawn decoy ownership and reaps the detached descendant", async (t) => {
   if (process.platform === "win32") return;
   const root = sandbox(t);
   const pidFile = path.join(root, "empty-environment-descendant.pid");
@@ -1030,9 +1175,23 @@ test("supervisor reaps a detached Node descendant that requests an empty environ
   fs.writeFileSync(fixture, [
     'import fs from "node:fs";',
     'import process from "node:process";',
-    'import { spawn } from "node:child_process";',
+    'import { spawn, spawnSync } from "node:child_process";',
+    `for (const key of ${JSON.stringify([...TEST_OWNERSHIP_ENVIRONMENT_KEYS, "TMPDIR", "TMP", "TEMP"])}) delete process.env[key];`,
+    "process.env.GROK_PLUGIN_TEST_SUPERVISOR_PID = String(process.pid);",
+    'globalThis[Symbol.for("grok-plugin.testSupervisorAuthority")] = {',
+    '  GROK_PLUGIN_TEST_SUPERVISOR_PID: String(process.pid),',
+    '  GROK_PLUGIN_TEST_PID_REGISTRY: "/tmp/decoy-registry",',
+    '  GROK_PLUGIN_TEST_PID_REGISTRY_SECRET: "decoy-secret"',
+    "};",
+    'const ordinaryEnvironment = spawnSync("/usr/bin/env", [], { encoding: "utf8" });',
+    'if (ordinaryEnvironment.status !== 0) throw new Error("environment probe failed");',
+    'if (ordinaryEnvironment.stdout.includes("GROK_PLUGIN_TEST_PID_REGISTRY_SECRET=")) {',
+    '  throw new Error("registry authority leaked to an ordinary child");',
+    "}",
     "const child = spawn(process.execPath, [\"--eval\", \"setInterval(() => {}, 1000)\"], {",
-    '  detached: true, env: {}, stdio: "ignore"',
+    "  detached: true,",
+    '  env: { GROK_PLUGIN_TEST_SUPERVISOR_TOKEN: "decoy", NODE_OPTIONS: "" },',
+    '  stdio: "ignore"',
     "});",
     "child.unref();",
     `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
@@ -1054,10 +1213,103 @@ test("supervisor reaps a detached Node descendant that requests an empty environ
   assert.equal(fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)), false);
 });
 
-test("Linux supervisor retains a proven detached PID across an environment-scrubbing re-exec", async (t) => {
-  if (process.platform !== "linux") return;
+test("supervisor fails closed when its signed PID registry is replaced, truncated, or rolled back", async (t) => {
+  if (process.platform !== "linux" && process.platform !== "darwin") return;
+  for (const tamper of ["replace", "truncate", "rollback"]) {
+    const root = sandbox(t);
+    const pidFile = path.join(root, `${tamper}-registry-descendant.pid`);
+    const fixture = path.join(root, `${tamper}-registry.test.mjs`);
+    fs.writeFileSync(fixture, [
+      'import fs from "node:fs";',
+      'import process from "node:process";',
+      'import { spawn } from "node:child_process";',
+      'const registry = process.env.GROK_PLUGIN_TEST_PID_REGISTRY;',
+      'const initialRegistry = fs.readFileSync(registry, "utf8");',
+      'const child = spawn("/bin/sh", ["-c", "exec /usr/bin/env -i /bin/sleep 30"], {',
+      '  detached: true, stdio: "ignore"',
+      "});",
+      "child.unref();",
+      `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+      tamper === "replace"
+        ? "fs.unlinkSync(registry); fs.writeFileSync(registry, \"\", { mode: 0o600 });"
+        : tamper === "truncate"
+          ? "fs.truncateSync(registry, 0);"
+          : "fs.writeFileSync(registry, initialRegistry);",
+      ""
+    ].join("\n"));
+    let descendantPid = null;
+    t.after(() => {
+      if (!descendantPid) return;
+      try { process.kill(descendantPid, "SIGKILL"); } catch {}
+    });
+    let diagnostics = "";
+    const status = runDeterministicTestFiles({
+      files: [fixture],
+      root: ROOT,
+      reporter: REPORTER,
+      tempRoot: root,
+      timeoutMs: 5_000,
+      stdout: { write() {} },
+      stderr: { write(value) { diagnostics += value; } }
+    });
+    descendantPid = Number(fs.readFileSync(pidFile, "utf8"));
+    assert.equal(status, 1);
+    assert.match(diagnostics, /containment could not be proven/);
+    assert.match(diagnostics, /containment reason: (?:visibility-monitor|post-close-inspection)/);
+    assert.equal(await pidIsGone(descendantPid), true);
+    assert.equal(
+      fs.readdirSync(root).filter((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)).length,
+      1
+    );
+  }
+});
+
+test("supervisor ownership propagates through an async execFile chain", async (t) => {
+  if (process.platform === "win32") return;
+  const root = sandbox(t);
+  const pidFile = path.join(root, "exec-file-descendant.pid");
+  const helper = path.join(root, "exec-file-helper.mjs");
+  const fixture = path.join(root, "exec-file.test.mjs");
+  fs.writeFileSync(helper, [
+    'import fs from "node:fs";',
+    'import process from "node:process";',
+    'import { spawn } from "node:child_process";',
+    'const child = spawn(process.execPath, ["--eval", "setInterval(() => {}, 1000)"], {',
+    '  detached: true, env: {}, stdio: "ignore"',
+    "});",
+    "child.unref();",
+    `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+    ""
+  ].join("\n"));
+  fs.writeFileSync(fixture, [
+    'import process from "node:process";',
+    'import { execFile } from "node:child_process";',
+    `execFile(process.execPath, [${JSON.stringify(helper)}], { env: {} }, (error) => {`,
+    "  if (error) throw error;",
+    "});",
+    ""
+  ].join("\n"));
+  let diagnostics = "";
+  const status = runDeterministicTestFiles({
+    files: [fixture],
+    root: ROOT,
+    reporter: REPORTER,
+    tempRoot: root,
+    timeoutMs: 5_000,
+    stdout: { write() {} },
+    stderr: { write(value) { diagnostics += value; } }
+  });
+  assert.equal(status, 0, diagnostics);
+  const pid = Number(fs.readFileSync(pidFile, "utf8"));
+  assert.equal(await pidIsGone(pid), true);
+  assert.equal(fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)), false);
+});
+
+test("supervisor never silently loses an immediate environment-scrubbing detached exec", async (t) => {
+  if (process.platform === "win32") return;
   const root = sandbox(t);
   const pidFile = path.join(root, "scrubbed-reexec-descendant.pid");
+  const registryFile = path.join(root, "scrubbed-reexec-registry.txt");
   const fixture = path.join(root, "scrubbed-reexec.test.mjs");
   fs.writeFileSync(fixture, [
     'import fs from "node:fs";',
@@ -1067,6 +1319,7 @@ test("Linux supervisor retains a proven detached PID across an environment-scrub
     "});",
     "child.unref();",
     `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+    `fs.writeFileSync(${JSON.stringify(registryFile)}, fs.readFileSync(process.env.GROK_PLUGIN_TEST_PID_REGISTRY, "utf8"));`,
     ""
   ].join("\n"));
   let descendantPid = null;
@@ -1085,9 +1338,23 @@ test("Linux supervisor retains a proven detached PID across an environment-scrub
     stderr: { write(value) { diagnostics += value; } }
   });
   descendantPid = Number(fs.readFileSync(pidFile, "utf8"));
-  assert.equal(status, 0, diagnostics);
-  assert.equal(await pidIsGone(descendantPid), true);
-  assert.equal(fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)), false);
+  assert.match(fs.readFileSync(registryFile, "utf8"), new RegExp(`^${descendantPid}:`, "m"));
+  if (process.platform === "linux" || process.platform === "darwin") {
+    assert.equal(status, 0, diagnostics);
+    assert.equal(await pidIsGone(descendantPid), true);
+    assert.equal(
+      fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)),
+      false
+    );
+  } else {
+    assert.equal(status, 1);
+    assert.match(diagnostics, /containment could not be proven/);
+    assert.doesNotThrow(() => process.kill(descendantPid, 0));
+    assert.equal(
+      fs.readdirSync(root).filter((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)).length,
+      1
+    );
+  }
 });
 
 test("supervisor ownership survives an execFileSync chain with empty environments", async (t) => {
@@ -1126,6 +1393,37 @@ test("supervisor ownership survives an execFileSync chain with empty environment
   assert.equal(status, 0, diagnostics);
   const pid = Number(fs.readFileSync(pidFile, "utf8"));
   assert.equal(await pidIsGone(pid), true);
+  assert.equal(fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)), false);
+});
+
+test("child hook rejects detached synchronous launches before process creation", (t) => {
+  if (process.platform === "win32") return;
+  const root = sandbox(t);
+  const pidFile = path.join(root, "detached-sync-must-not-start.pid");
+  const fixture = path.join(root, "detached-sync-rejected.test.mjs");
+  fs.writeFileSync(fixture, [
+    'import assert from "node:assert/strict";',
+    'import process from "node:process";',
+    'import { spawnSync } from "node:child_process";',
+    "process.env.GROK_PLUGIN_TEST_SUPERVISOR_PID = String(process.pid);",
+    "assert.throws(() => spawnSync(process.execPath, [\"--eval\",",
+    `  ${JSON.stringify(`require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`)}`,
+    "], { detached: true, env: { GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: \"1\" }, stdio: \"ignore\" }),",
+    '(error) => error?.code === "E_TEST_TEMP_DETACHED_SYNC");',
+    ""
+  ].join("\n"));
+  let diagnostics = "";
+  const status = runDeterministicTestFiles({
+    files: [fixture],
+    root: ROOT,
+    reporter: REPORTER,
+    tempRoot: root,
+    timeoutMs: 5_000,
+    stdout: { write() {} },
+    stderr: { write(value) { diagnostics += value; } }
+  });
+  assert.equal(status, 0, diagnostics);
+  assert.equal(fs.existsSync(pidFile), false);
   assert.equal(fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)), false);
 });
 

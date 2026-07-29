@@ -623,6 +623,8 @@ npm ci --ignore-scripts   # as in CI
 npm run validate          # structure, versions, manifests, contracts
 npm test                  # full offline suite, including three concurrent read jobs
 npm run check             # validate + deterministic offline tests; skip/TODO fails; installed/authenticated boundaries run separately
+npm run test:temp:cleanup # dry-run manifest-backed temp cleanup; add -- --legacy to inventory exact source-proven legacy families
+npm run test:temp:cleanup -- --apply --older-than 1h # remove only revalidated inactive candidates
 npm run test:pty-ingress  # issue #2 real nonblocking PTY + negative-input gate
 npm run test:installed-codex # clean CODEX_HOME install and cached-wrapper gate
 npm run codex:update-local # verify, reinstall into this Codex home, compare source/cache
@@ -630,6 +632,12 @@ npm run test:natural-codex # quota-using installed Codex -> real Grok -> host-ch
 npm run version:check     # versions only
 npm run version:bump      # coordinated version bump helper
 ```
+
+Deterministic tests isolate each file in a private temp root and impose a
+ten-minute per-file timeout. Linux containment additionally requires
+`/usr/bin/python3` with `os.pidfd_open` and `signal.pidfd_send_signal`; the
+runner fails closed before launching tests when that identity-bound signaling
+boundary is unavailable.
 
 CI matrix:
 

@@ -28,6 +28,7 @@ const REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
 const SUPERVISOR = path.join(ROOT, "scripts/lib/test-temp-supervisor.mjs");
 export const DETERMINISTIC_TEST_FILE_TIMEOUT_MS = 10 * 60_000;
 const DETERMINISTIC_SUPERVISOR_SHUTDOWN_ALLOWANCE_MS = 30_000;
+const OUTPUT_LIMIT_EXIT_CODE = 125;
 const CONTAINMENT_FAILURE_EXIT_CODE = 126;
 const CONTAINMENT_REASON_PATTERN =
   /(?:^|\n)grok-plugin-containment-v1:(unsupported-platform|startup-visibility|visibility-monitor-token|visibility-monitor-proc|visibility-monitor-unknown|post-close-inspection|termination-incomplete-group|termination-incomplete-owned|termination-incomplete-unknown)(?:\n|$)/u;
@@ -149,6 +150,7 @@ export function runDeterministicTestFiles({
       let result;
       let fileRoot;
       let containmentUnproven = false;
+      let startFailed = false;
       let startedAt;
       try {
         startedAt = now();
@@ -202,13 +204,14 @@ export function runDeterministicTestFiles({
           stdio: ["ignore", "pipe", "pipe"]
         });
       } catch {
-        stderr.write(`Deterministic test child ${child} could not start.\n`);
+        startFailed = true;
         failed = true;
         continue;
       } finally {
-        stderr.write(
-          `Deterministic test child ${child} completed in ${elapsedMilliseconds(startedAt, now)} ms.\n`
-        );
+        const elapsed = elapsedMilliseconds(startedAt, now);
+        stderr.write(startFailed
+          ? `Deterministic test child ${child} could not start after ${elapsed} ms.\n`
+          : `Deterministic test child ${child} completed in ${elapsed} ms.\n`);
         containmentUnproven = result?.status === CONTAINMENT_FAILURE_EXIT_CODE
           || result?.error?.code === "ETIMEDOUT"
           || Boolean(result?.signal);
@@ -224,9 +227,12 @@ export function runDeterministicTestFiles({
           failed = true;
         } else if (fileRoot) {
           try {
-            removeOwnedTestTempRoot(fileRoot);
+            if (!removeOwnedTestTempRoot(fileRoot)) {
+              throw new Error("The owned file root identity was unavailable.");
+            }
           } catch {
             stderr.write(`Deterministic test child ${child} temp cleanup failed.\n`);
+            preserveRunRoot = true;
             failed = true;
           }
         }
@@ -241,6 +247,11 @@ export function runDeterministicTestFiles({
       // signals, or invalid stdout. Only fixed, ordinal diagnostics leave here.
       if (result?.status === 124) {
         stderr.write(`Deterministic test child ${child} timed out.\n`);
+        failed = true;
+        continue;
+      }
+      if (result?.status === OUTPUT_LIMIT_EXIT_CODE) {
+        stderr.write(`Deterministic test child ${child} exceeded the output limit.\n`);
         failed = true;
         continue;
       }
@@ -289,7 +300,9 @@ export function runDeterministicTestFiles({
       stderr.write("The deterministic test run temp root was preserved for stale reaping.\n");
     } else {
       try {
-        removeOwnedTestTempRoot(runRoot);
+        if (!removeOwnedTestTempRoot(runRoot)) {
+          throw new Error("The owned run root identity was unavailable.");
+        }
       } catch {
         stderr.write("The deterministic test run temp cleanup failed.\n");
         failed = true;

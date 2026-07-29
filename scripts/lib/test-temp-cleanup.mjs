@@ -118,6 +118,7 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "grok-plugin-external-marker-",
   "grok-plugin-inventory-",
   "grok-plugin-linked-parent-",
+  "grok-plugin-test-",
   "grok-primary-admission-gen1-",
   "grok-primary-admission-gen2-",
   "grok-proof-platform-",
@@ -409,7 +410,7 @@ const REMOVE_INVENTORIED_ROOT_HELPER = fileURLToPath(
 export function removeInventoriedTestTempRoot(
   root,
   expectedIdentity,
-  { run = spawnSync } = {}
+  { run = spawnSync, afterQuarantine = null } = {}
 ) {
   if (!root || !path.isAbsolute(root) || !expectedIdentity) return false;
   const quarantine = path.join(
@@ -424,6 +425,7 @@ export function removeInventoriedTestTempRoot(
   }
 
   try {
+    if (afterQuarantine) afterQuarantine(quarantine);
     const result = run(process.execPath, [
       REMOVE_INVENTORIED_ROOT_HELPER,
       String(expectedIdentity.dev),
@@ -792,6 +794,7 @@ export function cleanupTestTemp({
 
   let removed = 0;
   let reclaimedBytes = 0;
+  let abortReason = null;
   if (apply) {
     let finalOpenSnapshot = openPathsProvider();
     if (
@@ -889,7 +892,57 @@ export function cleanupTestTemp({
         continue;
       }
       try {
-        if (!removeRoot(record.path, record.identity)) {
+        if (!removeRoot(record.path, record.identity, {
+          afterQuarantine(quarantine) {
+            const postRenameOpenSnapshot = openPathsProvider();
+            if (
+              !postRenameOpenSnapshot?.available
+              || !Array.isArray(postRenameOpenSnapshot.paths)
+              || !Array.isArray(postRenameOpenSnapshot.commands)
+            ) {
+              const error = new Error(
+                "Active-process visibility was lost after quarantine."
+              );
+              error.code = "E_TEST_TEMP_VISIBILITY_AFTER_QUARANTINE";
+              throw error;
+            }
+            const activeAfterRename = activeReferencesForRoot(
+              root,
+              postRenameOpenSnapshot
+            );
+            if (
+              activeAfterRename.has(record.path)
+              || activeAfterRename.has(quarantine)
+            ) {
+              const error = new Error(
+                "The cleanup candidate became active after quarantine."
+              );
+              error.code = "E_TEST_TEMP_ACTIVE_AFTER_QUARANTINE";
+              throw error;
+            }
+            const postRenameWorktrees = worktreeProvider();
+            if (
+              !postRenameWorktrees?.available
+              || !Array.isArray(postRenameWorktrees.paths)
+            ) {
+              const error = new Error(
+                "Worktree visibility was lost after quarantine."
+              );
+              error.code = "E_TEST_TEMP_WORKTREE_VISIBILITY_AFTER_QUARANTINE";
+              throw error;
+            }
+            if (
+              worktreeReason(record.path, postRenameWorktrees)
+              || worktreeReason(quarantine, postRenameWorktrees)
+            ) {
+              const error = new Error(
+                "The cleanup candidate became a registered worktree after quarantine."
+              );
+              error.code = "E_TEST_TEMP_WORKTREE_AFTER_QUARANTINE";
+              throw error;
+            }
+          }
+        })) {
           record.eligible = false;
           record.reasons.push("candidate-disappeared");
           continue;
@@ -899,13 +952,25 @@ export function cleanupTestTemp({
         if (Number.isSafeInteger(record.sizeBytes)) reclaimedBytes += record.sizeBytes;
       } catch (error) {
         record.eligible = false;
-        record.reasons.push(
-          error?.code === "E_TEST_TEMP_IDENTITY_CHANGED"
-            ? "identity-changed"
-            : "remove-failed"
-        );
+        if (error?.code === "E_TEST_TEMP_IDENTITY_CHANGED") {
+          record.reasons.push("identity-changed");
+        } else if (error?.code === "E_TEST_TEMP_ACTIVE_AFTER_QUARANTINE") {
+          record.reasons.push("active-process-reference");
+        } else if (error?.code === "E_TEST_TEMP_WORKTREE_AFTER_QUARANTINE") {
+          record.reasons.push("registered-worktree");
+        } else {
+          record.reasons.push("remove-failed");
+        }
         if (typeof error?.quarantinePath === "string") {
           record.quarantinePath = error.quarantinePath;
+        }
+        if (error?.code === "E_TEST_TEMP_VISIBILITY_AFTER_QUARANTINE") {
+          abortReason = "active-process-visibility-unavailable";
+          break;
+        }
+        if (error?.code === "E_TEST_TEMP_WORKTREE_VISIBILITY_AFTER_QUARANTINE") {
+          abortReason = "worktree-visibility-unavailable";
+          break;
         }
       }
     }
@@ -914,8 +979,8 @@ export function cleanupTestTemp({
   return {
     root,
     mode: apply ? "apply" : "dry-run",
-    aborted: false,
-    reason: null,
+    aborted: abortReason !== null,
+    reason: abortReason,
     olderThanMs,
     legacy,
     sizeScanTruncated: candidates.some((candidate) => candidate.sizeTruncated),

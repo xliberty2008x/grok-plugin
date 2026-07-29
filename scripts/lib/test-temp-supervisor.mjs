@@ -3,7 +3,7 @@
 import process from "node:process";
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -15,6 +15,10 @@ const OUTPUT_LIMIT_EXIT_CODE = 125;
 const CONTAINMENT_FAILURE_EXIT_CODE = 126;
 const OWNERSHIP_TOKEN_ENV = "GROK_PLUGIN_TEST_SUPERVISOR_TOKEN";
 const PID_REGISTRY_ENV = "GROK_PLUGIN_TEST_PID_REGISTRY";
+const PID_REGISTRY_SECRET_ENV = "GROK_PLUGIN_TEST_PID_REGISTRY_SECRET";
+const SUPERVISOR_AUTHORITY_SYMBOL = Symbol.for(
+  "grok-plugin.testSupervisorAuthority"
+);
 const PID_REGISTRY_BASENAME = ".grok-plugin-owned-pids";
 const CHILD_HOOK_BYPASS_ENV = "GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS";
 const PS_PATHS = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
@@ -24,7 +28,13 @@ const PIDFD_SIGNAL_HELPER = fileURLToPath(
 );
 const LINUX_PYTHON = "/usr/bin/python3";
 let provenLinuxVisibilityToken = null;
-const knownLinuxOwnedProcesses = new Map();
+let activePidRegistrySecret = null;
+let activePidRegistryPath = null;
+let activePidRegistryIdentity = null;
+let activePidRegistryContents = null;
+const knownOwnedProcesses = new Map();
+const registeredProcessRecords = new Set();
+const acknowledgedRegistrations = new Set();
 const CONTAINMENT_DIAGNOSTIC_PREFIX = "grok-plugin-containment-v1:";
 const CONTAINMENT_REASONS = new Set([
   "unsupported-platform",
@@ -70,23 +80,22 @@ function parseArgs(argv) {
   return { timeoutMs, command: argv[3], args: argv.slice(4) };
 }
 
-function signalOwnedGroup(child, signal) {
-  if (!child?.pid) return;
-  // Linux descendants are enumerated and signaled through identity-bound
-  // pidfds below. A negative-PID kill can race process-group ID reuse.
-  if (process.platform === "linux") return;
-  if (process.platform !== "win32") {
-    try {
-      process.kill(-child.pid, signal);
-      return;
-    } catch (error) {
-      if (error?.code !== "ESRCH") throw error;
-    }
-  }
+export function signalOwnedGroup(
+  child,
+  signal,
+  { platform = process.platform } = {}
+) {
+  if (!child?.pid) return false;
+  // Linux uses pidfds and macOS uses signed PID/start-identity records plus
+  // fresh marker discovery. Never signal a bare POSIX process-group ID: once
+  // its leader exits, that numeric PGID can be reused by an unrelated group.
+  if (platform !== "win32") return false;
   try {
     child.kill(signal);
+    return true;
   } catch (error) {
     if (error?.code !== "ESRCH") throw error;
+    return false;
   }
 }
 
@@ -209,8 +218,64 @@ function linuxProcessIdentity(pid) {
   }
 }
 
-function createLinuxPidRegistry(tempIdentity) {
-  if (process.platform !== "linux" || !tempIdentity) return null;
+function darwinProcessIdentity(pid) {
+  if (process.platform !== "darwin" || !Number.isSafeInteger(pid) || pid <= 1) return null;
+  const ps = trustedPs();
+  if (!ps) return null;
+  const result = spawnSync(ps, ["-p", String(pid), "-o", "state=,lstart="], {
+    env: { LC_ALL: "C", [CHILD_HOOK_BYPASS_ENV]: "1" },
+    encoding: "utf8",
+    shell: false,
+    timeout: 1_000,
+    maxBuffer: 8 * 1024
+  });
+  const match = /^\s*(\S+)\s+(.+?)\s*$/u.exec(String(result.stdout || ""));
+  const state = match?.[1];
+  const startToken = match?.[2];
+  return (
+    result.status === 0
+    && !result.error
+    && !result.signal
+    && !state?.includes("Z")
+    && startToken
+  ) ? `${pid}:m${Buffer.from(startToken, "utf8").toString("hex")}` : null;
+}
+
+function registeredProcessIdentity(pid) {
+  if (process.platform === "linux") return linuxProcessIdentity(pid);
+  if (process.platform === "darwin") return darwinProcessIdentity(pid);
+  return null;
+}
+
+function registryIdentity(stat) {
+  return {
+    dev: stat.dev,
+    ino: stat.ino,
+    uid: stat.uid,
+    mode: stat.mode
+  };
+}
+
+function registryIdentityMatches(expected, stat) {
+  return Boolean(
+    expected
+    && stat.isFile()
+    && !stat.isSymbolicLink()
+    && stat.dev === expected.dev
+    && stat.ino === expected.ino
+    && stat.uid === expected.uid
+    && stat.mode === expected.mode
+    && (stat.mode & 0o777) === 0o600
+  );
+}
+
+function createPidRegistry(tempIdentity, registrySecret) {
+  if (
+    (process.platform !== "linux" && process.platform !== "darwin")
+    || !tempIdentity
+  ) {
+    return null;
+  }
   const registry = path.join(tempIdentity, PID_REGISTRY_BASENAME);
   const descriptor = fs.openSync(
     registry,
@@ -220,22 +285,83 @@ function createLinuxPidRegistry(tempIdentity) {
       | fs.constants.O_NOFOLLOW,
     0o600
   );
-  fs.closeSync(descriptor);
-  return registry;
+  try {
+    const opened = fs.fstatSync(descriptor);
+    if (
+      !registryIdentityMatches(registryIdentity(opened), opened)
+      || typeof process.getuid !== "function"
+      || opened.uid !== process.getuid()
+    ) {
+      throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
+    }
+    const nonce = randomUUID();
+    const headerIdentity = `registry-v1:${nonce}`;
+    const signature = createHmac("sha256", registrySecret)
+      .update(headerIdentity)
+      .digest("hex");
+    const contents = `${headerIdentity}:${signature}\n`;
+    fs.writeSync(descriptor, contents, null, "utf8");
+    return {
+      path: registry,
+      identity: registryIdentity(opened),
+      contents
+    };
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
-function loadRegisteredLinuxOwnedProcesses(tempIdentity) {
-  const registry = process.env[PID_REGISTRY_ENV];
+function signatureMatches(value, suppliedHex, secret) {
+  const expected = createHmac("sha256", secret).update(value).digest();
+  const supplied = Buffer.from(suppliedHex, "hex");
+  return (
+    supplied.length === expected.length
+    && timingSafeEqual(supplied, expected)
+  );
+}
+
+function appendRegistrationAcknowledgements(registrations) {
+  if (registrations.size === 0) return;
+  let descriptor;
+  try {
+    descriptor = fs.openSync(
+      activePidRegistryPath,
+      fs.constants.O_WRONLY
+        | fs.constants.O_APPEND
+        | fs.constants.O_NOFOLLOW
+    );
+    const opened = fs.fstatSync(descriptor);
+    if (!registryIdentityMatches(activePidRegistryIdentity, opened)) {
+      throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
+    }
+    const lines = [...registrations].map((registration) => {
+      const signature = createHmac("sha256", activePidRegistrySecret)
+        .update(`ack:${registration}`)
+        .digest("hex");
+      return `ack:${registration}:${signature}\n`;
+    }).join("");
+    fs.writeSync(descriptor, lines, null, "utf8");
+    for (const registration of registrations) {
+      acknowledgedRegistrations.add(registration);
+    }
+  } finally {
+    if (Number.isInteger(descriptor)) fs.closeSync(descriptor);
+  }
+}
+
+function loadRegisteredOwnedProcesses(tempIdentity) {
+  const registry = activePidRegistryPath;
+  const registrySecret = activePidRegistrySecret;
   if (
-    process.platform !== "linux"
+    (process.platform !== "linux" && process.platform !== "darwin")
     || !tempIdentity
     || registry !== path.join(tempIdentity, PID_REGISTRY_BASENAME)
+    || !activePidRegistryIdentity
+    || typeof activePidRegistryContents !== "string"
+    || typeof registrySecret !== "string"
+    || registrySecret.length < 32
   ) {
     throw visibilityError("E_TEST_TEMP_VISIBILITY_TOKEN");
-  }
-  const before = fs.lstatSync(registry);
-  if (!before.isFile() || before.isSymbolicLink()) {
-    throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
   }
   let descriptor;
   let contents;
@@ -246,9 +372,7 @@ function loadRegisteredLinuxOwnedProcesses(tempIdentity) {
     );
     const opened = fs.fstatSync(descriptor);
     if (
-      !opened.isFile()
-      || opened.dev !== before.dev
-      || opened.ino !== before.ino
+      !registryIdentityMatches(activePidRegistryIdentity, opened)
       || opened.size > 1024 * 1024
     ) {
       throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
@@ -257,44 +381,104 @@ function loadRegisteredLinuxOwnedProcesses(tempIdentity) {
   } finally {
     if (Number.isInteger(descriptor)) fs.closeSync(descriptor);
   }
-  const registrations = contents.split("\n");
-  // One append is one small write. Ignore only an in-flight trailing fragment;
-  // every complete record is newline-terminated and must validate strictly.
-  registrations.pop();
-  for (const registration of registrations) {
-    if (!registration) continue;
-    const match = /^([1-9]\d*):([1-9]\d*)$/u.exec(registration);
+  const header = contents.slice(0, contents.indexOf("\n"));
+  const headerMatch = /^registry-v1:([0-9a-f-]{36}):([a-f0-9]{64})$/u.exec(
+    header || ""
+  );
+  const expectedHeaderSignature = headerMatch
+    ? createHmac("sha256", registrySecret)
+        .update(`registry-v1:${headerMatch[1]}`)
+        .digest()
+    : null;
+  const suppliedHeaderSignature = headerMatch
+    ? Buffer.from(headerMatch[2], "hex")
+    : null;
+  if (
+    !expectedHeaderSignature
+    || !suppliedHeaderSignature
+    || suppliedHeaderSignature.length !== expectedHeaderSignature.length
+    || !timingSafeEqual(suppliedHeaderSignature, expectedHeaderSignature)
+    || !contents.startsWith(activePidRegistryContents)
+  ) {
+    throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
+  }
+  // Parse only the append-only suffix not already observed. Retain an
+  // in-flight trailing fragment for the next scan; complete records are
+  // newline-terminated and validated exactly once.
+  const previousContents = activePidRegistryContents;
+  const appendedContents = contents.slice(previousContents.length);
+  const completeLength = appendedContents.lastIndexOf("\n") + 1;
+  const completeContents = completeLength > 0
+    ? appendedContents.slice(0, completeLength)
+    : "";
+  const records = completeContents.split("\n");
+  records.pop();
+  const registrationsToAcknowledge = new Set();
+  for (const record of records) {
+    if (!record) continue;
+    const acknowledgement = /^ack:([1-9]\d*):((?:[1-9]\d*)|(?:m[a-f0-9]+)):([a-f0-9]{64})$/u.exec(
+      record
+    );
+    if (acknowledgement) {
+      const registration = `${acknowledgement[1]}:${acknowledgement[2]}`;
+      if (
+        !signatureMatches(
+          `ack:${registration}`,
+          acknowledgement[3],
+          registrySecret
+        )
+      ) {
+        throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
+      }
+      if (!registeredProcessRecords.has(registration)) {
+        throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
+      }
+      acknowledgedRegistrations.add(registration);
+      continue;
+    }
+    const match = /^([1-9]\d*):((?:[1-9]\d*)|(?:m[a-f0-9]+)):([a-f0-9]{64})$/u.exec(
+      record
+    );
     if (!match) throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
     const pid = Number(match[1]);
     if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) {
       throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
     }
     const identity = `${pid}:${match[2]}`;
-    if (linuxProcessIdentity(pid) === identity) {
-      knownLinuxOwnedProcesses.set(pid, identity);
+    if (!signatureMatches(identity, match[3], registrySecret)) {
+      throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
+    }
+    registeredProcessRecords.add(identity);
+    if (!acknowledgedRegistrations.has(identity)) {
+      registrationsToAcknowledge.add(identity);
+    }
+    if (registeredProcessIdentity(pid) === identity) {
+      knownOwnedProcesses.set(pid, identity);
     }
   }
+  activePidRegistryContents = previousContents + completeContents;
+  appendRegistrationAcknowledgements(registrationsToAcknowledge);
 }
 
-function rememberLinuxOwnedProcess(pid) {
-  const identity = linuxProcessIdentity(pid);
-  if (identity) knownLinuxOwnedProcesses.set(pid, identity);
+function rememberOwnedProcess(pid) {
+  const identity = registeredProcessIdentity(pid);
+  if (identity) knownOwnedProcesses.set(pid, identity);
 }
 
-function verifiedKnownLinuxProcessIds() {
+function verifiedKnownProcessIds() {
   const verified = [];
-  for (const [pid, identity] of knownLinuxOwnedProcesses) {
-    const current = linuxProcessIdentity(pid);
+  for (const [pid, identity] of knownOwnedProcesses) {
+    const current = registeredProcessIdentity(pid);
     if (current === identity) verified.push(pid);
-    else knownLinuxOwnedProcesses.delete(pid);
+    else knownOwnedProcesses.delete(pid);
   }
   return verified;
 }
 
 function signalKnownLinuxOwnedProcesses(signal) {
-  for (const [pid, identity] of [...knownLinuxOwnedProcesses]) {
+  for (const [pid, identity] of [...knownOwnedProcesses]) {
     if (linuxProcessIdentity(pid) !== identity) {
-      knownLinuxOwnedProcesses.delete(pid);
+      knownOwnedProcesses.delete(pid);
       continue;
     }
     const result = spawnSync(LINUX_PYTHON, [
@@ -309,7 +493,7 @@ function signalKnownLinuxOwnedProcesses(signal) {
       maxBuffer: 8 * 1024
     });
     if (result.status === 3) {
-      knownLinuxOwnedProcesses.delete(pid);
+      knownOwnedProcesses.delete(pid);
       continue;
     }
     if (result.status !== 0 || result.error || result.signal) {
@@ -318,13 +502,40 @@ function signalKnownLinuxOwnedProcesses(signal) {
   }
 }
 
+function signalKnownDarwinOwnedProcesses(signal) {
+  for (const [pid, identity] of [...knownOwnedProcesses]) {
+    if (darwinProcessIdentity(pid) !== identity) {
+      knownOwnedProcesses.delete(pid);
+      continue;
+    }
+    try {
+      process.kill(pid, signal);
+    } catch (error) {
+      if (error?.code === "ESRCH") {
+        knownOwnedProcesses.delete(pid);
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 async function waitForKnownLinuxProcessesGone(timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (verifiedKnownLinuxProcessIds().length === 0) return true;
+    if (verifiedKnownProcessIds().length === 0) return true;
     await wait(25);
   }
-  return verifiedKnownLinuxProcessIds().length === 0;
+  return verifiedKnownProcessIds().length === 0;
+}
+
+async function waitForKnownDarwinProcessesGone(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (verifiedKnownProcessIds().length === 0) return true;
+    await wait(25);
+  }
+  return verifiedKnownProcessIds().length === 0;
 }
 
 export function environmentProvesOwnership(
@@ -345,7 +556,7 @@ function ownedProcessIds(token, tempIdentity) {
     if (provenLinuxVisibilityToken !== token) {
       throw visibilityError("E_TEST_TEMP_VISIBILITY_TOKEN");
     }
-    loadRegisteredLinuxOwnedProcesses(tempIdentity);
+    loadRegisteredOwnedProcesses(tempIdentity);
     let processEntries;
     try {
       processEntries = fs.readdirSync("/proc", { withFileTypes: true });
@@ -360,17 +571,17 @@ function ownedProcessIds(token, tempIdentity) {
         const stat = fs.readFileSync(path.join("/proc", entry.name, "stat"), "utf8");
         const member = linuxProcessGroupMemberFromStat(pid, stat);
         if (member?.terminal) {
-          knownLinuxOwnedProcesses.delete(pid);
+          knownOwnedProcesses.delete(pid);
           continue;
         }
         const environment = fs.readFileSync(path.join("/proc", entry.name, "environ"));
         if (linuxProcessProvesLiveOwnership(pid, stat, environment, entries)) {
           const identity = linuxProcessIdentityFromStat(pid, stat);
-          if (identity) knownLinuxOwnedProcesses.set(pid, identity);
+          if (identity) knownOwnedProcesses.set(pid, identity);
           ids.push(pid);
           continue;
         }
-        const knownIdentity = knownLinuxOwnedProcesses.get(pid);
+        const knownIdentity = knownOwnedProcesses.get(pid);
         const currentIdentity = linuxProcessIdentityFromStat(pid, stat);
         if (knownIdentity) {
           if (linuxKnownProcessIdentityMatches(knownIdentity, currentIdentity)) {
@@ -379,14 +590,14 @@ function ownedProcessIds(token, tempIdentity) {
             ids.push(pid);
             continue;
           }
-          knownLinuxOwnedProcesses.delete(pid);
+          knownOwnedProcesses.delete(pid);
         }
       } catch (error) {
         if (error?.code === "ENOENT") {
-          knownLinuxOwnedProcesses.delete(pid);
+          knownOwnedProcesses.delete(pid);
           continue;
         }
-        const knownIdentity = knownLinuxOwnedProcesses.get(pid);
+        const knownIdentity = knownOwnedProcesses.get(pid);
         if (knownIdentity) {
           const currentIdentity = linuxProcessIdentity(pid);
           if (linuxKnownProcessIdentityMatches(knownIdentity, currentIdentity)) {
@@ -396,7 +607,7 @@ function ownedProcessIds(token, tempIdentity) {
             ids.push(pid);
             continue;
           }
-          knownLinuxOwnedProcesses.delete(pid);
+          knownOwnedProcesses.delete(pid);
         }
         // A vanished or protected unrelated process is benign after the
         // tagged detached-child probe below has proved that this supervisor can
@@ -409,6 +620,7 @@ function ownedProcessIds(token, tempIdentity) {
   if (!ps || typeof process.getuid !== "function") {
     throw new Error("Owned-process visibility is unavailable.");
   }
+  if (process.platform === "darwin") loadRegisteredOwnedProcesses(tempIdentity);
   const result = spawnSync(ps, [
     "eww",
     "-U",
@@ -419,7 +631,7 @@ function ownedProcessIds(token, tempIdentity) {
     env: { LC_ALL: "C", [CHILD_HOOK_BYPASS_ENV]: "1" },
     encoding: "utf8",
     shell: false,
-    timeout: 10_000,
+    timeout: 2_000,
     maxBuffer: 128 * 1024 * 1024
   });
   if (result.status !== 0 || result.error || result.signal) {
@@ -427,11 +639,14 @@ function ownedProcessIds(token, tempIdentity) {
   }
   const escapedEntries = entries.map((entry) => entry.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"));
   const marker = new RegExp(`(?:^|\\s)(?:${escapedEntries.join("|")})(?:\\s|$)`, "u");
-  return String(result.stdout || "")
+  const markerPids = String(result.stdout || "")
     .split(/\r?\n/u)
     .filter((line) => marker.test(line))
     .map((line) => Number(line.trim().match(/^(\d+)/u)?.[1]))
     .filter((pid) => Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid);
+  if (process.platform !== "darwin") return markerPids;
+  for (const pid of markerPids) rememberOwnedProcess(pid);
+  return [...new Set([...markerPids, ...verifiedKnownProcessIds()])];
 }
 
 async function proveLinuxOwnedProcessVisibility(token, tempIdentity) {
@@ -517,7 +732,7 @@ async function proveLinuxOwnedProcessVisibility(token, tempIdentity) {
   if (Number.isSafeInteger(orphanPid) && orphanPid > 1) cleanupPids.add(orphanPid);
   let processSweepAvailable = true;
   try {
-    loadRegisteredLinuxOwnedProcesses(tempIdentity);
+    loadRegisteredOwnedProcesses(tempIdentity);
     for (const entry of fs.readdirSync("/proc", { withFileTypes: true })) {
       if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
       const pid = Number(entry.name);
@@ -539,13 +754,13 @@ async function proveLinuxOwnedProcessVisibility(token, tempIdentity) {
         pid: orphanPid,
         supervisorPid: process.pid
       });
-      if (orphanVisible) rememberLinuxOwnedProcess(orphanPid);
+      if (orphanVisible) rememberOwnedProcess(orphanPid);
     } catch {
       orphanVisible = false;
     }
   }
   for (const pid of cleanupPids) {
-    rememberLinuxOwnedProcess(pid);
+    rememberOwnedProcess(pid);
   }
   try {
     signalKnownLinuxOwnedProcesses("SIGKILL");
@@ -557,11 +772,17 @@ async function proveLinuxOwnedProcessVisibility(token, tempIdentity) {
 }
 
 function signalOwnedProcesses(token, tempIdentity, signal) {
-  const owned = ownedProcessIds(token, tempIdentity);
   if (process.platform === "linux") {
+    ownedProcessIds(token, tempIdentity);
     signalKnownLinuxOwnedProcesses(signal);
     return;
   }
+  if (process.platform === "darwin") {
+    ownedProcessIds(token, tempIdentity);
+    signalKnownDarwinOwnedProcesses(signal);
+    return;
+  }
+  const owned = ownedProcessIds(token, tempIdentity);
   for (const pid of owned) {
     try {
       process.kill(pid, signal);
@@ -649,6 +870,13 @@ async function terminate(child, token, tempIdentity) {
       } catch {
         // Containment remains unproven and the caller returns 126.
       }
+    } else if (process.platform === "darwin") {
+      try {
+        signalKnownDarwinOwnedProcesses("SIGKILL");
+        await waitForKnownDarwinProcessesGone(KILL_GRACE_MS);
+      } catch {
+        // Containment remains unproven and the caller returns 126.
+      }
     }
     return false;
   }
@@ -665,9 +893,10 @@ async function main() {
 
   const ownershipToken = randomUUID();
   const tempIdentity = privateTempIdentity();
+  const pidRegistrySecret = randomUUID();
   let pidRegistry = null;
   try {
-    pidRegistry = createLinuxPidRegistry(tempIdentity);
+    pidRegistry = createPidRegistry(tempIdentity, pidRegistrySecret);
   } catch {
     return containmentFailure("startup-visibility");
   }
@@ -676,8 +905,25 @@ async function main() {
   // launches visibility probes or the actual test command.
   process.env.GROK_PLUGIN_TEST_SUPERVISOR_PID = String(process.pid);
   process.env[OWNERSHIP_TOKEN_ENV] = ownershipToken;
-  if (pidRegistry) process.env[PID_REGISTRY_ENV] = pidRegistry;
-  process.env.NODE_OPTIONS = childNodeOptions();
+  if (pidRegistry) {
+    process.env[PID_REGISTRY_ENV] = pidRegistry.path;
+    activePidRegistrySecret = pidRegistrySecret;
+    activePidRegistryPath = pidRegistry.path;
+    activePidRegistryIdentity = pidRegistry.identity;
+    activePidRegistryContents = pidRegistry.contents;
+  }
+  const supervisorNodeOptions = childNodeOptions();
+  process.env.NODE_OPTIONS = supervisorNodeOptions;
+  globalThis[SUPERVISOR_AUTHORITY_SYMBOL] = Object.freeze(Object.fromEntries(
+    Object.entries({
+      [PID_REGISTRY_ENV]: pidRegistry?.path,
+      [PID_REGISTRY_SECRET_ENV]: pidRegistrySecret,
+      GROK_PLUGIN_TEST_SUPERVISOR_TOKEN: ownershipToken,
+      GROK_PLUGIN_TEST_TEMP_ROOT: tempIdentity,
+      GROK_PLUGIN_TEST_SUPERVISOR_PID: String(process.pid),
+      NODE_OPTIONS: supervisorNodeOptions
+    }).filter(([, value]) => typeof value === "string")
+  ));
   // Node does not expose Windows Job Objects. A PID/PPID snapshot is not a
   // sufficient containment boundary after an intermediate process exits, so
   // fail closed instead of launching an uncontained deterministic test.
@@ -702,7 +948,8 @@ async function main() {
         ...process.env,
         GROK_PLUGIN_TEST_SUPERVISOR_PID: String(process.pid),
         [OWNERSHIP_TOKEN_ENV]: ownershipToken,
-        NODE_OPTIONS: childNodeOptions()
+        [PID_REGISTRY_SECRET_ENV]: pidRegistrySecret,
+        NODE_OPTIONS: supervisorNodeOptions
       },
       shell: false,
       detached: process.platform !== "win32",
@@ -711,8 +958,11 @@ async function main() {
   } catch {
     return 1;
   }
-  if (process.platform === "linux" && child.pid) {
-    rememberLinuxOwnedProcess(child.pid);
+  if (
+    (process.platform === "linux" || process.platform === "darwin")
+    && child.pid
+  ) {
+    rememberOwnedProcess(child.pid);
   }
 
   const chunks = [];
@@ -750,6 +1000,22 @@ async function main() {
   const containmentFailed = new Promise((resolve) => {
     resolveContainmentFailure = resolve;
   });
+  let registryMonitor = null;
+  if (process.platform === "linux" || process.platform === "darwin") {
+    registryMonitor = setInterval(() => {
+      try {
+        loadRegisteredOwnedProcesses(tempIdentity);
+      } catch (error) {
+        containmentReason = error?.code === "E_TEST_TEMP_VISIBILITY_TOKEN"
+          ? "visibility-monitor-token"
+          : error?.code === "E_TEST_TEMP_VISIBILITY_PROC"
+            ? "visibility-monitor-proc"
+            : "visibility-monitor-unknown";
+        resolveContainmentFailure("containment-failure");
+      }
+    }, 5);
+    registryMonitor.unref();
+  }
   let containmentMonitor = null;
   if (process.platform === "linux") {
     let consecutiveVisibilityFailures = 0;
@@ -812,6 +1078,7 @@ async function main() {
   }
   process.removeListener("SIGINT", interrupt);
   process.removeListener("SIGTERM", interrupt);
+  if (registryMonitor) clearInterval(registryMonitor);
   if (containmentMonitor) clearInterval(containmentMonitor);
 
   if (!overflow && chunks.length) fs.writeSync(process.stdout.fd, Buffer.concat(chunks));

@@ -143,7 +143,7 @@ if (
   throw new Error("Worker broker evidence test partition is invalid.");
 }
 let workerBrokerEvidenceTestOrdinal = 0;
-function test(...args) {
+function registerPartitionedTest(register, args) {
   workerBrokerEvidenceTestOrdinal += 1;
   const inPartition = workerBrokerEvidencePartition === null
     || (
@@ -156,7 +156,16 @@ function test(...args) {
           workerBrokerEvidencePartition - 1
         ] ?? Number.POSITIVE_INFINITY)
     );
-  return inPartition ? nodeTest(...args) : undefined;
+  return inPartition ? register(...args) : undefined;
+}
+function test(...args) {
+  return registerPartitionedTest(nodeTest, args);
+}
+for (const method of ["only", "skip", "todo"]) {
+  test[method] = (...args) => registerPartitionedTest(
+    nodeTest[method].bind(nodeTest),
+    args
+  );
 }
 
 const STARTED_AT = "2026-07-16T10:00:00.000Z";
@@ -171,6 +180,7 @@ const DETERMINISTIC_CHECK_RUNNER = path.join(ROOT, "scripts/check-deterministic.
 const DETERMINISTIC_TEST_LIBRARY = path.join(ROOT, "scripts/lib/deterministic-test-runner.mjs");
 const TEST_TEMP_LIBRARY = path.join(ROOT, "scripts/lib/test-temp.mjs");
 const TEST_TEMP_CHILD_HOOK = path.join(ROOT, "scripts/lib/test-temp-child-hook.cjs");
+const TEST_TEMP_PIDFD_SIGNAL = path.join(ROOT, "scripts/lib/test-temp-pidfd-signal.py");
 const TEST_TEMP_SUPERVISOR = path.join(ROOT, "scripts/lib/test-temp-supervisor.mjs");
 const REDACT_LIBRARY = path.join(ROOT, "plugins/grok/scripts/lib/redact.mjs");
 const PROTECTED_REVIEW_BOOTSTRAP = path.join(
@@ -213,6 +223,7 @@ function installPhaseOneFocusedRunner(root) {
     DETERMINISTIC_TEST_LIBRARY,
     TEST_TEMP_LIBRARY,
     TEST_TEMP_CHILD_HOOK,
+    TEST_TEMP_PIDFD_SIGNAL,
     TEST_TEMP_SUPERVISOR,
     STATIC_ESM_IMPORT_PARSER,
     PHASE_ONE_FOCUSED_RUNNER
@@ -356,7 +367,7 @@ test("deterministic runner executes files sequentially and aggregates exact zero
   assert.ok(calls.every((call) => call.binary === "/exact/node"));
   assert.ok(calls.every((call) => call.options.cwd === "/exact/root"));
   assert.ok(calls.every((call) => call.options.shell === false));
-  assert.ok(calls.every((call) => call.options.timeout === 610000));
+  assert.ok(calls.every((call) => call.options.timeout === 630000));
   assert.ok(calls.every((call) => call.options.killSignal === "SIGKILL"));
   assert.ok(calls.every((call) => call.options.maxBuffer === 1024 * 1024));
   assert.ok(calls.every((call) => call.options.env.TMPDIR === call.options.env.TMP));
@@ -516,6 +527,11 @@ test("deterministic runner fails closed on malformed, partial, or non-passing ch
       label: "empty-test-file",
       result: { status: 0, signal: null, stdout: zeroSkipSummary({ passed: 0 }), stderr: "" },
       message: /failed its zero-skip gate/
+    },
+    {
+      label: "output-limit",
+      result: { status: 125, signal: null, stdout: "", stderr: "" },
+      message: /exceeded the output limit/
     },
     {
       label: "signal",

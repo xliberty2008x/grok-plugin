@@ -4,6 +4,7 @@ import path from "node:path";
 import process from "node:process";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 export const TEST_TEMP_MANIFEST = ".grok-test-temp-owner.json";
 export const TEST_TEMP_SCHEMA_VERSION = 1;
@@ -16,6 +17,10 @@ const SYSTEM_PS_CANDIDATES = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
 const MANAGED_KINDS = Object.freeze(new Set(["run", "file", "process"]));
 let processFixtureRoot = null;
 let processCleanupRegistered = false;
+const createdRootIdentities = new Map();
+const REMOVE_OWNED_ROOT_HELPER = fileURLToPath(
+  new URL("./test-temp-remove-helper.cjs", import.meta.url)
+);
 
 function systemPsBinary() {
   if (process.platform === "win32") return null;
@@ -139,6 +144,34 @@ export function createOwnedTestTempRoot({
       `${JSON.stringify(owner)}\n`,
       { encoding: "utf8", flag: "wx", mode: 0o600 }
     );
+    const rootStat = fs.lstatSync(root);
+    const manifestPath = path.join(root, TEST_TEMP_MANIFEST);
+    const manifestStat = fs.lstatSync(manifestPath);
+    const manifestContents = fs.readFileSync(manifestPath);
+    if (
+      !rootStat.isDirectory()
+      || rootStat.isSymbolicLink()
+      || !manifestStat.isFile()
+      || manifestStat.isSymbolicLink()
+      || manifestStat.uid !== rootStat.uid
+    ) {
+      throw new Error("The created test-temp root identity is invalid.");
+    }
+    createdRootIdentities.set(root, Object.freeze({
+      root: Object.freeze({
+        dev: rootStat.dev,
+        ino: rootStat.ino,
+        uid: rootStat.uid
+      }),
+      manifest: Object.freeze({
+        dev: manifestStat.dev,
+        ino: manifestStat.ino,
+        uid: manifestStat.uid,
+        mode: manifestStat.mode,
+        size: manifestStat.size,
+        digest: crypto.createHash("sha256").update(manifestContents).digest("hex")
+      })
+    }));
     return root;
   } catch (error) {
     fs.rmSync(root, { recursive: true, force: true });
@@ -146,44 +179,96 @@ export function createOwnedTestTempRoot({
   }
 }
 
-function makeTreeWritable(root) {
-  let stat;
-  try {
-    stat = fs.lstatSync(root);
-  } catch (error) {
-    if (error?.code === "ENOENT") return;
-    throw error;
+function sameCreatedRootIdentity(expected, stat) {
+  return Boolean(
+    expected
+    && stat.isDirectory()
+    && !stat.isSymbolicLink()
+    && stat.dev === expected.dev
+    && stat.ino === expected.ino
+    && stat.uid === expected.uid
+  );
+}
+
+function verifyCreatedRoot(root, expected) {
+  const rootStat = fs.lstatSync(root);
+  if (!sameCreatedRootIdentity(expected.root, rootStat)) {
+    throw new Error("The test-temp root identity changed before cleanup.");
   }
-  if (stat.isSymbolicLink() || !stat.isDirectory()) return;
-  try {
-    fs.chmodSync(root, 0o700);
-  } catch {
-    // fs.rmSync below remains authoritative and reports any residual failure.
+  const manifestPath = path.join(root, TEST_TEMP_MANIFEST);
+  const manifestStat = fs.lstatSync(manifestPath);
+  const manifest = expected.manifest;
+  if (
+    !manifestStat.isFile()
+    || manifestStat.isSymbolicLink()
+    || manifestStat.dev !== manifest.dev
+    || manifestStat.ino !== manifest.ino
+    || manifestStat.uid !== manifest.uid
+    || manifestStat.mode !== manifest.mode
+    || manifestStat.size !== manifest.size
+  ) {
+    throw new Error("The test-temp owner manifest identity changed before cleanup.");
   }
-  let entries;
-  try {
-    entries = fs.readdirSync(root);
-  } catch {
-    return;
+  const digest = crypto
+    .createHash("sha256")
+    .update(fs.readFileSync(manifestPath))
+    .digest("hex");
+  if (digest !== manifest.digest) {
+    throw new Error("The test-temp owner manifest changed before cleanup.");
   }
-  for (const entry of entries) makeTreeWritable(path.join(root, entry));
 }
 
 export function removeOwnedTestTempRoot(root) {
   if (!root || !path.isAbsolute(root)) return false;
-  let stat;
+  const expected = createdRootIdentities.get(root);
+  if (!expected) return false;
+  verifyCreatedRoot(root, expected);
+  const quarantine = path.join(
+    path.dirname(root),
+    `.grok-plugin-owned-quarantine-${crypto.randomUUID()}`
+  );
   try {
-    stat = fs.lstatSync(root);
+    fs.renameSync(root, quarantine);
   } catch (error) {
-    if (error?.code === "ENOENT") return false;
     throw error;
   }
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error("Refusing to remove a non-directory test-temp root.");
+  try {
+    verifyCreatedRoot(quarantine, expected);
+    const result = spawnSync(process.execPath, [
+      REMOVE_OWNED_ROOT_HELPER,
+      String(expected.root.dev),
+      String(expected.root.ino)
+    ], {
+      cwd: quarantine,
+      env: { GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1" },
+      encoding: "utf8",
+      shell: false,
+      maxBuffer: 8 * 1024
+    });
+    if (result?.status !== 0 || result?.error || result?.signal) {
+      throw new Error("The identity-pinned test-temp root could not be removed.");
+    }
+    createdRootIdentities.delete(root);
+    return true;
+  } catch (error) {
+    let restored = false;
+    try {
+      fs.lstatSync(root);
+    } catch (rootError) {
+      if (rootError?.code === "ENOENT") {
+        try {
+          fs.renameSync(quarantine, root);
+          restored = true;
+        } catch {
+          // Preserve the quarantined tree and report cleanup failure below.
+        }
+      }
+    }
+    if (!restored && fs.existsSync(quarantine)) {
+      error.quarantinePath = quarantine;
+    }
+    throw error;
   }
-  makeTreeWritable(root);
-  fs.rmSync(root, { recursive: true, force: true });
-  return true;
 }
 
 function managedFileRootFromEnvironment() {
