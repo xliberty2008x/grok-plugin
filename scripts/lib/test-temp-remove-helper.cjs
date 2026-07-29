@@ -54,23 +54,8 @@ function openVerifiedDirectory(entry, expected, allowPermissionRepair = true) {
     return openVerifiedDirectory(entry, expected, false);
   }
 
-  if (process.platform === "darwin") {
-    // macOS chmod -h changes the directory itself but never follows a raced
-    // symlink. Revalidate the exact identity before recursive traversal.
-    const repaired = spawnSync("/bin/chmod", ["-h", "700", entry], {
-      env: { GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1" },
-      encoding: "utf8",
-      shell: false,
-      maxBuffer: 8 * 1024
-    });
-    if (repaired.status !== 0 || repaired.error || repaired.signal) {
-      throw new Error("Safe permission repair failed.");
-    }
-    const writable = fs.lstatSync(entry);
-    if (!sameDirectoryIdentity(writable, expected)) process.exit(43);
-    return openVerifiedDirectory(entry, expected, false);
-  }
-
+  // Linux O_PATH is the only supported way to pin a permission-locked inode
+  // before changing it. Other platforms fail closed and report the residual.
   throw new Error("Safe permission repair is unavailable.");
 }
 

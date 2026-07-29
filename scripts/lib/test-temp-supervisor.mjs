@@ -14,9 +14,15 @@ const TIMEOUT_EXIT_CODE = 124;
 const OUTPUT_LIMIT_EXIT_CODE = 125;
 const CONTAINMENT_FAILURE_EXIT_CODE = 126;
 const OWNERSHIP_TOKEN_ENV = "GROK_PLUGIN_TEST_SUPERVISOR_TOKEN";
+const PID_REGISTRY_ENV = "GROK_PLUGIN_TEST_PID_REGISTRY";
+const PID_REGISTRY_BASENAME = ".grok-plugin-owned-pids";
 const CHILD_HOOK_BYPASS_ENV = "GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS";
 const PS_PATHS = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
 const CHILD_HOOK = fileURLToPath(new URL("./test-temp-child-hook.cjs", import.meta.url));
+const PIDFD_SIGNAL_HELPER = fileURLToPath(
+  new URL("./test-temp-pidfd-signal.py", import.meta.url)
+);
+const LINUX_PYTHON = "/usr/bin/python3";
 let provenLinuxVisibilityToken = null;
 const knownLinuxOwnedProcesses = new Map();
 const CONTAINMENT_DIAGNOSTIC_PREFIX = "grok-plugin-containment-v1:";
@@ -66,6 +72,9 @@ function parseArgs(argv) {
 
 function signalOwnedGroup(child, signal) {
   if (!child?.pid) return;
+  // Linux descendants are enumerated and signaled through identity-bound
+  // pidfds below. A negative-PID kill can race process-group ID reuse.
+  if (process.platform === "linux") return;
   if (process.platform !== "win32") {
     try {
       process.kill(-child.pid, signal);
@@ -200,6 +209,73 @@ function linuxProcessIdentity(pid) {
   }
 }
 
+function createLinuxPidRegistry(tempIdentity) {
+  if (process.platform !== "linux" || !tempIdentity) return null;
+  const registry = path.join(tempIdentity, PID_REGISTRY_BASENAME);
+  const descriptor = fs.openSync(
+    registry,
+    fs.constants.O_WRONLY
+      | fs.constants.O_CREAT
+      | fs.constants.O_EXCL
+      | fs.constants.O_NOFOLLOW,
+    0o600
+  );
+  fs.closeSync(descriptor);
+  return registry;
+}
+
+function loadRegisteredLinuxOwnedProcesses(tempIdentity) {
+  const registry = process.env[PID_REGISTRY_ENV];
+  if (
+    process.platform !== "linux"
+    || !tempIdentity
+    || registry !== path.join(tempIdentity, PID_REGISTRY_BASENAME)
+  ) {
+    throw visibilityError("E_TEST_TEMP_VISIBILITY_TOKEN");
+  }
+  const before = fs.lstatSync(registry);
+  if (!before.isFile() || before.isSymbolicLink()) {
+    throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
+  }
+  let descriptor;
+  let contents;
+  try {
+    descriptor = fs.openSync(
+      registry,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
+    );
+    const opened = fs.fstatSync(descriptor);
+    if (
+      !opened.isFile()
+      || opened.dev !== before.dev
+      || opened.ino !== before.ino
+      || opened.size > 1024 * 1024
+    ) {
+      throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
+    }
+    contents = fs.readFileSync(descriptor, "utf8");
+  } finally {
+    if (Number.isInteger(descriptor)) fs.closeSync(descriptor);
+  }
+  const registrations = contents.split("\n");
+  // One append is one small write. Ignore only an in-flight trailing fragment;
+  // every complete record is newline-terminated and must validate strictly.
+  registrations.pop();
+  for (const registration of registrations) {
+    if (!registration) continue;
+    const match = /^([1-9]\d*):([1-9]\d*)$/u.exec(registration);
+    if (!match) throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
+    const pid = Number(match[1]);
+    if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) {
+      throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
+    }
+    const identity = `${pid}:${match[2]}`;
+    if (linuxProcessIdentity(pid) === identity) {
+      knownLinuxOwnedProcesses.set(pid, identity);
+    }
+  }
+}
+
 function rememberLinuxOwnedProcess(pid) {
   const identity = linuxProcessIdentity(pid);
   if (identity) knownLinuxOwnedProcesses.set(pid, identity);
@@ -216,12 +292,28 @@ function verifiedKnownLinuxProcessIds() {
 }
 
 function signalKnownLinuxOwnedProcesses(signal) {
-  for (const pid of verifiedKnownLinuxProcessIds()) {
-    try {
-      process.kill(pid, signal);
-    } catch (error) {
-      if (error?.code === "ESRCH") knownLinuxOwnedProcesses.delete(pid);
-      else throw error;
+  for (const [pid, identity] of [...knownLinuxOwnedProcesses]) {
+    if (linuxProcessIdentity(pid) !== identity) {
+      knownLinuxOwnedProcesses.delete(pid);
+      continue;
+    }
+    const result = spawnSync(LINUX_PYTHON, [
+      PIDFD_SIGNAL_HELPER,
+      identity,
+      signal
+    ], {
+      env: { [CHILD_HOOK_BYPASS_ENV]: "1" },
+      encoding: "utf8",
+      shell: false,
+      timeout: 2_000,
+      maxBuffer: 8 * 1024
+    });
+    if (result.status === 3) {
+      knownLinuxOwnedProcesses.delete(pid);
+      continue;
+    }
+    if (result.status !== 0 || result.error || result.signal) {
+      throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
     }
   }
 }
@@ -253,6 +345,7 @@ function ownedProcessIds(token, tempIdentity) {
     if (provenLinuxVisibilityToken !== token) {
       throw visibilityError("E_TEST_TEMP_VISIBILITY_TOKEN");
     }
+    loadRegisteredLinuxOwnedProcesses(tempIdentity);
     let processEntries;
     try {
       processEntries = fs.readdirSync("/proc", { withFileTypes: true });
@@ -422,15 +515,21 @@ async function proveLinuxOwnedProcessVisibility(token, tempIdentity) {
   const orphanPid = Number(Buffer.concat(stdout).toString("utf8").trim());
   const cleanupPids = new Set();
   if (Number.isSafeInteger(orphanPid) && orphanPid > 1) cleanupPids.add(orphanPid);
-  for (const entry of fs.readdirSync("/proc", { withFileTypes: true })) {
-    if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
-    const pid = Number(entry.name);
-    try {
-      const environment = fs.readFileSync(path.join("/proc", entry.name, "environ"));
-      if (environmentProvesOwnership(environment, entries, { pid })) cleanupPids.add(pid);
-    } catch {
-      // The proof will fail; cleanup below still handles every PID already known.
+  let processSweepAvailable = true;
+  try {
+    loadRegisteredLinuxOwnedProcesses(tempIdentity);
+    for (const entry of fs.readdirSync("/proc", { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
+      const pid = Number(entry.name);
+      try {
+        const environment = fs.readFileSync(path.join("/proc", entry.name, "environ"));
+        if (environmentProvesOwnership(environment, entries, { pid })) cleanupPids.add(pid);
+      } catch {
+        // The proof will fail; cleanup below still handles every PID already known.
+      }
     }
+  } catch {
+    processSweepAvailable = false;
   }
   let orphanVisible = false;
   if (closed && cleanupPids.has(orphanPid)) {
@@ -447,18 +546,23 @@ async function proveLinuxOwnedProcessVisibility(token, tempIdentity) {
   }
   for (const pid of cleanupPids) {
     rememberLinuxOwnedProcess(pid);
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch (error) {
-      if (error?.code !== "ESRCH") orphanVisible = false;
-    }
+  }
+  try {
+    signalKnownLinuxOwnedProcesses("SIGKILL");
+  } catch {
+    orphanVisible = false;
   }
   if (!await waitForKnownLinuxProcessesGone(1_000)) orphanVisible = false;
-  return directVisible && closed && orphanVisible;
+  return directVisible && closed && orphanVisible && processSweepAvailable;
 }
 
 function signalOwnedProcesses(token, tempIdentity, signal) {
-  for (const pid of ownedProcessIds(token, tempIdentity)) {
+  const owned = ownedProcessIds(token, tempIdentity);
+  if (process.platform === "linux") {
+    signalKnownLinuxOwnedProcesses(signal);
+    return;
+  }
+  for (const pid of owned) {
     try {
       process.kill(pid, signal);
     } catch (error) {
@@ -561,11 +665,18 @@ async function main() {
 
   const ownershipToken = randomUUID();
   const tempIdentity = privateTempIdentity();
+  let pidRegistry = null;
+  try {
+    pidRegistry = createLinuxPidRegistry(tempIdentity);
+  } catch {
+    return containmentFailure("startup-visibility");
+  }
   // A supervisor can itself run beneath another supervisor. Rebind the
   // preloaded child hook to this supervisor's ownership identity before it
   // launches visibility probes or the actual test command.
   process.env.GROK_PLUGIN_TEST_SUPERVISOR_PID = String(process.pid);
   process.env[OWNERSHIP_TOKEN_ENV] = ownershipToken;
+  if (pidRegistry) process.env[PID_REGISTRY_ENV] = pidRegistry;
   process.env.NODE_OPTIONS = childNodeOptions();
   // Node does not expose Windows Job Objects. A PID/PPID snapshot is not a
   // sufficient containment boundary after an intermediate process exits, so
@@ -714,5 +825,11 @@ async function main() {
 }
 
 if (path.resolve(process.argv[1] || "") === fileURLToPath(import.meta.url)) {
-  process.exit(await main());
+  let exitCode;
+  try {
+    exitCode = await main();
+  } catch {
+    exitCode = containmentFailure("termination-incomplete-unknown");
+  }
+  process.exit(exitCode);
 }

@@ -33,6 +33,7 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
 const REMOVE_HELPER = path.join(ROOT, "scripts/lib/test-temp-remove-helper.cjs");
+const PIDFD_SIGNAL_HELPER = path.join(ROOT, "scripts/lib/test-temp-pidfd-signal.py");
 const OLD_MS = 2 * 60 * 60_000;
 
 function sandbox(t) {
@@ -217,6 +218,41 @@ test("Linux fallback identities distinguish a live PID from exit or PID reuse", 
   assert.equal(linuxKnownProcessIdentityMatches(knownIdentity, knownIdentity), true);
   assert.equal(linuxKnownProcessIdentityMatches(knownIdentity, reusedIdentity), false);
   assert.equal(linuxKnownProcessIdentityMatches(knownIdentity, null), false);
+});
+
+test("Linux pidfd helper refuses a reused identity and signals only the pinned process", async (t) => {
+  if (process.platform !== "linux") return;
+  const child = spawn("/bin/sleep", ["30"], { stdio: "ignore" });
+  t.after(() => {
+    try { child.kill("SIGKILL"); } catch {}
+  });
+  const stat = fs.readFileSync(`/proc/${child.pid}/stat`, "utf8");
+  const identity = linuxProcessIdentityFromStat(child.pid, stat);
+  assert.ok(identity);
+  const [pid, startTime] = identity.split(":");
+  const mismatch = spawnSync("/usr/bin/python3", [
+    PIDFD_SIGNAL_HELPER,
+    `${pid}:${BigInt(startTime) + 1n}`,
+    "SIGKILL"
+  ], {
+    env: { GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1" },
+    encoding: "utf8",
+    shell: false
+  });
+  assert.equal(mismatch.status, 3);
+  assert.doesNotThrow(() => process.kill(child.pid, 0));
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  const signaled = spawnSync("/usr/bin/python3", [
+    PIDFD_SIGNAL_HELPER,
+    identity,
+    "SIGKILL"
+  ], {
+    env: { GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1" },
+    encoding: "utf8",
+    shell: false
+  });
+  assert.equal(signaled.status, 0);
+  await exited;
 });
 
 test("process start tokens use a stable C locale", () => {
@@ -538,7 +574,7 @@ test("apply does not count a candidate that disappears during removal", (t) => {
   assert.equal(result.reclaimedBytes, 0);
 });
 
-test("apply removes verified old trees with restricted descendants without following symlinks", (t) => {
+test("restricted descendant cleanup is inode-pinned on Linux and otherwise reports safely", (t) => {
   const root = sandbox(t);
   const target = legacy(root);
   const restricted = path.join(target, "restricted");
@@ -550,8 +586,14 @@ test("apply removes verified old trees with restricted descendants without follo
   fs.chmodSync(restricted, 0o000);
   age(target);
   const result = cleanupTestTemp(options(root, { apply: true }));
-  assert.equal(record(result, target).removed, true);
-  assert.equal(fs.existsSync(target), false);
+  if (process.platform === "linux") {
+    assert.equal(record(result, target).removed, true);
+    assert.equal(fs.existsSync(target), false);
+  } else {
+    assert.ok(record(result, target).reasons.includes("remove-failed"));
+    assert.equal(fs.existsSync(target), true);
+    fs.chmodSync(restricted, 0o700);
+  }
   assert.equal(fs.readFileSync(path.join(outside, "keep"), "utf8"), "keep");
 });
 
@@ -619,6 +661,58 @@ test("recursive permission repair cannot chmod through a raced symlink", (t) => 
   assert.equal(fs.statSync(outside).mode & 0o777, 0o500);
   fs.chmodSync(moved, 0o700);
   fs.chmodSync(outside, 0o700);
+});
+
+test("recursive permission repair cannot chmod a raced real-directory replacement", (t) => {
+  if (process.platform === "win32") return;
+  const root = sandbox(t);
+  const target = legacy(root);
+  const restricted = path.join(target, "restricted");
+  const moved = path.join(target, "restricted-original");
+  const replacement = path.join(target, "zz-replacement-source");
+  const preload = path.join(root, "swap-real-directory-before-open.cjs");
+  fs.mkdirSync(restricted);
+  fs.mkdirSync(replacement);
+  fs.chmodSync(restricted, 0o000);
+  fs.chmodSync(replacement, 0o500);
+  fs.writeFileSync(preload, [
+    '"use strict";',
+    'const fs = require("node:fs");',
+    'const path = require("node:path");',
+    `const restricted = ${JSON.stringify(restricted)};`,
+    `const moved = ${JSON.stringify(moved)};`,
+    `const replacement = ${JSON.stringify(replacement)};`,
+    "const originalOpenSync = fs.openSync;",
+    "const originalRenameSync = fs.renameSync;",
+    "let swapped = false;",
+    "fs.openSync = function(targetPath, ...args) {",
+    "  if (!swapped && path.resolve(String(targetPath)) === restricted) {",
+    "    swapped = true;",
+    "    originalRenameSync(restricted, moved);",
+    "    originalRenameSync(replacement, restricted);",
+    "  }",
+    "  return originalOpenSync.call(fs, targetPath, ...args);",
+    "};",
+    ""
+  ].join("\n"));
+  const identity = fs.lstatSync(target);
+  const result = spawnSync(process.execPath, [
+    REMOVE_HELPER,
+    String(identity.dev),
+    String(identity.ino)
+  ], {
+    cwd: target,
+    env: {
+      GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1",
+      NODE_OPTIONS: `--require=${preload}`
+    },
+    encoding: "utf8",
+    shell: false
+  });
+  assert.notEqual(result.status, 0);
+  assert.equal(fs.statSync(restricted).mode & 0o777, 0o500);
+  fs.chmodSync(restricted, 0o700);
+  fs.chmodSync(moved, 0o700);
 });
 
 test("stale manifest-backed crash roots are reaped while an active owner sibling is preserved", (t) => {
@@ -777,6 +871,48 @@ test("deterministic runner preserves one manifest-backed run root when containme
   assert.equal(entries.filter((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)).length, 1);
 });
 
+test("Linux startup /proc sweep failure is containment failure, not generic cleanup", (t) => {
+  if (process.platform !== "linux") return;
+  const root = sandbox(t);
+  const fixture = path.join(root, "startup-visibility.test.mjs");
+  const preload = path.join(root, "fail-proc-sweep.cjs");
+  fs.writeFileSync(fixture, 'import test from "node:test"; test("never starts", () => {});\n');
+  fs.writeFileSync(preload, [
+    '"use strict";',
+    'const fs = require("node:fs");',
+    "const original = fs.readdirSync;",
+    "let failed = false;",
+    "fs.readdirSync = function(target, ...args) {",
+    '  if (!failed && target === "/proc") {',
+    "    failed = true;",
+    '    const error = new Error("fixture visibility failure");',
+    '    error.code = "EACCES";',
+    "    throw error;",
+    "  }",
+    "  return original.call(fs, target, ...args);",
+    "};",
+    ""
+  ].join("\n"));
+  let diagnostics = "";
+  const status = runDeterministicTestFiles({
+    files: [fixture],
+    root: ROOT,
+    reporter: REPORTER,
+    tempRoot: root,
+    timeoutMs: 5_000,
+    env: { ...process.env, NODE_OPTIONS: `--require=${preload}` },
+    stdout: { write() {} },
+    stderr: { write(value) { diagnostics += value; } }
+  });
+  assert.equal(status, 1);
+  assert.match(diagnostics, /containment could not be proven/);
+  assert.match(diagnostics, /containment reason: startup-visibility/);
+  assert.equal(
+    fs.readdirSync(root).filter((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)).length,
+    1
+  );
+});
+
 test("real per-file timeout kills the isolated process group and cleans its temp roots", async (t) => {
   if (process.platform === "win32") return;
   const root = sandbox(t);
@@ -926,12 +1062,11 @@ test("Linux supervisor retains a proven detached PID across an environment-scrub
   fs.writeFileSync(fixture, [
     'import fs from "node:fs";',
     'import { spawn } from "node:child_process";',
-    `const child = spawn("/bin/sh", ["-c", "sleep 0.2; exec /usr/bin/env -i /bin/sleep 30"], {`,
+    `const child = spawn("/bin/sh", ["-c", "exec /usr/bin/env -i /bin/sleep 30"], {`,
     '  detached: true, stdio: "ignore"',
     "});",
     "child.unref();",
     `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
-    "await new Promise((resolve) => setTimeout(resolve, 600));",
     ""
   ].join("\n"));
   let descendantPid = null;
