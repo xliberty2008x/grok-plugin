@@ -11,6 +11,7 @@ import { cleanupExitCode, parseCleanupArgs } from "../scripts/cleanup-test-temp.
 import { runDeterministicTestFiles } from "../scripts/lib/deterministic-test-runner.mjs";
 import {
   environmentProvesOwnership,
+  linuxProcessGroupMemberFromStat,
   linuxProcessIdentityFromStat
 } from "../scripts/lib/test-temp-supervisor.mjs";
 import {
@@ -152,8 +153,26 @@ test("Linux fallback identity parses start time after complex process names", ()
     linuxProcessIdentityFromStat(42, `42 (node worker (fixture)) ${fields.join(" ")}`),
     "42:987654"
   );
+  assert.equal(
+    linuxProcessIdentityFromStat(42, `42 (dead worker) Z ${fields.slice(1).join(" ")}`),
+    null
+  );
   assert.equal(linuxProcessIdentityFromStat(42, "malformed"), null);
   assert.equal(linuxProcessIdentityFromStat(1, `1 (init) ${fields.join(" ")}`), null);
+});
+
+test("Linux process-group parsing distinguishes live members from terminal zombies", () => {
+  const live = ["S", "1", "42", ...Array.from({ length: 17 }, (_, index) => String(index + 4))];
+  const zombie = ["Z", ...live.slice(1)];
+  assert.deepEqual(
+    linuxProcessGroupMemberFromStat(43, `43 (worker (live)) ${live.join(" ")}`),
+    { processGroupId: 42, terminal: false }
+  );
+  assert.deepEqual(
+    linuxProcessGroupMemberFromStat(44, `44 (worker dead) ${zombie.join(" ")}`),
+    { processGroupId: 42, terminal: true }
+  );
+  assert.equal(linuxProcessGroupMemberFromStat(44, "malformed"), null);
 });
 
 test("process start tokens use a stable C locale", () => {

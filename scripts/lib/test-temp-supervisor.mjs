@@ -114,8 +114,34 @@ export function linuxProcessIdentityFromStat(pid, stat) {
   const commandEnd = stat.lastIndexOf(")");
   if (commandEnd < 0) return null;
   const fieldsAfterCommand = stat.slice(commandEnd + 1).trim().split(/\s+/u);
+  const state = fieldsAfterCommand[0];
   const startTime = fieldsAfterCommand[19];
-  return startTime && /^\d+$/u.test(startTime) ? `${pid}:${startTime}` : null;
+  return (
+    !["Z", "X", "x"].includes(state)
+    && startTime
+    && /^\d+$/u.test(startTime)
+  ) ? `${pid}:${startTime}` : null;
+}
+
+export function linuxProcessGroupMemberFromStat(pid, stat) {
+  if (!Number.isSafeInteger(pid) || pid <= 1 || typeof stat !== "string") return null;
+  const commandEnd = stat.lastIndexOf(")");
+  if (commandEnd < 0) return null;
+  const fieldsAfterCommand = stat.slice(commandEnd + 1).trim().split(/\s+/u);
+  const state = fieldsAfterCommand[0];
+  const processGroupId = Number(fieldsAfterCommand[2]);
+  if (
+    typeof state !== "string"
+    || state.length !== 1
+    || !Number.isSafeInteger(processGroupId)
+    || processGroupId <= 1
+  ) {
+    return null;
+  }
+  return {
+    processGroupId,
+    terminal: ["Z", "X", "x"].includes(state)
+  };
 }
 
 function linuxProcessIdentity(pid) {
@@ -367,6 +393,38 @@ function wait(ms) {
 function processGroupAlive(child) {
   if (!child?.pid) return false;
   if (process.platform === "win32") return child.exitCode == null && child.signalCode == null;
+  if (process.platform === "linux") {
+    let kernelReportsGroup = true;
+    try {
+      process.kill(-child.pid, 0);
+    } catch (error) {
+      if (error?.code === "ESRCH") return false;
+      if (error?.code !== "EPERM") throw error;
+    }
+    let sawMember = false;
+    for (const entry of fs.readdirSync("/proc", { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
+      try {
+        const pid = Number(entry.name);
+        const stat = fs.readFileSync(path.join("/proc", entry.name, "stat"), "utf8");
+        const member = linuxProcessGroupMemberFromStat(pid, stat);
+        if (member?.processGroupId !== child.pid) continue;
+        sawMember = true;
+        if (!member.terminal) return true;
+      } catch {
+        // A vanished or unrelated protected process is resolved by the final
+        // kernel group check below.
+      }
+    }
+    if (sawMember) return false;
+    try {
+      process.kill(-child.pid, 0);
+    } catch (error) {
+      if (error?.code === "ESRCH") kernelReportsGroup = false;
+      else if (error?.code !== "EPERM") throw error;
+    }
+    return kernelReportsGroup;
+  }
   try {
     process.kill(-child.pid, 0);
     return true;
