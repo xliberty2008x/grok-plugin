@@ -144,6 +144,21 @@ export function linuxProcessGroupMemberFromStat(pid, stat) {
   };
 }
 
+export function linuxProcessProvesLiveOwnership(
+  pid,
+  stat,
+  environment,
+  entries,
+  { supervisorPid = process.pid } = {}
+) {
+  const member = linuxProcessGroupMemberFromStat(pid, stat);
+  return member?.terminal !== true && environmentProvesOwnership(
+    environment,
+    entries,
+    { pid, supervisorPid }
+  );
+}
+
 function linuxProcessIdentity(pid) {
   try {
     const stat = fs.readFileSync(path.join("/proc", String(pid), "stat"), "utf8");
@@ -211,8 +226,14 @@ function ownedProcessIds(token, tempIdentity) {
       if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
       const pid = Number(entry.name);
       try {
+        const stat = fs.readFileSync(path.join("/proc", entry.name, "stat"), "utf8");
+        const member = linuxProcessGroupMemberFromStat(pid, stat);
+        if (member?.terminal) {
+          knownLinuxOwnedProcesses.delete(pid);
+          continue;
+        }
         const environment = fs.readFileSync(path.join("/proc", entry.name, "environ"));
-        if (environmentProvesOwnership(environment, entries, { pid })) {
+        if (linuxProcessProvesLiveOwnership(pid, stat, environment, entries)) {
           rememberLinuxOwnedProcess(pid);
           ids.push(pid);
         }

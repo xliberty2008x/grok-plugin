@@ -12,7 +12,8 @@ import { runDeterministicTestFiles } from "../scripts/lib/deterministic-test-run
 import {
   environmentProvesOwnership,
   linuxProcessGroupMemberFromStat,
-  linuxProcessIdentityFromStat
+  linuxProcessIdentityFromStat,
+  linuxProcessProvesLiveOwnership
 } from "../scripts/lib/test-temp-supervisor.mjs";
 import {
   LEGACY_REPOSITORY_PREFIX,
@@ -173,6 +174,30 @@ test("Linux process-group parsing distinguishes live members from terminal zombi
     { processGroupId: 42, terminal: true }
   );
   assert.equal(linuxProcessGroupMemberFromStat(44, "malformed"), null);
+});
+
+test("Linux terminal process states cannot retain a live ownership identity", () => {
+  const marker = "GROK_PLUGIN_TEST_SUPERVISOR_TOKEN=fixture";
+  for (const state of ["Z", "X", "x"]) {
+    const fields = [
+      state,
+      "1",
+      "42",
+      ...Array.from({ length: 16 }, (_, index) => String(index + 4)),
+      "987654"
+    ];
+    assert.equal(
+      linuxProcessIdentityFromStat(42, `42 (terminal worker) ${fields.join(" ")}`),
+      null
+    );
+    assert.equal(linuxProcessProvesLiveOwnership(
+      42,
+      `42 (terminal worker) ${fields.join(" ")}`,
+      Buffer.from(`${marker}\0`),
+      [marker],
+      { supervisorPid: 41 }
+    ), false);
+  }
 });
 
 test("process start tokens use a stable C locale", () => {
