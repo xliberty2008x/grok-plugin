@@ -866,11 +866,14 @@ function projectContextManifest(value, { trustHostAuthority = true } = {}) {
     materialization: projectMaterialization(value.materialization, { trustHostAuthority })
   };
   // Validate the raw value only; never trim/lowercase/sanitize into a digest.
-  if (typeof git.taskRelevantMetadataIdentity === "string"
+  if (trustHostAuthority
+    && typeof git.taskRelevantMetadataIdentity === "string"
     && SHA256_HEX_DIGEST.test(git.taskRelevantMetadataIdentity)) {
     projected.taskRelevantMetadataIdentity = git.taskRelevantMetadataIdentity;
   }
-  const sharedRefIdentity = projectSharedRefIdentitySummary(git.sharedRefIdentity);
+  const sharedRefIdentity = trustHostAuthority
+    ? projectSharedRefIdentitySummary(git.sharedRefIdentity)
+    : null;
   if (sharedRefIdentity) projected.sharedRefIdentity = sharedRefIdentity;
   return projected;
 }

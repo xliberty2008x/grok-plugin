@@ -489,6 +489,16 @@ test("purported public snapshots are re-projected instead of trusted by version 
     context: {
       schemaVersion: 1,
       upstreamFreshness: "verified",
+      taskRelevantMetadataIdentity: "1".repeat(64),
+      sharedRefIdentity: {
+        schemaVersion: 1,
+        complete: true,
+        refCount: 2,
+        taskRelevantRefCount: 1,
+        unrelatedRefCount: 1,
+        taskRelevantRefIdentity: "2".repeat(64),
+        unrelatedRefIdentity: "3".repeat(64)
+      },
       materialization: { state: "local_complete", upstreamFreshness: "verified" }
     },
     result: {
@@ -517,6 +527,11 @@ test("purported public snapshots are re-projected instead of trusted by version 
   assert.deepEqual(normalized.lifecycleEvents[0].detail, { state: "accepted" });
   assert.equal(normalized.taskContract.context.upstreamFreshness, "not_checked");
   assert.equal(normalized.context.upstreamFreshness, "not_checked");
+  assert.equal(
+    Object.hasOwn(normalized.context, "taskRelevantMetadataIdentity"),
+    false
+  );
+  assert.equal(Object.hasOwn(normalized.context, "sharedRefIdentity"), false);
   assert.equal(normalized.context.materialization.upstreamFreshness, "not_checked");
   assertConforms("WorkerSnapshot", normalized);
 });

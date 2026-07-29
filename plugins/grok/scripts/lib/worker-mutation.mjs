@@ -1853,6 +1853,8 @@ export function assertWorkerProviderLaunchPreparation(job, {
   providerGeneration = null,
   env = process.env
 } = {}) {
+  // Exhaustive split: every read job and every generation other than the
+  // exact write-repair generation returns before post-binding validation.
   if (job?.write !== true || providerGeneration !== 2) {
     return assertDurableSpawnRequestBinding(job, env);
   }
