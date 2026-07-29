@@ -513,7 +513,9 @@ function ownerActivity(manifest, tokenForPid = processStartToken) {
     return { active: false, known: false };
   }
   if (current === manifest.startToken) return { active: true, known: true };
-  if (current) return { active: false, known: true };
+  if (current && !manifest.startToken.startsWith("opaque:")) {
+    return { active: false, known: true };
+  }
   try {
     process.kill(manifest.pid, 0);
     return { active: false, known: false };
@@ -647,6 +649,7 @@ export function cleanupTestTemp({
   worktreeProvider = () => captureRegisteredWorktrees(repoRoot),
   tokenForPid = processStartToken,
   beforeDelete = null,
+  removeRoot = removeOwnedTestTempRoot,
   sizeScanEntryBudget = TEST_TEMP_SIZE_SCAN_ENTRY_BUDGET,
   snapshotRefreshMs = TEST_TEMP_SNAPSHOT_REFRESH_MS,
   clock = Date.now
@@ -823,7 +826,11 @@ export function cleanupTestTemp({
         continue;
       }
       try {
-        removeOwnedTestTempRoot(record.path);
+        if (!removeRoot(record.path)) {
+          record.eligible = false;
+          record.reasons.push("candidate-disappeared");
+          continue;
+        }
         record.removed = true;
         removed += 1;
         if (Number.isSafeInteger(record.sizeBytes)) reclaimedBytes += record.sizeBytes;

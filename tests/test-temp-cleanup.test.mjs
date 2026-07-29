@@ -127,6 +127,23 @@ test("Linux ownership matching requires an exact environment entry and excludes 
   ), true);
 });
 
+test("process start tokens use a stable C locale", () => {
+  let invocation = null;
+  const token = processStartToken(process.pid, {
+    run(binary, args, options) {
+      invocation = { binary, args, options };
+      return { status: 0, stdout: "Mon Jan  1 00:00:00 2001\n" };
+    }
+  });
+  if (process.platform === "win32") {
+    assert.equal(token, null);
+    assert.equal(invocation, null);
+    return;
+  }
+  assert.equal(token, "Mon Jan  1 00:00:00 2001");
+  assert.deepEqual(invocation.options.env, { LC_ALL: "C", LANG: "C" });
+});
+
 test("legacy allowlist exactly covers checked-in literal system-temp allocation patterns", () => {
   const proven = new Set([
     // These wrappers bind their literal prefix to os.tmpdir() or fixed /tmp
@@ -366,6 +383,25 @@ test("apply rechecks inode identity and preserves a rename-swap replacement", (t
   assert.equal(fs.readFileSync(path.join(moved, "original"), "utf8"), "original");
 });
 
+test("apply does not count a candidate that disappears during removal", (t) => {
+  const root = sandbox(t);
+  const target = legacy(root);
+  fs.writeFileSync(path.join(target, "payload"), "payload");
+  age(target);
+  const result = cleanupTestTemp(options(root, {
+    apply: true,
+    removeRoot(candidate) {
+      fs.rmSync(candidate, { recursive: true, force: true });
+      return false;
+    }
+  }));
+  const candidate = record(result, target);
+  assert.ok(candidate.reasons.includes("candidate-disappeared"));
+  assert.notEqual(candidate.removed, true);
+  assert.equal(result.removed, 0);
+  assert.equal(result.reclaimedBytes, 0);
+});
+
 test("apply removes verified old trees with restricted descendants without following symlinks", (t) => {
   const root = sandbox(t);
   const target = legacy(root);
@@ -411,6 +447,27 @@ test("stale manifest-backed crash roots are reaped while an active owner sibling
   assert.ok(record(result, active).reasons.includes("active-owner"));
   assert.equal(fs.existsSync(stale), false);
   assert.equal(fs.existsSync(active), true);
+});
+
+test("opaque owner tokens preserve a managed root while the owner PID remains live", (t) => {
+  const root = sandbox(t);
+  const target = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_RUN_PREFIX,
+    kind: "run",
+    pid: process.pid,
+    startToken: `opaque:${"a".repeat(32)}`
+  });
+  age(target);
+  const result = cleanupTestTemp(options(root, {
+    apply: true,
+    legacy: false,
+    tokenForPid: () => "Mon Jan  1 00:00:00 2001"
+  }));
+  const candidate = record(result, target);
+  assert.ok(candidate.reasons.includes("owner-identity-unavailable"));
+  assert.notEqual(candidate.removed, true);
+  assert.equal(fs.existsSync(target), true);
 });
 
 test("direct node --test helper fallback removes its one process-owned container on normal exit", (t) => {

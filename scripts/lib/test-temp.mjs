@@ -37,7 +37,8 @@ export function processStartToken(pid, { run = spawnSync } = {}) {
     encoding: "utf8",
     shell: false,
     timeout: 2_000,
-    maxBuffer: 8 * 1024
+    maxBuffer: 8 * 1024,
+    env: { LC_ALL: "C", LANG: "C" }
   });
   const token = result?.status === 0 ? String(result.stdout || "").trim() : "";
   return token && token.length <= 256 ? token : null;
