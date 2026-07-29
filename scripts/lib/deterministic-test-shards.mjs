@@ -1,4 +1,7 @@
 export const DETERMINISTIC_TEST_SHARD_COUNT = 3;
+export const DETERMINISTIC_SUPPORT_TEST_FILES = Object.freeze([
+  "tests/worker-broker-evidence_part2.mjs"
+]);
 
 // Duration-balanced with longest-processing-time assignment from the
 // macOS / Node 22 lane in Actions run 30382034077 on 2026-07-28. Keep this
@@ -45,6 +48,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/stdin.test.mjs",
     "tests/test-temp-cleanup.test.mjs",
     "tests/worker-broker-evidence.test.mjs",
+    "tests/worker-broker-evidence_part2.mjs",
     "tests/worker-context-roles.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
     "tests/worker-presentation.test.mjs",
@@ -124,8 +128,9 @@ export function validateDeterministicTestShards({
       errors.push(`Deterministic shard ${index + 1} must be a nonempty array.`);
       continue;
     }
+    const supportFiles = new Set(DETERMINISTIC_SUPPORT_TEST_FILES);
     if (files.some((file) => typeof file !== "string"
-      || !/^tests\/[^/]+\.test\.mjs$/u.test(file))) {
+      || (!/^tests\/[^/]+\.test\.mjs$/u.test(file) && !supportFiles.has(file)))) {
       errors.push(`Deterministic shard ${index + 1} contains an invalid test path.`);
       continue;
     }

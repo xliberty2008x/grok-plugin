@@ -51,6 +51,25 @@ export function parseCleanupArgs(argv) {
   return { help: false, apply, legacy, olderThanMs };
 }
 
+export function cleanupExitCode(result, { apply }) {
+  if (result.aborted) return 2;
+  if (
+    apply
+    && result.candidates.some((candidate) =>
+      !candidate.removed
+      && (
+        candidate.eligible
+        || candidate.reasons.includes("candidate-disappeared")
+        || candidate.reasons.includes("identity-changed")
+        || candidate.reasons.includes("remove-failed")
+      )
+    )
+  ) {
+    return 1;
+  }
+  return 0;
+}
+
 function main() {
   let options;
   try {
@@ -65,11 +84,7 @@ function main() {
   }
   const result = cleanupTestTemp(options);
   process.stdout.write(`${JSON.stringify(result)}\n`);
-  if (result.aborted) return 2;
-  if (options.apply && result.candidates.some((candidate) => candidate.eligible && !candidate.removed)) {
-    return 1;
-  }
-  return 0;
+  return cleanupExitCode(result, options);
 }
 
 const invoked = process.argv[1] ? path.resolve(process.argv[1]) : null;

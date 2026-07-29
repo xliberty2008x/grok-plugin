@@ -14,8 +14,11 @@ const TIMEOUT_EXIT_CODE = 124;
 const OUTPUT_LIMIT_EXIT_CODE = 125;
 const CONTAINMENT_FAILURE_EXIT_CODE = 126;
 const OWNERSHIP_TOKEN_ENV = "GROK_PLUGIN_TEST_SUPERVISOR_TOKEN";
+const CHILD_HOOK_BYPASS_ENV = "GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS";
 const PS_PATHS = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
+const CHILD_HOOK = fileURLToPath(new URL("./test-temp-child-hook.cjs", import.meta.url));
 let provenLinuxVisibilityToken = null;
+const knownLinuxOwnedProcesses = new Map();
 
 function usage() {
   return "Usage: node test-temp-supervisor.mjs --timeout-ms <ms> -- <node> <args...>\n";
@@ -99,6 +102,66 @@ function ownershipEnvironmentEntries(token, tempIdentity) {
   return entries;
 }
 
+function childNodeOptions() {
+  const hook = `--require=${JSON.stringify(CHILD_HOOK)}`;
+  const existing = String(process.env.NODE_OPTIONS || "").trim();
+  if (existing.includes(hook)) return existing;
+  return existing ? `${existing} ${hook}` : hook;
+}
+
+export function linuxProcessIdentityFromStat(pid, stat) {
+  if (!Number.isSafeInteger(pid) || pid <= 1 || typeof stat !== "string") return null;
+  const commandEnd = stat.lastIndexOf(")");
+  if (commandEnd < 0) return null;
+  const fieldsAfterCommand = stat.slice(commandEnd + 1).trim().split(/\s+/u);
+  const startTime = fieldsAfterCommand[19];
+  return startTime && /^\d+$/u.test(startTime) ? `${pid}:${startTime}` : null;
+}
+
+function linuxProcessIdentity(pid) {
+  try {
+    const stat = fs.readFileSync(path.join("/proc", String(pid), "stat"), "utf8");
+    return linuxProcessIdentityFromStat(pid, stat);
+  } catch {
+    return null;
+  }
+}
+
+function rememberLinuxOwnedProcess(pid) {
+  const identity = linuxProcessIdentity(pid);
+  if (identity) knownLinuxOwnedProcesses.set(pid, identity);
+}
+
+function verifiedKnownLinuxProcessIds() {
+  const verified = [];
+  for (const [pid, identity] of knownLinuxOwnedProcesses) {
+    const current = linuxProcessIdentity(pid);
+    if (current === identity) verified.push(pid);
+    else knownLinuxOwnedProcesses.delete(pid);
+  }
+  return verified;
+}
+
+function signalKnownLinuxOwnedProcesses(signal) {
+  for (const pid of verifiedKnownLinuxProcessIds()) {
+    try {
+      process.kill(pid, signal);
+    } catch (error) {
+      if (error?.code === "ESRCH") knownLinuxOwnedProcesses.delete(pid);
+      else throw error;
+    }
+  }
+}
+
+async function waitForKnownLinuxProcessesGone(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (verifiedKnownLinuxProcessIds().length === 0) return true;
+    await wait(25);
+  }
+  return verifiedKnownLinuxProcessIds().length === 0;
+}
+
 export function environmentProvesOwnership(
   environment,
   entries,
@@ -120,14 +183,24 @@ function ownedProcessIds(token, tempIdentity) {
     const ids = [];
     for (const entry of fs.readdirSync("/proc", { withFileTypes: true })) {
       if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
+      const pid = Number(entry.name);
       try {
         const environment = fs.readFileSync(path.join("/proc", entry.name, "environ"));
-        const pid = Number(entry.name);
-        if (environmentProvesOwnership(environment, entries, { pid })) ids.push(pid);
-      } catch {
+        if (environmentProvesOwnership(environment, entries, { pid })) {
+          rememberLinuxOwnedProcess(pid);
+          ids.push(pid);
+        }
+      } catch (error) {
+        if (error?.code === "ENOENT") {
+          knownLinuxOwnedProcesses.delete(pid);
+          continue;
+        }
+        if (knownLinuxOwnedProcesses.has(pid)) {
+          throw new Error("Owned-process visibility became unavailable.");
+        }
         // A vanished or protected unrelated process is benign after the
-        // tagged-child probe below has proved that this supervisor can inspect
-        // the exact class of processes it owns.
+        // tagged detached-child probe below has proved that this supervisor can
+        // inspect both direct and reparented processes that it owns.
       }
     }
     return ids;
@@ -143,7 +216,7 @@ function ownedProcessIds(token, tempIdentity) {
     "-o",
     "pid=,command="
   ], {
-    env: { LC_ALL: "C" },
+    env: { LC_ALL: "C", [CHILD_HOOK_BYPASS_ENV]: "1" },
     encoding: "utf8",
     shell: false,
     timeout: 10_000,
@@ -168,7 +241,15 @@ async function proveLinuxOwnedProcessVisibility(token, tempIdentity) {
   try {
     probe = spawn(process.execPath, [
       "--eval",
-      "setInterval(() => {}, 1000)"
+      [
+        "const { spawn } = require('node:child_process');",
+        "const orphan = spawn(process.execPath, ['--eval', 'setInterval(() => {}, 1000)'], {",
+        "  detached: true, env: process.env, shell: false, stdio: 'ignore'",
+        "});",
+        "orphan.unref();",
+        "process.stdout.write(String(orphan.pid) + '\\n');",
+        "setTimeout(() => process.exit(0), 250);"
+      ].join("\n")
     ], {
       cwd: process.cwd(),
       env: {
@@ -183,12 +264,14 @@ async function proveLinuxOwnedProcessVisibility(token, tempIdentity) {
       },
       shell: false,
       detached: false,
-      stdio: "ignore"
+      stdio: ["ignore", "pipe", "ignore"]
     });
   } catch {
     return false;
   }
 
+  const stdout = [];
+  probe.stdout.on("data", (chunk) => stdout.push(chunk));
   let probeErrored = false;
   const probeClosed = new Promise((resolve) => {
     probe.once("close", () => resolve(true));
@@ -197,7 +280,7 @@ async function proveLinuxOwnedProcessVisibility(token, tempIdentity) {
       resolve(false);
     });
   });
-  let visible = false;
+  let directVisible = false;
   const deadline = Date.now() + 1_000;
   while (Date.now() < deadline && probe.pid && !probeErrored) {
     try {
@@ -206,7 +289,7 @@ async function proveLinuxOwnedProcessVisibility(token, tempIdentity) {
         pid: probe.pid,
         supervisorPid: process.pid
       })) {
-        visible = true;
+        directVisible = true;
         break;
       }
     } catch (error) {
@@ -215,18 +298,56 @@ async function proveLinuxOwnedProcessVisibility(token, tempIdentity) {
     await wait(10);
   }
 
-  try {
-    probe.kill("SIGKILL");
-  } catch (error) {
-    if (error?.code !== "ESRCH") visible = false;
-  }
   const closed = await Promise.race([
     probe.exitCode != null || probe.signalCode != null
       ? Promise.resolve(true)
       : probeClosed,
     wait(1_000).then(() => false)
   ]);
-  return visible && closed;
+  if (!closed) {
+    try {
+      probe.kill("SIGKILL");
+    } catch {
+      // The failed visibility proof remains authoritative.
+    }
+  }
+
+  const orphanPid = Number(Buffer.concat(stdout).toString("utf8").trim());
+  const cleanupPids = new Set();
+  if (Number.isSafeInteger(orphanPid) && orphanPid > 1) cleanupPids.add(orphanPid);
+  for (const entry of fs.readdirSync("/proc", { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
+    const pid = Number(entry.name);
+    try {
+      const environment = fs.readFileSync(path.join("/proc", entry.name, "environ"));
+      if (environmentProvesOwnership(environment, entries, { pid })) cleanupPids.add(pid);
+    } catch {
+      // The proof will fail; cleanup below still handles every PID already known.
+    }
+  }
+  let orphanVisible = false;
+  if (closed && cleanupPids.has(orphanPid)) {
+    try {
+      const environment = fs.readFileSync(path.join("/proc", String(orphanPid), "environ"));
+      orphanVisible = environmentProvesOwnership(environment, entries, {
+        pid: orphanPid,
+        supervisorPid: process.pid
+      });
+      if (orphanVisible) rememberLinuxOwnedProcess(orphanPid);
+    } catch {
+      orphanVisible = false;
+    }
+  }
+  for (const pid of cleanupPids) {
+    rememberLinuxOwnedProcess(pid);
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch (error) {
+      if (error?.code !== "ESRCH") orphanVisible = false;
+    }
+  }
+  if (!await waitForKnownLinuxProcessesGone(1_000)) orphanVisible = false;
+  return directVisible && closed && orphanVisible;
 }
 
 function signalOwnedProcesses(token, tempIdentity, signal) {
@@ -278,6 +399,14 @@ async function terminate(child, token, tempIdentity) {
     signalOwnedProcesses(token, tempIdentity, "SIGKILL");
     return await waitForOwnedProcessesGone(child, token, tempIdentity, KILL_GRACE_MS);
   } catch {
+    if (process.platform === "linux") {
+      try {
+        signalKnownLinuxOwnedProcesses("SIGKILL");
+        await waitForKnownLinuxProcessesGone(KILL_GRACE_MS);
+      } catch {
+        // Containment remains unproven and the caller returns 126.
+      }
+    }
     return false;
   }
 }
@@ -293,6 +422,16 @@ async function main() {
 
   const ownershipToken = randomUUID();
   const tempIdentity = privateTempIdentity();
+  // A supervisor can itself run beneath another supervisor. Rebind the
+  // preloaded child hook to this supervisor's ownership identity before it
+  // launches visibility probes or the actual test command.
+  process.env.GROK_PLUGIN_TEST_SUPERVISOR_PID = String(process.pid);
+  process.env[OWNERSHIP_TOKEN_ENV] = ownershipToken;
+  process.env.NODE_OPTIONS = childNodeOptions();
+  // Node does not expose Windows Job Objects. A PID/PPID snapshot is not a
+  // sufficient containment boundary after an intermediate process exits, so
+  // fail closed instead of launching an uncontained deterministic test.
+  if (process.platform === "win32") return CONTAINMENT_FAILURE_EXIT_CODE;
   if (!await proveLinuxOwnedProcessVisibility(ownershipToken, tempIdentity)) {
     return CONTAINMENT_FAILURE_EXIT_CODE;
   }
@@ -312,7 +451,8 @@ async function main() {
       env: {
         ...process.env,
         GROK_PLUGIN_TEST_SUPERVISOR_PID: String(process.pid),
-        [OWNERSHIP_TOKEN_ENV]: ownershipToken
+        [OWNERSHIP_TOKEN_ENV]: ownershipToken,
+        NODE_OPTIONS: childNodeOptions()
       },
       shell: false,
       detached: process.platform !== "win32",
@@ -320,6 +460,9 @@ async function main() {
     });
   } catch {
     return 1;
+  }
+  if (process.platform === "linux" && child.pid) {
+    rememberLinuxOwnedProcess(child.pid);
   }
 
   const chunks = [];
@@ -352,6 +495,21 @@ async function main() {
   const interruptedSignal = new Promise((resolve) => {
     resolveInterrupt = resolve;
   });
+  let resolveContainmentFailure;
+  const containmentFailed = new Promise((resolve) => {
+    resolveContainmentFailure = resolve;
+  });
+  let containmentMonitor = null;
+  if (process.platform === "linux") {
+    containmentMonitor = setInterval(() => {
+      try {
+        ownedProcessIds(ownershipToken, tempIdentity);
+      } catch {
+        resolveContainmentFailure("containment-failure");
+      }
+    }, 25);
+    containmentMonitor.unref();
+  }
   const interrupt = () => {
     if (interrupted) return;
     interrupted = true;
@@ -364,10 +522,16 @@ async function main() {
     closed.then(() => "closed"),
     wait(parsed.timeoutMs).then(() => "timeout"),
     overflowed,
-    interruptedSignal
+    interruptedSignal,
+    containmentFailed
   ]);
   let contained = true;
-  if (outcome === "timeout" || outcome === "overflow" || outcome === "interrupt") {
+  if (
+    outcome === "timeout"
+    || outcome === "overflow"
+    || outcome === "interrupt"
+    || outcome === "containment-failure"
+  ) {
     contained = await terminate(child, ownershipToken, tempIdentity);
   } else {
     try {
@@ -382,9 +546,11 @@ async function main() {
   }
   process.removeListener("SIGINT", interrupt);
   process.removeListener("SIGTERM", interrupt);
+  if (containmentMonitor) clearInterval(containmentMonitor);
 
   if (!overflow && chunks.length) fs.writeSync(process.stdout.fd, Buffer.concat(chunks));
   if (!contained) return CONTAINMENT_FAILURE_EXIT_CODE;
+  if (outcome === "containment-failure") return CONTAINMENT_FAILURE_EXIT_CODE;
   if (overflow) return OUTPUT_LIMIT_EXIT_CODE;
   if (outcome === "timeout") return TIMEOUT_EXIT_CODE;
   if (interrupted) return 130;

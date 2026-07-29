@@ -7,13 +7,17 @@ import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { parseCleanupArgs } from "../scripts/cleanup-test-temp.mjs";
+import { cleanupExitCode, parseCleanupArgs } from "../scripts/cleanup-test-temp.mjs";
 import { runDeterministicTestFiles } from "../scripts/lib/deterministic-test-runner.mjs";
-import { environmentProvesOwnership } from "../scripts/lib/test-temp-supervisor.mjs";
+import {
+  environmentProvesOwnership,
+  linuxProcessIdentityFromStat
+} from "../scripts/lib/test-temp-supervisor.mjs";
 import {
   LEGACY_REPOSITORY_PREFIX,
   LEGACY_TEST_TEMP_PREFIXES,
-  cleanupTestTemp
+  cleanupTestTemp,
+  removeInventoriedTestTempRoot
 } from "../scripts/lib/test-temp-cleanup.mjs";
 import {
   TEST_TEMP_PROCESS_PREFIX,
@@ -108,6 +112,21 @@ test("cleanup arguments default to dry-run and require explicit apply, legacy, a
   assert.throws(() => parseCleanupArgs(["--delete"]), /Unknown/);
 });
 
+test("cleanup apply exits nonzero when a verified candidate is not removed", () => {
+  assert.equal(cleanupExitCode({
+    aborted: false,
+    candidates: [{ eligible: false, removed: false, reasons: ["remove-failed"] }]
+  }, { apply: true }), 1);
+  assert.equal(cleanupExitCode({
+    aborted: false,
+    candidates: [{ eligible: false, removed: false, reasons: ["too-recent"] }]
+  }, { apply: true }), 0);
+  assert.equal(cleanupExitCode({
+    aborted: true,
+    candidates: []
+  }, { apply: true }), 2);
+});
+
 test("Linux ownership matching requires an exact environment entry and excludes the supervisor", () => {
   const marker = "GROK_PLUGIN_TEST_SUPERVISOR_TOKEN=fixture";
   assert.equal(environmentProvesOwnership(
@@ -125,6 +144,16 @@ test("Linux ownership matching requires an exact environment entry and excludes 
     [marker],
     { pid: 42, supervisorPid: 41 }
   ), true);
+});
+
+test("Linux fallback identity parses start time after complex process names", () => {
+  const fields = ["S", ...Array.from({ length: 18 }, (_, index) => String(index + 1)), "987654"];
+  assert.equal(
+    linuxProcessIdentityFromStat(42, `42 (node worker (fixture)) ${fields.join(" ")}`),
+    "42:987654"
+  );
+  assert.equal(linuxProcessIdentityFromStat(42, "malformed"), null);
+  assert.equal(linuxProcessIdentityFromStat(1, `1 (init) ${fields.join(" ")}`), null);
 });
 
 test("process start tokens use a stable C locale", () => {
@@ -383,6 +412,50 @@ test("apply rechecks inode identity and preserves a rename-swap replacement", (t
   assert.equal(fs.readFileSync(path.join(moved, "original"), "utf8"), "original");
 });
 
+test("apply preserves a replacement swapped after the final path identity check", (t) => {
+  const root = sandbox(t);
+  const target = legacy(root);
+  fs.writeFileSync(path.join(target, "original"), "original");
+  age(target);
+  const moved = `${target}-moved-after-check`;
+  const result = cleanupTestTemp(options(root, {
+    apply: true,
+    removeRoot(candidate, identity) {
+      fs.renameSync(candidate, moved);
+      fs.mkdirSync(candidate);
+      fs.writeFileSync(path.join(candidate, "replacement"), "replacement");
+      return removeInventoriedTestTempRoot(candidate, identity);
+    }
+  }));
+  assert.ok(record(result, target).reasons.includes("identity-changed"));
+  assert.equal(fs.readFileSync(path.join(target, "replacement"), "utf8"), "replacement");
+  assert.equal(fs.readFileSync(path.join(moved, "original"), "utf8"), "original");
+  assert.equal(
+    fs.readdirSync(root).some((name) => name.startsWith(".grok-plugin-cleanup-quarantine-")),
+    false
+  );
+});
+
+test("verified recursive removal has no timeout that can orphan a descendant helper", (t) => {
+  const root = sandbox(t);
+  const target = legacy(root);
+  fs.writeFileSync(path.join(target, "payload"), "payload");
+  const identity = fs.lstatSync(target);
+  let helperOptions;
+  assert.equal(removeInventoriedTestTempRoot(target, identity, {
+    run(_executable, _arguments, options) {
+      helperOptions = options;
+      fs.rmSync(options.cwd, { recursive: true, force: true });
+      return { status: 0, error: null, signal: null };
+    }
+  }), true);
+  assert.equal(Object.hasOwn(helperOptions, "timeout"), false);
+  assert.doesNotMatch(
+    fs.readFileSync(path.join(ROOT, "scripts/lib/test-temp-remove-helper.cjs"), "utf8"),
+    /\btimeout\s*:/u
+  );
+});
+
 test("apply does not count a candidate that disappears during removal", (t) => {
   const root = sandbox(t);
   const target = legacy(root);
@@ -447,6 +520,34 @@ test("stale manifest-backed crash roots are reaped while an active owner sibling
   assert.ok(record(result, active).reasons.includes("active-owner"));
   assert.equal(fs.existsSync(stale), false);
   assert.equal(fs.existsSync(active), true);
+});
+
+test("managed cleanup binds each direct prefix to its exact manifest kind", (t) => {
+  const root = sandbox(t);
+  const runWithProcessOwner = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_RUN_PREFIX,
+    kind: "process",
+    pid: process.pid,
+    startToken: "stale-process-owner"
+  });
+  const processWithRunOwner = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_PROCESS_PREFIX,
+    kind: "run",
+    pid: process.pid,
+    startToken: "stale-run-owner"
+  });
+  age(runWithProcessOwner);
+  age(processWithRunOwner);
+  const result = cleanupTestTemp(options(root, {
+    apply: true,
+    legacy: false
+  }));
+  assert.ok(record(result, runWithProcessOwner).reasons.includes("manifest-kind-mismatch"));
+  assert.ok(record(result, processWithRunOwner).reasons.includes("manifest-kind-mismatch"));
+  assert.equal(fs.existsSync(runWithProcessOwner), true);
+  assert.equal(fs.existsSync(processWithRunOwner), true);
 });
 
 test("opaque owner tokens preserve a managed root while the owner PID remains live", (t) => {
@@ -585,6 +686,7 @@ test("supervisor interruption promptly kills a TERM-resistant group and runner c
     'process.on("SIGTERM", () => {});',
     `fs.writeFileSync(${JSON.stringify(controlFile)}, JSON.stringify({`,
     "  supervisorPid: Number(process.env.GROK_PLUGIN_TEST_SUPERVISOR_PID),",
+    "  fixturePid: process.pid,",
     "  descendantPid: child.pid",
     "}));",
     "setInterval(() => {}, 1000);",
@@ -619,20 +721,151 @@ test("supervisor interruption promptly kills a TERM-resistant group and runner c
   await waitForPath(controlFile);
   const control = JSON.parse(fs.readFileSync(controlFile, "utf8"));
   assert.equal(Number.isSafeInteger(control.supervisorPid), true);
+  assert.equal(Number.isSafeInteger(control.fixturePid), true);
   assert.equal(Number.isSafeInteger(control.descendantPid), true);
-  const startedAt = Date.now();
-  process.kill(control.supervisorPid, "SIGTERM");
-  const exit = await new Promise((resolve, reject) => {
+  assert.notEqual(
+    control.supervisorPid,
+    Number(process.env.GROK_PLUGIN_TEST_SUPERVISOR_PID),
+    "the nested lifecycle fixture must target its inner supervisor"
+  );
+  assert.notEqual(
+    control.supervisorPid,
+    process.pid,
+    "the nested lifecycle fixture must not target its parent test process"
+  );
+  const exited = new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("Interrupted runner did not exit.")), 6_000);
     runner.once("exit", (code, signal) => {
       clearTimeout(timer);
       resolve({ code, signal });
     });
   });
+  const startedAt = Date.now();
+  process.kill(control.supervisorPid, "SIGTERM");
+  const exit = await exited;
   assert.equal(exit.code, 1);
   assert.equal(exit.signal, null);
   assert.ok(Date.now() - startedAt < 6_000);
   assert.equal(await pidIsGone(control.descendantPid), true);
+  assert.equal(fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)), false);
+});
+
+test("supervisor reaps a detached Node descendant that requests an empty environment", async (t) => {
+  if (process.platform === "win32") return;
+  const root = sandbox(t);
+  const pidFile = path.join(root, "empty-environment-descendant.pid");
+  const fixture = path.join(root, "empty-environment.test.mjs");
+  fs.writeFileSync(fixture, [
+    'import fs from "node:fs";',
+    'import process from "node:process";',
+    'import { spawn } from "node:child_process";',
+    "const child = spawn(process.execPath, [\"--eval\", \"setInterval(() => {}, 1000)\"], {",
+    '  detached: true, env: {}, stdio: "ignore"',
+    "});",
+    "child.unref();",
+    `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+    ""
+  ].join("\n"));
+  let diagnostics = "";
+  const status = runDeterministicTestFiles({
+    files: [fixture],
+    root: ROOT,
+    reporter: REPORTER,
+    tempRoot: root,
+    timeoutMs: 5_000,
+    stdout: { write() {} },
+    stderr: { write(value) { diagnostics += value; } }
+  });
+  assert.equal(status, 0, diagnostics);
+  const pid = Number(fs.readFileSync(pidFile, "utf8"));
+  assert.equal(await pidIsGone(pid), true);
+  assert.equal(fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)), false);
+});
+
+test("supervisor ownership survives an execFileSync chain with empty environments", async (t) => {
+  if (process.platform === "win32") return;
+  const root = sandbox(t);
+  const pidFile = path.join(root, "exec-sync-descendant.pid");
+  const helper = path.join(root, "exec-sync-helper.mjs");
+  const fixture = path.join(root, "exec-sync.test.mjs");
+  fs.writeFileSync(helper, [
+    'import fs from "node:fs";',
+    'import process from "node:process";',
+    'import { spawn } from "node:child_process";',
+    "const child = spawn(process.execPath, [\"--eval\", \"setInterval(() => {}, 1000)\"], {",
+    '  detached: true, env: {}, stdio: "ignore"',
+    "});",
+    "child.unref();",
+    `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+    ""
+  ].join("\n"));
+  fs.writeFileSync(fixture, [
+    'import process from "node:process";',
+    'import { execFileSync } from "node:child_process";',
+    `execFileSync(process.execPath, [${JSON.stringify(helper)}], { env: {}, stdio: "ignore" });`,
+    ""
+  ].join("\n"));
+  let diagnostics = "";
+  const status = runDeterministicTestFiles({
+    files: [fixture],
+    root: ROOT,
+    reporter: REPORTER,
+    tempRoot: root,
+    timeoutMs: 5_000,
+    stdout: { write() {} },
+    stderr: { write(value) { diagnostics += value; } }
+  });
+  assert.equal(status, 0, diagnostics);
+  const pid = Number(fs.readFileSync(pidFile, "utf8"));
+  assert.equal(await pidIsGone(pid), true);
+  assert.equal(fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)), false);
+});
+
+test("sync child-process options-only overloads preserve ownership and compatibility", async (t) => {
+  if (process.platform === "win32") return;
+  const root = sandbox(t);
+  const spawnPidFile = path.join(root, "spawn-sync-options-only.pid");
+  const execPidFile = path.join(root, "exec-file-sync-options-only.pid");
+  const spawnHelper = path.join(root, "spawn-sync-options-only");
+  const execHelper = path.join(root, "exec-file-sync-options-only");
+  const fixture = path.join(root, "sync-options-only.test.mjs");
+  const helperSource = (pidFile) => [
+    `#!${process.execPath}`,
+    'const fs = require("node:fs");',
+    'const process = require("node:process");',
+    'const { spawn } = require("node:child_process");',
+    "const child = spawn(process.execPath, [\"--eval\", \"setInterval(() => {}, 1000)\"], {",
+    '  detached: true, env: {}, stdio: "ignore"',
+    "});",
+    "child.unref();",
+    `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+    ""
+  ].join("\n");
+  fs.writeFileSync(spawnHelper, helperSource(spawnPidFile));
+  fs.writeFileSync(execHelper, helperSource(execPidFile));
+  fs.chmodSync(spawnHelper, 0o700);
+  fs.chmodSync(execHelper, 0o700);
+  fs.writeFileSync(fixture, [
+    'import { execFileSync, spawnSync } from "node:child_process";',
+    `const spawned = spawnSync(${JSON.stringify(spawnHelper)}, { env: {}, stdio: "ignore" });`,
+    'if (spawned.status !== 0) throw new Error("options-only spawnSync failed");',
+    `execFileSync(${JSON.stringify(execHelper)}, { env: {}, stdio: "ignore" });`,
+    ""
+  ].join("\n"));
+  let diagnostics = "";
+  const status = runDeterministicTestFiles({
+    files: [fixture],
+    root: ROOT,
+    reporter: REPORTER,
+    tempRoot: root,
+    timeoutMs: 5_000,
+    stdout: { write() {} },
+    stderr: { write(value) { diagnostics += value; } }
+  });
+  assert.equal(status, 0, diagnostics);
+  for (const pidFile of [spawnPidFile, execPidFile]) {
+    assert.equal(await pidIsGone(Number(fs.readFileSync(pidFile, "utf8"))), true);
+  }
   assert.equal(fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)), false);
 });
 

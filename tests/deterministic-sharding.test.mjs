@@ -10,6 +10,7 @@ import {
   listDeterministicTestFiles
 } from "../scripts/test-deterministic.mjs";
 import {
+  DETERMINISTIC_SUPPORT_TEST_FILES,
   DETERMINISTIC_TEST_SHARD_COUNT,
   DETERMINISTIC_TEST_SHARDS,
   parseDeterministicShardArgument,
@@ -35,6 +36,20 @@ test("deterministic shard manifest is an exact nonempty partition of the invento
   assert.equal(new Set(combined).size, combined.length);
   assert.deepEqual([...combined].sort(), inventory);
   assert.ok(EXTERNAL_BOUNDARY_TESTS.every((file) => !combined.includes(`tests/${file}`)));
+});
+
+test("deterministic-only evidence harness is explicit and excluded from ordinary test discovery", () => {
+  assert.deepEqual(DETERMINISTIC_SUPPORT_TEST_FILES, [
+    "tests/worker-broker-evidence_part2.mjs"
+  ]);
+  const ordinary = fs.readdirSync(path.join(ROOT, "tests"))
+    .filter((name) => name.endsWith(".test.mjs"))
+    .map((name) => `tests/${name}`);
+  assert.equal(ordinary.includes("tests/worker-broker-evidence.test.mjs"), true);
+  assert.equal(ordinary.includes(DETERMINISTIC_SUPPORT_TEST_FILES[0]), false);
+  assert.equal(listDeterministicTestFiles().filter(
+    (file) => file === DETERMINISTIC_SUPPORT_TEST_FILES[0]
+  ).length, 1);
 });
 
 test("deterministic shard CLI accepts only one exact three-way shard specification", () => {

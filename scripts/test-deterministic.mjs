@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { runDeterministicTestFiles } from "./lib/deterministic-test-runner.mjs";
 import {
+  DETERMINISTIC_SUPPORT_TEST_FILES,
   DETERMINISTIC_TEST_SHARDS,
   parseDeterministicShardArgument,
   selectDeterministicTestFiles,
@@ -25,12 +26,12 @@ export const EXTERNAL_BOUNDARY_TESTS = Object.freeze([
 
 export function listDeterministicTestFiles(testRoot = TEST_ROOT) {
   const excluded = new Set(EXTERNAL_BOUNDARY_TESTS);
-  return fs.readdirSync(testRoot, { withFileTypes: true })
+  const discovered = fs.readdirSync(testRoot, { withFileTypes: true })
     .filter((entry) => entry.isFile()
       && entry.name.endsWith(".test.mjs")
       && !excluded.has(entry.name))
-    .map((entry) => `tests/${entry.name}`)
-    .sort();
+    .map((entry) => `tests/${entry.name}`);
+  return [...discovered, ...DETERMINISTIC_SUPPORT_TEST_FILES].sort();
 }
 
 export function main(argv = process.argv.slice(2)) {

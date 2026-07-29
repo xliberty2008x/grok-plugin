@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import nodeTest from "node:test";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -117,6 +117,38 @@ import zeroSkipTestReporter, {
 } from "../scripts/lib/zero-skip-test-reporter.mjs";
 import { ROOT, git, initRepo, run, tempDir, waitFor } from "./helpers.mjs";
 
+const WORKER_BROKER_EVIDENCE_PARTITION_KEY = Symbol.for(
+  "grok-plugin.worker-broker-evidence-partition"
+);
+const WORKER_BROKER_EVIDENCE_PARTITION_ENV =
+  "GROK_PLUGIN_WORKER_BROKER_EVIDENCE_PARTITION";
+const WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARY = 90;
+const configuredWorkerBrokerEvidencePartition =
+  globalThis[WORKER_BROKER_EVIDENCE_PARTITION_KEY]
+  ?? process.env[WORKER_BROKER_EVIDENCE_PARTITION_ENV];
+// Direct `node --test` runs register the complete file. The deterministic
+// runner and the part-2 entrypoint opt into disjoint registration ranges so
+// each supervised file remains below the fixed ten-minute limit.
+const workerBrokerEvidencePartition = configuredWorkerBrokerEvidencePartition == null
+  ? null
+  : Number(configuredWorkerBrokerEvidencePartition);
+if (
+  workerBrokerEvidencePartition !== null
+  && workerBrokerEvidencePartition !== 1
+  && workerBrokerEvidencePartition !== 2
+) {
+  throw new Error("Worker broker evidence test partition is invalid.");
+}
+let workerBrokerEvidenceTestOrdinal = 0;
+function test(...args) {
+  workerBrokerEvidenceTestOrdinal += 1;
+  const inPartition = workerBrokerEvidencePartition === null
+    || (workerBrokerEvidencePartition === 1
+      ? workerBrokerEvidenceTestOrdinal < WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARY
+      : workerBrokerEvidenceTestOrdinal >= WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARY);
+  return inPartition ? nodeTest(...args) : undefined;
+}
+
 const STARTED_AT = "2026-07-16T10:00:00.000Z";
 const ENDED_AT = "2026-07-16T10:00:01.000Z";
 const PRE_V5_PROOF_MANIFEST_DIGESTS = Object.freeze({
@@ -128,6 +160,7 @@ const ZERO_SKIP_REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.
 const DETERMINISTIC_CHECK_RUNNER = path.join(ROOT, "scripts/check-deterministic.mjs");
 const DETERMINISTIC_TEST_LIBRARY = path.join(ROOT, "scripts/lib/deterministic-test-runner.mjs");
 const TEST_TEMP_LIBRARY = path.join(ROOT, "scripts/lib/test-temp.mjs");
+const TEST_TEMP_CHILD_HOOK = path.join(ROOT, "scripts/lib/test-temp-child-hook.cjs");
 const TEST_TEMP_SUPERVISOR = path.join(ROOT, "scripts/lib/test-temp-supervisor.mjs");
 const REDACT_LIBRARY = path.join(ROOT, "plugins/grok/scripts/lib/redact.mjs");
 const PROTECTED_REVIEW_BOOTSTRAP = path.join(
@@ -169,6 +202,7 @@ function installPhaseOneFocusedRunner(root) {
   for (const source of [
     DETERMINISTIC_TEST_LIBRARY,
     TEST_TEMP_LIBRARY,
+    TEST_TEMP_CHILD_HOOK,
     TEST_TEMP_SUPERVISOR,
     STATIC_ESM_IMPORT_PARSER,
     PHASE_ONE_FOCUSED_RUNNER
@@ -193,6 +227,8 @@ test("deterministic zero-skip runner excludes only explicit external boundaries"
   const expected = all.filter((relative) => (
     !EXTERNAL_BOUNDARY_TESTS.includes(path.basename(relative))
   ));
+  expected.push("tests/worker-broker-evidence_part2.mjs");
+  expected.sort();
   assert.deepEqual(listDeterministicTestFiles(), expected);
 });
 
@@ -323,6 +359,42 @@ test("deterministic runner executes files sequentially and aggregates exact zero
     violations: [],
     omittedViolations: 0
   });
+});
+
+test("deterministic runner owns the evidence partition environment", () => {
+  const calls = [];
+  const status = runDeterministicTestFiles({
+    files: [
+      "tests/worker-broker-evidence.test.mjs",
+      "tests/worker-broker-evidence_part2.mjs"
+    ],
+    root: ROOT,
+    reporter: ZERO_SKIP_REPORTER,
+    env: {
+      ...process.env,
+      [WORKER_BROKER_EVIDENCE_PARTITION_ENV]: "2"
+    },
+    run(binary, args, options) {
+      calls.push({ binary, args, options });
+      return {
+        status: 0,
+        signal: null,
+        stdout: zeroSkipSummary(),
+        stderr: ""
+      };
+    },
+    stdout: { write() {} },
+    stderr: { write() {} }
+  });
+  assert.equal(status, 0);
+  assert.equal(
+    calls[0].options.env[WORKER_BROKER_EVIDENCE_PARTITION_ENV],
+    "1"
+  );
+  assert.equal(
+    Object.hasOwn(calls[1].options.env, WORKER_BROKER_EVIDENCE_PARTITION_ENV),
+    false
+  );
 });
 
 test("Phase 1 focused runner executes its fixed inventory in exact serial order", () => {

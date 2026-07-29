@@ -1,15 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import {
   TEST_TEMP_PROCESS_PREFIX,
   TEST_TEMP_RUN_PREFIX,
   canonicalSystemTempRoot,
   processStartToken,
-  readTestTempManifest,
-  removeOwnedTestTempRoot
+  readTestTempManifest
 } from "./test-temp.mjs";
 
 export const DEFAULT_TEST_TEMP_MAX_AGE_MS = 60 * 60_000;
@@ -336,8 +337,8 @@ const PS_CANDIDATES = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
 const GIT_CANDIDATES = Object.freeze(["/usr/bin/git", "/opt/homebrew/bin/git"]);
 const SIX_CHARACTER_SUFFIX = /^[A-Za-z0-9]{6}$/u;
 const MANAGED_PREFIX_KINDS = new Map([
-  [TEST_TEMP_RUN_PREFIX, "managed"],
-  [TEST_TEMP_PROCESS_PREFIX, "managed"]
+  [TEST_TEMP_RUN_PREFIX, "run"],
+  [TEST_TEMP_PROCESS_PREFIX, "process"]
 ]);
 const LEGACY_PREFIX_SET = new Set(LEGACY_TEST_TEMP_PREFIXES);
 
@@ -371,8 +372,8 @@ function isWithin(root, target) {
 function classifyName(name, legacy) {
   if (name.length <= 6 || !SIX_CHARACTER_SUFFIX.test(name.slice(-6))) return null;
   const prefix = name.slice(0, -6);
-  const managedKind = MANAGED_PREFIX_KINDS.get(prefix);
-  if (managedKind) return { prefix, kind: managedKind };
+  const manifestKind = MANAGED_PREFIX_KINDS.get(prefix);
+  if (manifestKind) return { prefix, kind: "managed", manifestKind };
   if (!legacy) return null;
   if (prefix === LEGACY_REPOSITORY_PREFIX) {
     return { prefix: LEGACY_REPOSITORY_PREFIX, kind: "legacy-repository" };
@@ -399,6 +400,67 @@ function sameIdentity(left, right) {
     && left.uid === right.uid
     && left.size === right.size
     && left.mtimeMs === right.mtimeMs;
+}
+
+const REMOVE_INVENTORIED_ROOT_HELPER = fileURLToPath(
+  new URL("./test-temp-remove-helper.cjs", import.meta.url)
+);
+
+export function removeInventoriedTestTempRoot(
+  root,
+  expectedIdentity,
+  { run = spawnSync } = {}
+) {
+  if (!root || !path.isAbsolute(root) || !expectedIdentity) return false;
+  const quarantine = path.join(
+    path.dirname(root),
+    `.grok-plugin-cleanup-quarantine-${randomUUID()}`
+  );
+  try {
+    fs.renameSync(root, quarantine);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+
+  try {
+    const result = run(process.execPath, [
+      REMOVE_INVENTORIED_ROOT_HELPER,
+      String(expectedIdentity.dev),
+      String(expectedIdentity.ino)
+    ], {
+      cwd: quarantine,
+      env: { GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1" },
+      encoding: "utf8",
+      shell: false,
+      maxBuffer: 8 * 1024
+    });
+    if (result?.status === 42 || result?.status === 43) {
+      const mismatch = new Error("The cleanup candidate identity changed before removal.");
+      mismatch.code = "E_TEST_TEMP_IDENTITY_CHANGED";
+      throw mismatch;
+    }
+    if (result?.status !== 0 || result?.error || result?.signal) {
+      throw new Error("The verified cleanup candidate could not be removed.");
+    }
+    return true;
+  } catch (error) {
+    let restored = false;
+    try {
+      fs.lstatSync(root);
+    } catch (rootError) {
+      if (rootError?.code === "ENOENT") {
+        try {
+          fs.renameSync(quarantine, root);
+          restored = true;
+        } catch {
+          // The quarantined tree is preserved and reported below.
+        }
+      }
+    }
+    if (!restored && fs.existsSync(quarantine)) error.quarantinePath = quarantine;
+    throw error;
+  }
 }
 
 function treeSize(root, budget) {
@@ -608,6 +670,7 @@ function candidateRecord({
 
   const manifest = family.kind === "managed" ? readTestTempManifest(candidate) : null;
   if (family.kind === "managed" && !manifest) reasons.push("invalid-owner-manifest");
+  if (manifest && manifest.kind !== family.manifestKind) reasons.push("manifest-kind-mismatch");
   const owner = ownerActivity(manifest, tokenForPid);
   if (!owner.known) reasons.push("owner-identity-unavailable");
   if (owner.active) reasons.push("active-owner");
@@ -649,7 +712,7 @@ export function cleanupTestTemp({
   worktreeProvider = () => captureRegisteredWorktrees(repoRoot),
   tokenForPid = processStartToken,
   beforeDelete = null,
-  removeRoot = removeOwnedTestTempRoot,
+  removeRoot = removeInventoriedTestTempRoot,
   sizeScanEntryBudget = TEST_TEMP_SIZE_SCAN_ENTRY_BUDGET,
   snapshotRefreshMs = TEST_TEMP_SNAPSHOT_REFRESH_MS,
   clock = Date.now
@@ -826,7 +889,7 @@ export function cleanupTestTemp({
         continue;
       }
       try {
-        if (!removeRoot(record.path)) {
+        if (!removeRoot(record.path, record.identity)) {
           record.eligible = false;
           record.reasons.push("candidate-disappeared");
           continue;
@@ -834,9 +897,16 @@ export function cleanupTestTemp({
         record.removed = true;
         removed += 1;
         if (Number.isSafeInteger(record.sizeBytes)) reclaimedBytes += record.sizeBytes;
-      } catch {
+      } catch (error) {
         record.eligible = false;
-        record.reasons.push("remove-failed");
+        record.reasons.push(
+          error?.code === "E_TEST_TEMP_IDENTITY_CHANGED"
+            ? "identity-changed"
+            : "remove-failed"
+        );
+        if (typeof error?.quarantinePath === "string") {
+          record.quarantinePath = error.quarantinePath;
+        }
       }
     }
   }

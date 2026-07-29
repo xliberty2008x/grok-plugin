@@ -28,6 +28,10 @@ const REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
 const SUPERVISOR = path.join(ROOT, "scripts/lib/test-temp-supervisor.mjs");
 export const DETERMINISTIC_TEST_FILE_TIMEOUT_MS = 10 * 60_000;
 const CONTAINMENT_FAILURE_EXIT_CODE = 126;
+const WORKER_BROKER_EVIDENCE_TEST =
+  "tests/worker-broker-evidence.test.mjs";
+const WORKER_BROKER_EVIDENCE_PARTITION_ENV =
+  "GROK_PLUGIN_WORKER_BROKER_EVIDENCE_PARTITION";
 const NONPASS_FIELDS = Object.freeze([
   "failed",
   "cancelled",
@@ -166,6 +170,11 @@ export function runDeterministicTestFiles({
           TEMP: fileRoot,
           [TEST_TEMP_ROOT_ENV]: fileRoot
         };
+        if (file === WORKER_BROKER_EVIDENCE_TEST) {
+          childEnvironment[WORKER_BROKER_EVIDENCE_PARTITION_ENV] = "1";
+        } else {
+          delete childEnvironment[WORKER_BROKER_EVIDENCE_PARTITION_ENV];
+        }
         // A deterministic runner can itself be exercised from node:test.
         // The private harness marker must not turn the supervisor into an
         // unintended nested test worker.
