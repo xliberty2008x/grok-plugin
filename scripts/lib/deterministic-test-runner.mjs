@@ -13,9 +13,21 @@ import {
   sanitizeZeroSkipFile,
   validateZeroSkipSummary
 } from "./zero-skip-test-reporter.mjs";
+import {
+  TEST_TEMP_FILE_PREFIX,
+  TEST_TEMP_ROOT_ENV,
+  TEST_TEMP_RUN_PREFIX,
+  canonicalSystemTempRoot,
+  createOwnedTestTempRoot,
+  newTestTempOwnerToken,
+  removeOwnedTestTempRoot
+} from "./test-temp.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
+const SUPERVISOR = path.join(ROOT, "scripts/lib/test-temp-supervisor.mjs");
+export const DETERMINISTIC_TEST_FILE_TIMEOUT_MS = 10 * 60_000;
+const CONTAINMENT_FAILURE_EXIT_CODE = 126;
 const NONPASS_FIELDS = Object.freeze([
   "failed",
   "cancelled",
@@ -95,7 +107,9 @@ export function runDeterministicTestFiles({
   run = spawnSync,
   now = () => performance.now(),
   stdout = process.stdout,
-  stderr = process.stderr
+  stderr = process.stderr,
+  timeoutMs = DETERMINISTIC_TEST_FILE_TIMEOUT_MS,
+  tempRoot = canonicalSystemTempRoot()
 } = {}) {
   if (!Array.isArray(files) || !files.length) {
     stderr.write("No deterministic test files were found.\n");
@@ -105,90 +119,169 @@ export function runDeterministicTestFiles({
   const aggregate = emptyAggregate();
   const knownSecrets = collectZeroSkipKnownSecrets(env);
   let failed = false;
-  for (let index = 0; index < files.length; index += 1) {
-    const file = files[index];
-    const child = index + 1;
-    let result;
-    let startedAt;
-    try {
-      startedAt = now();
-    } catch {
-      startedAt = 0;
-    }
-    // Emit only a fixed ordinal before the blocking child call. This keeps
-    // paths, environment values, and child output private while allowing a
-    // bounded CI timeout to identify the last child that actually started.
-    stderr.write(`Deterministic test child ${child} started.\n`);
-    try {
-      result = run(node, [
-        "--test",
-        `--test-reporter=${reporter}`,
-        file
-      ], {
-        cwd: root,
-        env,
-        shell: false,
-        encoding: "utf8",
-        maxBuffer: 1024 * 1024,
-        stdio: ["ignore", "pipe", "pipe"]
-      });
-    } catch {
-      stderr.write(
-        `Deterministic test child ${child} completed in ${elapsedMilliseconds(startedAt, now)} ms.\n`
-      );
-      stderr.write(`Deterministic test child ${child} could not start.\n`);
-      failed = true;
-      continue;
-    }
-    stderr.write(
-      `Deterministic test child ${child} completed in ${elapsedMilliseconds(startedAt, now)} ms.\n`
-    );
+  const ownerStartToken = newTestTempOwnerToken(process.pid);
+  let runRoot;
+  let preserveRunRoot = false;
+  try {
+    runRoot = createOwnedTestTempRoot({
+      base: tempRoot,
+      prefix: TEST_TEMP_RUN_PREFIX,
+      kind: "run",
+      startToken: ownerStartToken
+    });
+  } catch {
+    stderr.write("The deterministic test temp root could not be created safely.\n");
+    stdout.write(`${JSON.stringify(aggregate)}\n`);
+    return 1;
+  }
 
-    // Never forward or interpolate raw child stderr, spawn error details, paths,
-    // signals, or invalid stdout. Only fixed, ordinal diagnostics leave here.
-    if (result?.error) {
-      stderr.write(`Deterministic test child ${child} could not start.\n`);
-      failed = true;
-      continue;
-    }
-    if (result?.signal) {
-      stderr.write(`Deterministic test child ${child} ended by a signal.\n`);
-      failed = true;
-      continue;
-    }
+  try {
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      const child = index + 1;
+      let result;
+      let fileRoot;
+      let containmentUnproven = false;
+      let startedAt;
+      try {
+        startedAt = now();
+      } catch {
+        startedAt = 0;
+      }
+      // Emit only a fixed ordinal before the blocking child call. This keeps
+      // paths, environment values, and child output private while allowing a
+      // bounded CI timeout to identify the last child that actually started.
+      stderr.write(`Deterministic test child ${child} started.\n`);
+      try {
+        fileRoot = createOwnedTestTempRoot({
+          base: runRoot,
+          prefix: TEST_TEMP_FILE_PREFIX,
+          kind: "file",
+          startToken: ownerStartToken
+        });
+        const childEnvironment = {
+          ...env,
+          TMPDIR: fileRoot,
+          TMP: fileRoot,
+          TEMP: fileRoot,
+          [TEST_TEMP_ROOT_ENV]: fileRoot
+        };
+        // A deterministic runner can itself be exercised from node:test.
+        // The private harness marker must not turn the supervisor into an
+        // unintended nested test worker.
+        delete childEnvironment.NODE_TEST_CONTEXT;
+        result = run(node, [
+          SUPERVISOR,
+          "--timeout-ms",
+          String(timeoutMs),
+          "--",
+          node,
+          "--test",
+          `--test-reporter=${reporter}`,
+          file
+        ], {
+          cwd: root,
+          env: childEnvironment,
+          shell: false,
+          encoding: "utf8",
+          timeout: timeoutMs + 10_000,
+          killSignal: "SIGKILL",
+          maxBuffer: 1024 * 1024,
+          stdio: ["ignore", "pipe", "pipe"]
+        });
+      } catch {
+        stderr.write(`Deterministic test child ${child} could not start.\n`);
+        failed = true;
+        continue;
+      } finally {
+        stderr.write(
+          `Deterministic test child ${child} completed in ${elapsedMilliseconds(startedAt, now)} ms.\n`
+        );
+        containmentUnproven = result?.status === CONTAINMENT_FAILURE_EXIT_CODE
+          || result?.error?.code === "ETIMEDOUT"
+          || Boolean(result?.signal);
+        if (containmentUnproven) {
+          preserveRunRoot = true;
+          stderr.write(`Deterministic test child ${child} containment could not be proven.\n`);
+          failed = true;
+        } else if (fileRoot) {
+          try {
+            removeOwnedTestTempRoot(fileRoot);
+          } catch {
+            stderr.write(`Deterministic test child ${child} temp cleanup failed.\n`);
+            failed = true;
+          }
+        }
+      }
 
-    const summary = parseZeroSkipSummary(result?.stdout, root, knownSecrets);
-    if (!summary) {
-      stderr.write(`Deterministic test child ${child} emitted an invalid zero-skip summary.\n`);
-      failed = true;
-      continue;
-    }
+      if (containmentUnproven) break;
 
-    const nextCounts = safeAggregateCounts(aggregate, summary);
-    if (!nextCounts) {
-      stderr.write(`Deterministic test child ${child} could not be aggregated safely.\n`);
-      failed = true;
-      continue;
-    }
-    Object.assign(aggregate, nextCounts);
+      // Never forward or interpolate raw child stderr, spawn error details, paths,
+      // signals, or invalid stdout. Only fixed, ordinal diagnostics leave here.
+      if (result?.status === 124 || result?.error?.code === "ETIMEDOUT") {
+        stderr.write(`Deterministic test child ${child} timed out.\n`);
+        failed = true;
+        continue;
+      }
+      if (result?.status === CONTAINMENT_FAILURE_EXIT_CODE) {
+        failed = true;
+        continue;
+      }
+      if (result?.error) {
+        stderr.write(`Deterministic test child ${child} could not start.\n`);
+        failed = true;
+        continue;
+      }
+      if (result?.signal) {
+        stderr.write(`Deterministic test child ${child} ended by a signal.\n`);
+        failed = true;
+        continue;
+      }
 
-    const fallbackFile = sanitizeZeroSkipFile(file, root, knownSecrets);
-    for (const violation of summary.violations) {
-      if (aggregate.violations.length >= ZERO_SKIP_MAX_VIOLATIONS) break;
-      aggregate.violations.push({
-        ...violation,
-        file: violation.file ?? fallbackFile
-      });
-    }
+      const summary = parseZeroSkipSummary(result?.stdout, root, knownSecrets);
+      if (!summary) {
+        stderr.write(`Deterministic test child ${child} emitted an invalid zero-skip summary.\n`);
+        failed = true;
+        continue;
+      }
 
-    if (result.status !== 0
-      || summary.passed === 0
-      || summary.failed > 0
-      || summary.cancelled > 0
-      || summary.skipped > 0
-      || summary.todo > 0) {
-      stderr.write(`Deterministic test child ${child} failed its zero-skip gate.\n`);
-      failed = true;
+      const nextCounts = safeAggregateCounts(aggregate, summary);
+      if (!nextCounts) {
+        stderr.write(`Deterministic test child ${child} could not be aggregated safely.\n`);
+        failed = true;
+        continue;
+      }
+      Object.assign(aggregate, nextCounts);
+
+      const fallbackFile = sanitizeZeroSkipFile(file, root, knownSecrets);
+      for (const violation of summary.violations) {
+        if (aggregate.violations.length >= ZERO_SKIP_MAX_VIOLATIONS) break;
+        aggregate.violations.push({
+          ...violation,
+          file: violation.file ?? fallbackFile
+        });
+      }
+
+      if (result.status !== 0
+        || summary.passed === 0
+        || summary.failed > 0
+        || summary.cancelled > 0
+        || summary.skipped > 0
+        || summary.todo > 0) {
+        stderr.write(`Deterministic test child ${child} failed its zero-skip gate.\n`);
+        failed = true;
+      }
+    }
+  } finally {
+    if (preserveRunRoot) {
+      stderr.write("The deterministic test run temp root was preserved for stale reaping.\n");
+    } else {
+      try {
+        removeOwnedTestTempRoot(runRoot);
+      } catch {
+        stderr.write("The deterministic test run temp cleanup failed.\n");
+        failed = true;
+      }
     }
   }
 

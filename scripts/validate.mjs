@@ -286,6 +286,7 @@ if (!versionsOnly) {
     ".agents/plugins/marketplace.json",
     ".github/workflows/ci.yml",
     "scripts/validate.mjs",
+    "scripts/cleanup-test-temp.mjs",
     "scripts/lib/ci-workflow-contract.mjs",
     "scripts/test-deterministic.mjs",
     "scripts/lib/deterministic-test-runner.mjs",
@@ -298,6 +299,9 @@ if (!versionsOnly) {
     "scripts/lib/installed-worker-mcp-mailbox-poll.mjs",
     "scripts/lib/installed-worker-mcp-setup-boundary.mjs",
     "scripts/lib/installed-worker-mcp-session-boundary.mjs",
+    "scripts/lib/test-temp.mjs",
+    "scripts/lib/test-temp-cleanup.mjs",
+    "scripts/lib/test-temp-supervisor.mjs",
     "scripts/trusted/worker-broker-review-operation.cjs",
     "scripts/trusted/worker-broker-review.mjs",
     "tests/live-grok.test.mjs",
@@ -314,6 +318,7 @@ if (!versionsOnly) {
     "tests/pty-ingress.test.mjs",
     "tests/pty-stdin-driver.py",
     "tests/stdin.test.mjs",
+    "tests/test-temp-cleanup.test.mjs",
     "tests/e2e-results/macos-0.2.99-2026-07-13.json",
     "tests/e2e-results/worker-broker/phase-1-readonly-dcb78b8.json",
     "tests/windows-neutral.test.mjs",
@@ -450,7 +455,7 @@ if (!versionsOnly) {
     if (packageJson.type !== "module") problem("The package must use ESM (`type: module`).", "package.json");
     if (packageJson.license !== "Apache-2.0") problem("Package license must be Apache-2.0.", "package.json");
     if (packageJson.engines?.node !== ">=18.18") problem("Node engine must remain >=18.18.", "package.json");
-    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "test:protected-review", "test:installed-worker-mcp", "codex:update-local", "validate", "version:check", "version:bump", "check"]) {
+    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "test:protected-review", "test:installed-worker-mcp", "test:temp:cleanup", "codex:update-local", "validate", "version:check", "version:bump", "check"]) {
       if (!packageJson.scripts?.[script]) problem(`Missing npm script: ${script}.`, "package.json");
     }
     if (packageJson.scripts?.["test:pty-ingress"] !== "node --test tests/pty-ingress.test.mjs") {
@@ -468,6 +473,9 @@ if (!versionsOnly) {
     }
     if (packageJson.scripts?.["test:deterministic"] !== "node scripts/test-deterministic.mjs") {
       problem("test:deterministic must execute the zero-skip deterministic runner directly.", "package.json");
+    }
+    if (packageJson.scripts?.["test:temp:cleanup"] !== "node scripts/cleanup-test-temp.mjs") {
+      problem("test:temp:cleanup must execute the guarded test-temp cleanup command directly.", "package.json");
     }
     if (packageJson.scripts?.check !== "npm run validate && npm run test:deterministic") {
       problem("check must run validation and the zero-skip deterministic suite.", "package.json");

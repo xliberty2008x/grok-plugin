@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
@@ -126,6 +127,8 @@ const EVIDENCE_MODULE_URL = new URL("../scripts/lib/worker-broker-evidence.mjs",
 const ZERO_SKIP_REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
 const DETERMINISTIC_CHECK_RUNNER = path.join(ROOT, "scripts/check-deterministic.mjs");
 const DETERMINISTIC_TEST_LIBRARY = path.join(ROOT, "scripts/lib/deterministic-test-runner.mjs");
+const TEST_TEMP_LIBRARY = path.join(ROOT, "scripts/lib/test-temp.mjs");
+const TEST_TEMP_SUPERVISOR = path.join(ROOT, "scripts/lib/test-temp-supervisor.mjs");
 const REDACT_LIBRARY = path.join(ROOT, "plugins/grok/scripts/lib/redact.mjs");
 const PROTECTED_REVIEW_BOOTSTRAP = path.join(
   ROOT,
@@ -165,6 +168,8 @@ function installZeroSkipReporter(root) {
 function installPhaseOneFocusedRunner(root) {
   for (const source of [
     DETERMINISTIC_TEST_LIBRARY,
+    TEST_TEMP_LIBRARY,
+    TEST_TEMP_SUPERVISOR,
     STATIC_ESM_IMPORT_PARSER,
     PHASE_ONE_FOCUSED_RUNNER
   ]) {
@@ -291,6 +296,11 @@ test("deterministic runner executes files sequentially and aggregates exact zero
     "Deterministic test child 2 completed in 50 ms.\n"
   ]);
   assert.deepEqual(calls.map((call) => call.args), files.map((file) => [
+    TEST_TEMP_SUPERVISOR,
+    "--timeout-ms",
+    "600000",
+    "--",
+    "/exact/node",
     "--test",
     "--test-reporter=/exact/reporter.mjs",
     file
@@ -298,7 +308,11 @@ test("deterministic runner executes files sequentially and aggregates exact zero
   assert.ok(calls.every((call) => call.binary === "/exact/node"));
   assert.ok(calls.every((call) => call.options.cwd === "/exact/root"));
   assert.ok(calls.every((call) => call.options.shell === false));
+  assert.ok(calls.every((call) => call.options.timeout === 610000));
+  assert.ok(calls.every((call) => call.options.killSignal === "SIGKILL"));
   assert.ok(calls.every((call) => call.options.maxBuffer === 1024 * 1024));
+  assert.ok(calls.every((call) => call.options.env.TMPDIR === call.options.env.TMP));
+  assert.ok(calls.every((call) => call.options.env.TMPDIR === call.options.env.TEMP));
   assert.deepEqual(JSON.parse(output), {
     reporter: ZERO_SKIP_REPORTER_ID,
     passed: 3,
@@ -370,7 +384,9 @@ test("Phase 3 focused runner is fixed, serial, and fails closed on TODO", () => 
   assert.equal(summary.skipped, 0);
 });
 
-test("deterministic runner fails closed on malformed, partial, or non-passing child results", () => {
+test("deterministic runner fails closed on malformed, partial, or non-passing child results", (t) => {
+  const tempRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "runner-failures-")));
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
   const cases = [
     {
       label: "malformed-summary",
@@ -419,7 +435,7 @@ test("deterministic runner fails closed on malformed, partial, or non-passing ch
     {
       label: "signal",
       result: { status: null, signal: "SIGTERM", stdout: "", stderr: "" },
-      message: /ended by a signal/
+      message: /containment could not be proven/
     },
     {
       label: "spawn-error",
@@ -432,6 +448,7 @@ test("deterministic runner fails closed on malformed, partial, or non-passing ch
     let diagnostic = "";
     const status = runDeterministicTestFiles({
       files: [`tests/${fixture.label}.test.mjs`],
+      tempRoot,
       run: () => fixture.result,
       stdout: { write(value) { output += value; } },
       stderr: { write(value) { diagnostic += value; } }

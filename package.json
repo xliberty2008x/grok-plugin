@@ -10,6 +10,7 @@
   "scripts": {
     "test": "node --test tests/*.test.mjs",
     "test:deterministic": "node scripts/test-deterministic.mjs",
+    "test:temp:cleanup": "node scripts/cleanup-test-temp.mjs",
     "test:e2e": "node --test tests/live-grok.test.mjs",
     "test:pty-ingress": "node --test tests/pty-ingress.test.mjs",
     "test:installed-codex": "node --test tests/installed-codex.test.mjs",
