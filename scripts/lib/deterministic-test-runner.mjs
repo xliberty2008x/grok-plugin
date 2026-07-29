@@ -29,7 +29,7 @@ const SUPERVISOR = path.join(ROOT, "scripts/lib/test-temp-supervisor.mjs");
 export const DETERMINISTIC_TEST_FILE_TIMEOUT_MS = 10 * 60_000;
 const CONTAINMENT_FAILURE_EXIT_CODE = 126;
 const CONTAINMENT_REASON_PATTERN =
-  /(?:^|\n)grok-plugin-containment-v1:(unsupported-platform|startup-visibility|visibility-monitor|post-close-inspection|termination-incomplete-group|termination-incomplete-owned|termination-incomplete-unknown)(?:\n|$)/u;
+  /(?:^|\n)grok-plugin-containment-v1:(unsupported-platform|startup-visibility|visibility-monitor-token|visibility-monitor-proc|visibility-monitor-unknown|post-close-inspection|termination-incomplete-group|termination-incomplete-owned|termination-incomplete-unknown)(?:\n|$)/u;
 const WORKER_BROKER_EVIDENCE_TEST =
   "tests/worker-broker-evidence.test.mjs";
 const WORKER_BROKER_EVIDENCE_PARTITION_ENV =

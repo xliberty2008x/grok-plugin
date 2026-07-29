@@ -23,7 +23,9 @@ const CONTAINMENT_DIAGNOSTIC_PREFIX = "grok-plugin-containment-v1:";
 const CONTAINMENT_REASONS = new Set([
   "unsupported-platform",
   "startup-visibility",
-  "visibility-monitor",
+  "visibility-monitor-token",
+  "visibility-monitor-proc",
+  "visibility-monitor-unknown",
   "post-close-inspection",
   "termination-incomplete-group",
   "termination-incomplete-owned",
@@ -38,6 +40,12 @@ function containmentFailure(reason) {
   const safeReason = CONTAINMENT_REASONS.has(reason) ? reason : "termination-incomplete-unknown";
   process.stderr.write(`${CONTAINMENT_DIAGNOSTIC_PREFIX}${safeReason}\n`);
   return CONTAINMENT_FAILURE_EXIT_CODE;
+}
+
+function visibilityError(code) {
+  const error = new Error("Owned-process visibility is unavailable.");
+  error.code = code;
+  return error;
 }
 
 function parseArgs(argv) {
@@ -243,10 +251,16 @@ function ownedProcessIds(token, tempIdentity) {
   if (process.platform === "win32") return [];
   if (process.platform === "linux") {
     if (provenLinuxVisibilityToken !== token) {
-      throw new Error("Owned-process visibility is unavailable.");
+      throw visibilityError("E_TEST_TEMP_VISIBILITY_TOKEN");
+    }
+    let processEntries;
+    try {
+      processEntries = fs.readdirSync("/proc", { withFileTypes: true });
+    } catch {
+      throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
     }
     const ids = [];
-    for (const entry of fs.readdirSync("/proc", { withFileTypes: true })) {
+    for (const entry of processEntries) {
       if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
       const pid = Number(entry.name);
       try {
@@ -614,11 +628,19 @@ async function main() {
   });
   let containmentMonitor = null;
   if (process.platform === "linux") {
+    let consecutiveVisibilityFailures = 0;
     containmentMonitor = setInterval(() => {
       try {
         ownedProcessIds(ownershipToken, tempIdentity);
-      } catch {
-        containmentReason = "visibility-monitor";
+        consecutiveVisibilityFailures = 0;
+      } catch (error) {
+        consecutiveVisibilityFailures += 1;
+        if (consecutiveVisibilityFailures < 4) return;
+        containmentReason = error?.code === "E_TEST_TEMP_VISIBILITY_TOKEN"
+          ? "visibility-monitor-token"
+          : error?.code === "E_TEST_TEMP_VISIBILITY_PROC"
+            ? "visibility-monitor-proc"
+            : "visibility-monitor-unknown";
         resolveContainmentFailure("containment-failure");
       }
     }, 25);
@@ -670,7 +692,7 @@ async function main() {
 
   if (!overflow && chunks.length) fs.writeSync(process.stdout.fd, Buffer.concat(chunks));
   if (!contained) return containmentFailure(containmentReason);
-  if (outcome === "containment-failure") return containmentFailure("visibility-monitor");
+  if (outcome === "containment-failure") return containmentFailure(containmentReason);
   if (overflow) return OUTPUT_LIMIT_EXIT_CODE;
   if (outcome === "timeout") return TIMEOUT_EXIT_CODE;
   if (interrupted) return 130;
