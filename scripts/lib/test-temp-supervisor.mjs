@@ -21,6 +21,8 @@ const SUPERVISOR_AUTHORITY_SYMBOL = Symbol.for(
 );
 const PID_REGISTRY_BASENAME = ".grok-plugin-owned-pids";
 const CHILD_HOOK_BYPASS_ENV = "GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS";
+const WORKER_BROKER_EVIDENCE_PARTITION_ENV =
+  "GROK_PLUGIN_WORKER_BROKER_EVIDENCE_PARTITION";
 const PS_PATHS = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
 const CHILD_HOOK = fileURLToPath(new URL("./test-temp-child-hook.cjs", import.meta.url));
 const PIDFD_SIGNAL_HELPER = fileURLToPath(
@@ -56,6 +58,14 @@ function containmentFailure(reason) {
   const safeReason = CONTAINMENT_REASONS.has(reason) ? reason : "termination-incomplete-unknown";
   process.stderr.write(`${CONTAINMENT_DIAGNOSTIC_PREFIX}${safeReason}\n`);
   return CONTAINMENT_FAILURE_EXIT_CODE;
+}
+
+export function consumeWorkerBrokerEvidencePartition(environment) {
+  if (!environment || typeof environment !== "object") return false;
+  const selected =
+    environment[WORKER_BROKER_EVIDENCE_PARTITION_ENV] === "1";
+  delete environment[WORKER_BROKER_EVIDENCE_PARTITION_ENV];
+  return selected;
 }
 
 function visibilityError(code) {
@@ -898,6 +908,8 @@ async function main() {
     process.stderr.write(usage());
     return 2;
   }
+  const workerBrokerEvidencePartition =
+    consumeWorkerBrokerEvidencePartition(process.env);
 
   const ownershipToken = randomUUID();
   const tempIdentity = privateTempIdentity();
@@ -962,6 +974,9 @@ async function main() {
         GROK_PLUGIN_TEST_SUPERVISOR_PID: String(process.pid),
         [OWNERSHIP_TOKEN_ENV]: ownershipToken,
         [PID_REGISTRY_SECRET_ENV]: pidRegistrySecret,
+        ...(workerBrokerEvidencePartition
+          ? { [WORKER_BROKER_EVIDENCE_PARTITION_ENV]: "1" }
+          : {}),
         NODE_OPTIONS: supervisorNodeOptions
       },
       shell: false,

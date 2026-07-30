@@ -10,6 +10,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { cleanupExitCode, parseCleanupArgs } from "../scripts/cleanup-test-temp.mjs";
 import { runDeterministicTestFiles } from "../scripts/lib/deterministic-test-runner.mjs";
 import {
+  consumeWorkerBrokerEvidencePartition,
   environmentProvesOwnership,
   linuxKnownProcessIdentityMatches,
   linuxProcessGroupMemberFromStat,
@@ -1275,6 +1276,21 @@ test("worker broker evidence partition fails closed without supervisor authority
     result.stderr,
     /Worker broker evidence partition authority could not be established/
   );
+});
+
+test("supervisor consumes the evidence partition marker before ownership probes", () => {
+  const environment = {
+    GROK_PLUGIN_WORKER_BROKER_EVIDENCE_PARTITION: "1",
+    PRESERVED: "yes"
+  };
+  assert.equal(consumeWorkerBrokerEvidencePartition(environment), true);
+  assert.deepEqual(environment, { PRESERVED: "yes" });
+
+  const unselected = {
+    GROK_PLUGIN_WORKER_BROKER_EVIDENCE_PARTITION: "decoy"
+  };
+  assert.equal(consumeWorkerBrokerEvidencePartition(unselected), false);
+  assert.deepEqual(unselected, {});
 });
 
 test("async spawn kills the exact child immediately when ownership registration cannot be written", async (t) => {
