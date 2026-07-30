@@ -10,6 +10,11 @@ const BYPASS_ENVIRONMENT_KEY = "GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS";
 const PID_REGISTRY_ENVIRONMENT_KEY = "GROK_PLUGIN_TEST_PID_REGISTRY";
 const PID_REGISTRY_SECRET_ENVIRONMENT_KEY = "GROK_PLUGIN_TEST_PID_REGISTRY_SECRET";
 const SUPERVISOR_PID_ENVIRONMENT_KEY = "GROK_PLUGIN_TEST_SUPERVISOR_PID";
+const WORKER_BROKER_EVIDENCE_PARTITION_ENVIRONMENT_KEY =
+  "GROK_PLUGIN_WORKER_BROKER_EVIDENCE_PARTITION";
+const WORKER_BROKER_EVIDENCE_PARTITION_SYMBOL = Symbol.for(
+  "grok-plugin.worker-broker-evidence-partition"
+);
 const SUPERVISOR_AUTHORITY_SYMBOL = Symbol.for(
   "grok-plugin.testSupervisorAuthority"
 );
@@ -77,6 +82,46 @@ function isDirectNodeLaunch(file) {
   return path.resolve(String(file || "")) === path.resolve(process.execPath);
 }
 
+function isTrustedSupervisorEntrypoint(candidate) {
+  const selected = path.resolve(String(candidate || ""));
+  if (
+    !path.isAbsolute(String(candidate || ""))
+    || path.basename(selected) !== path.basename(SUPERVISOR_HELPER)
+  ) {
+    return false;
+  }
+  try {
+    const selectedStat = fs.lstatSync(selected);
+    const trustedStat = fs.lstatSync(SUPERVISOR_HELPER);
+    if (
+      !selectedStat.isFile()
+      || selectedStat.isSymbolicLink()
+      || !trustedStat.isFile()
+      || trustedStat.isSymbolicLink()
+      || selectedStat.size !== trustedStat.size
+      || selectedStat.size > 1024 * 1024
+      || (
+        typeof process.getuid === "function"
+        && (
+          selectedStat.uid !== process.getuid()
+          || trustedStat.uid !== process.getuid()
+        )
+      )
+      || fs.realpathSync(selected) !== selected
+    ) {
+      return false;
+    }
+    const selectedContents = fs.readFileSync(selected);
+    const trustedContents = fs.readFileSync(SUPERVISOR_HELPER);
+    return (
+      selectedContents.length === trustedContents.length
+      && crypto.timingSafeEqual(selectedContents, trustedContents)
+    );
+  } catch {
+    return false;
+  }
+}
+
 function forcedEnvironment({
   nestedSupervisor = false,
   includeRegistrySecret = false
@@ -84,8 +129,10 @@ function forcedEnvironment({
   const selected = { ...activeAuthority() };
   if (nestedSupervisor) {
     delete selected[PID_REGISTRY_ENVIRONMENT_KEY];
+    delete selected.GROK_PLUGIN_TEST_SUPERVISOR_TOKEN;
     delete selected.GROK_PLUGIN_TEST_TEMP_ROOT;
     delete selected[SUPERVISOR_PID_ENVIRONMENT_KEY];
+    delete selected.NODE_OPTIONS;
   }
   const registrySecret = activeRegistrySecret();
   if (registrySecret && !nestedSupervisor && includeRegistrySecret) {
@@ -96,14 +143,26 @@ function forcedEnvironment({
 
 function isNestedSupervisorLaunch(file, args) {
   return (
-    file === process.execPath
+    path.resolve(String(file || "")) === path.resolve(process.execPath)
     && Array.isArray(args)
-    && path.resolve(String(args[0] || "")) === SUPERVISOR_HELPER
+    && isTrustedSupervisorEntrypoint(args[0])
   );
 }
 
 function syncBypassAuthorized(file, args, options) {
   if (options?.env?.[BYPASS_ENVIRONMENT_KEY] !== "1") return false;
+  if (
+    capturedSupervisorEntrypoint
+    && (file === "/bin/ps" || file === "/usr/bin/ps")
+    && Array.isArray(args)
+    && options.shell === false
+    && Number.isFinite(options.timeout)
+    && options.timeout <= 2_000
+    && Number.isFinite(options.maxBuffer)
+    && options.maxBuffer <= 128 * 1024 * 1024
+  ) {
+    return true;
+  }
   return (
     file === process.execPath
     && Array.isArray(args)
@@ -221,6 +280,13 @@ function waitForRegistrationAcknowledgement(registry, registration, registrySecr
   throw error;
 }
 
+function registrationFailure(registration, code) {
+  const error = new Error("Child ownership could not be registered safely.");
+  error.code = code;
+  error.registration = registration;
+  return error;
+}
+
 function appendProcessRegistration(pid, expectedParentPid = null) {
   const authority = activeAuthority();
   const registry = authority[PID_REGISTRY_ENVIRONMENT_KEY];
@@ -241,9 +307,12 @@ function appendProcessRegistration(pid, expectedParentPid = null) {
     .update(registration)
     .digest("hex");
   let descriptor;
+  let wroteRegistration = false;
   try {
     const before = fs.lstatSync(registry);
-    if (!before.isFile() || before.isSymbolicLink()) return;
+    if (!before.isFile() || before.isSymbolicLink()) {
+      throw registrationFailure(registration, "E_TEST_TEMP_REGISTRATION_WRITE");
+    }
     descriptor = fs.openSync(
       registry,
       fs.constants.O_WRONLY
@@ -256,15 +325,47 @@ function appendProcessRegistration(pid, expectedParentPid = null) {
       || opened.dev !== before.dev
       || opened.ino !== before.ino
     ) {
-      return;
+      throw registrationFailure(registration, "E_TEST_TEMP_REGISTRATION_WRITE");
     }
     fs.writeSync(descriptor, `${registration}:${signature}\n`, null, "utf8");
-  } catch {
-    // The supervisor still has process-group and environment visibility.
+    wroteRegistration = true;
+  } catch (error) {
+    if (capturedSupervisorEntrypoint) return;
+    if (error?.code?.startsWith?.("E_TEST_TEMP_REGISTRATION_")) throw error;
+    throw registrationFailure(registration, "E_TEST_TEMP_REGISTRATION_WRITE");
   } finally {
     if (Number.isInteger(descriptor)) fs.closeSync(descriptor);
   }
+  if (!wroteRegistration) return;
   waitForRegistrationAcknowledgement(registry, registration, registrySecret);
+}
+
+function installWorkerBrokerEvidencePartitionAuthority() {
+  const partition = process.env[
+    WORKER_BROKER_EVIDENCE_PARTITION_ENVIRONMENT_KEY
+  ];
+  delete process.env[WORKER_BROKER_EVIDENCE_PARTITION_ENVIRONMENT_KEY];
+  if (partition !== "1" || capturedSupervisorEntrypoint) return;
+  const authority = activeAuthority();
+  const supervisorPid = Number(
+    authority[SUPERVISOR_PID_ENVIRONMENT_KEY]
+  );
+  const registry = authority[PID_REGISTRY_ENVIRONMENT_KEY];
+  const tempRoot = authority.GROK_PLUGIN_TEST_TEMP_ROOT;
+  const registrySecret = activeRegistrySecret();
+  if (
+    !Number.isSafeInteger(supervisorPid)
+    || supervisorPid <= 1
+    || !path.isAbsolute(registry || "")
+    || !path.isAbsolute(tempRoot || "")
+    || path.dirname(registry) !== path.resolve(tempRoot)
+    || typeof registrySecret !== "string"
+    || registrySecret.length < 32
+    || processRegistration(process.pid, supervisorPid) === null
+  ) {
+    return;
+  }
+  globalThis[WORKER_BROKER_EVIDENCE_PARTITION_SYMBOL] = 1;
 }
 
 function selectedEnvironment(keys) {
@@ -294,7 +395,9 @@ function injectObjectEnvironment(
   }
   if (nestedSupervisor) {
     delete environment[PID_REGISTRY_ENVIRONMENT_KEY];
+    delete environment.GROK_PLUGIN_TEST_SUPERVISOR_TOKEN;
     delete environment[SUPERVISOR_PID_ENVIRONMENT_KEY];
+    delete environment.NODE_OPTIONS;
   }
   return {
     ...options,
@@ -308,9 +411,20 @@ function environmentPairKey(entry) {
   return separator === -1 ? text : text.slice(0, separator);
 }
 
+function environmentPairValue(entry) {
+  const text = String(entry);
+  const separator = text.indexOf("=");
+  return separator === -1 ? "" : text.slice(separator + 1);
+}
+
 const originalSpawn = childProcess.ChildProcess.prototype.spawn;
 childProcess.ChildProcess.prototype.spawn = function spawnWithTestOwnership(options) {
+  const nestedSupervisor = isNestedSupervisorLaunch(
+    options?.file,
+    Array.isArray(options?.args) ? options.args.slice(1) : []
+  );
   const forced = forcedEnvironment({
+    nestedSupervisor,
     includeRegistrySecret: isDirectNodeLaunch(options?.file)
   });
   const fallback = capturedFallbackEnvironment;
@@ -318,10 +432,25 @@ childProcess.ChildProcess.prototype.spawn = function spawnWithTestOwnership(opti
     ...Object.keys(forced),
     PID_REGISTRY_SECRET_ENVIRONMENT_KEY
   ]);
+  if (nestedSupervisor) {
+    forcedKeys.add(PID_REGISTRY_ENVIRONMENT_KEY);
+    forcedKeys.add("GROK_PLUGIN_TEST_SUPERVISOR_TOKEN");
+    forcedKeys.add(SUPERVISOR_PID_ENVIRONMENT_KEY);
+    forcedKeys.add("NODE_OPTIONS");
+  }
   const providedKeys = new Set((options?.envPairs || [])
     .map(environmentPairKey));
+  const inheritedTempRoot = activeAuthority().GROK_PLUGIN_TEST_TEMP_ROOT;
   const envPairs = Array.isArray(options?.envPairs)
-    ? options.envPairs.filter((entry) => !forcedKeys.has(environmentPairKey(entry)))
+    ? options.envPairs.filter((entry) => {
+        const key = environmentPairKey(entry);
+        if (forcedKeys.has(key)) return false;
+        return !(
+          nestedSupervisor
+          && key === "GROK_PLUGIN_TEST_TEMP_ROOT"
+          && environmentPairValue(entry) === inheritedTempRoot
+        );
+      })
     : [];
   for (const [key, value] of Object.entries(fallback)) {
     if (!providedKeys.has(key)) envPairs.push(`${key}=${value}`);
@@ -329,7 +458,21 @@ childProcess.ChildProcess.prototype.spawn = function spawnWithTestOwnership(opti
   for (const [key, value] of Object.entries(forced)) envPairs.push(`${key}=${value}`);
   const result = originalSpawn.call(this, { ...options, envPairs });
   if (process.platform === "linux" || process.platform === "darwin") {
-    appendProcessRegistration(this.pid, process.pid);
+    try {
+      appendProcessRegistration(this.pid, process.pid);
+    } catch (error) {
+      if (
+        typeof error?.registration === "string"
+        && processRegistration(this.pid) === error.registration
+      ) {
+        try {
+          this.kill("SIGKILL");
+        } catch {
+          // The supervisor still observes the failed containment boundary.
+        }
+      }
+      throw error;
+    }
   }
   return result;
 };
@@ -378,4 +521,5 @@ if (
   appendProcessRegistration(process.pid);
 }
 
+installWorkerBrokerEvidencePartitionAuthority();
 syncBuiltinESMExports();

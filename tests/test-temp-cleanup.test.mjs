@@ -33,6 +33,7 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
 const REMOVE_HELPER = path.join(ROOT, "scripts/lib/test-temp-remove-helper.cjs");
+const CHILD_HOOK = path.join(ROOT, "scripts/lib/test-temp-child-hook.cjs");
 const PIDFD_SIGNAL_HELPER = path.join(ROOT, "scripts/lib/test-temp-pidfd-signal.py");
 const OLD_MS = 2 * 60 * 60_000;
 const TEST_OWNERSHIP_ENVIRONMENT_KEYS = Object.freeze([
@@ -976,7 +977,10 @@ test("deterministic runner preserves an outside canary swapped into an owned fil
   });
   const swappedRoot = fs.readFileSync(controlFile, "utf8");
   assert.equal(status, 1);
-  assert.match(diagnostics, /temp cleanup failed/);
+  assert.match(
+    diagnostics,
+    /(?:temp cleanup failed|containment could not be proven)/
+  );
   assert.match(diagnostics, /run temp root was preserved/);
   assert.equal(fs.readFileSync(path.join(swappedRoot, "must-survive.txt"), "utf8"), "outside\n");
   assert.equal(
@@ -1262,6 +1266,60 @@ test("supervisor fails closed when its signed PID registry is replaced, truncate
       1
     );
   }
+});
+
+test("async spawn kills the exact child immediately when ownership registration cannot be written", async (t) => {
+  if (process.platform !== "linux" && process.platform !== "darwin") return;
+  const root = sandbox(t);
+  const invalidRegistry = path.join(root, "invalid-registry");
+  const evidenceFile = path.join(root, "registration-write-failure.json");
+  const driver = path.join(root, "registration-write-failure.mjs");
+  fs.mkdirSync(invalidRegistry);
+  fs.writeFileSync(driver, [
+    'import fs from "node:fs";',
+    'import process from "node:process";',
+    'import { spawn } from "node:child_process";',
+    "const startedAt = Date.now();",
+    "let failure = null;",
+    "try {",
+    '  spawn(process.execPath, ["--eval", "setInterval(() => {}, 1000)"], { stdio: "ignore" });',
+    "} catch (error) {",
+    "  failure = {",
+    "    code: error?.code || null,",
+    "    registration: error?.registration || null,",
+    "    elapsedMs: Date.now() - startedAt",
+    "  };",
+    "}",
+    `fs.writeFileSync(${JSON.stringify(evidenceFile)}, JSON.stringify(failure));`,
+    ""
+  ].join("\n"));
+  const result = spawnSync("/usr/bin/env", [
+    "GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS=1",
+    `GROK_PLUGIN_TEST_PID_REGISTRY=${invalidRegistry}`,
+    `GROK_PLUGIN_TEST_PID_REGISTRY_SECRET=${"r".repeat(32)}`,
+    `GROK_PLUGIN_TEST_SUPERVISOR_PID=${process.pid}`,
+    `GROK_PLUGIN_TEST_SUPERVISOR_TOKEN=${"t".repeat(32)}`,
+    `GROK_PLUGIN_TEST_TEMP_ROOT=${root}`,
+    `NODE_OPTIONS=--require=${CHILD_HOOK}`,
+    process.execPath,
+    driver
+  ], {
+    cwd: ROOT,
+    env: {},
+    encoding: "utf8",
+    shell: false,
+    timeout: 5_000
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const evidence = JSON.parse(fs.readFileSync(evidenceFile, "utf8"));
+  assert.equal(evidence.code, "E_TEST_TEMP_REGISTRATION_WRITE");
+  assert.match(evidence.registration, /^\d+:(?:m[0-9a-f]+|\d+)$/);
+  assert.ok(
+    evidence.elapsedMs < 2_000,
+    `registration failure took ${evidence.elapsedMs} ms`
+  );
+  const childPid = Number(evidence.registration.split(":", 1)[0]);
+  assert.equal(await pidIsGone(childPid), true);
 });
 
 test("supervisor ownership propagates through an async execFile chain", async (t) => {

@@ -248,6 +248,12 @@ export function removeOwnedTestTempRoot(root) {
     if (result?.status !== 0 || result?.error || result?.signal) {
       throw new Error("The identity-pinned test-temp root could not be removed.");
     }
+    try {
+      fs.lstatSync(quarantine);
+      throw new Error("The identity-pinned test-temp root still exists after removal.");
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
     createdRootIdentities.delete(root);
     return true;
   } catch (error) {

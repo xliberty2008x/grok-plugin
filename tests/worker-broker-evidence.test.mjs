@@ -125,8 +125,7 @@ const WORKER_BROKER_EVIDENCE_PARTITION_ENV =
 const WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES = Object.freeze([90, 102, 115]);
 const WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT = 125;
 const configuredWorkerBrokerEvidencePartition =
-  globalThis[WORKER_BROKER_EVIDENCE_PARTITION_KEY]
-  ?? process.env[WORKER_BROKER_EVIDENCE_PARTITION_ENV];
+  globalThis[WORKER_BROKER_EVIDENCE_PARTITION_KEY];
 // Direct `node --test` runs register the complete file. The deterministic
 // runner and the support entrypoints opt into disjoint registration ranges so
 // each supervised file remains below the fixed ten-minute limit.
@@ -143,6 +142,7 @@ if (
   throw new Error("Worker broker evidence test partition is invalid.");
 }
 let workerBrokerEvidenceTestOrdinal = 0;
+let workerBrokerEvidenceRegisteredCount = 0;
 function registerPartitionedTest(register, args) {
   workerBrokerEvidenceTestOrdinal += 1;
   const inPartition = workerBrokerEvidencePartition === null
@@ -156,7 +156,9 @@ function registerPartitionedTest(register, args) {
           workerBrokerEvidencePartition - 1
         ] ?? Number.POSITIVE_INFINITY)
     );
-  return inPartition ? register(...args) : undefined;
+  if (!inPartition) return undefined;
+  workerBrokerEvidenceRegisteredCount += 1;
+  return register(...args);
 }
 function test(...args) {
   return registerPartitionedTest(nodeTest, args);
@@ -181,6 +183,10 @@ const DETERMINISTIC_TEST_LIBRARY = path.join(ROOT, "scripts/lib/deterministic-te
 const TEST_TEMP_LIBRARY = path.join(ROOT, "scripts/lib/test-temp.mjs");
 const TEST_TEMP_CHILD_HOOK = path.join(ROOT, "scripts/lib/test-temp-child-hook.cjs");
 const TEST_TEMP_PIDFD_SIGNAL = path.join(ROOT, "scripts/lib/test-temp-pidfd-signal.py");
+const TEST_TEMP_REMOVE_HELPER = path.join(
+  ROOT,
+  "scripts/lib/test-temp-remove-helper.cjs"
+);
 const TEST_TEMP_SUPERVISOR = path.join(ROOT, "scripts/lib/test-temp-supervisor.mjs");
 const REDACT_LIBRARY = path.join(ROOT, "plugins/grok/scripts/lib/redact.mjs");
 const PROTECTED_REVIEW_BOOTSTRAP = path.join(
@@ -224,6 +230,7 @@ function installPhaseOneFocusedRunner(root) {
     TEST_TEMP_LIBRARY,
     TEST_TEMP_CHILD_HOOK,
     TEST_TEMP_PIDFD_SIGNAL,
+    TEST_TEMP_REMOVE_HELPER,
     TEST_TEMP_SUPERVISOR,
     STATIC_ESM_IMPORT_PARSER,
     PHASE_ONE_FOCUSED_RUNNER
@@ -8842,5 +8849,27 @@ test("qualify CLI fails closed when it only records skipped live work", () => {
 if (workerBrokerEvidenceTestOrdinal !== WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT) {
   throw new Error(
     `Worker broker evidence partitions must be rebalanced after ${workerBrokerEvidenceTestOrdinal} registrations.`
+  );
+}
+const expectedWorkerBrokerEvidenceRegisteredCount = workerBrokerEvidencePartition === null
+  ? WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT
+  : [
+      WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[0] - 1,
+      WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[1]
+        - WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[0],
+      WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[2]
+        - WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[1],
+      WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT
+        - WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[2]
+        + 1
+    ][workerBrokerEvidencePartition - 1];
+if (
+  workerBrokerEvidenceRegisteredCount
+    !== expectedWorkerBrokerEvidenceRegisteredCount
+) {
+  throw new Error(
+    `Worker broker evidence partition ${workerBrokerEvidencePartition ?? "all"} registered `
+      + `${workerBrokerEvidenceRegisteredCount} tests instead of `
+      + `${expectedWorkerBrokerEvidenceRegisteredCount}.`
   );
 }
