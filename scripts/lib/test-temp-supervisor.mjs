@@ -834,49 +834,18 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function processGroupAlive(child) {
+export function processGroupAlive(
+  child,
+  { platform = process.platform } = {}
+) {
   if (!child?.pid) return false;
-  if (process.platform === "win32") return child.exitCode == null && child.signalCode == null;
-  if (process.platform === "linux") {
-    let kernelReportsGroup = true;
-    try {
-      process.kill(-child.pid, 0);
-    } catch (error) {
-      if (error?.code === "ESRCH") return false;
-      if (error?.code !== "EPERM") throw error;
-    }
-    let sawMember = false;
-    for (const entry of fs.readdirSync("/proc", { withFileTypes: true })) {
-      if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
-      try {
-        const pid = Number(entry.name);
-        const stat = fs.readFileSync(path.join("/proc", entry.name, "stat"), "utf8");
-        const member = linuxProcessGroupMemberFromStat(pid, stat);
-        if (member?.processGroupId !== child.pid) continue;
-        sawMember = true;
-        if (!member.terminal) return true;
-      } catch {
-        // A vanished or unrelated protected process is resolved by the final
-        // kernel group check below.
-      }
-    }
-    if (sawMember) return false;
-    try {
-      process.kill(-child.pid, 0);
-    } catch (error) {
-      if (error?.code === "ESRCH") kernelReportsGroup = false;
-      else if (error?.code !== "EPERM") throw error;
-    }
-    return kernelReportsGroup;
-  }
-  try {
-    process.kill(-child.pid, 0);
-    return true;
-  } catch (error) {
-    if (error?.code === "ESRCH") return false;
-    if (error?.code === "EPERM") return true;
-    throw error;
-  }
+  // A POSIX PGID is only a reusable number once its leader exits. It cannot
+  // prove that a remaining group belongs to this supervisor, and this module
+  // deliberately refuses to signal a bare POSIX PGID for the same reason.
+  // Exact token, registry, and PID/start identities in ownedProcessIds() are
+  // the sole POSIX liveness authority.
+  if (platform !== "win32") return false;
+  return child.exitCode == null && child.signalCode == null;
 }
 
 function ownedProcessesAlive(child, token, tempIdentity) {

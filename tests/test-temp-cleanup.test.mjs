@@ -20,6 +20,7 @@ import {
   linuxProcessGroupMemberFromStat,
   linuxProcessIdentityFromStat,
   linuxProcessProvesLiveOwnership,
+  processGroupAlive,
   signalOwnedGroup
 } from "../scripts/lib/test-temp-supervisor.mjs";
 import {
@@ -231,6 +232,25 @@ test("macOS never signals a bare stale or reused process-group identity", () => 
   };
   assert.equal(signalOwnedGroup(child, "SIGKILL", { platform: "darwin" }), false);
   assert.deepEqual(signals, []);
+});
+
+test("POSIX liveness never trusts a live group that may reuse a closed child's PGID", (t) => {
+  if (process.platform === "win32") return;
+  const foreign = spawn(
+    process.execPath,
+    ["--eval", "setInterval(() => {}, 1000)"],
+    { detached: true, stdio: "ignore" }
+  );
+  t.after(() => {
+    try { process.kill(-foreign.pid, "SIGKILL"); } catch {}
+  });
+  const closedChild = {
+    pid: foreign.pid,
+    exitCode: 0,
+    signalCode: null
+  };
+  assert.equal(processGroupAlive(closedChild, { platform: "linux" }), false);
+  assert.equal(processGroupAlive(closedChild, { platform: "darwin" }), false);
 });
 
 test("Linux fallback identities distinguish a live PID from exit or PID reuse", () => {
