@@ -108,19 +108,19 @@ function capabilities(config) {
   return {
     protocolVersion: config.protocolVersion ?? 1,
     agentCapabilities: {
-      loadSession: config.loadSession ?? true,
-      ...(config.deepResearch || config.workflowCapability
-        ? {
-            workflow: true,
-            tools: config.workflowTools ?? [{ name: "workflow" }]
-          }
-        : {})
+      loadSession: config.loadSession ?? true
     },
     authMethods: config.authMethods ?? [{ id: "local", name: "Local test auth" }],
     _meta: {
       modelState: { availableModels: models },
       ...(config.deepResearch || config.workflowCapability
-        ? { workflow: true }
+        ? {
+            availableCommands: config.initializeAvailableCommands
+              ?? [
+                { name: "deep-research", description: "Built-in deep research" },
+                { name: "workflow", description: "Built-in workflow management" }
+              ]
+          }
         : {})
     }
   };
@@ -174,19 +174,54 @@ async function serveAcp(binary, config) {
         id: message.id,
         result: { sessionId: currentSession, models: {} }
       };
+      const emitCapabilityUpdates = () => {
+        // Match Grok 0.2.112/0.2.114: initialize does not attest tools.
+        // One session-scoped update carries both commands and _meta.tools.
+        if ((config.deepResearch || config.availableCommandsUpdate)
+          && config.suppressAvailableCommandsUpdate !== true) {
+          const defaultUpdate = {
+            sessionId: config.availableCommandsUpdateSessionId ?? currentSession,
+            availableCommands: config.availableCommands
+              ?? [
+                { name: "deep-research", description: "Built-in deep research" },
+                { name: "workflow", description: "Built-in workflow management" }
+              ],
+            ...(config.omitAvailableCommandTools
+              ? {}
+              : {
+                  _meta: {
+                    tools: config.availableCommandTools
+                      ?? ["workflow", "web_search", "task", "get_task_output", "kill_task"]
+                  }
+                })
+          };
+          const updates = Array.isArray(config.availableCommandsUpdates)
+            ? config.availableCommandsUpdates
+            : [defaultUpdate];
+          for (const advertised of updates) {
+            const {
+              sessionId: advertisedSessionId = currentSession,
+              ...payload
+            } = advertised || {};
+            update(advertisedSessionId, {
+              sessionUpdate: "available_commands_update",
+              ...payload
+            });
+          }
+        }
+      };
       const emitSessionReady = () => {
+        if (config.availableCommandsUpdatesBeforeSessionResponse === true) {
+          emitCapabilityUpdates();
+          send(response);
+          return;
+        }
         send(response);
-        // Session-scoped command advertisement for deep-research capability gate.
-        if (config.deepResearch || config.availableCommandsUpdate) {
-          const commands = config.availableCommands
-            ?? [
-              { name: "/deep-research", description: "Built-in deep research" },
-              { name: "/workflow", description: "Built-in workflow management" }
-            ];
-          update(currentSession, {
-            sessionUpdate: "available_commands_update",
-            availableCommands: commands
-          });
+        if (Number.isSafeInteger(config.availableCommandsUpdateDelayMs)
+          && config.availableCommandsUpdateDelayMs > 0) {
+          setTimeout(emitCapabilityUpdates, config.availableCommandsUpdateDelayMs);
+        } else {
+          emitCapabilityUpdates();
         }
       };
       if (Number.isSafeInteger(config.sessionResponseDelayMs)
@@ -199,16 +234,40 @@ async function serveAcp(binary, config) {
     }
 
     if (message.method === "x.ai/commands/list") {
-      const commands = config.availableCommands
-        ?? [
-          { name: "/deep-research", description: "Built-in deep research" },
-          { name: "/workflow", description: "Built-in workflow management" }
-        ];
-      send({
-        jsonrpc: "2.0",
-        id: message.id,
-        result: { availableCommands: commands, sessionId: message.params?.sessionId || currentSession }
-      });
+      const reply = () => {
+        if (config.commandsListError || config.disableCommandsList) {
+          send({
+            jsonrpc: "2.0",
+            id: message.id,
+            error: {
+              code: -32601,
+              message: config.commandsListError || "commands/list disabled"
+            }
+          });
+          return;
+        }
+        const commands = config.availableCommands
+          ?? [
+            { name: "deep-research", description: "Built-in deep research" },
+            { name: "workflow", description: "Built-in workflow management" }
+          ];
+        send({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: config.commandsListResult ?? {
+            commands,
+            tools: config.commandsListTools
+              ?? config.availableCommandTools
+              ?? ["workflow", "web_search", "task", "get_task_output", "kill_task"]
+          }
+        });
+      };
+      if (Number.isSafeInteger(config.commandsListResponseDelayMs)
+        && config.commandsListResponseDelayMs > 0) {
+        setTimeout(reply, config.commandsListResponseDelayMs);
+      } else {
+        reply();
+      }
       return;
     }
 

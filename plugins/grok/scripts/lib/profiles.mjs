@@ -45,6 +45,7 @@ const AGENT_PROFILE_BINDINGS = Object.freeze({
     promptMode: "full",
     permissionMode: "dontAsk",
     providerToolIds: Object.freeze([
+      "GrokBuild:workflow",
       "GrokBuild:web_search",
       "GrokBuild:task",
       "GrokBuild:get_task_output",
@@ -55,6 +56,7 @@ const AGENT_PROFILE_BINDINGS = Object.freeze({
     promptMode: "full",
     permissionMode: "dontAsk",
     providerToolIds: Object.freeze([
+      "GrokBuild:workflow",
       "GrokBuild:web_search",
       "GrokBuild:task",
       "GrokBuild:get_task_output",

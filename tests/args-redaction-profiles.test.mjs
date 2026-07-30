@@ -150,10 +150,25 @@ test("execution profiles keep reviews immutable and grant writes only to write r
   assert.ok(deepResearch.deniedProviderToolIds.includes("GrokBuild:web_fetch"));
   assert.ok(deepResearch.deniedTools.includes("Bash"));
   assert.ok(deepResearch.deniedTools.includes("read_file"));
+  assert.ok(deepResearch.providerToolIds.includes("GrokBuild:workflow"));
+  assert.equal(
+    deepResearch.providerToolIds.filter((id) => id === "GrokBuild:workflow").length,
+    1
+  );
+  assert.equal(deepResearch.deniedProviderToolIds.includes("GrokBuild:workflow"), false);
   const deepResearchWorkspace = profileFor("deep-research-workspace");
   assert.equal(deepResearchWorkspace.id, "deep-research-workspace-v1");
   assert.ok(deepResearchWorkspace.allowedTools.includes("read_file"));
   assert.ok(deepResearchWorkspace.deniedTools.includes("search_replace"));
+  assert.ok(deepResearchWorkspace.providerToolIds.includes("GrokBuild:workflow"));
+  assert.equal(
+    deepResearchWorkspace.providerToolIds.filter((id) => id === "GrokBuild:workflow").length,
+    1
+  );
+  assert.equal(
+    deepResearchWorkspace.deniedProviderToolIds.includes("GrokBuild:workflow"),
+    false
+  );
   assert.equal(readTask.webSearch, false);
   assert.equal(writeTask.webSearch, false);
 });

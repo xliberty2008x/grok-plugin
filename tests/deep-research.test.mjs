@@ -94,43 +94,93 @@ test("upstream slash command is exactly /deep-research <query> without wrapper f
   );
 });
 
-test("capability gate requires exact deep-research command and workflow tool", () => {
+test("capability gate requires one exact paired commands-and-tools advertisement", () => {
   assert.throws(
     () => assertDeepResearchCapability({}),
     (error) => error.code === "E_CAPABILITY" && /deep-research/.test(error.message)
   );
   assert.throws(
     () => assertDeepResearchCapability({
-      _meta: { availableCommands: [{ name: "/deep-research" }] }
+      commands: [
+        { name: "deep-research" },
+        { name: "workflow" }
+      ]
     }),
     (error) => error.code === "E_CAPABILITY" && /workflow/.test(error.message)
   );
   assert.throws(
-    () => assertDeepResearchCapability({}, {
-      availableCommands: [{ name: "/deep-research" }],
-      inspect: { tools: [{ name: "workflow" }] }
+    () => assertDeepResearchCapability({
+      tools: ["workflow"]
     }),
     (error) => error.code === "E_CAPABILITY"
   );
-  const ok = assertDeepResearchCapability({
-    agentCapabilities: { tools: [{ name: "workflow" }] },
-    _meta: {
-      availableCommands: [{ name: "/deep-research" }]
+  for (const malformed of [
+    {
+      commands: [
+        { name: "/deep-research" },
+        { name: "/workflow" }
+      ],
+      tools: ["GrokBuild:workflow"]
+    },
+    {
+      commands: [
+        { name: "deep-research-preview" },
+        { name: "workflow-admin" }
+      ],
+      tools: ["workflow-helper"]
+    },
+    {
+      commands: [
+        { name: "deep-research" },
+        { name: "workflow" }
+      ],
+      tools: [{ name: "workflow" }]
+    },
+    {
+      commands: [
+        { name: "deep-research" },
+        { name: "workflow" }
+      ],
+      tools: ["workflow", 7]
+    },
+    {
+      // initialize-shaped data is never a live session advertisement.
+      agentCapabilities: { tools: ["workflow"] },
+      _meta: { commands: [{ name: "deep-research" }, { name: "workflow" }] }
     }
+  ]) {
+    assert.throws(
+      () => assertDeepResearchCapability(malformed),
+      (error) => error.code === "E_CAPABILITY"
+    );
+  }
+  assert.throws(
+    () => assertDeepResearchCapability({
+      commands: [{ name: "deep-research" }, { name: "workflow" }],
+      tools: ["workflow"]
+    }),
+    (error) => error.code === "E_CAPABILITY"
+      && error.details?.missing?.includes("evidence:same-session")
+  );
+  const ok = assertDeepResearchCapability({
+    commands: [
+      { name: "deep-research" },
+      { name: "workflow" },
+      { name: "goal" }
+    ],
+    tools: ["workflow", "web_search"]
+  }, {
+    evidenceSource: "session-available-commands-update"
   });
   assert.equal(ok.deepResearchCommand, true);
+  assert.equal(ok.workflowCommand, true);
   assert.equal(ok.workflowTool, true);
-  const liveCommands = assertDeepResearchCapability({
-    tools: [{ name: "workflow" }]
-  }, {
-    availableCommands: [{ name: "deep-research" }, { name: "workflow" }],
-    inspect: { tools: [{ name: "not-live-workflow" }] }
-  });
-  assert.equal(liveCommands.workflowTool, true);
+  assert.deepEqual(ok.availableTools, ["workflow", "web_search"]);
 });
 
-test("feature capability receipt is bound to provider bytes, profile, and live commands", () => {
-  const receipt = buildDeepResearchCapabilityReceipt({
+test("feature capability receipt binds provider, profile, paired advertisement, source, and session", () => {
+  const sessionId = "private-session-id";
+  const receiptInput = {
     executableIdentity: {
       executableDigest: "a".repeat(64),
       size: 123
@@ -138,13 +188,54 @@ test("feature capability receipt is bound to provider bytes, profile, and live c
     providerVersion: "0.2.112",
     profileDigest: "b".repeat(64),
     availableCommands: ["workflow", "deep-research"],
-    workflowToolAttested: true
-  });
+    availableTools: ["web_search", "workflow"],
+    evidenceSource: "session-available-commands-update",
+    sessionId
+  };
+  const receipt = buildDeepResearchCapabilityReceipt(receiptInput);
+  assert.equal(receipt.schemaVersion, 2);
   assert.equal(receipt.receiptType, "grok-deep-research-capability");
   assert.equal(receipt.workflowToolAttested, true);
   assert.equal(receipt.deepResearchCommand, true);
   assert.equal(receipt.workflowCommand, true);
+  assert.deepEqual(receipt.availableTools, ["web_search", "workflow"]);
+  assert.equal(receipt.evidenceSource, "session-available-commands-update");
+  assert.match(receipt.sessionBindingDigest, /^[a-f0-9]{64}$/);
+  assert.equal(JSON.stringify(receipt).includes(sessionId), false);
   assert.match(receipt.capabilityDigest, /^[a-f0-9]{64}$/);
+  for (const changed of [
+    {
+      ...receiptInput,
+      executableIdentity: {
+        ...receiptInput.executableIdentity,
+        executableDigest: "c".repeat(64)
+      }
+    },
+    {
+      ...receiptInput,
+      executableIdentity: {
+        ...receiptInput.executableIdentity,
+        size: 124
+      }
+    },
+    { ...receiptInput, providerVersion: "0.2.114" },
+    { ...receiptInput, profileDigest: "d".repeat(64) },
+    {
+      ...receiptInput,
+      availableCommands: [...receiptInput.availableCommands, "context"]
+    },
+    {
+      ...receiptInput,
+      availableTools: [...receiptInput.availableTools, "task"]
+    },
+    { ...receiptInput, evidenceSource: "same-session-commands-list" },
+    { ...receiptInput, sessionId: "different-private-session-id" }
+  ]) {
+    assert.notEqual(
+      buildDeepResearchCapabilityReceipt(changed).capabilityDigest,
+      receipt.capabilityDigest
+    );
+  }
 });
 
 test("workflow binder binds one run and enforces monotonic revisions", () => {
@@ -658,6 +749,22 @@ test("fake-ACP lifecycle: session-scoped capability, launch-ack nonterminal, rep
   assert.equal(result.hostVerification, "not_run");
   assert.equal(result.replay, false);
   assert.equal(result.resume, false);
+  assert.equal(
+    result.capabilityReceipt.evidenceSource,
+    "session-available-commands-update"
+  );
+  assert.deepEqual(
+    result.capabilityReceipt.availableCommands.filter((name) => (
+      name === "deep-research" || name === "workflow"
+    )),
+    ["deep-research", "workflow"]
+  );
+  assert.ok(result.capabilityReceipt.availableTools.includes("workflow"));
+  assert.match(result.capabilityReceipt.sessionBindingDigest, /^[a-f0-9]{64}$/);
+  assert.equal(
+    JSON.stringify(result.capabilityReceipt).includes(result.sessionId),
+    false
+  );
 
   const launchAck = events.find((event) => event.type === "launch-ack");
   assert.ok(launchAck, "expected launch acknowledgement event");
@@ -689,6 +796,8 @@ test("fake-ACP lifecycle: session-scoped capability, launch-ack nonterminal, rep
       timeoutMs: 5_000
     }),
     (error) => error.code === "E_CAPABILITY"
+      && error.details?.replay === false
+      && error.details?.resume === false
   );
 
   // Interruption maps to non-replay workflow incomplete.
@@ -749,6 +858,207 @@ test("early deep-research startup failures retain the non-replay contract", asyn
       && error.details?.replay === false
       && error.details?.resume === false
   );
+});
+
+test("fake-ACP capability evidence is paired and bound to the newly-created session", async (t) => {
+  if (process.platform === "win32") return;
+  const previous = { ...process.env };
+  t.after(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+  });
+
+  const exactCommands = [
+    { name: "deep-research", description: "Built-in deep research" },
+    { name: "workflow", description: "Built-in workflow management" }
+  ];
+  const cases = [
+    {
+      name: "same-session-list",
+      config: { suppressAvailableCommandsUpdate: true },
+      expectedSource: "same-session-commands-list"
+    },
+    {
+      name: "notification-wins-list-error-race",
+      config: {
+        availableCommandsUpdateDelayMs: 30,
+        commandsListResponseDelayMs: 60,
+        commandsListError: "list unavailable"
+      },
+      expectedSource: "session-available-commands-update"
+    },
+    {
+      name: "wrong-session-update",
+      config: {
+        availableCommandsUpdateSessionId: "foreign-session",
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_CAPABILITY"
+    },
+    {
+      name: "split-update",
+      config: {
+        availableCommandsUpdates: [
+          { availableCommands: exactCommands },
+          {
+            availableCommands: [],
+            _meta: { tools: ["workflow", "web_search"] }
+          }
+        ],
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_CAPABILITY"
+    },
+    {
+      name: "malformed-update-tools",
+      config: {
+        availableCommandTools: ["workflow", 7],
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_CAPABILITY"
+    },
+    {
+      name: "oversized-session-binding",
+      config: {
+        availableCommandsUpdateSessionId: "s".repeat(257),
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_PROTOCOL"
+    },
+    {
+      name: "oversized-advertised-name",
+      config: {
+        availableCommands: [
+          { name: "deep-research" },
+          { name: "w".repeat(257) }
+        ],
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_PROTOCOL"
+    },
+    {
+      name: "non-array-large-fields",
+      config: {
+        availableCommands: { payload: "x".repeat(4096) },
+        availableCommandTools: { payload: "y".repeat(4096) },
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_CAPABILITY"
+    },
+    {
+      name: "initialize-only",
+      config: {
+        suppressAvailableCommandsUpdate: true,
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_CAPABILITY"
+    },
+    {
+      name: "substring-and-qualified-names",
+      config: {
+        availableCommands: [
+          { name: "deep-research-preview" },
+          { name: "workflow-admin" }
+        ],
+        availableCommandTools: ["GrokBuild:workflow"],
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_CAPABILITY"
+    },
+    {
+      name: "malformed-list-tools",
+      config: {
+        suppressAvailableCommandsUpdate: true,
+        commandsListResult: {
+          commands: exactCommands,
+          tools: [{ name: "workflow" }]
+        }
+      },
+      expectedCode: "E_CAPABILITY"
+    },
+    {
+      name: "pre-session-update-overflow",
+      config: {
+        availableCommandsUpdatesBeforeSessionResponse: true,
+        availableCommandsUpdates: Array.from(
+          { length: 17 },
+          () => ({
+            availableCommands: exactCommands,
+            _meta: { tools: ["workflow", "web_search"] }
+          })
+        ),
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_PROTOCOL"
+    }
+  ];
+
+  for (const fixture of cases) {
+    const fakeRoot = tempDir(`deep-research-capability-${fixture.name}-fake-`);
+    const logFile = path.join(fakeRoot, "provider.jsonl");
+    const fake = installFakeGrok(fakeRoot, {
+      deepResearch: true,
+      deepResearchRunId: `run-${fixture.name}`,
+      logFile,
+      authMethods: [{ id: "local", name: "Local test auth" }],
+      ...fixture.config
+    });
+    const pluginData = tempDir(`deep-research-capability-${fixture.name}-plugin-`);
+    const root = initRepo();
+    const state = tempDir(`deep-research-capability-${fixture.name}-state-`);
+    Object.assign(process.env, testEnvironment({
+      fake,
+      pluginData,
+      sessionId: `deep-research-capability-${fixture.name}`
+    }));
+    try {
+      const invocation = () => runDeepResearch({
+        root,
+        profile: profileFor("deep-research"),
+        query: `capability ${fixture.name}`,
+        options: { "web-only": true },
+        stateDir: state,
+        jobMarker: `deep-research-capability-${fixture.name}`,
+        timeoutMs: 5_000,
+        testHooks: { commandWaitMs: 10 }
+      });
+      if (fixture.expectedCode) {
+        await assert.rejects(
+          invocation,
+          (error) => error.code === fixture.expectedCode
+        );
+        const log = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "";
+        assert.doesNotMatch(log, /"event":"deep-research-launch"/);
+      } else {
+        const result = await invocation();
+        assert.equal(result.capabilityReceipt.evidenceSource, fixture.expectedSource);
+        assert.ok(result.capabilityReceipt.availableTools.includes("workflow"));
+        if (fixture.expectedSource === "same-session-commands-list") {
+          const records = fs.readFileSync(logFile, "utf8")
+            .trim()
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => JSON.parse(line));
+          const listRequest = records.find((entry) => (
+            entry.event === "rpc"
+            && entry.message?.method === "x.ai/commands/list"
+          ));
+          assert.equal(
+            listRequest?.message?.params?.sessionId,
+            result.sessionId
+          );
+        }
+      }
+    } finally {
+      try { thawTreeWritable(state); } catch { /* ignore */ }
+      fs.rmSync(state, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(pluginData, { recursive: true, force: true });
+      fs.rmSync(fakeRoot, { recursive: true, force: true });
+    }
+  }
 });
 
 test("fake-ACP terminal matrix covers partial, foreign/stale updates, pauses, budgets, failures, interruption, missing report, and timeout", async (t) => {
