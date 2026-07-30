@@ -722,6 +722,44 @@ test("owned process-tree cleanup refuses a forged leader start token", async () 
   assert.equal(processGroupAlive(child.pid), false);
 });
 
+test("owned process-tree cleanup normalizes non-ESRCH signal failures", async (t) => {
+  const child = spawn(
+    process.execPath,
+    ["-e", "setInterval(()=>{},1000)"],
+    { detached: true, stdio: "ignore" }
+  );
+  t.after(async () => {
+    try { process.kill(-child.pid, "SIGKILL"); } catch {}
+  });
+  const token = await waitFor(() => processStartToken(child.pid));
+  const raw = Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+  let failure;
+
+  try {
+    await ensureChildExit(
+      child,
+      { pid: child.pid, processGroupId: child.pid, startToken: token },
+      {
+        naturalExitMs: 0,
+        signalProcess: () => { throw raw; }
+      }
+    );
+  } catch (error) {
+    failure = error;
+  }
+  assert.equal(failure instanceof CompanionError, true);
+  assert.equal(failure?.code, "E_PROCESS_IDENTITY");
+  assert.equal(
+    failure?.message,
+    "Verified owned process signalling could not be completed."
+  );
+  assert.deepEqual(failure?.details?.secondaryDiagnostic, {
+    code: "EPERM",
+    message: "kill EPERM"
+  });
+  assert.equal(processGroupAlive(child.pid), true);
+});
+
 test("spawn identity acquisition stops untracked providers and preserves live-group cleanup identity", async () => {
   const signals = [];
   let failure;
@@ -758,6 +796,89 @@ test("spawn identity acquisition stops untracked providers and preserves live-gr
   }
   assert.equal(stoppedFailure?.code, "E_PROCESS_IDENTITY");
   assert.equal(providerCleanupIdentity(stoppedFailure), null, "stopped provider should not retain cleanup identity");
+});
+
+test("spawn identity acquisition normalizes synchronous non-ESRCH signal failures", async () => {
+  const signals = [];
+  const raw = Object.assign(
+    new Error("kill EPERM pid 424242 at /Users/private/worktree"),
+    { code: "EPERM" }
+  );
+  let failure;
+
+  try {
+    await captureSpawnIdentity({ pid: 424242 }, {
+      timeoutMs: 0,
+      shutdownTimeoutMs: 0,
+      readStartToken: () => null,
+      isGroupAlive: () => true,
+      signalGroup: (_pid, signal) => {
+        signals.push(signal);
+        throw raw;
+      }
+    });
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.equal(failure?.code, "E_PROCESS_IDENTITY");
+  assert.equal(
+    failure?.message,
+    "Verified owned process signalling could not be completed."
+  );
+  assert.equal(failure?.details?.secondaryDiagnostic?.code, "EPERM");
+  assert.equal(
+    failure?.details?.secondaryDiagnostic?.message.includes("424242"),
+    false
+  );
+  assert.equal(
+    failure?.details?.secondaryDiagnostic?.message.includes("/Users/private"),
+    false
+  );
+  assert.deepEqual(signals, ["SIGTERM"]);
+  assert.deepEqual(providerCleanupIdentity(failure), {
+    pid: 424242,
+    startToken: null,
+    processGroupId: 424242
+  });
+});
+
+test("spawn identity acquisition consumes rejected signal thenables and fails closed", async () => {
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.on("unhandledRejection", onUnhandled);
+  let failure;
+
+  try {
+    try {
+      await captureSpawnIdentity({ pid: 424242 }, {
+        timeoutMs: 0,
+        shutdownTimeoutMs: 0,
+        readStartToken: () => null,
+        isGroupAlive: () => true,
+        signalGroup: () => Promise.reject(
+          Object.assign(new Error("kill EPERM"), { code: "EPERM" })
+        )
+      });
+    } catch (error) {
+      failure = error;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+
+  assert.equal(failure?.code, "E_PROCESS_IDENTITY");
+  assert.deepEqual(failure?.details?.secondaryDiagnostic, {
+    code: "E_ASYNC_SIGNAL",
+    message: "Process signalling callback did not complete synchronously."
+  });
+  assert.deepEqual(unhandled, []);
+  assert.deepEqual(providerCleanupIdentity(failure), {
+    pid: 424242,
+    startToken: null,
+    processGroupId: 424242
+  });
 });
 
 test("childEnvironment strips project and provider secrets while retaining runtime essentials", () => {
@@ -920,6 +1041,58 @@ test("runProvider accepts max-turn completion and rejects refusal or legacy canc
       }),
       (error) => error?.code === "E_CANCELLED"
     );
+  });
+});
+
+test("ACP cancellation awaits a normalized signal failure before final cleanup", async () => {
+  await withFake({ delayMs: 60_000 }, async () => {
+    const root = initRepo();
+    const state = tempDir("provider-state-");
+    const marker = "task-acp-signal-failure";
+    const attempts = [];
+    let identity = null;
+    let sessionReady = false;
+    let injectedFailure = false;
+    let failure = null;
+
+    try {
+      await runProvider({
+        root,
+        profile: profileFor("task", false),
+        prompt: "cancel after provider startup",
+        stateDir: state,
+        jobMarker: marker,
+        cancelRequested: () => sessionReady,
+        onEvent(event) {
+          if (event.type === "provider") identity = event.process;
+          if (event.type === "session") sessionReady = true;
+        },
+        signalProcess(target, signal) {
+          attempts.push({ target, signal });
+          if (!injectedFailure) {
+            injectedFailure = true;
+            throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+          }
+          process.kill(target, signal);
+        }
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.equal(failure instanceof CompanionError, true);
+    assert.equal(failure?.code, "E_PROCESS_IDENTITY");
+    assert.deepEqual(failure?.details?.secondaryDiagnostic, {
+      code: "EPERM",
+      message: "kill EPERM"
+    });
+    assert.ok(identity);
+    assert.deepEqual(attempts[0], {
+      target: process.platform === "win32" ? identity.pid : -identity.processGroupId,
+      signal: "SIGTERM"
+    });
+    assert.notEqual(processStartToken(identity.pid), identity.startToken);
+    assert.equal(loadProviderGuard(root, marker), null);
   });
 });
 
@@ -1462,6 +1635,223 @@ test("provider event callback failures terminate ACP and headless children", asy
   });
 });
 
+test("ACP provider callback signal failures retain process identity evidence", async () => {
+  await withFake({ delayMs: 60_000 }, async () => {
+    const root = initRepo();
+    const state = tempDir("provider-state-");
+    let identity = null;
+    let injectedFailure = false;
+    let failure = null;
+
+    try {
+      await runProvider({
+        root,
+        profile: profileFor("task", false),
+        prompt: "inspect",
+        stateDir: state,
+        jobMarker: "task-callback-signal-failure",
+        onEvent(event) {
+          if (event.type === "provider") {
+            identity = event.process;
+            throw new Error("simulated state callback failure");
+          }
+        },
+        signalProcess(target, signal) {
+          if (!injectedFailure) {
+            injectedFailure = true;
+            throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+          }
+          process.kill(target, signal);
+        }
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.equal(failure instanceof CompanionError, true);
+    assert.equal(failure?.code, "E_PROCESS_IDENTITY");
+    assert.deepEqual(failure?.details?.secondaryDiagnostic, {
+      code: "EPERM",
+      message: "kill EPERM"
+    });
+    assert.ok(identity);
+    assert.notEqual(processStartToken(identity.pid), identity.startToken);
+  });
+
+  await withFake({ delayMs: 60_000 }, async () => {
+    const root = initRepo();
+    const state = tempDir("provider-state-");
+    let identity = null;
+    let injectedFailure = false;
+    let failure = null;
+
+    try {
+      await runProvider({
+        root,
+        profile: profileFor("task", false),
+        prompt: "inspect",
+        stateDir: state,
+        jobMarker: "task-session-callback-signal-failure",
+        onEvent(event) {
+          if (event.type === "provider") identity = event.process;
+          if (event.type === "session") {
+            throw new Error("simulated session callback failure");
+          }
+        },
+        signalProcess(target, signal) {
+          if (!injectedFailure) {
+            injectedFailure = true;
+            throw Object.assign(new Error("signal EIO"), { code: "EIO" });
+          }
+          process.kill(target, signal);
+        }
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.equal(failure?.code, "E_PROCESS_IDENTITY");
+    assert.equal(failure?.details?.secondaryDiagnostic?.code, "EIO");
+    assert.ok(identity);
+    assert.notEqual(processStartToken(identity.pid), identity.startToken);
+  });
+});
+
+test("post-session ACP update callback signal failures abort a delayed prompt immediately", { timeout: 10_000 }, async () => {
+  await withFake({ delayMs: 60_000 }, async () => {
+    const root = initRepo();
+    const state = tempDir("provider-state-");
+    const marker = "task-delayed-update-signal-failure";
+    let identity = null;
+    let sessionReady = false;
+    let eventFailureAt = null;
+    let injectedFailure = false;
+    let failure = null;
+
+    try {
+      await runProvider({
+        root,
+        profile: profileFor("task", false),
+        prompt: "inspect delayed provider update",
+        stateDir: state,
+        jobMarker: marker,
+        timeoutMs: 3_000,
+        onEvent(event) {
+          if (event.type === "provider") identity = event.process;
+          if (event.type === "session") sessionReady = true;
+          if (sessionReady && event.type === "usage") {
+            eventFailureAt = Date.now();
+            throw new Error("simulated delayed update persistence failure");
+          }
+        },
+        signalProcess(target, signal) {
+          if (!injectedFailure) {
+            injectedFailure = true;
+            throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+          }
+          process.kill(target, signal);
+        }
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.equal(failure?.code, "E_PROCESS_IDENTITY");
+    assert.deepEqual(failure?.details?.secondaryDiagnostic, {
+      code: "EPERM",
+      message: "kill EPERM"
+    });
+    assert.ok(eventFailureAt);
+    assert.ok(
+      Date.now() - eventFailureAt < 2_500,
+      "provider operation waited for its prompt timeout after the callback signal failure"
+    );
+    assert.ok(identity);
+    assert.notEqual(processStartToken(identity.pid), identity.startToken);
+    assert.equal(loadProviderGuard(root, marker), null);
+  });
+});
+
+test("mailbox-drain ACP update callback signal failures abort the drain immediately", { timeout: 10_000 }, async () => {
+  await withFake({ delayMsByPrompt: [0, 60_000] }, async () => {
+    const root = initRepo();
+    const state = tempDir("provider-state-");
+    const marker = "task-mailbox-drain-signal-failure";
+    const attempt = { dispatchAttemptId: "attempt-mailbox-signal-failure" };
+    let identity = null;
+    let mailboxPhase = "primary";
+    let eventFailureAt = null;
+    let injectedFailure = false;
+    let failure = null;
+
+    const mailboxController = {
+      async open() {
+        return attempt;
+      },
+      async recordPrimary() {
+        mailboxPhase = "drain";
+      },
+      async drain({ client, sessionId, collectTurnText, timeoutMs }) {
+        collectTurnText();
+        await client.promptTurn({
+          sessionId,
+          prompt: [{ type: "text", text: "deliver queued mailbox turn" }],
+          timeoutMs
+        });
+        return {
+          attempt,
+          closed: true,
+          deliveryUnknown: false,
+          turns: []
+        };
+      },
+      async interrupt() {}
+    };
+
+    try {
+      await runProvider({
+        root,
+        profile: profileFor("task", false),
+        prompt: "complete the primary turn",
+        stateDir: state,
+        jobMarker: marker,
+        timeoutMs: 3_000,
+        mailboxController,
+        onEvent(event) {
+          if (event.type === "provider") identity = event.process;
+          if (mailboxPhase === "drain" && event.type === "usage") {
+            eventFailureAt = Date.now();
+            throw new Error("simulated mailbox update persistence failure");
+          }
+        },
+        signalProcess(target, signal) {
+          if (!injectedFailure) {
+            injectedFailure = true;
+            throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+          }
+          process.kill(target, signal);
+        }
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.equal(failure?.code, "E_PROCESS_IDENTITY");
+    assert.deepEqual(failure?.details?.secondaryDiagnostic, {
+      code: "EPERM",
+      message: "kill EPERM"
+    });
+    assert.ok(eventFailureAt);
+    assert.ok(
+      Date.now() - eventFailureAt < 2_500,
+      "provider operation waited for its mailbox prompt timeout after the callback signal failure"
+    );
+    assert.ok(identity);
+    assert.notEqual(processStartToken(identity.pid), identity.startToken);
+    assert.equal(loadProviderGuard(root, marker), null);
+  });
+});
+
 test("headless timeout and output overflow escalate once to a forced exit", async () => {
   await withFake({ headlessDelayMs: 60_000, headlessIgnoreSigterm: true }, async () => {
     const root = initRepo(), state = tempDir("provider-state-"), marker = "review-timeout-test";
@@ -1484,6 +1874,92 @@ test("headless timeout and output overflow escalate once to a forced exit", asyn
       readFakeLog(fake.logFile).filter((entry) => entry.event === "signal" && entry.signal === "SIGTERM" && entry.transport === "headless").length,
       1
     );
+    assert.equal(cleanupReviewEnvironment(state, marker).ok, true);
+  });
+});
+
+test("headless timeout awaits a normalized signal failure before final cleanup", async () => {
+  await withFake({ headlessDelayMs: 60_000 }, async () => {
+    const root = initRepo();
+    const state = tempDir("provider-state-");
+    const marker = "review-signal-failure-timeout";
+    const attempts = [];
+    let injectedFailure = false;
+    let identity = null;
+    let failure = null;
+
+    try {
+      await runHeadless({
+        root,
+        profile: profileFor("review"),
+        prompt: "review",
+        stateDir: state,
+        jobMarker: marker,
+        timeoutMs: 25,
+        onEvent(event) {
+          if (event.type === "provider") identity = event.process;
+        },
+        signalProcess(target, signal) {
+          attempts.push({ target, signal });
+          if (signal === "SIGTERM" && !injectedFailure) {
+            injectedFailure = true;
+            throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+          }
+          process.kill(target, signal);
+        }
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.equal(failure instanceof CompanionError, true);
+    assert.equal(failure?.code, "E_PROCESS_IDENTITY");
+    assert.deepEqual(failure?.details?.secondaryDiagnostic, {
+      code: "EPERM",
+      message: "kill EPERM"
+    });
+    assert.ok(identity);
+    assert.deepEqual(attempts[0], {
+      target: process.platform === "win32" ? identity.pid : -identity.processGroupId,
+      signal: "SIGTERM"
+    });
+    assert.ok(attempts.length > 1, "final child cleanup did not retry signalling");
+    assert.notEqual(processStartToken(identity.pid), identity.startToken);
+    assert.equal(loadProviderGuard(root, marker), null);
+    assert.equal(cleanupReviewEnvironment(state, marker).ok, true);
+  });
+});
+
+test("runProvider forwards signal normalization through headless transport", async () => {
+  await withFake({ headlessDelayMs: 60_000 }, async () => {
+    const root = initRepo();
+    const state = tempDir("provider-state-");
+    const marker = "review-routed-signal-failure";
+    let injectedFailure = false;
+    let failure = null;
+
+    try {
+      await runProvider({
+        root,
+        profile: profileFor("review"),
+        prompt: "review",
+        stateDir: state,
+        jobMarker: marker,
+        timeoutMs: 25,
+        signalProcess(target, signal) {
+          if (!injectedFailure) {
+            injectedFailure = true;
+            throw Object.assign(new Error("kill EIO"), { code: "EIO" });
+          }
+          process.kill(target, signal);
+        }
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.equal(failure?.code, "E_PROCESS_IDENTITY");
+    assert.equal(failure?.details?.secondaryDiagnostic?.code, "EIO");
     assert.equal(cleanupReviewEnvironment(state, marker).ok, true);
   });
 });

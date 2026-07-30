@@ -371,6 +371,9 @@ export class AcpClient extends EventEmitter {
 
   close() {
     if (!this.closed) {
+      // ACP owns only the transport. The provider/controller that captured the
+      // exact child identity performs authoritative signalling and records any
+      // failure through ensureChildExit.
       try {
         this.child.stdin.end();
       } catch (error) {
@@ -378,11 +381,7 @@ export class AcpClient extends EventEmitter {
           "E_PROTOCOL",
           `Failed to close ACP stdin: ${error?.message || String(error)}`
         ));
-        return;
       }
-      setTimeout(() => {
-        if (!this.closed) this.child.kill("SIGTERM");
-      }, 500).unref();
     }
   }
 
@@ -390,7 +389,6 @@ export class AcpClient extends EventEmitter {
     this.buffer += chunk;
     if (Buffer.byteLength(this.buffer) > 8 * 1024 * 1024 && !this.buffer.includes("\n")) {
       this.#close(new CompanionError("E_PROTOCOL", "Grok ACP frame exceeded 8 MiB."));
-      try { this.child.kill("SIGTERM"); } catch { /* best-effort */ }
       return;
     }
     for (;;) {
@@ -404,7 +402,6 @@ export class AcpClient extends EventEmitter {
         message = JSON.parse(line);
       } catch {
         this.#close(new CompanionError("E_PROTOCOL", "Grok emitted malformed ACP JSON."));
-        try { this.child.kill("SIGTERM"); } catch { /* best-effort */ }
         return;
       }
       this.#message(message);

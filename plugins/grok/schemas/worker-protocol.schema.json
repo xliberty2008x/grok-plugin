@@ -425,6 +425,7 @@
         "missingPaths": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicPath" } },
         "unsafePaths": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicPath" } },
         "workspaceState": { "type": "string", "enum": ["complete", "task_scoped", "unknown"] },
+        "workerId": { "$ref": "#/$defs/workerId" },
         "conflictingJobId": { "$ref": "#/$defs/workerId" },
         "conflictingProviderHomeId": { "$ref": "#/$defs/workerId" },
         "limitBytes": { "type": "integer", "minimum": 0 }

@@ -174,6 +174,55 @@ test("presentation re-sanitizes forged versioned snapshots", () => {
   assert.equal(Object.hasOwn(presented.result, "verification"), false);
 });
 
+test("presentation re-projects public snapshots when either or both version flags are absent", () => {
+  const projected = projectWorkerSnapshot({
+    ...sampleJob(),
+    status: "failed",
+    phase: "context-rejected",
+    error: {
+      code: "E_CONTEXT_DRIFT",
+      message: "Final context changed.",
+      details: { reasons: ["[GIT_METADATA]"] }
+    }
+  });
+  const diagnostic =
+    "Cleanup retry failed with EACCES for provider_pid='+440001' at /Users/alice/private/runtime.";
+
+  for (const removed of [
+    ["workerProtocolVersion"],
+    ["snapshotSchemaVersion"],
+    ["workerProtocolVersion", "snapshotSchemaVersion"]
+  ]) {
+    const forged = structuredClone(projected);
+    for (const field of removed) delete forged[field];
+    forged.summary = diagnostic;
+    forged.latestPlan = [diagnostic];
+    forged.result = {
+      ...(forged.result || {}),
+      privacyWarning: diagnostic
+    };
+
+    const presented = presentWorker(forged);
+    const serialized = JSON.stringify(presented);
+    for (const privateValue of ["EACCES", "440001", "/Users/alice"]) {
+      assert.equal(
+        serialized.includes(privateValue),
+        false,
+        `${removed.join("+")}: ${privateValue} leaked`
+      );
+    }
+    assert.equal(presented.error.code, "E_CONTEXT_DRIFT");
+    assert.equal(
+      presented.summary,
+      "Process ownership verification failed."
+    );
+    assert.equal(
+      presented.plan[0],
+      "Process ownership verification failed."
+    );
+  }
+});
+
 test("presentation does not trust authority when forged snapshots omit version flags", () => {
   const canary = "UNVERSIONED_AUTHORITY_CANARY_52aa";
   const forged = {
@@ -200,6 +249,62 @@ test("presentation does not trust authority when forged snapshots omit version f
   assert.equal(Object.hasOwn(presented.result, "runtimeEvidence"), false);
   assert.equal(Object.hasOwn(presented.result, "verification"), false);
   assert.equal(JSON.stringify(presented).includes(canary), false);
+});
+
+test("presentation fails closed for documentary-prefixed process diagnostics", () => {
+  const documentary = "Historical: ordinary migration note.";
+  const actual =
+    "Example: final cleanup kill EPERM for providerPid=457301";
+  const projected = projectWorkerSnapshot({
+    ...sampleJob(),
+    status: "failed",
+    phase: "cleanup-blocked",
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "Process ownership verification failed."
+    }
+  });
+  const forged = {
+    ...projected,
+    summary: `${documentary}\n${actual}`,
+    latestPlan: [
+      "Example: signal EBUSY for providerPid=457302"
+    ],
+    result: {
+      workerProtocolVersion: 1,
+      resultSchemaVersion: 1,
+      reportRepair: {
+        attempted: true,
+        valid: false,
+        validationIssues: [actual],
+        error: {
+          code: "E_PROCESS_IDENTITY",
+          message: "Process ownership verification failed."
+        }
+      },
+      hostVerification: "not_run"
+    }
+  };
+  const presented = presentWorker(forged);
+  const serialized = JSON.stringify(presented);
+  assert.equal(presented.summary.includes(documentary), true);
+  for (const privateValue of [
+    "EPERM",
+    "EBUSY",
+    "457301",
+    "457302"
+  ]) {
+    assert.equal(serialized.includes(privateValue), false);
+  }
+
+  const clean = presentWorker({
+    ...sampleJob(),
+    summary: "Target 500 customers; Kill 10 flaky tests; Cleanup ENABLED."
+  });
+  assert.equal(
+    clean.summary,
+    "Target 500 customers; Kill 10 flaky tests; Cleanup ENABLED."
+  );
 });
 
 test("presentation strips display controls and rejects forged lineage fields", () => {

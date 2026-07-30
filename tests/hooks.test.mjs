@@ -17,6 +17,11 @@ import {
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import { identityMatches, processGroupAlive, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
 import { hasForeignActiveProvider, registerProviderGuard, unregisterProviderGuard } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
+import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
+import {
+  spawnReadOnlyWorker
+} from "../plugins/grok/scripts/lib/worker-mutation.mjs";
+import { projectWorkerSnapshot } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
 import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 import { readCodexSessionMetadata } from "../plugins/grok/scripts/lib/host.mjs";
 import { COMPANION, ROOT, initRepo, run, tempDir, testEnvironment, waitFor } from "./helpers.mjs";
@@ -79,6 +84,149 @@ function record(id, session, status = "completed", overrides = {}) {
     workerProcess: null,
     ...overrides
   };
+}
+
+function sessionEndPrincipal(root, sessionId) {
+  return {
+    hostKind: "claude-code",
+    threadId: sessionId,
+    turnId: "019f666e-4084-7902-8447-249f72043a37",
+    source: "claude-code-hook",
+    pluginId: "grok@grok-companion",
+    root,
+    mutationCapable: true
+  };
+}
+
+async function providerStartedSessionEndFixture(t, idempotencyKey) {
+  const root = fs.realpathSync(initRepo());
+  const pluginData = tempDir("grok-session-end-signal-data-");
+  const sessionId = "session-signal";
+  const env = {
+    ...process.env,
+    CLAUDE_PLUGIN_DATA: pluginData,
+    GROK_COMPANION_PLUGIN_DATA: pluginData,
+    GROK_COMPANION_HOST: "claude-code",
+    GROK_COMPANION_HOST_SESSION_ID: sessionId,
+    GROK_COMPANION_CLAUDE_SESSION_ID: sessionId
+  };
+  const admitted = spawnReadOnlyWorker({
+    root,
+    principal: sessionEndPrincipal(root, sessionId),
+    envelope: buildTaskEnvelope({
+      userRequest: "Exercise SessionEnd signal recovery",
+      mode: "read"
+    }),
+    idempotencyKey,
+    env
+  });
+  const workerId = admitted.handle.id;
+  const provider = spawn(process.execPath, [
+    "-e",
+    "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);",
+    "agent",
+    workerId,
+    "stdio"
+  ], { detached: true, stdio: "ignore" });
+  t.after(() => {
+    try { process.kill(-provider.pid, "SIGKILL"); } catch {}
+  });
+  await waitFor(() => processStartToken(provider.pid), {
+    timeoutMs: 5_000
+  });
+  const completedAt = new Date().toISOString();
+  withPluginData(pluginData, () => updateJob(root, workerId, (job) => {
+    const providerProcess = {
+      pid: provider.pid,
+      startToken: processStartToken(provider.pid),
+      processGroupId: provider.pid,
+      commandMarker: workerId
+    };
+    return {
+      ...job,
+      schemaVersion: 3,
+      status: "completed",
+      phase: "done",
+      completedAt,
+      heartbeatAt: completedAt,
+      summary: "Provider completed before SessionEnd",
+      error: null,
+      grokSessionId: "session-end-provider-session",
+      controllerProcess: null,
+      workerProcess: null,
+      providerProcess,
+      workerAuthorization: null,
+      request: {
+        prompt: job.request.prompt,
+        providerHomeId: job.request.providerHomeId || workerId,
+        contextManifest: job.request.contextManifest,
+        envelope: job.request.envelope
+      },
+      result: {
+        ...(job.result || {}),
+        hostVerification: "not_run",
+        taskRuntimeCleaned: false
+      }
+    };
+  }));
+  return { root, pluginData, sessionId, env, workerId, provider };
+}
+
+function injectedSessionEndSignalEnv(env, mode, privatePath) {
+  const directory = tempDir("grok-session-end-signal-injection-");
+  const preload = path.join(directory, "signal-injection.cjs");
+  fs.writeFileSync(preload, [
+    '"use strict";',
+    'const processModule = require("node:process");',
+    "const originalKill = processModule.kill.bind(processModule);",
+    "processModule.kill = (target, signal) => {",
+    "  const injected = signal === \"SIGTERM\" || signal === \"SIGKILL\";",
+    "  if (injected && Number(target) < 0) {",
+    "    if (process.env.GROK_TEST_SESSION_END_SIGNAL_MODE === \"EPERM\") {",
+    "      const error = new Error(`signal denied for pid=${Math.abs(Number(target))} at ${process.env.GROK_TEST_SESSION_END_PRIVATE_PATH}`);",
+    "      error.code = \"EPERM\";",
+    "      throw error;",
+    "    }",
+    "    if (process.env.GROK_TEST_SESSION_END_SIGNAL_MODE === \"ESRCH\") {",
+    "      try { originalKill(target, \"SIGKILL\"); } catch {}",
+    "      const error = new Error(\"process group is already gone\");",
+    "      error.code = \"ESRCH\";",
+    "      throw error;",
+    "    }",
+    "  }",
+    "  return originalKill(target, signal);",
+    "};"
+  ].join("\n"), { mode: 0o600 });
+  return {
+    ...env,
+    NODE_OPTIONS: [
+      env.NODE_OPTIONS,
+      `--require=${preload}`
+    ].filter(Boolean).join(" "),
+    GROK_TEST_SESSION_END_SIGNAL_MODE: mode,
+    GROK_TEST_SESSION_END_PRIVATE_PATH: privatePath
+  };
+}
+
+async function recoverSessionEndTask(fixture) {
+  const result = run(
+    process.execPath,
+    [
+      COMPANION,
+      "status",
+      fixture.workerId,
+      "--json",
+      "--cwd",
+      fixture.root
+    ],
+    {
+      cwd: fixture.root,
+      env: fixture.env,
+      timeout: 15_000
+    }
+  );
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  return JSON.parse(result.stdout);
 }
 
 test("SessionStart exports shell-safe session, transcript, and plugin-data values", () => {
@@ -291,6 +439,229 @@ test("SessionEnd verifies whole process-group shutdown before removing a termina
   assert.equal(completed.code, 0, completed.stderr);
   await waitFor(() => !processGroupAlive(child.pid));
   withPluginData(pluginData, () => assert.throws(() => readJob(root, id), (error) => error.code === "E_JOB_NOT_FOUND"));
+});
+
+test("SessionEnd retains bounded EPERM evidence and recovery publishes process-identity failure after the group is gone", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = await providerStartedSessionEndFixture(
+    t,
+    "session-end-signal-eperm-0001"
+  );
+  const privatePath =
+    "/private/session-end-signal/provider-secret.sock";
+  const running = spawnHook(
+    SESSION_HOOK,
+    "SessionEnd",
+    { cwd: fixture.root, session_id: fixture.sessionId },
+    {
+      cwd: fixture.root,
+      env: injectedSessionEndSignalEnv(
+        fixture.env,
+        "EPERM",
+        privatePath
+      )
+    }
+  );
+  const result = await running.completed;
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stderr, /process cleanup could not be verified/i);
+  assert.equal(result.stderr.includes("EPERM"), false);
+  assert.equal(result.stderr.includes(privatePath), false);
+  assert.equal(
+    result.stderr.includes(String(fixture.provider.pid)),
+    false
+  );
+
+  const blocked = withPluginData(
+    fixture.pluginData,
+    () => readJob(fixture.root, fixture.workerId)
+  );
+  assert.equal(blocked.status, "running");
+  assert.equal(blocked.phase, "cleanup-blocked");
+  assert.equal(blocked.pendingTerminal.status, "completed");
+  assert.equal(blocked.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(
+    blocked.error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+  assert.equal(
+    blocked.error.details.secondaryDiagnostic.message.includes(
+      privatePath
+    ),
+    false
+  );
+  assert.equal(
+    blocked.error.details.secondaryDiagnostic.message.includes(
+      String(fixture.provider.pid)
+    ),
+    false
+  );
+  const publicBlocked = JSON.stringify(projectWorkerSnapshot(blocked));
+  assert.equal(publicBlocked.includes("EPERM"), false);
+  assert.equal(publicBlocked.includes(privatePath), false);
+  assert.equal(
+    publicBlocked.includes(String(fixture.provider.pid)),
+    false
+  );
+
+  try { process.kill(-fixture.provider.pid, "SIGKILL"); } catch {}
+  await waitFor(() => !processGroupAlive(fixture.provider.pid), {
+    timeoutMs: 5_000
+  });
+  const recovered = await recoverSessionEndTask(fixture);
+  assert.equal(recovered.status, "failed");
+  assert.equal(recovered.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(recovered.result.taskRuntimeCleaned, true);
+  const stored = withPluginData(
+    fixture.pluginData,
+    () => readJob(fixture.root, fixture.workerId)
+  );
+  assert.equal(
+    stored.error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+  const publicRecovered = JSON.stringify(recovered);
+  assert.equal(publicRecovered.includes("EPERM"), false);
+  assert.equal(publicRecovered.includes(privatePath), false);
+  assert.equal(
+    publicRecovered.includes(String(fixture.provider.pid)),
+    false
+  );
+});
+
+test("SessionEnd recovery lets fresh final drift outrank retained EPERM evidence", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = await providerStartedSessionEndFixture(
+    t,
+    "session-end-signal-drift-0001"
+  );
+  const privatePath =
+    "/private/session-end-drift/provider-secret.sock";
+  const running = spawnHook(
+    SESSION_HOOK,
+    "SessionEnd",
+    { cwd: fixture.root, session_id: fixture.sessionId },
+    {
+      cwd: fixture.root,
+      env: injectedSessionEndSignalEnv(
+        fixture.env,
+        "EPERM",
+        privatePath
+      )
+    }
+  );
+  const result = await running.completed;
+  assert.equal(result.code, 0, result.stderr);
+  const blocked = withPluginData(
+    fixture.pluginData,
+    () => readJob(fixture.root, fixture.workerId)
+  );
+  assert.equal(
+    blocked.error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+
+  const configPath = path.join(fixture.root, ".git", "config");
+  const configBefore = fs.readFileSync(configPath);
+  t.after(() => {
+    try { fs.writeFileSync(configPath, configBefore); } catch {}
+  });
+  fs.appendFileSync(
+    configPath,
+    "\n[grok-session-end-final-drift]\n\tvalue = changed\n"
+  );
+  try { process.kill(-fixture.provider.pid, "SIGKILL"); } catch {}
+  await waitFor(() => !processGroupAlive(fixture.provider.pid), {
+    timeoutMs: 5_000
+  });
+  const recovered = await recoverSessionEndTask(fixture);
+  assert.equal(recovered.status, "failed");
+  assert.equal(recovered.phase, "context-rejected");
+  assert.equal(recovered.error.code, "E_CONTEXT_DRIFT");
+  assert.equal(recovered.result.taskRuntimeCleaned, true);
+  const stored = withPluginData(
+    fixture.pluginData,
+    () => readJob(fixture.root, fixture.workerId)
+  );
+  assert.equal(
+    stored.error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+  assert.ok(
+    stored.result.runtimeEvidence.observedChangedPaths.includes(
+      "[GIT_METADATA]"
+    )
+  );
+  const publicRecovered = JSON.stringify(recovered);
+  assert.equal(publicRecovered.includes("EPERM"), false);
+  assert.equal(publicRecovered.includes(privatePath), false);
+  assert.equal(
+    publicRecovered.includes(String(fixture.provider.pid)),
+    false
+  );
+});
+
+test("SessionEnd treats ESRCH as benign and leaves no recovered job", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const fixture = await providerStartedSessionEndFixture(
+    t,
+    "session-end-signal-esrch-0001"
+  );
+  const privatePath =
+    "/private/session-end-esrch/provider-secret.sock";
+  const running = spawnHook(
+    SESSION_HOOK,
+    "SessionEnd",
+    { cwd: fixture.root, session_id: fixture.sessionId },
+    {
+      cwd: fixture.root,
+      env: injectedSessionEndSignalEnv(
+        fixture.env,
+        "ESRCH",
+        privatePath
+      )
+    }
+  );
+  const result = await running.completed;
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stderr.includes("cleanup could not be verified"), false);
+  assert.equal(result.stderr.includes("ESRCH"), false);
+  await waitFor(() => !processGroupAlive(fixture.provider.pid), {
+    timeoutMs: 5_000
+  });
+  withPluginData(fixture.pluginData, () => {
+    assert.throws(
+      () => readJob(fixture.root, fixture.workerId),
+      (error) => error.code === "E_JOB_NOT_FOUND"
+    );
+  });
+
+  const status = run(
+    process.execPath,
+    [
+      COMPANION,
+      "status",
+      "--all",
+      "--json",
+      "--cwd",
+      fixture.root
+    ],
+    {
+      cwd: fixture.root,
+      env: fixture.env,
+      timeout: 15_000
+    }
+  );
+  assert.equal(status.status, 0, status.stderr || status.stdout);
+  assert.equal(
+    JSON.parse(status.stdout).some(
+      (job) => job.id === fixture.workerId
+    ),
+    false
+  );
 });
 
 test("SessionEnd signals a verified process group after the leader exits during cancel wait", { skip: process.platform === "win32" }, async (t) => {
