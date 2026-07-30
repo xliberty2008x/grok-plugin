@@ -120,12 +120,17 @@ export async function runDeterministicTestFilesCli({
   stderr = process.stderr,
   timeoutMs = DETERMINISTIC_TEST_FILE_TIMEOUT_MS,
   tempRoot = canonicalSystemTempRoot(),
+  spawnProcess = spawn,
   simulateStartupVisibilityFailure = false,
   testPreCommandDelayMs = 0,
   onTestSupervisorPreCommandReady = null
 } = {}) {
   if (!Array.isArray(files) || !files.length) {
     stderr.write("No deterministic test files were found.\n");
+    return 1;
+  }
+  if (typeof spawnProcess !== "function") {
+    stderr.write("The deterministic supervisor launcher is invalid.\n");
     return 1;
   }
   if (
@@ -238,7 +243,7 @@ export async function runDeterministicTestFilesCli({
         ];
         let supervisor;
         try {
-          supervisor = spawn(node, childArguments, {
+          supervisor = spawnProcess(node, childArguments, {
             cwd: root,
             env: childEnvironment,
             shell: false,
@@ -257,6 +262,7 @@ export async function runDeterministicTestFilesCli({
         let outputOverflow = false;
         let outerTimedOut = false;
         let spawnError = false;
+        let spawnErrorWithPid = false;
         let testPreCommandObserved = false;
         let testPreCommandDiagnosticBuffer = "";
         const collect = (chunks, chunk, previousBytes) => {
@@ -297,21 +303,32 @@ export async function runDeterministicTestFilesCli({
             }
           }
         });
-        const watchdog = setTimeout(() => {
-          outerTimedOut = true;
-          try { supervisor.kill("SIGKILL"); } catch {}
-        }, timeoutMs + DETERMINISTIC_SUPERVISOR_SHUTDOWN_ALLOWANCE_MS);
+        let watchdog;
         const closeResult = await new Promise((resolve) => {
-          let closed = false;
-          supervisor.once("error", () => {
-            spawnError = true;
-          });
-          supervisor.once("close", (code, signal) => {
-            if (closed) return;
-            closed = true;
+          let settled = false;
+          const finish = (code, signal) => {
+            if (settled) return;
+            settled = true;
             activeSupervisor = null;
             resolve({ code, signal });
+          };
+          supervisor.once("error", () => {
+            spawnError = true;
+            spawnErrorWithPid = Number.isSafeInteger(supervisor.pid)
+              && supervisor.pid > 0;
+            finish(null, null);
           });
+          supervisor.once("close", (code, signal) => {
+            finish(code, signal);
+          });
+          watchdog = setTimeout(() => {
+            outerTimedOut = true;
+            try { supervisor.kill("SIGKILL"); } catch {}
+            // The exact child was signalled after the supervisor already
+            // exceeded its teardown allowance. Do not depend on a subsequent
+            // close event: return fail-closed and preserve the owned run root.
+            finish(null, null);
+          }, timeoutMs + DETERMINISTIC_SUPERVISOR_SHUTDOWN_ALLOWANCE_MS);
         });
         clearTimeout(watchdog);
         activeSupervisor = null;
@@ -324,6 +341,8 @@ export async function runDeterministicTestFilesCli({
             ? { code: "ETIMEDOUT" }
             : outputOverflow
               ? { code: "ENOBUFS" }
+              : spawnErrorWithPid
+                ? { code: "E_TEST_TEMP_CONTAINMENT" }
               : spawnError
                 ? { code: "E_TEST_TEMP_START" }
                 : null
@@ -341,6 +360,7 @@ export async function runDeterministicTestFilesCli({
         containmentUnproven = result?.status === CONTAINMENT_FAILURE_EXIT_CODE
           || result?.error?.code === "ETIMEDOUT"
           || result?.error?.code === "ENOBUFS"
+          || result?.error?.code === "E_TEST_TEMP_CONTAINMENT"
           || Boolean(result?.signal);
         if (containmentUnproven) {
           preserveRunRoot = true;

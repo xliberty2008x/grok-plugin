@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -1115,6 +1117,101 @@ test("startup visibility failure is containment failure, not generic cleanup", (
   assert.equal(status, 1);
   assert.match(diagnostics, /containment could not be proven/);
   assert.match(diagnostics, /containment reason: startup-visibility/);
+  assert.equal(
+    fs.readdirSync(root).filter((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)).length,
+    1
+  );
+});
+
+test("async CLI settles an error without close and removes roots when no PID exists", {
+  timeout: 5_000
+}, async (t) => {
+  const root = sandbox(t);
+  const fixture = path.join(root, "never-starts.test.mjs");
+  fs.writeFileSync(fixture, 'import test from "node:test"; test("never starts", () => {});\n');
+  const supervisor = new EventEmitter();
+  supervisor.exitCode = null;
+  supervisor.signalCode = null;
+  supervisor.stdout = new PassThrough();
+  supervisor.stderr = new PassThrough();
+  supervisor.kill = () => true;
+  let diagnostics = "";
+  let output = "";
+  const startedAt = Date.now();
+  queueMicrotask(() => supervisor.emit("error", new Error("synthetic spawn failure")));
+  const status = await runDeterministicTestFilesCli({
+    files: [fixture],
+    root: ROOT,
+    reporter: REPORTER,
+    spawnProcess: () => supervisor,
+    tempRoot: root,
+    timeoutMs: 500,
+    stdout: { write(value) { output += value; } },
+    stderr: { write(value) { diagnostics += value; } }
+  });
+  assert.equal(status, 1);
+  assert.ok(Date.now() - startedAt < 5_000);
+  assert.match(diagnostics, /child 1 could not start/);
+  assert.doesNotMatch(diagnostics, /containment could not be proven/);
+  assert.deepEqual(JSON.parse(output.trim()), {
+    reporter: "zero-skip-v2",
+    passed: 0,
+    failed: 0,
+    cancelled: 0,
+    skipped: 0,
+    todo: 0,
+    violations: [],
+    omittedViolations: 0
+  });
+  assert.equal(
+    fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)),
+    false
+  );
+});
+
+test("async CLI preserves roots when a PID-bearing error precedes a late close", {
+  timeout: 5_000
+}, async (t) => {
+  const root = sandbox(t);
+  const fixture = path.join(root, "uncertain-start.test.mjs");
+  fs.writeFileSync(fixture, 'import test from "node:test"; test("never starts", () => {});\n');
+  const supervisor = new EventEmitter();
+  supervisor.pid = 424_242;
+  supervisor.exitCode = null;
+  supervisor.signalCode = null;
+  supervisor.stdout = new PassThrough();
+  supervisor.stderr = new PassThrough();
+  supervisor.kill = () => true;
+  let diagnostics = "";
+  let output = "";
+  queueMicrotask(() => {
+    supervisor.emit("error", new Error("synthetic PID-bearing failure"));
+    supervisor.emit("close", 0, null);
+  });
+  const status = await runDeterministicTestFilesCli({
+    files: [fixture],
+    root: ROOT,
+    reporter: REPORTER,
+    spawnProcess: () => supervisor,
+    tempRoot: root,
+    timeoutMs: 500,
+    stdout: { write(value) { output += value; } },
+    stderr: { write(value) { diagnostics += value; } }
+  });
+  assert.equal(status, 1);
+  assert.match(diagnostics, /containment could not be proven/);
+  assert.match(diagnostics, /run temp root was preserved/);
+  assert.doesNotMatch(diagnostics, /child 1 could not start/);
+  assert.deepEqual(JSON.parse(output.trim()), {
+    reporter: "zero-skip-v2",
+    passed: 0,
+    failed: 0,
+    cancelled: 0,
+    skipped: 0,
+    todo: 0,
+    violations: [],
+    omittedViolations: 0
+  });
   assert.equal(
     fs.readdirSync(root).filter((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)).length,
     1
