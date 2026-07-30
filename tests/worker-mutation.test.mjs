@@ -164,7 +164,7 @@ if (
 }
 let workerMutationTestOrdinal = 0;
 let workerMutationRegisteredCount = 0;
-function test(...args) {
+function registerPartitionedWorkerMutationTest(register, args) {
   workerMutationTestOrdinal += 1;
   const selectedRange = WORKER_MUTATION_PARTITION_RANGES[
     workerMutationPartition
@@ -179,7 +179,16 @@ function test(...args) {
     return undefined;
   }
   workerMutationRegisteredCount += 1;
-  return nodeTest(...args);
+  return register(...args);
+}
+function test(...args) {
+  return registerPartitionedWorkerMutationTest(nodeTest, args);
+}
+for (const method of ["only", "skip", "todo"]) {
+  test[method] = (...args) => registerPartitionedWorkerMutationTest(
+    nodeTest[method].bind(nodeTest),
+    args
+  );
 }
 
 const THREAD = "019f666a-6469-7cc1-9a8d-8c1adf61e103";

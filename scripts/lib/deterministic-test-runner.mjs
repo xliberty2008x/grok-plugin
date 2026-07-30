@@ -475,7 +475,12 @@ export async function runDeterministicTestFilesCli({
   return failed ? 1 : 0;
 }
 
-/** Run an exact test inventory one file at a time and aggregate zero-skip output. */
+/**
+ * Run an exact test inventory synchronously for programmatic callers and
+ * injected test doubles. Do not use this API as a process entrypoint:
+ * spawnSync prevents JavaScript signal forwarding while the child is active.
+ * Every shipped CLI entrypoint uses runDeterministicTestFilesCli instead.
+ */
 export function runDeterministicTestFiles({
   files,
   root = ROOT,
