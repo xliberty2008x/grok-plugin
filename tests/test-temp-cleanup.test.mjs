@@ -1270,6 +1270,31 @@ test("supervisor fails closed when its signed PID registry is replaced, truncate
   }
 });
 
+test("worker broker evidence partition fails closed without supervisor authority", (t) => {
+  const root = sandbox(t);
+  const marker = path.join(root, "partition-ran");
+  const result = spawnSync("/usr/bin/env", [
+    "GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS=1",
+    "GROK_PLUGIN_WORKER_BROKER_EVIDENCE_PARTITION=1",
+    `NODE_OPTIONS=--require=${CHILD_HOOK}`,
+    process.execPath,
+    "--eval",
+    `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran")`
+  ], {
+    cwd: ROOT,
+    env: {},
+    encoding: "utf8",
+    shell: false,
+    timeout: 5_000
+  });
+  assert.notEqual(result.status, 0);
+  assert.equal(fs.existsSync(marker), false);
+  assert.match(
+    result.stderr,
+    /Worker broker evidence partition authority could not be established/
+  );
+});
+
 test("async spawn kills the exact child immediately when ownership registration cannot be written", async (t) => {
   if (process.platform !== "linux" && process.platform !== "darwin") return;
   const root = sandbox(t);

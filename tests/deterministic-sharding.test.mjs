@@ -140,8 +140,8 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
       "        shard: [1, 2, 3]\n        exclude:\n          - os: macos-latest\n            node: 18.18.2\n            shard: 3"
     ),
     workflow.replace(
-      "    timeout-minutes: 20",
-      "    timeout-minutes: 20\n    continue-on-error: true"
+      "    timeout-minutes: 40",
+      "    timeout-minutes: 40\n    continue-on-error: true"
     ),
     workflow.replace(
       "        run: npm run test:pty-ingress",

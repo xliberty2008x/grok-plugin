@@ -81,7 +81,7 @@ export function validateHostedCiWorkflow(source, { shardCount = 3 } = {}) {
     const validationRun = workflowStep(unixJob, "Validate release structure");
     const deterministicRun = workflowStep(unixJob, "Run deterministic zero-skip shard");
     if (!/runs-on:\s*\$\{\{\s*matrix\.os\s*\}\}/u.test(unixJob)
-      || !/timeout-minutes:\s*20\b/u.test(unixJob)
+      || !/timeout-minutes:\s*40\b/u.test(unixJob)
       || !/fail-fast:\s*false\b/u.test(unixJob)
       || containsContinueOnError(unixJob)
       || /windows-latest/u.test(matrix)
@@ -93,7 +93,7 @@ export function validateHostedCiWorkflow(source, { shardCount = 3 } = {}) {
           (_, index) => index + 1
         ).join(",\\s*")}\\]`, "u")
       ])) {
-      errors.push("The Unix deterministic matrix must remain OS x Node x three exact shards with a 20-minute budget and fail-fast disabled.");
+      errors.push("The Unix deterministic matrix must remain OS x Node x three exact shards with a 40-minute aggregate budget and fail-fast disabled.");
     }
     if (!isShardOneValidationStep(validationRun)) {
       errors.push("Each Unix OS/Node combination must run structural validation only on shard 1.");

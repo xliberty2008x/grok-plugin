@@ -367,7 +367,11 @@ function installWorkerBrokerEvidencePartitionAuthority() {
     || registrySecret.length < 32
     || processRegistration(process.pid, supervisorPid) === null
   ) {
-    return;
+    const error = new Error(
+      "Worker broker evidence partition authority could not be established."
+    );
+    error.code = "E_TEST_TEMP_PARTITION_AUTHORITY";
+    throw error;
   }
   globalThis[WORKER_BROKER_EVIDENCE_PARTITION_SYMBOL] = 1;
 }
