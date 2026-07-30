@@ -378,6 +378,33 @@ function selectedEnvironment(keys) {
     .map((key) => [key, process.env[key]]));
 }
 
+function nodeOptionsWithAuthoritativeHook(provided, authoritative) {
+  if (
+    typeof authoritative !== "string"
+    || !authoritative
+    || typeof provided !== "string"
+    || provided === authoritative
+  ) {
+    return authoritative;
+  }
+  let extension = null;
+  if (provided.startsWith(`${authoritative} `)) {
+    extension = provided.slice(authoritative.length + 1).trim();
+  } else if (provided.endsWith(` ${authoritative}`)) {
+    extension = provided.slice(0, -(authoritative.length + 1)).trim();
+  }
+  if (
+    !extension
+    || extension === authoritative
+    || Buffer.byteLength(extension, "utf8") > 32 * 1024
+  ) {
+    return authoritative;
+  }
+  // Test-only fault preloads may extend an authority-bearing environment, but
+  // the canonical hook always loads last and reasserts child-process wrappers.
+  return `${extension} ${authoritative}`;
+}
+
 function injectObjectEnvironment(
   options = {},
   { nestedSupervisor = false, file = null } = {}
@@ -386,14 +413,21 @@ function injectObjectEnvironment(
   const fallback = Object.fromEntries(Object.entries(
     capturedFallbackEnvironment
   ).filter(([key]) => typeof provided[key] !== "string"));
+  const forced = forcedEnvironment({
+    nestedSupervisor,
+    includeRegistrySecret: isDirectNodeLaunch(file)
+  });
   const environment = {
     ...provided,
     ...fallback,
-    ...forcedEnvironment({
-      nestedSupervisor,
-      includeRegistrySecret: isDirectNodeLaunch(file)
-    })
+    ...forced
   };
+  if (!nestedSupervisor && typeof forced.NODE_OPTIONS === "string") {
+    environment.NODE_OPTIONS = nodeOptionsWithAuthoritativeHook(
+      provided.NODE_OPTIONS,
+      forced.NODE_OPTIONS
+    );
+  }
   if (nestedSupervisor || !isDirectNodeLaunch(file)) {
     delete environment[PID_REGISTRY_SECRET_ENVIRONMENT_KEY];
   }

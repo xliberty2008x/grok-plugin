@@ -91,9 +91,18 @@ export function runCompanion(args, {
   input,
   companionScript = COMPANION
 } = {}) {
-  return run(process.execPath, [companionScript, ...args], {
+  const companionPreload = env?.GROK_TEST_COMPANION_PRELOAD;
+  const childEnv = { ...(env || process.env) };
+  delete childEnv.GROK_TEST_COMPANION_PRELOAD;
+  return run(process.execPath, [
+    ...(path.isAbsolute(companionPreload || "")
+      ? [`--require=${companionPreload}`]
+      : []),
+    companionScript,
+    ...args
+  ], {
     cwd,
-    env,
+    env: childEnv,
     timeout,
     input
   });

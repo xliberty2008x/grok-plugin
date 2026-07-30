@@ -548,10 +548,7 @@ function injectedImportSignalEnv(env, mode, privatePath) {
   return {
     env: {
       ...env,
-      NODE_OPTIONS: [
-        env.NODE_OPTIONS,
-        `--require=${preload}`
-      ].filter(Boolean).join(" "),
+      GROK_TEST_COMPANION_PRELOAD: preload,
       GROK_TEST_IMPORT_SIGNAL_LOG: logFile,
       GROK_TEST_IMPORT_SIGNAL_MODE: mode,
       GROK_TEST_IMPORT_SIGNAL_PRIVATE_PATH: privatePath
