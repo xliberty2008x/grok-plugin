@@ -1439,43 +1439,30 @@ test("static human launch surfaces use public worker projections", () => {
 });
 
 test("foreground launch-unsettled failures retain a public durable job handle", (t) => {
-  const launcherHook = path.join(
-    tempDir("grok-launch-unsettled-hook-"),
-    "force-launcher-exit.cjs"
-  );
-  fs.writeFileSync(
-    launcherHook,
-    [
-      'if (process.argv.includes("--launch-worker")) {',
-      '  process.stderr.write("forced launcher exit\\n");',
-      "  process.exit(42);",
-      "}",
-      ""
-    ].join("\n"),
-    { mode: 0o600 }
-  );
-  const launchEnv = (env) => ({
-    ...env,
-    NODE_OPTIONS: [
-      env.NODE_OPTIONS,
-      `--require=${launcherHook}`
-    ].filter(Boolean).join(" ")
-  });
   const forcedLauncherFixture = () => {
     const runtime = fixture();
     const pinned = installPinnedFakeCompanion(runtime.fake, runtime.env);
     t.after(pinned.cleanup);
     const source = fs.readFileSync(pinned.companionScript, "utf8");
-    const needle = "const allowed = new Set([";
-    assert.equal(source.split(needle).length - 1, 1);
+    const injection = [
+      'if (process.argv.includes("--launch-worker")) {',
+      '  process.stderr.write("forced launcher exit\\n");',
+      "  process.exit(42);",
+      "}",
+      ""
+    ].join("\n");
+    const firstNewline = source.indexOf("\n");
+    const injectedSource = source.startsWith("#!") && firstNewline !== -1
+      ? `${source.slice(0, firstNewline + 1)}${injection}${source.slice(firstNewline + 1)}`
+      : `${injection}${source}`;
     fs.writeFileSync(
       pinned.companionScript,
-      source.replace(needle, 'const allowed = new Set(["NODE_OPTIONS", '),
+      injectedSource,
       "utf8"
     );
     return {
       ...runtime,
-      env: launchEnv(pinned.env),
+      env: pinned.env,
       companionScript: pinned.companionScript
     };
   };

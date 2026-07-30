@@ -255,7 +255,6 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "grok-force-cancel-terminal-race-",
   "grok-import-signal-injection-",
   "grok-issue34-real-vertical-",
-  "grok-launch-unsettled-hook-",
   "grok-plugin-abs-hooks-",
   "grok-plugin-ancestor-hooks-",
   "grok-plugin-bisect-ctrl-",
