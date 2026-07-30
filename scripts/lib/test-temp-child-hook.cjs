@@ -524,9 +524,19 @@ childProcess.execFileSync = function execFileSyncWithTestOwnership(file, args, o
   const hasArgs = Array.isArray(args);
   const selectedOptions = hasArgs ? options : args;
   rejectDetachedSync(file, selectedOptions);
-  const injected = injectObjectEnvironment(selectedOptions, { file });
+  const nestedSupervisor = isNestedSupervisorLaunch(
+    file,
+    hasArgs ? args : []
+  );
+  const injected = injectObjectEnvironment(selectedOptions, {
+    nestedSupervisor,
+    file
+  });
+  const selectedArgs = nestedSupervisor
+    ? [SUPERVISOR_HELPER, ...args.slice(1)]
+    : args;
   return hasArgs
-    ? originalExecFileSync.call(this, file, args, injected)
+    ? originalExecFileSync.call(this, file, selectedArgs, injected)
     : originalExecFileSync.call(this, file, injected);
 };
 

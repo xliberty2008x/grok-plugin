@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -1428,6 +1428,57 @@ test("a recognized supervisor copy executes only the canonical containment bundl
     maxBuffer: 1024 * 1024
   });
   assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(copiedHookMarker), false);
+  assert.equal(fs.readFileSync(fixtureMarker, "utf8"), "canonical\n");
+});
+
+test("execFileSync executes a recognized supervisor copy through the canonical containment bundle", (t) => {
+  if (process.platform !== "linux" && process.platform !== "darwin") return;
+  const activeFileRoot = process.env.GROK_PLUGIN_TEST_TEMP_ROOT;
+  if (!path.isAbsolute(activeFileRoot || "")) return;
+  const root = sandbox(t);
+  const copiedSupervisor = path.join(root, "test-temp-supervisor.mjs");
+  const copiedHookMarker = path.join(root, "copied-hook-ran");
+  const fixtureMarker = path.join(root, "canonical-supervisor-ran");
+  fs.copyFileSync(SUPERVISOR, copiedSupervisor);
+  fs.writeFileSync(path.join(root, "test-temp-child-hook.cjs"), [
+    'const fs = require("node:fs");',
+    `fs.writeFileSync(${JSON.stringify(copiedHookMarker)}, "unsafe\\n");`,
+    'throw new Error("copied hook must not execute");',
+    ""
+  ].join("\n"));
+  fs.writeFileSync(
+    path.join(root, "test-temp-pidfd-signal.py"),
+    "raise SystemExit('copied pidfd helper must not execute')\n"
+  );
+  const nestedRoot = createOwnedTestTempRoot({
+    base: path.dirname(activeFileRoot),
+    prefix: "file-",
+    kind: "file"
+  });
+  t.after(() => removeOwnedTestTempRoot(nestedRoot));
+  execFileSync(process.execPath, [
+    copiedSupervisor,
+    "--timeout-ms",
+    "10000",
+    "--",
+    process.execPath,
+    "--eval",
+    `require("node:fs").writeFileSync(${JSON.stringify(fixtureMarker)}, "canonical\\n")`
+  ], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      GROK_PLUGIN_TEST_TEMP_ROOT: nestedRoot,
+      TEMP: nestedRoot,
+      TMP: nestedRoot,
+      TMPDIR: nestedRoot
+    },
+    encoding: "utf8",
+    shell: false,
+    timeout: 20_000,
+    maxBuffer: 1024 * 1024
+  });
   assert.equal(fs.existsSync(copiedHookMarker), false);
   assert.equal(fs.readFileSync(fixtureMarker, "utf8"), "canonical\n");
 });
