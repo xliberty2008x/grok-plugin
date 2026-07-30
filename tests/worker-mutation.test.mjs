@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import nodeTest from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
@@ -119,6 +119,68 @@ import {
   testEnvironment,
   waitFor
 } from "./helpers.mjs";
+
+const WORKER_MUTATION_PARTITION_KEY = Symbol.for(
+  "grok-plugin.worker-mutation-partition"
+);
+const WORKER_MUTATION_PARTITION_RANGES = Object.freeze({
+  1: Object.freeze([1, 32]),
+  2: Object.freeze([32, 63])
+});
+const WORKER_MUTATION_TEST_REGISTRATION_COUNT = 62;
+const workerMutationPartitionCoverage = new Uint8Array(
+  WORKER_MUTATION_TEST_REGISTRATION_COUNT + 1
+);
+for (const range of Object.values(WORKER_MUTATION_PARTITION_RANGES)) {
+  const [start, end] = range;
+  if (
+    !Number.isInteger(start)
+    || !Number.isInteger(end)
+    || start < 1
+    || end <= start
+    || end > WORKER_MUTATION_TEST_REGISTRATION_COUNT + 1
+  ) {
+    throw new Error("Worker mutation partition range is invalid.");
+  }
+  for (let ordinal = start; ordinal < end; ordinal += 1) {
+    workerMutationPartitionCoverage[ordinal] += 1;
+  }
+}
+if (workerMutationPartitionCoverage.slice(1).some((count) => count !== 1)) {
+  throw new Error(
+    "Worker mutation partition ranges must cover every registration exactly once."
+  );
+}
+const configuredWorkerMutationPartition =
+  globalThis[WORKER_MUTATION_PARTITION_KEY];
+const workerMutationPartition = configuredWorkerMutationPartition == null
+  ? null
+  : Number(configuredWorkerMutationPartition);
+if (
+  workerMutationPartition !== null
+  && !Object.hasOwn(WORKER_MUTATION_PARTITION_RANGES, workerMutationPartition)
+) {
+  throw new Error("Worker mutation test partition is invalid.");
+}
+let workerMutationTestOrdinal = 0;
+let workerMutationRegisteredCount = 0;
+function test(...args) {
+  workerMutationTestOrdinal += 1;
+  const selectedRange = WORKER_MUTATION_PARTITION_RANGES[
+    workerMutationPartition
+  ];
+  if (
+    workerMutationPartition !== null
+    && (
+      workerMutationTestOrdinal < selectedRange[0]
+      || workerMutationTestOrdinal >= selectedRange[1]
+    )
+  ) {
+    return undefined;
+  }
+  workerMutationRegisteredCount += 1;
+  return nodeTest(...args);
+}
 
 const THREAD = "019f666a-6469-7cc1-9a8d-8c1adf61e103";
 const THREAD_B = "019f666b-1e72-74b1-b27c-9d186d7f1016";
@@ -7847,3 +7909,20 @@ test("low-level spawn rejects a second provider launch lifecycle before durable 
   );
   assert.equal(listJobs(root, env).length, 0);
 });
+
+if (workerMutationTestOrdinal !== WORKER_MUTATION_TEST_REGISTRATION_COUNT) {
+  throw new Error(
+    `Worker mutation partitions must be rebalanced after ${workerMutationTestOrdinal} registrations.`
+  );
+}
+const expectedWorkerMutationRegisteredCount = workerMutationPartition === null
+  ? WORKER_MUTATION_TEST_REGISTRATION_COUNT
+  : WORKER_MUTATION_PARTITION_RANGES[workerMutationPartition][1]
+    - WORKER_MUTATION_PARTITION_RANGES[workerMutationPartition][0];
+if (workerMutationRegisteredCount !== expectedWorkerMutationRegisteredCount) {
+  throw new Error(
+    `Worker mutation partition ${workerMutationPartition ?? "all"} registered `
+      + `${workerMutationRegisteredCount} tests instead of `
+      + `${expectedWorkerMutationRegisteredCount}.`
+  );
+}

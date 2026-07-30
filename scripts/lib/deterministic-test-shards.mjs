@@ -1,13 +1,21 @@
 export const DETERMINISTIC_TEST_SHARD_COUNT = 3;
+export const DETERMINISTIC_AGGREGATE_TEST_FILES = Object.freeze([
+  "tests/worker-broker-evidence.test.mjs",
+  "tests/worker-mutation.test.mjs"
+]);
 export const DETERMINISTIC_SUPPORT_TEST_FILES = Object.freeze([
+  "tests/worker-broker-evidence_part1.mjs",
   "tests/worker-broker-evidence_part2.mjs",
   "tests/worker-broker-evidence_part3.mjs",
-  "tests/worker-broker-evidence_part4.mjs"
+  "tests/worker-broker-evidence_part4.mjs",
+  "tests/worker-broker-evidence_part5.mjs",
+  "tests/worker-mutation_part1.mjs",
+  "tests/worker-mutation_part2.mjs"
 ]);
 
 // Duration-balanced from the macOS and Linux lanes in Actions run 30516745831.
-// The process-heavy cleanup test and four evidence partitions are spread so
-// every shard has one or two, rather than serializing all five in one job.
+// The process-heavy cleanup test and partition wrappers are spread so every
+// shard has two or three, rather than serializing them in one job.
 // Keep this manifest explicit: validation must fail when the deterministic
 // inventory changes until the new file is deliberately assigned.
 export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
@@ -23,6 +31,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/provider-capability.test.mjs",
     "tests/version-policy.test.mjs",
     "tests/worker-broker-evidence_part2.mjs",
+    "tests/worker-broker-evidence_part5.mjs",
     "tests/worker-broker-phase3-evidence.test.mjs",
     "tests/worker-execution-binding.test.mjs",
     "tests/worker-host-actions.test.mjs",
@@ -50,10 +59,11 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/readonly-status.test.mjs",
     "tests/state.test.mjs",
     "tests/stdin.test.mjs",
-    "tests/worker-broker-evidence.test.mjs",
+    "tests/worker-broker-evidence_part1.mjs",
     "tests/worker-broker-evidence_part3.mjs",
     "tests/worker-context-roles.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
+    "tests/worker-mutation_part1.mjs",
     "tests/worker-presentation.test.mjs",
     "tests/worker-reconcile-safety.test.mjs",
     "tests/worker-session-close-environment.test.mjs"
@@ -79,7 +89,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/worker-broker-evidence_part4.mjs",
     "tests/worker-cli-authority.test.mjs",
     "tests/worker-mailbox.test.mjs",
-    "tests/worker-mutation.test.mjs",
+    "tests/worker-mutation_part2.mjs",
     "tests/worker-owner-lifecycle.test.mjs",
     "tests/worker-provider-rotation-intent.test.mjs",
     "tests/worker-startup-crash-window.test.mjs"

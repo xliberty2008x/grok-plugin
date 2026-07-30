@@ -1,16 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import {
+  TEST_TEMP_MANIFEST,
   TEST_TEMP_PROCESS_PREFIX,
   TEST_TEMP_RUN_PREFIX,
   canonicalSystemTempRoot,
   processStartToken,
-  readTestTempManifest
+  validateTestTempManifest
 } from "./test-temp.mjs";
 
 export const DEFAULT_TEST_TEMP_MAX_AGE_MS = 60 * 60_000;
@@ -408,6 +409,127 @@ function sameIdentity(left, right) {
     && left.mtimeMs === right.mtimeMs;
 }
 
+const TEST_TEMP_MANIFEST_MAX_BYTES = 4 * 1024;
+
+function manifestIdentity(stat) {
+  return {
+    dev: stat.dev,
+    ino: stat.ino,
+    mode: stat.mode,
+    uid: stat.uid,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs
+  };
+}
+
+function sameManifestIdentity(left, right) {
+  return Boolean(
+    left
+    && right
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs
+  );
+}
+
+function sameDigest(left, right) {
+  if (
+    typeof left !== "string"
+    || typeof right !== "string"
+    || !/^[a-f0-9]{64}$/u.test(left)
+    || !/^[a-f0-9]{64}$/u.test(right)
+  ) {
+    return false;
+  }
+  return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"));
+}
+
+function readStableOwnerManifest(root, expectedUid) {
+  if (!Number.isInteger(fs.constants.O_NOFOLLOW)) return null;
+  const manifestPath = path.join(root, TEST_TEMP_MANIFEST);
+  let descriptor;
+  try {
+    const directoryBefore = fs.lstatSync(root);
+    const pathBefore = fs.lstatSync(manifestPath);
+    if (
+      !directoryBefore.isDirectory()
+      || directoryBefore.isSymbolicLink()
+      || directoryBefore.uid !== expectedUid
+      || !pathBefore.isFile()
+      || pathBefore.isSymbolicLink()
+      || pathBefore.uid !== expectedUid
+      || (pathBefore.mode & 0o777) !== 0o600
+      || pathBefore.size > TEST_TEMP_MANIFEST_MAX_BYTES
+    ) {
+      return null;
+    }
+    descriptor = fs.openSync(
+      manifestPath,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
+    );
+    const openedBefore = fs.fstatSync(descriptor);
+    if (
+      !openedBefore.isFile()
+      || openedBefore.isSymbolicLink()
+      || openedBefore.uid !== expectedUid
+      || (openedBefore.mode & 0o777) !== 0o600
+      || openedBefore.size > TEST_TEMP_MANIFEST_MAX_BYTES
+      || !sameManifestIdentity(
+        manifestIdentity(pathBefore),
+        manifestIdentity(openedBefore)
+      )
+    ) {
+      return null;
+    }
+    const contents = fs.readFileSync(descriptor);
+    const openedAfter = fs.fstatSync(descriptor);
+    const pathAfter = fs.lstatSync(manifestPath);
+    const directoryAfter = fs.lstatSync(root);
+    if (
+      contents.length !== openedAfter.size
+      || !sameManifestIdentity(
+        manifestIdentity(openedBefore),
+        manifestIdentity(openedAfter)
+      )
+      || !sameManifestIdentity(
+        manifestIdentity(openedAfter),
+        manifestIdentity(pathAfter)
+      )
+      || directoryBefore.dev !== directoryAfter.dev
+      || directoryBefore.ino !== directoryAfter.ino
+      || directoryBefore.mode !== directoryAfter.mode
+      || directoryBefore.uid !== directoryAfter.uid
+    ) {
+      return null;
+    }
+    const value = validateTestTempManifest(JSON.parse(contents.toString("utf8")));
+    if (!value) return null;
+    return {
+      value,
+      identity: manifestIdentity(openedAfter),
+      digest: createHash("sha256").update(contents).digest("hex")
+    };
+  } catch {
+    return null;
+  } finally {
+    if (Number.isInteger(descriptor)) fs.closeSync(descriptor);
+  }
+}
+
+function sameOwnerManifestSnapshot(left, right) {
+  return Boolean(
+    left
+    && right
+    && sameManifestIdentity(left.identity, right.identity)
+    && sameDigest(left.digest, right.digest)
+  );
+}
+
 const REMOVE_INVENTORIED_ROOT_HELPER = fileURLToPath(
   new URL("./test-temp-remove-helper.cjs", import.meta.url)
 );
@@ -675,7 +797,10 @@ function candidateRecord({
   if (stat.uid !== expectedUid) reasons.push("owner-mismatch");
   if (nowMs - stat.mtimeMs < olderThanMs) reasons.push("too-recent");
 
-  const manifest = family.kind === "managed" ? readTestTempManifest(candidate) : null;
+  const manifestSnapshot = family.kind === "managed"
+    ? readStableOwnerManifest(candidate, expectedUid)
+    : null;
+  const manifest = manifestSnapshot?.value ?? null;
   if (family.kind === "managed" && !manifest) reasons.push("invalid-owner-manifest");
   if (manifest && manifest.kind !== family.manifestKind) reasons.push("manifest-kind-mismatch");
   const owner = ownerActivity(manifest, tokenForPid);
@@ -702,6 +827,7 @@ function candidateRecord({
     registeredWorktree: gitReason === "registered-worktree",
     identity,
     manifest,
+    manifestSnapshot,
     eligible: reasons.length === 0,
     reasons
   };
@@ -899,6 +1025,27 @@ export function cleanupTestTemp({
       try {
         if (!removeRoot(record.path, record.identity, {
           afterQuarantine(quarantine) {
+            let quarantinedRoot;
+            try {
+              quarantinedRoot = fs.lstatSync(quarantine);
+            } catch {
+              const error = new Error(
+                "The quarantined cleanup candidate identity is unavailable."
+              );
+              error.code = "E_TEST_TEMP_IDENTITY_CHANGED";
+              throw error;
+            }
+            if (
+              !quarantinedRoot.isDirectory()
+              || quarantinedRoot.isSymbolicLink()
+              || !sameIdentity(record.identity, stableIdentity(quarantinedRoot))
+            ) {
+              const error = new Error(
+                "The quarantined cleanup candidate identity changed."
+              );
+              error.code = "E_TEST_TEMP_IDENTITY_CHANGED";
+              throw error;
+            }
             const postRenameOpenSnapshot = openPathsProvider();
             if (
               !postRenameOpenSnapshot?.available
@@ -946,6 +1093,42 @@ export function cleanupTestTemp({
               error.code = "E_TEST_TEMP_WORKTREE_AFTER_QUARANTINE";
               throw error;
             }
+            if (record.family === "managed") {
+              const freshManifest = readStableOwnerManifest(
+                quarantine,
+                expectedUid
+              );
+              if (!freshManifest) {
+                const error = new Error(
+                  "The cleanup candidate owner manifest became invalid."
+                );
+                error.code = "E_TEST_TEMP_MANIFEST_INVALID_AFTER_QUARANTINE";
+                throw error;
+              }
+              const freshOwner = ownerActivity(
+                freshManifest.value,
+                tokenForPid
+              );
+              if (!sameOwnerManifestSnapshot(
+                record.manifestSnapshot,
+                freshManifest
+              )) {
+                const error = new Error(
+                  "The cleanup candidate owner manifest changed."
+                );
+                error.code = "E_TEST_TEMP_MANIFEST_CHANGED";
+                throw error;
+              }
+              if (!freshOwner.known || freshOwner.active) {
+                const error = new Error(
+                  "The cleanup candidate owner identity is not stale."
+                );
+                error.code = freshOwner.active
+                  ? "E_TEST_TEMP_OWNER_ACTIVE_AFTER_QUARANTINE"
+                  : "E_TEST_TEMP_OWNER_UNKNOWN_AFTER_QUARANTINE";
+                throw error;
+              }
+            }
           }
         })) {
           record.eligible = false;
@@ -959,6 +1142,15 @@ export function cleanupTestTemp({
         record.eligible = false;
         if (error?.code === "E_TEST_TEMP_IDENTITY_CHANGED") {
           record.reasons.push("identity-changed");
+        } else if (
+          error?.code === "E_TEST_TEMP_MANIFEST_CHANGED"
+          || error?.code === "E_TEST_TEMP_MANIFEST_INVALID_AFTER_QUARANTINE"
+        ) {
+          record.reasons.push("owner-manifest-changed");
+        } else if (error?.code === "E_TEST_TEMP_OWNER_ACTIVE_AFTER_QUARANTINE") {
+          record.reasons.push("active-owner");
+        } else if (error?.code === "E_TEST_TEMP_OWNER_UNKNOWN_AFTER_QUARANTINE") {
+          record.reasons.push("owner-identity-unavailable");
         } else if (error?.code === "E_TEST_TEMP_ACTIVE_AFTER_QUARANTINE") {
           record.reasons.push("active-process-reference");
         } else if (error?.code === "E_TEST_TEMP_WORKTREE_AFTER_QUARANTINE") {

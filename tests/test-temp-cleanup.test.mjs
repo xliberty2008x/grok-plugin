@@ -8,9 +8,11 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { cleanupExitCode, parseCleanupArgs } from "../scripts/cleanup-test-temp.mjs";
-import { runDeterministicTestFiles } from "../scripts/lib/deterministic-test-runner.mjs";
 import {
-  consumeWorkerBrokerEvidencePartition,
+  runDeterministicTestFiles,
+  runDeterministicTestFilesCli
+} from "../scripts/lib/deterministic-test-runner.mjs";
+import {
   environmentProvesOwnership,
   linuxKnownProcessIdentityMatches,
   linuxProcessGroupMemberFromStat,
@@ -25,6 +27,7 @@ import {
   removeInventoriedTestTempRoot
 } from "../scripts/lib/test-temp-cleanup.mjs";
 import {
+  TEST_TEMP_MANIFEST,
   TEST_TEMP_PROCESS_PREFIX,
   TEST_TEMP_RUN_PREFIX,
   createOwnedTestTempRoot,
@@ -635,6 +638,77 @@ test("apply restores quarantine when a fresh worktree snapshot registers the can
   assert.equal(fs.readFileSync(path.join(target, "payload"), "utf8"), "payload");
 });
 
+test("managed apply restores a same-size in-place owner manifest rewrite after quarantine", (t) => {
+  if (process.platform === "win32") return;
+  const liveToken = processStartToken(process.pid);
+  if (!liveToken) {
+    t.skip("A stable process-start token is required.");
+    return;
+  }
+  const root = sandbox(t);
+  const staleToken = `${liveToken[0] === "X" ? "Y" : "X"}${liveToken.slice(1)}`;
+  const target = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_PROCESS_PREFIX,
+    kind: "process",
+    pid: process.pid,
+    startToken: staleToken
+  });
+  const outside = fs.mkdtempSync(path.join(root, "manifest-race-outside-"));
+  const canary = path.join(outside, "keep");
+  fs.writeFileSync(canary, "keep");
+  const manifestPath = path.join(target, TEST_TEMP_MANIFEST);
+  const fixedTime = new Date(Math.floor((Date.now() - OLD_MS) / 1_000) * 1_000);
+  fs.utimesSync(manifestPath, fixedTime, fixedTime);
+  const initialManifestStat = fs.lstatSync(manifestPath);
+  const initialManifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  const freshContents = Buffer.from(`${JSON.stringify({
+    ...initialManifest,
+    startToken: liveToken
+  })}\n`);
+  assert.equal(freshContents.length, initialManifestStat.size);
+  age(target);
+
+  const result = cleanupTestTemp(options(root, {
+    apply: true,
+    legacy: false,
+    tokenForPid: (pid) => (pid === process.pid ? liveToken : null),
+    beforeDelete(candidate) {
+      if (candidate.path !== target) return;
+      const descriptor = fs.openSync(manifestPath, "r+");
+      try {
+        fs.writeSync(descriptor, freshContents, 0, freshContents.length, 0);
+        fs.ftruncateSync(descriptor, freshContents.length);
+        fs.fsyncSync(descriptor);
+      } finally {
+        fs.closeSync(descriptor);
+      }
+      fs.utimesSync(
+        manifestPath,
+        initialManifestStat.atime,
+        initialManifestStat.mtime
+      );
+      const rewrittenStat = fs.lstatSync(manifestPath);
+      assert.equal(rewrittenStat.size, initialManifestStat.size);
+      assert.equal(rewrittenStat.mtimeMs, initialManifestStat.mtimeMs);
+    }
+  }));
+
+  const candidate = record(result, target);
+  assert.equal(candidate.removed, undefined);
+  assert.ok(candidate.reasons.includes("owner-manifest-changed"));
+  assert.equal(fs.existsSync(target), true);
+  assert.equal(
+    JSON.parse(fs.readFileSync(manifestPath, "utf8")).startToken,
+    liveToken
+  );
+  assert.equal(fs.readFileSync(canary, "utf8"), "keep");
+  assert.equal(
+    fs.readdirSync(root).some((name) => name.startsWith(".grok-plugin-cleanup-quarantine-")),
+    false
+  );
+});
+
 test("verified recursive removal has no timeout that can orphan a descendant helper", (t) => {
   const root = sandbox(t);
   const target = legacy(root);
@@ -1156,6 +1230,366 @@ test("supervisor interruption promptly kills a TERM-resistant group and runner c
   assert.equal(fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)), false);
 });
 
+test("ordinary process-group interruption cleans the run root and preserves a foreign process", async (t) => {
+  if (process.platform === "win32") return;
+  const root = sandbox(t);
+  const controlFile = path.join(root, "group-interrupt-control.json");
+  const fixture = path.join(root, "group-interrupt.test.mjs");
+  const driver = path.join(root, "group-interrupt-driver.mjs");
+  fs.writeFileSync(fixture, [
+    'import fs from "node:fs";',
+    'import process from "node:process";',
+    'import { spawn } from "node:child_process";',
+    'const child = spawn(process.execPath, ["--eval", "process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });',
+    'process.on("SIGTERM", () => {});',
+    `fs.writeFileSync(${JSON.stringify(controlFile)}, JSON.stringify({`,
+    "  fixturePid: process.pid,",
+    "  descendantPid: child.pid",
+    "}));",
+    "setInterval(() => {}, 1000);",
+    ""
+  ].join("\n"));
+  fs.writeFileSync(driver, [
+    'import process from "node:process";',
+    `import { runDeterministicTestFiles } from ${JSON.stringify(pathToFileURL(path.join(ROOT, "scripts/lib/deterministic-test-runner.mjs")).href)};`,
+    "const status = runDeterministicTestFiles({",
+    `  files: [${JSON.stringify(fixture)}],`,
+    `  root: ${JSON.stringify(ROOT)},`,
+    `  reporter: ${JSON.stringify(REPORTER)},`,
+    `  tempRoot: ${JSON.stringify(root)},`,
+    "  timeoutMs: 60_000,",
+    "  stdout: { write() {} },",
+    "  stderr: { write() {} }",
+    "});",
+    "process.exit(status);",
+    ""
+  ].join("\n"));
+  const environment = { ...process.env };
+  delete environment.NODE_TEST_CONTEXT;
+  const runner = spawn(process.execPath, [driver], {
+    cwd: ROOT,
+    env: environment,
+    detached: true,
+    stdio: "ignore"
+  });
+  const foreign = spawn(process.execPath, ["--eval", "setInterval(() => {}, 1000)"], {
+    cwd: ROOT,
+    env: environment,
+    detached: true,
+    stdio: "ignore"
+  });
+  t.after(() => {
+    try { process.kill(-runner.pid, "SIGKILL"); } catch {}
+    try { process.kill(-foreign.pid, "SIGKILL"); } catch {}
+  });
+  await waitForPath(controlFile);
+  const control = JSON.parse(fs.readFileSync(controlFile, "utf8"));
+  const exited = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Interrupted runner did not exit.")), 6_000);
+    runner.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
+  process.kill(-runner.pid, "SIGINT");
+  const exit = await exited;
+  assert.deepEqual(exit, { code: 1, signal: null });
+  assert.equal(await pidIsGone(control.fixturePid), true);
+  assert.equal(await pidIsGone(control.descendantPid), true);
+  assert.doesNotThrow(() => process.kill(foreign.pid, 0));
+  assert.equal(
+    fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)),
+    false
+  );
+});
+
+test("direct CLI PID interruption before supervisor readiness launches no test command", async (t) => {
+  if (process.platform === "win32") return;
+  const root = sandbox(t);
+  const readyFile = path.join(root, "pre-ready-supervisor.json");
+  const fixtureControlFile = path.join(root, "pre-ready-fixture.json");
+  const fixture = path.join(root, "pre-ready-interrupt.test.mjs");
+  const driver = path.join(root, "pre-ready-interrupt-driver.mjs");
+  fs.writeFileSync(fixture, [
+    'import fs from "node:fs";',
+    'import process from "node:process";',
+    'import { spawn } from "node:child_process";',
+    'const child = spawn(process.execPath, ["--eval", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });',
+    `fs.writeFileSync(${JSON.stringify(fixtureControlFile)}, JSON.stringify({`,
+    "  fixturePid: process.pid,",
+    "  descendantPid: child.pid",
+    "}));",
+    "setInterval(() => {}, 1000);",
+    ""
+  ].join("\n"));
+  fs.writeFileSync(driver, [
+    'import fs from "node:fs";',
+    'import process from "node:process";',
+    `import { runDeterministicTestFilesCli } from ${JSON.stringify(pathToFileURL(path.join(ROOT, "scripts/lib/deterministic-test-runner.mjs")).href)};`,
+    "const status = await runDeterministicTestFilesCli({",
+    `  files: [${JSON.stringify(fixture)}],`,
+    `  root: ${JSON.stringify(ROOT)},`,
+    `  reporter: ${JSON.stringify(REPORTER)},`,
+    `  tempRoot: ${JSON.stringify(root)},`,
+    "  timeoutMs: 60_000,",
+    "  testPreCommandDelayMs: 30_000,",
+    "  onTestSupervisorPreCommandReady({ supervisorPid }) {",
+    `    fs.writeFileSync(${JSON.stringify(readyFile)}, JSON.stringify({ supervisorPid }));`,
+    "  },",
+    "  stdout: { write() {} },",
+    "  stderr: { write() {} }",
+    "});",
+    "process.exitCode = status;",
+    ""
+  ].join("\n"));
+  const environment = { ...process.env };
+  delete environment.NODE_TEST_CONTEXT;
+  const runner = spawn(process.execPath, [driver], {
+    cwd: ROOT,
+    env: environment,
+    detached: true,
+    stdio: "ignore"
+  });
+  const foreign = spawn(process.execPath, ["--eval", "setInterval(() => {}, 1000)"], {
+    cwd: ROOT,
+    env: environment,
+    detached: true,
+    stdio: "ignore"
+  });
+  let supervisorPid = null;
+  let fixtureControl = null;
+  t.after(() => {
+    for (const pid of [
+      runner.pid,
+      supervisorPid,
+      fixtureControl?.fixturePid,
+      fixtureControl?.descendantPid,
+      foreign.pid
+    ]) {
+      if (!Number.isSafeInteger(pid)) continue;
+      try { process.kill(pid, "SIGKILL"); } catch {}
+    }
+  });
+  const exited = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Pre-ready interrupted CLI did not exit.")), 8_000);
+    runner.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
+  await waitForPath(readyFile);
+  ({ supervisorPid } = JSON.parse(fs.readFileSync(readyFile, "utf8")));
+  assert.equal(Number.isSafeInteger(supervisorPid), true);
+  assert.equal(fs.existsSync(fixtureControlFile), false);
+
+  const startedAt = Date.now();
+  process.kill(runner.pid, "SIGTERM");
+  const exit = await exited;
+  assert.deepEqual(exit, { code: 1, signal: null });
+  assert.ok(Date.now() - startedAt < 8_000);
+  assert.equal(await pidIsGone(supervisorPid), true);
+  if (fs.existsSync(fixtureControlFile)) {
+    fixtureControl = JSON.parse(fs.readFileSync(fixtureControlFile, "utf8"));
+    assert.equal(await pidIsGone(fixtureControl.fixturePid), true);
+    assert.equal(await pidIsGone(fixtureControl.descendantPid), true);
+  }
+  assert.equal(fs.existsSync(fixtureControlFile), false);
+  assert.doesNotThrow(() => process.kill(foreign.pid, 0));
+  assert.equal(
+    fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)),
+    false
+  );
+});
+
+test("direct CLI PID interruption reaches the supervisor and preserves a foreign process", async (t) => {
+  if (process.platform === "win32") return;
+  for (const relative of [
+    "scripts/test-deterministic.mjs",
+    "scripts/test-phase1-focused.mjs",
+    "scripts/test-phase2-focused.mjs",
+    "scripts/test-phase3-focused.mjs"
+  ]) {
+    const source = fs.readFileSync(path.join(ROOT, relative), "utf8");
+    assert.match(source, /\brunDeterministicTestFilesCli\b/u, relative);
+    assert.match(source, /process\.exitCode\s*=\s*await\b/u, relative);
+  }
+  const root = sandbox(t);
+  const controlFile = path.join(root, "direct-pid-interrupt-control.json");
+  const fixture = path.join(root, "direct-pid-interrupt.test.mjs");
+  const driver = path.join(root, "direct-pid-interrupt-driver.mjs");
+  fs.writeFileSync(fixture, [
+    'import fs from "node:fs";',
+    'import process from "node:process";',
+    'import { spawn } from "node:child_process";',
+    'const child = spawn(process.execPath, ["--eval", "process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });',
+    'process.on("SIGTERM", () => {});',
+    `fs.writeFileSync(${JSON.stringify(controlFile)}, JSON.stringify({`,
+    "  supervisorPid: Number(process.env.GROK_PLUGIN_TEST_SUPERVISOR_PID),",
+    "  fixturePid: process.pid,",
+    "  descendantPid: child.pid",
+    "}));",
+    "setInterval(() => {}, 1000);",
+    ""
+  ].join("\n"));
+  fs.writeFileSync(driver, [
+    'import process from "node:process";',
+    `import { runDeterministicTestFilesCli } from ${JSON.stringify(pathToFileURL(path.join(ROOT, "scripts/lib/deterministic-test-runner.mjs")).href)};`,
+    "const status = await runDeterministicTestFilesCli({",
+    `  files: [${JSON.stringify(fixture)}],`,
+    `  root: ${JSON.stringify(ROOT)},`,
+    `  reporter: ${JSON.stringify(REPORTER)},`,
+    `  tempRoot: ${JSON.stringify(root)},`,
+    "  timeoutMs: 60_000,",
+    "  stdout: { write() {} },",
+    "  stderr: { write() {} }",
+    "});",
+    "process.exitCode = status;",
+    ""
+  ].join("\n"));
+  const environment = { ...process.env };
+  delete environment.NODE_TEST_CONTEXT;
+  const runner = spawn(process.execPath, [driver], {
+    cwd: ROOT,
+    env: environment,
+    detached: true,
+    stdio: "ignore"
+  });
+  const foreign = spawn(process.execPath, ["--eval", "setInterval(() => {}, 1000)"], {
+    cwd: ROOT,
+    env: environment,
+    detached: true,
+    stdio: "ignore"
+  });
+  let control = null;
+  t.after(() => {
+    for (const pid of [
+      runner.pid,
+      control?.supervisorPid,
+      control?.fixturePid,
+      control?.descendantPid,
+      foreign.pid
+    ]) {
+      if (!Number.isSafeInteger(pid)) continue;
+      try { process.kill(pid, "SIGKILL"); } catch {}
+    }
+  });
+  await waitForPath(controlFile);
+  control = JSON.parse(fs.readFileSync(controlFile, "utf8"));
+  const exited = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Directly interrupted CLI did not exit.")), 8_000);
+    runner.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
+  const startedAt = Date.now();
+  process.kill(runner.pid, "SIGTERM");
+  const exit = await exited;
+  const elapsedMs = Date.now() - startedAt;
+  assert.deepEqual(exit, { code: 1, signal: null });
+  assert.ok(elapsedMs < 8_000);
+  assert.ok(elapsedMs < 60_000 / 4);
+  assert.equal(await pidIsGone(control.supervisorPid), true);
+  assert.equal(await pidIsGone(control.fixturePid), true);
+  assert.equal(await pidIsGone(control.descendantPid), true);
+  assert.doesNotThrow(() => process.kill(foreign.pid, 0));
+  assert.equal(
+    fs.readdirSync(root).some((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)),
+    false
+  );
+});
+
+test("forced runner crash leaves one manifest root that the stale reaper removes", async (t) => {
+  if (process.platform === "win32") return;
+  const root = sandbox(t);
+  const controlFile = path.join(root, "forced-crash-control.json");
+  const fixture = path.join(root, "forced-crash.test.mjs");
+  const driver = path.join(root, "forced-crash-driver.mjs");
+  fs.writeFileSync(fixture, [
+    'import fs from "node:fs";',
+    'import process from "node:process";',
+    `fs.writeFileSync(${JSON.stringify(controlFile)}, JSON.stringify({`,
+    "  fixturePid: process.pid,",
+    "  fixtureGroupPid: process.ppid",
+    "}));",
+    "setInterval(() => {}, 1000);",
+    ""
+  ].join("\n"));
+  fs.writeFileSync(driver, [
+    'import process from "node:process";',
+    `import { runDeterministicTestFiles } from ${JSON.stringify(pathToFileURL(path.join(ROOT, "scripts/lib/deterministic-test-runner.mjs")).href)};`,
+    "const status = runDeterministicTestFiles({",
+    `  files: [${JSON.stringify(fixture)}],`,
+    `  root: ${JSON.stringify(ROOT)},`,
+    `  reporter: ${JSON.stringify(REPORTER)},`,
+    `  tempRoot: ${JSON.stringify(root)},`,
+    "  timeoutMs: 60_000,",
+    "  stdout: { write() {} },",
+    "  stderr: { write() {} }",
+    "});",
+    "process.exit(status);",
+    ""
+  ].join("\n"));
+  const environment = { ...process.env };
+  delete environment.NODE_TEST_CONTEXT;
+  const runner = spawn(process.execPath, [driver], {
+    cwd: ROOT,
+    env: environment,
+    detached: true,
+    stdio: "ignore"
+  });
+  let fixturePid = null;
+  let fixtureGroupPid = null;
+  t.after(() => {
+    try { process.kill(-runner.pid, "SIGKILL"); } catch {}
+    if (fixtureGroupPid) {
+      try { process.kill(-fixtureGroupPid, "SIGKILL"); } catch {}
+    }
+  });
+  await waitForPath(controlFile);
+  const control = JSON.parse(fs.readFileSync(controlFile, "utf8"));
+  fixturePid = control.fixturePid;
+  fixtureGroupPid = control.fixtureGroupPid;
+  const exited = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Crashed runner did not exit.")), 6_000);
+    runner.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
+  process.kill(-runner.pid, "SIGKILL");
+  const exit = await exited;
+  assert.equal(exit.code, null);
+  assert.equal(exit.signal, "SIGKILL");
+  process.kill(-fixtureGroupPid, "SIGKILL");
+  assert.equal(await pidIsGone(fixturePid), true);
+
+  const crashedRoots = fs.readdirSync(root)
+    .filter((name) => name.startsWith(TEST_TEMP_RUN_PREFIX));
+  assert.equal(crashedRoots.length, 1);
+  const crashedRoot = path.join(root, crashedRoots[0]);
+  age(crashedRoot);
+
+  const token = processStartToken(process.pid) || "active-crash-sibling-token";
+  const active = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_PROCESS_PREFIX,
+    kind: "process",
+    pid: process.pid,
+    startToken: token
+  });
+  age(active);
+  const result = cleanupTestTemp(options(root, {
+    apply: true,
+    legacy: false,
+    tokenForPid: (pid) => (pid === process.pid ? token : null)
+  }));
+  assert.equal(record(result, crashedRoot).removed, true);
+  assert.ok(record(result, active).reasons.includes("active-owner"));
+  assert.equal(fs.existsSync(crashedRoot), false);
+  assert.equal(fs.existsSync(active), true);
+});
+
 test("supervisor replaces async-spawn decoy ownership and reaps the detached descendant", async (t) => {
   if (process.platform === "win32") return;
   const root = sandbox(t);
@@ -1251,46 +1685,6 @@ test("supervisor fails closed when its signed PID registry is replaced, truncate
       1
     );
   }
-});
-
-test("worker broker evidence partition fails closed without supervisor authority", (t) => {
-  const root = sandbox(t);
-  const marker = path.join(root, "partition-ran");
-  const result = spawnSync("/usr/bin/env", [
-    "GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS=1",
-    "GROK_PLUGIN_WORKER_BROKER_EVIDENCE_PARTITION=1",
-    `NODE_OPTIONS=--require=${CHILD_HOOK}`,
-    process.execPath,
-    "--eval",
-    `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran")`
-  ], {
-    cwd: ROOT,
-    env: {},
-    encoding: "utf8",
-    shell: false,
-    timeout: 5_000
-  });
-  assert.notEqual(result.status, 0);
-  assert.equal(fs.existsSync(marker), false);
-  assert.match(
-    result.stderr,
-    /Worker broker evidence partition authority could not be established/
-  );
-});
-
-test("supervisor consumes the evidence partition marker before ownership probes", () => {
-  const environment = {
-    GROK_PLUGIN_WORKER_BROKER_EVIDENCE_PARTITION: "1",
-    PRESERVED: "yes"
-  };
-  assert.equal(consumeWorkerBrokerEvidencePartition(environment), true);
-  assert.deepEqual(environment, { PRESERVED: "yes" });
-
-  const unselected = {
-    GROK_PLUGIN_WORKER_BROKER_EVIDENCE_PARTITION: "decoy"
-  };
-  assert.equal(consumeWorkerBrokerEvidencePartition(unselected), false);
-  assert.deepEqual(unselected, {});
 });
 
 test("async spawn kills the exact child immediately when ownership registration cannot be written", async (t) => {

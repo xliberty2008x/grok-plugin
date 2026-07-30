@@ -4,7 +4,10 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { runDeterministicTestFiles } from "./lib/deterministic-test-runner.mjs";
+import {
+  runDeterministicTestFiles,
+  runDeterministicTestFilesCli
+} from "./lib/deterministic-test-runner.mjs";
 
 /** Fixed Phase 1 proof inventory; callers cannot add, remove, or reorder tests. */
 export const PHASE1_FOCUSED_TEST_FILES = Object.freeze([
@@ -33,7 +36,8 @@ export const PHASE1_FOCUSED_TEST_FILES = Object.freeze([
   "tests/worker-cli-authority.test.mjs",
   "tests/worker-terminal-intent.test.mjs",
   "tests/process-control-owned-identity.test.mjs",
-  "tests/worker-mutation.test.mjs",
+  "tests/worker-mutation_part1.mjs",
+  "tests/worker-mutation_part2.mjs",
   "tests/worker-safety-proofs.test.mjs"
 ]);
 
@@ -46,5 +50,7 @@ export function runPhaseOneFocusedTests(options = {}) {
 
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : null;
 if (invokedPath && invokedPath === fileURLToPath(import.meta.url)) {
-  process.exitCode = runPhaseOneFocusedTests();
+  process.exitCode = await runDeterministicTestFilesCli({
+    files: PHASE1_FOCUSED_TEST_FILES
+  });
 }

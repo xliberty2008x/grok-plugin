@@ -4,7 +4,10 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { runDeterministicTestFiles } from "./lib/deterministic-test-runner.mjs";
+import {
+  runDeterministicTestFiles,
+  runDeterministicTestFilesCli
+} from "./lib/deterministic-test-runner.mjs";
 
 /**
  * Fixed Phase 3 proof inventory. It covers execution binding, managed-root
@@ -23,7 +26,8 @@ export const PHASE3_FOCUSED_TEST_FILES = Object.freeze([
   "tests/worker-dispatch-supervisor.test.mjs",
   "tests/worker-execution-binding.test.mjs",
   "tests/worker-launch-outbox.test.mjs",
-  "tests/worker-mutation.test.mjs",
+  "tests/worker-mutation_part1.mjs",
+  "tests/worker-mutation_part2.mjs",
   "tests/worker-owner-controller.test.mjs",
   "tests/worker-owner-lifecycle.test.mjs",
   "tests/worker-protocol.test.mjs",
@@ -46,5 +50,7 @@ export function runPhaseThreeFocusedTests(options = {}) {
 
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : null;
 if (invokedPath && invokedPath === fileURLToPath(import.meta.url)) {
-  process.exitCode = runPhaseThreeFocusedTests();
+  process.exitCode = await runDeterministicTestFilesCli({
+    files: PHASE3_FOCUSED_TEST_FILES
+  });
 }

@@ -84,6 +84,7 @@ import {
   sha256Text
 } from "../scripts/lib/worker-broker-evidence.mjs";
 import {
+  DETERMINISTIC_AGGREGATE_TEST_FILES,
   EXTERNAL_BOUNDARY_TESTS,
   listDeterministicTestFiles,
   runDeterministicTestFiles
@@ -120,10 +121,41 @@ import { ROOT, git, initRepo, run, tempDir, waitFor } from "./helpers.mjs";
 const WORKER_BROKER_EVIDENCE_PARTITION_KEY = Symbol.for(
   "grok-plugin.worker-broker-evidence-partition"
 );
-const WORKER_BROKER_EVIDENCE_PARTITION_ENV =
-  "GROK_PLUGIN_WORKER_BROKER_EVIDENCE_PARTITION";
-const WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES = Object.freeze([90, 102, 115]);
+const WORKER_BROKER_EVIDENCE_PARTITION_RANGES = Object.freeze({
+  1: Object.freeze([1, 45]),
+  2: Object.freeze([90, 102]),
+  3: Object.freeze([102, 115]),
+  4: Object.freeze([115, 126]),
+  5: Object.freeze([45, 90])
+});
 const WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT = 125;
+const workerBrokerEvidencePartitionCoverage = new Uint8Array(
+  WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT + 1
+);
+for (const range of Object.values(WORKER_BROKER_EVIDENCE_PARTITION_RANGES)) {
+  const [start, end] = range;
+  if (
+    !Number.isInteger(start)
+    || !Number.isInteger(end)
+    || start < 1
+    || end <= start
+    || end > WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT + 1
+  ) {
+    throw new Error("Worker broker evidence partition range is invalid.");
+  }
+  for (let ordinal = start; ordinal < end; ordinal += 1) {
+    workerBrokerEvidencePartitionCoverage[ordinal] += 1;
+  }
+}
+if (
+  workerBrokerEvidencePartitionCoverage
+    .slice(1)
+    .some((count) => count !== 1)
+) {
+  throw new Error(
+    "Worker broker evidence partition ranges must cover every registration exactly once."
+  );
+}
 const configuredWorkerBrokerEvidencePartition =
   globalThis[WORKER_BROKER_EVIDENCE_PARTITION_KEY];
 // Direct `node --test` runs register the complete file. The deterministic
@@ -134,10 +166,10 @@ const workerBrokerEvidencePartition = configuredWorkerBrokerEvidencePartition ==
   : Number(configuredWorkerBrokerEvidencePartition);
 if (
   workerBrokerEvidencePartition !== null
-  && workerBrokerEvidencePartition !== 1
-  && workerBrokerEvidencePartition !== 2
-  && workerBrokerEvidencePartition !== 3
-  && workerBrokerEvidencePartition !== 4
+  && !Object.hasOwn(
+    WORKER_BROKER_EVIDENCE_PARTITION_RANGES,
+    workerBrokerEvidencePartition
+  )
 ) {
   throw new Error("Worker broker evidence test partition is invalid.");
 }
@@ -145,16 +177,13 @@ let workerBrokerEvidenceTestOrdinal = 0;
 let workerBrokerEvidenceRegisteredCount = 0;
 function registerPartitionedTest(register, args) {
   workerBrokerEvidenceTestOrdinal += 1;
+  const selectedRange = WORKER_BROKER_EVIDENCE_PARTITION_RANGES[
+    workerBrokerEvidencePartition
+  ];
   const inPartition = workerBrokerEvidencePartition === null
     || (
-      workerBrokerEvidenceTestOrdinal
-        >= (WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[
-          workerBrokerEvidencePartition - 2
-        ] ?? 1)
-      && workerBrokerEvidenceTestOrdinal
-        < (WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[
-          workerBrokerEvidencePartition - 1
-        ] ?? Number.POSITIVE_INFINITY)
+      workerBrokerEvidenceTestOrdinal >= selectedRange[0]
+      && workerBrokerEvidenceTestOrdinal < selectedRange[1]
     );
   if (!inPartition) return undefined;
   workerBrokerEvidenceRegisteredCount += 1;
@@ -254,10 +283,15 @@ test("deterministic zero-skip runner excludes only explicit external boundaries"
     .sort();
   const expected = all.filter((relative) => (
     !EXTERNAL_BOUNDARY_TESTS.includes(path.basename(relative))
+    && !DETERMINISTIC_AGGREGATE_TEST_FILES.includes(relative)
   ));
+  expected.push("tests/worker-broker-evidence_part1.mjs");
   expected.push("tests/worker-broker-evidence_part2.mjs");
   expected.push("tests/worker-broker-evidence_part3.mjs");
   expected.push("tests/worker-broker-evidence_part4.mjs");
+  expected.push("tests/worker-broker-evidence_part5.mjs");
+  expected.push("tests/worker-mutation_part1.mjs");
+  expected.push("tests/worker-mutation_part2.mjs");
   expected.sort();
   assert.deepEqual(listDeterministicTestFiles(), expected);
 });
@@ -391,21 +425,21 @@ test("deterministic runner executes files sequentially and aggregates exact zero
   });
 });
 
-test("deterministic runner owns the evidence partition environment", () => {
+test("deterministic runner executes static partition wrappers as exact ordinary files", () => {
   const calls = [];
+  const files = [
+    "tests/worker-broker-evidence_part1.mjs",
+    "tests/worker-broker-evidence_part2.mjs",
+    "tests/worker-broker-evidence_part3.mjs",
+    "tests/worker-broker-evidence_part4.mjs",
+    "tests/worker-broker-evidence_part5.mjs",
+    "tests/worker-mutation_part1.mjs",
+    "tests/worker-mutation_part2.mjs"
+  ];
   const status = runDeterministicTestFiles({
-    files: [
-      "tests/worker-broker-evidence.test.mjs",
-      "tests/worker-broker-evidence_part2.mjs",
-      "tests/worker-broker-evidence_part3.mjs",
-      "tests/worker-broker-evidence_part4.mjs"
-    ],
+    files,
     root: ROOT,
     reporter: ZERO_SKIP_REPORTER,
-    env: {
-      ...process.env,
-      [WORKER_BROKER_EVIDENCE_PARTITION_ENV]: "2"
-    },
     run(binary, args, options) {
       calls.push({ binary, args, options });
       return {
@@ -419,13 +453,8 @@ test("deterministic runner owns the evidence partition environment", () => {
     stderr: { write() {} }
   });
   assert.equal(status, 0);
-  assert.equal(
-    calls[0].options.env[WORKER_BROKER_EVIDENCE_PARTITION_ENV],
-    "1"
-  );
-  assert.ok(calls.slice(1).every((call) => (
-    !Object.hasOwn(call.options.env, WORKER_BROKER_EVIDENCE_PARTITION_ENV)
-  )));
+  assert.deepEqual(calls.map((call) => call.args.at(-1)), files);
+  assert.ok(calls.every((call) => call.options.env.TMPDIR));
 });
 
 test("Phase 1 focused runner executes its fixed inventory in exact serial order", () => {
@@ -4914,7 +4943,7 @@ test("Phase 0 proof manifest and persisted producer provenance are exact", () =>
     "2": 15 * 60_000,
     "3": 15 * 60_000,
     "4": 5 * 60_000,
-    "5": 5 * 60_000,
+    "5": 10 * 60_000,
     aggregate: 5 * 60_000
   };
   for (const [phase, gates] of Object.entries(PHASE_PROOF_GATE_MANIFEST)) {
@@ -5581,7 +5610,7 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
       `the Phase 1 focused gate must execute ${relative} exactly once`
     );
   }
-  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 27);
+  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 28);
 });
 
 test("Phase 2 protected manifest, scope, and serial inventory are exact", () => {
@@ -5619,7 +5648,8 @@ test("Phase 2 protected manifest, scope, and serial inventory are exact", () => 
     "tests/worker-context-roles.test.mjs",
     "tests/worker-host-actions.test.mjs",
     "tests/worker-mailbox.test.mjs",
-    "tests/worker-mutation.test.mjs",
+    "tests/worker-mutation_part1.mjs",
+    "tests/worker-mutation_part2.mjs",
     "tests/worker-protocol.test.mjs",
     "tests/worker-service.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
@@ -5702,7 +5732,8 @@ test("Phase 3 protected manifest, scope, and zero-skip inventory are exact", () 
     "tests/worker-dispatch-supervisor.test.mjs",
     "tests/worker-execution-binding.test.mjs",
     "tests/worker-launch-outbox.test.mjs",
-    "tests/worker-mutation.test.mjs",
+    "tests/worker-mutation_part1.mjs",
+    "tests/worker-mutation_part2.mjs",
     "tests/worker-owner-controller.test.mjs",
     "tests/worker-owner-lifecycle.test.mjs",
     "tests/worker-protocol.test.mjs",
@@ -8853,16 +8884,12 @@ if (workerBrokerEvidenceTestOrdinal !== WORKER_BROKER_EVIDENCE_TEST_REGISTRATION
 }
 const expectedWorkerBrokerEvidenceRegisteredCount = workerBrokerEvidencePartition === null
   ? WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT
-  : [
-      WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[0] - 1,
-      WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[1]
-        - WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[0],
-      WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[2]
-        - WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[1],
-      WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT
-        - WORKER_BROKER_EVIDENCE_PARTITION_BOUNDARIES[2]
-        + 1
-    ][workerBrokerEvidencePartition - 1];
+  : WORKER_BROKER_EVIDENCE_PARTITION_RANGES[
+      workerBrokerEvidencePartition
+    ][1]
+      - WORKER_BROKER_EVIDENCE_PARTITION_RANGES[
+        workerBrokerEvidencePartition
+      ][0];
 if (
   workerBrokerEvidenceRegisteredCount
     !== expectedWorkerBrokerEvidenceRegisteredCount

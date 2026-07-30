@@ -21,8 +21,9 @@ const SUPERVISOR_AUTHORITY_SYMBOL = Symbol.for(
 );
 const PID_REGISTRY_BASENAME = ".grok-plugin-owned-pids";
 const CHILD_HOOK_BYPASS_ENV = "GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS";
-const WORKER_BROKER_EVIDENCE_PARTITION_ENV =
-  "GROK_PLUGIN_WORKER_BROKER_EVIDENCE_PARTITION";
+const TEST_PRE_COMMAND_DIAGNOSTIC =
+  "grok-plugin-test-pre-command-v1:ready";
+const MAX_TEST_PRE_COMMAND_DELAY_MS = 60_000;
 const PS_PATHS = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
 const CHILD_HOOK = fileURLToPath(new URL("./test-temp-child-hook.cjs", import.meta.url));
 const PIDFD_SIGNAL_HELPER = fileURLToPath(
@@ -51,21 +52,13 @@ const CONTAINMENT_REASONS = new Set([
 ]);
 
 function usage() {
-  return "Usage: node test-temp-supervisor.mjs --timeout-ms <ms> [--simulate-startup-visibility-failure] -- <node> <args...>\n";
+  return "Usage: node test-temp-supervisor.mjs --timeout-ms <ms> [--simulate-startup-visibility-failure] [--test-delay-before-command-ms <ms>] -- <node> <args...>\n";
 }
 
 function containmentFailure(reason) {
   const safeReason = CONTAINMENT_REASONS.has(reason) ? reason : "termination-incomplete-unknown";
   process.stderr.write(`${CONTAINMENT_DIAGNOSTIC_PREFIX}${safeReason}\n`);
   return CONTAINMENT_FAILURE_EXIT_CODE;
-}
-
-export function consumeWorkerBrokerEvidencePartition(environment) {
-  if (!environment || typeof environment !== "object") return false;
-  const selected =
-    environment[WORKER_BROKER_EVIDENCE_PARTITION_ENV] === "1";
-  delete environment[WORKER_BROKER_EVIDENCE_PARTITION_ENV];
-  return selected;
 }
 
 function visibilityError(code) {
@@ -75,14 +68,13 @@ function visibilityError(code) {
 }
 
 function parseArgs(argv) {
-  const simulateStartupVisibilityFailure =
-    argv[2] === "--simulate-startup-visibility-failure";
-  const separator = simulateStartupVisibilityFailure ? 3 : 2;
+  let cursor = 2;
+  let simulateStartupVisibilityFailure = false;
+  let testPreCommandDelayMs = 0;
   if (
-    argv.length < separator + 2
+    argv.length < 4
     || argv[0] !== "--timeout-ms"
     || !/^[1-9]\d*$/.test(argv[1])
-    || argv[separator] !== "--"
   ) {
     throw new Error("invalid arguments");
   }
@@ -90,11 +82,39 @@ function parseArgs(argv) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs > 24 * 60 * 60_000) {
     throw new Error("invalid timeout");
   }
+  while (argv[cursor] !== "--") {
+    if (
+      argv[cursor] === "--simulate-startup-visibility-failure"
+      && !simulateStartupVisibilityFailure
+    ) {
+      simulateStartupVisibilityFailure = true;
+      cursor += 1;
+      continue;
+    }
+    if (
+      argv[cursor] === "--test-delay-before-command-ms"
+      && testPreCommandDelayMs === 0
+      && /^[1-9]\d*$/u.test(argv[cursor + 1] || "")
+    ) {
+      testPreCommandDelayMs = Number(argv[cursor + 1]);
+      if (
+        !Number.isSafeInteger(testPreCommandDelayMs)
+        || testPreCommandDelayMs > MAX_TEST_PRE_COMMAND_DELAY_MS
+      ) {
+        throw new Error("invalid test delay");
+      }
+      cursor += 2;
+      continue;
+    }
+    throw new Error("invalid arguments");
+  }
+  if (argv.length < cursor + 2) throw new Error("invalid arguments");
   return {
     timeoutMs,
     simulateStartupVisibilityFailure,
-    command: argv[separator + 1],
-    args: argv.slice(separator + 2)
+    testPreCommandDelayMs,
+    command: argv[cursor + 1],
+    args: argv.slice(cursor + 2)
   };
 }
 
@@ -901,222 +921,241 @@ async function terminate(child, token, tempIdentity) {
 }
 
 async function main() {
-  let parsed;
-  try {
-    parsed = parseArgs(process.argv.slice(2));
-  } catch {
-    process.stderr.write(usage());
-    return 2;
-  }
-  const workerBrokerEvidencePartition =
-    consumeWorkerBrokerEvidencePartition(process.env);
-
-  const ownershipToken = randomUUID();
-  const tempIdentity = privateTempIdentity();
-  const pidRegistrySecret = randomUUID();
-  let pidRegistry = null;
-  try {
-    pidRegistry = createPidRegistry(tempIdentity, pidRegistrySecret);
-  } catch {
-    return containmentFailure("startup-visibility");
-  }
-  // This option exists only to exercise the fail-closed runner contract. It
-  // aborts before any test command can launch and cannot weaken containment.
-  if (parsed.simulateStartupVisibilityFailure) {
-    return containmentFailure("startup-visibility");
-  }
-  // A supervisor can itself run beneath another supervisor. Rebind the
-  // preloaded child hook to this supervisor's ownership identity before it
-  // launches visibility probes or the actual test command.
-  process.env.GROK_PLUGIN_TEST_SUPERVISOR_PID = String(process.pid);
-  process.env[OWNERSHIP_TOKEN_ENV] = ownershipToken;
-  if (pidRegistry) {
-    process.env[PID_REGISTRY_ENV] = pidRegistry.path;
-    activePidRegistrySecret = pidRegistrySecret;
-    activePidRegistryPath = pidRegistry.path;
-    activePidRegistryIdentity = pidRegistry.identity;
-    activePidRegistryContents = pidRegistry.contents;
-  }
-  const supervisorNodeOptions = childNodeOptions();
-  process.env.NODE_OPTIONS = supervisorNodeOptions;
-  globalThis[SUPERVISOR_AUTHORITY_SYMBOL] = Object.freeze(Object.fromEntries(
-    Object.entries({
-      [PID_REGISTRY_ENV]: pidRegistry?.path,
-      [PID_REGISTRY_SECRET_ENV]: pidRegistrySecret,
-      GROK_PLUGIN_TEST_SUPERVISOR_TOKEN: ownershipToken,
-      GROK_PLUGIN_TEST_TEMP_ROOT: tempIdentity,
-      GROK_PLUGIN_TEST_SUPERVISOR_PID: String(process.pid),
-      NODE_OPTIONS: supervisorNodeOptions
-    }).filter(([, value]) => typeof value === "string")
-  ));
-  // Node does not expose Windows Job Objects. A PID/PPID snapshot is not a
-  // sufficient containment boundary after an intermediate process exits, so
-  // fail closed instead of launching an uncontained deterministic test.
-  if (process.platform === "win32") return containmentFailure("unsupported-platform");
-  if (!await proveLinuxOwnedProcessVisibility(ownershipToken, tempIdentity)) {
-    return containmentFailure("startup-visibility");
-  }
-  if (process.platform === "linux") {
-    provenLinuxVisibilityToken = ownershipToken;
-  }
-  try {
-    ownedProcessIds(ownershipToken, tempIdentity);
-  } catch {
-    return containmentFailure("startup-visibility");
-  }
-
-  let child;
-  try {
-    child = spawn(parsed.command, parsed.args, {
-      cwd: process.cwd(),
-      env: {
-        ...process.env,
-        GROK_PLUGIN_TEST_SUPERVISOR_PID: String(process.pid),
-        [OWNERSHIP_TOKEN_ENV]: ownershipToken,
-        [PID_REGISTRY_SECRET_ENV]: pidRegistrySecret,
-        ...(workerBrokerEvidencePartition
-          ? { [WORKER_BROKER_EVIDENCE_PARTITION_ENV]: "1" }
-          : {}),
-        NODE_OPTIONS: supervisorNodeOptions
-      },
-      shell: false,
-      detached: process.platform !== "win32",
-      stdio: ["ignore", "pipe", "ignore"]
-    });
-  } catch {
-    return 1;
-  }
-  if (
-    (process.platform === "linux" || process.platform === "darwin")
-    && child.pid
-  ) {
-    rememberOwnedProcess(child.pid);
-  }
-
-  const chunks = [];
-  let outputBytes = 0;
-  let overflow = false;
-  let resolveOverflow;
-  const overflowed = new Promise((resolve) => {
-    resolveOverflow = resolve;
-  });
-  child.stdout.on("data", (chunk) => {
-    outputBytes += chunk.length;
-    if (outputBytes <= MAX_OUTPUT_BYTES) chunks.push(chunk);
-    else if (!overflow) {
-      overflow = true;
-      resolveOverflow("overflow");
-    }
-  });
-
-  let closeResult;
-  const closed = new Promise((resolve) => {
-    child.once("error", () => resolve({ code: null, signal: null, error: true }));
-    child.once("close", (code, signal) => resolve({ code, signal, error: false }));
-  }).then((result) => {
-    closeResult = result;
-    return result;
-  });
-
+  // Arm interruption before parsing or running any startup visibility probe.
+  // A pending signal is carried through bounded probe cleanup, then prevents
+  // the test command from launching. If it races with spawn, the same promise
+  // routes the exact owned child through terminate() below.
   let interrupted = false;
   let resolveInterrupt;
   const interruptedSignal = new Promise((resolve) => {
     resolveInterrupt = resolve;
   });
-  let resolveContainmentFailure;
-  let containmentReason = null;
-  const containmentFailed = new Promise((resolve) => {
-    resolveContainmentFailure = resolve;
-  });
-  let registryMonitor = null;
-  if (process.platform === "linux" || process.platform === "darwin") {
-    registryMonitor = setInterval(() => {
-      try {
-        loadRegisteredOwnedProcesses(tempIdentity);
-      } catch (error) {
-        containmentReason = error?.code === "E_TEST_TEMP_VISIBILITY_TOKEN"
-          ? "visibility-monitor-token"
-          : error?.code === "E_TEST_TEMP_VISIBILITY_PROC"
-            ? "visibility-monitor-proc"
-            : "visibility-monitor-unknown";
-        resolveContainmentFailure("containment-failure");
-      }
-    }, 5);
-    registryMonitor.unref();
-  }
-  let containmentMonitor = null;
-  if (process.platform === "linux") {
-    let consecutiveVisibilityFailures = 0;
-    containmentMonitor = setInterval(() => {
-      try {
-        ownedProcessIds(ownershipToken, tempIdentity);
-        consecutiveVisibilityFailures = 0;
-      } catch (error) {
-        consecutiveVisibilityFailures += 1;
-        if (consecutiveVisibilityFailures < 4) return;
-        containmentReason = error?.code === "E_TEST_TEMP_VISIBILITY_TOKEN"
-          ? "visibility-monitor-token"
-          : error?.code === "E_TEST_TEMP_VISIBILITY_PROC"
-            ? "visibility-monitor-proc"
-            : "visibility-monitor-unknown";
-        resolveContainmentFailure("containment-failure");
-      }
-    }, 25);
-    containmentMonitor.unref();
-  }
   const interrupt = () => {
     if (interrupted) return;
     interrupted = true;
     resolveInterrupt("interrupt");
   };
-  process.once("SIGINT", interrupt);
-  process.once("SIGTERM", interrupt);
+  process.on("SIGINT", interrupt);
+  process.on("SIGTERM", interrupt);
 
-  const outcome = await Promise.race([
-    closed.then(() => "closed"),
-    wait(parsed.timeoutMs).then(() => "timeout"),
-    overflowed,
-    interruptedSignal,
-    containmentFailed
-  ]);
-  let contained = true;
-  if (
-    outcome === "timeout"
-    || outcome === "overflow"
-    || outcome === "interrupt"
-    || outcome === "containment-failure"
-  ) {
-    contained = await terminate(child, ownershipToken, tempIdentity);
-  } else {
+  try {
+    let parsed;
     try {
-      const groupAlive = processGroupAlive(child);
-      const ownedAlive = ownedProcessIds(ownershipToken, tempIdentity).length > 0;
-      if (groupAlive || ownedAlive) {
-        containmentReason = groupAlive
-          ? "termination-incomplete-group"
-          : "termination-incomplete-owned";
-        // A test file can exit while an unref'ed or detached descendant remains.
-        // Reap only processes that retain the random token or private temp root.
-        contained = await terminate(child, ownershipToken, tempIdentity);
-      }
+      parsed = parseArgs(process.argv.slice(2));
     } catch {
-      containmentReason = "post-close-inspection";
-      contained = false;
+      process.stderr.write(usage());
+      return 2;
     }
-  }
-  process.removeListener("SIGINT", interrupt);
-  process.removeListener("SIGTERM", interrupt);
-  if (registryMonitor) clearInterval(registryMonitor);
-  if (containmentMonitor) clearInterval(containmentMonitor);
+    const ownershipToken = randomUUID();
+    const tempIdentity = privateTempIdentity();
+    const pidRegistrySecret = randomUUID();
+    let pidRegistry = null;
+    try {
+      pidRegistry = createPidRegistry(tempIdentity, pidRegistrySecret);
+    } catch {
+      return containmentFailure("startup-visibility");
+    }
+    if (interrupted) return 130;
+    // This option exists only to exercise the fail-closed runner contract. It
+    // aborts before any test command can launch and cannot weaken containment.
+    if (parsed.simulateStartupVisibilityFailure) {
+      return containmentFailure("startup-visibility");
+    }
+    // A supervisor can itself run beneath another supervisor. Rebind the
+    // preloaded child hook to this supervisor's ownership identity before it
+    // launches visibility probes or the actual test command.
+    process.env.GROK_PLUGIN_TEST_SUPERVISOR_PID = String(process.pid);
+    process.env[OWNERSHIP_TOKEN_ENV] = ownershipToken;
+    if (pidRegistry) {
+      process.env[PID_REGISTRY_ENV] = pidRegistry.path;
+      activePidRegistrySecret = pidRegistrySecret;
+      activePidRegistryPath = pidRegistry.path;
+      activePidRegistryIdentity = pidRegistry.identity;
+      activePidRegistryContents = pidRegistry.contents;
+    }
+    const supervisorNodeOptions = childNodeOptions();
+    process.env.NODE_OPTIONS = supervisorNodeOptions;
+    globalThis[SUPERVISOR_AUTHORITY_SYMBOL] = Object.freeze(Object.fromEntries(
+      Object.entries({
+        [PID_REGISTRY_ENV]: pidRegistry?.path,
+        [PID_REGISTRY_SECRET_ENV]: pidRegistrySecret,
+        GROK_PLUGIN_TEST_SUPERVISOR_TOKEN: ownershipToken,
+        GROK_PLUGIN_TEST_TEMP_ROOT: tempIdentity,
+        GROK_PLUGIN_TEST_SUPERVISOR_PID: String(process.pid),
+        NODE_OPTIONS: supervisorNodeOptions
+      }).filter(([, value]) => typeof value === "string")
+    ));
+    // Node does not expose Windows Job Objects. A PID/PPID snapshot is not a
+    // sufficient containment boundary after an intermediate process exits, so
+    // fail closed instead of launching an uncontained deterministic test.
+    if (process.platform === "win32") return containmentFailure("unsupported-platform");
+    if (!await proveLinuxOwnedProcessVisibility(ownershipToken, tempIdentity)) {
+      return containmentFailure("startup-visibility");
+    }
+    if (process.platform === "linux") {
+      provenLinuxVisibilityToken = ownershipToken;
+    }
+    try {
+      ownedProcessIds(ownershipToken, tempIdentity);
+    } catch {
+      return containmentFailure("startup-visibility");
+    }
+    if (interrupted) return 130;
 
-  if (!overflow && chunks.length) fs.writeSync(process.stdout.fd, Buffer.concat(chunks));
-  if (!contained) return containmentFailure(containmentReason);
-  if (outcome === "containment-failure") return containmentFailure(containmentReason);
-  if (overflow) return OUTPUT_LIMIT_EXIT_CODE;
-  if (outcome === "timeout") return TIMEOUT_EXIT_CODE;
-  if (interrupted) return 130;
-  if (closeResult?.error || closeResult?.signal) return 1;
-  return Number.isInteger(closeResult?.code) ? closeResult.code : 1;
+    // Hidden test-only scheduling hook. It can only delay command launch; all
+    // visibility and ownership checks above remain authoritative.
+    if (parsed.testPreCommandDelayMs > 0) {
+      process.stderr.write(`${TEST_PRE_COMMAND_DIAGNOSTIC}\n`);
+      await Promise.race([
+        wait(parsed.testPreCommandDelayMs),
+        interruptedSignal
+      ]);
+      if (interrupted) return 130;
+    }
+    // Let an already-delivered OS signal become observable before the final
+    // launch check. A later race is contained by the exact child identity.
+    await new Promise((resolve) => setImmediate(resolve));
+    if (interrupted) return 130;
+
+    let child;
+    try {
+      child = spawn(parsed.command, parsed.args, {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          GROK_PLUGIN_TEST_SUPERVISOR_PID: String(process.pid),
+          [OWNERSHIP_TOKEN_ENV]: ownershipToken,
+          [PID_REGISTRY_SECRET_ENV]: pidRegistrySecret,
+          NODE_OPTIONS: supervisorNodeOptions
+        },
+        shell: false,
+        detached: process.platform !== "win32",
+        stdio: ["ignore", "pipe", "ignore"]
+      });
+    } catch {
+      return 1;
+    }
+    if (
+      (process.platform === "linux" || process.platform === "darwin")
+      && child.pid
+    ) {
+      rememberOwnedProcess(child.pid);
+    }
+
+    const chunks = [];
+    let outputBytes = 0;
+    let overflow = false;
+    let resolveOverflow;
+    const overflowed = new Promise((resolve) => {
+      resolveOverflow = resolve;
+    });
+    child.stdout.on("data", (chunk) => {
+      outputBytes += chunk.length;
+      if (outputBytes <= MAX_OUTPUT_BYTES) chunks.push(chunk);
+      else if (!overflow) {
+        overflow = true;
+        resolveOverflow("overflow");
+      }
+    });
+
+    let closeResult;
+    const closed = new Promise((resolve) => {
+      child.once("error", () => resolve({ code: null, signal: null, error: true }));
+      child.once("close", (code, signal) => resolve({ code, signal, error: false }));
+    }).then((result) => {
+      closeResult = result;
+      return result;
+    });
+
+    let resolveContainmentFailure;
+    let containmentReason = null;
+    const containmentFailed = new Promise((resolve) => {
+      resolveContainmentFailure = resolve;
+    });
+    let registryMonitor = null;
+    if (process.platform === "linux" || process.platform === "darwin") {
+      registryMonitor = setInterval(() => {
+        try {
+          loadRegisteredOwnedProcesses(tempIdentity);
+        } catch (error) {
+          containmentReason = error?.code === "E_TEST_TEMP_VISIBILITY_TOKEN"
+            ? "visibility-monitor-token"
+            : error?.code === "E_TEST_TEMP_VISIBILITY_PROC"
+              ? "visibility-monitor-proc"
+              : "visibility-monitor-unknown";
+          resolveContainmentFailure("containment-failure");
+        }
+      }, 5);
+      registryMonitor.unref();
+    }
+    let containmentMonitor = null;
+    if (process.platform === "linux") {
+      let consecutiveVisibilityFailures = 0;
+      containmentMonitor = setInterval(() => {
+        try {
+          ownedProcessIds(ownershipToken, tempIdentity);
+          consecutiveVisibilityFailures = 0;
+        } catch (error) {
+          consecutiveVisibilityFailures += 1;
+          if (consecutiveVisibilityFailures < 4) return;
+          containmentReason = error?.code === "E_TEST_TEMP_VISIBILITY_TOKEN"
+            ? "visibility-monitor-token"
+            : error?.code === "E_TEST_TEMP_VISIBILITY_PROC"
+              ? "visibility-monitor-proc"
+              : "visibility-monitor-unknown";
+          resolveContainmentFailure("containment-failure");
+        }
+      }, 25);
+      containmentMonitor.unref();
+    }
+
+    const outcome = await Promise.race([
+      closed.then(() => "closed"),
+      wait(parsed.timeoutMs).then(() => "timeout"),
+      overflowed,
+      interruptedSignal,
+      containmentFailed
+    ]);
+    let contained = true;
+    if (
+      outcome === "timeout"
+      || outcome === "overflow"
+      || outcome === "interrupt"
+      || outcome === "containment-failure"
+    ) {
+      contained = await terminate(child, ownershipToken, tempIdentity);
+    } else {
+      try {
+        const groupAlive = processGroupAlive(child);
+        const ownedAlive = ownedProcessIds(ownershipToken, tempIdentity).length > 0;
+        if (groupAlive || ownedAlive) {
+          containmentReason = groupAlive
+            ? "termination-incomplete-group"
+            : "termination-incomplete-owned";
+          // A test file can exit while an unref'ed or detached descendant remains.
+          // Reap only processes that retain the random token or private temp root.
+          contained = await terminate(child, ownershipToken, tempIdentity);
+        }
+      } catch {
+        containmentReason = "post-close-inspection";
+        contained = false;
+      }
+    }
+    if (registryMonitor) clearInterval(registryMonitor);
+    if (containmentMonitor) clearInterval(containmentMonitor);
+
+    if (!overflow && chunks.length) fs.writeSync(process.stdout.fd, Buffer.concat(chunks));
+    if (!contained) return containmentFailure(containmentReason);
+    if (outcome === "containment-failure") return containmentFailure(containmentReason);
+    if (overflow) return OUTPUT_LIMIT_EXIT_CODE;
+    if (outcome === "timeout") return TIMEOUT_EXIT_CODE;
+    if (interrupted) return 130;
+    if (closeResult?.error || closeResult?.signal) return 1;
+    return Number.isInteger(closeResult?.code) ? closeResult.code : 1;
+  } finally {
+    process.removeListener("SIGINT", interrupt);
+    process.removeListener("SIGTERM", interrupt);
+  }
 }
 
 if (path.resolve(process.argv[1] || "") === fileURLToPath(import.meta.url)) {

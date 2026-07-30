@@ -10,11 +10,6 @@ const BYPASS_ENVIRONMENT_KEY = "GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS";
 const PID_REGISTRY_ENVIRONMENT_KEY = "GROK_PLUGIN_TEST_PID_REGISTRY";
 const PID_REGISTRY_SECRET_ENVIRONMENT_KEY = "GROK_PLUGIN_TEST_PID_REGISTRY_SECRET";
 const SUPERVISOR_PID_ENVIRONMENT_KEY = "GROK_PLUGIN_TEST_SUPERVISOR_PID";
-const WORKER_BROKER_EVIDENCE_PARTITION_ENVIRONMENT_KEY =
-  "GROK_PLUGIN_WORKER_BROKER_EVIDENCE_PARTITION";
-const WORKER_BROKER_EVIDENCE_PARTITION_SYMBOL = Symbol.for(
-  "grok-plugin.worker-broker-evidence-partition"
-);
 const SUPERVISOR_AUTHORITY_SYMBOL = Symbol.for(
   "grok-plugin.testSupervisorAuthority"
 );
@@ -344,38 +339,6 @@ function appendProcessRegistration(pid, expectedParentPid = null) {
   waitForRegistrationAcknowledgement(registry, registration, registrySecret);
 }
 
-function installWorkerBrokerEvidencePartitionAuthority() {
-  const partition = process.env[
-    WORKER_BROKER_EVIDENCE_PARTITION_ENVIRONMENT_KEY
-  ];
-  delete process.env[WORKER_BROKER_EVIDENCE_PARTITION_ENVIRONMENT_KEY];
-  if (partition !== "1" || capturedSupervisorEntrypoint) return;
-  const authority = activeAuthority();
-  const supervisorPid = Number(
-    authority[SUPERVISOR_PID_ENVIRONMENT_KEY]
-  );
-  const registry = authority[PID_REGISTRY_ENVIRONMENT_KEY];
-  const tempRoot = authority.GROK_PLUGIN_TEST_TEMP_ROOT;
-  const registrySecret = activeRegistrySecret();
-  if (
-    !Number.isSafeInteger(supervisorPid)
-    || supervisorPid <= 1
-    || !path.isAbsolute(registry || "")
-    || !path.isAbsolute(tempRoot || "")
-    || path.dirname(registry) !== path.resolve(tempRoot)
-    || typeof registrySecret !== "string"
-    || registrySecret.length < 32
-    || processRegistration(process.pid, supervisorPid) === null
-  ) {
-    const error = new Error(
-      "Worker broker evidence partition authority could not be established."
-    );
-    error.code = "E_TEST_TEMP_PARTITION_AUTHORITY";
-    throw error;
-  }
-  globalThis[WORKER_BROKER_EVIDENCE_PARTITION_SYMBOL] = 1;
-}
-
 function selectedEnvironment(keys) {
   return Object.fromEntries(keys
     .filter((key) => typeof process.env[key] === "string")
@@ -557,5 +520,4 @@ if (
   appendProcessRegistration(process.pid);
 }
 
-installWorkerBrokerEvidencePartitionAuthority();
 syncBuiltinESMExports();

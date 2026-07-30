@@ -10,6 +10,7 @@ import {
   listDeterministicTestFiles
 } from "../scripts/test-deterministic.mjs";
 import {
+  DETERMINISTIC_AGGREGATE_TEST_FILES,
   DETERMINISTIC_SUPPORT_TEST_FILES,
   DETERMINISTIC_TEST_SHARD_COUNT,
   DETERMINISTIC_TEST_SHARDS,
@@ -21,10 +22,13 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PROCESS_HEAVY_TEST_FILES = Object.freeze([
   "tests/test-temp-cleanup.test.mjs",
-  "tests/worker-broker-evidence.test.mjs",
+  "tests/worker-broker-evidence_part1.mjs",
   "tests/worker-broker-evidence_part2.mjs",
   "tests/worker-broker-evidence_part3.mjs",
-  "tests/worker-broker-evidence_part4.mjs"
+  "tests/worker-broker-evidence_part4.mjs",
+  "tests/worker-broker-evidence_part5.mjs",
+  "tests/worker-mutation_part1.mjs",
+  "tests/worker-mutation_part2.mjs"
 ]);
 
 test("deterministic shard manifest is an exact nonempty partition of the inventory", () => {
@@ -45,16 +49,27 @@ test("deterministic shard manifest is an exact nonempty partition of the invento
   assert.ok(EXTERNAL_BOUNDARY_TESTS.every((file) => !combined.includes(`tests/${file}`)));
 });
 
-test("deterministic-only evidence harness is explicit and excluded from ordinary test discovery", () => {
+test("deterministic partition harnesses replace only their ordinary aggregate files", () => {
+  assert.deepEqual(DETERMINISTIC_AGGREGATE_TEST_FILES, [
+    "tests/worker-broker-evidence.test.mjs",
+    "tests/worker-mutation.test.mjs"
+  ]);
   assert.deepEqual(DETERMINISTIC_SUPPORT_TEST_FILES, [
+    "tests/worker-broker-evidence_part1.mjs",
     "tests/worker-broker-evidence_part2.mjs",
     "tests/worker-broker-evidence_part3.mjs",
-    "tests/worker-broker-evidence_part4.mjs"
+    "tests/worker-broker-evidence_part4.mjs",
+    "tests/worker-broker-evidence_part5.mjs",
+    "tests/worker-mutation_part1.mjs",
+    "tests/worker-mutation_part2.mjs"
   ]);
   const ordinary = fs.readdirSync(path.join(ROOT, "tests"))
     .filter((name) => name.endsWith(".test.mjs"))
     .map((name) => `tests/${name}`);
-  assert.equal(ordinary.includes("tests/worker-broker-evidence.test.mjs"), true);
+  for (const aggregateFile of DETERMINISTIC_AGGREGATE_TEST_FILES) {
+    assert.equal(ordinary.includes(aggregateFile), true);
+    assert.equal(listDeterministicTestFiles().includes(aggregateFile), false);
+  }
   for (const supportFile of DETERMINISTIC_SUPPORT_TEST_FILES) {
     assert.equal(ordinary.includes(supportFile), false);
     assert.equal(listDeterministicTestFiles().filter(
@@ -67,8 +82,7 @@ test("process-heavy cleanup and evidence files are distributed across all shards
   const heavyCounts = DETERMINISTIC_TEST_SHARDS.map((files) =>
     files.filter((file) => PROCESS_HEAVY_TEST_FILES.includes(file)).length
   );
-  assert.equal(heavyCounts.reduce((total, count) => total + count, 0), 5);
-  assert.ok(heavyCounts.every((count) => count >= 1 && count <= 2));
+  assert.deepEqual(heavyCounts, [2, 3, 3]);
 });
 
 test("deterministic shard CLI accepts only one exact three-way shard specification", () => {
