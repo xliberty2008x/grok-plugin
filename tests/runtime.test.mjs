@@ -286,10 +286,11 @@ test("Codex task admission emits the canonical receipt E_CAPABILITY before durab
     path.join(ROOT, "plugins/grok/scripts/grok-companion.mjs"),
     "utf8"
   );
-  // Both gate emitter sites must use the single exported helper (no inline duplicates).
+  // Every gate emitter must use one local error factory and the single exported
+  // message helper (no inline duplicates).
   assert.equal(
     companionSource.split("missingInvalidProviderCapabilityReceiptMessage(").length - 1,
-    2
+    1
   );
   assert.equal(
     companionSource.includes("Valid provider capability receipt is missing or invalid; run"),

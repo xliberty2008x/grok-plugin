@@ -2866,6 +2866,35 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
   return readJob(root, id);
 }
 
+function invalidProviderCapabilityError() {
+  return new CompanionError(
+    "E_CAPABILITY",
+    missingInvalidProviderCapabilityReceiptMessage()
+  );
+}
+
+function requiredProviderSpawnBinding() {
+  const capabilityReceipt = readValidProviderCapabilityReceipt();
+  if (!capabilityReceipt) {
+    throw invalidProviderCapabilityError();
+  }
+  const providerLaunchBinding = assertExecutableProviderLaunchBinding(
+    capabilityReceipt.providerLaunchBinding
+  );
+  const providerLaunchBindingDigest = digestProviderLaunchBinding(
+    providerLaunchBinding
+  );
+  if (providerLaunchBindingDigest !== capabilityReceipt.providerLaunchBindingDigest) {
+    throw invalidProviderCapabilityError();
+  }
+  const providerCapabilityDigest = capabilityReceipt.capabilityDigest;
+  return Object.freeze({
+    providerCapabilityDigest,
+    providerLaunchBinding,
+    providerLaunchBindingDigest
+  });
+}
+
 function prepareSharedTaskDispatch(root, job) {
   const host = job.host;
   if (job.jobClass !== "task"
@@ -2875,31 +2904,7 @@ function prepareSharedTaskDispatch(root, job) {
   // provider readiness receipt before admitJob so detached workers cannot drift
   // to an ambient Grok binary. capabilityDigest is setup/readiness provenance
   // only; implementer profile and launch authorization remain separate.
-  const capabilityReceipt = readValidProviderCapabilityReceipt();
-  if (!capabilityReceipt) {
-    throw new CompanionError(
-      "E_CAPABILITY",
-      missingInvalidProviderCapabilityReceiptMessage()
-    );
-  }
-  const providerLaunchBinding = assertExecutableProviderLaunchBinding(
-    capabilityReceipt.providerLaunchBinding
-  );
-  const providerLaunchBindingDigest = digestProviderLaunchBinding(
-    providerLaunchBinding
-  );
-  if (providerLaunchBindingDigest !== capabilityReceipt.providerLaunchBindingDigest) {
-    throw new CompanionError(
-      "E_CAPABILITY",
-      missingInvalidProviderCapabilityReceiptMessage()
-    );
-  }
-  const providerCapabilityDigest = capabilityReceipt.capabilityDigest;
-  const providerSpawnBinding = {
-    providerCapabilityDigest,
-    providerLaunchBinding,
-    providerLaunchBindingDigest
-  };
+  const providerSpawnBinding = requiredProviderSpawnBinding();
   if (job.write) {
     // Direct Codex write tasks retain the established nonce launcher until they
     // have a provisioned execution binding. They still carry the exact setup
@@ -2929,8 +2934,9 @@ function prepareSharedTaskDispatch(root, job) {
     resumeJobId: job.request?.resumeJobId || null,
     resumeSessionId: job.request?.resumeSessionId || null,
     providerHomeId: job.request?.providerHomeId || job.id,
-    providerCapabilityDigest,
-    providerLaunchBindingDigest
+    providerCapabilityDigest: providerSpawnBinding.providerCapabilityDigest,
+    providerLaunchBindingDigest:
+      providerSpawnBinding.providerLaunchBindingDigest
   });
   job.controlWorkspaceId = controlWorkspaceId;
   job.role = { ...role, tools: [...role.tools] };
@@ -3455,6 +3461,10 @@ async function handleDeepResearch(raw) {
   const profile = researchOptions.workspace
     ? profileFor("deep-research-workspace")
     : profileFor("deep-research");
+  // Deep-research uses a dedicated detached launcher, but it must retain the
+  // same setup-owned executable identity as broker-dispatched tasks. Ambient
+  // GROK_BIN/PATH discovery is intentionally unavailable to the worker.
+  const providerSpawnBinding = requiredProviderSpawnBinding();
   const id = generateId(DEEP_RESEARCH_KIND);
   const stagedQuery = stageDeepResearchQuery(stateDir(root), id, query);
   const job = baseRecord({
@@ -3471,7 +3481,8 @@ async function handleDeepResearch(raw) {
         webOnly: researchOptions.webOnly,
         workspace: researchOptions.workspace
       },
-      publicObjective: null
+      publicObjective: null,
+      spawn: providerSpawnBinding
     },
     write: false,
     model: researchOptions.model || options.model || null,
@@ -3645,6 +3656,13 @@ async function executeDeepResearch(root, id) {
   }, 1000);
   heartbeatTimer.unref?.();
   try {
+    const providerLaunchBinding = assertExecutableProviderLaunchBinding(
+      job.request?.spawn?.providerLaunchBinding
+    );
+    if (digestProviderLaunchBinding(providerLaunchBinding)
+        !== job.request?.spawn?.providerLaunchBindingDigest) {
+      throw invalidProviderCapabilityError();
+    }
     query = consumeDeepResearchQuery(
       stateDir(root),
       id,
@@ -3662,6 +3680,7 @@ async function executeDeepResearch(root, id) {
       jobMarker: id,
       model: job.model,
       effort: job.effort,
+      providerExecutableBinding: providerLaunchBinding,
       cancelRequested: () => isCancelRequested(root, id, workerNonce),
       onEvent: (event) => {
         try {

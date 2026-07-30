@@ -2646,7 +2646,17 @@ function spawnArgs({ root, profile, model, effort, leaderSocket, taskProfile = n
     // Preserve the long-standing base inventory above for fixture pinning,
     // then replace its network/subagent denials with the research-only set.
     args.length = 6;
+    const researchTools = profile.providerToolIds.map((toolId) => {
+      if (typeof toolId !== "string" || !toolId.startsWith("GrokBuild:")) {
+        throw new CompanionError(
+          "E_SECURITY_PROFILE",
+          "Deep-research provider tools must use exact GrokBuild tool identifiers."
+        );
+      }
+      return toolId.slice("GrokBuild:".length);
+    });
     args.push(
+      "--tools", researchTools.join(","),
       "--deny", "WebFetch",
       "--deny", "MCPTool",
       "--deny", "Bash",

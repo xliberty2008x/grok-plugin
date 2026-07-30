@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import {
@@ -26,6 +27,7 @@ import {
   publicResearchReport,
   proveWorkspaceUnchanged,
   removeResearchTree,
+  researchEnvironment,
   researchReportRelativePath,
   runDeepResearch,
   stageDeepResearchQuery,
@@ -37,8 +39,10 @@ import { generateId, readJob, writeJob } from "../plugins/grok/scripts/lib/state
 import { projectWorkerSnapshot } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
 import { assertSafeJobId } from "../plugins/grok/scripts/lib/workspace.mjs";
 import { integritySnapshot } from "../plugins/grok/scripts/lib/git-review.mjs";
+import { resolveProviderExecutablePin } from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
 import { git, initRepo, tempDir, ROOT, testEnvironment } from "./helpers.mjs";
-import { installFakeGrok } from "./fake-grok.mjs";
+import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
+import { installPinnedFakeCompanion } from "./pinned-fake-grok.mjs";
 
 function fixtureHome(t) {
   const root = tempDir("deep-research-home-");
@@ -491,6 +495,64 @@ test("WebFetch attestation fail-closed or reduced coverage", () => {
   assert.equal(isUnexpectedDeepResearchPermission({ options: [] }), true);
 });
 
+test("isolated research environment disables WebFetch while retaining research capabilities", (t) => {
+  if (process.platform === "win32") return;
+  const state = tempDir("deep-research-environment-");
+  const authPath = path.join(state, "source-auth.json");
+  fs.writeFileSync(authPath, JSON.stringify({
+    "https://accounts.x.ai/sign-in": {
+      key: "opaque-fake-auth-secret-00000001",
+      auth_mode: "oauth",
+      expires_at: "2099-01-01T00:00:00Z"
+    }
+  }), { mode: 0o600 });
+  const previousAuthPath = process.env.GROK_AUTH_PATH;
+  process.env.GROK_AUTH_PATH = authPath;
+  let environment = null;
+  t.after(() => {
+    try { environment?.revokeCredential(); } catch { /* ignore */ }
+    if (previousAuthPath === undefined) delete process.env.GROK_AUTH_PATH;
+    else process.env.GROK_AUTH_PATH = previousAuthPath;
+    fs.rmSync(state, { recursive: true, force: true });
+  });
+
+  environment = researchEnvironment(state, "web-fetch-disabled");
+  assert.equal(environment.env.GROK_WEB_FETCH, "0");
+  assert.equal(environment.env.GROK_SUBAGENTS, "1");
+  assert.equal(environment.env.GROK_WORKFLOWS, "1");
+  assert.match(environment.configText, /\[subagents\]\nenabled = true/);
+  assert.match(environment.configText, /\[workflows\]\nenabled = true/);
+  assert.match(environment.configText, /\[tools\.web_fetch\]\nallow_local = false/);
+
+  const profile = profileFor("deep-research");
+  assert.ok(profile.providerToolIds.includes("GrokBuild:web_search"));
+  assert.ok(profile.providerToolIds.includes("GrokBuild:workflow"));
+  assert.ok(profile.providerToolIds.includes("GrokBuild:task"));
+  assert.ok(profile.deniedProviderToolIds.includes("GrokBuild:web_fetch"));
+});
+
+test("deep-research runner rejects ambient provider discovery by default", async (t) => {
+  if (process.platform === "win32") return;
+  const root = initRepo();
+  const state = tempDir("deep-research-unpinned-state-");
+  t.after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(state, { recursive: true, force: true });
+  });
+  await assert.rejects(
+    () => runDeepResearch({
+      root,
+      profile: profileFor("deep-research"),
+      query: "must not reach an ambient provider",
+      options: { "web-only": true },
+      stateDir: state,
+      jobMarker: "deep-research-unpinned"
+    }),
+    (error) => error.code === "E_CAPABILITY"
+      && /setup-pinned Grok executable/.test(error.message)
+  );
+});
+
 test("private query staging is digest-bound, mode-restricted, and consumed once", (t) => {
   const state = tempDir("deep-research-query-");
   t.after(() => fs.rmSync(state, { recursive: true, force: true }));
@@ -561,6 +623,16 @@ test("web-only profile denies repository reads; workspace profile permits read t
   assert.ok(workspace.allowedTools.includes("read_file"));
   assert.ok(workspace.allowedTools.includes("list_dir"));
   assert.ok(workspace.allowedTools.includes("grep"));
+  assert.deepEqual(workspace.providerToolIds, [
+    "GrokBuild:workflow",
+    "GrokBuild:web_search",
+    "GrokBuild:task",
+    "GrokBuild:get_task_output",
+    "GrokBuild:kill_task",
+    "GrokBuild:read_file",
+    "GrokBuild:list_dir",
+    "GrokBuild:grep"
+  ]);
   assert.ok(workspace.deniedTools.includes("Bash"));
   assert.ok(workspace.deniedTools.includes("search_replace"));
   assert.ok(!workspace.deniedProviderToolIds.includes("GrokBuild:read_file"));
@@ -729,7 +801,8 @@ test("fake-ACP lifecycle: session-scoped capability, launch-ack nonterminal, rep
     stateDir: state,
     jobMarker: "deep-research-lifecycle",
     onEvent: (event) => events.push(event),
-    timeoutMs: 10_000
+    timeoutMs: 10_000,
+    testHooks: { allowUnpinnedProvider: true }
   });
 
   assert.equal(result.sessionId, "fake-session-00000001");
@@ -749,6 +822,17 @@ test("fake-ACP lifecycle: session-scoped capability, launch-ack nonterminal, rep
   assert.equal(result.hostVerification, "not_run");
   assert.equal(result.replay, false);
   assert.equal(result.resume, false);
+  const providerInvocation = readFakeLog(fake.logFile).find(
+    (entry) => entry.event === "argv" && entry.args.includes("agent")
+  );
+  assert.ok(providerInvocation, "expected deep-research provider invocation");
+  const toolsIndex = providerInvocation.args.indexOf("--tools");
+  const agentIndex = providerInvocation.args.indexOf("agent");
+  assert.ok(toolsIndex >= 0 && toolsIndex < agentIndex);
+  assert.equal(
+    providerInvocation.args[toolsIndex + 1],
+    "workflow,web_search,task,get_task_output,kill_task"
+  );
   assert.equal(
     result.capabilityReceipt.evidenceSource,
     "session-available-commands-update"
@@ -793,7 +877,8 @@ test("fake-ACP lifecycle: session-scoped capability, launch-ack nonterminal, rep
       options: { "web-only": true },
       stateDir: tempDir("deep-research-state-nocmd-"),
       jobMarker: "deep-research-nocmd",
-      timeoutMs: 5_000
+      timeoutMs: 5_000,
+      testHooks: { allowUnpinnedProvider: true }
     }),
     (error) => error.code === "E_CAPABILITY"
       && error.details?.replay === false
@@ -805,6 +890,136 @@ test("fake-ACP lifecycle: session-scoped capability, launch-ack nonterminal, rep
   assert.equal(interrupted.error.code, "E_WORKFLOW_INCOMPLETE");
   assert.equal(interrupted.replay, false);
   assert.equal(interrupted.resume, false);
+});
+
+test("detached deep-research uses the setup-pinned provider instead of ambient discovery", (t) => {
+  if (process.platform === "win32") return;
+  const root = initRepo();
+  const pluginData = tempDir("deep-research-pinned-plugin-");
+  const fakeRoot = tempDir("deep-research-pinned-fake-");
+  const poisonRoot = tempDir("deep-research-poison-fake-");
+  const fake = installFakeGrok(fakeRoot, {
+    version: "0.2.99",
+    deepResearch: true,
+    deepResearchRunId: "run-pinned-deep-research",
+    deepResearchReport: "# Pinned provider\n\nSource: https://example.com/pinned\n",
+    deepResearchReportStatus: "verified",
+    authMethods: [{ id: "local", name: "Local test auth" }]
+  });
+  const poison = installFakeGrok(poisonRoot, {
+    version: "0.2.114",
+    deepResearch: true,
+    deepResearchRunId: "run-poison-deep-research",
+    authMethods: [{ id: "local", name: "Local test auth" }]
+  });
+  fs.symlinkSync(poison.binary, path.join(poisonRoot, "grok"));
+  const env = testEnvironment({
+    fake,
+    pluginData,
+    sessionId: "deep-research-pinned-session",
+    extra: {
+      CODEX_THREAD_ID: "deep-research-pinned-session",
+      GROK_COMPANION_HOST: "codex",
+      GROK_COMPANION_HOST_SESSION_ID: "deep-research-pinned-session",
+      GROK_COMPANION_PLUGIN_DATA: pluginData
+    }
+  });
+  const pinned = installPinnedFakeCompanion(fake, env);
+  t.after(() => {
+    pinned.cleanup();
+    for (const directory of [root, pluginData, fakeRoot, poisonRoot]) {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  const setup = spawnSync(
+    process.execPath,
+    [pinned.codexCompanionScript, "setup", "--json"],
+    {
+      cwd: root,
+      env: pinned.env,
+      encoding: "utf8",
+      timeout: 30_000
+    }
+  );
+  assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+  assert.equal(JSON.parse(setup.stdout).grok.version, "0.2.99");
+
+  const poisonedEnv = {
+    ...pinned.env,
+    GROK_BIN: poison.binary,
+    PATH: `${poisonRoot}${path.delimiter}${pinned.env.PATH || ""}`
+  };
+  const completed = spawnSync(
+    process.execPath,
+    [
+      pinned.codexCompanionScript,
+      "deep-research",
+      "--wait",
+      "--web-only",
+      "--query-stdin",
+      "--json"
+    ],
+    {
+      cwd: root,
+      env: poisonedEnv,
+      input: "prove exact setup provider binding",
+      encoding: "utf8",
+      timeout: 30_000
+    }
+  );
+  assert.equal(completed.status, 0, completed.stderr || completed.stdout);
+  const result = JSON.parse(completed.stdout);
+  assert.equal(result.status, "completed");
+  assert.equal(result.result?.workflow?.runId, "run-pinned-deep-research");
+
+  const receipt = JSON.parse(fs.readFileSync(
+    path.join(pluginData, "capabilities", "provider-capability-v2.json"),
+    "utf8"
+  ));
+  const pinnedExecutable = resolveProviderExecutablePin(
+    receipt.providerLaunchBinding,
+    { env: poisonedEnv }
+  );
+  const job = readJob(root, result.id, poisonedEnv);
+  assert.deepEqual(
+    job.request.spawn.providerLaunchBinding,
+    receipt.providerLaunchBinding
+  );
+  assert.equal(
+    job.request.spawn.providerLaunchBindingDigest,
+    receipt.providerLaunchBindingDigest
+  );
+  assert.equal(
+    job.request.spawn.providerCapabilityDigest,
+    receipt.capabilityDigest
+  );
+  assert.deepEqual(
+    {
+      providerVersion: job.result.capabilityReceipt.providerVersion,
+      executableDigest: job.result.capabilityReceipt.executableDigest,
+      executableSize: job.result.capabilityReceipt.executableSize
+    },
+    {
+      providerVersion: pinnedExecutable.executableIdentity.version,
+      executableDigest: pinnedExecutable.executableIdentity.executableDigest,
+      executableSize: pinnedExecutable.executableIdentity.size
+    }
+  );
+  assert.equal(job.result.researchRuntimeCleaned, true);
+  assert.equal(job.result.workflow.activeAgents, 0);
+  assert.equal(
+    readFakeLog(fake.logFile).some((entry) => (
+      entry.event === "deep-research-launch"
+      && entry.runId === "run-pinned-deep-research"
+    )),
+    true
+  );
+  assert.deepEqual(readFakeLog(poison.logFile), []);
+  assert.equal(
+    JSON.stringify(job).includes("prove exact setup provider binding"),
+    false
+  );
 });
 
 test("early deep-research startup failures retain the non-replay contract", async (t) => {
@@ -847,6 +1062,7 @@ test("early deep-research startup failures retain the non-replay contract", asyn
       jobMarker: "deep-research-startup-failure",
       timeoutMs: 5_000,
       testHooks: {
+        allowUnpinnedProvider: true,
         beforeDispatchPromotion() {
           const error = new Error("forced startup security failure");
           error.code = "E_SECURITY_PROFILE";
@@ -1022,7 +1238,10 @@ test("fake-ACP capability evidence is paired and bound to the newly-created sess
         stateDir: state,
         jobMarker: `deep-research-capability-${fixture.name}`,
         timeoutMs: 5_000,
-        testHooks: { commandWaitMs: 10 }
+        testHooks: {
+          allowUnpinnedProvider: true,
+          commandWaitMs: 10
+        }
       });
       if (fixture.expectedCode) {
         await assert.rejects(
@@ -1113,7 +1332,8 @@ test("fake-ACP terminal matrix covers partial, foreign/stale updates, pauses, bu
         options: { "web-only": true },
         stateDir: state,
         jobMarker: `deep-research-${fixture.name}`,
-        timeoutMs: fixture.timeoutMs || 5_000
+        timeoutMs: fixture.timeoutMs || 5_000,
+        testHooks: { allowUnpinnedProvider: true }
       });
       if (fixture.expectedCode) {
         await assert.rejects(
@@ -1183,7 +1403,10 @@ test("fake-ACP cancellation settles with exact /workflow stop and zero active ag
         }
       },
       timeoutMs: 10_000,
-      testHooks: { forceSettledAfterCancel: false }
+      testHooks: {
+        allowUnpinnedProvider: true,
+        forceSettledAfterCancel: false
+      }
     }),
     (error) => error.code === "E_CANCELLED" && error.details?.replay === false
   );

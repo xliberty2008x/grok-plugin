@@ -31,6 +31,7 @@ import { redactText } from "./redact.mjs";
 import { git } from "./workspace.mjs";
 import { processGroupGone } from "./process-control.mjs";
 import { captureExecutableFileIdentity } from "./executable-identity.mjs";
+import { resolveProviderExecutablePin } from "./provider-executable-pin.mjs";
 
 export const DEEP_RESEARCH_KIND = "deep-research";
 export const DEEP_RESEARCH_PROFILE_ID = "deep-research-v1";
@@ -1302,7 +1303,7 @@ export function researchEnvironment(stateDir, jobMarker, {
     GROK_SUBAGENTS: "1",
     GROK_WORKFLOWS: "1",
     GROK_MEMORY: "0",
-    GROK_WEB_FETCH: "1",
+    GROK_WEB_FETCH: "0",
     GROK_LSP_TOOLS: "0"
   });
   delete env.HOMEDRIVE;
@@ -1386,7 +1387,9 @@ export async function runDeepResearch({
   cancelRequested = () => false,
   onEvent = () => {},
   timeoutMs = DEEP_RESEARCH_TIMEOUT_MS,
-  testHooks = null
+  testHooks = null,
+  providerExecutableBinding = null,
+  providerExecutableEnv = process.env
 } = {}) {
   assertProviderPlatform();
   const allowedProfileIds = new Set(["deep-research-v1", "deep-research-workspace-v1"]);
@@ -1409,10 +1412,26 @@ export async function runDeepResearch({
       "Web-only deep-research requires the deep-research-v1 profile."
     );
   }
+  const allowUnpinnedTestProvider =
+    testHooks?.allowUnpinnedProvider === true;
+  if (providerExecutableBinding == null && !allowUnpinnedTestProvider) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Deep-research requires the exact setup-pinned Grok executable."
+    );
+  }
   const workspaceBefore = parsedOptions.workspace ? integritySnapshot(root) : null;
-  const providerBinary = discoverGrok();
+  const pinnedProvider = providerExecutableBinding == null
+    ? null
+    : resolveProviderExecutablePin(
+        providerExecutableBinding,
+        { env: providerExecutableEnv }
+      );
+  const providerBinary = pinnedProvider?.binary || discoverGrok();
   const providerExecutableBefore = captureExecutableFileIdentity(providerBinary);
-  const environment = researchEnvironment(stateDir, jobMarker);
+  const environment = researchEnvironment(stateDir, jobMarker, {
+    providerExecutableBinary: providerBinary
+  });
   let providerCwd;
   let snapshotMeta = null;
   if (parsedOptions.workspace) {
@@ -1451,6 +1470,8 @@ export async function runDeepResearch({
         onEvent(event);
       },
       strictPermissionRequests: true,
+      providerExecutableBinding,
+      providerExecutableEnv,
       testHooks
     });
   } catch (error) {
