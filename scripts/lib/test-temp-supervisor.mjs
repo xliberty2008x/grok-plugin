@@ -49,7 +49,7 @@ const CONTAINMENT_REASONS = new Set([
 ]);
 
 function usage() {
-  return "Usage: node test-temp-supervisor.mjs --timeout-ms <ms> -- <node> <args...>\n";
+  return "Usage: node test-temp-supervisor.mjs --timeout-ms <ms> [--simulate-startup-visibility-failure] -- <node> <args...>\n";
 }
 
 function containmentFailure(reason) {
@@ -65,11 +65,14 @@ function visibilityError(code) {
 }
 
 function parseArgs(argv) {
+  const simulateStartupVisibilityFailure =
+    argv[2] === "--simulate-startup-visibility-failure";
+  const separator = simulateStartupVisibilityFailure ? 3 : 2;
   if (
-    argv.length < 4
+    argv.length < separator + 2
     || argv[0] !== "--timeout-ms"
     || !/^[1-9]\d*$/.test(argv[1])
-    || argv[2] !== "--"
+    || argv[separator] !== "--"
   ) {
     throw new Error("invalid arguments");
   }
@@ -77,7 +80,12 @@ function parseArgs(argv) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs > 24 * 60 * 60_000) {
     throw new Error("invalid timeout");
   }
-  return { timeoutMs, command: argv[3], args: argv.slice(4) };
+  return {
+    timeoutMs,
+    simulateStartupVisibilityFailure,
+    command: argv[separator + 1],
+    args: argv.slice(separator + 2)
+  };
 }
 
 export function signalOwnedGroup(
@@ -898,6 +906,11 @@ async function main() {
   try {
     pidRegistry = createPidRegistry(tempIdentity, pidRegistrySecret);
   } catch {
+    return containmentFailure("startup-visibility");
+  }
+  // This option exists only to exercise the fail-closed runner contract. It
+  // aborts before any test command can launch and cannot weaken containment.
+  if (parsed.simulateStartupVisibilityFailure) {
     return containmentFailure("startup-visibility");
   }
   // A supervisor can itself run beneath another supervisor. Rebind the

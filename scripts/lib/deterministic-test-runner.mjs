@@ -117,7 +117,8 @@ export function runDeterministicTestFiles({
   stdout = process.stdout,
   stderr = process.stderr,
   timeoutMs = DETERMINISTIC_TEST_FILE_TIMEOUT_MS,
-  tempRoot = canonicalSystemTempRoot()
+  tempRoot = canonicalSystemTempRoot(),
+  simulateStartupVisibilityFailure = false
 } = {}) {
   if (!Array.isArray(files) || !files.length) {
     stderr.write("No deterministic test files were found.\n");
@@ -188,6 +189,9 @@ export function runDeterministicTestFiles({
           SUPERVISOR,
           "--timeout-ms",
           String(timeoutMs),
+          ...(simulateStartupVisibilityFailure
+            ? ["--simulate-startup-visibility-failure"]
+            : []),
           "--",
           node,
           "--test",

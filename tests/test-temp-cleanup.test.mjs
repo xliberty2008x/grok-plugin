@@ -1022,28 +1022,10 @@ test("deterministic runner preserves one manifest-backed run root when containme
   assert.equal(entries.filter((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)).length, 1);
 });
 
-test("Linux startup /proc sweep failure is containment failure, not generic cleanup", (t) => {
-  if (process.platform !== "linux") return;
+test("startup visibility failure is containment failure, not generic cleanup", (t) => {
   const root = sandbox(t);
   const fixture = path.join(root, "startup-visibility.test.mjs");
-  const preload = path.join(root, "fail-proc-sweep.cjs");
   fs.writeFileSync(fixture, 'import test from "node:test"; test("never starts", () => {});\n');
-  fs.writeFileSync(preload, [
-    '"use strict";',
-    'const fs = require("node:fs");',
-    "const original = fs.readdirSync;",
-    "let failed = false;",
-    "fs.readdirSync = function(target, ...args) {",
-    '  if (!failed && target === "/proc") {',
-    "    failed = true;",
-    '    const error = new Error("fixture visibility failure");',
-    '    error.code = "EACCES";',
-    "    throw error;",
-    "  }",
-    "  return original.call(fs, target, ...args);",
-    "};",
-    ""
-  ].join("\n"));
   let diagnostics = "";
   const status = runDeterministicTestFiles({
     files: [fixture],
@@ -1051,7 +1033,7 @@ test("Linux startup /proc sweep failure is containment failure, not generic clea
     reporter: REPORTER,
     tempRoot: root,
     timeoutMs: 5_000,
-    env: { ...process.env, NODE_OPTIONS: `--require=${preload}` },
+    simulateStartupVisibilityFailure: true,
     stdout: { write() {} },
     stderr: { write(value) { diagnostics += value; } }
   });
