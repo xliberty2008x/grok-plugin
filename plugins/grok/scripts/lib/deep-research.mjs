@@ -1374,6 +1374,18 @@ export async function runDeepResearch({
     });
   } catch (error) {
     try { environment.revokeCredential(); } catch { /* best effort */ }
+    if (error && typeof error === "object") {
+      const details = error.details
+        && typeof error.details === "object"
+        && !Array.isArray(error.details)
+        ? error.details
+        : {};
+      error.details = {
+        ...details,
+        replay: false,
+        resume: false
+      };
+    }
     throw error;
   }
 
