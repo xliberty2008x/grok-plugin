@@ -11,7 +11,7 @@ Grok Companion is a dual-host marketplace plugin that delegates code review, inv
 | **Plugin name** | `grok` |
 | **Claude namespace** | `/grok:*` slash commands |
 | **Codex namespace** | `$grok:*` skills |
-| **Grok CLI floor** | Official Grok Build **0.2.99+**; Worker Broker operational qualification used **0.2.112** |
+| **Grok CLI admission** | Stable Grok Build **0.2.99+**, with no upper version allowlist; Worker Broker operational qualification remains exact-version evidence for **0.2.112** |
 | **License** | Apache-2.0 |
 
 Command shape is modeled on OpenAI's [`codex-plugin-cc` v1.0.6](https://github.com/openai/codex-plugin-cc/tree/db52e28f4d9ded852ab3942cea316258ae4ef346). Reviews use headless Grok with the `explore` agent; resumable rescue tasks use ACP v1 over `grok agent stdio`; transcript import uses `grok import --json`.
@@ -143,6 +143,21 @@ Grok binary discovery order:
 2. `grok` on `PATH`
 3. Documented per-user location such as `~/.grok/bin/grok`
 
+The static release table is recognition evidence, not a version ceiling. Exact
+bytes that match a recorded release use the stronger `known-digest` path.
+Unfamiliar stable versions are admitted only when they are the active
+Grok-managed target selected by `$GROK_HOME/bin/grok` and its bounded
+`cli.installer` layout. Setup copies that candidate into the plugin's private
+immutable pin, rehashes it, and runs every version, authentication, isolation,
+ACP, session-loading, and capability probe against the private copy. An
+arbitrary unfamiliar `GROK_BIN` or `PATH` executable is rejected with
+`E_GROK_SOURCE`.
+
+`managed-observed` intentionally accepts the supply-chain risk of the initial
+managed installation. It proves which exact bytes setup observed and pinned; it
+does **not** prove that xAI issued those initial bytes. Replacement or drift
+after setup still invalidates the pin and its capability receipt.
+
 Provider qualification reminder: current Worker Broker evidence qualifies the exact v3 macOS/Codex path with official Grok Build 0.2.112. The dual-host prerelease remains release-unqualified; this evidence does not qualify Linux provider execution, independent Claude Code orchestration, or Windows provider execution/process control.
 
 ---
@@ -223,13 +238,19 @@ Codex installs a **versioned snapshot**. After you change the source checkout, u
 
 Both `/grok:setup` and `$grok:setup` probe:
 
-- Grok executable discovery and version (≥ 0.2.99)
+- Grok executable source, exact-byte identity, and stable version (≥ 0.2.99,
+  with no upper allowlist)
 - Cached authentication (no credential printing)
 - Required headless review flags
 - ACP `--agent-profile` / `--no-leader` / leader-socket support
 - Isolated `grok inspect --json` (builtin + provider-bundled skills under `<isolated GROK_HOME>/skills/` or `<isolated GROK_HOME>/bundled/skills/` allowed; external hooks/skills/plugins/MCP/non-builtin agents rejected)
 - Session-loading and model/effort menus used by rescue/transfer
 - Per-workspace stop-review-gate config
+
+Successful JSON output includes `grok.releaseRecognition` as `known-digest` or
+`managed-observed`. `ready: true` means the exact private pinned binary passed
+the current readiness probes. It does not transfer qualification from 0.2.112
+to another version or prove a complete provider lifecycle.
 
 Setup may create a transient mode-`0600` sanitized credential copy inside a private review home and **removes** that home when the probe finishes. It does not spend model quota on a real review or prove OS process-control release qualification.
 
@@ -590,8 +611,10 @@ Do not delegate secrets, regulated data, or third-party material that must not b
 
 | Symptom | Likely cause | What to do |
 |---|---|---|
-| Setup: Grok not found (`E_GROK_NOT_FOUND`) | CLI missing from discovery paths | `npm install -g @xai-official/grok`, or set `GROK_BIN` to the executable |
-| Setup: unsupported version (`E_GROK_VERSION`) | Older than 0.2.99 | Upgrade Grok Build to 0.2.99+ |
+| Setup: Grok not found (`E_GROK_NOT_FOUND`) | CLI missing from discovery paths | Install or activate the normal Grok-managed `$GROK_HOME/bin/grok`; use `GROK_BIN` only for bytes that already match a known release digest |
+| Setup: untrusted source (`E_GROK_SOURCE`) | An unfamiliar executable was found, but it is not the active Grok-managed target | Use the active `$GROK_HOME/bin/grok` installation; arbitrary unfamiliar `GROK_BIN` and `PATH` binaries are not admitted |
+| Setup: unsupported version (`E_GROK_VERSION`) | Version is older than 0.2.99, malformed, or prerelease | Activate a stable Grok Build 0.2.99+ |
+| Setup: executable identity failure (`E_PROCESS_IDENTITY`) | Known-release bytes differ, or the managed source/private pin changed during capture or launch | Restore a stable active managed link and executable, inspect for unexpected replacement, then retry setup |
 | Auth required (`E_AUTH_REQUIRED`) | No/expired cached login; env-key-only mode | Run `grok login`, then `/grok:setup` or `$grok:setup` again |
 | Isolation / capability failure (any other `E_CAPABILITY` message) | External extensions in Grok home, missing ACP flags, unsupported model/effort/platform, executable identity drift, or Windows provider path | Remove external hooks/skills/plugins/MCP from the isolated profile; confirm 0.2.99+; on Windows treat provider execution as unsupported. Do **not** auto-setup for arbitrary / non-receipt `E_CAPABILITY` |
 | Missing/invalid provider capability receipt (`E_CAPABILITY`, exact setup-recoverable message only) | Codex pre-launch receipt gate: setup-owned provider capability receipt is missing or invalid | **Sole setup-recoverable path:** run `$grok:setup` once; on success, retry the identical rescue task once. Surface setup failure unchanged and stop. A persistent receipt error after that one retry remains terminal |
@@ -716,7 +739,11 @@ Deeper design and release gates:
 - No documented native Grok review RPC equivalent to the pinned Codex reviewer; reviews use plugin-owned prompts and a validated JSON schema.
 - Reviews are **context-only**: the plugin embeds selected Git evidence up to 8 MiB (and rejects oversized targets) rather than granting repository tools to the review agent.
 - Stop gate is **advisory**; use a foreground review for a full structured verdict.
-- Grok Build **0.2.99** is the compatibility floor; Worker Broker operational qualification used exact official version **0.2.112**. Other versions are capability-probed at setup but are not automatically qualified.
+- Grok Build **0.2.99** is the stable compatibility floor and there is no upper
+  admission allowlist. Future active managed versions are exact-byte pinned and
+  capability-probed, but are not automatically qualified. Worker Broker
+  operational qualification remains bound to exact official version
+  **0.2.112** and its recorded source.
 - The v3 Worker Broker is operationally qualified for the recorded macOS/Codex path only; the dual-host prerelease remains release-unqualified. **Linux** and independent Claude Code provider execution remain unqualified; **Windows** provider execution and process control remain unsupported.
 - Setup readiness is not authenticated review execution or OS process-control certification.
 - Codex default hooks require explicit trust; no Codex `SessionEnd`; unfinished Codex jobs are command-driven for cleanup.

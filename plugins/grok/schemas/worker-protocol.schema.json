@@ -33,6 +33,7 @@
         "E_DELIVERY",
         "E_GIT_REQUIRED",
         "E_GROK_NOT_FOUND",
+        "E_GROK_SOURCE",
         "E_GROK_VERSION",
         "E_IDEMPOTENCY_CONFLICT",
         "E_IMPORT_RESULT",

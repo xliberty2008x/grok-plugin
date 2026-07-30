@@ -344,7 +344,7 @@ export function clearProviderCapabilityReceipt({ env = process.env } = {}) {
 
 /**
  * Read and revalidate one private provider capability receipt. Schema v1 and
- * any missing, tampered, mismatched, or non-official pin binding are rejected.
+ * any missing, tampered, or mismatched pin binding is rejected.
  */
 export function readValidProviderCapabilityReceipt({
   env = process.env,

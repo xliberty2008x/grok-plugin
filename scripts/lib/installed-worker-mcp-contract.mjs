@@ -53,6 +53,7 @@ export const INSTALLED_WORKER_SCENARIO_IDS = Object.freeze([
 const SETUP_KEYS = new Set(["ready", "grok", "config", "disclosure", "nextSteps"]);
 const SETUP_RUNTIME_KEYS = new Set([
   "version",
+  "releaseRecognition",
   "authenticated",
   "headlessReview",
   "acpIsolation",
@@ -567,6 +568,7 @@ const PUBLIC_WORKER_ERROR_CODES = new Set([
   "E_DELIVERY",
   "E_GIT_REQUIRED",
   "E_GROK_NOT_FOUND",
+  "E_GROK_SOURCE",
   "E_GROK_VERSION",
   "E_IDEMPOTENCY_CONFLICT",
   "E_IMPORT_RESULT",
@@ -985,6 +987,7 @@ function validSetupRuntime(runtime) {
     !exactKeys(runtime, SETUP_RUNTIME_KEYS)
     || !boundedString(runtime.version, 64)
     || !PROVIDER_VERSION.test(runtime.version)
+    || !["known-digest", "managed-observed"].includes(runtime.releaseRecognition)
     || runtime.authenticated !== true
     || runtime.protocolVersion !== 1
     || runtime.loadSession !== true

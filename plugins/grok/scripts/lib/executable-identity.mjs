@@ -8,7 +8,7 @@ import { CompanionError } from "./errors.mjs";
 const MAX_EXECUTABLE_BYTES = 256 * 1024 * 1024;
 const HASH_CHUNK_BYTES = 1024 * 1024;
 const SHA256_HEX = /^[a-f0-9]{64}$/;
-const VERSION = /^\d+\.\d+\.\d+$/;
+const VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const BUILD_COMMIT = /^[a-zA-Z0-9._-]{1,128}$/;
 const CHANNEL = /^[a-zA-Z0-9._-]{1,64}$/;
 const PACKAGE_NAME = /^@[a-z0-9._-]+\/[a-z0-9._-]+$/;
@@ -16,7 +16,10 @@ const PACKAGE_GIT_HEAD = /^[a-f0-9]{40}$/;
 const PLATFORM = /^[a-z0-9._-]{1,32}$/;
 const ARCH = /^[a-z0-9._-]{1,32}$/;
 const RELEASE_SOURCE = "official-package-pin-v1";
-const EXECUTABLE_ATTESTATION_KEYS = new Set([
+const MANAGED_RELEASE_SOURCE = "managed-observed-v1";
+const KNOWN_RELEASE_RECOGNITION = "known-digest";
+const MANAGED_RELEASE_RECOGNITION = "managed-observed";
+const EXECUTABLE_ATTESTATION_V1_KEYS = new Set([
   "schemaVersion",
   "identityDigest",
   "fileIdentityDigest",
@@ -27,6 +30,23 @@ const EXECUTABLE_ATTESTATION_KEYS = new Set([
   "packageVersion",
   "packageGitHead",
   "packageIntegrityDigest",
+  "platform",
+  "arch",
+  "version",
+  "buildCommit",
+  "channel",
+  "size",
+  "executableDigest"
+]);
+const EXECUTABLE_ATTESTATION_V2_KEYS = new Set([
+  "schemaVersion",
+  "identityDigest",
+  "fileIdentityDigest",
+  "pathDigest",
+  "releaseIdentityDigest",
+  "releaseRecognition",
+  "releaseSource",
+  "sourceProvenanceDigest",
   "platform",
   "arch",
   "version",
@@ -203,7 +223,15 @@ export function captureExecutableFileIdentity(binary) {
       "Grok executable path could not be canonicalized."
     );
   }
-  const before = fs.lstatSync(canonicalPath, { bigint: true });
+  let before;
+  try {
+    before = fs.lstatSync(canonicalPath, { bigint: true });
+  } catch {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Canonical Grok executable disappeared before identity capture."
+    );
+  }
   const beforeIdentity = statIdentity(before);
   if (!before.isFile() || before.isSymbolicLink()) {
     throw new CompanionError(
@@ -212,7 +240,15 @@ export function captureExecutableFileIdentity(binary) {
     );
   }
   const captured = captureOpenFile(canonicalPath);
-  const after = fs.lstatSync(canonicalPath, { bigint: true });
+  let after;
+  try {
+    after = fs.lstatSync(canonicalPath, { bigint: true });
+  } catch {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Canonical Grok executable disappeared during identity capture."
+    );
+  }
   const afterIdentity = statIdentity(after);
   if (!after.isFile()
     || after.isSymbolicLink()
@@ -278,7 +314,7 @@ function assertReleaseIdentity(release) {
   return Object.freeze(body);
 }
 
-function findOfficialRelease(fileIdentity, {
+function officialReleases({
   platform = process.platform,
   arch = process.arch,
   releases = OFFICIAL_GROK_RELEASES
@@ -289,21 +325,23 @@ function findOfficialRelease(fileIdentity, {
       "Official Grok package release policy is unavailable."
     );
   }
-  const matches = releases
+  return releases
     .map(assertReleaseIdentity)
-    .filter((release) => (
-      release.platform === platform
-      && release.arch === arch
-      && release.size === fileIdentity.size
-      && release.executableDigest === fileIdentity.executableDigest
-    ));
-  if (matches.length !== 1) {
+    .filter((release) => release.platform === platform && release.arch === arch);
+}
+
+function findOfficialRelease(fileIdentity, options = {}) {
+  const matches = officialReleases(options).filter((release) => (
+    release.size === fileIdentity.size
+    && release.executableDigest === fileIdentity.executableDigest
+  ));
+  if (matches.length > 1) {
     throw new CompanionError(
-      "E_GROK_VERSION",
-      "Grok executable bytes do not match one supported official package pin."
+      "E_PROCESS_IDENTITY",
+      "Grok executable bytes ambiguously match multiple official package pins."
     );
   }
-  return matches[0];
+  return matches[0] || null;
 }
 
 function attestationWithoutIdentityDigest(attestation) {
@@ -312,26 +350,29 @@ function attestationWithoutIdentityDigest(attestation) {
 }
 
 export function assertExecutableAttestation(attestation) {
-  if (!exactRecord(attestation, EXECUTABLE_ATTESTATION_KEYS)
-    || attestation.schemaVersion !== 1
-    || !SHA256_HEX.test(attestation.identityDigest || "")
-    || !SHA256_HEX.test(attestation.fileIdentityDigest || "")
-    || !SHA256_HEX.test(attestation.pathDigest || "")
-    || !SHA256_HEX.test(attestation.releaseIdentityDigest || "")
-    || attestation.releaseSource !== RELEASE_SOURCE
+  const schemaV1 = attestation?.schemaVersion === 1
+    && exactRecord(attestation, EXECUTABLE_ATTESTATION_V1_KEYS);
+  const schemaV2 = attestation?.schemaVersion === 2
+    && exactRecord(attestation, EXECUTABLE_ATTESTATION_V2_KEYS);
+  const commonInvalid = !SHA256_HEX.test(attestation?.identityDigest || "")
+    || !SHA256_HEX.test(attestation?.fileIdentityDigest || "")
+    || !SHA256_HEX.test(attestation?.pathDigest || "")
+    || !SHA256_HEX.test(attestation?.releaseIdentityDigest || "")
+    || !PLATFORM.test(attestation?.platform || "")
+    || !ARCH.test(attestation?.arch || "")
+    || !VERSION.test(attestation?.version || "")
+    || !BUILD_COMMIT.test(attestation?.buildCommit || "")
+    || !CHANNEL.test(attestation?.channel || "")
+    || !Number.isSafeInteger(attestation?.size)
+    || attestation.size < 1
+    || attestation.size > MAX_EXECUTABLE_BYTES
+    || !SHA256_HEX.test(attestation?.executableDigest || "");
+  const schemaV1Invalid = schemaV1 && (
+    attestation.releaseSource !== RELEASE_SOURCE
     || !PACKAGE_NAME.test(attestation.packageName || "")
     || !VERSION.test(attestation.packageVersion || "")
     || !PACKAGE_GIT_HEAD.test(attestation.packageGitHead || "")
     || !SHA256_HEX.test(attestation.packageIntegrityDigest || "")
-    || !PLATFORM.test(attestation.platform || "")
-    || !ARCH.test(attestation.arch || "")
-    || !VERSION.test(attestation.version || "")
-    || !BUILD_COMMIT.test(attestation.buildCommit || "")
-    || !CHANNEL.test(attestation.channel || "")
-    || !Number.isSafeInteger(attestation.size)
-    || attestation.size < 1
-    || attestation.size > MAX_EXECUTABLE_BYTES
-    || !SHA256_HEX.test(attestation.executableDigest || "")
     || attestation.releaseIdentityDigest !== stableDigest({
       releaseSource: attestation.releaseSource,
       packageName: attestation.packageName,
@@ -346,6 +387,29 @@ export function assertExecutableAttestation(attestation) {
       size: attestation.size,
       executableDigest: attestation.executableDigest
     })
+  );
+  const schemaV2Invalid = schemaV2 && (
+    attestation.releaseRecognition !== MANAGED_RELEASE_RECOGNITION
+    || attestation.releaseSource !== MANAGED_RELEASE_SOURCE
+    || !SHA256_HEX.test(attestation.sourceProvenanceDigest || "")
+    || attestation.channel !== "stable"
+    || attestation.releaseIdentityDigest !== stableDigest({
+      releaseRecognition: attestation.releaseRecognition,
+      releaseSource: attestation.releaseSource,
+      sourceProvenanceDigest: attestation.sourceProvenanceDigest,
+      platform: attestation.platform,
+      arch: attestation.arch,
+      version: attestation.version,
+      buildCommit: attestation.buildCommit,
+      channel: attestation.channel,
+      size: attestation.size,
+      executableDigest: attestation.executableDigest
+    })
+  );
+  if ((!schemaV1 && !schemaV2)
+    || commonInvalid
+    || schemaV1Invalid
+    || schemaV2Invalid
     || attestation.identityDigest !== stableDigest(
       attestationWithoutIdentityDigest(attestation)
     )) {
@@ -389,6 +453,80 @@ export function createExecutableAttestation(fileIdentity, releaseIdentity) {
   return Object.freeze(attestation);
 }
 
+function managedReleaseBody(managedRelease) {
+  return {
+    releaseRecognition: managedRelease.releaseRecognition,
+    releaseSource: managedRelease.releaseSource,
+    sourceProvenanceDigest: managedRelease.sourceProvenanceDigest,
+    platform: managedRelease.platform,
+    arch: managedRelease.arch,
+    version: managedRelease.version,
+    buildCommit: managedRelease.buildCommit,
+    channel: managedRelease.channel,
+    size: managedRelease.size,
+    executableDigest: managedRelease.executableDigest
+  };
+}
+
+function assertManagedReleaseIdentity(managedRelease) {
+  const body = managedReleaseBody(managedRelease || {});
+  if (body.releaseRecognition !== MANAGED_RELEASE_RECOGNITION
+    || body.releaseSource !== MANAGED_RELEASE_SOURCE
+    || !SHA256_HEX.test(body.sourceProvenanceDigest || "")
+    || !PLATFORM.test(body.platform || "")
+    || !ARCH.test(body.arch || "")
+    || !VERSION.test(body.version || "")
+    || !BUILD_COMMIT.test(body.buildCommit || "")
+    || body.channel !== "stable"
+    || !Number.isSafeInteger(body.size)
+    || body.size < 1
+    || body.size > MAX_EXECUTABLE_BYTES
+    || !SHA256_HEX.test(body.executableDigest || "")) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Managed Grok release identity is malformed or incomplete."
+    );
+  }
+  return Object.freeze(body);
+}
+
+export function createManagedObservedAttestation(fileIdentity, managedRelease) {
+  const release = assertManagedReleaseIdentity(managedRelease);
+  if (release.size !== fileIdentity.size
+    || release.executableDigest !== fileIdentity.executableDigest) {
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Managed Grok release identity does not match the captured executable bytes."
+    );
+  }
+  const attestation = {
+    schemaVersion: 2,
+    identityDigest: null,
+    fileIdentityDigest: stableDigest({
+      device: fileIdentity.device,
+      inode: fileIdentity.inode,
+      mode: fileIdentity.mode,
+      size: fileIdentity.size,
+      executableDigest: fileIdentity.executableDigest
+    }),
+    pathDigest: stableDigest({ canonicalPath: fileIdentity.canonicalPath }),
+    releaseIdentityDigest: stableDigest(release),
+    ...release
+  };
+  attestation.identityDigest = stableDigest(
+    attestationWithoutIdentityDigest(attestation)
+  );
+  assertExecutableAttestation(attestation);
+  return Object.freeze(attestation);
+}
+
+export function executableReleaseRecognition(attestation) {
+  const asserted = assertExecutableAttestation(attestation);
+  return asserted.schemaVersion === 1
+    ? KNOWN_RELEASE_RECOGNITION
+    : asserted.releaseRecognition;
+}
+
 function sameFileIdentity(left, right) {
   return left.canonicalPath === right.canonicalPath
     && sameStatIdentity(left, right)
@@ -407,7 +545,7 @@ export function sameExecutableAttestation(left, right) {
 }
 
 /**
- * Compare the immutable official package release while allowing independent
+ * Compare the immutable release identity while allowing independent
  * broker-owned materializations to have different path/inode attestations.
  */
 export function sameExecutableRelease(left, right) {
@@ -420,29 +558,92 @@ export function sameExecutableRelease(left, right) {
   return left.releaseIdentityDigest === right.releaseIdentityDigest;
 }
 
-/** Bind exact bytes to one code-owned official package release pin. */
+function attestationReleaseIdentity(attestation) {
+  const asserted = assertExecutableAttestation(attestation);
+  return asserted.schemaVersion === 1
+    ? releaseIdentityBody(asserted)
+    : managedReleaseBody(asserted);
+}
+
+function attestationForFile(fileIdentity, attestation) {
+  const asserted = assertExecutableAttestation(attestation);
+  return asserted.schemaVersion === 1
+    ? createExecutableAttestation(fileIdentity, attestationReleaseIdentity(asserted))
+    : createManagedObservedAttestation(
+        fileIdentity,
+        attestationReleaseIdentity(asserted)
+      );
+}
+
+/**
+ * Bind exact bytes to a known digest, a validated managed observation, or a
+ * previously persisted attestation during private-pin revalidation.
+ */
 export function captureGrokExecutableIdentity(binary, {
   platform = process.platform,
   arch = process.arch,
-  releases = OFFICIAL_GROK_RELEASES
+  releases = OFFICIAL_GROK_RELEASES,
+  managedRelease = null,
+  expectedAttestation = null
 } = {}) {
   const before = captureExecutableFileIdentity(binary);
-  const release = findOfficialRelease(before, { platform, arch, releases });
+  let attestation;
+  if (expectedAttestation) {
+    const expected = assertExecutableAttestation(expectedAttestation);
+    if (expected.platform !== platform
+      || expected.arch !== arch
+      || expected.size !== before.size
+      || expected.executableDigest !== before.executableDigest) {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "Grok executable no longer matches its persisted release identity."
+      );
+    }
+    attestation = attestationForFile(before, expected);
+  } else {
+    const release = findOfficialRelease(before, { platform, arch, releases });
+    if (release) {
+      attestation = createExecutableAttestation(before, release);
+    } else if (managedRelease) {
+      const managed = assertManagedReleaseIdentity({
+        ...managedRelease,
+        size: before.size,
+        executableDigest: before.executableDigest
+      });
+      const sameVersionPins = officialReleases({
+        platform,
+        arch,
+        releases
+      }).filter((entry) => entry.version === managed.version);
+      if (sameVersionPins.length) {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          `Managed Grok ${managed.version} bytes differ from its known release digest.`
+        );
+      }
+      attestation = createManagedObservedAttestation(before, managed);
+    } else {
+      throw new CompanionError(
+        "E_GROK_SOURCE",
+        "Unrecognized Grok executable bytes are not from the active managed installation."
+      );
+    }
+  }
   const after = captureExecutableFileIdentity(before.canonicalPath);
   if (!sameFileIdentity(before, after)) {
     throw new CompanionError(
       "E_PROCESS_IDENTITY",
-      "Grok executable changed during official package attestation."
+      "Grok executable changed during release attestation."
     );
   }
   return Object.freeze({
     ...after,
-    attestation: createExecutableAttestation(after, release)
+    attestation: attestationForFile(after, attestation)
   });
 }
 
 /**
- * Copy the pinned official bytes into a private broker-owned launch path.
+ * Copy the pinned bytes into a private broker-owned launch path.
  * The destination is rehashed after the copy; the mutable discovery path is
  * never executed by the worktree controller.
  */
@@ -450,7 +651,8 @@ export function materializePinnedGrokExecutable(binary, {
   directory,
   platform = process.platform,
   arch = process.arch,
-  releases = OFFICIAL_GROK_RELEASES
+  releases = OFFICIAL_GROK_RELEASES,
+  sourceIdentity = null
 } = {}) {
   if (typeof directory !== "string"
     || !path.isAbsolute(directory)
@@ -477,11 +679,13 @@ export function materializePinnedGrokExecutable(binary, {
       );
     }
 
-    const source = captureGrokExecutableIdentity(binary, {
-      platform,
-      arch,
-      releases
-    });
+    const source = sourceIdentity
+      ? captureGrokExecutableIdentity(binary, {
+          platform,
+          arch,
+          expectedAttestation: sourceIdentity.attestation
+        })
+      : captureGrokExecutableIdentity(binary, { platform, arch, releases });
     const nonce = crypto.randomBytes(16).toString("hex");
     temporary = path.join(directory, `.grok-${nonce}.tmp`);
     destination = path.join(directory, `grok-${nonce}`);
@@ -494,13 +698,13 @@ export function materializePinnedGrokExecutable(binary, {
     const copied = captureGrokExecutableIdentity(temporary, {
       platform,
       arch,
-      releases
+      expectedAttestation: source.attestation
     });
     if (copied.executableDigest !== source.executableDigest
       || copied.size !== source.size) {
       throw new CompanionError(
         "E_PROCESS_IDENTITY",
-        "Private Grok launch copy changed from its official package pin."
+        "Private Grok launch copy changed from its captured source identity."
       );
     }
     fs.renameSync(temporary, destination);
@@ -508,13 +712,13 @@ export function materializePinnedGrokExecutable(binary, {
     const materialized = captureGrokExecutableIdentity(destination, {
       platform,
       arch,
-      releases
+      expectedAttestation: source.attestation
     });
     if (materialized.executableDigest !== source.executableDigest
       || materialized.size !== source.size) {
       throw new CompanionError(
         "E_PROCESS_IDENTITY",
-        "Published Grok launch copy changed from its official package pin."
+        "Published Grok launch copy changed from its captured source identity."
       );
     }
     return materialized;
@@ -644,21 +848,7 @@ export function attestSpawnedExecutable(pid, expected, {
     || typeof expected.canonicalPath !== "string"
     || !sameExecutableAttestation(
       expected.attestation,
-      createExecutableAttestation(expected, {
-        releaseSource: expected.attestation?.releaseSource,
-        packageName: expected.attestation?.packageName,
-        packageVersion: expected.attestation?.packageVersion,
-        packageGitHead: expected.attestation?.packageGitHead,
-        packageIntegrityDigest:
-          expected.attestation?.packageIntegrityDigest,
-        platform: expected.attestation?.platform,
-        arch: expected.attestation?.arch,
-        version: expected.attestation?.version,
-        buildCommit: expected.attestation?.buildCommit,
-        channel: expected.attestation?.channel,
-        size: expected.attestation?.size,
-        executableDigest: expected.attestation?.executableDigest
-      })
+      attestationForFile(expected, expected.attestation)
     )) {
     throw new CompanionError(
       "E_PROCESS_IDENTITY",
