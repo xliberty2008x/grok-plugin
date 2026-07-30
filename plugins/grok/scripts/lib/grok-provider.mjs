@@ -27,7 +27,8 @@ import {
   assertCompleteDetachedOwnedIdentity,
   processGroupAlive,
   processGroupGone,
-  processStartToken
+  processStartToken,
+  signalOwnedProcess
 } from "./process-control.mjs";
 import {
   assertWorkerOwnerControllerBinding,
@@ -2588,10 +2589,25 @@ export async function captureSpawnIdentity(child, {
     while (isGroupAlive(pid) && Date.now() < stop) await new Promise((resolve) => setTimeout(resolve, Math.max(1, intervalMs)));
     return !isGroupAlive(pid);
   };
+  let signalFailure = null;
   for (const signal of ["SIGTERM", "SIGKILL"]) {
-    try { signalGroup(pid, signal); }
-    catch (error) { if (error.code !== "ESRCH") break; }
+    try {
+      signalOwnedProcess(
+        process.platform === "win32" ? pid : -pid,
+        signal,
+        (_target, requestedSignal) => signalGroup(pid, requestedSignal)
+      );
+    } catch (error) {
+      signalFailure = error;
+      break;
+    }
     if (await waitGone()) break;
+  }
+  if (signalFailure) {
+    if (isGroupAlive(pid)) {
+      throw attachProviderCleanupIdentity(signalFailure, identity);
+    }
+    throw signalFailure;
   }
   const error = new CompanionError("E_PROCESS_IDENTITY", "Could not record the Grok provider birth token before startup; the process was stopped before task execution.", { pid });
   if (isGroupAlive(pid)) throw attachProviderCleanupIdentity(error, identity);
@@ -3795,7 +3811,7 @@ export async function cleanupBoundBootstrapStart({
   stagedProfile.cleanup();
 }
 
-export async function openProvider({ root, profile, model = null, effort = null, stateDir, jobMarker = "probe", environment = null, knownSecrets = environment?.knownSecrets || [], cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, providerExecutableBinding = null, providerExecutableEnv = process.env, strictPermissionRequests = false, testHooks = null }) {
+export async function openProvider({ root, profile, model = null, effort = null, stateDir, jobMarker = "probe", environment = null, knownSecrets = environment?.knownSecrets || [], cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, providerExecutableBinding = null, providerExecutableEnv = process.env, strictPermissionRequests = false, testHooks = null, signalProcess = process.kill }) {
   assertProviderPlatform();
   const boundBootstrap = Boolean(guardBinding);
   const worktreeProvisioningBootstrap = isWorktreeProvisioningBinding(guardBinding);
@@ -4266,12 +4282,21 @@ export async function openProvider({ root, profile, model = null, effort = null,
     }
   }
   let eventError = null;
+  let eventSignalError = null;
+  let resolveEventFailure;
+  const eventFailure = new Promise((resolve) => {
+    resolveEventFailure = resolve;
+  });
+  const publishEventFailure = () => {
+    resolveEventFailure(eventSignalError || eventError);
+  };
   const permissionPolicy = (params) => {
     if (strictPermissionRequests) {
       eventError = new CompanionError(
         "E_SECURITY_PROFILE",
         "Unexpected ACP permission request under a strict provider profile."
       );
+      publishEventFailure();
       return { outcome: { outcome: "cancelled" } };
     }
     if (worktreeProvisioningBootstrap) {
@@ -4285,7 +4310,18 @@ export async function openProvider({ root, profile, model = null, effort = null,
     try { onEvent(event); }
     catch (error) {
       eventError = error;
-      try { process.kill(processIdentity.processGroupId && process.platform !== "win32" ? -processIdentity.processGroupId : child.pid, "SIGTERM"); } catch {}
+      try {
+        signalOwnedProcess(
+          processIdentity.processGroupId && process.platform !== "win32"
+            ? -processIdentity.processGroupId
+            : child.pid,
+          "SIGTERM",
+          signalProcess
+        );
+      } catch (signalError) {
+        eventSignalError = signalError;
+      }
+      publishEventFailure();
     }
   };
   try {
@@ -4334,7 +4370,7 @@ export async function openProvider({ root, profile, model = null, effort = null,
         guardRecord
       });
     }
-    throw eventError || error;
+    throw eventSignalError || eventError || error;
   }
   if (boundBootstrap) {
     try {
@@ -4407,11 +4443,11 @@ export async function openProvider({ root, profile, model = null, effort = null,
       30000,
       cancelRequested
     );
-    if (eventError) throw eventError;
+    if (eventSignalError || eventError) throw eventSignalError || eventError;
   } catch (error) {
     await cleanupFailedProviderStart({ child, identity: processIdentity, root, marker: safeMarker, stagedProfile, client, guardRecord });
     await settleWorktreeProvisioningStartupFailure();
-    throw eventError || error;
+    throw eventSignalError || eventError || error;
   }
   if (worktreeProvisioningBootstrap) {
     try {
@@ -4451,7 +4487,8 @@ export async function openProvider({ root, profile, model = null, effort = null,
       marker: safeMarker,
       guardRecord,
       emitEvent,
-      eventError: () => eventError,
+      eventError: () => eventSignalError || eventError,
+      eventFailure,
       cleanupAgentProfile: stagedProfile.cleanup,
       controllerCwd: providerCwd,
       controllerProfileId: runtimeProfile.id,
@@ -4486,13 +4523,17 @@ export async function openProvider({ root, profile, model = null, effort = null,
     marker: safeMarker,
     guardRecord,
     emitEvent,
-    eventError: () => eventError,
+    eventError: () => eventSignalError || eventError,
+    eventFailure,
     cleanupAgentProfile: stagedProfile.cleanup,
     executableIdentity: attestedExecutableIdentity
   };
 }
 
-export async function ensureChildExit(child, identity, { naturalExitMs = 750 } = {}) {
+export async function ensureChildExit(child, identity, {
+  naturalExitMs = 750,
+  signalProcess = process.kill
+} = {}) {
   // Defense in depth: unsupported platforms must surface E_CAPABILITY before identity failures.
   assertProviderPlatform();
   if (identity?.pid && child.pid === identity.pid && processGroupGone(identity)) return;
@@ -4509,10 +4550,13 @@ export async function ensureChildExit(child, identity, { naturalExitMs = 750 } =
     }
     return !alive();
   };
-  const signal = (name) => {
-    try { process.kill(identity.processGroupId && process.platform !== "win32" ? -identity.processGroupId : identity.pid, name); }
-    catch (error) { if (error.code !== "ESRCH") throw error; }
-  };
+  const signal = (name) => signalOwnedProcess(
+    identity.processGroupId && process.platform !== "win32"
+      ? -identity.processGroupId
+      : identity.pid,
+    name,
+    signalProcess
+  );
   if (await waitGone(naturalExitMs)) return;
   signal("SIGTERM");
   if (await waitGone(1500)) return;
@@ -4552,7 +4596,7 @@ function anonymousPrompt(directory, prompt) {
   }
 }
 
-export async function runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker = "review", resumeSessionId = null, structured = false, outputSchema = null, cancelRequested = () => false, onEvent = () => {}, timeoutMs = 15 * 60 * 1000, maxOutputBytes = 1024 * 1024 }) {
+export async function runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker = "review", resumeSessionId = null, structured = false, outputSchema = null, cancelRequested = () => false, onEvent = () => {}, timeoutMs = 15 * 60 * 1000, maxOutputBytes = 1024 * 1024, signalProcess = process.kill }) {
   assertProviderPlatform();
   // Validate trusted schema early (bounded + serializable) before spawning.
   const trustedSchema = structured ? resolveTrustedOutputSchema(outputSchema) : null;
@@ -4641,14 +4685,35 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
     cleanupReviewEnvironment(stateDir, marker);
     throw error;
   }
-  let stdout = "", stdoutBytes = 0, stderr = "", terminationReason = null, forceTimer = null, eventError = null;
+  let stdout = "", stdoutBytes = 0, stderr = "", terminationReason = null, forceTimer = null, eventError = null, terminationSignalError = null;
   const MAX_OUTPUT = maxOutputBytes;
-  const terminate = (signal) => { try { process.kill(identity.processGroupId && process.platform !== "win32" ? -identity.processGroupId : child.pid, signal); } catch (error) { if (error.code !== "ESRCH") throw error; } };
+  let rejectTerminationSignalFailure;
+  const terminationSignalFailure = new Promise((_, reject) => {
+    rejectTerminationSignalFailure = reject;
+  });
+  const terminate = (signal) => {
+    try {
+      assertCompleteDetachedOwnedIdentity(identity);
+      return signalOwnedProcess(
+        identity.processGroupId && process.platform !== "win32"
+          ? -identity.processGroupId
+          : identity.pid,
+        signal,
+        signalProcess
+      );
+    } catch (error) {
+      if (!terminationSignalError) {
+        terminationSignalError = error;
+        rejectTerminationSignalFailure(error);
+      }
+      return false;
+    }
+  };
   const beginTermination = (reason) => {
     if (terminationReason) return;
     terminationReason = reason;
-    terminate("SIGTERM");
-    forceTimer = setTimeout(() => { try { terminate("SIGKILL"); } catch {} }, 2000);
+    if (!terminate("SIGTERM")) return;
+    forceTimer = setTimeout(() => { terminate("SIGKILL"); }, 2000);
   };
   const emitEvent = (event) => {
     if (eventError) return;
@@ -4671,13 +4736,14 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
   const timeout = setTimeout(() => beginTermination("timeout"), timeoutMs);
   let code, signal;
   try {
-    [code, signal] = await completion;
+    [code, signal] = await Promise.race([completion, terminationSignalFailure]);
   } catch (error) {
+    if (error === terminationSignalError) throw error;
     throw new CompanionError("E_PROVIDER_EXIT", `Could not start Grok: ${error.message}`);
   } finally {
     clearInterval(cancelPoll); clearTimeout(timeout); if (forceTimer) clearTimeout(forceTimer);
     closePromptFd();
-    await ensureChildExit(child, identity);
+    await ensureChildExit(child, identity, { signalProcess });
     unregisterProviderGuard(root, marker, guardRecord);
   }
   if (eventError) { cleanupReviewEnvironment(stateDir, marker); throw eventError; }
@@ -4698,7 +4764,7 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
   return { sessionId, text: redactText(String(payload.text ?? "").trim(), isolation.knownSecrets), structuredOutput: redact(payload.structuredOutput, isolation.knownSecrets), stopReason: payload.stopReason || "EndTurn", provider: { version, process: identity, isolatedHome: isolation.home }, capabilities: { transport: "headless", agent: "explore", sandbox: isolation.sandboxProfile } };
 }
 
-export async function runProvider({ root, profile, prompt, model, effort, stateDir, jobMarker = "job", providerHomeId = null, resumeSessionId = null, cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, providerExecutableBinding = null, providerExecutableEnv = process.env, primaryTurnController = null, mailboxController = null, outputSchema = null, testHooks = null, timeoutMs = undefined }) {
+export async function runProvider({ root, profile, prompt, model, effort, stateDir, jobMarker = "job", providerHomeId = null, resumeSessionId = null, cancelRequested = () => false, onEvent = () => {}, guardBinding = null, providerLaunch = null, providerExecutableBinding = null, providerExecutableEnv = process.env, primaryTurnController = null, mailboxController = null, outputSchema = null, testHooks = null, timeoutMs = undefined, signalProcess = process.kill }) {
   if (profile.transport === "headless") {
     if (providerExecutableBinding !== null) {
       throw new CompanionError(
@@ -4712,7 +4778,7 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
         "Task structured output requires the ACP provider transport."
       );
     }
-    return runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker, resumeSessionId, cancelRequested, onEvent, ...(timeoutMs == null ? {} : { timeoutMs }) });
+    return runHeadless({ root, profile, prompt, model, effort, stateDir, jobMarker, resumeSessionId, cancelRequested, onEvent, signalProcess, ...(timeoutMs == null ? {} : { timeoutMs }) });
   }
   const boundOutputSchemaDigest = outputSchemaDigest(outputSchema);
   const resolvedExecutablePin = providerExecutableBinding === null
@@ -4781,7 +4847,8 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
       providerExecutableBinding:
         resolvedExecutablePin?.binding || providerExecutableBinding,
       providerExecutableEnv,
-      testHooks
+      testHooks,
+      signalProcess
     });
   } catch (error) {
     const failedIdentity = providerCleanupIdentity(error);
@@ -4815,30 +4882,75 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
   let primaryTurnAdmission = null;
   let mailboxAttempt = null;
   let mailboxClosed = false;
+  let terminationSignalError = null;
+  let rejectTerminationSignalFailure;
+  const terminationSignalFailure = new Promise((_, reject) => {
+    rejectTerminationSignalFailure = reject;
+  });
+  const signalProvider = (signal) => {
+    try {
+      assertCompleteDetachedOwnedIdentity(provider.process);
+      return signalOwnedProcess(
+        provider.process.processGroupId
+          ? -provider.process.processGroupId
+          : provider.child.pid,
+        signal,
+        signalProcess
+      );
+    } catch (error) {
+      if (!terminationSignalError) {
+        terminationSignalError = error;
+        rejectTerminationSignalFailure(error);
+      }
+      return false;
+    }
+  };
+  const scheduleProviderTermination = () => {
+    if (killTimer || terminationSignalError) return;
+    killTimer = setTimeout(() => {
+      killTimer = null;
+      signalProvider("SIGTERM");
+    }, 5000);
+  };
+  const awaitProviderOperation = (operation) => (
+    Promise.race([
+      operation,
+      terminationSignalFailure,
+      provider.eventFailure.then((error) => {
+        throw error;
+      })
+    ])
+  );
   try {
     if ((provider.initialized.authMethods || []).some((method) => method?.id === "cached_token")) {
-      await requestDuringProviderStartup(
-        provider.client,
-        "authenticate",
-        { methodId: "cached_token", _meta: { headless: true } },
-        30000,
-        cancelRequested
+      await awaitProviderOperation(
+        requestDuringProviderStartup(
+          provider.client,
+          "authenticate",
+          { methodId: "cached_token", _meta: { headless: true } },
+          30000,
+          cancelRequested
+        )
       );
     }
     const session = resumeSessionId
-      ? await requestDuringProviderStartup(
-          provider.client,
-          "session/load",
-          { sessionId: resumeSessionId, cwd: root, mcpServers: [] },
-          45000,
-          cancelRequested
+      ? await awaitProviderOperation(
+          requestDuringProviderStartup(
+            provider.client,
+            "session/load",
+            { sessionId: resumeSessionId, cwd: root, mcpServers: [] },
+            45000,
+            cancelRequested
+          )
         )
-      : await requestDuringProviderStartup(
-          provider.client,
-          "session/new",
-          { cwd: root, mcpServers: [] },
-          45000,
-          cancelRequested
+      : await awaitProviderOperation(
+          requestDuringProviderStartup(
+            provider.client,
+            "session/new",
+            { cwd: root, mcpServers: [] },
+            45000,
+            cancelRequested
+          )
         );
     sessionId = session?.sessionId || resumeSessionId;
     if (!sessionId) throw new CompanionError("E_PROTOCOL", "Grok did not return a session ID.");
@@ -4855,11 +4967,14 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
           "Attempt-bound mailbox pumping is available only on the primary provider generation."
         );
       }
-      mailboxAttempt = await mailboxController.open({
-        sessionId,
-        providerProcess: provider.process,
-        providerCapabilities: provider.initialized
-      });
+      mailboxAttempt = await awaitProviderOperation(
+        mailboxController.open({
+          sessionId,
+          providerProcess: provider.process,
+          providerCapabilities: provider.initialized
+        })
+      );
+      if (provider.eventError()) throw provider.eventError();
     }
     if (primaryTurnController) {
       if (typeof primaryTurnController.admit !== "function"
@@ -4920,9 +5035,7 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
           if (!outputError) {
             outputError = new CompanionError("E_OUTPUT_LIMIT", "Grok provider message output exceeded the 512 KiB job limit.", { limitBytes: 512 * 1024 });
             provider.client.notify("session/cancel", { sessionId });
-            killTimer = setTimeout(() => {
-              try { process.kill(provider.process.processGroupId ? -provider.process.processGroupId : provider.child.pid, "SIGTERM"); } catch {}
-            }, 5000);
+            scheduleProviderTermination();
           }
           return;
         }
@@ -4940,7 +5053,13 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
       }
     };
     provider.client.on("update", listener);
-    poll = setInterval(() => { if (!cancelled && cancelRequested()) { cancelled = true; provider.client.notify("session/cancel", { sessionId }); killTimer = setTimeout(() => { try { process.kill(provider.process.processGroupId ? -provider.process.processGroupId : provider.child.pid, "SIGTERM"); } catch {} }, 5000); } }, 100);
+    poll = setInterval(() => {
+      if (!cancelled && cancelRequested()) {
+        cancelled = true;
+        provider.client.notify("session/cancel", { sessionId });
+        scheduleProviderTermination();
+      }
+    }, 100);
     let result;
     let structuredOutput;
     let structuredOutputError;
@@ -4962,12 +5081,14 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
           );
         }
       }
-      const promptResponse = await provider.client.promptTurn({
-        sessionId,
-        prompt: [{ type: "text", text: prompt }],
-        outputSchema,
-        timeoutMs: timeoutMs ?? 30 * 60 * 1000
-      });
+      const promptResponse = await awaitProviderOperation(
+        provider.client.promptTurn({
+          sessionId,
+          prompt: [{ type: "text", text: prompt }],
+          outputSchema,
+          timeoutMs: timeoutMs ?? 30 * 60 * 1000
+        })
+      );
       result = promptResponse.result;
       if (Object.hasOwn(promptResponse, "structuredOutput")) {
         structuredOutput = promptResponse.structuredOutput;
@@ -4976,7 +5097,13 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
         structuredOutputError = promptResponse.structuredOutputError;
       }
     }
-    catch (error) { if (outputError) throw outputError; if (cancelled) throw new CompanionError("E_CANCELLED", "Grok job was cancelled."); throw provider.eventError() || error; }
+    catch (error) {
+      if (provider.eventError()) throw provider.eventError();
+      if (error === terminationSignalError) throw error;
+      if (outputError) throw outputError;
+      if (cancelled) throw new CompanionError("E_CANCELLED", "Grok job was cancelled.");
+      throw error;
+    }
     if (provider.eventError()) throw provider.eventError();
     if (outputError) throw outputError;
     if (cancelled
@@ -4996,19 +5123,21 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
     let selectedSequence = 0;
     let mailboxEvidence = null;
     if (mailboxController) {
-      await mailboxController.recordPrimary({
+      await awaitProviderOperation(mailboxController.recordPrimary({
         attempt: mailboxAttempt,
         prompt,
         stopReason: result?.stopReason || "end_turn"
-      });
-      const drained = await mailboxController.drain({
+      }));
+      if (provider.eventError()) throw provider.eventError();
+      const drained = await awaitProviderOperation(mailboxController.drain({
         attempt: mailboxAttempt,
         client: provider.client,
         sessionId,
         collectTurnText: beginTurn,
         timeoutMs: timeoutMs ?? 30 * 60 * 1000,
         cancelRequested
-      });
+      }));
+      if (provider.eventError()) throw provider.eventError();
       if (cancelled || cancelRequested()) {
         throw new CompanionError(
           "E_CANCELLED",
@@ -5052,6 +5181,7 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
         bodiesRetained: Boolean(drained?.bodiesRetained)
       };
     }
+    if (provider.eventError()) throw provider.eventError();
     clearInterval(poll); poll = null; provider.client.off("update", listener);
     return {
       sessionId,
@@ -5082,8 +5212,9 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
         if (error && typeof error === "object") error.details = details;
       }
     }
+    if (provider.eventError()) throw provider.eventError();
     if (/auth|login|unauthori[sz]ed|no auth method/i.test(`${error?.message || ""} ${error?.details?.data || ""}`)) throw new CompanionError("E_AUTH_REQUIRED", `Grok authentication is unavailable or expired. Run \`grok login\`, then ${hostCommand("setup")}.`);
-    throw provider.eventError() || error;
+    throw error;
   } finally {
     if (poll) clearInterval(poll);
     if (killTimer) clearTimeout(killTimer);
@@ -5097,7 +5228,7 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
     catch (error) { noteCleanupFailure("ACP client", error); }
 
     try {
-      await ensureChildExit(provider.child, provider.process);
+      await ensureChildExit(provider.child, provider.process, { signalProcess });
     } catch (error) {
       if (cleanupWarnings.length && error && typeof error === "object") {
         const details = error.details && typeof error.details === "object" && !Array.isArray(error.details)

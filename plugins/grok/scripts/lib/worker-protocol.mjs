@@ -81,6 +81,12 @@ const ACTIVE_WORKER_STATUSES = new Set(["queued", "running"]);
 const PUBLIC_WORKER_STATUSES = new Set(["queued", "running", "completed", "failed", "cancelled", "unknown"]);
 const PUBLIC_LIFECYCLE_EVENT_TYPES = new Set(LIFECYCLE_EVENT_TYPES);
 const PUBLIC_WORKER_ERROR_CODE_SET = new Set(PUBLIC_WORKER_ERROR_CODES);
+const FOREGROUND_PUBLIC_ERROR_CODE_SET = new Set([
+  "E_STORAGE_READONLY",
+  "E_CONTEXT_INCOMPLETE",
+  "E_INPUT_READ",
+  "E_INPUT_TIMEOUT"
+]);
 const WORKER_ID_PATTERN = /^(?:review|adversarial-review|task|stop-review|deep-research)-[a-f0-9]{16,64}$/;
 const MAX_PUBLIC_TEXT_BYTES = 2000;
 const MAX_PUBLIC_PLAN_ITEMS = 128;
@@ -90,6 +96,160 @@ const MAX_PUBLIC_REVIEW_FINDINGS = 200;
 const MAX_PUBLIC_TREE_DEPTH = 8;
 const MAX_PUBLIC_TREE_PROPERTIES = 64;
 const MAX_PUBLIC_TREE_ITEMS = 200;
+const MAX_PUBLIC_DIAGNOSTIC_TEXT_BYTES = 512 * 1024;
+const MAX_PRIVATE_PROCESS_DIAGNOSTIC_CODE_LENGTH = 64;
+const MAX_PRIVATE_PROCESS_DIAGNOSTIC_MESSAGE_LENGTH = 256;
+const PROCESS_IDENTITY_PUBLIC_MESSAGE = "Process ownership verification failed.";
+const SAFETY_PRIMARY_ERROR_CODES = new Set([
+  "E_CONTEXT_DRIFT",
+  "E_SCOPE_VIOLATION"
+]);
+const PROCESS_OS_ERROR_CODES = new Set([
+  "E2BIG",
+  "EACCES",
+  "EADDRINUSE",
+  "EADDRNOTAVAIL",
+  "EAFNOSUPPORT",
+  "EAGAIN",
+  "EALREADY",
+  "EBADF",
+  "EBADMSG",
+  "EBUSY",
+  "ECANCELED",
+  "ECHILD",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EDEADLK",
+  "EDESTADDRREQ",
+  "EDOM",
+  "EDQUOT",
+  "EEXIST",
+  "EFAULT",
+  "EFBIG",
+  "EHOSTUNREACH",
+  "EIDRM",
+  "EILSEQ",
+  "EINPROGRESS",
+  "EINTR",
+  "EINVAL",
+  "EIO",
+  "EISCONN",
+  "EISDIR",
+  "ELOOP",
+  "EMFILE",
+  "EMLINK",
+  "EMSGSIZE",
+  "EMULTIHOP",
+  "ENAMETOOLONG",
+  "ENETDOWN",
+  "ENETRESET",
+  "ENETUNREACH",
+  "ENFILE",
+  "ENOBUFS",
+  "ENODATA",
+  "ENODEV",
+  "ENOENT",
+  "ENOEXEC",
+  "ENOLCK",
+  "ENOLINK",
+  "ENOMEM",
+  "ENOMSG",
+  "ENOPROTOOPT",
+  "ENOSPC",
+  "ENOSR",
+  "ENOSTR",
+  "ENOSYS",
+  "ENOTCONN",
+  "ENOTDIR",
+  "ENOTEMPTY",
+  "ENOTRECOVERABLE",
+  "ENOTSOCK",
+  "ENOTSUP",
+  "ENOTTY",
+  "ENXIO",
+  "EOPNOTSUPP",
+  "EOVERFLOW",
+  "EOWNERDEAD",
+  "EPERM",
+  "EPIPE",
+  "EPROTO",
+  "EPROTONOSUPPORT",
+  "EPROTOTYPE",
+  "ERANGE",
+  "EROFS",
+  "ESHUTDOWN",
+  "ESOCKTNOSUPPORT",
+  "ESPIPE",
+  "ETIME",
+  "ETIMEDOUT",
+  "ETXTBSY",
+  "EWOULDBLOCK",
+  "EXDEV"
+]);
+const PUBLIC_PROCESS_SIGNAL_NAMES = new Set([
+  "SIGABRT",
+  "SIGALRM",
+  "SIGBREAK",
+  "SIGBUS",
+  "SIGCHLD",
+  "SIGCONT",
+  "SIGFPE",
+  "SIGHUP",
+  "SIGILL",
+  "SIGINT",
+  "SIGIO",
+  "SIGIOT",
+  "SIGKILL",
+  "SIGPIPE",
+  "SIGPOLL",
+  "SIGPROF",
+  "SIGPWR",
+  "SIGQUIT",
+  "SIGSEGV",
+  "SIGSTOP",
+  "SIGSYS",
+  "SIGTERM",
+  "SIGTRAP",
+  "SIGTSTP",
+  "SIGTTIN",
+  "SIGTTOU",
+  "SIGURG",
+  "SIGUSR1",
+  "SIGUSR2",
+  "SIGVTALRM",
+  "SIGWINCH",
+  "SIGXCPU",
+  "SIGXFSZ"
+]);
+const PUBLIC_LIFECYCLE_DETAIL_TEXT_FIELDS = Object.freeze({
+  envelopeId: Object.freeze({ kind: "text", maxBytes: 256 }),
+  resumeJobId: Object.freeze({ kind: "text", maxBytes: 256 }),
+  spawnSuccessDefinition: Object.freeze({ kind: "text", maxBytes: 1000 }),
+  requestAcceptedAt: Object.freeze({ kind: "timestamp" }),
+  reconciler: Object.freeze({ kind: "text", maxBytes: 128 }),
+  messageId: Object.freeze({ kind: "text", maxBytes: 256 }),
+  contentDigest: Object.freeze({ kind: "text", maxBytes: 256 }),
+  parentWorkerId: Object.freeze({ kind: "text", maxBytes: 256 }),
+  version: Object.freeze({ kind: "text", maxBytes: 128 }),
+  name: Object.freeze({ kind: "text", maxBytes: 300 }),
+  status: Object.freeze({ kind: "text", maxBytes: 80 }),
+  plan: Object.freeze({ kind: "text-list", maxItems: 20, maxBytes: 500 }),
+  questions: Object.freeze({
+    kind: "text-list",
+    maxItems: MAX_PUBLIC_LIST_ITEMS,
+    maxBytes: MAX_PUBLIC_TEXT_BYTES
+  }),
+  validationIssues: Object.freeze({
+    kind: "text-list",
+    maxItems: MAX_PUBLIC_PATH_ITEMS,
+    maxBytes: MAX_PUBLIC_TEXT_BYTES
+  }),
+  observedChangedPaths: Object.freeze({
+    kind: "path-list",
+    maxItems: MAX_PUBLIC_PATH_ITEMS
+  })
+});
 const PRIVATE_PROJECTION_FIELDS = new Set([
   "host",
   "sessionId",
@@ -222,8 +382,468 @@ function boundedText(value, { fallback = "", max = MAX_PUBLIC_TEXT_BYTES } = {})
   return projectWorkerPublicText(value, { fallback, maxBytes: max });
 }
 
+function rawProcessOsErrorCode(value) {
+  const code = String(value || "");
+  return PROCESS_OS_ERROR_CODES.has(code) ? code : null;
+}
+
+function rawProcessOsErrorCodesInText(value) {
+  if (typeof value !== "string") return [];
+  return [...value.normalize("NFKC").matchAll(/\bE[A-Z0-9_]{2,63}\b/g)]
+    .map((match) => rawProcessOsErrorCode(match[0]))
+    .filter(Boolean);
+}
+
+function boundedAuthoritativeProcessDiagnostic(value) {
+  if (!isPlainObject(value)) return null;
+  const code = typeof value.code === "string" ? value.code : "";
+  const message = typeof value.message === "string" ? value.message : "";
+  if (
+    !/^[A-Z][A-Z0-9_]{0,63}$/.test(code)
+    || code.length > MAX_PRIVATE_PROCESS_DIAGNOSTIC_CODE_LENGTH
+    || !message.trim()
+    || message.length > MAX_PRIVATE_PROCESS_DIAGNOSTIC_MESSAGE_LENGTH
+  ) {
+    return null;
+  }
+  return value;
+}
+
+function acceptsAuthoritativeProcessDiagnostic(error) {
+  return isPlainObject(error)
+    && (
+      error.code === "E_PROCESS_IDENTITY"
+      || SAFETY_PRIMARY_ERROR_CODES.has(error.code)
+    );
+}
+
+function isClearlyDocumentaryProcessText(value) {
+  if (typeof value !== "string") return false;
+  const text = value.normalize("NFKC");
+  const documentary = /^\s*(?:(?:historical|history|example|illustration)\b|fixture(?=\s*(?::|-|\b(?:example|note|documentation|record)\b)))/i.test(text);
+  const operationalFixture = /^\s*fixture\s+(?:cleanup|teardown|shutdown|failed|failure|error)\b/i.test(text);
+  const explicitlyCurrent = /\b(?:currently|current\s+(?:cleanup|retry|failure|error)|still|now|waiting\s+for|remains?\s+blocked)\b/i.test(text);
+  return documentary && !operationalFixture && !explicitlyCurrent;
+}
+
+function classifyProcessCleanupDiagnostic(value) {
+  if (typeof value !== "string") {
+    return Object.freeze({
+      sensitive: false,
+      documentary: false,
+      hasStrongProcessIdentity: false,
+      hasWeakProcessIdentity: false,
+      processDiagnostic: false,
+      rawCodes: []
+    });
+  }
+  const text = value.normalize("NFKC");
+  const documentary = isClearlyDocumentaryProcessText(text);
+  const rawCodes = rawProcessOsErrorCodesInText(text);
+  const hasStrongProcessIdentity =
+    scrubStrongProcessIdentityText(text) !== text;
+  const hasWeakProcessIdentity =
+    scrubWeakProcessIdentityText(text) !== text;
+  const operationalContext = (
+    /\b(?:cleanup|clean-up|teardown|shutdown|recover(?:y|ed|ing)?|reconcil(?:e|ed|er|ing|iation)|final[\s_-]+(?:observation|context|evidence|state|cleanup)|terminal(?:[\s_-]+(?:context|state|cleanup|record|error|failure))?|runtime[\s_-]+cleanup|provider[\s_-]+cleanup|process[\s_-]+(?:ownership|identity|group|termination|exit|shutdown|cleanup))\b/i.test(text)
+    || /\bkill\s+--\s+[+-]?\d+\b/i.test(text)
+    || /\b(?:kill|signal(?:led|ling|ed|ing)?|terminat(?:e|ed|ing))(?:[\s_-]+to)?[\s_-]+(?:process|group)\b/i.test(text)
+    || /\bsent\s+SIG[A-Z0-9]+\s+to\b/i.test(text)
+    || /\bwaiting\s+for\s+(?:process|group)\b/i.test(text)
+    || /\b(?:provider|worker|controller|child|leader)\s+process\s*[#:=]?\s*[+-]?\d+\b/i.test(text)
+    || (
+      rawCodes.length > 0
+      && /\b(?:kill|signal(?:led|ling|ed|ing)?|terminat(?:e|ed|ing|ion)|target)\b/i.test(text)
+    )
+  );
+  const processDiagnostic = hasStrongProcessIdentity
+    || (
+      operationalContext
+      && (hasWeakProcessIdentity || rawCodes.length > 0)
+    );
+  return Object.freeze({
+    sensitive: !documentary && processDiagnostic,
+    documentary,
+    hasStrongProcessIdentity,
+    hasWeakProcessIdentity,
+    operationalContext,
+    processDiagnostic,
+    rawCodes
+  });
+}
+
+function rawProcessSignalDiagnostic(error) {
+  if (!isPlainObject(error)) return null;
+  const secondary = isPlainObject(error.details?.secondaryDiagnostic)
+    ? error.details.secondaryDiagnostic
+    : null;
+  if (acceptsAuthoritativeProcessDiagnostic(error)) {
+    const authoritative = boundedAuthoritativeProcessDiagnostic(secondary);
+    if (authoritative) return authoritative;
+    if (error.code === "E_PROCESS_IDENTITY") return null;
+  }
+  const rawCode = rawProcessOsErrorCode(error.code);
+  if (rawCode && classifyProcessCleanupDiagnostic(error.message).processDiagnostic) {
+    return error;
+  }
+  if (secondary) {
+    const secondaryCode = rawProcessOsErrorCode(secondary.code);
+    if (secondaryCode) return secondary;
+  }
+  for (const warning of [
+    error.details?.warning,
+    error.details?.privacyWarning
+  ]) {
+    const classification = classifyProcessCleanupDiagnostic(warning);
+    if (classification.processDiagnostic && classification.rawCodes.length > 0) {
+      return {
+        code: classification.rawCodes[0] || null,
+        message: String(warning)
+      };
+    }
+  }
+  if (["E_BROKER", "E_PROVIDER_EXIT", "E_STATE"].includes(error.code)
+    && classifyProcessCleanupDiagnostic(error.message).processDiagnostic) {
+    const wrappedCode = rawProcessOsErrorCodesInText(error.message)[0] || null;
+    if (!wrappedCode) return null;
+    return { code: wrappedCode, message: String(error.message) };
+  }
+  return null;
+}
+
+function rawProcessSignalDiagnostics(error) {
+  const acceptsAuthoritativeCodes =
+    acceptsAuthoritativeProcessDiagnostic(error);
+  const diagnostics = [
+    rawProcessSignalDiagnostic(error),
+    ...(Array.isArray(error?.details?.sanitizationDiagnostics)
+      ? error.details.sanitizationDiagnostics
+      : [])
+  ].filter((diagnostic) => (
+    isPlainObject(diagnostic)
+    && (
+      rawProcessOsErrorCode(diagnostic.code)
+      || (
+        acceptsAuthoritativeCodes
+        && boundedAuthoritativeProcessDiagnostic(diagnostic)
+      )
+    )
+    && typeof diagnostic.message === "string"
+    && diagnostic.message.trim()
+  ));
+  const seen = new Set();
+  return diagnostics.filter((diagnostic) => {
+    const identity = `${diagnostic.code}\u0000${diagnostic.message}`;
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+}
+
+function hasActualProcessIdentityUncertainty(error) {
+  return isPlainObject(error)
+    && (
+      error.code === "E_PROCESS_IDENTITY"
+      || Boolean(rawProcessSignalDiagnostic(error))
+    );
+}
+
+function establishesProcessIdentityUncertainty(error) {
+  return isPlainObject(error)
+    && (
+      hasActualProcessIdentityUncertainty(error)
+      || SAFETY_PRIMARY_ERROR_CODES.has(error.code)
+    );
+}
+
+function scrubStrongProcessIdentityText(value) {
+  return String(value)
+    .replace(
+      /\b((?:pid(?:_t)?|pgid|process[\s_-]*(?:group(?:[\s_-]*(?:ids?|identifiers?))?|ids?|identifiers?)|signal[\s_-]*target|(?:child|leader|provider|worker|controller)[\s_-]*(?:pid(?:_t)?|process[\s_-]*(?:ids?|identifiers?)))\s*["']?\s*(?::|=|#|\bis\b)?\s*["']?\s*[\[(]?\s*)[+-]?\d+\b(\s*[\])]?["']?)/giu,
+      "$1[REDACTED]$2"
+    );
+}
+
+function scrubWeakProcessIdentityText(value) {
+  return String(value)
+    .replace(
+      /\b((?:target|group(?:[\s_-]+(?:ids?|identifiers?))?)\s*["']?\s*(?::|=|#|\bis\b)?\s*["']?\s*[\[(]?\s*)[+-]?\d+\b(\s*[\])]?["']?)/giu,
+      "$1[REDACTED]$2"
+    )
+    .replace(
+      /\b((?:kill|signal(?:led|ling|ed|ing)?|terminat(?:e|ed|ing))\s+--\s+)[+-]?\d+\b/giu,
+      "$1[REDACTED]"
+    )
+    .replace(
+      /\b((?:kill|signal(?:led|ling|ed|ing)?|terminat(?:e|ed|ing))(?:[\s_-]+to)?[\s_-]+(?:process|group)(?:\s+(?:with\s+)?(?:id|number))?(?:\s*(?::|=|#|\bis\b)\s*|\s+)["']?)[+-]?\d+\b(\s*["']?)/giu,
+      "$1[REDACTED]$2"
+    )
+    .replace(
+      /\b((?:kill|signal(?:led|ling|ed|ing)?|terminat(?:e|ed|ing))\s*(?:\(\s*|(?::|=|#|\bis\b)?\s+)["']?)[+-]?\d+\b(\s*["']?)/giu,
+      "$1[REDACTED]$2"
+    )
+    .replace(
+      /\b((?:waiting\s+for)\s+(?:process|group)(?:\s+(?:with\s+)?(?:id|number))?(?:\s*(?::|=|#|\bis\b)\s*|\s+)["']?)[+-]?\d+\b(\s*["']?)/giu,
+      "$1[REDACTED]$2"
+    )
+    .replace(
+      /\b((?:sent\s+SIG[A-Z0-9]+\s+to)\s+(?:(?:process|group)(?:\s+(?:with\s+)?(?:id|number))?\s*(?:(?::|=|#|\bis\b)\s*)?)?["']?)[+-]?\d+\b(\s*["']?)/giu,
+      "$1[REDACTED]$2"
+    )
+    .replace(
+      /\b((?:provider|worker|controller|child|leader)\s+process(?:\s+(?:with\s+)?(?:id|number))?(?:\s*(?::|=|#|\bis\b)\s*|\s+)["']?)[+-]?\d+\b(\s*["']?)/giu,
+      "$1[REDACTED]$2"
+    );
+}
+
+function scrubPublicProcessIdentityText(value, { includeWeak = true } = {}) {
+  const strong = scrubStrongProcessIdentityText(value);
+  return includeWeak ? scrubWeakProcessIdentityText(strong) : strong;
+}
+
+function scrubRawProcessOsErrorCodes(value) {
+  return String(value).replace(
+    /\bE[A-Z0-9_]{2,63}\b/g,
+    (code) => rawProcessOsErrorCode(code)
+      ? PROCESS_IDENTITY_PUBLIC_MESSAGE
+      : code
+  );
+}
+
+function scrubProcessDiagnosticText(value, error, { selfDetect = false } = {}) {
+  let text = String(value);
+  const diagnostics = rawProcessSignalDiagnostics(error);
+  for (const diagnostic of diagnostics) {
+    const rawMessage = diagnostic.message.trim();
+    text = text.replace(
+      new RegExp(rawMessage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "giu"),
+      PROCESS_IDENTITY_PUBLIC_MESSAGE
+    );
+    const rawCode = String(diagnostic.code || "");
+    if (!rawProcessOsErrorCode(rawCode)) {
+      text = text.replace(
+        new RegExp(`\\b${rawCode.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gu"),
+        PROCESS_IDENTITY_PUBLIC_MESSAGE
+      );
+    }
+  }
+  const activeUncertainty = establishesProcessIdentityUncertainty(error);
+  if (activeUncertainty) {
+    text = text
+      .replace(
+        /\bE_ASYNC_SIGNAL\b\s*:\s*Process signalling callback did not complete synchronously\./giu,
+        PROCESS_IDENTITY_PUBLIC_MESSAGE
+      )
+      .replace(
+        /Process signalling callback did not complete synchronously\./giu,
+        PROCESS_IDENTITY_PUBLIC_MESSAGE
+      )
+      .replace(
+        /\bE_ASYNC_SIGNAL\b/gu,
+        PROCESS_IDENTITY_PUBLIC_MESSAGE
+      );
+  }
+  if (!selfDetect && !activeUncertainty) return text;
+  const hasAuthoritativeDiagnostic = diagnostics.length > 0;
+  return text
+    .split(/((?:\r?\n)+|[.!?;](?:["')\]]*)[ \t]+|[ \t]+(?:—|–|\|)[ \t]+)/u)
+    .map((segment) => {
+      const classification = classifyProcessCleanupDiagnostic(segment);
+      // A documentary prefix is not evidence that process-looking content is
+      // harmless. Preserve such a sibling only when an authoritative raw
+      // secondary diagnostic identified a different exact segment first.
+      const preserveDocumentary = classification.documentary
+        && hasAuthoritativeDiagnostic;
+      const sensitive = classification.processDiagnostic
+        || (
+          activeUncertainty
+          && classification.hasWeakProcessIdentity
+        );
+      if (!sensitive || preserveDocumentary) return segment;
+      const withoutCodes = scrubRawProcessOsErrorCodes(segment);
+      return scrubPublicProcessIdentityText(withoutCodes, {
+        includeWeak: activeUncertainty || classification.operationalContext
+      });
+    })
+    .join("");
+}
+
+function scrubProcessDiagnosticsInPublicTree(
+  value,
+  error,
+  { selfDetect = false } = {}
+) {
+  if (!selfDetect && !establishesProcessIdentityUncertainty(error)) return value;
+  if (typeof value === "string") {
+    return scrubProcessDiagnosticText(value, error, { selfDetect });
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => scrubProcessDiagnosticsInPublicTree(
+      item,
+      error,
+      { selfDetect }
+    ));
+  }
+  if (!isPlainObject(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      key,
+      scrubProcessDiagnosticsInPublicTree(item, error, { selfDetect })
+    ])
+  );
+}
+
+function sanitizeCompleteWorkerProjection(value, error) {
+  return sanitizePublicProjection(scrubProcessDiagnosticsInPublicTree(
+    value,
+    error,
+    { selfDetect: true }
+  ));
+}
+
+function projectWorkerStatusText(
+  value,
+  error,
+  {
+    trustHostAuthority = true,
+    selfDetect = false,
+    max = MAX_PUBLIC_TEXT_BYTES
+  } = {}
+) {
+  if (typeof value !== "string") return null;
+  const text = scrubProcessDiagnosticText(value, error, { selfDetect });
+  return authorityBoundText(text, { trustHostAuthority, max });
+}
+
+function projectProcessDiagnosticWarning(value, error) {
+  if (typeof value !== "string") return null;
+  const classification = classifyProcessCleanupDiagnostic(value);
+  const warningError = rawProcessSignalDiagnostic(error)
+    ? error
+    : classification.processDiagnostic && classification.rawCodes.length > 0
+      ? { code: classification.rawCodes[0], message: value }
+      : error;
+  return boundedText(scrubProcessDiagnosticText(value, warningError, {
+    selfDetect: true
+  }));
+}
+
+function workerSanitizationError(job) {
+  const pending = isPlainObject(job?.pendingTerminal?.error)
+    ? job.pendingTerminal.error
+    : null;
+  const current = isPlainObject(job?.error) ? job.error : null;
+  const reportRepair = isPlainObject(job?.result?.reportRepair?.error)
+    ? job.result.reportRepair.error
+    : null;
+  const privacyWarning = typeof job?.result?.privacyWarning === "string"
+    ? job.result.privacyWarning
+    : null;
+  const warningClassification = classifyProcessCleanupDiagnostic(privacyWarning);
+  const warningError = warningClassification.processDiagnostic
+    ? {
+        code: "E_PROCESS_IDENTITY",
+        message: PROCESS_IDENTITY_PUBLIC_MESSAGE,
+        ...(warningClassification.rawCodes[0]
+          ? {
+              details: {
+                secondaryDiagnostic: {
+                  code: warningClassification.rawCodes[0],
+                  message: privacyWarning
+                }
+              }
+            }
+          : {})
+      }
+    : null;
+  const errors = [pending, current, reportRepair].filter(Boolean);
+  const identityErrors = [...errors, warningError]
+    .filter((error) => hasActualProcessIdentityUncertainty(error));
+  if (identityErrors.length) {
+    const selected = identityErrors.find(
+      (error) => rawProcessSignalDiagnostics(error).length > 0
+    ) || identityErrors[0];
+    const diagnostics = identityErrors
+      .flatMap((error) => rawProcessSignalDiagnostics(error));
+    if (diagnostics.length > rawProcessSignalDiagnostics(selected).length) {
+      return {
+        ...selected,
+        details: {
+          ...(isPlainObject(selected.details) ? selected.details : {}),
+          sanitizationDiagnostics: diagnostics
+        }
+      };
+    }
+    return selected;
+  }
+  return warningError
+    || errors.find((error) => SAFETY_PRIMARY_ERROR_CODES.has(error?.code))
+    || pending
+    || current
+    || reportRepair;
+}
+
+/**
+ * Bound and sanitize intentional human-facing text that is not part of the
+ * structured Worker Protocol schema (for example full research markdown or a
+ * provider session label). Operational process diagnostics are self-detected
+ * even when the job has no stored error.
+ */
+export function projectWorkerDiagnosticText(
+  value,
+  {
+    job = null,
+    error = null,
+    maxBytes = MAX_PUBLIC_TEXT_BYTES
+  } = {}
+) {
+  if (typeof value !== "string") return "";
+  const boundedMaximum = Number.isSafeInteger(maxBytes) && maxBytes >= 0
+    ? Math.min(maxBytes, MAX_PUBLIC_DIAGNOSTIC_TEXT_BYTES)
+    : MAX_PUBLIC_TEXT_BYTES;
+  const sanitizationError = job && typeof job === "object"
+    ? workerSanitizationError(job)
+    : error;
+  const scrubbed = scrubProcessDiagnosticText(value, sanitizationError, {
+    selfDetect: true
+  });
+  return projectWorkerPublicText(scrubbed, { maxBytes: boundedMaximum });
+}
+
 function nullableText(value, max = MAX_PUBLIC_TEXT_BYTES) {
   return typeof value === "string" ? boundedText(value, { max }) : null;
+}
+
+function nullableIsoDateTime(value) {
+  if (typeof value !== "string" || Buffer.byteLength(value, "utf8") > 64) {
+    return null;
+  }
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/.exec(value);
+  if (!match) return null;
+  const [, year, month, day, hour, minute, second, fraction = ""] = match;
+  const expected = [
+    Number(year),
+    Number(month),
+    Number(day),
+    Number(hour),
+    Number(minute),
+    Number(second),
+    Number(fraction.padEnd(3, "0") || 0)
+  ];
+  const parsed = new Date(0);
+  parsed.setUTCFullYear(expected[0], expected[1] - 1, expected[2]);
+  parsed.setUTCHours(expected[3], expected[4], expected[5], expected[6]);
+  const actual = [
+    parsed.getUTCFullYear(),
+    parsed.getUTCMonth() + 1,
+    parsed.getUTCDate(),
+    parsed.getUTCHours(),
+    parsed.getUTCMinutes(),
+    parsed.getUTCSeconds(),
+    parsed.getUTCMilliseconds()
+  ];
+  if (actual.some((part, index) => part !== expected[index])) return null;
+  return value;
 }
 
 function containsHostVerificationClaim(value) {
@@ -261,13 +881,23 @@ function publicWorkerStatus(value) {
   return PUBLIC_WORKER_STATUSES.has(value) ? value : "unknown";
 }
 
-function projectPublicPlan(value) {
+function projectPublicPlan(value, {
+  error = null,
+  trustHostAuthority = true,
+  selfDetect = false,
+  maxItems = MAX_PUBLIC_PLAN_ITEMS,
+  maxBytes = MAX_PUBLIC_TEXT_BYTES
+} = {}) {
   if (!Array.isArray(value)) return [];
   return value
     .filter((item) => typeof item === "string")
-    .map((item) => boundedText(item))
+    .map((item) => projectWorkerStatusText(item, error, {
+      trustHostAuthority,
+      selfDetect,
+      max: maxBytes
+    }))
     .filter(Boolean)
-    .slice(0, MAX_PUBLIC_PLAN_ITEMS);
+    .slice(0, maxItems);
 }
 
 function publicStringList(value, { maxItems = MAX_PUBLIC_LIST_ITEMS, maxBytes = MAX_PUBLIC_TEXT_BYTES } = {}) {
@@ -427,6 +1057,9 @@ function projectWorkerReport(value) {
  * provider/session identity, and stored payload bytes remain private.
  */
 export function projectWriteArtifactMetadata(value) {
+  const createdAt = isPlainObject(value)
+    ? nullableIsoDateTime(value.createdAt)
+    : null;
   if (!isPlainObject(value)
     || value.schemaVersion !== 1
     || value.path !== "target.txt"
@@ -435,8 +1068,7 @@ export function projectWriteArtifactMetadata(value) {
       .every((digest) => /^[a-f0-9]{64}$/.test(digest || ""))
     || !Number.isSafeInteger(value.contentBytes)
     || value.contentBytes < 1
-    || typeof value.createdAt !== "string"
-    || !Number.isFinite(Date.parse(value.createdAt))) {
+    || createdAt === null) {
     return null;
   }
   return Object.freeze({
@@ -448,42 +1080,86 @@ export function projectWriteArtifactMetadata(value) {
     patchDigest: value.patchDigest,
     contentDigest: value.contentDigest,
     contentBytes: value.contentBytes,
-    createdAt: value.createdAt
+    createdAt
   });
 }
 
-function projectNestedError(value) {
+function projectPublicErrorCore(value) {
   if (!isPlainObject(value)) return null;
-  const code = PUBLIC_WORKER_ERROR_CODE_SET.has(value.code) ? value.code : "E_BROKER";
+  const durableCode = PUBLIC_WORKER_ERROR_CODE_SET.has(value.code)
+    ? value.code
+    : "E_BROKER";
+  const diagnostic = rawProcessSignalDiagnostic(value);
+  const directClassification = classifyProcessCleanupDiagnostic(value.message);
+  const directSignalFailure = Boolean(
+    value.code === "E_PROCESS_IDENTITY"
+    || (
+      diagnostic
+      && (
+        rawProcessOsErrorCode(value.code)
+        || (
+          ["E_BROKER", "E_PROVIDER_EXIT", "E_STATE"].includes(value.code)
+          && directClassification.sensitive
+          && directClassification.rawCodes.length > 0
+        )
+      )
+    )
+  );
+  const code = directSignalFailure ? "E_PROCESS_IDENTITY" : durableCode;
+  const processUncertainty = establishesProcessIdentityUncertainty(value);
+  const message = code === "E_PROCESS_IDENTITY"
+    ? PROCESS_IDENTITY_PUBLIC_MESSAGE
+    : processUncertainty
+      ? scrubProcessDiagnosticText(value.message, value)
+      : value.message;
   return {
     code,
-    message: boundedText(value.message, { fallback: "Worker failed." }) || "Worker failed."
+    message: code === "E_PROCESS_IDENTITY"
+      ? PROCESS_IDENTITY_PUBLIC_MESSAGE
+      : boundedText(message, { fallback: "Worker failed." }) || "Worker failed."
   };
 }
 
-function projectPublicErrorDetails(code, value) {
+function projectNestedError(value) {
+  return projectPublicErrorCore(value);
+}
+
+function projectPublicErrorDetails(code, value, { error = null } = {}) {
   if (!isPlainObject(value)) return null;
   const projected = {};
   const warningCodes = new Set([
     "E_AUTH_REQUIRED",
+    "E_CANCELLED",
     "E_CAPABILITY",
     "E_IMPORT_RESULT",
     "E_IMPORT_SOURCE",
+    "E_OUTPUT_LIMIT",
+    "E_PROCESS_IDENTITY",
     "E_PROVIDER_EXIT",
-    "E_STATE"
+    "E_STATE",
+    "E_TIMEOUT"
   ]);
   if (warningCodes.has(code)) {
-    if (typeof value.warning === "string") projected.warning = boundedText(value.warning);
+    if (typeof value.warning === "string") {
+      projected.warning = projectProcessDiagnosticWarning(value.warning, error);
+    }
     if (typeof value.privacyWarning === "string") {
-      projected.privacyWarning = boundedText(value.privacyWarning);
+      projected.privacyWarning = projectProcessDiagnosticWarning(value.privacyWarning, error);
     }
   }
   if (code === "E_CAPABILITY") {
     if (Array.isArray(value.available)) projected.available = publicStringList(value.available);
     if (Array.isArray(value.missing)) projected.missing = publicStringList(value.missing);
+  } else if (code === "E_PROCESS_IDENTITY") {
+    if (typeof value.workerId === "string"
+      && WORKER_ID_PATTERN.test(value.workerId)) {
+      projected.workerId = value.workerId;
+    }
   } else if (code === "E_PROVIDER_EXIT") {
     if (Number.isSafeInteger(value.code)) projected.code = value.code;
-    if (typeof value.signal === "string") projected.signal = boundedText(value.signal, { max: 64 });
+    if (PUBLIC_PROCESS_SIGNAL_NAMES.has(value.signal)) {
+      projected.signal = value.signal;
+    }
   } else if (code === "E_SCHEMA") {
     if (typeof value.hint === "string") projected.hint = boundedText(value.hint);
     if (Array.isArray(value.rootKeys)) projected.rootKeys = publicStringList(value.rootKeys, { maxItems: 24, maxBytes: 128 });
@@ -519,7 +1195,10 @@ function projectPublicErrorDetails(code, value) {
   } else if (code === "E_OUTPUT_LIMIT" && Number.isSafeInteger(value.limitBytes) && value.limitBytes >= 0) {
     projected.limitBytes = value.limitBytes;
   }
-  return Object.keys(projected).length ? projected : null;
+  if (!Object.keys(projected).length) return null;
+  return scrubProcessDiagnosticsInPublicTree(projected, error, {
+    selfDetect: true
+  });
 }
 
 function projectReportRepair(value) {
@@ -673,7 +1352,7 @@ function projectRuntimeEvidence(value, { trustHostAuthority = true } = {}) {
     ? {
       privilege: nullableText(value.reconciler.privilege, 128),
       replayedPrompt: Boolean(value.reconciler.replayedPrompt),
-      at: nullableText(value.reconciler.at, 64)
+      at: nullableIsoDateTime(value.reconciler.at)
     }
     : null;
   const sharedRefObservation = projectSharedRefObservation(value.sharedRefObservation);
@@ -703,32 +1382,48 @@ function projectVerification(value, { trustHostAuthority = true } = {}) {
       ? value.outcome
       : "not_run",
     authority: value.authority === "host_asserted" ? "host_asserted" : "unknown",
-    recordedAt: nullableText(value.recordedAt, 64),
+    recordedAt: nullableIsoDateTime(value.recordedAt),
     observedChangedPaths: publicPathList(value.observedChangedPaths)
   };
 }
 
-function projectLifecycleDetail(value, { trustHostAuthority = true } = {}) {
+function projectLifecycleDetail(value, {
+  trustHostAuthority = true,
+  error = null
+} = {}) {
   if (!isPlainObject(value)) return null;
   const projected = {};
-  const textFields = {
-    envelopeId: 256,
-    resumeJobId: 256,
-    spawnSuccessDefinition: 1000,
-    requestAcceptedAt: 64,
-    reconciler: 128,
-    messageId: 256,
-    contentDigest: 256,
-    parentWorkerId: 256,
-    version: 128,
-    name: 300,
-    status: 80
-  };
-  for (const [key, max] of Object.entries(textFields)) {
+  for (const [key, field] of Object.entries(PUBLIC_LIFECYCLE_DETAIL_TEXT_FIELDS)) {
     // Mailbox lifecycle events expose only an opaque message handle and state.
     // Content and idempotency equality remain private durability evidence.
     if (key === "contentDigest" && typeof value.messageId === "string") continue;
-    if (typeof value[key] === "string") projected[key] = boundedText(value[key], { max });
+    if (field.kind === "timestamp") {
+      const timestamp = nullableIsoDateTime(value[key]);
+      if (timestamp !== null) projected[key] = timestamp;
+    } else if (field.kind === "text" && typeof value[key] === "string") {
+      projected[key] = projectWorkerStatusText(value[key], error, {
+        trustHostAuthority,
+        selfDetect: true,
+        max: field.maxBytes
+      });
+    } else if (field.kind === "text-list" && Array.isArray(value[key])) {
+      projected[key] = projectPublicPlan(value[key], {
+        error,
+        trustHostAuthority,
+        selfDetect: true,
+        maxItems: field.maxItems,
+        maxBytes: field.maxBytes
+      });
+    } else if (field.kind === "path-list" && Array.isArray(value[key])) {
+      projected[key] = publicPathList(
+        value[key].map((item) => (
+          typeof item === "string"
+            ? scrubProcessDiagnosticText(item, error, { selfDetect: true })
+            : item
+        )),
+        field.maxItems
+      );
+    }
   }
   if (["read", "write"].includes(value.mode)) projected.mode = value.mode;
   if (["accepted", "pending", "delivered", "delivery_unknown", "rejected"].includes(value.state)) {
@@ -749,16 +1444,6 @@ function projectLifecycleDetail(value, { trustHostAuthority = true } = {}) {
     if (Number.isSafeInteger(value[key]) && (key === "exitCode" || value[key] >= 0)) {
       projected[key] = value[key];
     }
-  }
-  if (Array.isArray(value.plan)) {
-    projected.plan = publicStringList(value.plan, { maxItems: 20, maxBytes: 500 });
-  }
-  if (Array.isArray(value.questions)) projected.questions = publicStringList(value.questions);
-  if (Array.isArray(value.validationIssues)) {
-    projected.validationIssues = publicStringList(value.validationIssues, { maxItems: MAX_PUBLIC_PATH_ITEMS });
-  }
-  if (Array.isArray(value.observedChangedPaths)) {
-    projected.observedChangedPaths = publicPathList(value.observedChangedPaths);
   }
   return Object.keys(projected).length ? projected : null;
 }
@@ -846,7 +1531,7 @@ function projectContextManifest(value, { trustHostAuthority = true } = {}) {
     schemaVersion: nullableInteger(value.schemaVersion),
     manifestId: nullableText(value.manifestId, 256),
     digest: nullableText(value.digest, 256),
-    capturedAt: nullableText(value.capturedAt, 64),
+    capturedAt: nullableIsoDateTime(value.capturedAt),
     branch: nullableText(git.branch, 256),
     head: nullableText(git.head, 256),
     dirtyDigest: nullableText(git.dirtyDigest, 256),
@@ -890,7 +1575,10 @@ export function isWorkerTerminal(job) {
  * Project a single lifecycle event for public consumption.
  * Copies only operational fields; never invents private host/provider identity.
  */
-export function projectLifecycleEvent(event, { trustHostAuthority = true } = {}) {
+export function projectLifecycleEvent(event, {
+  trustHostAuthority = true,
+  error = null
+} = {}) {
   if (!event || typeof event !== "object" || Array.isArray(event)) {
     return null;
   }
@@ -898,11 +1586,17 @@ export function projectLifecycleEvent(event, { trustHostAuthority = true } = {})
     workerProtocolVersion: WORKER_PROTOCOL_VERSION,
     eventSchemaVersion: WORKER_EVENT_SCHEMA_VERSION,
     type: PUBLIC_LIFECYCLE_EVENT_TYPES.has(event.type) ? event.type : "checkpoint",
-    at: nullableText(event.at, 64),
-    summary: authorityBoundText(event.summary, { trustHostAuthority }),
+    at: nullableIsoDateTime(event.at),
+    summary: projectWorkerStatusText(event.summary, error, {
+      trustHostAuthority,
+      selfDetect: true
+    }),
     sequence: Number.isSafeInteger(event.sequence) && event.sequence >= 1 ? event.sequence : null
   };
-  const detail = projectLifecycleDetail(event.detail, { trustHostAuthority });
+  const detail = projectLifecycleDetail(event.detail, {
+    trustHostAuthority,
+    error
+  });
   if (detail) projected.detail = detail;
   return sanitizePublicProjection(projected);
 }
@@ -911,10 +1605,13 @@ export function projectLifecycleEvent(event, { trustHostAuthority = true } = {})
  * Normalize and project a lifecycle event list for public snapshots.
  * Legacy unsequenced arrays receive deterministic sequences without mutating input.
  */
-export function projectLifecycleEvents(events, { trustHostAuthority = true } = {}) {
+export function projectLifecycleEvents(events, {
+  trustHostAuthority = true,
+  error = null
+} = {}) {
   return normalizeLifecycleEventSequences(Array.isArray(events) ? events : [])
     .slice(-MAX_LIFECYCLE_EVENTS)
-    .map((event) => projectLifecycleEvent(event, { trustHostAuthority }))
+    .map((event) => projectLifecycleEvent(event, { trustHostAuthority, error }))
     .filter(Boolean);
 }
 
@@ -967,7 +1664,8 @@ export function projectLifecycleEventsAfterCursor(events, cursor = 0, options = 
   const selected = normalized
     .filter((event) => event.sequence > cursor)
     .map((event) => projectLifecycleEvent(event, {
-      trustHostAuthority: options.trustHostAuthority !== false
+      trustHostAuthority: options.trustHostAuthority !== false,
+      error: options.error || null
     }))
     .filter(Boolean);
   // When already current (no new events), nextCursor stays at the supplied cursor.
@@ -1065,9 +1763,11 @@ export function projectWorkerLifecycleCursor(
     throw new CompanionError("E_STATE", "Worker cursor projection requires a job record.");
   }
   const sequence = parseWorkerEventCursor(job, cursor);
+  const sanitizationError = workerSanitizationError(job);
   const projected = projectLifecycleEventsAfterCursor(job.lifecycleEvents, sequence, {
     terminal: isWorkerTerminal(job),
-    trustHostAuthority
+    trustHostAuthority,
+    error: sanitizationError
   });
   return {
     ...projected,
@@ -1086,7 +1786,8 @@ export function projectWorkerHandle(job, { trustHostAuthority = true } = {}) {
   if (!job || typeof job !== "object") {
     throw new CompanionError("E_STATE", "Worker handle projection requires a job record.");
   }
-  return sanitizePublicProjection({
+  const sanitizationError = workerSanitizationError(job);
+  return sanitizeCompleteWorkerProjection({
     workerProtocolVersion: WORKER_PROTOCOL_VERSION,
     handleSchemaVersion: WORKER_HANDLE_SCHEMA_VERSION,
     id: canonicalWorkerId(job.id),
@@ -1095,13 +1796,17 @@ export function projectWorkerHandle(job, { trustHostAuthority = true } = {}) {
     write: Boolean(job.write),
     status: publicWorkerStatus(job.status),
     phase: nullableText(job.phase, 128),
-    summary: authorityBoundText(job.summary, { trustHostAuthority }),
-    progress: authorityBoundText(job.progress, { trustHostAuthority }),
-    createdAt: nullableText(job.createdAt, 64),
-    startedAt: nullableText(job.startedAt, 64),
-    updatedAt: nullableText(job.updatedAt, 64),
-    completedAt: nullableText(job.completedAt, 64),
-    heartbeatAt: nullableText(job.heartbeatAt, 64),
+    summary: projectWorkerStatusText(job.summary, sanitizationError, {
+      trustHostAuthority
+    }),
+    progress: projectWorkerStatusText(job.progress, sanitizationError, {
+      trustHostAuthority
+    }),
+    createdAt: nullableIsoDateTime(job.createdAt),
+    startedAt: nullableIsoDateTime(job.startedAt),
+    updatedAt: nullableIsoDateTime(job.updatedAt),
+    completedAt: nullableIsoDateTime(job.completedAt),
+    heartbeatAt: nullableIsoDateTime(job.heartbeatAt),
     profileId: nullableText(job.profile?.id, 256),
     model: nullableText(job.model, 256),
     effort: nullableText(job.effort, 128),
@@ -1110,14 +1815,18 @@ export function projectWorkerHandle(job, { trustHostAuthority = true } = {}) {
     roleId: nullableText(job.role?.id || job.profile?.id, 256),
     externalWorkerLabel: "external-grok-worker",
     terminal: isWorkerTerminal(job)
-  });
+  }, sanitizationError);
 }
 
 /**
  * Build the public result object shared by CLI status/result JSON and future brokers.
  * Never includes raw provider text, prompts, or private process fields.
  */
-function projectPublicResult(job, { detail = true, trustHostAuthority = true } = {}) {
+function projectPublicResult(job, {
+  detail = true,
+  trustHostAuthority = true,
+  error = null
+} = {}) {
   if (!detail || !job.result) return null;
   const hostVerification = trustHostAuthority
     && ["not_run", "passed", "failed", "skipped"].includes(job.result.hostVerification)
@@ -1125,9 +1834,9 @@ function projectPublicResult(job, { detail = true, trustHostAuthority = true } =
     : "not_run";
   const cancellation = isPlainObject(job.result.cancellation)
     ? {
-      requestAcceptedAt: nullableText(job.result.cancellation.requestAcceptedAt, 64),
-      processGroupGoneAt: nullableText(job.result.cancellation.processGroupGoneAt, 64),
-      terminalRecordCommittedAt: nullableText(job.result.cancellation.terminalRecordCommittedAt, 64),
+      requestAcceptedAt: nullableIsoDateTime(job.result.cancellation.requestAcceptedAt),
+      processGroupGoneAt: nullableIsoDateTime(job.result.cancellation.processGroupGoneAt),
+      terminalRecordCommittedAt: nullableIsoDateTime(job.result.cancellation.terminalRecordCommittedAt),
       receiptId: nullableText(job.result.cancellation.receiptId, 256)
     }
     : null;
@@ -1140,7 +1849,7 @@ function projectPublicResult(job, { detail = true, trustHostAuthority = true } =
   const interim = projectTextEvidence(job.result.interim);
   const researchReport = projectResearchReport(job.result.researchReport);
   const workflow = projectWorkflow(job.result.workflow || job.workflow);
-  return sanitizePublicProjection({
+  return sanitizeCompleteWorkerProjection({
     workerProtocolVersion: WORKER_PROTOCOL_VERSION,
     resultSchemaVersion: WORKER_RESULT_SCHEMA_VERSION,
     ...(review ? { review } : {}),
@@ -1170,25 +1879,50 @@ function projectPublicResult(job, { detail = true, trustHostAuthority = true } =
       ? { taskRuntimeCleaned: job.result.taskRuntimeCleaned }
       : {}),
     ...(typeof job.result.privacyWarning === "string"
-      ? { privacyWarning: boundedText(job.result.privacyWarning) }
+      ? { privacyWarning: projectProcessDiagnosticWarning(job.result.privacyWarning, error) }
       : {})
-  });
+  }, error);
 }
 
 function projectPublicError(error) {
-  if (!error || typeof error !== "object") return null;
-  const code = PUBLIC_WORKER_ERROR_CODE_SET.has(error.code) ? error.code : "E_BROKER";
-  const message = code === "E_PROCESS_IDENTITY"
-    ? "Process ownership verification failed."
-    : boundedText(error.message, { fallback: "Worker failed." }) || "Worker failed.";
-  const details = projectPublicErrorDetails(code, error.details);
-  return sanitizePublicProjection({
+  if (!isPlainObject(error)) return null;
+  const { code, message } = projectPublicErrorCore(error);
+  const details = projectPublicErrorDetails(code, error.details, { error });
+  return sanitizeCompleteWorkerProjection({
     workerProtocolVersion: WORKER_PROTOCOL_VERSION,
     errorSchemaVersion: WORKER_ERROR_SCHEMA_VERSION,
     code,
     message,
     ...(details ? { details } : {})
-  });
+  }, error);
+}
+
+/**
+ * Project a foreground CLI failure through the same public error boundary used
+ * by worker snapshots, without exposing protocol-envelope metadata in the
+ * legacy top-level `{ ok, error }` response shape.
+ */
+export function projectWorkerError(error) {
+  if (isPlainObject(error) && FOREGROUND_PUBLIC_ERROR_CODE_SET.has(error.code)) {
+    const messageText = typeof error.message === "string" ? error.message : "";
+    const message = scrubProcessDiagnosticText(messageText, error, {
+      selfDetect: true
+    });
+    return sanitizePublicProjection({
+      code: error.code,
+      message: boundedText(message, {
+        fallback: "Worker failed."
+      }) || "Worker failed."
+    });
+  }
+  const projected = projectPublicError(error);
+  if (!projected) return null;
+  const {
+    workerProtocolVersion: _workerProtocolVersion,
+    errorSchemaVersion: _errorSchemaVersion,
+    ...payload
+  } = projected;
+  return payload;
 }
 
 function projectContextReceipt(job) {
@@ -1242,7 +1976,8 @@ export function projectWorkerSnapshot(job, { detail = true, trustHostAuthority =
   const envelope = job.request?.envelope || null;
   const manifest = job.request?.contextManifest || null;
   const contextReceipt = detail ? projectContextReceipt(job) : null;
-  return sanitizePublicProjection({
+  const sanitizationError = workerSanitizationError(job);
+  return sanitizeCompleteWorkerProjection({
     workerProtocolVersion: WORKER_PROTOCOL_VERSION,
     snapshotSchemaVersion: WORKER_SNAPSHOT_SCHEMA_VERSION,
     schemaVersion: nullableInteger(job.schemaVersion),
@@ -1252,19 +1987,30 @@ export function projectWorkerSnapshot(job, { detail = true, trustHostAuthority =
     write: Boolean(job.write),
     status: publicWorkerStatus(job.status),
     phase: nullableText(job.phase, 128),
-    summary: authorityBoundText(job.summary, { trustHostAuthority }),
-    progress: authorityBoundText(job.progress, { trustHostAuthority }),
-    createdAt: nullableText(job.createdAt, 64),
-    startedAt: nullableText(job.startedAt, 64),
-    updatedAt: nullableText(job.updatedAt, 64),
-    completedAt: nullableText(job.completedAt, 64),
-    heartbeatAt: nullableText(job.heartbeatAt, 64),
+    summary: projectWorkerStatusText(job.summary, sanitizationError, {
+      trustHostAuthority
+    }),
+    progress: projectWorkerStatusText(job.progress, sanitizationError, {
+      trustHostAuthority
+    }),
+    createdAt: nullableIsoDateTime(job.createdAt),
+    startedAt: nullableIsoDateTime(job.startedAt),
+    updatedAt: nullableIsoDateTime(job.updatedAt),
+    completedAt: nullableIsoDateTime(job.completedAt),
+    heartbeatAt: nullableIsoDateTime(job.heartbeatAt),
     profileId: nullableText(job.profile?.id, 256),
     model: nullableText(job.model, 256),
     effort: nullableText(job.effort, 128),
     ...projectWorkerIdentityMetadata(job),
-    latestPlan: detail ? projectPublicPlan(job.latestPlan) : [],
-    lifecycleEvents: detail ? projectLifecycleEvents(job.lifecycleEvents, { trustHostAuthority }) : [],
+    latestPlan: detail
+      ? projectPublicPlan(job.latestPlan, { error: sanitizationError })
+      : [],
+    lifecycleEvents: detail
+      ? projectLifecycleEvents(job.lifecycleEvents, {
+          trustHostAuthority,
+          error: sanitizationError
+        })
+      : [],
     taskContract: detail
       ? projectTaskContract(envelope, job.request?.publicObjective, {
         trustHostAuthority,
@@ -1275,14 +2021,18 @@ export function projectWorkerSnapshot(job, { detail = true, trustHostAuthority =
     contextReceipt,
     context: detail ? projectContextManifest(manifest, { trustHostAuthority }) : null,
     resumeJobId: nullableText(job.request?.resumeJobId, 256),
-    result: projectPublicResult(job, { detail, trustHostAuthority }),
+    result: projectPublicResult(job, {
+      detail,
+      trustHostAuthority,
+      error: sanitizationError
+    }),
     error: projectPublicError(job.error),
     controlWorkspaceId: nullableText(job.controlWorkspaceId, 256),
     roleId: nullableText(job.role?.id || job.profile?.id, 256),
     externalWorkerLabel: "external-grok-worker",
     awaitingHostAction: projectAwaitingHostAction(job),
     terminal: isWorkerTerminal(job)
-  });
+  }, sanitizationError);
 }
 
 function assertPublicContextReceiptBinding(receipt, snapshot) {
@@ -1386,12 +2136,19 @@ export function normalizeWorkerSnapshot(snapshot, { detail = true } = {}) {
   normalized.contextBindingMode = detail ? snapshot.contextBindingMode : null;
   if (detail && hasContextReceipt) {
     assertContextReceiptShape(snapshot.contextReceipt);
-    assertPublicContextReceiptBinding(snapshot.contextReceipt, normalized);
-    normalized.contextReceipt = structuredClone(snapshot.contextReceipt);
+    const projectedContextReceipt = sanitizeCompleteWorkerProjection(
+      structuredClone(snapshot.contextReceipt),
+      workerSanitizationError(snapshot)
+    );
+    assertPublicContextReceiptBinding(projectedContextReceipt, normalized);
+    normalized.contextReceipt = projectedContextReceipt;
     if (normalized.taskContract?.context) {
       normalized.taskContract.context.facts = [];
       normalized.taskContract.context.constraints = [];
     }
   }
-  return sanitizePublicProjection(normalized);
+  return sanitizeCompleteWorkerProjection(
+    normalized,
+    workerSanitizationError(normalized)
+  );
 }

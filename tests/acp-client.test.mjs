@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter, once } from "node:events";
+import process from "node:process";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 
@@ -11,6 +12,7 @@ import {
   isValidJsonRpcNotification,
   validatePromptResponse
 } from "../plugins/grok/scripts/lib/acp-client.mjs";
+import { signalOwnedProcess } from "../plugins/grok/scripts/lib/process-control.mjs";
 
 class FakeChild extends EventEmitter {
   constructor() {
@@ -322,6 +324,139 @@ test("asynchronous ACP stdin EPIPE closes dispatch, notify, and close paths with
         );
       }
     });
+  }
+});
+
+test("ACP close is transport-only and leaves bounded signal outcomes to the authoritative owner", async () => {
+  const privatePath = "/private/acp-close-secret/provider.sock";
+  const unhandled = [];
+  const uncaught = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  const onUncaught = (error) => uncaught.push(error);
+  process.on("unhandledRejection", onUnhandled);
+  process.on("uncaughtException", onUncaught);
+
+  const cases = [
+    {
+      name: "EPERM",
+      signal() {
+        const failure = new Error(
+          `signal denied for pid=991001 at ${privatePath}`
+        );
+        failure.code = "EPERM";
+        throw failure;
+      }
+    },
+    {
+      name: "ESRCH",
+      signal() {
+        const failure = new Error("process is already gone");
+        failure.code = "ESRCH";
+        throw failure;
+      }
+    },
+    {
+      name: "async",
+      signal() {
+        const failure = new Error(
+          `late signal failure at ${privatePath}`
+        );
+        failure.code = "EPERM";
+        return Promise.reject(failure);
+      }
+    }
+  ].map((entry) => {
+    const child = new FakeChild();
+    let signalCalls = 0;
+    child.kill = (...args) => {
+      signalCalls += 1;
+      return entry.signal(...args);
+    };
+    const client = new AcpClient(child, { timeoutMs: 1000 });
+    client.close();
+    return {
+      ...entry,
+      child,
+      client,
+      signalCalls: () => signalCalls
+    };
+  });
+
+  try {
+    // This crosses the former delayed-kill boundary. ACP must never call the
+    // child signal callback; only the owner with exact identity may do so.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    for (const entry of cases) {
+      assert.equal(entry.child.stdin.writableEnded, true, entry.name);
+      assert.equal(entry.signalCalls(), 0, entry.name);
+      assert.equal(entry.client.closed, false, entry.name);
+    }
+
+    let permissionFailure = null;
+    try {
+      signalOwnedProcess(
+        -cases[0].child.pid,
+        "SIGTERM",
+        (_target, signal) => cases[0].child.kill(signal)
+      );
+    } catch (error) {
+      permissionFailure = error;
+    }
+    assert.equal(permissionFailure?.code, "E_PROCESS_IDENTITY");
+    assert.equal(
+      permissionFailure?.details?.secondaryDiagnostic?.code,
+      "EPERM"
+    );
+    assert.equal(permissionFailure.message.includes("EPERM"), false);
+    assert.equal(
+      permissionFailure.details.secondaryDiagnostic.message.includes(
+        privatePath
+      ),
+      false
+    );
+    assert.equal(
+      permissionFailure.details.secondaryDiagnostic.message.includes(
+        "991001"
+      ),
+      false
+    );
+
+    assert.equal(
+      signalOwnedProcess(
+        -cases[1].child.pid,
+        "SIGTERM",
+        (_target, signal) => cases[1].child.kill(signal)
+      ),
+      false
+    );
+
+    let asyncFailure = null;
+    try {
+      signalOwnedProcess(
+        -cases[2].child.pid,
+        "SIGTERM",
+        (_target, signal) => cases[2].child.kill(signal)
+      );
+    } catch (error) {
+      asyncFailure = error;
+    }
+    assert.equal(asyncFailure?.code, "E_PROCESS_IDENTITY");
+    assert.equal(
+      asyncFailure?.details?.secondaryDiagnostic?.code,
+      "E_ASYNC_SIGNAL"
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(uncaught, []);
+
+    for (const entry of cases) {
+      assert.equal(entry.signalCalls(), 1, entry.name);
+      entry.child.emit("exit", 0, null);
+      assert.equal(entry.client.closed, true, entry.name);
+    }
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    process.off("uncaughtException", onUncaught);
   }
 });
 

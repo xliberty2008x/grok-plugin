@@ -23,6 +23,7 @@ import {
   processGroupGone,
   processStartToken
 } from "../plugins/grok/scripts/lib/process-control.mjs";
+import { projectWorkerSnapshot } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
 import { reconcileBrokerWorkers } from "../plugins/grok/scripts/lib/worker-recovery.mjs";
 import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
 
@@ -213,6 +214,7 @@ test("unproven cleanup remains nonterminal and a forged birth token is never sig
   ));
   let blockedChild = null;
   let blockedCancellationWritten = false;
+  let privateSignalPath = null;
   t.after(() => killGroup(blockedChild));
   const launched = launchCommittedWorker({
     ...fixtureState,
@@ -236,7 +238,11 @@ test("unproven cleanup remains nonterminal and a forged birth token is never sig
       return processStartToken(pid);
     },
     terminateProcess: () => {
-      const failure = new Error("denied");
+      privateSignalPath =
+        `/private/controller-signal-${blockedChild.pid}/secret.sock`;
+      const failure = new Error(
+        `denied signal for pid=${blockedChild.pid} at ${privateSignalPath}`
+      );
       failure.code = "EPERM";
       throw failure;
     }
@@ -251,6 +257,28 @@ test("unproven cleanup remains nonterminal and a forged birth token is never sig
   assert.equal(blocked.result.taskRuntimeCleaned, false);
   assert.equal(blocked.pendingTerminal.status, "cancelled");
   assert.equal(blocked.result.runtimeEvidence.controllerTeardown.ok, false);
+  assert.equal(
+    blocked.error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
+  assert.equal(
+    blocked.result.runtimeEvidence.controllerTeardown
+      .secondaryDiagnostic.code,
+    "EPERM"
+  );
+  assert.equal(
+    blocked.error.details.secondaryDiagnostic.message.includes(
+      String(blockedChild.pid)
+    ),
+    false
+  );
+  assert.equal(
+    blocked.error.details.secondaryDiagnostic.message.includes(
+      privateSignalPath
+    ),
+    false
+  );
+  assert.equal(blocked.error.message.includes("EPERM"), false);
 
   killGroup(blockedChild);
   await waitFor(
@@ -265,11 +293,85 @@ test("unproven cleanup remains nonterminal and a forged birth token is never sig
   });
   assert.equal(recovery.results[0].action, "terminalized");
   const recovered = tryReadJob(fixtureState.root, fixtureState.workerId, fixtureState.env);
-  assert.equal(recovered.status, "cancelled");
-  assert.equal(recovered.error.code, "E_CANCELLED");
+  assert.equal(recovered.status, "failed");
+  assert.equal(recovered.error.code, "E_PROCESS_IDENTITY");
+  assert.equal(
+    recovered.error.details.secondaryDiagnostic.code,
+    "EPERM"
+  );
   assert.equal(recovered.request.spawn.controllerCleanupPending, false);
   assert.equal(recovered.request.spawn.controllerCleanupProcess, null);
   assert.equal(recovered.pendingTerminal, undefined);
   assert.equal(recovered.result.taskRuntimeCleaned, true);
   assert.equal(recovered.result.privacyWarning, undefined);
+  const publicRecovered = JSON.stringify(projectWorkerSnapshot(recovered));
+  assert.equal(publicRecovered.includes("EPERM"), false);
+  assert.equal(publicRecovered.includes(String(blockedChild.pid)), false);
+  assert.equal(publicRecovered.includes(privateSignalPath), false);
+});
+
+test("controller signal boundary treats ESRCH as benign and rejects async signalling without an unhandled rejection", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const esrchChild = spawn(
+    process.execPath,
+    ["-e", "setInterval(() => {}, 1000)"],
+    { detached: true, stdio: "ignore" }
+  );
+  t.after(() => killGroup(esrchChild));
+  assert.equal(
+    waitSync(() => Boolean(processStartToken(esrchChild.pid))),
+    true
+  );
+  const esrch = terminateControllerProcess(esrchChild, {
+    startToken: processStartToken(esrchChild.pid),
+    signalProcess: () => {
+      killGroup(esrchChild);
+      const failure = new Error("already gone");
+      failure.code = "ESRCH";
+      throw failure;
+    }
+  });
+  assert.equal(esrch.ok, true);
+  assert.equal(esrch.processGroupGone, true);
+  assert.deepEqual(esrch.signals, []);
+  assert.equal(esrch.secondaryDiagnostic, undefined);
+
+  const asyncChild = spawn(
+    process.execPath,
+    ["-e", "setInterval(() => {}, 1000)"],
+    { detached: true, stdio: "ignore" }
+  );
+  t.after(() => killGroup(asyncChild));
+  assert.equal(
+    waitSync(() => Boolean(processStartToken(asyncChild.pid))),
+    true
+  );
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.on("unhandledRejection", onUnhandled);
+  let asyncCleanup;
+  try {
+    asyncCleanup = terminateControllerProcess(asyncChild, {
+      startToken: processStartToken(asyncChild.pid),
+      signalProcess: () => {
+        const failure = new Error("late signal rejection");
+        failure.code = "EPERM";
+        return Promise.reject(failure);
+      }
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+  assert.equal(asyncCleanup.ok, false);
+  assert.equal(
+    asyncCleanup.secondaryDiagnostic.code,
+    "E_ASYNC_SIGNAL"
+  );
+  assert.equal(
+    asyncCleanup.warning.includes("EPERM"),
+    false
+  );
+  assert.deepEqual(unhandled, []);
 });

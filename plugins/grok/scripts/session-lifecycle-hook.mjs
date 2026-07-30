@@ -6,7 +6,15 @@ import process from "node:process";
 import { listJobs, requestCancel, terminal, removeJob, updateJob, now, withWorkspaceStateTransaction } from "./lib/state.mjs";
 import { workspaceRoot, workspaceState } from "./lib/workspace.mjs";
 import { cleanupReviewEnvironment, cleanupTaskRuntimeArtifacts } from "./lib/grok-provider.mjs";
-import { hasGrokAncestor, identityMatches, processGroupAlive, processGroupGone, processIsZombie, processStartToken } from "./lib/process-control.mjs";
+import {
+  hasGrokAncestor,
+  identityMatches,
+  processGroupAlive,
+  processGroupGone,
+  processIsZombie,
+  processStartToken,
+  signalOwnedProcess
+} from "./lib/process-control.mjs";
 import { hasForeignActiveProvider, resolveProviderCleanupTarget, unregisterProviderGuard } from "./lib/recursion-guard.mjs";
 import { pluginDataRoot, sameHostSession, writeCodexSessionMetadata } from "./lib/host.mjs";
 import { cancellationNonce } from "./lib/worker-mutation.mjs";
@@ -81,16 +89,29 @@ async function terminateOwned(identity, marker, kind, ownershipEstablished) {
     if (processGroupGone(identity)) return;
     if (useGroup) {
       if (!processGroupAlive(identity.processGroupId)) return;
-      try { process.kill(-identity.processGroupId, sig); } catch (error) { if (error.code !== "ESRCH") throw error; }
-      return;
+      return signalOwnedProcess(-identity.processGroupId, sig);
     }
-    try { process.kill(identity.pid, sig); } catch (error) { if (error.code !== "ESRCH") throw error; }
+    return signalOwnedProcess(identity.pid, sig);
   };
 
   signalIfStillLive("SIGTERM");
   if (await waitGone(1000)) return;
   signalIfStillLive("SIGKILL");
   if (!await waitGone(1000)) throw new Error(`The ${kind} process group remained active after SIGKILL.`);
+}
+
+function signalSecondaryDiagnostic(error) {
+  if (error?.code !== "E_PROCESS_IDENTITY") return null;
+  const diagnostic = error?.details?.secondaryDiagnostic;
+  if (!diagnostic || typeof diagnostic !== "object") return null;
+  const rawCode = String(diagnostic.code || "");
+  const code = /^[A-Z][A-Z0-9_]{0,63}$/.test(rawCode)
+    ? rawCode.slice(0, 64)
+    : "UNKNOWN";
+  const message = String(
+    diagnostic.message || "Process signalling failed."
+  ).slice(0, 256);
+  return Object.freeze({ code, message });
 }
 
 function includeGuardCleanup(root, id, cleanup) {
@@ -203,13 +224,41 @@ if (phase === "SessionEnd" && hostSessionId) {
     if (settlement.retained) return;
     const job = settlement.job;
     if (!job) return;
+    let providerIdentity;
+    let providerKind;
     try {
-      const { identity: providerIdentity, kind: providerKind } = resolveProviderCleanupTarget(root, job);
-      await Promise.all([
-        terminateOwned(providerIdentity, job.id, providerKind, verified.get(`${job.id}:provider`)),
-        terminateOwned(job.workerProcess, job.id, "worker", verified.get(`${job.id}:worker`))
-      ]);
-    } catch (error) { cleanupFailures.set(job.id, error); }
+      ({
+        identity: providerIdentity,
+        kind: providerKind
+      } = resolveProviderCleanupTarget(root, job));
+    } catch (error) {
+      cleanupFailures.set(job.id, error);
+      return;
+    }
+    const outcomes = await Promise.allSettled([
+      terminateOwned(
+        providerIdentity,
+        job.id,
+        providerKind,
+        verified.get(`${job.id}:provider`)
+      ),
+      terminateOwned(
+        job.workerProcess,
+        job.id,
+        "worker",
+        verified.get(`${job.id}:worker`)
+      )
+    ]);
+    const failures = outcomes
+      .filter((outcome) => outcome.status === "rejected")
+      .map((outcome) => outcome.reason);
+    if (failures.length > 0) {
+      cleanupFailures.set(
+        job.id,
+        failures.find((error) => signalSecondaryDiagnostic(error))
+        || failures[0]
+      );
+    }
   }));
   for (const original of owned) {
     const settlement = recheckAndRetainUnsettledLaunch(root, original.id);
@@ -227,7 +276,19 @@ if (phase === "SessionEnd" && hostSessionId) {
     if (cleanupFailure || !allGone) {
       try {
         job = updateJob(root, job.id, (value) => {
-          const cleanupError = { code: "E_PROCESS_IDENTITY", message: "SessionEnd could not verify complete process-group shutdown. Inspect the recorded process identities before manual cleanup." };
+          const secondaryDiagnostic =
+            signalSecondaryDiagnostic(cleanupFailure);
+          const cleanupError = {
+            code: "E_PROCESS_IDENTITY",
+            message: "SessionEnd could not verify complete process-group shutdown. Inspect the recorded process identities before manual cleanup.",
+            ...(secondaryDiagnostic
+              ? {
+                  details: {
+                    secondaryDiagnostic
+                  }
+                }
+              : {})
+          };
           if (value.jobClass === "task") {
             value.pendingTerminal ||= terminal(value)
               ? { status: value.status, phase: value.phase, completedAt: value.completedAt, error: value.error || null, summary: value.summary || null }

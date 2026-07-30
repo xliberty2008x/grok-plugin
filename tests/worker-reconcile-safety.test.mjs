@@ -6,7 +6,7 @@ import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs
 import { spawnReadOnlyWorker } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import { reconcileOwnedWorkers } from "../plugins/grok/scripts/lib/worker-reconcile.mjs";
 import { tryReadJob, updateJob } from "../plugins/grok/scripts/lib/state.mjs";
-import { initRepo, tempDir } from "./helpers.mjs";
+import { git, initRepo, tempDir } from "./helpers.mjs";
 
 const THREAD_ID = "019f6aa8-3066-7ac2-80ac-e38b5cfe11b4";
 
@@ -210,6 +210,68 @@ test("legacy non-dispatch reconciliation publishes terminal only after exact cle
   assert.doesNotMatch(JSON.stringify(terminal), new RegExp(rawCanary));
 });
 
+test("legacy task reconciliation observes final HEAD drift after cleanup", () => {
+  const root = initRepo();
+  const env = envFor();
+  const admitted = spawn(
+    root,
+    env,
+    "legacy-final-head-drift",
+    "Observe legacy final HEAD drift"
+  );
+  forceLegacyActiveState(root, env, admitted.handle.id);
+
+  const reconciliation = reconcileOwnedWorkers({
+    root,
+    principal: principal(root),
+    trusted: true,
+    processAlive: () => false,
+    cleanupProcess: () => {
+      git(
+        root,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "legacy cleanup-time head drift"
+      );
+      return { ok: true };
+    },
+    env
+  });
+
+  assert.deepEqual(reconciliation.results, [{
+    workerId: admitted.handle.id,
+    action: "marked-lost",
+    reason: "process-not-alive",
+    replayedPrompt: false
+  }]);
+  const terminal = tryReadJob(root, admitted.handle.id, env);
+  assert.equal(terminal.status, "failed");
+  assert.equal(terminal.phase, "context-rejected");
+  assert.equal(terminal.error.code, "E_CONTEXT_DRIFT");
+  assert.equal(typeof terminal.error.message, "string");
+  assert.ok(terminal.error.details.reasons.includes("[HEAD]"));
+  assert.equal(terminal.result.taskRuntimeCleaned, true);
+  assert.equal(terminal.result.runtimeEvidence.executionStatus, "failed");
+  assert.ok(
+    terminal.result.runtimeEvidence.observedChangedPaths.includes("[HEAD]")
+  );
+  assert.ok(terminal.completionContextManifest);
+  assert.equal(
+    terminal.result.runtimeEvidence.postContext.digest,
+    terminal.completionContextManifest.digest
+  );
+  assert.equal(
+    terminal.progress,
+    "Task runtime cleanup completed; workspace safety review is required"
+  );
+  assert.equal(
+    terminal.lifecycleEvents.at(-1).summary,
+    terminal.error.message
+  );
+  assert.equal(terminal.result.stopReason, undefined);
+});
+
 test("legacy non-dispatch cleanup failure preserves scrubbed pending terminal intent until a proven retry", () => {
   const root = initRepo();
   const env = envFor();
@@ -279,4 +341,149 @@ test("legacy non-dispatch cleanup failure preserves scrubbed pending terminal in
   assert.equal(terminal.result.taskRuntimeCleaned, true);
   assert.equal(terminal.result.privacyWarning, undefined);
   assert.doesNotMatch(JSON.stringify(terminal), new RegExp(rawCanary));
+});
+
+test("legacy cleanup retry preserves non-ESRCH signal precedence after exact cleanup", async (t) => {
+  for (const drift of [false, true]) {
+    await t.test(drift ? "final HEAD drift wins" : "signal failure wins without drift", () => {
+      const root = initRepo();
+      const env = envFor();
+      const admitted = spawn(
+        root,
+        env,
+        drift ? "legacy-signal-drift" : "legacy-signal-stable"
+      );
+      forceLegacyActiveState(root, env, admitted.handle.id);
+
+      const blocked = reconcileOwnedWorkers({
+        root,
+        principal: principal(root),
+        trusted: true,
+        processAlive: () => false,
+        cleanupProcess: () => {
+          const error = new Error("kill EPERM during legacy cleanup");
+          error.code = "EPERM";
+          throw error;
+        },
+        env
+      });
+      assert.equal(blocked.results[0].action, "cleanup-blocked");
+      const retained = tryReadJob(root, admitted.handle.id, env);
+      assert.equal(retained.status, "running");
+      assert.equal(retained.phase, "cleanup-blocked");
+      assert.equal(retained.error.code, "E_PROCESS_IDENTITY");
+      assert.equal(
+        retained.error.details.secondaryDiagnostic.code,
+        "EPERM"
+      );
+      assert.equal(retained.result.taskRuntimeCleaned, false);
+
+      const blockedAgain = reconcileOwnedWorkers({
+        root,
+        principal: principal(root),
+        trusted: true,
+        processAlive: () => false,
+        cleanupProcess: () => {
+          throw new Error("generic legacy cleanup retry failed");
+        },
+        env
+      });
+      assert.equal(blockedAgain.results[0].action, "cleanup-blocked");
+      const retainedAgain = tryReadJob(root, admitted.handle.id, env);
+      assert.equal(retainedAgain.status, "running");
+      assert.equal(retainedAgain.error.code, "E_PROCESS_IDENTITY");
+      assert.equal(
+        retainedAgain.error.details.secondaryDiagnostic.code,
+        "EPERM"
+      );
+      assert.equal(retainedAgain.result.taskRuntimeCleaned, false);
+
+      if (drift) {
+        git(
+          root,
+          "commit",
+          "--allow-empty",
+          "-m",
+          "legacy signal cleanup-time head drift"
+        );
+      }
+      const recovered = reconcileOwnedWorkers({
+        root,
+        principal: principal(root),
+        trusted: true,
+        processAlive: () => false,
+        cleanupProcess: () => ({ ok: true }),
+        env
+      });
+      assert.equal(recovered.results[0].action, "marked-lost");
+      const terminal = tryReadJob(root, admitted.handle.id, env);
+      assert.equal(terminal.status, "failed");
+      assert.equal(terminal.result.taskRuntimeCleaned, true);
+      assert.equal(terminal.result.privacyWarning, undefined);
+      assert.equal(terminal.pendingTerminal, undefined);
+      assert.equal(terminal.result.stopReason, undefined);
+      assert.equal(
+        terminal.error.details.secondaryDiagnostic.code,
+        "EPERM"
+      );
+      assert.equal(
+        terminal.lifecycleEvents.at(-1).summary,
+        terminal.error.message
+      );
+      if (drift) {
+        assert.equal(terminal.phase, "context-rejected");
+        assert.equal(terminal.error.code, "E_CONTEXT_DRIFT");
+        assert.ok(
+          terminal.result.runtimeEvidence.observedChangedPaths.includes("[HEAD]")
+        );
+        assert.equal(
+          terminal.progress,
+          "Task runtime cleanup completed; workspace safety review is required"
+        );
+      } else {
+        assert.equal(terminal.phase, "failed");
+        assert.equal(terminal.error.code, "E_PROCESS_IDENTITY");
+        assert.equal(terminal.progress, "Worker finalization completed");
+      }
+    });
+  }
+});
+
+test("legacy cleanup retry treats mixed-case ESRCH as benign signal evidence", () => {
+  const root = initRepo();
+  const env = envFor();
+  const admitted = spawn(root, env, "legacy-signal-esrch");
+  forceLegacyActiveState(root, env, admitted.handle.id);
+
+  reconcileOwnedWorkers({
+    root,
+    principal: principal(root),
+    trusted: true,
+    processAlive: () => false,
+    cleanupProcess: () => {
+      const error = new Error("kill eSrCh during legacy cleanup");
+      error.code = "eSrCh";
+      throw error;
+    },
+    env
+  });
+  const retained = tryReadJob(root, admitted.handle.id, env);
+  assert.equal(retained.status, "running");
+  assert.equal(retained.error.code, "E_RUNTIME_CLEANUP");
+  assert.equal(retained.result.taskRuntimeCleaned, false);
+
+  reconcileOwnedWorkers({
+    root,
+    principal: principal(root),
+    trusted: true,
+    processAlive: () => false,
+    cleanupProcess: () => ({ ok: true }),
+    env
+  });
+  const terminal = tryReadJob(root, admitted.handle.id, env);
+  assert.equal(terminal.status, "failed");
+  assert.equal(terminal.error.code, "E_PROVIDER_EXIT");
+  assert.equal(terminal.result.taskRuntimeCleaned, true);
+  assert.equal(terminal.result.privacyWarning, undefined);
+  assert.equal(terminal.progress, "Worker finalization completed");
 });

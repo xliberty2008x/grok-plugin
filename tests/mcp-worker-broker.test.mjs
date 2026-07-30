@@ -21,7 +21,12 @@ import {
 import {
   providerLaunchBindingDigest
 } from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
+import { CompanionError } from "../plugins/grok/scripts/lib/errors.mjs";
 import { MCP_SANDBOX_STATE_META_CAPABILITY } from "../plugins/grok/scripts/lib/worker-authority.mjs";
+import {
+  projectWorkerHandle,
+  projectWorkerSnapshot
+} from "../plugins/grok/scripts/lib/worker-protocol.mjs";
 import { ROOT, run, tempDir } from "./helpers.mjs";
 
 const PRINCIPAL = Object.freeze({
@@ -627,6 +632,203 @@ test("MCP calls enforce the advertised input schemas without Boolean coercion", 
   });
   assert.equal(unicodeValid.isError, undefined);
   assert.equal(observed.userRequest, unicodeRequest);
+});
+
+test("MCP preserves a generic process-identity safety code without private details", async () => {
+  const privateMessage =
+    "Verified Grok process group 424242 did not exit after SIGKILL.";
+  const result = await callWorkerTool({
+    name: "worker_get",
+    arguments: { id: "task-aaaaaaaaaaaaaaaa" },
+    _meta: {}
+  }, {
+    runtime: BASE_RUNTIME,
+    resolveAuthority: () => PRINCIPAL,
+    createService: () => ({
+      get() {
+        throw new CompanionError(
+          "E_PROCESS_IDENTITY",
+          privateMessage,
+          { pid: 424242, processGroupId: 424242 }
+        );
+      }
+    })
+  });
+
+  assert.deepEqual(result.structuredContent, {
+    ok: false,
+    error: {
+      code: "E_PROCESS_IDENTITY",
+      message: "Process ownership verification failed."
+    }
+  });
+  const serialized = JSON.stringify(result);
+  assert.equal(serialized.includes("424242"), false);
+  assert.equal(serialized.includes("SIGKILL"), false);
+  assert.equal(serialized.includes("E_BROKER"), false);
+});
+
+test("MCP owned list and get self-sanitize warning-only and nested process diagnostics", async () => {
+  const diagnostic =
+    "Terminal cleanup could not kill process -451101 after EPERM at /home/alice/private/runtime.";
+  const documentary =
+    "Example: kill ENOSPC for providerPid=459991 is a historical fixture.";
+  const ordinary = "Could not read the requested input: ENOENT.";
+  const stamped = "2026-07-29T00:00:00.000Z";
+  const privateJob = {
+    schemaVersion: 3,
+    id: "task-aaaaaaaaaaaaaaaa",
+    kind: "task",
+    jobClass: "task",
+    write: false,
+    status: "completed",
+    phase: "done",
+    summary: diagnostic,
+    progress: diagnostic,
+    createdAt: stamped,
+    startedAt: stamped,
+    updatedAt: stamped,
+    completedAt: stamped,
+    heartbeatAt: stamped,
+    profile: { id: "rescue-read-v3" },
+    model: null,
+    effort: null,
+    controlWorkspaceId: diagnostic,
+    role: { id: diagnostic },
+    request: {
+      providerHomeId: "task-aaaaaaaaaaaaaaaa",
+      resumeJobId: null,
+      envelope: null,
+      contextManifest: null
+    },
+    latestPlan: [diagnostic, documentary, ordinary],
+    lifecycleEvents: [],
+    result: {
+      hostVerification: "not_run",
+      privacyWarning: diagnostic,
+      workerReport: {
+        schemaVersion: 1,
+        structured: true,
+        valid: false,
+        outcome: "blocked",
+        summary: diagnostic,
+        changedFiles: [],
+        checksClaimed: [ordinary],
+        acceptanceResults: [],
+        risks: [diagnostic],
+        questions: [documentary],
+        validationIssues: []
+      }
+    },
+    error: null
+  };
+  const nestedDiagnostic =
+    "Example: final cleanup kill EBUSY for providerPid=451102";
+  const nestedJob = {
+    ...privateJob,
+    id: "task-bbbbbbbbbbbbbbbb",
+    summary: `Historical: ordinary note.\n${nestedDiagnostic}`,
+    progress: nestedDiagnostic,
+    controlWorkspaceId: null,
+    role: null,
+    request: {
+      ...privateJob.request,
+      providerHomeId: "task-bbbbbbbbbbbbbbbb"
+    },
+    latestPlan: [
+      nestedDiagnostic,
+      "Target 500 customers by Q4."
+    ],
+    result: {
+      hostVerification: "not_run",
+      reportRepair: {
+        attempted: true,
+        valid: false,
+        validationIssues: [nestedDiagnostic],
+        error: {
+          code: "E_PROCESS_IDENTITY",
+          message: "Verified owned process signalling could not be completed.",
+          details: {
+            secondaryDiagnostic: {
+              code: "EBUSY",
+              message: nestedDiagnostic
+            }
+          }
+        }
+      }
+    },
+    error: null
+  };
+  const options = {
+    runtime: BASE_RUNTIME,
+    resolveAuthority: () => PRINCIPAL,
+    createService: () => ({
+      listOwned: () => [
+        projectWorkerHandle(privateJob, { trustHostAuthority: false }),
+        projectWorkerHandle(nestedJob, { trustHostAuthority: false })
+      ],
+      get: (id) => projectWorkerSnapshot(
+        id === nestedJob.id ? nestedJob : privateJob,
+        {
+        trustHostAuthority: false
+        }
+      )
+    })
+  };
+
+  const listed = await callWorkerTool({
+    name: "worker_list_owned",
+    arguments: {}
+  }, options);
+  const got = await callWorkerTool({
+    name: "worker_get",
+    arguments: { id: privateJob.id }
+  }, options);
+  const nestedGot = await callWorkerTool({
+    name: "worker_get",
+    arguments: { id: nestedJob.id }
+  }, options);
+  for (const output of [listed, got, nestedGot]) {
+    assert.equal(output.isError, undefined);
+    const serialized = JSON.stringify(output);
+    for (const privateValue of [
+      "EPERM",
+      "EBUSY",
+      "451101",
+      "451102",
+      "/home/alice",
+      "/home/alice/private/runtime"
+    ]) {
+      assert.equal(
+        serialized.includes(privateValue),
+        false,
+        `${privateValue} leaked from ${serialized}`
+      );
+    }
+  }
+  assert.equal(
+    listed.structuredContent.workers[0].summary,
+    "Process ownership verification failed."
+  );
+  const snapshot = got.structuredContent.worker;
+  assert.equal(snapshot.error, null);
+  assert.equal(snapshot.latestPlan[1], documentary);
+  assert.equal(snapshot.latestPlan[2], ordinary);
+  assert.equal(snapshot.result.workerReport.questions[0], documentary);
+  assert.equal(snapshot.result.workerReport.checksClaimed[0], ordinary);
+  const nestedSnapshot = nestedGot.structuredContent.worker;
+  assert.equal(
+    nestedSnapshot.summary.startsWith("Historical: ordinary note."),
+    true
+  );
+  assert.equal(
+    nestedSnapshot.result.reportRepair.error.message,
+    "Process ownership verification failed."
+  );
+  assert.equal(
+    nestedSnapshot.latestPlan[1],
+    "Target [REDACTED] customers by Q4."
+  );
 });
 
 test("MCP exposes only bounded host-action decisions and grant-bound follow-up handles", async () => {

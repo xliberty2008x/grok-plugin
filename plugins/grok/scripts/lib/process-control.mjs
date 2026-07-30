@@ -4,8 +4,11 @@ import process from "node:process";
 import { spawnSync } from "node:child_process";
 
 import { CompanionError } from "./errors.mjs";
+import { sanitizeDisplayText } from "./redact.mjs";
 
 const MAX_PROCESS_START_TOKEN_LENGTH = 256;
+const MAX_SECONDARY_DIAGNOSTIC_CODE_LENGTH = 64;
+const MAX_SECONDARY_DIAGNOSTIC_MESSAGE_LENGTH = 256;
 const SYSTEM_PS_CANDIDATES = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
 
 export function assertCompleteDetachedOwnedIdentity(identity) {
@@ -130,6 +133,66 @@ export function processCommand(pid) {
   return run.status === 0 ? String(run.stdout).trim() : "";
 }
 
+function boundedPrivateSignalDiagnostic(error) {
+  const rawCode = sanitizeDisplayText(error?.code || "").trim();
+  const code = /^[A-Z][A-Z0-9_]{0,63}$/.test(rawCode)
+    ? rawCode.slice(0, MAX_SECONDARY_DIAGNOSTIC_CODE_LENGTH)
+    : "UNKNOWN";
+  const rawMessage = sanitizeDisplayText(error?.message || String(error || ""));
+  const message = rawMessage
+    .replace(/\bfile:\/\/[^\s"'`<>]+/gi, "[REDACTED_PATH]")
+    .replace(/\b[A-Za-z]:[\\/][^\s"'`<>]*/g, "[REDACTED_PATH]")
+    .replace(/(^|[\s("'`=])(?:~|\.{1,2})?[\\/][^\s"'`<>]*/g, "$1[REDACTED_PATH]")
+    .replace(/(^|[\s("'`=])[A-Za-z0-9_.-]+[\\/][^\s"'`<>]*/g, "$1[REDACTED_PATH]")
+    .replace(
+      /\b((?:pid|pgid|process(?:[\s_-]+(?:group(?:[\s_-]+(?:ids?|identifiers?))?|ids?|identifiers?))?|group(?:[\s_-]+(?:ids?|identifiers?))?|target|processGroupIds?|(?:child|leader|provider|worker|controller)Pid|(?:child|leader|provider|worker|controller)ProcessId|signalTarget)\s*(?::|=|#|\bis\b)?\s*[\[(]?\s*)-?\d+\b(\s*[\])])?/giu,
+      "$1[REDACTED]$2"
+    )
+    .replace(/(^|[\s(:,=])-?\d{2,}\b/g, "$1[REDACTED]")
+    .trim()
+    .slice(0, MAX_SECONDARY_DIAGNOSTIC_MESSAGE_LENGTH);
+  return {
+    code,
+    message: message || "Process signalling failed."
+  };
+}
+
+/**
+ * Signal an already-verified owned process target. ESRCH is the only benign
+ * failure; every other OS failure leaves cleanup unproven and is retained only
+ * as bounded private evidence.
+ */
+export function signalOwnedProcess(target, signal, signalProcess = process.kill) {
+  try {
+    const outcome = signalProcess(target, signal);
+    if (outcome && typeof outcome.then === "function") {
+      // Process signalling is an ownership-critical synchronous boundary.
+      // Consume a possible rejection before failing closed so an injected or
+      // adapter callback cannot create an unhandled rejection.
+      Promise.resolve(outcome).catch(() => {});
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "Verified owned process signalling could not be completed.",
+        {
+          secondaryDiagnostic: {
+            code: "E_ASYNC_SIGNAL",
+            message: "Process signalling callback did not complete synchronously."
+          }
+        }
+      );
+    }
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    if (error?.code === "E_PROCESS_IDENTITY") throw error;
+    throw new CompanionError(
+      "E_PROCESS_IDENTITY",
+      "Verified owned process signalling could not be completed.",
+      { secondaryDiagnostic: boundedPrivateSignalDiagnostic(error) }
+    );
+  }
+}
+
 export function isGrokProcessCommand(command) {
   const tokens = String(command).match(/"[^"]*"|'[^']*'|\S+/g) || [];
   const values = tokens.map((raw) => {
@@ -197,7 +260,8 @@ export function identityMatches(identity, marker, kind) {
 export async function terminateOwnedProcess(identity, marker, kind, {
   termTimeoutMs = 2_000,
   killTimeoutMs = 1_500,
-  pollMs = 50
+  pollMs = 50,
+  signalProcess = process.kill
 } = {}) {
   if (!identity) return false;
   if (process.platform === "win32") {
@@ -227,10 +291,7 @@ export async function terminateOwnedProcess(identity, marker, kind, {
   }
 
   const target = identity.processGroupId ? -identity.processGroupId : identity.pid;
-  const signal = (name) => {
-    try { process.kill(target, name); }
-    catch (error) { if (error.code !== "ESRCH") throw error; }
-  };
+  const signal = (name) => signalOwnedProcess(target, name, signalProcess);
   const stillAlive = () => (
     processStartToken(identity.pid) === identity.startToken
     || Boolean(identity.processGroupId && processGroupAlive(identity.processGroupId))

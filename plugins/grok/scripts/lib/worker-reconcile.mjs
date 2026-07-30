@@ -3,10 +3,16 @@
  * May clean verified owned processes or mark jobs lost.
  * MUST NEVER replay prompts or re-dispatch provider work.
  */
-import { CompanionError } from "./errors.mjs";
+import { CompanionError, asErrorPayload } from "./errors.mjs";
 import { sameHostSession } from "./host.mjs";
 import { listJobs, now, terminal, updateJob } from "./state.mjs";
 import { appendLifecycleEvent, scrubStoredJob } from "./task-contract.mjs";
+import {
+  captureTerminalEvidence,
+  normalizeTerminalProcessSignalError,
+  selectTaskTerminalError,
+  terminalTaskProgress
+} from "./task-terminal-evidence.mjs";
 import { isSupportedWorkerDispatch } from "./worker-launch-contract.mjs";
 
 export const RECONCILER_PRIVILEGE = "host-trusted-reconciler";
@@ -181,6 +187,13 @@ export function reconcileOwnedWorkers({
       };
 
       let cleanupProven = false;
+      const normalizedRetainedError =
+        normalizeTerminalProcessSignalError(current.error);
+      let cleanupSignalError =
+        normalizedRetainedError?.code === "E_PROCESS_IDENTITY"
+          && normalizedRetainedError.details?.secondaryDiagnostic != null
+          ? asErrorPayload(normalizedRetainedError)
+          : null;
       try {
         const cleanup = typeof cleanupProcess === "function"
           ? cleanupProcess(current)
@@ -191,7 +204,12 @@ export function reconcileOwnedWorkers({
           && !Array.isArray(cleanup)
           && cleanup.ok === true
         );
-      } catch {
+      } catch (error) {
+        const normalized = normalizeTerminalProcessSignalError(error);
+        if (normalized?.code === "E_PROCESS_IDENTITY"
+          && normalized.details?.secondaryDiagnostic != null) {
+          cleanupSignalError = asErrorPayload(normalized);
+        }
         cleanupProven = false;
       }
 
@@ -211,7 +229,7 @@ export function reconcileOwnedWorkers({
           pendingTerminal: intendedTerminal,
           summary: "Worker cleanup is incomplete.",
           progress: "Process was not found; exact cleanup proof is still pending.",
-          error: {
+          error: cleanupSignalError || {
             code: "E_RUNTIME_CLEANUP",
             message: "Worker cleanup could not be verified."
           },
@@ -227,35 +245,104 @@ export function reconcileOwnedWorkers({
       }
 
       decision = { action: "marked-lost", reason: "process-not-alive" };
+      const taskEvidence = current.jobClass === "task"
+        ? captureTerminalEvidence(
+            current.request?.spawn?.executionRoot
+              || current.workspaceRoot
+              || root,
+            current,
+            intendedTerminal.status === "completed"
+              ? "completed"
+              : intendedTerminal.status === "cancelled"
+                ? "cancelled"
+                : "failed"
+          )
+        : null;
+      const selectedTerminalError = taskEvidence
+        ? selectTaskTerminalError(
+            taskEvidence,
+            intendedTerminal.error || null,
+            current.error || null
+          )
+        : intendedTerminal.error || null;
+      const selectedError = selectedTerminalError
+        ? asErrorPayload(selectedTerminalError)
+        : null;
+      const finalStatus = taskEvidence && selectedError
+        ? (selectedError.code === "E_CANCELLED" ? "cancelled" : "failed")
+        : intendedTerminal.status;
+      const outcomeChanged = finalStatus !== intendedTerminal.status
+        || selectedError?.code !== intendedTerminal.error?.code
+        || selectedError?.message !== intendedTerminal.error?.message;
+      const finalPhase = selectedError?.code === "E_CONTEXT_DRIFT"
+        ? "context-rejected"
+        : selectedError?.code === "E_SCOPE_VIOLATION"
+          ? "scope-rejected"
+          : outcomeChanged
+            ? finalStatus
+            : intendedTerminal.phase;
+      const settledAt = now();
+      const finalCompletedAt = [
+        "E_CONTEXT_DRIFT",
+        "E_SCOPE_VIOLATION"
+      ].includes(selectedError?.code)
+        ? settledAt
+        : intendedTerminal.completedAt;
+      const finalSummary = outcomeChanged
+        ? selectedError?.message
+        : intendedTerminal.summary
+          || selectedError?.message
+          || "Lost";
+      if (taskEvidence?.runtimeEvidence) {
+        taskEvidence.runtimeEvidence.executionStatus =
+          finalStatus === "completed"
+            ? "completed"
+            : finalStatus === "cancelled"
+              ? "cancelled"
+              : "failed";
+      }
       const terminalResult = {
         ...(current.result || {}),
         hostVerification: current.result?.hostVerification || "not_run",
-        ...(!existingIntent ? { stopReason: "reconciler-lost" } : {}),
         ...(current.jobClass === "task" ? { taskRuntimeCleaned: true } : {}),
         runtimeEvidence: {
           ...(current.result?.runtimeEvidence || {}),
+          ...(taskEvidence?.runtimeEvidence || {}),
           reconciler: {
             privilege: RECONCILER_PRIVILEGE,
             replayedPrompt: false,
-            at: observedAt
+            at: settledAt
           }
         }
       };
+      if (!existingIntent
+        && (!taskEvidence || selectedError?.code === "E_PROVIDER_EXIT")) {
+        terminalResult.stopReason = "reconciler-lost";
+      }
+      if (finalStatus !== "cancelled"
+        && terminalResult.stopReason === "cancelled") {
+        delete terminalResult.stopReason;
+      }
       delete terminalResult.privacyWarning;
       const terminalized = {
         ...current,
-        status: intendedTerminal.status,
-        phase: intendedTerminal.phase,
-        summary: intendedTerminal.summary || intendedTerminal.error?.message || "Lost",
-        progress: "Process not found; cleanup verified and terminal intent published.",
-        completedAt: intendedTerminal.completedAt,
+        status: finalStatus,
+        phase: finalPhase,
+        summary: finalSummary,
+        progress: taskEvidence
+          ? terminalTaskProgress(finalStatus, selectedError)
+          : "Process not found; cleanup verified and terminal intent published.",
+        completedAt: finalCompletedAt,
+        ...(taskEvidence
+          ? { completionContextManifest: taskEvidence.postContext }
+          : {}),
         lifecycleEvents: appendLifecycleEvent(
           current.lifecycleEvents || [],
-          "checkpoint",
-          "Reconciler verified cleanup and published terminal intent without prompt replay.",
+          finalStatus === "completed" ? "checkpoint" : "blocked",
+          finalSummary,
           { reconciler: RECONCILER_PRIVILEGE, replayedPrompt: false }
         ),
-        error: intendedTerminal.error || null,
+        error: selectedError,
         result: terminalResult
       };
       delete terminalized.pendingTerminal;
