@@ -5,10 +5,11 @@ export const DETERMINISTIC_SUPPORT_TEST_FILES = Object.freeze([
   "tests/worker-broker-evidence_part4.mjs"
 ]);
 
-// Duration-balanced with longest-processing-time assignment from the
-// macOS / Node 22 lane in Actions run 30382034077 on 2026-07-28. Keep this
-// manifest explicit: validation must fail when the deterministic inventory
-// changes until the new file is deliberately assigned.
+// Duration-balanced from the macOS and Linux lanes in Actions run 30516745831.
+// The process-heavy cleanup test and four evidence partitions are spread so
+// every shard has one or two, rather than serializing all five in one job.
+// Keep this manifest explicit: validation must fail when the deterministic
+// inventory changes until the new file is deliberately assigned.
 export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
   Object.freeze([
     "tests/ci-post-grok-review.test.mjs",
@@ -20,7 +21,9 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/plugin-inventory.test.mjs",
     "tests/process-control-owned-identity.test.mjs",
     "tests/provider-capability.test.mjs",
+    "tests/test-temp-cleanup.test.mjs",
     "tests/version-policy.test.mjs",
+    "tests/worker-broker-evidence_part2.mjs",
     "tests/worker-broker-phase3-evidence.test.mjs",
     "tests/worker-execution-binding.test.mjs",
     "tests/worker-host-actions.test.mjs",
@@ -48,11 +51,8 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/readonly-status.test.mjs",
     "tests/state.test.mjs",
     "tests/stdin.test.mjs",
-    "tests/test-temp-cleanup.test.mjs",
     "tests/worker-broker-evidence.test.mjs",
-    "tests/worker-broker-evidence_part2.mjs",
     "tests/worker-broker-evidence_part3.mjs",
-    "tests/worker-broker-evidence_part4.mjs",
     "tests/worker-context-roles.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
     "tests/worker-presentation.test.mjs",
@@ -76,6 +76,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/redact.test.mjs",
     "tests/runtime.test.mjs",
     "tests/windows-neutral.test.mjs",
+    "tests/worker-broker-evidence_part4.mjs",
     "tests/worker-cli-authority.test.mjs",
     "tests/worker-mailbox.test.mjs",
     "tests/worker-mutation.test.mjs",

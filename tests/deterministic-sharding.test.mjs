@@ -19,6 +19,13 @@ import {
 } from "../scripts/lib/deterministic-test-shards.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const PROCESS_HEAVY_TEST_FILES = Object.freeze([
+  "tests/test-temp-cleanup.test.mjs",
+  "tests/worker-broker-evidence.test.mjs",
+  "tests/worker-broker-evidence_part2.mjs",
+  "tests/worker-broker-evidence_part3.mjs",
+  "tests/worker-broker-evidence_part4.mjs"
+]);
 
 test("deterministic shard manifest is an exact nonempty partition of the inventory", () => {
   const inventory = listDeterministicTestFiles();
@@ -54,6 +61,14 @@ test("deterministic-only evidence harness is explicit and excluded from ordinary
       (file) => file === supportFile
     ).length, 1);
   }
+});
+
+test("process-heavy cleanup and evidence files are distributed across all shards", () => {
+  const heavyCounts = DETERMINISTIC_TEST_SHARDS.map((files) =>
+    files.filter((file) => PROCESS_HEAVY_TEST_FILES.includes(file)).length
+  );
+  assert.equal(heavyCounts.reduce((total, count) => total + count, 0), 5);
+  assert.ok(heavyCounts.every((count) => count >= 1 && count <= 2));
 });
 
 test("deterministic shard CLI accepts only one exact three-way shard specification", () => {
