@@ -27,7 +27,8 @@ import {
   TEST_TEMP_PROCESS_PREFIX,
   TEST_TEMP_RUN_PREFIX,
   createOwnedTestTempRoot,
-  processStartToken
+  processStartToken,
+  removeOwnedTestTempRoot
 } from "../scripts/lib/test-temp.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -35,6 +36,7 @@ const REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
 const REMOVE_HELPER = path.join(ROOT, "scripts/lib/test-temp-remove-helper.cjs");
 const CHILD_HOOK = path.join(ROOT, "scripts/lib/test-temp-child-hook.cjs");
 const PIDFD_SIGNAL_HELPER = path.join(ROOT, "scripts/lib/test-temp-pidfd-signal.py");
+const SUPERVISOR = path.join(ROOT, "scripts/lib/test-temp-supervisor.mjs");
 const OLD_MS = 2 * 60 * 60_000;
 const TEST_OWNERSHIP_ENVIRONMENT_KEYS = Object.freeze([
   "GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS",
@@ -1320,6 +1322,170 @@ test("async spawn kills the exact child immediately when ownership registration 
   );
   const childPid = Number(evidence.registration.split(":", 1)[0]);
   assert.equal(await pidIsGone(childPid), true);
+});
+
+test("async spawn kills the exact child when ownership acknowledgement times out", async (t) => {
+  if (process.platform !== "linux" && process.platform !== "darwin") return;
+  const root = sandbox(t);
+  const registry = path.join(root, "unacknowledged-registry");
+  const evidenceFile = path.join(root, "registration-ack-failure.json");
+  const driver = path.join(root, "registration-ack-failure.mjs");
+  fs.writeFileSync(registry, "", { mode: 0o600 });
+  fs.writeFileSync(driver, [
+    'import fs from "node:fs";',
+    'import process from "node:process";',
+    'import { spawn } from "node:child_process";',
+    "const startedAt = Date.now();",
+    "let failure = null;",
+    "try {",
+    '  spawn(process.execPath, ["--eval", "setInterval(() => {}, 1000)"], { stdio: "ignore" });',
+    "} catch (error) {",
+    "  failure = {",
+    "    code: error?.code || null,",
+    "    registration: error?.registration || null,",
+    "    elapsedMs: Date.now() - startedAt",
+    "  };",
+    "}",
+    `fs.writeFileSync(${JSON.stringify(evidenceFile)}, JSON.stringify(failure));`,
+    ""
+  ].join("\n"));
+  const result = spawnSync("/usr/bin/env", [
+    "GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS=1",
+    `GROK_PLUGIN_TEST_PID_REGISTRY=${registry}`,
+    `GROK_PLUGIN_TEST_PID_REGISTRY_SECRET=${"r".repeat(32)}`,
+    `GROK_PLUGIN_TEST_SUPERVISOR_PID=${process.pid}`,
+    `GROK_PLUGIN_TEST_SUPERVISOR_TOKEN=${"t".repeat(32)}`,
+    `GROK_PLUGIN_TEST_TEMP_ROOT=${root}`,
+    `NODE_OPTIONS=--require=${CHILD_HOOK}`,
+    process.execPath,
+    driver
+  ], {
+    cwd: ROOT,
+    env: {},
+    encoding: "utf8",
+    shell: false,
+    timeout: 10_000
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const evidence = JSON.parse(fs.readFileSync(evidenceFile, "utf8"));
+  assert.equal(evidence.code, "E_TEST_TEMP_REGISTRATION_ACK");
+  assert.match(evidence.registration, /^\d+:(?:m[0-9a-f]+|\d+)$/);
+  assert.ok(
+    evidence.elapsedMs >= 4_500 && evidence.elapsedMs < 8_000,
+    `registration acknowledgement failure took ${evidence.elapsedMs} ms`
+  );
+  const childPid = Number(evidence.registration.split(":", 1)[0]);
+  assert.equal(await pidIsGone(childPid), true);
+});
+
+test("a recognized supervisor copy executes only the canonical containment bundle", (t) => {
+  if (process.platform !== "linux" && process.platform !== "darwin") return;
+  const activeFileRoot = process.env.GROK_PLUGIN_TEST_TEMP_ROOT;
+  if (!path.isAbsolute(activeFileRoot || "")) return;
+  const root = sandbox(t);
+  const copiedSupervisor = path.join(root, "test-temp-supervisor.mjs");
+  const copiedHook = path.join(root, "test-temp-child-hook.cjs");
+  const copiedPidfdHelper = path.join(root, "test-temp-pidfd-signal.py");
+  const copiedHookMarker = path.join(root, "copied-hook-ran");
+  const fixtureMarker = path.join(root, "canonical-supervisor-ran");
+  fs.copyFileSync(SUPERVISOR, copiedSupervisor);
+  fs.writeFileSync(copiedHook, [
+    'const fs = require("node:fs");',
+    `fs.writeFileSync(${JSON.stringify(copiedHookMarker)}, "unsafe\\n");`,
+    'throw new Error("copied hook must not execute");',
+    ""
+  ].join("\n"));
+  fs.writeFileSync(
+    copiedPidfdHelper,
+    "raise SystemExit('copied pidfd helper must not execute')\n"
+  );
+  const nestedRoot = createOwnedTestTempRoot({
+    base: path.dirname(activeFileRoot),
+    prefix: "file-",
+    kind: "file"
+  });
+  t.after(() => removeOwnedTestTempRoot(nestedRoot));
+  const result = spawnSync(process.execPath, [
+    copiedSupervisor,
+    "--timeout-ms",
+    "10000",
+    "--",
+    process.execPath,
+    "--eval",
+    `require("node:fs").writeFileSync(${JSON.stringify(fixtureMarker)}, "canonical\\n")`
+  ], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      GROK_PLUGIN_TEST_TEMP_ROOT: nestedRoot,
+      TEMP: nestedRoot,
+      TMP: nestedRoot,
+      TMPDIR: nestedRoot
+    },
+    encoding: "utf8",
+    shell: false,
+    timeout: 20_000,
+    maxBuffer: 1024 * 1024
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(copiedHookMarker), false);
+  assert.equal(fs.readFileSync(fixtureMarker, "utf8"), "canonical\n");
+});
+
+test("an asynchronously launched supervisor copy executes only the canonical containment bundle", {
+  timeout: 30_000
+}, async (t) => {
+  if (process.platform !== "linux" && process.platform !== "darwin") return;
+  const activeFileRoot = process.env.GROK_PLUGIN_TEST_TEMP_ROOT;
+  if (!path.isAbsolute(activeFileRoot || "")) return;
+  const root = sandbox(t);
+  const copiedSupervisor = path.join(root, "test-temp-supervisor.mjs");
+  const copiedHookMarker = path.join(root, "copied-hook-ran");
+  const fixtureMarker = path.join(root, "canonical-supervisor-ran");
+  fs.copyFileSync(SUPERVISOR, copiedSupervisor);
+  fs.writeFileSync(path.join(root, "test-temp-child-hook.cjs"), [
+    'const fs = require("node:fs");',
+    `fs.writeFileSync(${JSON.stringify(copiedHookMarker)}, "unsafe\\n");`,
+    'throw new Error("copied hook must not execute");',
+    ""
+  ].join("\n"));
+  fs.writeFileSync(
+    path.join(root, "test-temp-pidfd-signal.py"),
+    "raise SystemExit('copied pidfd helper must not execute')\n"
+  );
+  const nestedRoot = createOwnedTestTempRoot({
+    base: path.dirname(activeFileRoot),
+    prefix: "file-",
+    kind: "file"
+  });
+  t.after(() => removeOwnedTestTempRoot(nestedRoot));
+  const child = spawn(process.execPath, [
+    copiedSupervisor,
+    "--timeout-ms",
+    "10000",
+    "--",
+    process.execPath,
+    "--eval",
+    `require("node:fs").writeFileSync(${JSON.stringify(fixtureMarker)}, "canonical\\n")`
+  ], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      GROK_PLUGIN_TEST_TEMP_ROOT: nestedRoot,
+      TEMP: nestedRoot,
+      TMP: nestedRoot,
+      TMPDIR: nestedRoot
+    },
+    shell: false,
+    stdio: "ignore"
+  });
+  const outcome = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  assert.deepEqual(outcome, { code: 0, signal: null });
+  assert.equal(fs.existsSync(copiedHookMarker), false);
+  assert.equal(fs.readFileSync(fixtureMarker, "utf8"), "canonical\n");
 });
 
 test("supervisor ownership propagates through an async execFile chain", async (t) => {

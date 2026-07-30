@@ -83,6 +83,9 @@ function isDirectNodeLaunch(file) {
 }
 
 function isTrustedSupervisorEntrypoint(candidate) {
+  // A verified fixture copy is only a recognition signal. Spawn wrappers
+  // replace it with SUPERVISOR_HELPER so copied siblings and later swaps are
+  // never granted a containment-authority transition.
   const selected = path.resolve(String(candidate || ""));
   if (
     !path.isAbsolute(String(candidate || ""))
@@ -277,6 +280,7 @@ function waitForRegistrationAcknowledgement(registry, registration, registrySecr
   }
   const error = new Error("The test supervisor did not acknowledge child ownership.");
   error.code = "E_TEST_TEMP_REGISTRATION_ACK";
+  error.registration = registration;
   throw error;
 }
 
@@ -456,7 +460,18 @@ childProcess.ChildProcess.prototype.spawn = function spawnWithTestOwnership(opti
     if (!providedKeys.has(key)) envPairs.push(`${key}=${value}`);
   }
   for (const [key, value] of Object.entries(forced)) envPairs.push(`${key}=${value}`);
-  const result = originalSpawn.call(this, { ...options, envPairs });
+  const selectedOptions = nestedSupervisor
+    ? {
+        ...options,
+        args: [
+          options.args[0],
+          SUPERVISOR_HELPER,
+          ...options.args.slice(2)
+        ],
+        envPairs
+      }
+    : { ...options, envPairs };
+  const result = originalSpawn.call(this, selectedOptions);
   if (process.platform === "linux" || process.platform === "darwin") {
     try {
       appendProcessRegistration(this.pid, process.pid);
@@ -486,12 +501,19 @@ childProcess.spawnSync = function spawnSyncWithTestOwnership(file, args, options
       : originalSpawnSync.call(this, file, selectedOptions);
   }
   rejectDetachedSync(file, selectedOptions);
+  const nestedSupervisor = isNestedSupervisorLaunch(
+    file,
+    hasArgs ? args : []
+  );
   const injected = injectObjectEnvironment(selectedOptions, {
-    nestedSupervisor: isNestedSupervisorLaunch(file, hasArgs ? args : []),
+    nestedSupervisor,
     file
   });
+  const selectedArgs = nestedSupervisor
+    ? [SUPERVISOR_HELPER, ...args.slice(1)]
+    : args;
   const result = hasArgs
-    ? originalSpawnSync.call(this, file, args, injected)
+    ? originalSpawnSync.call(this, file, selectedArgs, injected)
     : originalSpawnSync.call(this, file, injected);
   appendProcessRegistration(result?.pid, process.pid);
   return result;

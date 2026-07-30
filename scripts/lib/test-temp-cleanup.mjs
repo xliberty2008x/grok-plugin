@@ -251,7 +251,11 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "deep-research-runtime-state-",
   "deep-research-state-",
   "deep-research-state-nocmd-",
+  "grok-force-cancel-task-cleanup-race-",
+  "grok-force-cancel-terminal-race-",
+  "grok-import-signal-injection-",
   "grok-issue34-real-vertical-",
+  "grok-launch-unsettled-hook-",
   "grok-plugin-abs-hooks-",
   "grok-plugin-ancestor-hooks-",
   "grok-plugin-bisect-ctrl-",
@@ -287,6 +291,8 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "grok-plugin-sparse-ctrl-",
   "grok-plugin-unresolved-upstream-",
   "grok-runtime-linked-ref-",
+  "grok-session-end-signal-data-",
+  "grok-session-end-signal-injection-",
   "runner-failures-",
   // Finite template-literal expansions whose labels are checked in beside the
   // allocating helper calls.
