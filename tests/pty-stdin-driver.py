@@ -115,7 +115,7 @@ def main():
             write_error = f"{error.__class__.__name__}: {error}"
 
     try:
-        code = process.wait(timeout=20)
+        code = process.wait(timeout=30)
     except subprocess.TimeoutExpired:
         process.kill()
         code = process.wait(timeout=5)

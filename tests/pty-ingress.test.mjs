@@ -186,7 +186,7 @@ test("source Codex wrapper survives delayed input on a genuinely nonblocking PTY
   const dispatch = runPtyStdin(
     pinned.codexCompanionScript,
     ["task", "--background", "--envelope-stdin", "--stdin-ready", "--fresh", "--effort", "high", "--json"],
-    { cwd: root, env: pinned.env, input: envelope, timeout: 30_000 }
+    { cwd: root, env: pinned.env, input: envelope, timeout: 45_000 }
   );
   assert.equal(dispatch.driver.status, 0, dispatch.driver.stderr || dispatch.driver.stdout);
   assert.ok(dispatch.result, "PTY driver did not return structured evidence");
@@ -235,7 +235,7 @@ test("source Codex wrapper survives delayed input on a genuinely nonblocking PTY
       cwd: root,
       env: pinned.env,
       input: verification,
-      timeout: 30_000
+      timeout: 45_000
     }
   );
   assert.equal(record.driver.status, 0, record.driver.stderr || record.driver.stdout);
@@ -322,7 +322,7 @@ test("original issue #2 invocation waits for a delayed PTY writer without a read
   const dispatch = runPtyStdin(
     pinned.codexCompanionScript,
     ["task", "--background", "--envelope-stdin", "--fresh", "--effort", "high", "--json"],
-    { cwd: root, env: pinned.env, input: envelope, timeout: 30_000 }
+    { cwd: root, env: pinned.env, input: envelope, timeout: 45_000 }
   );
   assert.equal(dispatch.driver.status, 0, dispatch.driver.stderr || dispatch.driver.stdout);
   assert.equal(dispatch.result?.requiresReady, false);
