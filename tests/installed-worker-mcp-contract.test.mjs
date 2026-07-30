@@ -109,6 +109,7 @@ function setupFixture() {
     ready: true,
     grok: {
       version: "0.2.99",
+      releaseRecognition: "known-digest",
       authenticated: true,
       headlessReview: {
         flags: ["--prompt-file", "--json-schema", "--tools", "--disallowed-tools", "--sandbox"],

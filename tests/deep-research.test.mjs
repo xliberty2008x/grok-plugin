@@ -698,6 +698,59 @@ test("fake-ACP lifecycle: session-scoped capability, launch-ack nonterminal, rep
   assert.equal(interrupted.resume, false);
 });
 
+test("early deep-research startup failures retain the non-replay contract", async (t) => {
+  if (process.platform === "win32") return;
+  const previous = { ...process.env };
+  t.after(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+  });
+
+  const fakeRoot = tempDir("deep-research-startup-failure-fake-");
+  const fake = installFakeGrok(fakeRoot, {
+    deepResearch: true,
+    authMethods: [{ id: "local", name: "Local test auth" }]
+  });
+  const pluginData = tempDir("deep-research-startup-failure-plugin-");
+  Object.assign(process.env, testEnvironment({
+    fake,
+    pluginData,
+    sessionId: "deep-research-startup-failure-session"
+  }));
+  const root = initRepo();
+  const state = tempDir("deep-research-startup-failure-state-");
+  t.after(() => {
+    try { thawTreeWritable(state); } catch { /* ignore */ }
+    for (const directory of [state, root, pluginData, fakeRoot]) {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  await assert.rejects(
+    () => runDeepResearch({
+      root,
+      profile: profileFor("deep-research"),
+      query: "forced startup failure",
+      options: { "web-only": true },
+      stateDir: state,
+      jobMarker: "deep-research-startup-failure",
+      timeoutMs: 5_000,
+      testHooks: {
+        beforeDispatchPromotion() {
+          const error = new Error("forced startup security failure");
+          error.code = "E_SECURITY_PROFILE";
+          throw error;
+        }
+      }
+    }),
+    (error) => error.code === "E_SECURITY_PROFILE"
+      && error.details?.replay === false
+      && error.details?.resume === false
+  );
+});
+
 test("fake-ACP terminal matrix covers partial, foreign/stale updates, pauses, budgets, failures, interruption, missing report, and timeout", async (t) => {
   if (process.platform === "win32") return;
   const previous = { ...process.env };

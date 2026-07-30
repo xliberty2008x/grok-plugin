@@ -3124,7 +3124,10 @@ async function handleSetup(raw) {
     });
     // The setup response is public; the private pin path stays internal.
     const { binary: _privatePinnedBinary, ...publicRuntime } = probed;
-    runtime = publicRuntime;
+    runtime = {
+      ...publicRuntime,
+      releaseRecognition: pinned.releaseRecognition
+    };
   } catch (error) {
     try { clearProviderCapabilityReceipt(); } catch {}
     runtime = { ready: false, error: asErrorPayload(error) };
@@ -3136,7 +3139,15 @@ async function handleSetup(raw) {
       ? ["Install with `npm install -g @xai-official/grok`, then retry."]
       : runtime.error.code === "E_AUTH_REQUIRED"
         ? ["Authenticate with `grok login`, then retry."]
-        : ["Update to a compatible Grok CLI and review the reported capability or platform limitation before retrying."];
+        : runtime.error.code === "E_GROK_SOURCE"
+          ? ["Use the active Grok-managed installation; arbitrary unfamiliar `GROK_BIN` or `PATH` executables are not accepted."]
+          : runtime.error.code === "E_GROK_VERSION"
+            ? ["Activate a stable Grok version 0.2.99 or newer; malformed and prerelease versions are not admitted."]
+            : runtime.error.code === "E_PROCESS_IDENTITY"
+              ? ["Restore the active managed link and executable bytes to a stable state, then retry setup."]
+              : runtime.error.code === "E_CAPABILITY"
+                ? ["The exact pinned Grok binary is present but did not satisfy a required runtime capability; review the reported probe failure."]
+                : ["Review the reported prerequisite or platform limitation before retrying."];
   const result = { ready: !runtime.error, grok: runtime, config: config(root), disclosure: "Grok/xAI may process task prompts, selected repository content, provider-tool output, and imported Claude Code or privacy-filtered Codex transcript context. Each task lineage uses a private Grok home under this workspace's plugin state; its sanitized cached credential is removed before the task prompt is sent, while provider session data may remain for explicit resume. Imported sessions remain under ~/.grok/sessions. Each headless review uses a private per-job home and removes it on completion or verified crash recovery.", nextSteps };
   out(options.json ? result : [`Grok Companion: ${result.ready ? "ready" : "not ready"}`, result.disclosure, ...(result.grok.version ? [`Grok ${result.grok.version}; ACP v${result.grok.protocolVersion}`, `Models: ${result.grok.models.map((x) => x.id).join(", ")}`] : [result.grok.error?.message]), `Stop gate: ${result.config.stopReviewGate ? "enabled" : "disabled"}`, ...result.nextSteps].join("\n"), options.json);
 }

@@ -71,7 +71,7 @@ export function rethrowStorageCapability(error) {
 
 export function exitCodeFor(error) {
   if (error?.code === "E_USAGE") return EXIT.USAGE;
-  if (["E_GIT_REQUIRED", "E_GROK_NOT_FOUND", "E_GROK_VERSION", "E_AUTH_REQUIRED", "E_CAPABILITY", "E_POLICY", "E_STORAGE_READONLY"].includes(error?.code)) return EXIT.PREREQ;
+  if (["E_GIT_REQUIRED", "E_GROK_NOT_FOUND", "E_GROK_SOURCE", "E_GROK_VERSION", "E_AUTH_REQUIRED", "E_CAPABILITY", "E_POLICY", "E_STORAGE_READONLY"].includes(error?.code)) return EXIT.PREREQ;
   if (["E_SCHEMA", "E_IMPORT_SOURCE", "E_IMPORT_RESULT", "E_JOB_NOT_FOUND", "E_JOB_ACTIVE", "E_NO_RESUME_CANDIDATE", "E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE", "E_INPUT_READ", "E_INPUT_TIMEOUT"].includes(error?.code)) return EXIT.VALIDATION;
   if (error?.code === "E_CANCELLED") return EXIT.CANCELLED;
   if (["E_RECURSION", "E_REVIEW_MUTATED_WORKSPACE", "E_PROCESS_IDENTITY", "E_SCOPE_VIOLATION", "E_SECURITY_PROFILE"].includes(error?.code)) return EXIT.SAFETY;

@@ -2,12 +2,15 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 import { CompanionError } from "./errors.mjs";
 import {
   OFFICIAL_GROK_RELEASES,
   assertExecutableAttestation,
   captureGrokExecutableIdentity,
+  createManagedObservedAttestation,
+  executableReleaseRecognition,
   materializePinnedGrokExecutable,
   sameExecutableAttestation
 } from "./executable-identity.mjs";
@@ -26,6 +29,11 @@ const PIN_RECORD_FILE = /^gpin-[0-9a-f]{32}\.json$/;
 const PIN_BINARY_FILE = /^grok-[0-9a-f]{32}(?:\.exe)?$/;
 const SHA256_HEX = /^[a-f0-9]{64}$/;
 const MAX_PIN_RECORD_BYTES = 64 * 1024;
+const MAX_GROK_CONFIG_BYTES = 64 * 1024;
+const MAX_VERSION_OUTPUT_BYTES = 64 * 1024;
+const STABLE_SEMVER =
+  /^((?:0|[1-9]\d*))\.((?:0|[1-9]\d*))\.((?:0|[1-9]\d*))$/;
+const MIN_GROK_VERSION = Object.freeze([0n, 2n, 99n]);
 
 const LAUNCH_BINDING_KEYS = new Set([
   "schemaVersion",
@@ -191,7 +199,7 @@ export function assertProviderLaunchBinding(binding) {
     || !SHA256_HEX.test(binding.releaseIdentityDigest || "")) {
     throw new CompanionError(
       "E_CAPABILITY",
-      "Provider launch binding is missing, malformed, or non-official."
+      "Provider launch binding is missing or malformed."
     );
   }
   return Object.freeze({ ...binding });
@@ -269,26 +277,320 @@ function executableOnPath(name, env, platform) {
   return matches;
 }
 
-function findNpmLauncherPackageRoot(candidate) {
-  let current = path.dirname(candidate);
-  for (let depth = 0; depth < 8; depth += 1) {
-    const manifest = path.join(current, "package.json");
-    try {
-      const parsed = JSON.parse(fs.readFileSync(manifest, "utf8"));
-      if (parsed?.name === "@xai-official/grok") {
-        return Object.freeze({
-          root: current,
-          version: typeof parsed.version === "string" ? parsed.version : null
-        });
-      }
-    } catch {
-      // Continue walking through npm prefix/symlink layouts.
+function grokInstaller(grokHome) {
+  const configFile = path.join(grokHome, "config.toml");
+  let source;
+  let before;
+  let after;
+  try {
+    before = fs.lstatSync(configFile);
+    if (!before.isFile()
+      || before.isSymbolicLink()
+      || before.size < 1
+      || before.size > MAX_GROK_CONFIG_BYTES
+      || (before.mode & 0o022) !== 0
+      || (typeof process.getuid === "function" && before.uid !== process.getuid())
+      || fs.realpathSync(configFile) !== configFile) {
+      throw new Error("unsafe config");
     }
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    current = parent;
+    source = fs.readFileSync(configFile, "utf8");
+    after = fs.lstatSync(configFile);
+    if (before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.mode !== after.mode
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs) {
+      throw new Error("config changed");
+    }
+  } catch {
+    throw new CompanionError(
+      "E_GROK_SOURCE",
+      "The active Grok installation has no bounded canonical cli.installer setting."
+    );
   }
-  return null;
+  let inCli = false;
+  let installer = null;
+  for (const line of source.split(/\r?\n/)) {
+    if (/^\s*\[cli\]\s*(?:#.*)?$/.test(line)) {
+      inCli = true;
+      continue;
+    }
+    if (/^\s*\[[^\]]+\]/.test(line)) {
+      inCli = false;
+      continue;
+    }
+    if (!inCli) continue;
+    const match = line.match(/^\s*installer\s*=\s*"(internal|npm)"\s*(?:#.*)?$/);
+    if (!match) continue;
+    if (installer !== null) {
+      throw new CompanionError(
+        "E_GROK_SOURCE",
+        "The active Grok installation has an ambiguous cli.installer setting."
+      );
+    }
+    installer = match[1];
+  }
+  if (!installer) {
+    throw new CompanionError(
+      "E_GROK_SOURCE",
+      "The active Grok installation does not declare cli.installer."
+    );
+  }
+  return Object.freeze({
+    installer,
+    contentDigest: stableDigest({ source }),
+    identityDigest: stableDigest({
+      device: String(after.dev),
+      inode: String(after.ino),
+      mode: after.mode,
+      size: after.size,
+      mtimeMs: after.mtimeMs
+    })
+  });
+}
+
+function semverAtLeastFloor(version) {
+  const match = String(version || "").match(STABLE_SEMVER);
+  if (!match) {
+    throw new CompanionError(
+      "E_GROK_VERSION",
+      "The active managed Grok filename does not contain a stable semantic version."
+    );
+  }
+  const parts = match.slice(1).map(BigInt);
+  for (let index = 0; index < parts.length; index += 1) {
+    if (parts[index] > MIN_GROK_VERSION[index]) return version;
+    if (parts[index] < MIN_GROK_VERSION[index]) {
+      throw new CompanionError(
+        "E_GROK_VERSION",
+        `Grok ${version} is too old; 0.2.99 or newer is required.`
+      );
+    }
+  }
+  return version;
+}
+
+function donorPlatformName(platform) {
+  if (platform === "darwin") return "macos";
+  return platform;
+}
+
+function donorArchitectureName(arch) {
+  if (arch === "arm64") return "aarch64";
+  if (arch === "x64") return "x86_64";
+  return arch;
+}
+
+function managedDirectoryIdentity(directory, label) {
+  try {
+    const canonical = fs.realpathSync(directory);
+    const stat = fs.lstatSync(canonical);
+    const currentUid = typeof process.getuid === "function"
+      ? process.getuid()
+      : null;
+    if (canonical !== directory
+      || !stat.isDirectory()
+      || stat.isSymbolicLink()
+      || (stat.mode & 0o022) !== 0
+      || (currentUid !== null && stat.uid !== currentUid)) {
+      throw new Error("unsafe managed directory");
+    }
+    return stableDigest({
+      device: String(stat.dev),
+      inode: String(stat.ino),
+      mode: stat.mode,
+      uid: currentUid === null ? null : stat.uid,
+      mtimeMs: stat.mtimeMs
+    });
+  } catch {
+    throw new CompanionError(
+      "E_GROK_SOURCE",
+      `The active Grok ${label} has unsafe ownership, permissions, or indirection.`
+    );
+  }
+}
+
+function managedInstallation({
+  grokHome,
+  platform,
+  arch
+}) {
+  let canonicalHome;
+  try {
+    canonicalHome = fs.realpathSync(path.resolve(grokHome));
+  } catch {
+    return null;
+  }
+  const binaryName = platform === "win32" ? "grok.exe" : "grok";
+  const binDirectory = path.join(canonicalHome, "bin");
+  const activePath = path.join(binDirectory, binaryName);
+  let target;
+  let linkIdentity;
+  let rawTarget;
+  let link;
+  try {
+    link = fs.lstatSync(activePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw new CompanionError(
+      "E_GROK_SOURCE",
+      "The active Grok managed link could not be inspected."
+    );
+  }
+  const homeIdentity = managedDirectoryIdentity(
+    canonicalHome,
+    "managed home"
+  );
+  const binIdentity = managedDirectoryIdentity(
+    binDirectory,
+    "managed bin directory"
+  );
+  if (!link.isSymbolicLink()) {
+    throw new CompanionError(
+      "E_GROK_SOURCE",
+      "The active Grok path is not a managed symbolic link."
+    );
+  }
+  const currentUid = typeof process.getuid === "function"
+    ? process.getuid()
+    : null;
+  if (currentUid !== null && link.uid !== currentUid) {
+    throw new CompanionError(
+      "E_GROK_SOURCE",
+      "The active Grok managed link is not owned by the current user."
+    );
+  }
+  try {
+    rawTarget = fs.readlinkSync(activePath);
+    target = fs.realpathSync(activePath);
+    const afterLink = fs.lstatSync(activePath);
+    if (link.dev !== afterLink.dev
+      || link.ino !== afterLink.ino
+      || link.mode !== afterLink.mode
+      || link.size !== afterLink.size
+      || link.mtimeMs !== afterLink.mtimeMs
+      || rawTarget !== fs.readlinkSync(activePath)) {
+      throw new Error("managed link changed");
+    }
+    linkIdentity = stableDigest({
+      device: String(afterLink.dev),
+      inode: String(afterLink.ino),
+      mode: afterLink.mode,
+      size: afterLink.size,
+      mtimeMs: afterLink.mtimeMs,
+      rawTarget
+    });
+  } catch {
+    throw new CompanionError(
+      "E_GROK_SOURCE",
+      "The active Grok managed link is stale or unstable."
+    );
+  }
+  const installerRecord = grokInstaller(canonicalHome);
+  const { installer } = installerRecord;
+  const targetName = path.basename(target);
+  let versionText;
+  let expectedDirectory;
+  if (installer === "internal") {
+    const suffix = `-${donorPlatformName(platform)}-${donorArchitectureName(arch)}`;
+    if (!targetName.startsWith("grok-") || !targetName.endsWith(suffix)) {
+      throw new CompanionError(
+        "E_GROK_VERSION",
+        "The active internal Grok target has a malformed versioned filename."
+      );
+    }
+    versionText = targetName.slice("grok-".length, -suffix.length);
+    expectedDirectory = path.join(canonicalHome, "downloads");
+  } else {
+    const suffix = platform === "win32" ? ".exe" : "";
+    if (!targetName.startsWith("grok-") || !targetName.endsWith(suffix)) {
+      throw new CompanionError(
+        "E_GROK_VERSION",
+        "The active npm Grok target has a malformed versioned filename."
+      );
+    }
+    versionText = targetName.slice("grok-".length, suffix ? -suffix.length : undefined);
+    expectedDirectory = path.join(canonicalHome, "bin");
+  }
+  const version = semverAtLeastFloor(versionText);
+  let canonicalDirectory;
+  try {
+    canonicalDirectory = fs.realpathSync(expectedDirectory);
+  } catch {
+    throw new CompanionError(
+      "E_GROK_SOURCE",
+      "The active Grok target is outside its declared installer layout."
+    );
+  }
+  const targetDirectoryIdentity = managedDirectoryIdentity(
+    expectedDirectory,
+    "managed target directory"
+  );
+  if (path.dirname(target) !== canonicalDirectory) {
+    throw new CompanionError(
+      "E_GROK_SOURCE",
+      "The active Grok target escaped its declared installer layout."
+    );
+  }
+  let targetStat;
+  try {
+    targetStat = fs.lstatSync(target);
+    fs.accessSync(target, fs.constants.X_OK);
+  } catch {
+    throw new CompanionError(
+      "E_GROK_SOURCE",
+      "The active managed Grok target is missing or unreadable."
+    );
+  }
+  if (!targetStat.isFile()
+    || targetStat.isSymbolicLink()
+    || (targetStat.mode & 0o111) === 0
+    || (targetStat.mode & 0o022) !== 0
+    || (currentUid !== null && targetStat.uid !== currentUid)) {
+    throw new CompanionError(
+      "E_GROK_SOURCE",
+      "The active managed Grok target has unsafe ownership or permissions."
+    );
+  }
+  const targetIdentity = stableDigest({
+    device: String(targetStat.dev),
+    inode: String(targetStat.ino),
+    mode: targetStat.mode,
+    uid: currentUid === null ? null : targetStat.uid,
+    size: targetStat.size,
+    mtimeMs: targetStat.mtimeMs
+  });
+  return Object.freeze({
+    canonicalPath: target,
+    release: Object.freeze({
+      releaseRecognition: "managed-observed",
+      releaseSource: "managed-observed-v1",
+      sourceProvenanceDigest: stableDigest({
+        schemaVersion: 1,
+        installer,
+        configDigest: installerRecord.contentDigest,
+        targetName,
+        platform,
+        arch,
+        version
+      }),
+      platform,
+      arch,
+      version,
+      buildCommit: "unobserved",
+      channel: "stable"
+    }),
+    observationDigest: stableDigest({
+      homeIdentity,
+      binIdentity,
+      targetDirectoryIdentity,
+      targetIdentity,
+      installerIdentityDigest: installerRecord.identityDigest,
+      installerContentDigest: installerRecord.contentDigest,
+      linkIdentity,
+      target
+    })
+  });
 }
 
 /**
@@ -313,34 +615,6 @@ export function discoverManagedRawGrokExecutable({
   }
   pathExecutableCandidate(path.join(grokHome, "bin", binaryName), candidates);
 
-  for (let index = 0; index < candidates.length && index < 32; index += 1) {
-    const candidate = candidates[index];
-    const packageRoot = findNpmLauncherPackageRoot(candidate);
-    if (!packageRoot) continue;
-    if (packageRoot.version) {
-      pathExecutableCandidate(
-        path.join(
-          grokHome,
-          "bin",
-          platform === "win32"
-            ? `grok-${packageRoot.version}.exe`
-            : `grok-${packageRoot.version}`
-        ),
-        candidates
-      );
-    }
-    pathExecutableCandidate(
-      path.join(
-        packageRoot.root,
-        "..",
-        `grok-${platform}-${arch}`,
-        "bin",
-        binaryName
-      ),
-      candidates
-    );
-  }
-
   const failures = [];
   for (const candidate of candidates.slice(0, 32)) {
     try {
@@ -353,22 +627,57 @@ export function discoverManagedRawGrokExecutable({
       failures.push(error?.code || "E_PROCESS_IDENTITY");
     }
   }
+  const managed = managedInstallation({ grokHome, platform, arch });
+  if (managed) {
+    const captured = captureGrokExecutableIdentity(managed.canonicalPath, {
+      platform,
+      arch,
+      releases,
+      managedRelease: managed.release
+    });
+    let afterManaged;
+    try {
+      afterManaged = managedInstallation({ grokHome, platform, arch });
+    } catch {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "The active managed Grok source changed while it was captured."
+      );
+    }
+    if (!afterManaged
+      || afterManaged.canonicalPath !== managed.canonicalPath
+      || afterManaged.observationDigest !== managed.observationDigest
+      || afterManaged.release.sourceProvenanceDigest
+        !== managed.release.sourceProvenanceDigest) {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "The active managed Grok source changed while it was captured."
+      );
+    }
+    return captured;
+  }
+  if (candidates.length) {
+    throw new CompanionError(
+      "E_GROK_SOURCE",
+      "Found Grok executable candidates, but none are a known digest or the active managed installation.",
+      { discoveryFailures: failures.slice(0, 8) }
+    );
+  }
   throw new CompanionError(
     "E_GROK_NOT_FOUND",
-    "Managed raw native Grok binary was not found. Install `@xai-official/grok`, then retry setup.",
+    "Grok executable was not found. Install `@xai-official/grok`, then retry setup.",
     { discoveryFailures: failures.slice(0, 8) }
   );
 }
 
 function reattestPinnedBinary(binaryPath, expectedAttestation, {
   platform,
-  arch,
-  releases
+  arch
 }) {
   const captured = captureGrokExecutableIdentity(binaryPath, {
     platform,
     arch,
-    releases
+    expectedAttestation
   });
   if (!sameExecutableAttestation(captured.attestation, expectedAttestation)) {
     throw new CompanionError(
@@ -384,6 +693,95 @@ function removeNewPinArtifacts(layout, pinRef) {
   try {
     fs.rmSync(pinDirectoryFor(layout, pinRef), { recursive: true, force: true });
   } catch {}
+}
+
+function managedVersionEnvironment(env) {
+  const allowed = [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "PATH",
+    "SystemRoot",
+    "ComSpec",
+    "PATHEXT"
+  ];
+  const child = {};
+  for (const key of allowed) {
+    if (typeof env[key] === "string") child[key] = env[key];
+  }
+  child.GROK_COMPANION_CHILD = "1";
+  return child;
+}
+
+function finalizeManagedPinnedAttestation(materialized, env) {
+  if (materialized.attestation.schemaVersion !== 2) return materialized;
+  const run = spawnSync(materialized.canonicalPath, ["--version"], {
+    encoding: "utf8",
+    shell: false,
+    timeout: 10_000,
+    maxBuffer: MAX_VERSION_OUTPUT_BYTES,
+    env: managedVersionEnvironment(env)
+  });
+  const output = `${run.stdout || ""} ${run.stderr || ""}`.trim();
+  const versionMatch = output.match(
+    /(?:^|\s)(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?=$|\s)/
+  );
+  if (run.status !== 0
+    || run.error
+    || !versionMatch
+    || versionMatch[1] !== materialized.attestation.version) {
+    throw new CompanionError(
+      "E_GROK_VERSION",
+      "The private managed Grok copy did not report its filename-bound stable version."
+    );
+  }
+  const buildMatch = output.match(/\(([a-zA-Z0-9._-]{1,128})\)/);
+  const channelMatch = output.match(/\[([a-zA-Z0-9._-]{1,64})\]/);
+  if (!buildMatch || channelMatch?.[1] !== "stable") {
+    throw new CompanionError(
+      "E_GROK_VERSION",
+      "The private managed Grok copy did not report a build identity on the stable channel."
+    );
+  }
+  const channel = channelMatch[1];
+  const prior = materialized.attestation;
+  const attestation = createManagedObservedAttestation(materialized, {
+    releaseRecognition: prior.releaseRecognition,
+    releaseSource: prior.releaseSource,
+    sourceProvenanceDigest: prior.sourceProvenanceDigest,
+    platform: prior.platform,
+    arch: prior.arch,
+    version: prior.version,
+    buildCommit: buildMatch[1],
+    channel,
+    size: prior.size,
+    executableDigest: prior.executableDigest
+  });
+  return Object.freeze({
+    ...materialized,
+    attestation
+  });
+}
+
+function sameDiscoveredRelease(discovered, pinned) {
+  if (discovered.schemaVersion !== pinned.schemaVersion) return false;
+  if (discovered.schemaVersion === 1) {
+    return discovered.releaseIdentityDigest === pinned.releaseIdentityDigest;
+  }
+  return discovered.releaseRecognition === pinned.releaseRecognition
+    && discovered.releaseSource === pinned.releaseSource
+    && discovered.sourceProvenanceDigest === pinned.sourceProvenanceDigest
+    && discovered.platform === pinned.platform
+    && discovered.arch === pinned.arch
+    && discovered.version === pinned.version
+    && discovered.channel === pinned.channel
+    && discovered.size === pinned.size
+    && discovered.executableDigest === pinned.executableDigest;
 }
 
 function readPinRecord(layout, pinRef) {
@@ -409,7 +807,7 @@ function readActiveBinding(layout) {
 
 /**
  * Setup-owned publication. A valid active pin is reused only when it matches
- * the discovered official release. Old immutable pins are retained so already
+ * the discovered release identity. Old immutable pins are retained so already
  * admitted jobs remain launchable after a later setup rotation.
  */
 export function publishProviderExecutablePin({
@@ -438,12 +836,17 @@ export function publishProviderExecutablePin({
         arch,
         releases
       });
-      if (resolved.executableIdentity.releaseIdentityDigest
-        === discovered.attestation.releaseIdentityDigest) {
+      if (sameDiscoveredRelease(
+        discovered.attestation,
+        resolved.executableIdentity
+      )) {
         return Object.freeze({
           binding: active,
           binary: resolved.binary,
           executableIdentity: resolved.executableIdentity,
+          releaseRecognition: executableReleaseRecognition(
+            resolved.executableIdentity
+          ),
           reused: true
         });
       }
@@ -458,38 +861,43 @@ export function publishProviderExecutablePin({
   }
   const pinRef = `gpin-${crypto.randomBytes(16).toString("hex")}`;
   const pinDirectory = pinDirectoryFor(layout, pinRef);
-  const materialized = materializePinnedGrokExecutable(discovered.canonicalPath, {
-    directory: pinDirectory,
-    platform,
-    arch,
-    releases
-  });
-  const body = {
-    schemaVersion: PROVIDER_EXECUTABLE_PIN_SCHEMA_VERSION,
-    pinRef,
-    binaryPath: materialized.canonicalPath,
-    executableIdentity: materialized.attestation,
-    createdAt: new Date(observedAt).toISOString()
-  };
-  const record = Object.freeze({
-    ...body,
-    pinRecordDigest: stableDigest(body)
-  });
-  const binding = publicBindingFromRecord(record);
   try {
+    const copied = materializePinnedGrokExecutable(discovered.canonicalPath, {
+      directory: pinDirectory,
+      platform,
+      arch,
+      releases,
+      sourceIdentity: discovered
+    });
+    const materialized = finalizeManagedPinnedAttestation(copied, env);
+    const body = {
+      schemaVersion: PROVIDER_EXECUTABLE_PIN_SCHEMA_VERSION,
+      pinRef,
+      binaryPath: materialized.canonicalPath,
+      executableIdentity: materialized.attestation,
+      createdAt: new Date(observedAt).toISOString()
+    };
+    const record = Object.freeze({
+      ...body,
+      pinRecordDigest: stableDigest(body)
+    });
+    const binding = publicBindingFromRecord(record);
     writePrivateJsonFile(recordFileFor(layout, pinRef), record);
     // Publish the path-free active reference only after the immutable record.
     writePrivateJsonFile(layout.activeBindingFile, binding);
+    return Object.freeze({
+      binding,
+      binary: materialized.canonicalPath,
+      executableIdentity: materialized.attestation,
+      releaseRecognition: executableReleaseRecognition(
+        materialized.attestation
+      ),
+      reused: false
+    });
   } catch (error) {
     removeNewPinArtifacts(layout, pinRef);
     throw error;
   }
-  return Object.freeze({
-    binding,
-    binary: materialized.canonicalPath,
-    executableIdentity: materialized.attestation,
-    reused: false
-  });
 }
 
 /**
@@ -553,7 +961,7 @@ export function resolveProviderExecutablePin(binding, {
   const reattested = reattestPinnedBinary(
     record.binaryPath,
     record.executableIdentity,
-    { platform, arch, releases }
+    { platform, arch }
   );
   if (reattested.attestation.identityDigest !== expected.executableIdentityDigest
     || reattested.attestation.releaseIdentityDigest !== expected.releaseIdentityDigest) {

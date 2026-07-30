@@ -180,6 +180,37 @@ function sameBoundProviderIdentity(left, right) {
     && left.providerGeneration === right.providerGeneration;
 }
 
+function providerStartedRecoveryWasSuperseded(snapshot, latest) {
+  if (!latest) return false;
+  const before = snapshot?.request?.spawn?.dispatch;
+  const after = latest?.request?.spawn?.dispatch;
+  if (!isDispatchV2(before) || !isDispatchV2(after)) {
+    return false;
+  }
+  try {
+    assertDispatchContract(latest);
+  } catch {
+    return false;
+  }
+  const sameAttempt = after.attemptId === before.attemptId
+    && after.fence === before.fence;
+  if (!sameAttempt || after.state !== "provider-started") return true;
+  if (!terminal(latest)
+    || latest.request?.spawn?.cleanupFence != null
+    || latest.result?.taskRuntimeCleaned !== true) {
+    return false;
+  }
+  try {
+    return [
+      latest.controllerProcess,
+      latest.workerProcess,
+      latest.providerProcess
+    ].every(processGroupGone);
+  } catch {
+    return false;
+  }
+}
+
 function recoveryProviderGuardBinding(job, intent, authenticated) {
   const spawn = job?.request?.spawn;
   const executableBound = Boolean(
@@ -697,6 +728,7 @@ export async function recoverLostProviderStartedWorker({
     cleanupBlocked(root, workerId, error.details?.warning, env);
     return { action: "cleanup-blocked", reason: "runtime-cleanup-incomplete" };
   }
+  await testHooks?.afterProviderLossSettled?.(settled);
   return restoringTerminalIntent
     ? { action: "terminalized", reason: "pending-terminal-restored", job: settled }
     : { action: "marked-lost", reason: "worker-process-not-alive", job: settled };
@@ -1168,18 +1200,33 @@ export async function reconcileBrokerWorkers({
       continue;
     }
     if (dispatch.state === "provider-started") {
-      const recovered = await recoverLostProviderStartedWorker({
-        root,
-        workerId: snapshot.id,
-        attemptId: dispatch.attemptId,
-        workerProcess,
-        controllerProcess,
-        requireControllerGone: true,
-        reconciler: true,
-        testHooks,
-        env
-      });
-      results.push({ workerId: snapshot.id, ...recovered });
+      try {
+        const recovered = await recoverLostProviderStartedWorker({
+          root,
+          workerId: snapshot.id,
+          attemptId: dispatch.attemptId,
+          workerProcess,
+          controllerProcess,
+          requireControllerGone: true,
+          reconciler: true,
+          testHooks,
+          env
+        });
+        results.push({ workerId: snapshot.id, ...recovered });
+      } catch (error) {
+        if (!["E_PROCESS_IDENTITY", "E_STATE"].includes(error?.code)
+          || !providerStartedRecoveryWasSuperseded(
+            snapshot,
+            tryReadJob(root, snapshot.id, env)
+          )) {
+          throw error;
+        }
+        results.push({
+          workerId: snapshot.id,
+          action: "none",
+          reason: "dispatch-settled-concurrently"
+        });
+      }
       continue;
     }
     results.push({ workerId: snapshot.id, action: "none", reason: "dispatch-settled" });

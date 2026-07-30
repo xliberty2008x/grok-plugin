@@ -14,8 +14,7 @@ import {
   runCodexCompanion,
   runPtyStdin,
   tempDir,
-  testEnvironment,
-  waitFor
+  testEnvironment
 } from "./helpers.mjs";
 
 const PYTHON_AVAILABLE = ptyPythonAvailable();
@@ -205,16 +204,21 @@ test("source Codex wrapper survives delayed input on a genuinely nonblocking PTY
   const job = JSON.parse(dispatch.result.stdout);
   assert.ok(job.id);
 
-  const terminal = await waitFor(() => {
-    const status = run(
-      process.execPath,
-      [pinned.codexCompanionScript, "status", job.id, "--json"],
-      { cwd: root, env: pinned.env, timeout: 5_000 }
-    );
-    if (status.status !== 0) return null;
-    const parsed = JSON.parse(status.stdout);
-    return ["completed", "failed", "cancelled"].includes(parsed.status) ? parsed : null;
-  }, { timeoutMs: 10_000 });
+  const terminalStatus = run(
+    process.execPath,
+    [
+      pinned.codexCompanionScript,
+      "status",
+      job.id,
+      "--wait",
+      "--timeout-ms",
+      "30000",
+      "--json"
+    ],
+    { cwd: root, env: pinned.env, timeout: 45_000 }
+  );
+  assert.equal(terminalStatus.status, 0, terminalStatus.stderr || terminalStatus.stdout);
+  const terminal = JSON.parse(terminalStatus.stdout);
   assert.equal(terminal.status, "completed");
   const providerStarts = readFakeLog(fake.logFile).filter(
     (entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio")
@@ -333,16 +337,21 @@ test("original issue #2 invocation waits for a delayed PTY writer without a read
   assert.doesNotMatch(dispatch.result?.stderr || "", /EAGAIN|resource temporarily unavailable/i);
   const job = JSON.parse(dispatch.result.stdout);
   assert.ok(job.id);
-  const terminal = await waitFor(() => {
-    const status = run(
-      process.execPath,
-      [pinned.codexCompanionScript, "status", job.id, "--json"],
-      { cwd: root, env: pinned.env, timeout: 5_000 }
-    );
-    if (status.status !== 0) return null;
-    const parsed = JSON.parse(status.stdout);
-    return ["completed", "failed", "cancelled"].includes(parsed.status) ? parsed : null;
-  }, { timeoutMs: 10_000 });
+  const terminalStatus = run(
+    process.execPath,
+    [
+      pinned.codexCompanionScript,
+      "status",
+      job.id,
+      "--wait",
+      "--timeout-ms",
+      "30000",
+      "--json"
+    ],
+    { cwd: root, env: pinned.env, timeout: 45_000 }
+  );
+  assert.equal(terminalStatus.status, 0, terminalStatus.stderr || terminalStatus.stdout);
+  const terminal = JSON.parse(terminalStatus.stdout);
   assert.equal(terminal.status, "completed");
   const providerStarts = readFakeLog(fake.logFile).filter(
     (entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio")

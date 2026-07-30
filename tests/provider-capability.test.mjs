@@ -41,7 +41,14 @@ function sha256(file) {
  * tiny shell script remains executable after pin copying and avoids Node 18
  * treating an extensionless JavaScript double as CommonJS.
  */
-function installVersionCapableProvider(directory, version = PINNED_PROVIDER_VERSION) {
+function installVersionCapableProvider(
+  directory,
+  version = PINNED_PROVIDER_VERSION,
+  {
+    buildCommit = "managed-test-build",
+    channel = "stable"
+  } = {}
+) {
   if (process.platform === "win32") {
     throw new Error("Provider capability pin fixtures currently target POSIX runners.");
   }
@@ -53,7 +60,7 @@ function installVersionCapableProvider(directory, version = PINNED_PROVIDER_VERS
     [
       "#!/bin/sh",
       `if [ "$1" = "--version" ]; then`,
-      `  printf '%s\\n' "grok ${version}"`,
+      `  printf '%s\\n' "grok ${version}${buildCommit ? ` (${buildCommit})` : ""}${channel ? ` [${channel}]` : ""}"`,
       "  exit 0",
       "fi",
       "exit 1",
@@ -63,6 +70,61 @@ function installVersionCapableProvider(directory, version = PINNED_PROVIDER_VERS
   );
   fs.chmodSync(binary, 0o700);
   return { binary, version };
+}
+
+function donorPlatformName(platform) {
+  return platform === "darwin" ? "macos" : platform;
+}
+
+function donorArchitectureName(arch) {
+  if (arch === "arm64") return "aarch64";
+  if (arch === "x64") return "x86_64";
+  return arch;
+}
+
+function installManagedProvider(version, {
+  installer = "internal",
+  targetDirectory = null,
+  buildCommit = "managed-test-build",
+  channel = "stable"
+} = {}) {
+  const home = tempDir("grok-managed-home-");
+  const grokHome = path.join(home, ".grok");
+  const bin = path.join(grokHome, "bin");
+  const managedDirectory = targetDirectory || (
+    installer === "internal" ? path.join(grokHome, "downloads") : bin
+  );
+  fs.mkdirSync(bin, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(managedDirectory, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(
+    path.join(grokHome, "config.toml"),
+    `[cli]\ninstaller = "${installer}"\n`,
+    { mode: 0o600 }
+  );
+  const targetName = installer === "internal"
+    ? `grok-${version}-${donorPlatformName(process.platform)}-${donorArchitectureName(process.arch)}`
+    : `grok-${version}`;
+  const installed = installVersionCapableProvider(
+    managedDirectory,
+    version,
+    { buildCommit, channel }
+  );
+  const target = path.join(managedDirectory, targetName);
+  fs.renameSync(installed.binary, target);
+  fs.symlinkSync(path.relative(bin, target), path.join(bin, "grok"));
+  return {
+    home,
+    grokHome,
+    active: path.join(bin, "grok"),
+    target,
+    env: {
+      HOME: home,
+      GROK_HOME: grokHome,
+      PATH: "",
+      PLUGIN_DATA: tempDir("grok-managed-data-"),
+      GROK_COMPANION_HOST: "codex"
+    }
+  };
 }
 
 function releaseFor(fileIdentity, version = PINNED_PROVIDER_VERSION) {
@@ -186,6 +248,315 @@ test("setup discovery resolves an npm trampoline to managed raw native bytes", (
   assert.notEqual(discovered.canonicalPath, fs.realpathSync(trampoline));
 });
 
+test("future active managed Grok pins as schema v2 and raw/symlink observations agree", () => {
+  const managed = installManagedProvider("0.2.114");
+  const viaLink = discoverManagedRawGrokExecutable({
+    env: { ...managed.env, GROK_BIN: managed.active },
+    releases: []
+  });
+  const viaRaw = discoverManagedRawGrokExecutable({
+    env: { ...managed.env, GROK_BIN: managed.target },
+    releases: []
+  });
+  assert.equal(viaLink.attestation.schemaVersion, 2);
+  assert.equal(viaLink.attestation.releaseRecognition, "managed-observed");
+  assert.equal(
+    viaLink.attestation.releaseIdentityDigest,
+    viaRaw.attestation.releaseIdentityDigest
+  );
+
+  const pinned = publishProviderExecutablePin({
+    env: managed.env,
+    releases: [],
+    sourceBinary: managed.target
+  });
+  assert.equal(pinned.releaseRecognition, "managed-observed");
+  assert.equal(pinned.executableIdentity.schemaVersion, 2);
+  assert.equal(pinned.executableIdentity.buildCommit, "managed-test-build");
+  const resolved = resolveProviderExecutablePin(pinned.binding, {
+    env: managed.env,
+    releases: []
+  });
+  assert.equal(
+    resolved.executableIdentity.sourceProvenanceDigest,
+    viaRaw.attestation.sourceProvenanceDigest
+  );
+  assert.equal(
+    resolved.executableIdentity.executableDigest,
+    viaRaw.attestation.executableDigest
+  );
+  const reused = publishProviderExecutablePin({
+    env: managed.env,
+    releases: [],
+    sourceBinary: managed.active
+  });
+  assert.equal(reused.reused, true);
+  assert.equal(
+    reused.executableIdentity.identityDigest,
+    pinned.executableIdentity.identityDigest
+  );
+  const runtime = {
+    binary: pinned.binary,
+    version: "0.2.114",
+    authenticated: true,
+    protocolVersion: 1,
+    loadSession: true,
+    acpIsolation: {
+      isolated: true,
+      unattendedPrivilegeExpansion: false,
+      agentProfileDigest: sha256(
+        path.join(ROOT, "plugins/grok/provider-agents/setup-probe.md")
+      )
+    }
+  };
+  const observedAt = Date.parse("2026-07-30T10:00:00.000Z");
+  const receipt = writeProviderCapabilityReceipt({
+    runtime,
+    providerLaunchBinding: pinned.binding,
+    env: managed.env,
+    releases: [],
+    clock: () => observedAt
+  });
+  assert.equal(receipt.providerVersion, "0.2.114");
+  assert.ok(readValidProviderCapabilityReceipt({
+    env: managed.env,
+    releases: [],
+    clock: () => observedAt + 1
+  }));
+});
+
+test("future npm-managed Grok and unbounded stable SemVer components pin as schema v2", () => {
+  for (const [version, installer] of [
+    ["0.2.115", "npm"],
+    ["9999999999.2.114", "internal"]
+  ]) {
+    const managed = installManagedProvider(version, { installer });
+    const discovered = discoverManagedRawGrokExecutable({
+      env: managed.env,
+      releases: []
+    });
+    assert.equal(discovered.attestation.schemaVersion, 2);
+    assert.equal(discovered.attestation.releaseRecognition, "managed-observed");
+    assert.equal(discovered.attestation.version, version);
+    assert.equal(discovered.canonicalPath, fs.realpathSync(managed.target));
+
+    const pinned = publishProviderExecutablePin({
+      env: managed.env,
+      releases: [],
+      sourceBinary: managed.active
+    });
+    assert.equal(pinned.releaseRecognition, "managed-observed");
+    assert.equal(pinned.executableIdentity.version, version);
+    assert.equal(pinned.executableIdentity.buildCommit, "managed-test-build");
+    assert.equal(
+      resolveProviderExecutablePin(pinned.binding, {
+        env: managed.env,
+        releases: []
+      }).executableIdentity.identityDigest,
+      pinned.executableIdentity.identityDigest
+    );
+  }
+});
+
+test("managed discovery rejects arbitrary, escaped, prerelease, old, and malformed versions", () => {
+  const arbitrary = installVersionCapableProvider(
+    tempDir("grok-unmanaged-provider-"),
+    "0.2.114"
+  );
+  assert.throws(
+    () => discoverManagedRawGrokExecutable({
+      env: {
+        HOME: tempDir("grok-unmanaged-home-"),
+        GROK_BIN: arbitrary.binary,
+        PATH: ""
+      },
+      releases: []
+    }),
+    (error) => error?.code === "E_GROK_SOURCE"
+  );
+
+  const escapedDirectory = tempDir("grok-managed-escaped-");
+  const escaped = installManagedProvider("0.2.114", {
+    targetDirectory: escapedDirectory
+  });
+  fs.symlinkSync(
+    escapedDirectory,
+    path.join(escaped.grokHome, "downloads")
+  );
+  assert.throws(
+    () => discoverManagedRawGrokExecutable({
+      env: escaped.env,
+      releases: []
+    }),
+    (error) => error?.code === "E_GROK_SOURCE"
+  );
+
+  const stale = installManagedProvider("0.2.114");
+  fs.unlinkSync(stale.target);
+  assert.throws(
+    () => discoverManagedRawGrokExecutable({
+      env: stale.env,
+      releases: []
+    }),
+    (error) => error?.code === "E_GROK_SOURCE"
+  );
+
+  for (const version of [
+    "0.2.98",
+    "0.2.114-alpha",
+    "00.2.114"
+  ]) {
+    const invalid = installManagedProvider(version);
+    assert.throws(
+      () => discoverManagedRawGrokExecutable({
+        env: invalid.env,
+        releases: []
+      }),
+      (error) => error?.code === "E_GROK_VERSION",
+      version
+    );
+  }
+});
+
+test("known-version managed digest mismatch fails process identity", () => {
+  const managed = installManagedProvider("0.2.114");
+  const fileIdentity = captureExecutableFileIdentity(managed.target);
+  const mismatched = releaseFor({
+    ...fileIdentity,
+    executableDigest: "f".repeat(64)
+  }, "0.2.114");
+  assert.throws(
+    () => discoverManagedRawGrokExecutable({
+      env: managed.env,
+      releases: [mismatched]
+    }),
+    (error) => error?.code === "E_PROCESS_IDENTITY"
+  );
+});
+
+test("managed discovery rejects unsafe layout permissions and source races", () => {
+  const unsafe = installManagedProvider("0.2.114");
+  const unsafeBin = path.dirname(unsafe.active);
+  fs.chmodSync(unsafeBin, 0o777);
+  assert.throws(
+    () => discoverManagedRawGrokExecutable({
+      env: unsafe.env,
+      releases: []
+    }),
+    (error) => error?.code === "E_GROK_SOURCE"
+  );
+  fs.chmodSync(unsafeBin, 0o700);
+
+  const raced = installManagedProvider("0.2.114");
+  const targetDirectory = path.dirname(raced.target);
+  const replacement = installVersionCapableProvider(
+    targetDirectory,
+    "0.2.115"
+  );
+  const replacementTarget = path.join(
+    targetDirectory,
+    `grok-0.2.115-${donorPlatformName(process.platform)}-${donorArchitectureName(process.arch)}`
+  );
+  fs.renameSync(replacement.binary, replacementTarget);
+  const originalReadSync = fs.readSync;
+  let executableReads = 0;
+  fs.readSync = (...args) => {
+    const result = originalReadSync(...args);
+    executableReads += 1;
+    if (executableReads === 2) {
+      fs.unlinkSync(raced.active);
+      fs.symlinkSync(
+        path.relative(path.dirname(raced.active), replacementTarget),
+        raced.active
+      );
+    }
+    return result;
+  };
+  try {
+    assert.throws(
+      () => discoverManagedRawGrokExecutable({
+        env: raced.env,
+        releases: []
+      }),
+      (error) => error?.code === "E_PROCESS_IDENTITY"
+    );
+  } finally {
+    fs.readSync = originalReadSync;
+  }
+
+  const dangling = installManagedProvider("0.2.114");
+  const originalReadlinkSync = fs.readlinkSync;
+  let managedLinkReads = 0;
+  fs.readlinkSync = (...args) => {
+    const result = originalReadlinkSync(...args);
+    managedLinkReads += 1;
+    if (managedLinkReads === 3) fs.unlinkSync(dangling.target);
+    return result;
+  };
+  try {
+    assert.throws(
+      () => discoverManagedRawGrokExecutable({
+        env: dangling.env,
+        releases: []
+      }),
+      (error) => error?.code === "E_PROCESS_IDENTITY"
+    );
+  } finally {
+    fs.readlinkSync = originalReadlinkSync;
+  }
+});
+
+test("managed pin requires an observed build identity and stable channel", () => {
+  for (const metadata of [
+    { buildCommit: null, channel: "stable" },
+    { buildCommit: "managed-test-build", channel: null },
+    { buildCommit: "managed-test-build", channel: "alpha" }
+  ]) {
+    const managed = installManagedProvider("0.2.114", metadata);
+    assert.throws(
+      () => publishProviderExecutablePin({
+        env: managed.env,
+        releases: [],
+        sourceBinary: managed.active
+      }),
+      (error) => error?.code === "E_GROK_VERSION"
+    );
+    assert.equal(
+      fs.existsSync(path.join(managed.env.PLUGIN_DATA, "provider-launch", "records")),
+      true
+    );
+    assert.deepEqual(
+      fs.readdirSync(
+        path.join(managed.env.PLUGIN_DATA, "provider-launch", "records")
+      ),
+      []
+    );
+    assert.deepEqual(
+      fs.readdirSync(
+        path.join(managed.env.PLUGIN_DATA, "provider-launch", "pins")
+      ),
+      []
+    );
+  }
+});
+
+test("an existing Grok home without an active candidate is not found", () => {
+  const home = tempDir("grok-empty-home-");
+  const grokHome = path.join(home, ".grok");
+  fs.mkdirSync(grokHome, { mode: 0o700 });
+  assert.throws(
+    () => discoverManagedRawGrokExecutable({
+      env: {
+        HOME: home,
+        GROK_HOME: grokHome,
+        PATH: ""
+      },
+      releases: []
+    }),
+    (error) => error?.code === "E_GROK_NOT_FOUND"
+  );
+});
+
 test("provider capability v2 is path-free, pin-bound, tamper-evident, and durably clearable", (t) => {
   const state = fixture();
   const issuedAt = Date.parse("2026-07-23T10:00:00.000Z");
@@ -292,6 +663,19 @@ test("provider capability v2 fails closed on expiry, v1, and bound identity drif
   fs.writeFileSync(state.receiptFile, `${JSON.stringify(stored)}\n`, { mode: 0o600 });
   assert.equal(readReceipt(state, validOptions), null);
   assert.equal(receipt.mcpCapabilityContractVersion, MCP_CAPABILITY_CONTRACT_VERSION);
+});
+
+test("historical schema-v1 pin replay does not require its release-table row", () => {
+  const state = fixture();
+  const resolved = resolveProviderExecutablePin(state.pinned.binding, {
+    env: state.env,
+    releases: []
+  });
+  assert.equal(resolved.executableIdentity.schemaVersion, 1);
+  assert.equal(
+    resolved.executableIdentity.identityDigest,
+    state.pinned.executableIdentity.identityDigest
+  );
 });
 
 test("provider capability rejects reordered, duplicated, and extra capability entries", () => {

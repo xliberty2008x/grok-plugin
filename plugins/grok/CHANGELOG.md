@@ -4,6 +4,20 @@
 
 Status: hardening candidate; not release-qualified.
 
+- Replaced the stale exact-version setup ceiling with forward admission for
+  stable Grok Build 0.2.99 and newer. Recorded release digests remain the
+  stronger `known-digest` path; unfamiliar versions are accepted only from the
+  active Grok-managed `cli.installer` layout, captured without executing the
+  discovery path, copied and rehashed into the private immutable pin, then
+  probed from that exact copy. Managed releases use backward-compatible
+  executable-attestation schema v2 and report `managed-observed`; this records
+  exact bytes and source provenance without fabricating npm integrity or Git
+  provenance and does not prove that xAI issued the initial bytes. Arbitrary
+  unfamiliar `GROK_BIN`/`PATH` executables fail with `E_GROK_SOURCE`; malformed
+  or below-floor versions use `E_GROK_VERSION`; known digest mismatches and
+  capture drift use `E_PROCESS_IDENTITY`. Schema-v1 pins, launch binding schema
+  1, capability receipt schema 2, historical pins, receipt expiry, and the
+  single setup retry contract remain unchanged.
 - Added first-class Grok `/deep-research` dispatch as a dedicated companion
   surface (`$grok:deep-research` / `/grok:deep-research`), not an arbitrary
   plugin runner. Jobs use kind `deep-research`, schema v3, and dedicated
@@ -217,6 +231,7 @@ Status: hardening candidate; not release-qualified.
   0.2.99 on July 13, 2026 is retained under `tests/e2e-results/` as prior
   evidence for an earlier contract and does **not** qualify the current
   hardening worktree.
-- Enforced Grok Build 0.2.99 compatibility floor. Linux remains
+- Enforced the stable Grok Build 0.2.99 compatibility floor without an upper
+  managed-version allowlist. Linux remains
   provider-unverified; Windows provider execution/process control is unsupported
   until authenticated lifecycle evidence exists.

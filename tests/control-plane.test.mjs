@@ -5716,16 +5716,17 @@ test("integration: Codex nonblocking stdin accepts arbitrary markers and records
   const job = JSON.parse(dispatched.stdout);
   assert.ok(job.id);
 
-  const terminal = await waitFor(() => {
-    const result = runCompanion(["status", job.id, "--json"], {
+  const terminalStatus = runCompanion(
+    ["status", job.id, "--wait", "--timeout-ms", "30000", "--json"],
+    {
       cwd: root,
       env: pinned.env,
+      timeout: 45_000,
       companionScript: pinned.codexCompanionScript
-    });
-    if (result.status !== 0) return null;
-    const status = JSON.parse(result.stdout);
-    return ["completed", "failed", "cancelled"].includes(status.status) ? status : null;
-  }, { timeoutMs: 10000 });
+    }
+  );
+  assert.equal(terminalStatus.status, 0, terminalStatus.stderr || terminalStatus.stdout);
+  const terminal = JSON.parse(terminalStatus.stdout);
   assert.equal(terminal.status, "completed");
   const providerStarts = readFakeLog(fake.logFile).filter(
     (entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio")

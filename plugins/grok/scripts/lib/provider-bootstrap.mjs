@@ -739,7 +739,8 @@ export async function runProviderBootstrap({
     if (executableAttestedLaunch) {
       await testHooks?.beforeExecutableRecapture?.({ spec, providerProcess });
       capturedExecutableIdentity = captureExecutableIdentity(spec.binary, {
-        env: grokEnvironment
+        env: grokEnvironment,
+        expectedAttestation: spec.executableIdentity
       });
       if (!sameExecutableAttestation(
         capturedExecutableIdentity?.attestation,
