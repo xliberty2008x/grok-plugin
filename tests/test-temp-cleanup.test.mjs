@@ -329,6 +329,9 @@ test("legacy allowlist exactly covers checked-in literal system-temp allocation 
     // through a local variable rather than in the same allocation expression.
     "grok-ci-auth-installer-",
     "grok-ci-auth-test-",
+    // Historical prefix retained so legacy cleanup remains source-proven after
+    // shortening the fixture path for macOS filename-component limits.
+    "deep-research-pinned-plugin-",
     "grok-installed-worker-mcp-",
     "grok-mcp-client-",
     "grok-mcp-reflection-secret-",
@@ -1139,6 +1142,41 @@ test("deterministic runner preserves one manifest-backed run root when containme
   assert.equal(launches, 1);
   const entries = fs.readdirSync(root);
   assert.equal(entries.filter((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)).length, 1);
+});
+
+test("sync deterministic runner preserves its run root on bounded-output containment failures", (t) => {
+  for (const errorCode of ["ENOBUFS", "E_TEST_TEMP_CONTAINMENT"]) {
+    const root = sandbox(t);
+    let diagnostics = "";
+    let launches = 0;
+    const status = runDeterministicTestFiles({
+      files: ["tests/fixture.test.mjs", "tests/must-not-start.test.mjs"],
+      root: ROOT,
+      reporter: REPORTER,
+      tempRoot: root,
+      run: () => {
+        launches += 1;
+        return {
+          status: null,
+          signal: null,
+          error: { code: errorCode },
+          stderr: "",
+          stdout: ""
+        };
+      },
+      stdout: { write() {} },
+      stderr: { write(value) { diagnostics += value; } }
+    });
+    assert.equal(status, 1, errorCode);
+    assert.equal(launches, 1, errorCode);
+    assert.match(diagnostics, /containment could not be proven/, errorCode);
+    assert.match(diagnostics, /preserved for stale reaping/, errorCode);
+    assert.equal(
+      fs.readdirSync(root).filter((name) => name.startsWith(TEST_TEMP_RUN_PREFIX)).length,
+      1,
+      errorCode
+    );
+  }
 });
 
 test("startup visibility failure is containment failure, not generic cleanup", (t) => {

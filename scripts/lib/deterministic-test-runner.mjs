@@ -597,6 +597,8 @@ export function runDeterministicTestFiles({
           : `Deterministic test child ${child} completed in ${elapsed} ms.\n`);
         containmentUnproven = result?.status === CONTAINMENT_FAILURE_EXIT_CODE
           || result?.error?.code === "ETIMEDOUT"
+          || result?.error?.code === "ENOBUFS"
+          || result?.error?.code === "E_TEST_TEMP_CONTAINMENT"
           || Boolean(result?.signal);
         if (containmentUnproven) {
           preserveRunRoot = true;
