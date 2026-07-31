@@ -1953,6 +1953,30 @@ test("exact owned-root cleanup permits internal linked-worktree metadata", (t) =
   assert.equal(fs.existsSync(owned), false);
 });
 
+test("exact owned-root cleanup unlinks descendant symlinks without following them", (t) => {
+  const root = sandbox(t);
+  const owned = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_PROCESS_PREFIX,
+    kind: "process",
+    pid: process.pid,
+    startToken: "owned-descendant-symlinks"
+  });
+  const carrier = path.join(owned, "provider");
+  const outside = fs.mkdtempSync(path.join(root, "owned-symlink-canary-"));
+  const canary = path.join(outside, "keep");
+  fs.mkdirSync(carrier);
+  fs.writeFileSync(path.join(carrier, "provider.mjs"), "export {};\n");
+  fs.symlinkSync("provider.mjs", path.join(carrier, "grok"));
+  fs.symlinkSync("missing-provider", path.join(carrier, "dangling"));
+  fs.writeFileSync(canary, "keep");
+  fs.symlinkSync(outside, path.join(owned, "outside-link"));
+
+  assert.equal(removeOwnedTestTempRoot(owned), true);
+  assert.equal(fs.existsSync(owned), false);
+  assert.equal(fs.readFileSync(canary, "utf8"), "keep");
+});
+
 test("managed cleanup canonicalizes Darwin system-temp aliases end to end", (t) => {
   const root = sandbox(t);
   const aliasRoot = darwinSystemAlias(root);

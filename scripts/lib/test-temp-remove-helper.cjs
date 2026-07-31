@@ -523,10 +523,12 @@ if (!mountBoundary.available || mountBoundary.nested.length > 0) {
 }
 
 let managedProof = null;
+let canonicalCurrentDirectory = null;
 if (cleanupMode === "managed-contained") {
   removeDiagnosticStage = "managed-proof";
   const currentDirectory = canonicalContainedPath(".");
   if (!isWithin(canonicalManagedRoot, currentDirectory)) process.exit(43);
+  canonicalCurrentDirectory = currentDirectory;
   if (currentDirectory === canonicalManagedRoot) {
     const inspection = inspectContainedGitMetadata({
       root: canonicalManagedRoot,
@@ -564,13 +566,16 @@ if (cleanupMode === "managed-contained") {
 }
 
 function managedRelative(target) {
-  let resolved;
-  try {
-    resolved = canonicalContainedPath(target);
-  } catch {
+  const resolved = normalizeDarwinSystemPath(target);
+  if (
+    !isWithin(canonicalManagedRoot, resolved)
+    || (
+      resolved !== canonicalCurrentDirectory
+      && path.dirname(resolved) !== canonicalCurrentDirectory
+    )
+  ) {
     process.exit(43);
   }
-  if (!isWithin(canonicalManagedRoot, resolved)) process.exit(43);
   return path.relative(canonicalManagedRoot, resolved);
 }
 
