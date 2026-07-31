@@ -2090,9 +2090,7 @@ test("legacy CLI cancel extracts the broker object authorization nonce", async (
 });
 
 test("CLI cancel terminalizes only cleanup-proven broker boundaries and retains ambiguous launch states", { timeout: 60_000 }, async () => {
-  const root = fs.realpathSync(initRepo());
   const runtime = codexBrokerFixture();
-  const stateRoot = workspaceState(root, runtime.env);
   const cases = [
     {
       name: "pending",
@@ -2121,10 +2119,19 @@ test("CLI cancel terminalizes only cleanup-proven broker boundaries and retains 
     }
   ];
 
+  // These cases assert independent launch-boundary semantics. Give each one a
+  // private workspace so parallel CLI recovery cannot turn the test into a
+  // shared state-lock scheduling benchmark.
   for (const fixture of cases) {
-    const spawned = spawnPendingBrokerJob(root, runtime, `runtime-cancel-settlement-${fixture.name}`);
+    fixture.root = fs.realpathSync(initRepo());
+    fixture.stateRoot = workspaceState(fixture.root, runtime.env);
+    const spawned = spawnPendingBrokerJob(
+      fixture.root,
+      runtime,
+      `runtime-cancel-settlement-${fixture.name}`
+    );
     fixture.id = spawned.handle.id;
-    updateJob(root, fixture.id, (job) => {
+    updateJob(fixture.root, fixture.id, (job) => {
       const spawnState = { ...job.request.spawn };
       if (fixture.launch) Object.assign(spawnState, fixture.launch);
       else {
@@ -2137,16 +2144,25 @@ test("CLI cancel terminalizes only cleanup-proven broker boundaries and retains 
         request: { ...job.request, spawn: spawnState }
       };
     }, runtime.env);
-    fixture.before = readJob(root, fixture.id, runtime.env);
+    fixture.before = readJob(fixture.root, fixture.id, runtime.env);
     fixture.nonce = fixture.before.workerAuthorization.nonce;
-    fixture.runtimeFile = path.join(stateRoot, "task-homes", fixture.id, ".grok", "auth.json");
+    fixture.runtimeFile = path.join(
+      fixture.stateRoot,
+      "task-homes",
+      fixture.id,
+      ".grok",
+      "auth.json"
+    );
     fs.mkdirSync(path.dirname(fixture.runtimeFile), { recursive: true, mode: 0o700 });
     fs.writeFileSync(fixture.runtimeFile, `private-${fixture.name}-runtime\n`, { mode: 0o600 });
   }
 
   const canceling = cases.map((fixture) => ({
     fixture,
-    process: spawnCompanion(["cancel", fixture.id, "--json"], { cwd: root, env: runtime.env })
+    process: spawnCompanion(
+      ["cancel", fixture.id, "--json"],
+      { cwd: fixture.root, env: runtime.env }
+    )
   }));
 
   const outcomes = await Promise.all(canceling.map(async ({ fixture, process: running }) => ({
@@ -2156,8 +2172,8 @@ test("CLI cancel terminalizes only cleanup-proven broker boundaries and retains 
   for (const { fixture, completed } of outcomes) {
     assert.equal(completed.code, 0, completed.stderr || completed.stdout);
     const projected = JSON.parse(completed.stdout);
-    const stored = readJob(root, fixture.id, runtime.env);
-    const marker = path.join(stateRoot, "jobs", `${fixture.id}.cancel`);
+    const stored = readJob(fixture.root, fixture.id, runtime.env);
+    const marker = path.join(fixture.stateRoot, "jobs", `${fixture.id}.cancel`);
     assert.equal(fs.readFileSync(marker, "utf8"), `${fixture.nonce}\n`);
 
     if (!fixture.retained) {
@@ -2186,7 +2202,10 @@ test("CLI cancel terminalizes only cleanup-proven broker boundaries and retains 
     assert.equal(fs.existsSync(fixture.runtimeFile), true, `${fixture.name} runtime must be retained`);
     assert.doesNotMatch(stored.error?.message || "", new RegExp(fixture.id));
     assert.doesNotMatch(stored.error?.message || "", new RegExp(fixture.nonce));
-    assert.doesNotMatch(completed.stdout, new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.doesNotMatch(
+      completed.stdout,
+      new RegExp(fixture.root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    );
     assert.doesNotMatch(completed.stderr, new RegExp(fixture.nonce));
   }
 });
