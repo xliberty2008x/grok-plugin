@@ -1156,8 +1156,8 @@ function parseRegisteredWorktreeOutput(stdout, canonicalRepoRoot) {
       inRecord = true;
       continue;
     }
-    if (!inRecord || line === "bare" || !(
-      /^(?:HEAD [a-fA-F0-9]{40,64}|branch \S+|detached|locked(?: .*)?|prunable(?: .*)?)$/u.test(line)
+    if (!inRecord || !(
+      /^(?:HEAD [a-fA-F0-9]{40,64}|branch \S+|bare|detached|locked(?: .*)?|prunable(?: .*)?)$/u.test(line)
     )) {
       throw new Error("Git returned invalid worktree porcelain output.");
     }

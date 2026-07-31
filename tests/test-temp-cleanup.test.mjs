@@ -873,6 +873,31 @@ test("worktree metadata proof supports linked checkouts and scrubs ambient Git a
   assert.deepEqual(calls[0].args, ["worktree", "list", "--porcelain"]);
 });
 
+test("worktree metadata proof accepts a bare main record with a linked checkout", (t) => {
+  const fixture = worktreeMetadataFixture(t, { linked: true });
+  let calls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run() {
+      calls += 1;
+      return {
+        status: 0,
+        stdout: [
+          `worktree ${fixture.commonDir}`,
+          "bare",
+          "",
+          worktreePorcelain([fixture.repo])
+        ].join("\n")
+      };
+    }
+  });
+  const result = provider();
+  assert.equal(result.available, true);
+  assert.ok(result.paths.includes(fixture.commonDir));
+  assert.ok(result.paths.includes(fixture.repo));
+  assert.equal(calls, 1);
+});
+
 test("worktree metadata proof supports a live relative registration gitdir", (t) => {
   const fixture = worktreeMetadataFixture(t, { linked: true });
   const relativeWorktree = path.join(fixture.root, "relative-worktree");
