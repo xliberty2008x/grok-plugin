@@ -21,7 +21,10 @@ import {
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import { reconcileBrokerWorkers } from "../plugins/grok/scripts/lib/worker-recovery.mjs";
 import { processGroupGone, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
-import { createExecutableAttestation } from "../plugins/grok/scripts/lib/executable-identity.mjs";
+import {
+  createExecutableAttestation,
+  createManagedObservedAttestation
+} from "../plugins/grok/scripts/lib/executable-identity.mjs";
 import {
   loadProviderGuard,
   registerProviderGuard,
@@ -74,6 +77,25 @@ const TEST_EXECUTABLE_IDENTITY = createExecutableAttestation({
   channel: "stable",
   size: 4096,
   executableDigest: "1".repeat(64)
+});
+const TEST_MANAGED_EXECUTABLE_IDENTITY = createManagedObservedAttestation({
+  canonicalPath: "/private/test/grok-managed",
+  device: "7",
+  inode: "8",
+  mode: 0o100755,
+  size: 4096,
+  executableDigest: "2".repeat(64)
+}, {
+  releaseRecognition: "managed-observed",
+  releaseSource: "managed-observed-v1",
+  sourceProvenanceDigest: "4".repeat(64),
+  platform: process.platform,
+  arch: process.arch,
+  version: "0.2.114",
+  buildCommit: "managed-test-build",
+  channel: "stable",
+  size: 4096,
+  executableDigest: "2".repeat(64)
 });
 
 function ownerEnvironment(pluginData) {
@@ -369,6 +391,46 @@ test("bootstrap argv contains only opaque dispatch coordinates while the private
     }),
     (error) => error?.code === "E_USAGE"
   );
+});
+
+test("provider bootstrap private spec preserves managed-observed schema v2 identity", async () => {
+  const root = "/private/control-root/managed-observed";
+  const controllerCwd = "/private/controller-cwd/managed-observed";
+  const marker = "task-aabbccddeeff0011";
+  const binding = {
+    purpose: "worktree-provisioning",
+    controlWorkspaceId: `cws-${"b".repeat(32)}`,
+    controlRoot: root,
+    expectedExecutionRoot: "/private/worker-root/managed-observed",
+    executionBindingDigest: "c".repeat(64),
+    provisioningAttemptId: "d".repeat(32),
+    provisioningFence: 2,
+    holderId: "e".repeat(32),
+    providerSpawnIntentId: "f".repeat(32)
+  };
+  const launch = createProviderBootstrapLaunch({
+    root: controllerCwd,
+    marker,
+    owner: THREAD_ID,
+    binding,
+    binary: "/private/provider/managed-observed",
+    executableIdentity: TEST_MANAGED_EXECUTABLE_IDENTITY,
+    args: ["agent", "stdio"]
+  });
+  const parsed = await readProviderBootstrapSpec(
+    Readable.from([launch.specPayload]),
+    {
+      marker,
+      purpose: binding.purpose,
+      provisioningAttemptId: binding.provisioningAttemptId,
+      provisioningFence: binding.provisioningFence,
+      holderId: binding.holderId,
+      intentId: binding.providerSpawnIntentId
+    }
+  );
+  assert.deepEqual(parsed.executableIdentity, TEST_MANAGED_EXECUTABLE_IDENTITY);
+  assert.equal(parsed.executableIdentity.schemaVersion, 2);
+  assert.equal(parsed.executableIdentity.releaseRecognition, "managed-observed");
 });
 
 test("worktree provisioning bootstrap is separately bound and acknowledgements fail closed on identity drift", async () => {

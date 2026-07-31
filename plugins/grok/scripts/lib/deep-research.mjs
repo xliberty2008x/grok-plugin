@@ -31,6 +31,7 @@ import { redactText } from "./redact.mjs";
 import { git } from "./workspace.mjs";
 import { processGroupGone } from "./process-control.mjs";
 import { captureExecutableFileIdentity } from "./executable-identity.mjs";
+import { resolveProviderExecutablePin } from "./provider-executable-pin.mjs";
 
 export const DEEP_RESEARCH_KIND = "deep-research";
 export const DEEP_RESEARCH_PROFILE_ID = "deep-research-v1";
@@ -43,6 +44,18 @@ export const DEEP_RESEARCH_MAX_AGENT_LAUNCHES = 8;
 export const DEEP_RESEARCH_CANCEL_GRACE_MS = 10_000;
 export const DEEP_RESEARCH_COMMAND = "/deep-research";
 export const DEEP_RESEARCH_STOP_COMMAND = "/workflow stop";
+const DEEP_RESEARCH_ADVERTISED_COMMAND = "deep-research";
+const WORKFLOW_ADVERTISED_COMMAND = "workflow";
+const WORKFLOW_ADVERTISED_TOOL = "workflow";
+const CAPABILITY_EVIDENCE_SOURCES = new Set([
+  "session-available-commands-update",
+  "same-session-commands-list"
+]);
+const MAX_PENDING_CAPABILITY_UPDATES = 16;
+const MAX_ADVERTISED_COMMANDS = 128;
+const MAX_ADVERTISED_TOOLS = 256;
+const MAX_ADVERTISED_NAME_LENGTH = 256;
+const MAX_CAPABILITY_SESSION_ID_LENGTH = 256;
 
 const SNAPSHOT_EXCLUDES = new Set([
   ".git",
@@ -92,23 +105,46 @@ export function buildDeepResearchCapabilityReceipt({
   providerVersion,
   profileDigest,
   availableCommands,
-  workflowToolAttested = false
+  availableTools,
+  evidenceSource,
+  sessionId
 } = {}) {
   if (!executableIdentity?.executableDigest || typeof providerVersion !== "string") {
     throw new CompanionError("E_PROCESS_IDENTITY", "Deep-research capability receipt requires an exact provider identity.");
   }
   const commands = [...new Set((availableCommands || []).map(String))].sort();
+  const tools = [...new Set((availableTools || []).map(String))].sort();
+  if (!CAPABILITY_EVIDENCE_SOURCES.has(evidenceSource)
+    || typeof sessionId !== "string"
+    || !sessionId) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Deep-research capability receipt requires exact same-session evidence."
+    );
+  }
+  assertDeepResearchCapability({
+    commands: commands.map((name) => ({ name })),
+    tools
+  }, {
+    evidenceSource
+  });
   const body = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     receiptType: "grok-deep-research-capability",
     providerVersion,
     executableDigest: executableIdentity.executableDigest,
     executableSize: executableIdentity.size,
     profileDigest: typeof profileDigest === "string" ? profileDigest : null,
     availableCommands: commands,
-    deepResearchCommand: commands.includes("deep-research") || commands.includes("/deep-research"),
-    workflowCommand: commands.includes("workflow") || commands.includes("/workflow"),
-    workflowToolAttested: workflowToolAttested === true
+    availableTools: tools,
+    evidenceSource,
+    sessionBindingDigest: crypto
+      .createHash("sha256")
+      .update(`grok-companion:deep-research:session-binding:v1\0${sessionId}`)
+      .digest("hex"),
+    deepResearchCommand: commands.includes(DEEP_RESEARCH_ADVERTISED_COMMAND),
+    workflowCommand: commands.includes(WORKFLOW_ADVERTISED_COMMAND),
+    workflowToolAttested: tools.includes(WORKFLOW_ADVERTISED_TOOL)
   };
   const capabilityDigest = crypto
     .createHash("sha256")
@@ -330,71 +366,118 @@ export function extractAvailableCommandNames(source) {
 
 export function isAvailableCommandsUpdate(update) {
   if (!update || typeof update !== "object") return false;
-  const kind = String(update.sessionUpdate || update.type || update.kind || "");
-  return kind === "available_commands_update"
-    || kind === "available_commands"
-    || kind.includes("available_command");
+  return update.sessionUpdate === "available_commands_update";
+}
+
+function compactCapabilityAdvertisement(commands, tools) {
+  if ((Array.isArray(commands) && commands.length > MAX_ADVERTISED_COMMANDS)
+    || (Array.isArray(tools) && tools.length > MAX_ADVERTISED_TOOLS)) {
+    throw new CompanionError(
+      "E_PROTOCOL",
+      "Deep-research capability advertisement exceeds bounded entry limits."
+    );
+  }
+  const compactCommands = Array.isArray(commands)
+    ? commands.map((item) => {
+        const name = item && typeof item === "object" && !Array.isArray(item)
+          ? item.name
+          : null;
+        if (typeof name === "string" && name.length > MAX_ADVERTISED_NAME_LENGTH) {
+          throw new CompanionError(
+            "E_PROTOCOL",
+            "Deep-research advertised command name exceeds the bounded limit."
+          );
+        }
+        return { name };
+      })
+    : null;
+  const compactTools = Array.isArray(tools)
+    ? tools.map((item) => {
+        if (typeof item === "string" && item.length > MAX_ADVERTISED_NAME_LENGTH) {
+          throw new CompanionError(
+            "E_PROTOCOL",
+            "Deep-research advertised tool name exceeds the bounded limit."
+          );
+        }
+        return typeof item === "string" ? item : null;
+      })
+    : null;
+  return Object.freeze({
+    commands: compactCommands,
+    tools: compactTools
+  });
 }
 
 /**
- * Require exact live deep-research command advertisement and workflow tool.
+ * Require one paired, live advertisement containing exact command and tool
+ * names. The caller owns the same-session transport binding; this function
+ * deliberately does not merge split payloads or inspect initialize data.
  */
-export function assertDeepResearchCapability(capabilities, {
-  availableCommands = null
+export function assertDeepResearchCapability(advertisement, {
+  evidenceSource = null
 } = {}) {
   const missing = [];
-  const commands = Array.isArray(availableCommands)
-    ? availableCommands
-    : Array.isArray(capabilities?.availableCommands)
-      ? capabilities.availableCommands
-      : Array.isArray(capabilities?._meta?.availableCommands)
-        ? capabilities._meta.availableCommands
-        : Array.isArray(capabilities?._meta?.commands)
-          ? capabilities._meta.commands
-          : [];
-  const commandNames = commands.map((item) => {
-    if (typeof item === "string") return item;
-    if (item && typeof item === "object") {
-      return item.name || item.command || item.id || "";
-    }
-    return "";
-  }).filter(Boolean);
-  const hasDeepResearchCommand = commandNames.some((name) => (
-    name === DEEP_RESEARCH_COMMAND
-    || name === "deep-research"
-    || name === "/deep-research"
-  ));
+  const commands = advertisement?.commands;
+  const tools = advertisement?.tools;
+  const commandsMalformed = !Array.isArray(commands)
+    || commands.length === 0
+    || commands.some((item) => (
+      !item
+      || typeof item !== "object"
+      || Array.isArray(item)
+      || !Object.hasOwn(item, "name")
+      || typeof item.name !== "string"
+      || !item.name
+      || item.name.trim() !== item.name
+    ));
+  const toolsMalformed = !Array.isArray(tools)
+    || tools.length === 0
+    || tools.some((item) => (
+      typeof item !== "string"
+      || !item
+      || item.trim() !== item
+    ));
+  const commandNames = commandsMalformed
+    ? []
+    : [...new Set(commands.map((item) => item.name))];
+  const toolNames = toolsMalformed
+    ? []
+    : [...new Set(tools)];
+  const hasDeepResearchCommand = commandNames.includes(
+    DEEP_RESEARCH_ADVERTISED_COMMAND
+  );
   if (!hasDeepResearchCommand) missing.push("command:/deep-research");
-
-  const tools = [
-    ...(Array.isArray(capabilities?.tools) ? capabilities.tools : []),
-    ...(Array.isArray(capabilities?.agentCapabilities?.tools)
-      ? capabilities.agentCapabilities.tools
-      : []),
-    ...(Array.isArray(capabilities?._meta?.tools) ? capabilities._meta.tools : [])
-  ];
-  const toolNames = tools.map((item) => {
-    if (typeof item === "string") return item;
-    if (item && typeof item === "object") return item.name || item.id || item.tool || "";
-    return "";
-  }).filter(Boolean);
-  const hasWorkflow = toolNames.some((name) => (
-    name === "workflow"
-    || name === "GrokBuild:workflow"
-  ));
+  const hasWorkflowCommand = commandNames.includes(
+    WORKFLOW_ADVERTISED_COMMAND
+  );
+  if (!hasWorkflowCommand) missing.push("command:/workflow");
+  const hasWorkflow = toolNames.includes(WORKFLOW_ADVERTISED_TOOL);
   if (!hasWorkflow) missing.push("tool:workflow");
+  const evidenceSourceValid = CAPABILITY_EVIDENCE_SOURCES.has(evidenceSource);
+  if (!evidenceSourceValid) missing.push("evidence:same-session");
 
   if (missing.length) {
     throw new CompanionError(
       "E_CAPABILITY",
       "Installed Grok does not advertise the exact live deep-research command and workflow tool required for this feature.",
-      { missing, available: commandNames.slice(0, 32) }
+      {
+        missing,
+        malformed: {
+          commands: commandsMalformed,
+          tools: toolsMalformed
+        },
+        available: commandNames.slice(0, 32),
+        availableTools: toolNames.slice(0, 64)
+      }
     );
   }
   return Object.freeze({
     deepResearchCommand: true,
+    workflowCommand: true,
     workflowTool: true,
-    availableCommands: commandNames
+    availableCommands: commandNames,
+    availableTools: toolNames,
+    evidenceSource
   });
 }
 
@@ -1220,7 +1303,7 @@ export function researchEnvironment(stateDir, jobMarker, {
     GROK_SUBAGENTS: "1",
     GROK_WORKFLOWS: "1",
     GROK_MEMORY: "0",
-    GROK_WEB_FETCH: "1",
+    GROK_WEB_FETCH: "0",
     GROK_LSP_TOOLS: "0"
   });
   delete env.HOMEDRIVE;
@@ -1304,8 +1387,9 @@ export async function runDeepResearch({
   cancelRequested = () => false,
   onEvent = () => {},
   timeoutMs = DEEP_RESEARCH_TIMEOUT_MS,
-  availableCommands = null,
-  testHooks = null
+  testHooks = null,
+  providerExecutableBinding = null,
+  providerExecutableEnv = process.env
 } = {}) {
   assertProviderPlatform();
   const allowedProfileIds = new Set(["deep-research-v1", "deep-research-workspace-v1"]);
@@ -1328,10 +1412,26 @@ export async function runDeepResearch({
       "Web-only deep-research requires the deep-research-v1 profile."
     );
   }
+  const allowUnpinnedTestProvider =
+    testHooks?.allowUnpinnedProvider === true;
+  if (providerExecutableBinding == null && !allowUnpinnedTestProvider) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      "Deep-research requires the exact setup-pinned Grok executable."
+    );
+  }
   const workspaceBefore = parsedOptions.workspace ? integritySnapshot(root) : null;
-  const providerBinary = discoverGrok();
+  const pinnedProvider = providerExecutableBinding == null
+    ? null
+    : resolveProviderExecutablePin(
+        providerExecutableBinding,
+        { env: providerExecutableEnv }
+      );
+  const providerBinary = pinnedProvider?.binary || discoverGrok();
   const providerExecutableBefore = captureExecutableFileIdentity(providerBinary);
-  const environment = researchEnvironment(stateDir, jobMarker);
+  const environment = researchEnvironment(stateDir, jobMarker, {
+    providerExecutableBinary: providerBinary
+  });
   let providerCwd;
   let snapshotMeta = null;
   if (parsedOptions.workspace) {
@@ -1370,10 +1470,24 @@ export async function runDeepResearch({
         onEvent(event);
       },
       strictPermissionRequests: true,
+      providerExecutableBinding,
+      providerExecutableEnv,
       testHooks
     });
   } catch (error) {
     try { environment.revokeCredential(); } catch { /* best effort */ }
+    if (error && typeof error === "object") {
+      const details = error.details
+        && typeof error.details === "object"
+        && !Array.isArray(error.details)
+        ? error.details
+        : {};
+      error.details = {
+        ...details,
+        replay: false,
+        resume: false
+      };
+    }
     throw error;
   }
 
@@ -1388,8 +1502,9 @@ export async function runDeepResearch({
   let stopSent = false;
   let thrownError = null;
   const startedAt = Date.now();
-  let sessionCommands = Array.isArray(availableCommands) ? [...availableCommands] : [];
-  let commandsReady = sessionCommands.length > 0;
+  let capability = null;
+  let lastCapabilityError = null;
+  const pendingCapabilityUpdates = [];
   const countedAgentToolCalls = new Set();
 
   const failSecurity = (message) => {
@@ -1445,12 +1560,64 @@ export async function runDeepResearch({
       );
     }
 
-    const noteCommands = (source) => {
-      const names = extractAvailableCommandNames(source);
-      if (!names.length) return;
-      sessionCommands = [...new Set([...sessionCommands, ...names])];
-      commandsReady = true;
-      onEvent({ type: "available-commands", commands: sessionCommands });
+    const acceptCapabilityAdvertisement = (
+      advertisement,
+      evidenceSource
+    ) => {
+      if (capability) return true;
+      try {
+        capability = assertDeepResearchCapability(advertisement, {
+          evidenceSource
+        });
+        onEvent({
+          type: "available-commands",
+          commands: capability.availableCommands,
+          tools: capability.availableTools,
+          source: capability.evidenceSource
+        });
+        return true;
+      } catch (error) {
+        if (error?.code !== "E_CAPABILITY") throw error;
+        lastCapabilityError = error;
+        return false;
+      }
+    };
+
+    const considerCapabilityUpdate = (notification) => {
+      if (notification?.method !== "session/update") return false;
+      const notificationSessionId = notification.params?.sessionId;
+      const update = notification.params?.update;
+      if (!isAvailableCommandsUpdate(update)) return false;
+      if (typeof notificationSessionId !== "string"
+        || !notificationSessionId
+        || notificationSessionId.length > MAX_CAPABILITY_SESSION_ID_LENGTH) {
+        throw new CompanionError(
+          "E_PROTOCOL",
+          "Deep-research capability update has an invalid session binding."
+        );
+      }
+      const candidate = Object.freeze({
+        sessionId: notificationSessionId,
+        advertisement: compactCapabilityAdvertisement(
+          update.availableCommands,
+          update._meta?.tools
+        )
+      });
+      if (!sessionId) {
+        if (pendingCapabilityUpdates.length >= MAX_PENDING_CAPABILITY_UPDATES) {
+          throw new CompanionError(
+            "E_PROTOCOL",
+            "Deep-research received too many capability updates before session binding."
+          );
+        }
+        pendingCapabilityUpdates.push(candidate);
+        return false;
+      }
+      if (notificationSessionId !== sessionId) return false;
+      return acceptCapabilityAdvertisement(
+        candidate.advertisement,
+        "session-available-commands-update"
+      );
     };
 
     const handleNotification = (notification) => {
@@ -1461,9 +1628,7 @@ export async function runDeepResearch({
         }
         if (notification?.method === "session/update") {
           const update = notification.params?.update || notification.params;
-          if (isAvailableCommandsUpdate(update) || isAvailableCommandsUpdate(notification.params)) {
-            noteCommands(update || notification.params);
-          }
+          considerCapabilityUpdate(notification);
           const toolEvent = String(update?.sessionUpdate || update?.type || "");
           if (toolEvent.includes("tool_call")) {
             noteAgentLaunchFromToolEvent({
@@ -1508,9 +1673,6 @@ export async function runDeepResearch({
     const handleUpdate = (update) => {
       try {
         const raw = update?.value || update;
-        if (isAvailableCommandsUpdate(raw) || isAvailableCommandsUpdate(update)) {
-          noteCommands(raw);
-        }
         const applied = binder.applyUpdate(raw);
         if (applied?.accepted) {
           onEvent({
@@ -1552,17 +1714,21 @@ export async function runDeepResearch({
     environment.revokeCredential();
     onEvent({ type: "session", sessionId, models: session?.models });
 
-    // Capture commands embedded in the session result itself.
-    if (isAvailableCommandsUpdate(session) || session?.availableCommands || session?._meta?.availableCommands) {
-      noteCommands(session);
+    // A same-session notification can arrive in the same stdout chunk as the
+    // session/new response and therefore before this async continuation.
+    for (const candidate of pendingCapabilityUpdates.splice(0)) {
+      if (candidate.sessionId !== sessionId) continue;
+      acceptCapabilityAdvertisement(
+        candidate.advertisement,
+        "session-available-commands-update"
+      );
     }
-    if (!commandsReady && testHooks?.sessionCommands) {
-      noteCommands(testHooks.sessionCommands);
-    }
+    if (securityError) throw securityError;
 
-    // Wait briefly for session-scoped available_commands_update, then list.
+    // Wait briefly for one paired, session-scoped
+    // available_commands_update, then pull the same session's paired catalog.
     const commandWaitDeadline = Date.now() + (testHooks?.commandWaitMs ?? 1500);
-    while (!commandsReady && Date.now() < commandWaitDeadline) {
+    while (!capability && Date.now() < commandWaitDeadline) {
       if (securityError) throw securityError;
       if (cancelRequested()) {
         throw new CompanionError("E_CANCELLED", "Deep-research was cancelled before capability gate.");
@@ -1570,31 +1736,41 @@ export async function runDeepResearch({
       await new Promise((resolve) => setTimeout(resolve, 25));
       if (testHooks?.afterSessionWait) await testHooks.afterSessionWait({ sessionId });
     }
-    if (!commandsReady) {
+    if (!capability) {
+      let listed;
       try {
-        const listed = await provider.client.request(
+        listed = await provider.client.request(
           "x.ai/commands/list",
           { sessionId },
           15000
         );
-        noteCommands(listed);
       } catch (error) {
-        if (testHooks?.commandsListResult) {
-          noteCommands(testHooks.commandsListResult);
-        } else if (!commandsReady) {
+        if (!capability) {
           throw new CompanionError(
             "E_CAPABILITY",
-            "Deep-research could not obtain session-scoped command advertisement after session creation.",
-            { cause: error?.code || null }
+            "Deep-research could not obtain paired capability evidence for the newly-created session.",
+            {
+              cause: error?.code || null,
+              priorMissing: lastCapabilityError?.details?.missing || []
+            }
           );
         }
       }
+      if (!capability) {
+        acceptCapabilityAdvertisement(
+          compactCapabilityAdvertisement(listed?.commands, listed?.tools),
+          "same-session-commands-list"
+        );
+      }
     }
 
-    // Capability is established only after session creation and exact advertisement.
-    const capability = assertDeepResearchCapability(provider.initialized, {
-      availableCommands: sessionCommands
-    });
+    if (!capability) throw lastCapabilityError || new CompanionError(
+      "E_CAPABILITY",
+      "Deep-research did not receive one paired command and tool advertisement for the newly-created session."
+    );
+
+    // Capability is established only after session creation and one exact,
+    // paired same-session advertisement. initialize/inspect are not evidence.
     const providerExecutableAfter = captureExecutableFileIdentity(provider.binary);
     if (!sameExecutableFileIdentity(providerExecutableBefore, providerExecutableAfter)) {
       throw new CompanionError(
@@ -1607,7 +1783,9 @@ export async function runDeepResearch({
       providerVersion: provider.version,
       profileDigest: profile.agentProfileDigest,
       availableCommands: capability.availableCommands,
-      workflowToolAttested: capability.workflowTool
+      availableTools: capability.availableTools,
+      evidenceSource: capability.evidenceSource,
+      sessionId
     });
 
     // Exact upstream slash — wrapper flags never forwarded.

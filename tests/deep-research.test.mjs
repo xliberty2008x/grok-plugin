@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import {
@@ -26,6 +27,7 @@ import {
   publicResearchReport,
   proveWorkspaceUnchanged,
   removeResearchTree,
+  researchEnvironment,
   researchReportRelativePath,
   runDeepResearch,
   stageDeepResearchQuery,
@@ -37,8 +39,10 @@ import { generateId, readJob, writeJob } from "../plugins/grok/scripts/lib/state
 import { projectWorkerSnapshot } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
 import { assertSafeJobId } from "../plugins/grok/scripts/lib/workspace.mjs";
 import { integritySnapshot } from "../plugins/grok/scripts/lib/git-review.mjs";
+import { resolveProviderExecutablePin } from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
 import { git, initRepo, tempDir, ROOT, testEnvironment } from "./helpers.mjs";
-import { installFakeGrok } from "./fake-grok.mjs";
+import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
+import { installPinnedFakeCompanion } from "./pinned-fake-grok.mjs";
 
 function fixtureHome(t) {
   const root = tempDir("deep-research-home-");
@@ -94,43 +98,93 @@ test("upstream slash command is exactly /deep-research <query> without wrapper f
   );
 });
 
-test("capability gate requires exact deep-research command and workflow tool", () => {
+test("capability gate requires one exact paired commands-and-tools advertisement", () => {
   assert.throws(
     () => assertDeepResearchCapability({}),
     (error) => error.code === "E_CAPABILITY" && /deep-research/.test(error.message)
   );
   assert.throws(
     () => assertDeepResearchCapability({
-      _meta: { availableCommands: [{ name: "/deep-research" }] }
+      commands: [
+        { name: "deep-research" },
+        { name: "workflow" }
+      ]
     }),
     (error) => error.code === "E_CAPABILITY" && /workflow/.test(error.message)
   );
   assert.throws(
-    () => assertDeepResearchCapability({}, {
-      availableCommands: [{ name: "/deep-research" }],
-      inspect: { tools: [{ name: "workflow" }] }
+    () => assertDeepResearchCapability({
+      tools: ["workflow"]
     }),
     (error) => error.code === "E_CAPABILITY"
   );
-  const ok = assertDeepResearchCapability({
-    agentCapabilities: { tools: [{ name: "workflow" }] },
-    _meta: {
-      availableCommands: [{ name: "/deep-research" }]
+  for (const malformed of [
+    {
+      commands: [
+        { name: "/deep-research" },
+        { name: "/workflow" }
+      ],
+      tools: ["GrokBuild:workflow"]
+    },
+    {
+      commands: [
+        { name: "deep-research-preview" },
+        { name: "workflow-admin" }
+      ],
+      tools: ["workflow-helper"]
+    },
+    {
+      commands: [
+        { name: "deep-research" },
+        { name: "workflow" }
+      ],
+      tools: [{ name: "workflow" }]
+    },
+    {
+      commands: [
+        { name: "deep-research" },
+        { name: "workflow" }
+      ],
+      tools: ["workflow", 7]
+    },
+    {
+      // initialize-shaped data is never a live session advertisement.
+      agentCapabilities: { tools: ["workflow"] },
+      _meta: { commands: [{ name: "deep-research" }, { name: "workflow" }] }
     }
+  ]) {
+    assert.throws(
+      () => assertDeepResearchCapability(malformed),
+      (error) => error.code === "E_CAPABILITY"
+    );
+  }
+  assert.throws(
+    () => assertDeepResearchCapability({
+      commands: [{ name: "deep-research" }, { name: "workflow" }],
+      tools: ["workflow"]
+    }),
+    (error) => error.code === "E_CAPABILITY"
+      && error.details?.missing?.includes("evidence:same-session")
+  );
+  const ok = assertDeepResearchCapability({
+    commands: [
+      { name: "deep-research" },
+      { name: "workflow" },
+      { name: "goal" }
+    ],
+    tools: ["workflow", "web_search"]
+  }, {
+    evidenceSource: "session-available-commands-update"
   });
   assert.equal(ok.deepResearchCommand, true);
+  assert.equal(ok.workflowCommand, true);
   assert.equal(ok.workflowTool, true);
-  const liveCommands = assertDeepResearchCapability({
-    tools: [{ name: "workflow" }]
-  }, {
-    availableCommands: [{ name: "deep-research" }, { name: "workflow" }],
-    inspect: { tools: [{ name: "not-live-workflow" }] }
-  });
-  assert.equal(liveCommands.workflowTool, true);
+  assert.deepEqual(ok.availableTools, ["workflow", "web_search"]);
 });
 
-test("feature capability receipt is bound to provider bytes, profile, and live commands", () => {
-  const receipt = buildDeepResearchCapabilityReceipt({
+test("feature capability receipt binds provider, profile, paired advertisement, source, and session", () => {
+  const sessionId = "private-session-id";
+  const receiptInput = {
     executableIdentity: {
       executableDigest: "a".repeat(64),
       size: 123
@@ -138,13 +192,54 @@ test("feature capability receipt is bound to provider bytes, profile, and live c
     providerVersion: "0.2.112",
     profileDigest: "b".repeat(64),
     availableCommands: ["workflow", "deep-research"],
-    workflowToolAttested: true
-  });
+    availableTools: ["web_search", "workflow"],
+    evidenceSource: "session-available-commands-update",
+    sessionId
+  };
+  const receipt = buildDeepResearchCapabilityReceipt(receiptInput);
+  assert.equal(receipt.schemaVersion, 2);
   assert.equal(receipt.receiptType, "grok-deep-research-capability");
   assert.equal(receipt.workflowToolAttested, true);
   assert.equal(receipt.deepResearchCommand, true);
   assert.equal(receipt.workflowCommand, true);
+  assert.deepEqual(receipt.availableTools, ["web_search", "workflow"]);
+  assert.equal(receipt.evidenceSource, "session-available-commands-update");
+  assert.match(receipt.sessionBindingDigest, /^[a-f0-9]{64}$/);
+  assert.equal(JSON.stringify(receipt).includes(sessionId), false);
   assert.match(receipt.capabilityDigest, /^[a-f0-9]{64}$/);
+  for (const changed of [
+    {
+      ...receiptInput,
+      executableIdentity: {
+        ...receiptInput.executableIdentity,
+        executableDigest: "c".repeat(64)
+      }
+    },
+    {
+      ...receiptInput,
+      executableIdentity: {
+        ...receiptInput.executableIdentity,
+        size: 124
+      }
+    },
+    { ...receiptInput, providerVersion: "0.2.114" },
+    { ...receiptInput, profileDigest: "d".repeat(64) },
+    {
+      ...receiptInput,
+      availableCommands: [...receiptInput.availableCommands, "context"]
+    },
+    {
+      ...receiptInput,
+      availableTools: [...receiptInput.availableTools, "task"]
+    },
+    { ...receiptInput, evidenceSource: "same-session-commands-list" },
+    { ...receiptInput, sessionId: "different-private-session-id" }
+  ]) {
+    assert.notEqual(
+      buildDeepResearchCapabilityReceipt(changed).capabilityDigest,
+      receipt.capabilityDigest
+    );
+  }
 });
 
 test("workflow binder binds one run and enforces monotonic revisions", () => {
@@ -400,6 +495,64 @@ test("WebFetch attestation fail-closed or reduced coverage", () => {
   assert.equal(isUnexpectedDeepResearchPermission({ options: [] }), true);
 });
 
+test("isolated research environment disables WebFetch while retaining research capabilities", (t) => {
+  if (process.platform === "win32") return;
+  const state = tempDir("deep-research-environment-");
+  const authPath = path.join(state, "source-auth.json");
+  fs.writeFileSync(authPath, JSON.stringify({
+    "https://accounts.x.ai/sign-in": {
+      key: "opaque-fake-auth-secret-00000001",
+      auth_mode: "oauth",
+      expires_at: "2099-01-01T00:00:00Z"
+    }
+  }), { mode: 0o600 });
+  const previousAuthPath = process.env.GROK_AUTH_PATH;
+  process.env.GROK_AUTH_PATH = authPath;
+  let environment = null;
+  t.after(() => {
+    try { environment?.revokeCredential(); } catch { /* ignore */ }
+    if (previousAuthPath === undefined) delete process.env.GROK_AUTH_PATH;
+    else process.env.GROK_AUTH_PATH = previousAuthPath;
+    fs.rmSync(state, { recursive: true, force: true });
+  });
+
+  environment = researchEnvironment(state, "web-fetch-disabled");
+  assert.equal(environment.env.GROK_WEB_FETCH, "0");
+  assert.equal(environment.env.GROK_SUBAGENTS, "1");
+  assert.equal(environment.env.GROK_WORKFLOWS, "1");
+  assert.match(environment.configText, /\[subagents\]\nenabled = true/);
+  assert.match(environment.configText, /\[workflows\]\nenabled = true/);
+  assert.match(environment.configText, /\[tools\.web_fetch\]\nallow_local = false/);
+
+  const profile = profileFor("deep-research");
+  assert.ok(profile.providerToolIds.includes("GrokBuild:web_search"));
+  assert.ok(profile.providerToolIds.includes("GrokBuild:workflow"));
+  assert.ok(profile.providerToolIds.includes("GrokBuild:task"));
+  assert.ok(profile.deniedProviderToolIds.includes("GrokBuild:web_fetch"));
+});
+
+test("deep-research runner rejects ambient provider discovery by default", async (t) => {
+  if (process.platform === "win32") return;
+  const root = initRepo();
+  const state = tempDir("deep-research-unpinned-state-");
+  t.after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(state, { recursive: true, force: true });
+  });
+  await assert.rejects(
+    () => runDeepResearch({
+      root,
+      profile: profileFor("deep-research"),
+      query: "must not reach an ambient provider",
+      options: { "web-only": true },
+      stateDir: state,
+      jobMarker: "deep-research-unpinned"
+    }),
+    (error) => error.code === "E_CAPABILITY"
+      && /setup-pinned Grok executable/.test(error.message)
+  );
+});
+
 test("private query staging is digest-bound, mode-restricted, and consumed once", (t) => {
   const state = tempDir("deep-research-query-");
   t.after(() => fs.rmSync(state, { recursive: true, force: true }));
@@ -470,6 +623,16 @@ test("web-only profile denies repository reads; workspace profile permits read t
   assert.ok(workspace.allowedTools.includes("read_file"));
   assert.ok(workspace.allowedTools.includes("list_dir"));
   assert.ok(workspace.allowedTools.includes("grep"));
+  assert.deepEqual(workspace.providerToolIds, [
+    "GrokBuild:workflow",
+    "GrokBuild:web_search",
+    "GrokBuild:task",
+    "GrokBuild:get_task_output",
+    "GrokBuild:kill_task",
+    "GrokBuild:read_file",
+    "GrokBuild:list_dir",
+    "GrokBuild:grep"
+  ]);
   assert.ok(workspace.deniedTools.includes("Bash"));
   assert.ok(workspace.deniedTools.includes("search_replace"));
   assert.ok(!workspace.deniedProviderToolIds.includes("GrokBuild:read_file"));
@@ -638,7 +801,8 @@ test("fake-ACP lifecycle: session-scoped capability, launch-ack nonterminal, rep
     stateDir: state,
     jobMarker: "deep-research-lifecycle",
     onEvent: (event) => events.push(event),
-    timeoutMs: 10_000
+    timeoutMs: 10_000,
+    testHooks: { allowUnpinnedProvider: true }
   });
 
   assert.equal(result.sessionId, "fake-session-00000001");
@@ -658,6 +822,33 @@ test("fake-ACP lifecycle: session-scoped capability, launch-ack nonterminal, rep
   assert.equal(result.hostVerification, "not_run");
   assert.equal(result.replay, false);
   assert.equal(result.resume, false);
+  const providerInvocation = readFakeLog(fake.logFile).find(
+    (entry) => entry.event === "argv" && entry.args.includes("agent")
+  );
+  assert.ok(providerInvocation, "expected deep-research provider invocation");
+  const toolsIndex = providerInvocation.args.indexOf("--tools");
+  const agentIndex = providerInvocation.args.indexOf("agent");
+  assert.ok(toolsIndex >= 0 && toolsIndex < agentIndex);
+  assert.equal(
+    providerInvocation.args[toolsIndex + 1],
+    "workflow,web_search,task,get_task_output,kill_task"
+  );
+  assert.equal(
+    result.capabilityReceipt.evidenceSource,
+    "session-available-commands-update"
+  );
+  assert.deepEqual(
+    result.capabilityReceipt.availableCommands.filter((name) => (
+      name === "deep-research" || name === "workflow"
+    )),
+    ["deep-research", "workflow"]
+  );
+  assert.ok(result.capabilityReceipt.availableTools.includes("workflow"));
+  assert.match(result.capabilityReceipt.sessionBindingDigest, /^[a-f0-9]{64}$/);
+  assert.equal(
+    JSON.stringify(result.capabilityReceipt).includes(result.sessionId),
+    false
+  );
 
   const launchAck = events.find((event) => event.type === "launch-ack");
   assert.ok(launchAck, "expected launch acknowledgement event");
@@ -686,9 +877,12 @@ test("fake-ACP lifecycle: session-scoped capability, launch-ack nonterminal, rep
       options: { "web-only": true },
       stateDir: tempDir("deep-research-state-nocmd-"),
       jobMarker: "deep-research-nocmd",
-      timeoutMs: 5_000
+      timeoutMs: 5_000,
+      testHooks: { allowUnpinnedProvider: true }
     }),
     (error) => error.code === "E_CAPABILITY"
+      && error.details?.replay === false
+      && error.details?.resume === false
   );
 
   // Interruption maps to non-replay workflow incomplete.
@@ -696,6 +890,394 @@ test("fake-ACP lifecycle: session-scoped capability, launch-ack nonterminal, rep
   assert.equal(interrupted.error.code, "E_WORKFLOW_INCOMPLETE");
   assert.equal(interrupted.replay, false);
   assert.equal(interrupted.resume, false);
+});
+
+test("detached deep-research uses the setup-pinned provider instead of ambient discovery", (t) => {
+  if (process.platform === "win32") return;
+  const root = initRepo();
+  const pluginData = tempDir("deep-research-pinned-plugin-");
+  const fakeRoot = tempDir("deep-research-pinned-fake-");
+  const poisonRoot = tempDir("deep-research-poison-fake-");
+  const fake = installFakeGrok(fakeRoot, {
+    version: "0.2.99",
+    deepResearch: true,
+    deepResearchRunId: "run-pinned-deep-research",
+    deepResearchReport: "# Pinned provider\n\nSource: https://example.com/pinned\n",
+    deepResearchReportStatus: "verified",
+    authMethods: [{ id: "local", name: "Local test auth" }]
+  });
+  const poison = installFakeGrok(poisonRoot, {
+    version: "0.2.114",
+    deepResearch: true,
+    deepResearchRunId: "run-poison-deep-research",
+    authMethods: [{ id: "local", name: "Local test auth" }]
+  });
+  fs.symlinkSync(poison.binary, path.join(poisonRoot, "grok"));
+  const env = testEnvironment({
+    fake,
+    pluginData,
+    sessionId: "deep-research-pinned-session",
+    extra: {
+      CODEX_THREAD_ID: "deep-research-pinned-session",
+      GROK_COMPANION_HOST: "codex",
+      GROK_COMPANION_HOST_SESSION_ID: "deep-research-pinned-session",
+      GROK_COMPANION_PLUGIN_DATA: pluginData
+    }
+  });
+  const pinned = installPinnedFakeCompanion(fake, env);
+  t.after(() => {
+    pinned.cleanup();
+    for (const directory of [root, pluginData, fakeRoot, poisonRoot]) {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  const setup = spawnSync(
+    process.execPath,
+    [pinned.codexCompanionScript, "setup", "--json"],
+    {
+      cwd: root,
+      env: pinned.env,
+      encoding: "utf8",
+      timeout: 30_000
+    }
+  );
+  assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+  assert.equal(JSON.parse(setup.stdout).grok.version, "0.2.99");
+
+  const poisonedEnv = {
+    ...pinned.env,
+    GROK_BIN: poison.binary,
+    PATH: `${poisonRoot}${path.delimiter}${pinned.env.PATH || ""}`
+  };
+  const completed = spawnSync(
+    process.execPath,
+    [
+      pinned.codexCompanionScript,
+      "deep-research",
+      "--wait",
+      "--web-only",
+      "--query-stdin",
+      "--json"
+    ],
+    {
+      cwd: root,
+      env: poisonedEnv,
+      input: "prove exact setup provider binding",
+      encoding: "utf8",
+      timeout: 30_000
+    }
+  );
+  assert.equal(completed.status, 0, completed.stderr || completed.stdout);
+  const result = JSON.parse(completed.stdout);
+  assert.equal(result.status, "completed");
+  assert.equal(result.result?.workflow?.runId, "run-pinned-deep-research");
+
+  const receipt = JSON.parse(fs.readFileSync(
+    path.join(pluginData, "capabilities", "provider-capability-v2.json"),
+    "utf8"
+  ));
+  const pinnedExecutable = resolveProviderExecutablePin(
+    receipt.providerLaunchBinding,
+    { env: poisonedEnv }
+  );
+  const job = readJob(root, result.id, poisonedEnv);
+  assert.deepEqual(
+    job.request.spawn.providerLaunchBinding,
+    receipt.providerLaunchBinding
+  );
+  assert.equal(
+    job.request.spawn.providerLaunchBindingDigest,
+    receipt.providerLaunchBindingDigest
+  );
+  assert.equal(
+    job.request.spawn.providerCapabilityDigest,
+    receipt.capabilityDigest
+  );
+  assert.deepEqual(
+    {
+      providerVersion: job.result.capabilityReceipt.providerVersion,
+      executableDigest: job.result.capabilityReceipt.executableDigest,
+      executableSize: job.result.capabilityReceipt.executableSize
+    },
+    {
+      providerVersion: pinnedExecutable.executableIdentity.version,
+      executableDigest: pinnedExecutable.executableIdentity.executableDigest,
+      executableSize: pinnedExecutable.executableIdentity.size
+    }
+  );
+  assert.equal(job.result.researchRuntimeCleaned, true);
+  assert.equal(job.result.workflow.activeAgents, 0);
+  assert.equal(
+    readFakeLog(fake.logFile).some((entry) => (
+      entry.event === "deep-research-launch"
+      && entry.runId === "run-pinned-deep-research"
+    )),
+    true
+  );
+  assert.deepEqual(readFakeLog(poison.logFile), []);
+  assert.equal(
+    JSON.stringify(job).includes("prove exact setup provider binding"),
+    false
+  );
+});
+
+test("early deep-research startup failures retain the non-replay contract", async (t) => {
+  if (process.platform === "win32") return;
+  const previous = { ...process.env };
+  t.after(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+  });
+
+  const fakeRoot = tempDir("deep-research-startup-failure-fake-");
+  const fake = installFakeGrok(fakeRoot, {
+    deepResearch: true,
+    authMethods: [{ id: "local", name: "Local test auth" }]
+  });
+  const pluginData = tempDir("deep-research-startup-failure-plugin-");
+  Object.assign(process.env, testEnvironment({
+    fake,
+    pluginData,
+    sessionId: "deep-research-startup-failure-session"
+  }));
+  const root = initRepo();
+  const state = tempDir("deep-research-startup-failure-state-");
+  t.after(() => {
+    try { thawTreeWritable(state); } catch { /* ignore */ }
+    for (const directory of [state, root, pluginData, fakeRoot]) {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  await assert.rejects(
+    () => runDeepResearch({
+      root,
+      profile: profileFor("deep-research"),
+      query: "forced startup failure",
+      options: { "web-only": true },
+      stateDir: state,
+      jobMarker: "deep-research-startup-failure",
+      timeoutMs: 5_000,
+      testHooks: {
+        allowUnpinnedProvider: true,
+        beforeDispatchPromotion() {
+          const error = new Error("forced startup security failure");
+          error.code = "E_SECURITY_PROFILE";
+          throw error;
+        }
+      }
+    }),
+    (error) => error.code === "E_SECURITY_PROFILE"
+      && error.details?.replay === false
+      && error.details?.resume === false
+  );
+});
+
+test("fake-ACP capability evidence is paired and bound to the newly-created session", async (t) => {
+  if (process.platform === "win32") return;
+  const previous = { ...process.env };
+  t.after(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+  });
+
+  const exactCommands = [
+    { name: "deep-research", description: "Built-in deep research" },
+    { name: "workflow", description: "Built-in workflow management" }
+  ];
+  const cases = [
+    {
+      name: "same-session-list",
+      config: { suppressAvailableCommandsUpdate: true },
+      expectedSource: "same-session-commands-list"
+    },
+    {
+      name: "notification-wins-list-error-race",
+      config: {
+        availableCommandsUpdateDelayMs: 30,
+        commandsListResponseDelayMs: 60,
+        commandsListError: "list unavailable"
+      },
+      expectedSource: "session-available-commands-update"
+    },
+    {
+      name: "wrong-session-update",
+      config: {
+        availableCommandsUpdateSessionId: "foreign-session",
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_CAPABILITY"
+    },
+    {
+      name: "split-update",
+      config: {
+        availableCommandsUpdates: [
+          { availableCommands: exactCommands },
+          {
+            availableCommands: [],
+            _meta: { tools: ["workflow", "web_search"] }
+          }
+        ],
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_CAPABILITY"
+    },
+    {
+      name: "malformed-update-tools",
+      config: {
+        availableCommandTools: ["workflow", 7],
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_CAPABILITY"
+    },
+    {
+      name: "oversized-session-binding",
+      config: {
+        availableCommandsUpdateSessionId: "s".repeat(257),
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_PROTOCOL"
+    },
+    {
+      name: "oversized-advertised-name",
+      config: {
+        availableCommands: [
+          { name: "deep-research" },
+          { name: "w".repeat(257) }
+        ],
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_PROTOCOL"
+    },
+    {
+      name: "non-array-large-fields",
+      config: {
+        availableCommands: { payload: "x".repeat(4096) },
+        availableCommandTools: { payload: "y".repeat(4096) },
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_CAPABILITY"
+    },
+    {
+      name: "initialize-only",
+      config: {
+        suppressAvailableCommandsUpdate: true,
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_CAPABILITY"
+    },
+    {
+      name: "substring-and-qualified-names",
+      config: {
+        availableCommands: [
+          { name: "deep-research-preview" },
+          { name: "workflow-admin" }
+        ],
+        availableCommandTools: ["GrokBuild:workflow"],
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_CAPABILITY"
+    },
+    {
+      name: "malformed-list-tools",
+      config: {
+        suppressAvailableCommandsUpdate: true,
+        commandsListResult: {
+          commands: exactCommands,
+          tools: [{ name: "workflow" }]
+        }
+      },
+      expectedCode: "E_CAPABILITY"
+    },
+    {
+      name: "pre-session-update-overflow",
+      config: {
+        availableCommandsUpdatesBeforeSessionResponse: true,
+        availableCommandsUpdates: Array.from(
+          { length: 17 },
+          () => ({
+            availableCommands: exactCommands,
+            _meta: { tools: ["workflow", "web_search"] }
+          })
+        ),
+        commandsListError: "list unavailable"
+      },
+      expectedCode: "E_PROTOCOL"
+    }
+  ];
+
+  for (const fixture of cases) {
+    const fakeRoot = tempDir(`deep-research-capability-${fixture.name}-fake-`);
+    const logFile = path.join(fakeRoot, "provider.jsonl");
+    const fake = installFakeGrok(fakeRoot, {
+      deepResearch: true,
+      deepResearchRunId: `run-${fixture.name}`,
+      logFile,
+      authMethods: [{ id: "local", name: "Local test auth" }],
+      ...fixture.config
+    });
+    const pluginData = tempDir(`deep-research-capability-${fixture.name}-plugin-`);
+    const root = initRepo();
+    const state = tempDir(`deep-research-capability-${fixture.name}-state-`);
+    Object.assign(process.env, testEnvironment({
+      fake,
+      pluginData,
+      sessionId: `deep-research-capability-${fixture.name}`
+    }));
+    try {
+      const invocation = () => runDeepResearch({
+        root,
+        profile: profileFor("deep-research"),
+        query: `capability ${fixture.name}`,
+        options: { "web-only": true },
+        stateDir: state,
+        jobMarker: `deep-research-capability-${fixture.name}`,
+        timeoutMs: 5_000,
+        testHooks: {
+          allowUnpinnedProvider: true,
+          commandWaitMs: 10
+        }
+      });
+      if (fixture.expectedCode) {
+        await assert.rejects(
+          invocation,
+          (error) => error.code === fixture.expectedCode
+        );
+        const log = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "";
+        assert.doesNotMatch(log, /"event":"deep-research-launch"/);
+      } else {
+        const result = await invocation();
+        assert.equal(result.capabilityReceipt.evidenceSource, fixture.expectedSource);
+        assert.ok(result.capabilityReceipt.availableTools.includes("workflow"));
+        if (fixture.expectedSource === "same-session-commands-list") {
+          const records = fs.readFileSync(logFile, "utf8")
+            .trim()
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => JSON.parse(line));
+          const listRequest = records.find((entry) => (
+            entry.event === "rpc"
+            && entry.message?.method === "x.ai/commands/list"
+          ));
+          assert.equal(
+            listRequest?.message?.params?.sessionId,
+            result.sessionId
+          );
+        }
+      }
+    } finally {
+      try { thawTreeWritable(state); } catch { /* ignore */ }
+      fs.rmSync(state, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(pluginData, { recursive: true, force: true });
+      fs.rmSync(fakeRoot, { recursive: true, force: true });
+    }
+  }
 });
 
 test("fake-ACP terminal matrix covers partial, foreign/stale updates, pauses, budgets, failures, interruption, missing report, and timeout", async (t) => {
@@ -750,7 +1332,8 @@ test("fake-ACP terminal matrix covers partial, foreign/stale updates, pauses, bu
         options: { "web-only": true },
         stateDir: state,
         jobMarker: `deep-research-${fixture.name}`,
-        timeoutMs: fixture.timeoutMs || 5_000
+        timeoutMs: fixture.timeoutMs || 5_000,
+        testHooks: { allowUnpinnedProvider: true }
       });
       if (fixture.expectedCode) {
         await assert.rejects(
@@ -820,7 +1403,10 @@ test("fake-ACP cancellation settles with exact /workflow stop and zero active ag
         }
       },
       timeoutMs: 10_000,
-      testHooks: { forceSettledAfterCancel: false }
+      testHooks: {
+        allowUnpinnedProvider: true,
+        forceSettledAfterCancel: false
+      }
     }),
     (error) => error.code === "E_CANCELLED" && error.details?.replay === false
   );

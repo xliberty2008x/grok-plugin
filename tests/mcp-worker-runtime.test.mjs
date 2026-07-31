@@ -641,6 +641,23 @@ function spawnIdleProcess(t) {
   return child;
 }
 
+function spawnProviderProcess(t, workerId) {
+  const child = spawnProcess(process.execPath, [
+    "-e",
+    "setInterval(() => {}, 1000);",
+    workerId,
+    "agent",
+    "stdio"
+  ], {
+    detached: true,
+    stdio: "ignore"
+  });
+  t.after(() => {
+    try { process.kill(-child.pid, "SIGKILL"); } catch {}
+  });
+  return child;
+}
+
 async function boundProcessIdentity(child, workerId, claim, extra = {}) {
   return {
     pid: child.pid,
@@ -668,7 +685,7 @@ async function activeProviderRecoveryFixture(t, label) {
   const claim = claimWorkerDispatch({ root, principal, workerId, env });
   const controllerChild = spawnIdleProcess(t);
   const workerChild = spawnIdleProcess(t);
-  const providerChild = spawnIdleProcess(t);
+  const providerChild = spawnProviderProcess(t, workerId);
   const controllerProcess = await boundProcessIdentity(controllerChild, workerId, claim);
   const workerProcess = await boundProcessIdentity(workerChild, workerId, claim);
   const providerProcess = await boundProcessIdentity(providerChild, workerId, claim, {
@@ -783,6 +800,130 @@ test("provider-started recovery rejects a forged caller witness before signallin
 
   assert.equal(JSON.stringify(tryReadJob(state.root, state.workerId, state.env)), before);
   assert.equal(processGroupGone(state.providerProcess), false);
+});
+
+for (const code of ["E_STATE", "E_PROCESS_IDENTITY"]) {
+  test(`provider-started recovery absorbs a validated post-commit ${code} race`, {
+    skip: process.platform === "win32"
+  }, async (t) => {
+    const state = await activeProviderRecoveryFixture(t, `post-commit-race-${code}`);
+    const recovery = await reconcileBrokerWorkers({
+      root: state.root,
+      principal: state.principal,
+      dispatchStartupGraceMs: 0,
+      env: state.env,
+      testHooks: {
+        afterProviderLossSettled() {
+          const error = new Error("Injected post-commit recovery error.");
+          error.code = code;
+          throw error;
+        }
+      }
+    });
+    assert.deepEqual(
+      recovery.results.map(({ action, reason }) => ({ action, reason })),
+      [{ action: "none", reason: "dispatch-settled-concurrently" }]
+    );
+    const lost = tryReadJob(state.root, state.workerId, state.env);
+    assert.equal(lost.status, "failed");
+    assert.equal(lost.error.code, "E_WORKER_LOST");
+    assert.equal(processGroupGone(state.providerProcess), true);
+  });
+}
+
+test("provider-started recovery preserves post-commit errors without cleanup proof", {
+  skip: process.platform === "win32"
+}, async (t) => {
+  const state = await activeProviderRecoveryFixture(t, "post-commit-incomplete");
+  await assert.rejects(
+    () => reconcileBrokerWorkers({
+      root: state.root,
+      principal: state.principal,
+      dispatchStartupGraceMs: 0,
+      env: state.env,
+      testHooks: {
+        afterProviderLossSettled() {
+          updateJob(state.root, state.workerId, (job) => ({
+            ...job,
+            result: {
+              ...job.result,
+              taskRuntimeCleaned: false
+            }
+          }), state.env);
+          const error = new Error("Injected unverified post-commit recovery error.");
+          error.code = "E_STATE";
+          throw error;
+        }
+      }
+    }),
+    (error) => error?.code === "E_STATE"
+  );
+  assert.equal(
+    tryReadJob(state.root, state.workerId, state.env).result.taskRuntimeCleaned,
+    false
+  );
+});
+
+test("two provider-started reconcilers converge behind one cleanup fence", {
+  skip: process.platform === "win32",
+  timeout: 15_000
+}, async (t) => {
+  const state = await activeProviderRecoveryFixture(t, "concurrent-reconcilers");
+  let releaseFirst;
+  const firstRelease = new Promise((resolve) => { releaseFirst = resolve; });
+  let firstFenceId = null;
+  let secondFenceId = null;
+  const firstOutcome = reconcileBrokerWorkers({
+    root: state.root,
+    principal: state.principal,
+    dispatchStartupGraceMs: 0,
+    env: state.env,
+    testHooks: {
+      async afterCleanupFenceClaimed(claimed) {
+        firstFenceId = claimed.fenceId;
+        await firstRelease;
+      }
+    }
+  })
+    .then(
+      (value) => ({ value, error: null }),
+      (error) => ({ value: null, error })
+    );
+  let second = null;
+  let failure = null;
+  try {
+    await waitFor(() => firstFenceId, { timeoutMs: 5_000, intervalMs: 25 });
+    try {
+      second = await reconcileBrokerWorkers({
+        root: state.root,
+        principal: state.principal,
+        dispatchStartupGraceMs: 0,
+        env: state.env,
+        testHooks: {
+          afterCleanupFenceClaimed(claimed) {
+            secondFenceId = claimed.fenceId;
+          }
+        }
+      });
+    } catch (error) {
+      failure = error;
+    }
+  } catch (error) {
+    failure = error;
+  } finally {
+    releaseFirst();
+  }
+  const initialOutcome = await firstOutcome;
+  const initial = initialOutcome.value;
+  failure ||= initialOutcome.error;
+  if (failure) throw failure;
+  assert.equal(firstFenceId, secondFenceId);
+  assert.equal(initial.privilege, "host-trusted-reconciler");
+  assert.equal(second.privilege, "host-trusted-reconciler");
+  const lost = tryReadJob(state.root, state.workerId, state.env);
+  assert.equal(lost.status, "failed");
+  assert.equal(lost.error.code, "E_WORKER_LOST");
+  assert.equal(processGroupGone(state.providerProcess), true);
 });
 
 test("a conflicting live provider guard blocks cleanup and preserves runtime artifacts", {
@@ -3096,16 +3237,11 @@ test("MCP cancellation of an active provider reaches terminal state and leaves n
 
 test("controller watchdog settles a provider-started worker crash and cleans every owned process", { skip: process.platform === "win32" }, async (t) => {
   const { root, fake, env } = fixture({ cancelMode: "wait" });
-  const recoveryFailures = [];
   const options = {
     env,
-    async reconcileWorkers(args) {
-      try { return await reconcileBrokerWorkers(args); }
-      catch (error) {
-        recoveryFailures.push({ code: error?.code || null, message: error?.message || String(error) });
-        throw error;
-      }
-    }
+    // This test proves the live controller watchdog path. Host-side recovery
+    // has separate coverage and must not race the watchdog in this scenario.
+    async reconcileWorkers() {}
   };
   let workerId = null;
   t.after(() => workerId && emergencyStop(tryReadJob(root, workerId, env)));
@@ -3126,11 +3262,7 @@ test("controller watchdog settles a provider-started worker crash and cleans eve
     "SIGKILL"
   );
 
-  try { await waitForTerminal(root, workerId, options); }
-  catch (error) {
-    error.message = `${error.message}\nRecovery failures: ${JSON.stringify(recoveryFailures)}`;
-    throw error;
-  }
+  await waitForTerminal(root, workerId, options);
   const lost = tryReadJob(root, workerId, env);
   assert.equal(lost.status, "failed");
   assert.equal(lost.phase, "lost");
@@ -3166,9 +3298,19 @@ test("worker restart recovery settles an inflight mailbox turn as unknown withou
     cancelMode: "wait",
     cancelModeOnPrompt: 2
   });
+  const recoveryFailures = [];
   const options = {
     env,
-    reconcileWorkers: (args) => reconcileBrokerWorkers(args)
+    async reconcileWorkers(args) {
+      try { return await reconcileBrokerWorkers(args); }
+      catch (error) {
+        recoveryFailures.push({
+          code: error?.code || null,
+          message: error?.message || String(error)
+        });
+        throw error;
+      }
+    }
   };
   let workerId = null;
   t.after(() => workerId && emergencyStop(tryReadJob(root, workerId, env)));
@@ -3231,9 +3373,22 @@ test("worker restart recovery settles an inflight mailbox turn as unknown withou
     { timeoutMs: 15_000, intervalMs: 25 }
   );
   const active = tryReadJob(root, workerId, env);
+  process.kill(-active.controllerProcess.processGroupId, "SIGKILL");
+  await waitFor(
+    () => processGroupGone(active.controllerProcess),
+    { timeoutMs: 5_000, intervalMs: 25 }
+  );
   process.kill(-active.workerProcess.processGroupId, "SIGKILL");
+  await waitFor(
+    () => processGroupGone(active.workerProcess),
+    { timeoutMs: 5_000, intervalMs: 25 }
+  );
 
-  await waitForTerminal(root, workerId, options);
+  try { await waitForTerminal(root, workerId, options); }
+  catch (error) {
+    error.message = `${error.message}\nRecovery failures: ${JSON.stringify(recoveryFailures)}`;
+    throw error;
+  }
   const lost = tryReadJob(root, workerId, env);
   assert.equal(lost.status, "failed");
   assert.equal(lost.error.code, "E_WORKER_LOST");

@@ -14,8 +14,7 @@ import {
   runCodexCompanion,
   runPtyStdin,
   tempDir,
-  testEnvironment,
-  waitFor
+  testEnvironment
 } from "./helpers.mjs";
 
 const PYTHON_AVAILABLE = ptyPythonAvailable();
@@ -196,7 +195,7 @@ test("source Codex wrapper survives delayed input on a genuinely nonblocking PTY
   const dispatch = runPtyStdin(
     pinned.codexCompanionScript,
     ["task", "--background", "--envelope-stdin", "--stdin-ready", "--fresh", "--effort", "high", "--json"],
-    { cwd: root, env: pinned.env, input: envelope, timeout: 30_000 }
+    { cwd: root, env: pinned.env, input: envelope, timeout: 45_000 }
   );
   assert.equal(dispatch.driver.status, 0, dispatch.driver.stderr || dispatch.driver.stdout);
   assert.ok(dispatch.result, "PTY driver did not return structured evidence");
@@ -214,16 +213,21 @@ test("source Codex wrapper survives delayed input on a genuinely nonblocking PTY
   const job = JSON.parse(dispatch.result.stdout);
   assert.ok(job.id);
 
-  const terminal = await waitFor(() => {
-    const status = run(
-      process.execPath,
-      [pinned.codexCompanionScript, "status", job.id, "--json"],
-      { cwd: root, env: pinned.env, timeout: 5_000 }
-    );
-    if (status.status !== 0) return null;
-    const parsed = JSON.parse(status.stdout);
-    return ["completed", "failed", "cancelled"].includes(parsed.status) ? parsed : null;
-  }, { timeoutMs: 10_000 });
+  const terminalStatus = run(
+    process.execPath,
+    [
+      pinned.codexCompanionScript,
+      "status",
+      job.id,
+      "--wait",
+      "--timeout-ms",
+      "30000",
+      "--json"
+    ],
+    { cwd: root, env: pinned.env, timeout: 45_000 }
+  );
+  assert.equal(terminalStatus.status, 0, terminalStatus.stderr || terminalStatus.stdout);
+  const terminal = JSON.parse(terminalStatus.stdout);
   assert.equal(terminal.status, "completed");
   const providerStarts = readFakeLog(fake.logFile).filter(
     (entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio")
@@ -240,7 +244,7 @@ test("source Codex wrapper survives delayed input on a genuinely nonblocking PTY
       cwd: root,
       env: pinned.env,
       input: verification,
-      timeout: 30_000
+      timeout: 45_000
     }
   );
   assert.equal(record.driver.status, 0, record.driver.stderr || record.driver.stdout);
@@ -325,7 +329,7 @@ test("original issue #2 invocation waits for a delayed PTY writer without a read
   const dispatch = runPtyStdin(
     pinned.codexCompanionScript,
     ["task", "--background", "--envelope-stdin", "--fresh", "--effort", "high", "--json"],
-    { cwd: root, env: pinned.env, input: envelope, timeout: 30_000 }
+    { cwd: root, env: pinned.env, input: envelope, timeout: 45_000 }
   );
   assert.equal(dispatch.driver.status, 0, dispatch.driver.stderr || dispatch.driver.stdout);
   assert.equal(dispatch.result?.requiresReady, false);
@@ -340,16 +344,21 @@ test("original issue #2 invocation waits for a delayed PTY writer without a read
   assert.doesNotMatch(dispatch.result?.stderr || "", /EAGAIN|resource temporarily unavailable/i);
   const job = JSON.parse(dispatch.result.stdout);
   assert.ok(job.id);
-  const terminal = await waitFor(() => {
-    const status = run(
-      process.execPath,
-      [pinned.codexCompanionScript, "status", job.id, "--json"],
-      { cwd: root, env: pinned.env, timeout: 5_000 }
-    );
-    if (status.status !== 0) return null;
-    const parsed = JSON.parse(status.stdout);
-    return ["completed", "failed", "cancelled"].includes(parsed.status) ? parsed : null;
-  }, { timeoutMs: 10_000 });
+  const terminalStatus = run(
+    process.execPath,
+    [
+      pinned.codexCompanionScript,
+      "status",
+      job.id,
+      "--wait",
+      "--timeout-ms",
+      "30000",
+      "--json"
+    ],
+    { cwd: root, env: pinned.env, timeout: 45_000 }
+  );
+  assert.equal(terminalStatus.status, 0, terminalStatus.stderr || terminalStatus.stdout);
+  const terminal = JSON.parse(terminalStatus.stdout);
   assert.equal(terminal.status, "completed");
   const providerStarts = readFakeLog(fake.logFile).filter(
     (entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio")

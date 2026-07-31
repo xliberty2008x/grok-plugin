@@ -11,6 +11,7 @@ import {
   captureExecutableFileIdentity,
   captureGrokExecutableIdentity,
   createExecutableAttestation,
+  executableReleaseRecognition,
   materializePinnedGrokExecutable,
   sameExecutableAttestation,
   sameExecutableRelease
@@ -72,6 +73,58 @@ test("Grok executable identity binds exact bytes to one official package pin", (
   }
 });
 
+test("managed-observed schema v2 records exact bytes without package claims", (t) => {
+  const binary = executableFixture(t);
+  const captured = captureGrokExecutableIdentity(binary, {
+    releases: [],
+    managedRelease: {
+      releaseRecognition: "managed-observed",
+      releaseSource: "managed-observed-v1",
+      sourceProvenanceDigest: "a".repeat(64),
+      platform: process.platform,
+      arch: process.arch,
+      version: "0.2.114",
+      buildCommit: "unobserved",
+      channel: "stable"
+    }
+  });
+  const attestation = assertExecutableAttestation(captured.attestation);
+
+  assert.equal(attestation.schemaVersion, 2);
+  assert.equal(executableReleaseRecognition(attestation), "managed-observed");
+  assert.equal(attestation.version, "0.2.114");
+  for (const fabricated of [
+    "packageName",
+    "packageVersion",
+    "packageGitHead",
+    "packageIntegrityDigest"
+  ]) {
+    assert.equal(Object.hasOwn(attestation, fabricated), false);
+  }
+  const replay = captureGrokExecutableIdentity(binary, {
+    releases: [],
+    expectedAttestation: attestation
+  });
+  assert.equal(
+    sameExecutableAttestation(replay.attestation, attestation),
+    true
+  );
+  const launchDirectory = path.join(
+    fs.realpathSync(path.dirname(binary)),
+    "managed-pin"
+  );
+  const materialized = materializePinnedGrokExecutable(binary, {
+    directory: launchDirectory,
+    releases: [],
+    sourceIdentity: captured
+  });
+  assert.equal(materialized.attestation.schemaVersion, 2);
+  assert.equal(
+    sameExecutableRelease(materialized.attestation, attestation),
+    true
+  );
+});
+
 test("same-size in-place replacement is rejected by the official package pin", (t) => {
   const initial = "#!/bin/sh\nexit 0\n";
   const replacement = "#!/bin/sh\nexit 1\n";
@@ -85,7 +138,7 @@ test("same-size in-place replacement is rejected by the official package pin", (
     () => captureGrokExecutableIdentity(binary, {
       releases: [releaseFor(pinned)]
     }),
-    (error) => error?.code === "E_GROK_VERSION"
+    (error) => error?.code === "E_GROK_SOURCE"
   );
 });
 
@@ -103,7 +156,7 @@ test("atomic path replacement is rejected by the official package pin", (t) => {
     () => captureGrokExecutableIdentity(binary, {
       releases: [releaseFor(pinned)]
     }),
-    (error) => error?.code === "E_GROK_VERSION"
+    (error) => error?.code === "E_GROK_SOURCE"
   );
 });
 
@@ -111,7 +164,7 @@ test("unknown executable bytes are rejected without executing the discovery path
   const binary = executableFixture(t);
   assert.throws(
     () => captureGrokExecutableIdentity(binary),
-    (error) => error?.code === "E_GROK_VERSION"
+    (error) => error?.code === "E_GROK_SOURCE"
   );
 });
 
@@ -167,7 +220,7 @@ test("private materialization removes its launch directory when pinning fails", 
       directory: launchDirectory,
       releases: []
     }),
-    (error) => error?.code === "E_GROK_VERSION"
+    (error) => error?.code === "E_GROK_SOURCE"
   );
   assert.equal(fs.existsSync(launchDirectory), false);
 });
@@ -189,6 +242,28 @@ test("spawned executable attestation proves the current kernel mapping", () => {
     assert.throws(
       () => attestSpawnedExecutable(process.pid, expected),
       (error) => error?.code === "E_CAPABILITY"
+    );
+  }
+});
+
+test("spawned executable attestation accepts managed-observed schema v2", () => {
+  const expected = captureGrokExecutableIdentity(process.execPath, {
+    releases: [],
+    managedRelease: {
+      releaseRecognition: "managed-observed",
+      releaseSource: "managed-observed-v1",
+      sourceProvenanceDigest: "b".repeat(64),
+      platform: process.platform,
+      arch: process.arch,
+      version: "0.2.114",
+      buildCommit: "unobserved",
+      channel: "stable"
+    }
+  });
+  if (process.platform === "darwin" || process.platform === "linux") {
+    assert.equal(
+      attestSpawnedExecutable(process.pid, expected),
+      expected.attestation
     );
   }
 });

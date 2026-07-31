@@ -5047,8 +5047,7 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   const context = { ...baseContext, fixtureRoot };
   const fixtureStatus = initializeFixtureRepository(
     fixtureRoot,
-    context.env,
-    { workloadFiles: ACTIVE_WINDOW_WORKLOAD_FILES }
+    context.env
   );
   const tracker = createTracker("authenticated-completion", fixtureStatus);
   context.runner.trackers.push({ context, tracker });
@@ -5056,13 +5055,15 @@ async function runCompletionScenario(baseContext, fixtureRoot) {
   let client = await startInstalledMcp(context);
   await verifyMcpSurface(context, client, { negative: true });
   enterQualificationStage("completion-spawn");
+  // Immediate ordered mailbox sends already exercise the active primary-turn
+  // window. Keep the provider task minimal so fixture work cannot become the
+  // lifecycle gate that this scenario is meant to measure.
   const started = await beginScenario(
     context,
     tracker,
     client,
     `installed-completion-${crypto.randomUUID()}`,
-    "authenticated completion",
-    { activeWindow: true }
+    "authenticated completion"
   );
   enterQualificationStage("completion-mailbox-open");
   await waitForInstalledMailboxOpen(context, tracker);

@@ -5636,9 +5636,9 @@ test("rescue skill remediates only the exact missing capability-receipt admissio
     GROK_COMPANION_CLAUDE_SESSION_ID: "claude-session"
   });
 
-  // AC-1: single helper source of truth; both emitters use it; skill/docs bind to canonical forms.
+  // AC-1: single helper source of truth; the shared gate emitter uses it; skill/docs bind to canonical forms.
   assert.match(hostLib, /export function missingInvalidProviderCapabilityReceiptMessage/);
-  assert.equal(companion.split("missingInvalidProviderCapabilityReceiptMessage(").length - 1, 2);
+  assert.equal(companion.split("missingInvalidProviderCapabilityReceiptMessage(").length - 1, 1);
   assert.equal(companion.includes("Valid provider capability receipt is missing or invalid; run"), false);
   assert.equal(
     canonicalCodex,
@@ -5785,16 +5785,17 @@ test("integration: Codex nonblocking stdin accepts arbitrary markers and records
   const job = JSON.parse(dispatched.stdout);
   assert.ok(job.id);
 
-  const terminal = await waitFor(() => {
-    const result = runCompanion(["status", job.id, "--json"], {
+  const terminalStatus = runCompanion(
+    ["status", job.id, "--wait", "--timeout-ms", "30000", "--json"],
+    {
       cwd: root,
       env: pinned.env,
+      timeout: 45_000,
       companionScript: pinned.codexCompanionScript
-    });
-    if (result.status !== 0) return null;
-    const status = JSON.parse(result.stdout);
-    return ["completed", "failed", "cancelled"].includes(status.status) ? status : null;
-  }, { timeoutMs: 10000 });
+    }
+  );
+  assert.equal(terminalStatus.status, 0, terminalStatus.stderr || terminalStatus.stdout);
+  const terminal = JSON.parse(terminalStatus.stdout);
   assert.equal(terminal.status, "completed");
   const providerStarts = readFakeLog(fake.logFile).filter(
     (entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio")

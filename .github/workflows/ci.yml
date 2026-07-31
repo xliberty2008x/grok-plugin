@@ -46,8 +46,9 @@ jobs:
     name: ${{ matrix.os }} / Node ${{ matrix.node }} / shard ${{ matrix.shard }}/3
     runs-on: ${{ matrix.os }}
     # Each file remains independently bounded to ten minutes by the runner.
-    # The larger aggregate budget covers sequential containment teardown.
-    timeout-minutes: 40
+    # Hosted macOS shards can approach 20 minutes under load; preserve the
+    # complete zero-skip inventory with bounded headroom.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

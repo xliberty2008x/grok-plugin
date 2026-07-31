@@ -27,6 +27,12 @@ Parity means:
 - The upstream reference is pinned to v1.0.6, commit `db52e28f4d9ded852ab3942cea316258ae4ef346`.
 - The pinned upstream repository passed all 91 tests and its build when the baseline was frozen.
 - The runtime enforces Grok Build 0.2.99 as the compatibility floor because the hardened ACP path depends on `--agent-profile`, `agent --no-leader`, and `--leader-socket`.
+- Stable managed Grok versions at or above the floor have no upper allowlist.
+  Known release digests keep their stronger evidence; unfamiliar versions are
+  accepted only through the active donor-defined managed layout, copied into a
+  private immutable pin before execution, and capability-probed from that pin.
+  This `managed-observed` path accepts initial managed-install supply-chain
+  risk without transferring qualification from 0.2.112.
 - **Hardening slice implemented in this worktree (documentation now aligned):**
   - TaskEnvelope v1 and ContextManifest v1, including runtime-verified exact `context.requiredPaths` for task-scoped checkout inventory.
   - Schema-3 jobs with progress, heartbeat, lifecycle events, completion manifests, and public JSON projection.
@@ -201,7 +207,9 @@ Build a disposable harness before porting production runtime code.
 - Verify the exact `injectDefaultTools: false` profiles: read exposes only `GrokBuild:read_file`, `GrokBuild:list_dir`, and `GrokBuild:grep`; write exposes those three plus `GrokBuild:search_replace` and `GrokBuild:todo_write` with **no** terminal tools.
 - Exercise session creation, session loading, prompt streaming, stop reasons, cancellation, unexpected process exit, and pre-prompt credential revocation.
 - Capture representative agent-message, plan, tool-call, tool-update, usage, error, and unknown events.
-- Keep 0.2.99 as the enforced compatibility floor and distinguish it from authenticated platform evidence for the code under test.
+- Keep 0.2.99 as the enforced stable compatibility floor with no upper
+  allowlist. Treat exact-version qualification separately from forward
+  managed admission.
 - Treat the July 13, 2026 authenticated macOS 0.2.99 10/10 result as historical only. The July 14 direct-runtime pass is evidence for the changed code, but do not claim the hardening slice is qualified until installed-host and release-recording gates pass.
 
 ### Sandbox tasks
@@ -375,7 +383,7 @@ Using the fake provider and an opt-in real CLI test against this worktree:
 - Use atomic writes and a bounded lock with stale-lock recovery.
 - Use `0700` directories and `0600` sensitive files where supported.
 - Retain at most 50 jobs without evicting active jobs.
-- For the P3.1 cutover, reject dirty/unsafe control checkouts; atomically commit each write job, idempotency witness, immutable private `ExecutionBinding`, and `planned` journal before any filesystem effect; then use one fenced `planned → provisioning → ready` attempt that durably binds and bootstrap-attests the exact official Grok executable before requesting exact worktree creation through the official Grok ACP extension, and independently verify its registered path/base/common-directory identity. The no-model provisioner uses a separate private CWD because the execution root does not yet exist. Keep `ready` free of prompt/outbox/authorization authority; a later atomic ready-only launch transition constructs those materials after revalidation and requires the model provider `cwd` plus every worker/provider authority digest to equal the binding before dispatch. Restart/replay must return an exact durable `ready` result without another create; unknown effects may be host-adopted only after exact clean registration proof, and create may be reissued only after independent absence proof. Cleanup uses a distinct owner-authorized remove-only controller after artifact/integration/abandon disposition, never the P3-P3 create controller.
+- For the P3.1 cutover, reject dirty/unsafe control checkouts; atomically commit each write job, idempotency witness, immutable private `ExecutionBinding`, and `planned` journal before any filesystem effect; then use one fenced `planned → provisioning → ready` attempt that durably binds and bootstrap-attests the exact admitted private Grok pin before requesting exact worktree creation through the official Grok ACP extension, and independently verify its registered path/base/common-directory identity. The no-model provisioner uses a separate private CWD because the execution root does not exist yet. Keep `ready` free of prompt/outbox/authorization authority; a later atomic ready-only launch transition constructs those materials after revalidation and requires the model provider `cwd` plus every worker/provider authority digest to equal the binding before dispatch. Restart/replay must return an exact durable `ready` result without another create; unknown effects may be host-adopted only after exact clean registration proof, and create may be reissued only after independent absence proof. Cleanup uses a distinct owner-authorized remove-only controller after artifact/integration/abandon disposition, never the P3-P3 create controller.
 - Retain one control-workspace writer as a conservative transitional fence; P3.2 replaces it with durable managed-root leases so distinct execution roots may overlap while the same root/lineage remains exclusive.
 - Implement `queued`, `running`, `completed`, `failed`, and `cancelled` transitions with progress and heartbeat.
 - Persist workspace, host kind/session, Grok session, the complete effective security profile, model, effort, verified process identities, timestamps, TaskEnvelope/context manifests, completion manifests, lifecycle events, result (worker report, provider claims, runtime evidence, hostVerification), and stable error; read legacy schema-1/2 records compatibly.
@@ -432,9 +440,19 @@ Using the fake provider and an opt-in real CLI test against this worktree:
 
 ### Setup tasks
 
-- Check Grok binary discovery and the 0.2.99 compatibility floor, including the required agent-profile, no-leader, and leader-socket capabilities.
+- Check Grok binary discovery and the stable 0.2.99 compatibility floor without
+  an upper allowlist, including the required agent-profile, no-leader, and
+  leader-socket capabilities.
+- Preserve `known-digest` recognition for tabled releases. Admit an unfamiliar
+  version only from the active `cli.installer`-consistent managed symlink
+  layout, reject arbitrary unfamiliar paths as `E_GROK_SOURCE`, and copy/hash
+  the source into the private immutable pin before any execution.
+- Persist managed-observed executable-attestation schema v2 without fabricated
+  npm/git provenance; keep schema-v1 pins, provider launch binding schema 1,
+  and capability receipt schema 2 compatible.
 - Run `grok models`, initialize ACP, and inspect authentication, protocol version, session loading, models, and effort options.
-- Distinguish missing CLI, unsupported version, expired authentication, and ACP capability loss.
+- Distinguish missing CLI, unmanaged source, malformed/below-floor version,
+  executable identity drift, expired authentication, and ACP capability loss.
 - Describe setup readiness narrowly: it validates required headless flags and isolated inspection without spending model quota, permits only builtin capabilities and provider-bundled skills rooted beneath either `<isolated GROK_HOME>/skills/` or `<isolated GROK_HOME>/bundled/skills/`, and rejects external extensions. It does not execute or qualify model-backed review behavior, write confinement for this hardening slice, operating-system process control, or release readiness.
 - Offer the exact `npm install -g @xai-official/grok` command only after explicit approval; document the official curl installer as a manual alternative.
 - Require a cached `grok login`, reject environment-key-only authentication, refresh cached authentication whose finite expiry is under 45 minutes, and provide official login guidance without requesting or printing a key.
@@ -581,7 +599,9 @@ Before release, run the protected `GROK_E2E=1` headless review, sandbox, cancell
 - Explain read-only versus write profiles, no-terminal write tools, host-owned verification, and managed-policy limitations.
 - Document residual limitations: macOS child-network caveat; exact-source qualification boundaries; restrictive-umask compatibility; outstanding independent Claude Code and platform qualification.
 - Document stable error codes and troubleshooting.
-- Publish the 0.2.99 compatibility floor separately from exact authenticated test evidence; do not imply historical July 13 evidence qualifies the current worktree.
+- Publish the stable 0.2.99 compatibility floor and no-upper-allowlist policy
+  separately from exact authenticated test evidence; do not imply historical
+  0.2.99 or operational 0.2.112 evidence qualifies future versions.
 - Classify this branch as an unqualified hardening candidate until re-qualification completes.
 - Classify Linux as provider-unverified and Windows provider execution/process control as unsupported until their release evidence exists.
 - Explain that normal review is plugin-prompt-based, not a native review RPC, and that rescue is a control plane, not verbatim host forwarding.
@@ -650,7 +670,7 @@ Implementation SHOULD occur on `codex/grok-port` and merge into `main` only afte
 
 | ID | Risk | Likelihood | Impact | Mitigation | Gate |
 |---|---|---:|---:|---|---|
-| R1 | ACP or CLI schema changes after the Grok 0.2.99 floor | High | High | Capability negotiation, required-flag checks, redacted unknown-event preservation, and current-version contract tests | G1, G3, G7 |
+| R1 | ACP or CLI schema changes after the Grok 0.2.99 floor | High | High | Active-managed source classification, exact-byte private pinning, capability/protocol negotiation, required-flag checks, redacted unknown-event preservation, and current-version lifecycle tests | G1, G3, G7 |
 | R2 | Prompt-based review is weaker than native Codex review | Medium | High | Versioned prompts, structured findings, fixed evaluation repositories, golden expected findings | G5, G7 |
 | R3 | Child Grok discovers and recursively invokes the plugin | High | Critical | Child marker, runtime refusal, hook no-op, prompt rule, disabled review subagents | G1 |
 | R4 | Sandbox behavior differs by platform; macOS network isolation not enforced by Grok | Medium | Critical | Strict profiles, tool denial, workspace fingerprints, canaries, documented residual limitations | G1, G7 |

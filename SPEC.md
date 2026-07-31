@@ -61,7 +61,9 @@ Behavioral parity does not require identical provider internals. Headless Grok r
 - Reimplementing Grok's shell, filesystem, model loop, or sandbox.
 - Hosting Grok remotely.
 - Claiming affiliation with or endorsement by xAI or OpenAI.
-- Guaranteeing compatibility with untested Grok CLI versions.
+- Guaranteeing lifecycle compatibility with untested Grok CLI versions;
+  forward admission after exact-byte pinning and current capability probes is
+  not a qualification claim.
 - Automatic fallback to Claude when Grok fails.
 - Native Grok review behavior unless xAI publishes and supports such an API.
 - A shared long-lived Grok broker in v0.3.
@@ -119,7 +121,55 @@ Grok binary discovery order:
 
 The selected path MUST resolve to an executable regular file. It MUST be invoked directly with an argument array and `shell: false`.
 
-The runtime SHALL reject Grok CLI versions older than 0.2.99. This floor is required because 0.2.99 advertises the isolated ACP `--agent-profile`, `--no-leader`, and custom leader-socket contracts used by this release. A historical authenticated macOS matrix for the earlier contract passed with Grok Build 0.2.99 on July 13, 2026; that evidence does **not** qualify the current hardened worktree. A wider supported range or release claim MUST NOT be published until the release suite passes against each claimed endpoint for the code under test.
+The runtime SHALL reject Grok CLI versions older than 0.2.99, malformed
+versions, and prerelease channels. This floor is required because 0.2.99
+advertises the isolated ACP `--agent-profile`, `--no-leader`, and custom
+leader-socket contracts used by this release. Stable versions at or above the
+floor SHALL have no upper version allowlist. Forward admission is not a
+qualification claim: historical and current lifecycle evidence remains bound
+to each recorded exact source, version, platform, and provider run.
+
+Setup SHALL recognize two executable trust paths:
+
+1. `known-digest`: exact bytes match an existing platform/architecture release
+   record. The static release table remains stronger integrity evidence and
+   MUST NOT act as an upper-version ceiling.
+2. `managed-observed`: unfamiliar bytes are accepted only when they are the
+   active Grok-managed installation. On supported POSIX layouts setup SHALL
+   resolve `$GROK_HOME/bin/grok`, read a bounded canonical `cli.installer`
+   setting, require `internal` targets below `$GROK_HOME/downloads` or `npm`
+   versioned siblings below `$GROK_HOME/bin`, and verify the canonical target,
+   stable SemVer filename, platform/architecture naming, size, executable
+   mode, ownership, permissions, and source stability. The active symlink, its
+   exact raw target, and an npm launcher used only to locate that managed target
+   are acceptable discovery inputs. Arbitrary unfamiliar `GROK_BIN` or `PATH`
+   executables MUST fail with `E_GROK_SOURCE`.
+
+Before any candidate is executed, setup MUST copy and hash it into the existing
+private immutable provider pin and re-attest the copied bytes. Every `--version`,
+authentication, isolation, ACP v1, session-loading, and capability probe MUST
+then use that private copy. A same-version/platform known-release digest
+mismatch or source/copy drift MUST fail with `E_PROCESS_IDENTITY`; absence of
+any candidate is `E_GROK_NOT_FOUND`; a malformed or below-floor version is
+`E_GROK_VERSION`; and missing runtime behavior remains `E_CAPABILITY`. Only
+`E_GROK_NOT_FOUND` may recommend installation.
+
+Executable-attestation schema v2 SHALL persist `managed-observed` provenance,
+version, observed build, stable channel, platform, architecture,
+source-provenance digest, size, executable digest, and the existing
+file/path/release/identity digests without fabricating npm integrity or Git-head
+claims. Readers MUST continue accepting schema-v1 known-release attestations
+and historical private pins. Pin resolution MUST rehash against its persisted
+attestation without consulting the current release table. Provider launch
+binding schema 1 and provider-capability receipt schema 2 remain unchanged;
+`releaseIdentityDigest` remains the stable artifact-identity field and no
+longer implies code-preapproval.
+
+Successful setup output SHALL add
+`grok.releaseRecognition = known-digest|managed-observed`. `ready: true` means
+the exact pinned bytes passed the current readiness probes; it does not qualify
+an untested lifecycle. `managed-observed` accepts the initial managed-install
+supply-chain risk and does not prove that xAI issued the observed bytes.
 
 Task model IDs and transfer model selection MUST be derived from Grok's advertised capabilities. Public rescue/transfer effort syntax is limited to `low`, `medium`, and `high`; transfer additionally checks advertised efforts when Grok supplies them. The plugin MUST NOT hardcode a "latest" model or silently substitute a requested model.
 
@@ -198,9 +248,9 @@ Write processes perform native-like edits through `search_replace` only inside a
 
 Before write provisioning, the broker MUST hold control-workspace admission, capture a complete parent fingerprint, and reject a dirty or unsafe control checkout, including tracked, staged, untracked, ignored, unresolved-index, hidden-index, mode, symlink, and content drift. Dirty-source materialization is unsupported until a separately approved contract exists. The exact clean `HEAD` is the only worktree base.
 
-Every accepted write job MUST have one private durable `ExecutionBinding` created before any filesystem effect or provider dispatch. Its immutable body MUST cover the worker and control-workspace identities, exact base commit/tree, trusted clean-parent fingerprint, canonical control root and deterministic expected execution root, Git common-directory identity, TaskEnvelope scope, role/profile/context identities, creation time, and an immutable digest. The mutable provisioning journal MUST be separately digest-bound to that body. The binding digest MUST enter the provisioning intent/controller bootstrap/guard and every later launch contract, worker authorization, controller/worker identity, and provider guard. Before any official create request, the provisioning intent and authenticated bootstrap MUST also bind an independently captured identity for the exact official Grok executable: canonical private path identity, device/inode/mode/size, full executable digest, version/build identity, and a stable identity digest. The bootstrap MUST fail closed unless it can re-attest the spawned process executable to that identity; a mutable discovery path, version string alone, or provider response is insufficient. Because the execution root does not exist before official create, the no-model provisioning controller MUST launch from a distinct private broker-owned CWD with only the exact source/Git/destination grants. A later model provider MUST launch with `cwd` equal to the independently verified execution root. Both stages MUST fail closed if any bound identity is missing, partial, stale, or inconsistent. Only digests and non-sensitive lifecycle state may enter public projections.
+Every accepted write job MUST have one private durable `ExecutionBinding` created before any filesystem effect or provider dispatch. Its immutable body MUST cover the worker and control-workspace identities, exact base commit/tree, trusted clean-parent fingerprint, canonical control root and deterministic expected execution root, Git common-directory identity, TaskEnvelope scope, role/profile/context identities, creation time, and an immutable digest. The mutable provisioning journal MUST be separately digest-bound to that body. The binding digest MUST enter the provisioning intent/controller bootstrap/guard and every later launch contract, worker authorization, controller/worker identity, and provider guard. Before any official create request, the provisioning intent and authenticated bootstrap MUST also bind an independently captured identity for the exact admitted private Grok pin: canonical private path identity, device/inode/mode/size, full executable digest, version/build identity, and a stable identity digest. The bootstrap MUST fail closed unless it can re-attest the spawned process executable to that identity; a mutable discovery path, version string alone, or provider response is insufficient. Because the execution root does not exist before official create, the no-model provisioning controller MUST launch from a distinct private broker-owned CWD with only the exact source/Git/destination grants. A later model provider MUST launch with `cwd` equal to the independently verified execution root. Both stages MUST fail closed if any bound identity is missing, partial, stale, or inconsistent. Only digests and non-sensitive lifecycle state may enter public projections.
 
-Provisioning MUST use a job-first, effect-second state machine. Under control-workspace admission the broker atomically commits the job, idempotency witness, immutable binding body, and `planned` journal state without a dispatch outbox or launch authorization. A fenced provisioning attempt then durably binds the exact official executable identity, advances `planned → provisioning`, asks the official Grok ACP worktree extension to create the exact deterministic clean Git worktree at the pinned base, independently verifies its registered-worktree/common-directory/base/cleanliness/symlink/index identity plus the unchanged parent, captures its ContextManifest, removes the provisioning controller, and atomically advances to `ready`. The official receipt and ready transition MUST remain bound to the same attested executable identity. `ready` is proof of a verified worktree only: it MUST contain no prompt, request digest, dispatch outbox, worker authorization, model session, or provider authority. A separate atomic `ready → launch-authorized` transition MUST revalidate the binding/worktree/context and create those exact launch materials before a model provider can start. Ambiguous effects enter `cleanup_pending`; terminal cleanup states are `cleaned` or `failed`.
+Provisioning MUST use a job-first, effect-second state machine. Under control-workspace admission the broker atomically commits the job, idempotency witness, immutable binding body, and `planned` journal state without a dispatch outbox or launch authorization. A fenced provisioning attempt then durably binds the exact admitted executable identity, advances `planned → provisioning`, asks the official Grok ACP worktree extension to create the exact deterministic clean Git worktree at the pinned base, independently verifies its registered-worktree/common-directory/base/cleanliness/symlink/index identity plus the unchanged parent, captures its ContextManifest, removes the provisioning controller, and atomically advances to `ready`. The official receipt and ready transition MUST remain bound to the same attested executable identity. `ready` is proof of a verified worktree only: it MUST contain no prompt, request digest, dispatch outbox, worker authorization, model session, or provider authority. A separate atomic `ready → launch-authorized` transition MUST revalidate the binding/worktree/context and create those exact launch materials before a model provider can start. Ambiguous effects enter `cleanup_pending`; terminal cleanup states are `cleaned` or `failed`.
 
 Recovery MAY retry `planned`. Exact `ready` replay MUST return the durable result without starting a controller or sending another create request. It MAY adopt an ambiguous provisioning effect only when the deterministic path is independently classified as registered, clean, and exact for the original binding worker/control/common-directory/base and attested executable identity; adoption evidence MUST state that the host reconciled an unknown official response rather than inventing a `created` receipt. Reissue is allowed only after independent proof that both the exact filesystem effect and raw Git registration are absent, under a fresh fence that preserves the original operation identity. Dirty, foreign, mismatched, occupied, unsafe, or fresh upstream `exists` outcomes MUST NOT promote or auto-remove. Cancellation during provisioning disables dispatch and requests exact-identity reconciliation. Owner cleanup belongs to a later, separately authorized no-model remove-only controller; it MUST call the official remove extension with only the exact bound path after artifact/integration/abandon decision and worker/binding/common-directory verification, then independently prove filesystem, Git-registration, admin-directory, controller-process/guard/credential/home, and session absence. A crash MUST NOT create a launchable unbound worker or permit cleanup of an arbitrary path.
 
@@ -921,7 +971,8 @@ Resuming a session MUST NOT weaken or change its stored security profile. A requ
 | `E_USAGE` | Invalid or conflicting arguments |
 | `E_GIT_REQUIRED` | Git unavailable or command outside a required repository |
 | `E_GROK_NOT_FOUND` | Grok executable unavailable |
-| `E_GROK_VERSION` | Unsupported Grok version |
+| `E_GROK_SOURCE` | An unfamiliar executable is not the active managed Grok installation |
+| `E_GROK_VERSION` | Grok version is malformed, prerelease, or below 0.2.99 |
 | `E_AUTH_REQUIRED` | Missing or expired authentication |
 | `E_CAPABILITY` | Required ACP capability unavailable |
 | `E_POLICY` | Managed policy prevents the requested profile |
@@ -942,7 +993,7 @@ Resuming a session MUST NOT weaken or change its stored security profile. A requ
 | `E_STORAGE_READONLY` | Workspace control-state storage is not writable (capability/prerequisite; e.g. EPERM/EACCES/EROFS on state initialization/repair, migration, durable lock, or atomic admission write) |
 | `E_SECURITY_PROFILE` | The checked-in ACP agent profile no longer matches its recorded digest |
 | `E_WORKER_LOST` | Recorded worker disappeared |
-| `E_PROCESS_IDENTITY` | A recorded PID could not be proven to belong to the job |
+| `E_PROCESS_IDENTITY` | Executable bytes/source drifted, a known digest mismatched, or a recorded PID could not be proven to belong to the job |
 | `E_RECURSION` | Nested companion invocation refused |
 | `E_REVIEW_MUTATED_WORKSPACE` | Read-only review changed repository state |
 | `E_OUTPUT_LIMIT` | Provider output exceeded a bounded job limit |

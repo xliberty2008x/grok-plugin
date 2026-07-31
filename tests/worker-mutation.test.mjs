@@ -80,7 +80,10 @@ import {
   resolveWorkerAuthority
 } from "../plugins/grok/scripts/lib/worker-authority.mjs";
 import { processGroupGone, processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
-import { createExecutableAttestation } from "../plugins/grok/scripts/lib/executable-identity.mjs";
+import {
+  createExecutableAttestation,
+  createManagedObservedAttestation
+} from "../plugins/grok/scripts/lib/executable-identity.mjs";
 import {
   providerLaunchBindingDigest
 } from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
@@ -216,6 +219,25 @@ const TEST_EXECUTABLE_IDENTITY = createExecutableAttestation({
   channel: "stable",
   size: 4096,
   executableDigest: "1".repeat(64)
+});
+const TEST_MANAGED_EXECUTABLE_IDENTITY = createManagedObservedAttestation({
+  canonicalPath: "/private/test/grok-managed",
+  device: "7",
+  inode: "8",
+  mode: 0o100755,
+  size: 4096,
+  executableDigest: "2".repeat(64)
+}, {
+  releaseRecognition: "managed-observed",
+  releaseSource: "managed-observed-v1",
+  sourceProvenanceDigest: "4".repeat(64),
+  platform: process.platform,
+  arch: process.arch,
+  version: "0.2.114",
+  buildCommit: "unobserved",
+  channel: "stable",
+  size: 4096,
+  executableDigest: "2".repeat(64)
 });
 
 function runIsolatedModule(source) {
@@ -1885,6 +1907,26 @@ test("write provisioner intent is private, idempotent, fenced, and exactly settl
   });
   assert.equal(settledReplay.settled, false);
   assert.equal(settledReplay.replayed, true);
+});
+
+test("managed-observed schema v2 survives durable write-provisioning admission", () => {
+  const fixture = plannedWriteProvisioningFixture("managed-v2-intent");
+  fixture.actor = {
+    ...fixture.actor,
+    executableIdentity: TEST_MANAGED_EXECUTABLE_IDENTITY
+  };
+  const prepared = prepareProvisioningIntent(fixture);
+  assert.equal(prepared.intent.executableIdentity.schemaVersion, 2);
+  assert.equal(
+    prepared.intent.executableIdentity.releaseRecognition,
+    "managed-observed"
+  );
+  const stored = tryReadJob(fixture.root, fixture.workerId, fixture.env);
+  assert.doesNotThrow(() => assertWriteExecutionJob(stored, fixture.env));
+  assert.equal(
+    stored.provisioningRuntime.intent.executableIdentity.identityDigest,
+    TEST_MANAGED_EXECUTABLE_IDENTITY.identityDigest
+  );
 });
 
 test("planned preactivation cleanup records one transient process proof without activation authority", {
