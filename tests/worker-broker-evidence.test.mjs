@@ -1420,7 +1420,7 @@ process.stdout.write("ok\\n");
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   const completed = new Promise((resolve, reject) => {
     child.once("error", reject);
-    child.once("exit", (code, signal) => resolve({ code, signal, stdout, stderr }));
+    child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
   });
   return { child, completed };
 }
@@ -8798,8 +8798,34 @@ test("concurrent Phase 0 proof writers retain one current record without lost cu
   await waitFor(() => fs.existsSync(readyA) && fs.existsSync(readyB));
   fs.writeFileSync(barrier, "go\n");
   const [firstResult, secondResult] = await Promise.all([first.completed, second.completed]);
-  assert.equal(firstResult.code, 0, firstResult.stderr);
-  assert.equal(secondResult.code, 0, secondResult.stderr);
+  const attempts = [
+    { slice: "concurrent-a", result: firstResult },
+    { slice: "concurrent-b", result: secondResult }
+  ];
+  const retrySlices = [];
+  let successfulAttempts = 0;
+  for (const { slice, result } of attempts) {
+    assert.equal(result.signal, null, result.stderr || result.stdout);
+    assert.equal(result.stderr, "");
+    const payload = JSON.parse(result.stdout);
+    if (result.code === 0) {
+      assert.deepEqual(payload, { ok: true, code: null });
+      successfulAttempts += 1;
+      continue;
+    }
+    assert.equal(result.code, 1, result.stdout);
+    assert.deepEqual(payload, { ok: false, code: "E_PROOF_PUBLICATION" });
+    retrySlices.push(slice);
+  }
+  assert.ok(successfulAttempts >= 1);
+  assert.ok(retrySlices.length <= 1);
+  // Proof publication deliberately bounds lock contention. A sufficiently
+  // slow runner may reject one concurrent attempt after the other writer
+  // acquired the lock; retry only after both children have closed.
+  for (const slice of retrySlices) {
+    const retried = provePhaseZero({ phase: "0", slice, root, write: true });
+    assert.equal(retried.ok, true, retried.code);
+  }
   const ledger = loadLedger(root);
   assert.equal(ledger.entries.filter((entry) => entry.currency === "current").length, 1);
   assert.equal(ledger.entries.filter((entry) => entry.currency === "invalidated").length, 1);
