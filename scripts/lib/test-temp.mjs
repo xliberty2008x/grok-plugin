@@ -5,6 +5,9 @@ import process from "node:process";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import gitContainment from "./test-temp-git-containment.cjs";
+
+const { inspectContainedGitMetadata } = gitContainment;
 
 export const TEST_TEMP_MANIFEST = ".grok-test-temp-owner.json";
 export const TEST_TEMP_SCHEMA_VERSION = 1;
@@ -144,9 +147,9 @@ export function createOwnedTestTempRoot({
       `${JSON.stringify(owner)}\n`,
       { encoding: "utf8", flag: "wx", mode: 0o600 }
     );
-    const rootStat = fs.lstatSync(root);
+    const rootStat = fs.lstatSync(root, { bigint: true });
     const manifestPath = path.join(root, TEST_TEMP_MANIFEST);
-    const manifestStat = fs.lstatSync(manifestPath);
+    const manifestStat = fs.lstatSync(manifestPath, { bigint: true });
     const manifestContents = fs.readFileSync(manifestPath);
     if (
       !rootStat.isDirectory()
@@ -159,16 +162,16 @@ export function createOwnedTestTempRoot({
     }
     createdRootIdentities.set(root, Object.freeze({
       root: Object.freeze({
-        dev: rootStat.dev,
-        ino: rootStat.ino,
-        uid: rootStat.uid
+        dev: String(rootStat.dev),
+        ino: String(rootStat.ino),
+        uid: String(rootStat.uid)
       }),
       manifest: Object.freeze({
-        dev: manifestStat.dev,
-        ino: manifestStat.ino,
-        uid: manifestStat.uid,
-        mode: manifestStat.mode,
-        size: manifestStat.size,
+        dev: String(manifestStat.dev),
+        ino: String(manifestStat.ino),
+        uid: String(manifestStat.uid),
+        mode: String(manifestStat.mode),
+        size: String(manifestStat.size),
         digest: crypto.createHash("sha256").update(manifestContents).digest("hex")
       })
     }));
@@ -184,28 +187,28 @@ function sameCreatedRootIdentity(expected, stat) {
     expected
     && stat.isDirectory()
     && !stat.isSymbolicLink()
-    && stat.dev === expected.dev
-    && stat.ino === expected.ino
-    && stat.uid === expected.uid
+    && String(stat.dev) === expected.dev
+    && String(stat.ino) === expected.ino
+    && String(stat.uid) === expected.uid
   );
 }
 
 function verifyCreatedRoot(root, expected) {
-  const rootStat = fs.lstatSync(root);
+  const rootStat = fs.lstatSync(root, { bigint: true });
   if (!sameCreatedRootIdentity(expected.root, rootStat)) {
     throw new Error("The test-temp root identity changed before cleanup.");
   }
   const manifestPath = path.join(root, TEST_TEMP_MANIFEST);
-  const manifestStat = fs.lstatSync(manifestPath);
+  const manifestStat = fs.lstatSync(manifestPath, { bigint: true });
   const manifest = expected.manifest;
   if (
     !manifestStat.isFile()
     || manifestStat.isSymbolicLink()
-    || manifestStat.dev !== manifest.dev
-    || manifestStat.ino !== manifest.ino
-    || manifestStat.uid !== manifest.uid
-    || manifestStat.mode !== manifest.mode
-    || manifestStat.size !== manifest.size
+    || String(manifestStat.dev) !== manifest.dev
+    || String(manifestStat.ino) !== manifest.ino
+    || String(manifestStat.uid) !== manifest.uid
+    || String(manifestStat.mode) !== manifest.mode
+    || String(manifestStat.size) !== manifest.size
   ) {
     throw new Error("The test-temp owner manifest identity changed before cleanup.");
   }
@@ -234,10 +237,26 @@ export function removeOwnedTestTempRoot(root) {
   }
   try {
     verifyCreatedRoot(quarantine, expected);
+    const gitProof = inspectContainedGitMetadata({
+      root: quarantine,
+      originalRoot: root,
+      expectedUid: expected.root.uid,
+      expectedDev: expected.root.dev
+    });
+    if (!gitProof.available) {
+      throw new Error("The test-temp root contains unproven Git metadata.");
+    }
     const result = spawnSync(process.execPath, [
       REMOVE_OWNED_ROOT_HELPER,
-      String(expected.root.dev),
-      String(expected.root.ino)
+      expected.root.dev,
+      expected.root.ino,
+      expected.root.dev,
+      "managed-contained",
+      "none",
+      root,
+      quarantine,
+      expected.root.uid,
+      gitProof.digest
     ], {
       cwd: quarantine,
       env: { GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1" },

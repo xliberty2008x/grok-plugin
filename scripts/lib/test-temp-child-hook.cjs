@@ -161,14 +161,44 @@ function syncBypassAuthorized(file, args, options) {
   ) {
     return true;
   }
+  const removeHelperArgumentsAreBounded = (
+    Array.isArray(args)
+    && args.length >= 3
+    && args.length <= 10
+    && path.resolve(String(args[0] || "")) === REMOVE_HELPER
+    && /^[0-9]+$/u.test(String(args[1] || ""))
+    && /^[0-9]+$/u.test(String(args[2] || ""))
+    && (
+      args.length < 4
+      || /^[0-9]+$/u.test(String(args[3] || ""))
+    )
+    && (
+      args.length < 5
+      || ["guarded", "managed-contained"].includes(String(args[4] || ""))
+    )
+    && (
+      args.length < 6
+      || ["none", "dotgit", "modules", "registration", "worktrees"].includes(
+        String(args[5] || "")
+      )
+    )
+    && (
+      String(args[4] || "guarded") === "managed-contained"
+        ? (
+            args.length === 10
+            && path.isAbsolute(String(args[6] || ""))
+            && path.isAbsolute(String(args[7] || ""))
+            && /^(?:0|[1-9][0-9]*)$/u.test(String(args[8] || ""))
+            && /^[a-f0-9]{64}$/u.test(String(args[9] || ""))
+          )
+        : args.length <= 6
+    )
+  );
   return (
     file === process.execPath
     && Array.isArray(args)
     && (
-      (
-        args.length === 3
-        && path.resolve(String(args[0] || "")) === REMOVE_HELPER
-      )
+      removeHelperArgumentsAreBounded
       || (
         args.length === 1
         && path.resolve(String(args[0] || "")) === DIRECT_TEMP_FALLBACK_HELPER
@@ -308,7 +338,7 @@ function appendProcessRegistration(pid, expectedParentPid = null) {
   let descriptor;
   let wroteRegistration = false;
   try {
-    const before = fs.lstatSync(registry);
+    const before = fs.lstatSync(registry, { bigint: true });
     if (!before.isFile() || before.isSymbolicLink()) {
       throw registrationFailure(registration, "E_TEST_TEMP_REGISTRATION_WRITE");
     }
@@ -318,7 +348,7 @@ function appendProcessRegistration(pid, expectedParentPid = null) {
         | fs.constants.O_APPEND
         | fs.constants.O_NOFOLLOW
     );
-    const opened = fs.fstatSync(descriptor);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
     if (
       !opened.isFile()
       || opened.dev !== before.dev

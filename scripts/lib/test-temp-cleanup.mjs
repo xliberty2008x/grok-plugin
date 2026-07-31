@@ -4,6 +4,7 @@ import process from "node:process";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import gitContainment from "./test-temp-git-containment.cjs";
 
 import {
   TEST_TEMP_MANIFEST,
@@ -13,6 +14,8 @@ import {
   processStartToken,
   validateTestTempManifest
 } from "./test-temp.mjs";
+
+const { gitConfigSemantics, inspectContainedGitMetadata } = gitContainment;
 
 export const DEFAULT_TEST_TEMP_MAX_AGE_MS = 60 * 60_000;
 export const TEST_TEMP_SIZE_SCAN_ENTRY_BUDGET = 10_000;
@@ -687,7 +690,7 @@ function captureRelativeRegistrationGitDir(
   }
   return {
     semantic: {
-      lexicalPath: lexicalTarget,
+      lexicalPath: canonicalTarget,
       parent: {
         identity: semanticDirectoryIdentity(parentAfter),
         path: parentPath
@@ -1312,12 +1315,13 @@ function classifyName(name, legacy) {
 
 function stableIdentity(stat) {
   return {
-    dev: stat.dev,
-    ino: stat.ino,
-    mode: stat.mode,
-    uid: stat.uid,
-    size: stat.size,
-    mtimeMs: stat.mtimeMs
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+    mode: String(stat.mode),
+    uid: String(stat.uid),
+    size: String(stat.size),
+    mtimeNs: String(stat.mtimeNs),
+    ctimeNs: String(stat.ctimeNs)
   };
 }
 
@@ -1327,20 +1331,30 @@ function sameIdentity(left, right) {
     && left.mode === right.mode
     && left.uid === right.uid
     && left.size === right.size
-    && left.mtimeMs === right.mtimeMs;
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+function sameRelocatedIdentity(left, right) {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs;
 }
 
 const TEST_TEMP_MANIFEST_MAX_BYTES = 4 * 1024;
 
 function manifestIdentity(stat) {
   return {
-    dev: stat.dev,
-    ino: stat.ino,
-    mode: stat.mode,
-    uid: stat.uid,
-    size: stat.size,
-    mtimeMs: stat.mtimeMs,
-    ctimeMs: stat.ctimeMs
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+    mode: String(stat.mode),
+    uid: String(stat.uid),
+    size: String(stat.size),
+    mtimeNs: String(stat.mtimeNs),
+    ctimeNs: String(stat.ctimeNs)
   };
 }
 
@@ -1353,8 +1367,8 @@ function sameManifestIdentity(left, right) {
     && left.mode === right.mode
     && left.uid === right.uid
     && left.size === right.size
-    && left.mtimeMs === right.mtimeMs
-    && left.ctimeMs === right.ctimeMs
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs
   );
 }
 
@@ -1373,19 +1387,21 @@ function sameDigest(left, right) {
 function readStableOwnerManifest(root, expectedUid) {
   if (!Number.isInteger(fs.constants.O_NOFOLLOW)) return null;
   const manifestPath = path.join(root, TEST_TEMP_MANIFEST);
+  const exactExpectedUid = BigInt(expectedUid);
   let descriptor;
   try {
-    const directoryBefore = fs.lstatSync(root);
-    const pathBefore = fs.lstatSync(manifestPath);
+    const directoryBefore = fs.lstatSync(root, { bigint: true });
+    const pathBefore = fs.lstatSync(manifestPath, { bigint: true });
     if (
       !directoryBefore.isDirectory()
       || directoryBefore.isSymbolicLink()
-      || directoryBefore.uid !== expectedUid
+      || directoryBefore.uid !== exactExpectedUid
       || !pathBefore.isFile()
       || pathBefore.isSymbolicLink()
-      || pathBefore.uid !== expectedUid
-      || (pathBefore.mode & 0o777) !== 0o600
-      || pathBefore.size > TEST_TEMP_MANIFEST_MAX_BYTES
+      || pathBefore.uid !== exactExpectedUid
+      || (pathBefore.mode & 0o777n) !== 0o600n
+      || pathBefore.size < 0n
+      || pathBefore.size > BigInt(TEST_TEMP_MANIFEST_MAX_BYTES)
     ) {
       return null;
     }
@@ -1393,13 +1409,14 @@ function readStableOwnerManifest(root, expectedUid) {
       manifestPath,
       fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
     );
-    const openedBefore = fs.fstatSync(descriptor);
+    const openedBefore = fs.fstatSync(descriptor, { bigint: true });
     if (
       !openedBefore.isFile()
       || openedBefore.isSymbolicLink()
-      || openedBefore.uid !== expectedUid
-      || (openedBefore.mode & 0o777) !== 0o600
-      || openedBefore.size > TEST_TEMP_MANIFEST_MAX_BYTES
+      || openedBefore.uid !== exactExpectedUid
+      || (openedBefore.mode & 0o777n) !== 0o600n
+      || openedBefore.size < 0n
+      || openedBefore.size > BigInt(TEST_TEMP_MANIFEST_MAX_BYTES)
       || !sameManifestIdentity(
         manifestIdentity(pathBefore),
         manifestIdentity(openedBefore)
@@ -1408,11 +1425,11 @@ function readStableOwnerManifest(root, expectedUid) {
       return null;
     }
     const contents = fs.readFileSync(descriptor);
-    const openedAfter = fs.fstatSync(descriptor);
-    const pathAfter = fs.lstatSync(manifestPath);
-    const directoryAfter = fs.lstatSync(root);
+    const openedAfter = fs.fstatSync(descriptor, { bigint: true });
+    const pathAfter = fs.lstatSync(manifestPath, { bigint: true });
+    const directoryAfter = fs.lstatSync(root, { bigint: true });
     if (
-      contents.length !== openedAfter.size
+      BigInt(contents.length) !== openedAfter.size
       || !sameManifestIdentity(
         manifestIdentity(openedBefore),
         manifestIdentity(openedAfter)
@@ -1451,6 +1468,19 @@ function sameOwnerManifestSnapshot(left, right) {
   );
 }
 
+function exactIdentityArgument(value) {
+  if (typeof value === "bigint") {
+    return value >= 0n ? String(value) : null;
+  }
+  if (
+    typeof value === "string"
+    && /^(?:0|[1-9][0-9]*)$/u.test(value)
+  ) {
+    return value;
+  }
+  return null;
+}
+
 const REMOVE_INVENTORIED_ROOT_HELPER = fileURLToPath(
   new URL("./test-temp-remove-helper.cjs", import.meta.url)
 );
@@ -1458,9 +1488,20 @@ const REMOVE_INVENTORIED_ROOT_HELPER = fileURLToPath(
 export function removeInventoriedTestTempRoot(
   root,
   expectedIdentity,
-  { run = spawnSync, afterQuarantine = null } = {}
+  {
+    run = spawnSync,
+    afterQuarantine = null,
+    gitContainment = null
+  } = {}
 ) {
   if (!root || !path.isAbsolute(root) || !expectedIdentity) return false;
+  const expectedDev = exactIdentityArgument(expectedIdentity.dev);
+  const expectedIno = exactIdentityArgument(expectedIdentity.ino);
+  if (!expectedDev || !expectedIno) {
+    const error = new Error("The cleanup candidate identity is not exact.");
+    error.code = "E_TEST_TEMP_IDENTITY_CHANGED";
+    throw error;
+  }
   const quarantine = path.join(
     path.dirname(root),
     `.grok-plugin-cleanup-quarantine-${randomUUID()}`
@@ -1474,11 +1515,28 @@ export function removeInventoriedTestTempRoot(
 
   try {
     if (afterQuarantine) afterQuarantine(quarantine);
-    const result = run(process.execPath, [
+    const managedContainment = gitContainment
+      && gitContainment.originalRoot === root
+      && Number.isSafeInteger(gitContainment.expectedUid)
+      && gitContainment.expectedUid >= 0
+      && /^[a-f0-9]{64}$/u.test(gitContainment.digest || "");
+    const helperArguments = [
       REMOVE_INVENTORIED_ROOT_HELPER,
-      String(expectedIdentity.dev),
-      String(expectedIdentity.ino)
-    ], {
+      expectedDev,
+      expectedIno,
+      expectedDev,
+      managedContainment ? "managed-contained" : "guarded",
+      "none"
+    ];
+    if (managedContainment) {
+      helperArguments.push(
+        root,
+        quarantine,
+        String(gitContainment.expectedUid),
+        gitContainment.digest
+      );
+    }
+    const result = run(process.execPath, helperArguments, {
       cwd: quarantine,
       env: { GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1" },
       encoding: "utf8",
@@ -1668,34 +1726,245 @@ function activeReferencesForRoot(root, snapshot) {
   return active;
 }
 
-function linkedWorktreeMetadataReason(gitDirectory) {
+function asciiCaseEqual(left, right) {
+  return left.length === right.length && left.toLowerCase() === right;
+}
+
+function optionalNoFollowStat(target) {
   try {
-    const linkedWorktrees = fs.lstatSync(path.join(gitDirectory, "worktrees"));
-    if (linkedWorktrees.isDirectory() && !linkedWorktrees.isSymbolicLink()) {
-      return "git-worktree-metadata";
-    }
-    return "git-metadata-ambiguous";
+    return fs.lstatSync(target, { bigint: true });
   } catch (error) {
-    if (error?.code !== "ENOENT") return "git-metadata-ambiguous";
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function safeGitMarkerFile(stat, expectedDevice) {
+  return Boolean(
+    stat
+    && stat.dev === expectedDevice
+    && stat.isFile()
+    && !stat.isSymbolicLink()
+    && stat.size >= 0n
+    && stat.size <= BigInt(WORKTREE_METADATA_FILE_MAX_BYTES)
+  );
+}
+
+function safeGitMarkerDirectory(stat, expectedDevice) {
+  return Boolean(
+    stat
+    && stat.dev === expectedDevice
+    && stat.isDirectory()
+    && !stat.isSymbolicLink()
+  );
+}
+
+function gitConfigurationReason(gitDirectory, expectedDevice, expectedUid) {
+  for (const name of ["config", "config.worktree"]) {
+    const target = path.join(gitDirectory, name);
+    let file;
+    try {
+      file = optionalStableFile(target, expectedUid, null);
+    } catch {
+      return "git-metadata-ambiguous";
+    }
+    if (!file) continue;
+    const stat = optionalNoFollowStat(target);
+    if (!safeGitMarkerFile(stat, expectedDevice)) {
+      return "git-metadata-ambiguous";
+    }
+    const semantics = gitConfigSemantics(file.contents);
+    if (!semantics.safe) return "git-metadata-ambiguous";
+    if (semantics.worktrees.length > 0) return "external-worktree-link";
   }
   return null;
 }
 
-function descendantGitMetadataReason(candidate, rootGitDirectory) {
+function linkedWorktreeMetadataReason(
+  gitDirectory,
+  expectedDevice,
+  expectedUid
+) {
   try {
-    const rootStat = fs.lstatSync(candidate);
+    const before = fs.lstatSync(gitDirectory, { bigint: true });
+    if (!safeGitMarkerDirectory(before, expectedDevice)) {
+      return "git-metadata-ambiguous";
+    }
+    const configReason = gitConfigurationReason(
+      gitDirectory,
+      expectedDevice,
+      expectedUid
+    );
+    if (configReason) return configReason;
+    for (const control of ["commondir", "gitdir"]) {
+      const stat = optionalNoFollowStat(path.join(gitDirectory, control));
+      if (!stat) continue;
+      return safeGitMarkerFile(stat, expectedDevice)
+        ? "external-worktree-link"
+        : "git-metadata-ambiguous";
+    }
+    const modules = optionalNoFollowStat(path.join(gitDirectory, "modules"));
+    if (modules) return "git-metadata-ambiguous";
+    const linkedWorktrees = optionalNoFollowStat(path.join(gitDirectory, "worktrees"));
+    if (linkedWorktrees) {
+      return safeGitMarkerDirectory(linkedWorktrees, expectedDevice)
+        ? "git-worktree-metadata"
+        : "git-metadata-ambiguous";
+    }
+    const after = fs.lstatSync(gitDirectory, { bigint: true });
+    return sameBigintIdentity(bigintIdentity(before), bigintIdentity(after))
+      ? null
+      : "git-metadata-ambiguous";
+  } catch {
+    return "git-metadata-ambiguous";
+  }
+}
+
+function gitCommonDirectoryShapeReason(commonDirectory, expectedDevice) {
+  try {
+    const head = optionalNoFollowStat(path.join(commonDirectory, "HEAD"));
+    const config = optionalNoFollowStat(path.join(commonDirectory, "config"));
+    const objects = optionalNoFollowStat(path.join(commonDirectory, "objects"));
+    const refs = optionalNoFollowStat(path.join(commonDirectory, "refs"));
+    const reftable = optionalNoFollowStat(path.join(commonDirectory, "reftable"));
+    if (
+      safeGitMarkerFile(head, expectedDevice)
+      && safeGitMarkerFile(config, expectedDevice)
+      && safeGitMarkerDirectory(objects, expectedDevice)
+      && (
+        safeGitMarkerDirectory(refs, expectedDevice)
+        || safeGitMarkerDirectory(reftable, expectedDevice)
+      )
+    ) {
+      return "git-worktree-metadata";
+    }
+    return null;
+  } catch {
+    return "git-metadata-ambiguous";
+  }
+}
+
+function worktreeRegistrationDirectoryReason(
+  worktreesDirectory,
+  expectedDevice,
+  expectedUid
+) {
+  let names;
+  let worktreesBefore;
+  try {
+    worktreesBefore = fs.lstatSync(worktreesDirectory, { bigint: true });
+    if (!safeGitMarkerDirectory(worktreesBefore, expectedDevice)) {
+      return "git-metadata-ambiguous";
+    }
+    names = boundedDirectoryNames(
+      worktreesDirectory,
+      WORKTREE_REGISTRATION_MAX_ENTRIES
+    );
+  } catch {
+    return "git-metadata-ambiguous";
+  }
+  for (const name of names) {
+    const registration = path.join(worktreesDirectory, name);
+    let registrationStat;
+    let registrationAfter;
+    let gitdir;
+    let commondir;
+    try {
+      registrationStat = fs.lstatSync(registration, { bigint: true });
+      if (!safeGitMarkerDirectory(registrationStat, expectedDevice)) continue;
+      gitdir = optionalNoFollowStat(path.join(registration, "gitdir"));
+      commondir = optionalNoFollowStat(path.join(registration, "commondir"));
+      registrationAfter = fs.lstatSync(registration, { bigint: true });
+    } catch {
+      return "git-metadata-ambiguous";
+    }
+    if (
+      !sameBigintIdentity(
+        bigintIdentity(registrationStat),
+        bigintIdentity(registrationAfter)
+      )
+    ) {
+      return "git-metadata-ambiguous";
+    }
+    if (!gitdir && !commondir) continue;
+    const configReason = gitConfigurationReason(
+      registration,
+      expectedDevice,
+      expectedUid
+    );
+    if (configReason) return configReason;
+    if (
+      safeGitMarkerFile(gitdir, expectedDevice)
+      && safeGitMarkerFile(commondir, expectedDevice)
+    ) {
+      return "git-worktree-metadata";
+    }
+    return "git-metadata-ambiguous";
+  }
+  try {
+    const worktreesAfter = fs.lstatSync(worktreesDirectory, { bigint: true });
+    if (
+      !sameBigintIdentity(
+        bigintIdentity(worktreesBefore),
+        bigintIdentity(worktreesAfter)
+      )
+    ) {
+      return "git-metadata-ambiguous";
+    }
+  } catch {
+    return "git-metadata-ambiguous";
+  }
+  return null;
+}
+
+function nestedWorktreesMetadataReason(
+  worktreesDirectory,
+  worktreesStat,
+  expectedDevice,
+  expectedUid
+) {
+  if (!safeGitMarkerDirectory(worktreesStat, expectedDevice)) {
+    return "git-metadata-ambiguous";
+  }
+  const commonReason = gitCommonDirectoryShapeReason(
+    path.dirname(worktreesDirectory),
+    expectedDevice
+  );
+  if (commonReason) return commonReason;
+  return worktreeRegistrationDirectoryReason(
+    worktreesDirectory,
+    expectedDevice,
+    expectedUid
+  );
+}
+
+function descendantGitMetadataReason(candidate, expectedUid) {
+  let rootStat;
+  try {
+    rootStat = fs.lstatSync(candidate, { bigint: true });
     if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
       return "git-metadata-ambiguous";
     }
   } catch (error) {
     return error?.code === "ENOENT" ? null : "git-metadata-ambiguous";
   }
+  const expectedDevice = rootStat.dev;
   const stack = [candidate];
   let remaining = WORKTREE_DESCENDANT_GIT_SCAN_MAX_ENTRIES;
   while (stack.length > 0) {
     const current = stack.pop();
     let directory;
+    let directoryBefore;
+    const commonShapeEntries = new Map();
     try {
+      directoryBefore = fs.lstatSync(current, { bigint: true });
+      if (
+        !safeGitMarkerDirectory(directoryBefore, expectedDevice)
+      ) {
+        return directoryBefore.dev === expectedDevice
+          ? "git-metadata-ambiguous"
+          : "cross-device-descendant";
+      }
       directory = fs.opendirSync(current);
       while (true) {
         const entry = directory.readSync();
@@ -1705,21 +1974,57 @@ function descendantGitMetadataReason(candidate, rootGitDirectory) {
         const entryPath = path.join(current, entry.name);
         let stat;
         try {
-          stat = fs.lstatSync(entryPath);
+          stat = fs.lstatSync(entryPath, { bigint: true });
         } catch {
           return "git-metadata-ambiguous";
         }
-        if (entryPath === rootGitDirectory) continue;
-        if (entry.name === ".git") {
+        if (stat.dev !== expectedDevice) return "cross-device-descendant";
+        const foldedName = entry.name.toLowerCase();
+        if (["head", "config", "objects", "refs", "reftable"].includes(foldedName)) {
+          if (commonShapeEntries.has(foldedName)) {
+            return "git-metadata-ambiguous";
+          }
+          commonShapeEntries.set(foldedName, stat);
+        }
+        if (asciiCaseEqual(entry.name, ".git")) {
           if (stat.isFile() || stat.isSymbolicLink()) {
             return "external-worktree-link";
           }
           if (!stat.isDirectory()) return "git-metadata-ambiguous";
-          const reason = linkedWorktreeMetadataReason(entryPath);
+          const reason = linkedWorktreeMetadataReason(
+            entryPath,
+            expectedDevice,
+            expectedUid
+          );
           if (reason) return reason;
           continue;
         }
+        if (asciiCaseEqual(entry.name, "worktrees")) {
+          const reason = nestedWorktreesMetadataReason(
+            entryPath,
+            stat,
+            expectedDevice,
+            expectedUid
+          );
+          if (reason) return reason;
+        }
         if (stat.isDirectory() && !stat.isSymbolicLink()) stack.push(entryPath);
+      }
+      if (
+        safeGitMarkerFile(commonShapeEntries.get("head"), expectedDevice)
+        && safeGitMarkerFile(commonShapeEntries.get("config"), expectedDevice)
+        && safeGitMarkerDirectory(commonShapeEntries.get("objects"), expectedDevice)
+        && (
+          safeGitMarkerDirectory(commonShapeEntries.get("refs"), expectedDevice)
+          || safeGitMarkerDirectory(commonShapeEntries.get("reftable"), expectedDevice)
+        )
+      ) {
+        const reason = gitConfigurationReason(
+          current,
+          expectedDevice,
+          expectedUid
+        );
+        if (reason) return reason;
       }
     } catch {
       return "git-metadata-ambiguous";
@@ -1730,30 +2035,80 @@ function descendantGitMetadataReason(candidate, rootGitDirectory) {
         return "git-metadata-ambiguous";
       }
     }
+    try {
+      const directoryAfter = fs.lstatSync(current, { bigint: true });
+      if (
+        !sameBigintIdentity(
+          bigintIdentity(directoryBefore),
+          bigintIdentity(directoryAfter)
+        )
+      ) {
+        return "git-metadata-ambiguous";
+      }
+    } catch {
+      return "git-metadata-ambiguous";
+    }
   }
   return null;
 }
 
-function worktreeReason(candidate, snapshot) {
+function registeredWorktreeReason(candidate, snapshot) {
   if (!snapshot.available) return "worktree-visibility-unavailable";
-  if (snapshot.paths.some((worktree) => isWithin(candidate, worktree))) {
+  if (snapshot.paths.some((worktree) => (
+    isWithin(candidate, worktree)
+    || isWithin(worktree, candidate)
+  ))) {
     return "registered-worktree";
   }
+  return null;
+}
+
+function worktreeReason(candidate, snapshot, expectedUid) {
+  const registrationReason = registeredWorktreeReason(candidate, snapshot);
+  if (registrationReason) return registrationReason;
   const gitDirectory = path.join(candidate, ".git");
   try {
-    const gitMarker = fs.lstatSync(gitDirectory);
+    const gitMarker = fs.lstatSync(gitDirectory, { bigint: true });
     if (gitMarker.isFile() || gitMarker.isSymbolicLink()) return "external-worktree-link";
     if (!gitMarker.isDirectory()) return "git-metadata-ambiguous";
-    const reason = linkedWorktreeMetadataReason(gitDirectory);
+    const gitDirectoryStat = fs.lstatSync(gitDirectory, { bigint: true });
+    const reason = linkedWorktreeMetadataReason(
+      gitDirectory,
+      gitDirectoryStat.dev,
+      expectedUid
+    );
     if (reason) return reason;
   } catch (error) {
     if (error?.code !== "ENOENT") return "git-metadata-ambiguous";
   }
-  return descendantGitMetadataReason(candidate, gitDirectory);
+  return descendantGitMetadataReason(candidate, expectedUid);
+}
+
+function managedWorktreeInspection(
+  candidate,
+  snapshot,
+  { expectedUid, originalRoot = candidate } = {}
+) {
+  const registrationReason = registeredWorktreeReason(candidate, snapshot);
+  if (registrationReason) {
+    return { reason: registrationReason, containment: null };
+  }
+  const containment = inspectContainedGitMetadata({
+    root: candidate,
+    originalRoot,
+    expectedUid
+  });
+  return containment.available
+    ? { reason: null, containment }
+    : {
+        reason: containment.reason || "git-metadata-ambiguous",
+        containment: null
+      };
 }
 
 function candidateRecord({
   root,
+  rootDevice,
   entry,
   family,
   expectedUid,
@@ -1768,16 +2123,26 @@ function candidateRecord({
   const reasons = [];
   let stat;
   try {
-    stat = fs.lstatSync(candidate);
+    stat = fs.lstatSync(candidate, { bigint: true });
   } catch {
     return null;
   }
+  const mtimeMs = Number(stat.mtimeNs / 1_000_000n);
+  if (!Number.isSafeInteger(mtimeMs)) {
+    throw new Error("Cleanup candidate modification time is not representable.");
+  }
+  const exactExpectedUid = BigInt(expectedUid);
   const identity = stableIdentity(stat);
   if (!stat.isDirectory() || stat.isSymbolicLink()) reasons.push("not-real-directory");
-  if (stat.uid !== expectedUid) reasons.push("owner-mismatch");
-  if (nowMs - stat.mtimeMs < olderThanMs) reasons.push("too-recent");
+  if (stat.dev !== rootDevice) reasons.push("cross-device-candidate");
+  if (stat.uid !== exactExpectedUid) reasons.push("owner-mismatch");
+  if (nowMs - mtimeMs < olderThanMs) reasons.push("too-recent");
 
-  const manifestSnapshot = family.kind === "managed"
+  const inspectable = stat.isDirectory()
+    && !stat.isSymbolicLink()
+    && stat.dev === rootDevice
+    && stat.uid === exactExpectedUid;
+  const manifestSnapshot = family.kind === "managed" && inspectable
     ? readStableOwnerManifest(candidate, expectedUid)
     : null;
   const manifest = manifestSnapshot?.value ?? null;
@@ -1787,20 +2152,31 @@ function candidateRecord({
   if (!owner.known) reasons.push("owner-identity-unavailable");
   if (owner.active) reasons.push("active-owner");
   if (activeReferences.has(candidate)) reasons.push("active-process-reference");
-  const gitReason = worktreeReason(candidate, worktrees);
+  const gitInspection = family.kind === "managed" && inspectable
+    ? managedWorktreeInspection(candidate, worktrees, { expectedUid })
+    : null;
+  const gitReason = inspectable
+    ? (
+        family.kind === "managed"
+          ? gitInspection.reason
+          : worktreeReason(candidate, worktrees, expectedUid)
+      )
+    : null;
   if (gitReason) reasons.push(gitReason);
 
-  const size = treeSize(candidate, sizeBudget);
+  const size = inspectable && gitReason !== "cross-device-descendant"
+    ? treeSize(candidate, sizeBudget)
+    : { bytes: null, truncated: true };
   return {
     path: candidate,
     name: entry.name,
     prefix: family.prefix,
     family: family.kind,
-    uid: stat.uid,
-    dev: stat.dev,
-    ino: stat.ino,
-    mtimeMs: stat.mtimeMs,
-    ageMs: Math.max(0, nowMs - stat.mtimeMs),
+    uid: Number(stat.uid),
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+    mtimeMs,
+    ageMs: Math.max(0, nowMs - mtimeMs),
     sizeBytes: size.bytes,
     sizeTruncated: size.truncated,
     active: owner.active || activeReferences.has(candidate),
@@ -1808,6 +2184,7 @@ function candidateRecord({
     identity,
     manifest,
     manifestSnapshot,
+    gitContainmentDigest: gitInspection?.containment?.digest ?? null,
     eligible: reasons.length === 0,
     reasons
   };
@@ -1831,6 +2208,7 @@ export function cleanupTestTemp({
   clock = Date.now
 } = {}) {
   const root = canonicalRoot(tempRoot);
+  const rootDevice = fs.lstatSync(root, { bigint: true }).dev;
   if (!Number.isSafeInteger(olderThanMs) || olderThanMs < 0) {
     throw new Error("Cleanup age must be a non-negative safe integer.");
   }
@@ -1891,6 +2269,7 @@ export function cleanupTestTemp({
     if (!family) continue;
     const record = candidateRecord({
       root,
+      rootDevice,
       entry,
       family,
       expectedUid,
@@ -1976,7 +2355,7 @@ export function cleanupTestTemp({
       if (beforeDelete) beforeDelete(record);
       let current;
       try {
-        current = fs.lstatSync(record.path);
+        current = fs.lstatSync(record.path, { bigint: true });
       } catch {
         record.eligible = false;
         record.reasons.push("candidate-disappeared");
@@ -1992,10 +2371,23 @@ export function cleanupTestTemp({
         record.reasons.push("active-process-reference");
         continue;
       }
-      const finalGitReason = worktreeReason(record.path, finalWorktrees);
+      const finalGitInspection = record.family === "managed"
+        ? managedWorktreeInspection(record.path, finalWorktrees, { expectedUid })
+        : null;
+      const finalGitReason = record.family === "managed"
+        ? finalGitInspection.reason
+        : worktreeReason(record.path, finalWorktrees, expectedUid);
       if (finalGitReason) {
         record.eligible = false;
         record.reasons.push(finalGitReason);
+        continue;
+      }
+      if (
+        record.family === "managed"
+        && finalGitInspection.containment.digest !== record.gitContainmentDigest
+      ) {
+        record.eligible = false;
+        record.reasons.push("git-metadata-ambiguous");
         continue;
       }
       const owner = ownerActivity(record.manifest, tokenForPid);
@@ -2006,10 +2398,17 @@ export function cleanupTestTemp({
       }
       try {
         if (!removeRoot(record.path, record.identity, {
+          gitContainment: record.family === "managed"
+            ? {
+                digest: record.gitContainmentDigest,
+                expectedUid,
+                originalRoot: record.path
+              }
+            : null,
           afterQuarantine(quarantine) {
             let quarantinedRoot;
             try {
-              quarantinedRoot = fs.lstatSync(quarantine);
+              quarantinedRoot = fs.lstatSync(quarantine, { bigint: true });
             } catch {
               const error = new Error(
                 "The quarantined cleanup candidate identity is unavailable."
@@ -2020,7 +2419,10 @@ export function cleanupTestTemp({
             if (
               !quarantinedRoot.isDirectory()
               || quarantinedRoot.isSymbolicLink()
-              || !sameIdentity(record.identity, stableIdentity(quarantinedRoot))
+              || !sameRelocatedIdentity(
+                record.identity,
+                stableIdentity(quarantinedRoot)
+              )
             ) {
               const error = new Error(
                 "The quarantined cleanup candidate identity changed."
@@ -2065,14 +2467,57 @@ export function cleanupTestTemp({
               error.code = "E_TEST_TEMP_WORKTREE_VISIBILITY_AFTER_QUARANTINE";
               throw error;
             }
-            if (
-              worktreeReason(record.path, postRenameWorktrees)
-              || worktreeReason(quarantine, postRenameWorktrees)
-            ) {
+            const originalRegistrationReason = registeredWorktreeReason(
+              record.path,
+              postRenameWorktrees
+            );
+            const quarantineRegistrationReason = registeredWorktreeReason(
+              quarantine,
+              postRenameWorktrees
+            );
+            const quarantinedGitInspection = record.family === "managed"
+              ? managedWorktreeInspection(quarantine, postRenameWorktrees, {
+                  expectedUid,
+                  originalRoot: record.path
+                })
+              : null;
+            const postRenameGitReason = record.family === "managed"
+              ? (
+                  originalRegistrationReason
+                  || quarantineRegistrationReason
+                  || quarantinedGitInspection.reason
+                )
+              : (
+                  worktreeReason(
+                    record.path,
+                    postRenameWorktrees,
+                    expectedUid
+                  )
+                  || worktreeReason(
+                    quarantine,
+                    postRenameWorktrees,
+                    expectedUid
+                  )
+                );
+            if (postRenameGitReason) {
               const error = new Error(
                 "The cleanup candidate became a registered worktree after quarantine."
               );
               error.code = "E_TEST_TEMP_WORKTREE_AFTER_QUARANTINE";
+              throw error;
+            }
+            if (
+              record.family === "managed"
+              && (
+                !quarantinedGitInspection.containment
+                || quarantinedGitInspection.containment.digest
+                  !== record.gitContainmentDigest
+              )
+            ) {
+              const error = new Error(
+                "The cleanup candidate Git-containment proof changed."
+              );
+              error.code = "E_TEST_TEMP_GIT_CONTAINMENT_AFTER_QUARANTINE";
               throw error;
             }
             if (record.family === "managed") {
@@ -2137,6 +2582,10 @@ export function cleanupTestTemp({
           record.reasons.push("active-process-reference");
         } else if (error?.code === "E_TEST_TEMP_WORKTREE_AFTER_QUARANTINE") {
           record.reasons.push("registered-worktree");
+        } else if (
+          error?.code === "E_TEST_TEMP_GIT_CONTAINMENT_AFTER_QUARANTINE"
+        ) {
+          record.reasons.push("git-metadata-ambiguous");
         } else {
           record.reasons.push("remove-failed");
         }

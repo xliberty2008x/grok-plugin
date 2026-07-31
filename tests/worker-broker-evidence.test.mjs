@@ -214,6 +214,10 @@ const DETERMINISTIC_CHECK_RUNNER = path.join(ROOT, "scripts/check-deterministic.
 const DETERMINISTIC_TEST_LIBRARY = path.join(ROOT, "scripts/lib/deterministic-test-runner.mjs");
 const TEST_TEMP_LIBRARY = path.join(ROOT, "scripts/lib/test-temp.mjs");
 const TEST_TEMP_CHILD_HOOK = path.join(ROOT, "scripts/lib/test-temp-child-hook.cjs");
+const TEST_TEMP_GIT_CONTAINMENT = path.join(
+  ROOT,
+  "scripts/lib/test-temp-git-containment.cjs"
+);
 const TEST_TEMP_PIDFD_SIGNAL = path.join(ROOT, "scripts/lib/test-temp-pidfd-signal.py");
 const TEST_TEMP_REMOVE_HELPER = path.join(
   ROOT,
@@ -261,6 +265,7 @@ function installPhaseOneFocusedRunner(root) {
     DETERMINISTIC_TEST_LIBRARY,
     TEST_TEMP_LIBRARY,
     TEST_TEMP_CHILD_HOOK,
+    TEST_TEMP_GIT_CONTAINMENT,
     TEST_TEMP_PIDFD_SIGNAL,
     TEST_TEMP_REMOVE_HELPER,
     TEST_TEMP_SUPERVISOR,

@@ -302,6 +302,7 @@ if (!versionsOnly) {
     "scripts/lib/test-temp.mjs",
     "scripts/lib/test-temp-child-hook.cjs",
     "scripts/lib/test-temp-cleanup.mjs",
+    "scripts/lib/test-temp-git-containment.cjs",
     "scripts/lib/test-temp-pidfd-signal.py",
     "scripts/lib/test-temp-remove-helper.cjs",
     "scripts/lib/test-temp-supervisor.mjs",

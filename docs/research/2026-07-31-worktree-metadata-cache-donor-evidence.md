@@ -84,6 +84,30 @@ The local cleanup will:
    nested `.git` links without following symlinks; unreadable or truncated
    descendant scans fail closed rather than relying on a hand-maintained subset
    of worktree-bearing prefixes.
+7. Require candidate and descendant device identity to match the canonical temp
+   root, recognize case variants and structured Git common/worktree metadata,
+   and repeat those device/Git-marker guards inside the quarantined recursive
+   remover.
+8. Represent filesystem device/inode identities as exact decimal strings from
+   BigInt stats, so large macOS or Node 18 identities cannot alias after Number
+   rounding.
+9. Permit manifest-backed roots with linked worktrees only when a bounded,
+   stable content proof shows every marker, common directory, registration, and
+   backpointer remains inside that same owned root. Recreate the proof after
+   quarantine, cryptographically compare it with the inventory proof, and make
+   the recursive remover enforce the proven control-file identities. Any
+   external, dangling, symlinked, mixed, or changed endpoint preserves the
+   entire root.
+10. Bind strict Git configuration semantics as part of that proof: includes are
+    unsupported, and every `core.worktree` must resolve physically inside the
+    same managed root. Treat Linux mount-table boundaries and per-directory filesystem types
+    as containment boundaries in addition to device IDs.
+11. Record unreadable managed descendants as exact restricted-directory
+    identities. On Linux only, the remover may pin one such inode with
+    no-follow `O_PATH`, repair its mode, prove the newly readable subtree, and
+    then delete it; any proof failure restores the original mode and root.
+    Platforms without an equivalent pinned repair preserve and report the
+    residual.
 
 Timestamps may help detect an in-progress read, but they are not the semantic
 cache key: routine Git activity touches registration metadata. Content hashes
