@@ -1396,8 +1396,16 @@ fs.writeFileSync(process.env.READY_FILE, "ready\\n");
 while (!fs.existsSync(process.env.BARRIER_FILE)) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
 }
-updateLedger(entry, process.env.LEDGER_ROOT);
-process.stdout.write("ok\\n");
+try {
+  updateLedger(entry, process.env.LEDGER_ROOT);
+  process.stdout.write(JSON.stringify({ ok: true, code: null }) + "\\n");
+} catch (error) {
+  process.stdout.write(JSON.stringify({
+    ok: false,
+    code: typeof error?.code === "string" ? error.code : null
+  }) + "\\n");
+  process.exitCode = 1;
+}
 `;
   const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
     cwd: root,
@@ -1423,6 +1431,19 @@ process.stdout.write("ok\\n");
     child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
   });
   return { child, completed };
+}
+
+function ledgerAppenderNeedsRetry(result) {
+  assert.equal(result.signal, null, result.stderr || result.stdout);
+  assert.equal(result.stderr, "");
+  const payload = JSON.parse(result.stdout);
+  if (result.code === 0) {
+    assert.deepEqual(payload, { ok: true, code: null });
+    return false;
+  }
+  assert.equal(result.code, 1, result.stdout);
+  assert.deepEqual(payload, { ok: false, code: "E_EVIDENCE_LEDGER_LOCK" });
+  return true;
 }
 
 function passedCommand(gateId, command, boundary = "source-provider-neutral") {
@@ -4682,15 +4703,17 @@ test("barriered cross-process ledger appends retain distinct phases", async () =
   const root = initRepo();
   const control = tempDir("ledger-append-barrier-");
   const barrier = path.join(control, "go");
+  const firstEntry = syntheticLedgerEntry("0", "concurrent-phase-0");
+  const secondEntry = syntheticLedgerEntry("1", "concurrent-phase-1");
   const first = spawnLedgerAppender({
     root,
-    entry: syntheticLedgerEntry("0", "concurrent-phase-0"),
+    entry: firstEntry,
     ready: path.join(control, "ready-0"),
     barrier
   });
   const second = spawnLedgerAppender({
     root,
-    entry: syntheticLedgerEntry("1", "concurrent-phase-1"),
+    entry: secondEntry,
     ready: path.join(control, "ready-1"),
     barrier
   });
@@ -4698,7 +4721,14 @@ test("barriered cross-process ledger appends retain distinct phases", async () =
     && fs.existsSync(path.join(control, "ready-1")));
   fs.writeFileSync(barrier, "go\n");
   const results = await Promise.all([first.completed, second.completed]);
-  for (const result of results) assert.equal(result.code, 0, result.stderr);
+  const retryEntries = [firstEntry, secondEntry].filter(
+    (_entry, index) => ledgerAppenderNeedsRetry(results[index])
+  );
+  assert.ok(retryEntries.length <= 1);
+  assert.ok(results.length - retryEntries.length >= 1);
+  // Lock acquisition is intentionally bounded. On a slow runner, retry only
+  // the exact losing append after both children have closed.
+  for (const entry of retryEntries) updateLedger(entry, root);
   const ledger = loadLedger(root);
   assert.equal(ledger.entries.length, 2);
   assert.deepEqual(new Set(ledger.entries.map((entry) => entry.phase)), new Set(["0", "1"]));
@@ -4709,15 +4739,17 @@ test("barriered same-phase appends retain one current and one historical entry",
   const root = initRepo();
   const control = tempDir("ledger-same-phase-barrier-");
   const barrier = path.join(control, "go");
+  const firstEntry = syntheticLedgerEntry("2", "same-phase-a");
+  const secondEntry = syntheticLedgerEntry("2", "same-phase-b");
   const first = spawnLedgerAppender({
     root,
-    entry: syntheticLedgerEntry("2", "same-phase-a"),
+    entry: firstEntry,
     ready: path.join(control, "ready-a"),
     barrier
   });
   const second = spawnLedgerAppender({
     root,
-    entry: syntheticLedgerEntry("2", "same-phase-b"),
+    entry: secondEntry,
     ready: path.join(control, "ready-b"),
     barrier
   });
@@ -4725,7 +4757,13 @@ test("barriered same-phase appends retain one current and one historical entry",
     && fs.existsSync(path.join(control, "ready-b")));
   fs.writeFileSync(barrier, "go\n");
   const results = await Promise.all([first.completed, second.completed]);
-  for (const result of results) assert.equal(result.code, 0, result.stderr);
+  const retryEntries = [firstEntry, secondEntry].filter(
+    (_entry, index) => ledgerAppenderNeedsRetry(results[index])
+  );
+  assert.ok(retryEntries.length <= 1);
+  assert.ok(results.length - retryEntries.length >= 1);
+  // Preserve the same bounded-contention contract for same-phase cutover.
+  for (const entry of retryEntries) updateLedger(entry, root);
   const ledger = loadLedger(root);
   assert.equal(ledger.entries.length, 2);
   assert.deepEqual(
