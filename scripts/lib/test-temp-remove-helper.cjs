@@ -577,8 +577,11 @@ function validateManagedProof(target, required = false) {
   } catch {
     process.exit(43);
   }
+  const expectedIdentity = Object.hasOwn(expected, "identity")
+    ? expected.identity
+    : expected;
   if (
-    !sameProofIdentity(current.identity, expected.identity)
+    !sameProofIdentity(current.identity, expectedIdentity)
     || (
       Object.hasOwn(expected, "digest")
       && current.digest !== expected.digest
