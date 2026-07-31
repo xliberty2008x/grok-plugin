@@ -460,7 +460,7 @@ test("Codex manifest, marketplace, public skills, hooks, and wrapper form one in
   });
   assert.ok(rescueSkill.includes(canonicalCodex));
   assert.ok(readme.includes(canonicalCodex));
-  assert.equal(companion.split("missingInvalidProviderCapabilityReceiptMessage(").length - 1, 2);
+  assert.equal(companion.split("missingInvalidProviderCapabilityReceiptMessage(").length - 1, 1);
   assert.match(rescueSkill, /missingInvalidProviderCapabilityReceiptMessage/);
   assert.match(rescueSkill, /authoritative setup action \*\*at most once\*\*/i);
   assert.match(rescueSkill, /identical\*\* bounded task launch \*\*exactly once\*\*/i);

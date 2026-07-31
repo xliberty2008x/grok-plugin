@@ -7,6 +7,7 @@ agents_md: false
 injectDefaultTools: false
 toolConfig:
   tools:
+    - id: GrokBuild:workflow
     - id: GrokBuild:web_search
     - id: GrokBuild:task
     - id: GrokBuild:get_task_output
