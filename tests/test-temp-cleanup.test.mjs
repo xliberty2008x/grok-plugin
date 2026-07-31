@@ -710,6 +710,49 @@ test("worktree metadata cache reuses a cryptographically bound snapshot and copy
   assert.equal(calls, 1);
 });
 
+test("worktree metadata cache freshly hashes the Git executable on every proof pass", (t) => {
+  const fixture = worktreeMetadataFixture(t);
+  const originalOpenSync = fs.openSync;
+  const originalReadFileSync = fs.readFileSync;
+  const originalCloseSync = fs.closeSync;
+  const executableDescriptors = new Set();
+  let executableReads = 0;
+  fs.openSync = (...args) => {
+    const descriptor = originalOpenSync(...args);
+    if (args[0] === fixture.gitExecutable) executableDescriptors.add(descriptor);
+    return descriptor;
+  };
+  fs.readFileSync = (target, ...args) => {
+    if (executableDescriptors.has(target)) executableReads += 1;
+    return originalReadFileSync(target, ...args);
+  };
+  fs.closeSync = (descriptor, ...args) => {
+    try {
+      return originalCloseSync(descriptor, ...args);
+    } finally {
+      executableDescriptors.delete(descriptor);
+    }
+  };
+  t.after(() => {
+    fs.openSync = originalOpenSync;
+    fs.readFileSync = originalReadFileSync;
+    fs.closeSync = originalCloseSync;
+  });
+
+  let calls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run() {
+      calls += 1;
+      return { status: 0, stdout: worktreePorcelain([fixture.repo]) };
+    }
+  });
+  assert.equal(provider().available, true);
+  assert.equal(provider().available, true);
+  assert.equal(calls, 1);
+  assert.equal(executableReads, 6);
+});
+
 test("one cleanup invocation enumerates Git once across many stable candidates and safety rechecks", (t) => {
   const fixture = worktreeMetadataFixture(t);
   const cleanupRoot = path.join(fixture.root, "many-candidates");

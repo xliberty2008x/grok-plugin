@@ -492,8 +492,7 @@ function stableFileOnce(
   {
     maxBytes = WORKTREE_METADATA_FILE_MAX_BYTES,
     allowMultipleLinks = false,
-    allowRootOwner = false,
-    digestCache = null
+    allowRootOwner = false
   } = {}
 ) {
   if (!Number.isInteger(fs.constants.O_NOFOLLOW)) {
@@ -519,25 +518,17 @@ function stableFileOnce(
     if (!sameBigintIdentity(bigintIdentity(before), bigintIdentity(openedBefore))) {
       throw unstableWorktreeMetadata("Worktree metadata changed before it was opened.");
     }
-    const cachedDigest = digestCache?.identity
-      && sameBigintIdentity(digestCache.identity, bigintIdentity(openedBefore))
-      ? digestCache.digest
-      : null;
-    let contents = null;
-    let contentDigest = cachedDigest;
-    if (!contentDigest) {
-      contents = fs.readFileSync(descriptor);
-      if (contents.length !== Number(openedBefore.size)) {
-        throw unstableWorktreeMetadata(
-          "Worktree metadata length changed while it was read."
-        );
-      }
-      if (budget) {
-        budget.remaining -= contents.length;
-        if (budget.remaining < 0) throw new Error("Worktree metadata budget exceeded.");
-      }
-      contentDigest = sha256(contents);
+    const contents = fs.readFileSync(descriptor);
+    if (contents.length !== Number(openedBefore.size)) {
+      throw unstableWorktreeMetadata(
+        "Worktree metadata length changed while it was read."
+      );
     }
+    if (budget) {
+      budget.remaining -= contents.length;
+      if (budget.remaining < 0) throw new Error("Worktree metadata budget exceeded.");
+    }
+    const contentDigest = sha256(contents);
     const openedAfter = fs.fstatSync(descriptor, { bigint: true });
     const after = fs.lstatSync(target, { bigint: true });
     if (
@@ -828,7 +819,7 @@ function stableExecutableLink(target, expectedUid) {
   };
 }
 
-function selectGitExecutable(candidates, expectedUid, executableCache) {
+function selectGitExecutable(candidates, expectedUid) {
   for (const candidate of candidates) {
     try {
       const authority = fs.lstatSync(candidate, { bigint: true });
@@ -848,11 +839,9 @@ function selectGitExecutable(candidates, expectedUid, executableCache) {
       const file = stableFile(executablePath, expectedUid, null, {
         allowMultipleLinks: true,
         allowRootOwner: true,
-        digestCache: executableCache.value,
         maxBytes: WORKTREE_GIT_EXECUTABLE_MAX_BYTES
       });
       if ((BigInt(file.identity.mode) & 0o111n) === 0n) continue;
-      executableCache.value = { digest: file.digest, identity: file.identity };
       return {
         path: executablePath,
         proof: {
@@ -888,8 +877,7 @@ function selectGitExecutable(candidates, expectedUid, executableCache) {
 
 function captureWorktreeMetadataProofPass(repoRoot, {
   expectedUid,
-  gitCandidates,
-  executableCache
+  gitCandidates
 }) {
   const budget = { remaining: WORKTREE_METADATA_TOTAL_MAX_BYTES };
   const canonicalRepoRoot = fs.realpathSync(path.resolve(repoRoot));
@@ -1002,7 +990,7 @@ function captureWorktreeMetadataProofPass(repoRoot, {
   ) {
     throw new Error("Git metadata changed while the proof was captured.");
   }
-  const gitExecutable = selectGitExecutable(gitCandidates, expectedUid, executableCache);
+  const gitExecutable = selectGitExecutable(gitCandidates, expectedUid);
   const semantic = {
     schema: WORKTREE_PROOF_SCHEMA,
     repoRoot: {
@@ -1191,7 +1179,6 @@ export function createRegisteredWorktreeProvider(repoRoot, {
   gitCandidates = GIT_CANDIDATES
 } = {}) {
   let cached = null;
-  const executableCache = { value: null };
   return function registeredWorktrees() {
     if (!Number.isSafeInteger(expectedUid) || expectedUid < 0) {
       cached = null;
@@ -1202,8 +1189,7 @@ export function createRegisteredWorktreeProvider(repoRoot, {
       try {
         before = captureWorktreeMetadataProof(repoRoot, {
           expectedUid,
-          gitCandidates,
-          executableCache
+          gitCandidates
         });
       } catch {
         if (attempt === 0) continue;
@@ -1244,8 +1230,7 @@ export function createRegisteredWorktreeProvider(repoRoot, {
       try {
         after = captureWorktreeMetadataProof(repoRoot, {
           expectedUid,
-          gitCandidates,
-          executableCache
+          gitCandidates
         });
       } catch {
         if (attempt === 0) continue;
