@@ -393,12 +393,6 @@ const WORKTREE_REGISTRATION_IGNORED_DIRECTORIES = new Set([
   "refs",
   "sequencer"
 ]);
-const NESTED_WORKTREE_PARENT_PREFIXES = new Set([
-  "grok-plugin-linked-parent-",
-  "grok-readonly-legacy-linked-parent-",
-  "grok-readonly-linked-parent-",
-  "grok-readonly-missing-linked-parent-"
-]);
 const WORKTREE_GIT_ENV = Object.freeze({
   GIT_CONFIG_GLOBAL: "/dev/null",
   GIT_CONFIG_NOSYSTEM: "1",
@@ -617,15 +611,22 @@ function rejectConfigIncludes(file) {
   }
 }
 
-function resolveControlDirectory(base, value) {
+function resolveControlPath(base, value) {
   if (!value || value.includes("\u0000") || /[\r\n]/u.test(value)) {
     throw new Error("Invalid Git control-directory path.");
   }
-  const resolved = path.resolve(base, value);
-  if (fs.realpathSync(resolved) !== resolved) {
-    throw new Error("Git control-directory path is not canonical.");
+  const lexicalTarget = path.resolve(base, value);
+  const rawTarget = path.isAbsolute(value)
+    ? value
+    : `${base}${base.endsWith(path.sep) ? "" : path.sep}${value}`;
+  if (fs.realpathSync(rawTarget) !== lexicalTarget) {
+    throw new Error("Git control-directory path is physically ambiguous.");
   }
-  return resolved;
+  return lexicalTarget;
+}
+
+function resolveControlDirectory(base, value) {
+  return resolveControlPath(base, value);
 }
 
 function relevantFileProof(file) {
@@ -667,11 +668,7 @@ function captureRelativeRegistrationGitDir(
 ) {
   const value = exactControlLine(gitdirFile);
   if (path.isAbsolute(value)) return null;
-  const lexicalTarget = path.resolve(registrationDirectory, value);
-  const canonicalTarget = fs.realpathSync(lexicalTarget);
-  if (canonicalTarget !== lexicalTarget) {
-    throw new Error("Relative worktree registration crosses a symlink.");
-  }
+  const canonicalTarget = resolveControlPath(registrationDirectory, value);
   const parentPath = path.dirname(canonicalTarget);
   const parentBefore = stableDirectory(parentPath, expectedUid);
   const targetFile = stableFile(canonicalTarget, expectedUid, budget);
@@ -1145,10 +1142,14 @@ function parseRegisteredWorktreeOutput(stdout, canonicalRepoRoot) {
     }
     if (line.startsWith("worktree ")) {
       const value = line.slice("worktree ".length);
-      if (!path.isAbsolute(value) || value.includes("\u0000")) {
+      if (
+        !path.isAbsolute(value)
+        || value.includes("\u0000")
+        || path.normalize(value) !== value
+      ) {
         throw new Error("Git returned an invalid worktree path.");
       }
-      rawPaths.push(path.resolve(value));
+      rawPaths.push(value);
       inRecord = true;
       continue;
     }
@@ -1733,7 +1734,7 @@ function descendantGitMetadataReason(candidate, rootGitDirectory) {
   return null;
 }
 
-function worktreeReason(candidate, snapshot, { scanDescendants = false } = {}) {
+function worktreeReason(candidate, snapshot) {
   if (!snapshot.available) return "worktree-visibility-unavailable";
   if (snapshot.paths.some((worktree) => isWithin(candidate, worktree))) {
     return "registered-worktree";
@@ -1748,9 +1749,7 @@ function worktreeReason(candidate, snapshot, { scanDescendants = false } = {}) {
   } catch (error) {
     if (error?.code !== "ENOENT") return "git-metadata-ambiguous";
   }
-  return scanDescendants
-    ? descendantGitMetadataReason(candidate, gitDirectory)
-    : null;
+  return descendantGitMetadataReason(candidate, gitDirectory);
 }
 
 function candidateRecord({
@@ -1788,9 +1787,7 @@ function candidateRecord({
   if (!owner.known) reasons.push("owner-identity-unavailable");
   if (owner.active) reasons.push("active-owner");
   if (activeReferences.has(candidate)) reasons.push("active-process-reference");
-  const gitReason = worktreeReason(candidate, worktrees, {
-    scanDescendants: NESTED_WORKTREE_PARENT_PREFIXES.has(family.prefix)
-  });
+  const gitReason = worktreeReason(candidate, worktrees);
   if (gitReason) reasons.push(gitReason);
 
   const size = treeSize(candidate, sizeBudget);
@@ -1995,9 +1992,7 @@ export function cleanupTestTemp({
         record.reasons.push("active-process-reference");
         continue;
       }
-      const finalGitReason = worktreeReason(record.path, finalWorktrees, {
-        scanDescendants: NESTED_WORKTREE_PARENT_PREFIXES.has(record.prefix)
-      });
+      const finalGitReason = worktreeReason(record.path, finalWorktrees);
       if (finalGitReason) {
         record.eligible = false;
         record.reasons.push(finalGitReason);
@@ -2071,12 +2066,8 @@ export function cleanupTestTemp({
               throw error;
             }
             if (
-              worktreeReason(record.path, postRenameWorktrees, {
-                scanDescendants: NESTED_WORKTREE_PARENT_PREFIXES.has(record.prefix)
-              })
-              || worktreeReason(quarantine, postRenameWorktrees, {
-                scanDescendants: NESTED_WORKTREE_PARENT_PREFIXES.has(record.prefix)
-              })
+              worktreeReason(record.path, postRenameWorktrees)
+              || worktreeReason(quarantine, postRenameWorktrees)
             ) {
               const error = new Error(
                 "The cleanup candidate became a registered worktree after quarantine."

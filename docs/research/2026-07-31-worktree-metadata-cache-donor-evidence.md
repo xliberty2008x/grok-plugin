@@ -70,15 +70,20 @@ The local cleanup will:
 1. Capture a bounded, no-follow, internally stable metadata proof for the active
    repository, Git common directory, relevant configuration, direct worktree
    registration entries, and selected Git executable.
-2. Compute a versioned SHA-256 binding over semantic metadata and the sorted
-   normalized paths returned by Git.
-3. Reuse only a copy-protected path snapshot when a new metadata proof has the
-   same digest.
+2. Reject non-normal porcelain paths, then compute a versioned SHA-256 binding
+   over semantic metadata and the sorted raw paths returned by Git.
+3. Reuse only a copy-protected raw-path snapshot when a new metadata proof has
+   the same digest, re-materializing canonical and platform aliases on every
+   use.
 4. On any metadata change, bracket one authoritative
    `git worktree list --porcelain` call with matching before/after proofs; retry
    once on concurrent churn, then fail closed.
 5. Never fall back to stale paths after an unreadable, unsupported, oversized,
    symlinked, owner-mismatched, locked, or unstable metadata state.
+6. Scan every already allowlisted legacy or manifest-backed candidate for
+   nested `.git` links without following symlinks; unreadable or truncated
+   descendant scans fail closed rather than relying on a hand-maintained subset
+   of worktree-bearing prefixes.
 
 Timestamps may help detect an in-progress read, but they are not the semantic
 cache key: routine Git activity touches registration metadata. Content hashes
