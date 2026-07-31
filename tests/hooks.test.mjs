@@ -1659,6 +1659,9 @@ test("a crashed stop hook honors explicit host context and is recovered without 
 
   let active = null;
   t.after(() => {
+    if (running.child.exitCode === null && running.child.signalCode === null) {
+      try { running.child.kill("SIGKILL"); } catch {}
+    }
     if (active?.providerProcess && processStartToken(active.providerProcess.pid) === active.providerProcess.startToken) {
       try { process.kill(-active.providerProcess.processGroupId, "SIGKILL"); } catch {}
     }
@@ -1667,7 +1670,7 @@ test("a crashed stop hook honors explicit host context and is recovered without 
   active = await waitFor(() => {
     const job = withPluginData(pluginData, () => listJobs(root).find((candidate) => candidate.kind === "stop-review" && candidate.providerProcess?.startToken));
     return job || null;
-  });
+  }, { timeoutMs: 30_000 });
   assert.deepEqual(active.host, { kind: "claude-code", sessionId: "stop-crash-session" });
   running.child.kill("SIGKILL");
   const killed = await running.completed;

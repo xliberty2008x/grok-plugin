@@ -287,10 +287,10 @@ function registeredProcessIdentity(pid) {
 
 function registryIdentity(stat) {
   return {
-    dev: stat.dev,
-    ino: stat.ino,
-    uid: stat.uid,
-    mode: stat.mode
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+    uid: String(stat.uid),
+    mode: String(stat.mode)
   };
 }
 
@@ -299,11 +299,11 @@ function registryIdentityMatches(expected, stat) {
     expected
     && stat.isFile()
     && !stat.isSymbolicLink()
-    && stat.dev === expected.dev
-    && stat.ino === expected.ino
-    && stat.uid === expected.uid
-    && stat.mode === expected.mode
-    && (stat.mode & 0o777) === 0o600
+    && String(stat.dev) === expected.dev
+    && String(stat.ino) === expected.ino
+    && String(stat.uid) === expected.uid
+    && String(stat.mode) === expected.mode
+    && (stat.mode & 0o777n) === 0o600n
   );
 }
 
@@ -324,11 +324,11 @@ function createPidRegistry(tempIdentity, registrySecret) {
     0o600
   );
   try {
-    const opened = fs.fstatSync(descriptor);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
     if (
       !registryIdentityMatches(registryIdentity(opened), opened)
       || typeof process.getuid !== "function"
-      || opened.uid !== process.getuid()
+      || opened.uid !== BigInt(process.getuid())
     ) {
       throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
     }
@@ -368,7 +368,7 @@ function appendRegistrationAcknowledgements(registrations) {
         | fs.constants.O_APPEND
         | fs.constants.O_NOFOLLOW
     );
-    const opened = fs.fstatSync(descriptor);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
     if (!registryIdentityMatches(activePidRegistryIdentity, opened)) {
       throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
     }
@@ -408,10 +408,10 @@ function loadRegisteredOwnedProcesses(tempIdentity) {
       registry,
       fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
     );
-    const opened = fs.fstatSync(descriptor);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
     if (
       !registryIdentityMatches(activePidRegistryIdentity, opened)
-      || opened.size > 1024 * 1024
+      || opened.size > 1024n * 1024n
     ) {
       throw visibilityError("E_TEST_TEMP_VISIBILITY_PROC");
     }

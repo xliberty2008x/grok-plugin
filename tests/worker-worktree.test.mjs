@@ -1466,10 +1466,23 @@ test("managed worktree adoption requires one exact detached registration and imm
   assert.equal(removeWorkerWorktree(worktree.executionRoot, root, workerId, env), true);
 });
 
-test("worktree-effect classifier distinguishes exact, dirty, absent, occupied, and stale registration", () => {
+test("worktree-effect classifier distinguishes exact, dirty, absent, occupied, and stale registration", (t) => {
   const root = initRepo();
   const env = envFor();
   const base = git(root, "rev-parse", "HEAD");
+  let alias = null;
+  let stale = null;
+  let aliased = null;
+  t.after(() => {
+    if (stale) {
+      fs.rmSync(stale.executionRoot, { recursive: true, force: true });
+    }
+    if (aliased) {
+      fs.rmSync(aliased.executionRoot, { recursive: true, force: true });
+    }
+    if (alias) fs.rmSync(alias, { force: true });
+    git(root, "worktree", "prune", "--expire", "now");
+  });
 
   const absentWorkerId = "task-effect-absence-0001";
   const absentParent = expectedWorkerWorktreeParent(root, absentWorkerId, env);
@@ -1558,7 +1571,7 @@ test("worktree-effect classifier distinguishes exact, dirty, absent, occupied, a
   assert.equal(removedAbsent.evidence.adminBacklinkMatchCount, 0);
 
   const staleWorkerId = "task-effect-stale-000001";
-  const stale = createWorkerWorktree({
+  stale = createWorkerWorktree({
     controlRoot: root,
     baseCommit: base,
     workerId: staleWorkerId,
@@ -1574,7 +1587,7 @@ test("worktree-effect classifier distinguishes exact, dirty, absent, occupied, a
   }).classification, "stale-registration");
 
   const aliasedWorkerId = "task-effect-alias-stale01";
-  const aliased = createWorkerWorktree({
+  aliased = createWorkerWorktree({
     controlRoot: root,
     baseCommit: base,
     workerId: aliasedWorkerId,
@@ -1586,7 +1599,7 @@ test("worktree-effect classifier distinguishes exact, dirty, absent, occupied, a
   );
   const adminDirectory = gitdirPointer.match(/^gitdir: (.+)\n$/)?.[1];
   assert.ok(adminDirectory);
-  const alias = path.join(path.dirname(path.dirname(aliased.executionRoot)), "alias-parent");
+  alias = path.join(path.dirname(path.dirname(aliased.executionRoot)), "alias-parent");
   fs.symlinkSync(path.dirname(aliased.executionRoot), alias);
   fs.writeFileSync(
     path.join(adminDirectory, "gitdir"),

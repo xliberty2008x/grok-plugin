@@ -935,8 +935,11 @@ test("effective hooksPath directory symlink and cycle-safe target follow (issue 
   assert.equal(cycleSerialized.includes("cycle-b"), false);
 });
 
-test("effective include.path / includeIf config changes task-relevant identity (issue #34 AC-1)", () => {
+test("effective include.path / includeIf config changes task-relevant identity (issue #34 AC-1)", (t) => {
   const root = initRepo();
+  const configPath = path.join(root, ".git", "config");
+  const originalConfig = fs.readFileSync(configPath);
+  t.after(() => fs.writeFileSync(configPath, originalConfig));
   const externalDir = tempDir("grok-plugin-ext-config-");
   const included = path.join(externalDir, "included.gitconfig");
   fs.writeFileSync(included, "[grok-companion-include]\n\tmarker = v1\n");
@@ -944,7 +947,7 @@ test("effective include.path / includeIf config changes task-relevant identity (
   // Absolute include.path: repository config bytes stay fixed while the external
   // included file changes effective config (Git resolves includes on list).
   fs.appendFileSync(
-    path.join(root, ".git", "config"),
+    configPath,
     `\n[include]\n\tpath = ${included}\n`
   );
 
@@ -1007,7 +1010,7 @@ test("effective include.path / includeIf config changes task-relevant identity (
   // Git matches includeIf gitdir against the realpath of the repository git dir.
   const gitDirAbs = fs.realpathSync(path.resolve(root, ".git"));
   fs.appendFileSync(
-    path.join(root, ".git", "config"),
+    configPath,
     `\n[includeIf "gitdir:${gitDirAbs}"]\n\tpath = ${conditionalIncluded}\n`
   );
   const beforeCond = captureContextManifest(root);
@@ -2867,8 +2870,22 @@ test("MERGE_RR create/change/remove is task-relevant operational drift (issue #3
   assert.equal(evidence.includes("tracked.txt"), false);
 });
 
-test("primary complete-but-unattributable identical manifests pass strict compare (issue #34)", () => {
+test("primary complete-but-unattributable identical manifests pass strict compare (issue #34)", (t) => {
   const root = initRepo();
+  t.after(() => {
+    const refs = git(
+      root,
+      "for-each-ref",
+      "--format=%(refname)",
+      "refs/heads"
+    ).split(/\r?\n/u).filter((ref) => ref.startsWith("refs/heads/bulk-"));
+    if (refs.length === 0) return;
+    const result = run("git", ["update-ref", "--stdin"], {
+      cwd: root,
+      input: `${refs.map((ref) => `delete ${ref}`).join("\n")}\n`
+    });
+    assert.equal(result.status, 0, result.stderr);
+  });
   const head = git(root, "rev-parse", "HEAD");
   // Create >2000 and <=10000 refs so complete=true, attributable=false.
   const target = 2001;
@@ -3273,11 +3290,50 @@ test("operational and non-ref symlink target contents bind identity (issue #34 A
   fs.writeFileSync(excludePath, "");
 });
 
-test("metadata hashing and directory walks enforce hard byte/entry bounds (issue #34 re-review)", () => {
+test("metadata hashing and directory walks enforce hard byte/entry bounds (issue #34 re-review)", (t) => {
   const root = initRepo();
   const externalHooks = path.join(tempDir("grok-plugin-bound-hooks-"), "hooks");
   fs.mkdirSync(externalHooks, { recursive: true });
   git(root, "config", "core.hooksPath", externalHooks);
+  const captureWithSyntheticEntryOverflow = (
+    captureRoot,
+    targetDirectory,
+    prefix
+  ) => {
+    const sentinelName = `${prefix}-sentinel`;
+    fs.writeFileSync(path.join(targetDirectory, sentinelName), "");
+    const sentinel = fs.readdirSync(
+      targetDirectory,
+      { withFileTypes: true }
+    ).find((entry) => entry.name === sentinelName);
+    assert.ok(sentinel?.isFile());
+    const canonicalTarget = fs.realpathSync(targetDirectory);
+    const originalOpendirSync = fs.opendirSync;
+    fs.opendirSync = function syntheticOverflowOpendirSync(directory, ...args) {
+      const handle = originalOpendirSync.call(fs, directory, ...args);
+      let canonicalDirectory;
+      try {
+        canonicalDirectory = fs.realpathSync(String(directory));
+      } catch {
+        return handle;
+      }
+      if (canonicalDirectory !== canonicalTarget) return handle;
+      let index = 0;
+      return {
+        readSync() {
+          if (index > 10_000) return null;
+          index += 1;
+          return sentinel;
+        },
+        closeSync: handle.closeSync.bind(handle)
+      };
+    };
+    try {
+      return captureContextManifest(captureRoot);
+    } finally {
+      fs.opendirSync = originalOpendirSync;
+    }
+  };
 
   // Within-bound directories stay deterministic across captures.
   fs.writeFileSync(path.join(externalHooks, "zeta"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
@@ -3327,20 +3383,16 @@ test("metadata hashing and directory walks enforce hard byte/entry bounds (issue
   assert.equal(JSON.stringify(afterOversize).includes("oversize-hook"), false);
   fs.unlinkSync(oversizePath);
 
-  // Hard entry bound: more than MAX_GIT_METADATA_ENTRIES (10_000) siblings fail closed
-  // without requiring flaky concurrent growth races.
+  // Hard entry bound: a bounded synthetic reader presents more than
+  // MAX_GIT_METADATA_ENTRIES (10_000) siblings without materializing an
+  // unreapable on-disk tree if this test process is killed.
   const entryFlood = path.join(externalHooks, "entry-flood");
   fs.mkdirSync(entryFlood, { recursive: true });
-  // Root hooks already have alpha/mu/zeta (+ directory entry). Flood with 10_000
-  // children so the shared entry walk must hit the hard bound.
-  for (let index = 0; index < 10_000; index += 1) {
-    fs.writeFileSync(
-      path.join(entryFlood, `e${String(index).padStart(5, "0")}`),
-      "",
-      { mode: 0o644 }
-    );
-  }
-  const afterEntries = captureContextManifest(root);
+  const afterEntries = captureWithSyntheticEntryOverflow(
+    root,
+    entryFlood,
+    "e"
+  );
   assert.equal(afterEntries.git.sharedRefIdentity.complete, false);
   assert.equal(afterEntries.git.sharedRefIdentity.attributable, false);
   assert.ok(observeChangedPaths(first, afterEntries).includes("[GIT_METADATA]"));
@@ -3359,7 +3411,7 @@ test("metadata hashing and directory walks enforce hard byte/entry bounds (issue
   }));
   assert.equal(entriesSerialized.includes(externalHooks), false);
   assert.equal(entriesSerialized.includes(entryFlood), false);
-  assert.equal(entriesSerialized.includes("e00000"), false);
+  assert.equal(entriesSerialized.includes("e-sentinel"), false);
 
   // Drop the hooks flood so later operational capture is not already fail-closed.
   fs.rmSync(entryFlood, { recursive: true, force: true });
@@ -3375,11 +3427,13 @@ test("metadata hashing and directory walks enforce hard byte/entry bounds (issue
   const beforeOp = captureContextManifest(linkedRoot);
   assert.equal(beforeOp.git.sharedRefIdentity.complete, true);
   const sequencer = path.join(absoluteGitDir, "sequencer");
+  t.after(() => fs.rmSync(sequencer, { recursive: true, force: true }));
   fs.mkdirSync(sequencer, { recursive: true });
-  for (let index = 0; index < 10_000; index += 1) {
-    fs.writeFileSync(path.join(sequencer, `s${String(index).padStart(5, "0")}`), "x");
-  }
-  const afterOp = captureContextManifest(linkedRoot);
+  const afterOp = captureWithSyntheticEntryOverflow(
+    linkedRoot,
+    sequencer,
+    "s"
+  );
   assert.equal(afterOp.git.sharedRefIdentity.complete, false);
   assert.ok(observeChangedPaths(beforeOp, afterOp).includes("[GIT_METADATA]"));
   assert.equal(
@@ -4477,7 +4531,7 @@ test("legacy metadataIdentity bounds default hooks and refs without unbounded wa
   assert.equal(oversizeEvidence.includes(defaultHooks), false);
 });
 
-test("core.hooksPath unset/relative/absolute/include resolution stays Git-faithful (issue #34)", () => {
+test("core.hooksPath unset/relative/absolute/include resolution stays Git-faithful (issue #34)", (t) => {
   // Helper: privacy is enforced on the public/runtime evidence surface, not on
   // the private ContextManifest (which intentionally retains workspaceRoot).
   const publicEvidence = (pre, post, changedPaths = ["[GIT_METADATA]"]) => JSON.stringify(
@@ -4562,6 +4616,9 @@ test("core.hooksPath unset/relative/absolute/include resolution stays Git-faithf
 
   // --- Include-derived core.hooksPath (absolute) ---
   const rootInc = initRepo();
+  const rootIncConfig = path.join(rootInc, ".git", "config");
+  const originalRootIncConfig = fs.readFileSync(rootIncConfig);
+  t.after(() => fs.writeFileSync(rootIncConfig, originalRootIncConfig));
   const includeDir = fs.realpathSync(tempDir("grok-plugin-hooks-include-"));
   const includedConfig = path.join(includeDir, "hooks.gitconfig");
   const includedHooks = path.join(includeDir, "included-hooks");
@@ -4574,7 +4631,7 @@ test("core.hooksPath unset/relative/absolute/include resolution stays Git-faithf
     `[core]\n\thooksPath = ${includedHooks}\n`
   );
   fs.appendFileSync(
-    path.join(rootInc, ".git", "config"),
+    rootIncConfig,
     `\n[include]\n\tpath = ${includedConfig}\n`
   );
   // Explicit includes: Git must surface the included absolute hooksPath.

@@ -5,6 +5,12 @@ import process from "node:process";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import gitContainment from "./test-temp-git-containment.cjs";
+
+const {
+  canonicalContainedPath,
+  inspectContainedGitMetadata
+} = gitContainment;
 
 export const TEST_TEMP_MANIFEST = ".grok-test-temp-owner.json";
 export const TEST_TEMP_SCHEMA_VERSION = 1;
@@ -21,6 +27,28 @@ const createdRootIdentities = new Map();
 const REMOVE_OWNED_ROOT_HELPER = fileURLToPath(
   new URL("./test-temp-remove-helper.cjs", import.meta.url)
 );
+const REMOVE_DIAGNOSTIC_PATTERN =
+  /(?:^|\n)grok-plugin-test-temp-remove-v1:(arguments|root-identity|mount-boundary|managed-proof|directory-inventory|entry-validation|recursive-removal|file-removal|directory-open|child-removal|root-removal):(1|42|43|44)(?=\n|$)/gu;
+
+function ownedCleanupError(message, cleanupReason) {
+  const error = new Error(message);
+  error.cleanupReason = cleanupReason;
+  return error;
+}
+
+function helperCleanupReason(result) {
+  const diagnostics = [
+    ...String(result?.stderr || "").matchAll(REMOVE_DIAGNOSTIC_PATTERN)
+  ];
+  if (diagnostics.length > 0) {
+    const [, stage, status] = diagnostics[0];
+    return `helper-${stage}-${status}`;
+  }
+  if (result?.error) return "helper-launch-error";
+  if (result?.signal) return "helper-signal";
+  if (Number.isInteger(result?.status)) return `helper-exit-${result.status}`;
+  return "helper-result-unavailable";
+}
 
 function systemPsBinary() {
   if (process.platform === "win32") return null;
@@ -144,9 +172,9 @@ export function createOwnedTestTempRoot({
       `${JSON.stringify(owner)}\n`,
       { encoding: "utf8", flag: "wx", mode: 0o600 }
     );
-    const rootStat = fs.lstatSync(root);
+    const rootStat = fs.lstatSync(root, { bigint: true });
     const manifestPath = path.join(root, TEST_TEMP_MANIFEST);
-    const manifestStat = fs.lstatSync(manifestPath);
+    const manifestStat = fs.lstatSync(manifestPath, { bigint: true });
     const manifestContents = fs.readFileSync(manifestPath);
     if (
       !rootStat.isDirectory()
@@ -159,16 +187,16 @@ export function createOwnedTestTempRoot({
     }
     createdRootIdentities.set(root, Object.freeze({
       root: Object.freeze({
-        dev: rootStat.dev,
-        ino: rootStat.ino,
-        uid: rootStat.uid
+        dev: String(rootStat.dev),
+        ino: String(rootStat.ino),
+        uid: String(rootStat.uid)
       }),
       manifest: Object.freeze({
-        dev: manifestStat.dev,
-        ino: manifestStat.ino,
-        uid: manifestStat.uid,
-        mode: manifestStat.mode,
-        size: manifestStat.size,
+        dev: String(manifestStat.dev),
+        ino: String(manifestStat.ino),
+        uid: String(manifestStat.uid),
+        mode: String(manifestStat.mode),
+        size: String(manifestStat.size),
         digest: crypto.createHash("sha256").update(manifestContents).digest("hex")
       })
     }));
@@ -184,28 +212,28 @@ function sameCreatedRootIdentity(expected, stat) {
     expected
     && stat.isDirectory()
     && !stat.isSymbolicLink()
-    && stat.dev === expected.dev
-    && stat.ino === expected.ino
-    && stat.uid === expected.uid
+    && String(stat.dev) === expected.dev
+    && String(stat.ino) === expected.ino
+    && String(stat.uid) === expected.uid
   );
 }
 
 function verifyCreatedRoot(root, expected) {
-  const rootStat = fs.lstatSync(root);
+  const rootStat = fs.lstatSync(root, { bigint: true });
   if (!sameCreatedRootIdentity(expected.root, rootStat)) {
     throw new Error("The test-temp root identity changed before cleanup.");
   }
   const manifestPath = path.join(root, TEST_TEMP_MANIFEST);
-  const manifestStat = fs.lstatSync(manifestPath);
+  const manifestStat = fs.lstatSync(manifestPath, { bigint: true });
   const manifest = expected.manifest;
   if (
     !manifestStat.isFile()
     || manifestStat.isSymbolicLink()
-    || manifestStat.dev !== manifest.dev
-    || manifestStat.ino !== manifest.ino
-    || manifestStat.uid !== manifest.uid
-    || manifestStat.mode !== manifest.mode
-    || manifestStat.size !== manifest.size
+    || String(manifestStat.dev) !== manifest.dev
+    || String(manifestStat.ino) !== manifest.ino
+    || String(manifestStat.uid) !== manifest.uid
+    || String(manifestStat.mode) !== manifest.mode
+    || String(manifestStat.size) !== manifest.size
   ) {
     throw new Error("The test-temp owner manifest identity changed before cleanup.");
   }
@@ -223,6 +251,7 @@ export function removeOwnedTestTempRoot(root) {
   const expected = createdRootIdentities.get(root);
   if (!expected) return false;
   verifyCreatedRoot(root, expected);
+  const canonicalOriginalRoot = canonicalContainedPath(root);
   const quarantine = path.join(
     path.dirname(root),
     `.grok-plugin-owned-quarantine-${crypto.randomUUID()}`
@@ -234,19 +263,42 @@ export function removeOwnedTestTempRoot(root) {
   }
   try {
     verifyCreatedRoot(quarantine, expected);
+    const canonicalQuarantine = canonicalContainedPath(quarantine);
+    const gitProof = inspectContainedGitMetadata({
+      root: canonicalQuarantine,
+      originalRoot: canonicalOriginalRoot,
+      expectedUid: expected.root.uid,
+      expectedDev: expected.root.dev
+    });
+    if (!gitProof.available) {
+      throw ownedCleanupError(
+        "The test-temp root contains unproven Git metadata.",
+        gitProof.reason || "git-metadata-ambiguous"
+      );
+    }
     const result = spawnSync(process.execPath, [
       REMOVE_OWNED_ROOT_HELPER,
-      String(expected.root.dev),
-      String(expected.root.ino)
+      expected.root.dev,
+      expected.root.ino,
+      expected.root.dev,
+      "managed-contained",
+      "none",
+      canonicalOriginalRoot,
+      canonicalQuarantine,
+      expected.root.uid,
+      gitProof.digest
     ], {
-      cwd: quarantine,
+      cwd: canonicalQuarantine,
       env: { GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1" },
       encoding: "utf8",
       shell: false,
       maxBuffer: 8 * 1024
     });
     if (result?.status !== 0 || result?.error || result?.signal) {
-      throw new Error("The identity-pinned test-temp root could not be removed.");
+      throw ownedCleanupError(
+        "The identity-pinned test-temp root could not be removed.",
+        helperCleanupReason(result)
+      );
     }
     try {
       fs.lstatSync(quarantine);

@@ -16,14 +16,19 @@ export const DETERMINISTIC_SUPPORT_TEST_FILES = Object.freeze([
   "tests/worker-broker-evidence_part6.mjs",
   "tests/worker-broker-evidence_part7.mjs",
   "tests/worker-broker-evidence_part8.mjs",
+  "tests/worker-broker-evidence_part9.mjs",
   "tests/worker-mutation_part1.mjs",
   "tests/worker-mutation_part2.mjs"
 ]);
 
 // Duration-balanced from the macOS and Linux lanes in Actions runs
-// 30516745831, 30567663739, and 30604307011. Shards 1 and 2 retain their
-// successful assignments; the two largest whole-file costs from the old
-// shard 3 moved to shard 4 after both macOS lanes reached the 30-minute bound.
+// 30516745831, 30567663739, 30604307011, and 30639026874. The first rebalance
+// retained shards 1 and 2 while moving the old shard 3's two largest whole-file
+// costs to shard 4 after both macOS lanes reached the 30-minute bound. The
+// measured worker-broker evidence partition 5 cleanup exceeded the fixed entry
+// budget in run 30639026874, so its second half runs in shard 4.
+// That run also measured mcp-worker-runtime as shard 1's slowest whole file
+// before macOS/Node 18 exceeded 30 minutes, so the file now runs in shard 4.
 // Keep this manifest explicit: validation must fail when the deterministic
 // inventory changes until the new file is deliberately assigned.
 export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
@@ -33,7 +38,6 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/deterministic-sharding.test.mjs",
     "tests/git-review.test.mjs",
     "tests/grok-review-app-target-collector.test.mjs",
-    "tests/mcp-worker-runtime.test.mjs",
     "tests/plugin-inventory.test.mjs",
     "tests/process-control-owned-identity.test.mjs",
     "tests/provider-capability.test.mjs",
@@ -106,7 +110,9 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/worker-startup-crash-window.test.mjs"
   ]),
   Object.freeze([
+    "tests/mcp-worker-runtime.test.mjs",
     "tests/runtime.test.mjs",
+    "tests/worker-broker-evidence_part9.mjs",
     "tests/worker-mutation_part2.mjs"
   ])
 ]);

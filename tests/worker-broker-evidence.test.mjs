@@ -126,10 +126,11 @@ const WORKER_BROKER_EVIDENCE_PARTITION_RANGES = Object.freeze({
   2: Object.freeze([90, 93]),
   3: Object.freeze([102, 115]),
   4: Object.freeze([115, 126]),
-  5: Object.freeze([45, 90]),
+  5: Object.freeze([45, 67]),
   6: Object.freeze([93, 96]),
   7: Object.freeze([96, 99]),
-  8: Object.freeze([99, 102])
+  8: Object.freeze([99, 102]),
+  9: Object.freeze([67, 90])
 });
 const WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT = 125;
 const workerBrokerEvidencePartitionCoverage = new Uint8Array(
@@ -214,6 +215,10 @@ const DETERMINISTIC_CHECK_RUNNER = path.join(ROOT, "scripts/check-deterministic.
 const DETERMINISTIC_TEST_LIBRARY = path.join(ROOT, "scripts/lib/deterministic-test-runner.mjs");
 const TEST_TEMP_LIBRARY = path.join(ROOT, "scripts/lib/test-temp.mjs");
 const TEST_TEMP_CHILD_HOOK = path.join(ROOT, "scripts/lib/test-temp-child-hook.cjs");
+const TEST_TEMP_GIT_CONTAINMENT = path.join(
+  ROOT,
+  "scripts/lib/test-temp-git-containment.cjs"
+);
 const TEST_TEMP_PIDFD_SIGNAL = path.join(ROOT, "scripts/lib/test-temp-pidfd-signal.py");
 const TEST_TEMP_REMOVE_HELPER = path.join(
   ROOT,
@@ -261,6 +266,7 @@ function installPhaseOneFocusedRunner(root) {
     DETERMINISTIC_TEST_LIBRARY,
     TEST_TEMP_LIBRARY,
     TEST_TEMP_CHILD_HOOK,
+    TEST_TEMP_GIT_CONTAINMENT,
     TEST_TEMP_PIDFD_SIGNAL,
     TEST_TEMP_REMOVE_HELPER,
     TEST_TEMP_SUPERVISOR,
@@ -299,6 +305,7 @@ test("deterministic zero-skip runner excludes only explicit external boundaries"
   expected.push("tests/worker-broker-evidence_part6.mjs");
   expected.push("tests/worker-broker-evidence_part7.mjs");
   expected.push("tests/worker-broker-evidence_part8.mjs");
+  expected.push("tests/worker-broker-evidence_part9.mjs");
   expected.push("tests/worker-mutation_part1.mjs");
   expected.push("tests/worker-mutation_part2.mjs");
   expected.sort();
@@ -448,6 +455,7 @@ test("deterministic runner executes static partition wrappers as exact ordinary 
     "tests/worker-broker-evidence_part6.mjs",
     "tests/worker-broker-evidence_part7.mjs",
     "tests/worker-broker-evidence_part8.mjs",
+    "tests/worker-broker-evidence_part9.mjs",
     "tests/worker-mutation_part1.mjs",
     "tests/worker-mutation_part2.mjs"
   ];
@@ -4215,12 +4223,16 @@ test("strict replay accepts a complete qualified aggregate without exposing a ge
 });
 
 test("strict offline live receipt replay rejects symlinks, directory replacement, depth, and directory budgets", async (t) => {
-  await t.test("static symlink", () => {
+  await t.test("static symlink", (t) => {
     const fixture = initLiveReceiptFixture("live-inventory-static-symlink");
     const receipt = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
     const outside = tempDir("live-inventory-outside-");
     fs.writeFileSync(path.join(outside, "outside.txt"), "outside\n");
     const link = path.join(fixture.root, "plugins/grok/static-link");
+    t.after(() => {
+      fs.rmSync(link, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    });
     fs.symlinkSync(outside, link, process.platform === "win32" ? "junction" : "dir");
     const result = validateLiveQualificationReceipt(
       receipt,
@@ -4323,10 +4335,12 @@ test("strict offline live receipt replay rejects symlinks, directory replacement
     assert.ok(validation.errors.some((message) => /source identity could not be verified/i.test(message)));
   });
 
-  await t.test("depth budget", () => {
+  await t.test("depth budget", (t) => {
     const fixture = initLiveReceiptFixture("live-inventory-depth-budget");
     const receipt = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
-    let directory = path.join(fixture.root, "plugins/grok/deep");
+    const deepRoot = path.join(fixture.root, "plugins/grok/deep");
+    t.after(() => fs.rmSync(deepRoot, { recursive: true, force: true }));
+    let directory = deepRoot;
     for (let index = 0; index < 33; index += 1) {
       fs.mkdirSync(directory);
       directory = path.join(directory, "d");
@@ -4340,10 +4354,11 @@ test("strict offline live receipt replay rejects symlinks, directory replacement
     assert.ok(result.errors.some((message) => /source identity could not be verified/i.test(message)));
   });
 
-  await t.test("directory budget", () => {
+  await t.test("directory budget", (t) => {
     const fixture = initLiveReceiptFixture("live-inventory-directory-budget");
     const receipt = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
     const parent = path.join(fixture.root, "plugins/grok/many-directories");
+    t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
     fs.mkdirSync(parent);
     for (let index = 0; index < 512; index += 1) {
       fs.mkdirSync(path.join(parent, `d-${String(index).padStart(3, "0")}`));
@@ -4356,23 +4371,31 @@ test("strict offline live receipt replay rejects symlinks, directory replacement
     assert.ok(result.errors.some((message) => /source identity could not be verified/i.test(message)));
   });
 
-  await t.test("directory entry fan-out budget", () => {
+  await t.test("directory entry fan-out budget", (t) => {
     const fixture = initLiveReceiptFixture("live-inventory-fanout-budget");
     const receipt = structuralLiveReceipt(fixture, LIVE_RECEIPT_AUTHORITY_SYNTHETIC);
     const parent = path.join(fixture.root, "plugins/grok/fanout");
+    t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
     fs.mkdirSync(parent);
-    for (let index = 0; index < 4097; index += 1) {
-      fs.mkdirSync(path.join(parent, `d-${String(index).padStart(4, "0")}`));
-    }
+    const sentinelPath = path.join(parent, "d-sentinel");
+    fs.mkdirSync(sentinelPath);
+    const sentinel = fs.readdirSync(
+      parent,
+      { withFileTypes: true }
+    ).find((entry) => entry.name === path.basename(sentinelPath));
+    assert.ok(sentinel?.isDirectory());
     const originalOpendirSync = fs.opendirSync;
     let targetReadCount = 0;
     fs.opendirSync = function countedOpendirSync(directory, ...args) {
       const handle = originalOpendirSync.call(fs, directory, ...args);
       if (path.resolve(String(directory)) !== parent) return handle;
+      let index = 0;
       return {
         readSync() {
           targetReadCount += 1;
-          return handle.readSync();
+          if (index >= 4097) return null;
+          index += 1;
+          return sentinel;
         },
         closeSync: handle.closeSync.bind(handle)
       };

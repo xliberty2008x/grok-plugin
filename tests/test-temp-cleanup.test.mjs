@@ -8,6 +8,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import gitContainment from "../scripts/lib/test-temp-git-containment.cjs";
 
 import { cleanupExitCode, parseCleanupArgs } from "../scripts/cleanup-test-temp.mjs";
 import {
@@ -28,6 +29,7 @@ import {
   LEGACY_TEST_TEMP_PREFIXES,
   captureRegisteredWorktrees,
   cleanupTestTemp,
+  createRegisteredWorktreeProvider,
   removeInventoriedTestTempRoot
 } from "../scripts/lib/test-temp-cleanup.mjs";
 import {
@@ -39,6 +41,7 @@ import {
   removeOwnedTestTempRoot
 } from "../scripts/lib/test-temp.mjs";
 
+const { inspectContainedGitMetadata } = gitContainment;
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
 const REMOVE_HELPER = path.join(ROOT, "scripts/lib/test-temp-remove-helper.cjs");
@@ -71,12 +74,166 @@ function legacy(root, prefix = LEGACY_REPOSITORY_PREFIX) {
   return fs.mkdtempSync(path.join(root, prefix));
 }
 
+function darwinSystemAlias(target) {
+  if (process.platform !== "darwin") return null;
+  const resolved = path.resolve(target);
+  for (const prefix of [
+    `${path.sep}private${path.sep}var`,
+    `${path.sep}private${path.sep}tmp`
+  ]) {
+    if (resolved === prefix || resolved.startsWith(`${prefix}${path.sep}`)) {
+      return resolved.slice(`${path.sep}private`.length);
+    }
+  }
+  return null;
+}
+
 function closedPaths() {
   return { available: true, paths: [], commands: [] };
 }
 
 function noWorktrees() {
   return { available: true, paths: [] };
+}
+
+function worktreePorcelain(paths) {
+  return paths.map((target, index) => [
+    `worktree ${target}`,
+    `HEAD ${String(index + 1).padStart(40, "0")}`,
+    "branch refs/heads/main",
+    ""
+  ].join("\n")).join("\n");
+}
+
+function worktreeMetadataFixture(t, { linked = false } = {}) {
+  const root = sandbox(t);
+  const repo = path.join(root, "repo");
+  const gitExecutable = path.join(root, "git");
+  const gitExecutableLink = path.join(root, "git-hardlink");
+  fs.mkdirSync(repo, { mode: 0o700 });
+  fs.writeFileSync(gitExecutable, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  fs.chmodSync(gitExecutable, 0o755);
+  fs.linkSync(gitExecutable, gitExecutableLink);
+  const commonDir = linked ? path.join(root, "common.git") : path.join(repo, ".git");
+  fs.mkdirSync(commonDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(commonDir, "config"), [
+    "[core]",
+    "\trepositoryformatversion = 0",
+    "\tbare = false",
+    "[extensions]",
+    "\tworktreeConfig = true",
+    ""
+  ].join("\n"), { mode: 0o600 });
+
+  function addRegistration(name, target) {
+    const registration = path.join(commonDir, "worktrees", name);
+    fs.mkdirSync(registration, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(registration, "gitdir"),
+      `${path.join(target, ".git")}\n`,
+      { mode: 0o600 }
+    );
+    fs.writeFileSync(path.join(registration, "commondir"), "../..\n", { mode: 0o600 });
+    fs.writeFileSync(
+      path.join(registration, "HEAD"),
+      `${"1".repeat(40)}\n`,
+      { mode: 0o600 }
+    );
+    return registration;
+  }
+
+  let activeGitDir = commonDir;
+  if (linked) {
+    activeGitDir = addRegistration("active", repo);
+    fs.writeFileSync(
+      path.join(repo, ".git"),
+      `gitdir: ${activeGitDir}\n`,
+      { mode: 0o600 }
+    );
+    fs.writeFileSync(
+      path.join(activeGitDir, "config.worktree"),
+      "[core]\n\tsparseCheckout = false\n",
+      { mode: 0o600 }
+    );
+    fs.mkdirSync(path.join(activeGitDir, "info"), { mode: 0o700 });
+    fs.writeFileSync(
+      path.join(activeGitDir, "info", "sparse-checkout"),
+      "/*\n",
+      { mode: 0o600 }
+    );
+    fs.writeFileSync(
+      path.join(activeGitDir, `sharedindex.${"a".repeat(40)}`),
+      "split-index\n",
+      { mode: 0o600 }
+    );
+  }
+
+  return {
+    activeGitDir,
+    addRegistration,
+    commonDir,
+    gitExecutable,
+    repo: fs.realpathSync(repo),
+    root
+  };
+}
+
+function addInternalLinkedWorktree(root) {
+  const primary = path.join(root, "repository", "primary");
+  const linked = path.join(root, "repository", "linked");
+  const common = path.join(primary, ".git");
+  const registration = path.join(common, "worktrees", "linked");
+  fs.mkdirSync(path.join(common, "objects"), { recursive: true });
+  fs.mkdirSync(path.join(common, "refs"));
+  fs.mkdirSync(registration, { recursive: true });
+  fs.mkdirSync(linked, { recursive: true });
+  fs.writeFileSync(path.join(common, "HEAD"), "ref: refs/heads/main\n");
+  fs.writeFileSync(path.join(common, "config"), "[core]\n\tbare = false\n");
+  fs.writeFileSync(
+    path.join(linked, ".git"),
+    `gitdir: ${registration}\n`
+  );
+  fs.writeFileSync(
+    path.join(registration, "gitdir"),
+    `${path.join(linked, ".git")}\n`
+  );
+  fs.writeFileSync(path.join(registration, "commondir"), "../..\n");
+  fs.writeFileSync(
+    path.join(registration, "config.worktree"),
+    "[core]\n\tsparseCheckout = false\n"
+  );
+  fs.writeFileSync(path.join(registration, "HEAD"), "1".repeat(40) + "\n");
+  const submodule = path.join(primary, "submodule");
+  const submoduleGit = path.join(common, "modules", "submodule");
+  fs.mkdirSync(path.join(submoduleGit, "objects"), { recursive: true });
+  fs.mkdirSync(path.join(submoduleGit, "refs"));
+  fs.mkdirSync(submodule);
+  fs.writeFileSync(
+    path.join(submodule, ".git"),
+    `gitdir: ${submoduleGit}\n`
+  );
+  fs.writeFileSync(
+    path.join(submoduleGit, "gitdir"),
+    `${path.join(submodule, ".git")}\n`
+  );
+  fs.writeFileSync(path.join(submoduleGit, "HEAD"), "ref: refs/heads/main\n");
+  fs.writeFileSync(
+    path.join(submoduleGit, "config"),
+    [
+      "[core]",
+      "\tbare = false",
+      `\tworktree = ${path.relative(submoduleGit, submodule)}`,
+      ""
+    ].join("\n")
+  );
+  return {
+    common,
+    linked,
+    primary,
+    registration,
+    submodule,
+    submoduleGit
+  };
 }
 
 function options(root, overrides = {}) {
@@ -421,8 +578,8 @@ test("dry-run inventories identity, ownership, age, size, activity, and Git stat
   assert.equal(result.removed, 0);
   assert.equal(candidate.eligible, true);
   assert.equal(candidate.uid, process.getuid());
-  assert.equal(Number.isSafeInteger(candidate.dev), true);
-  assert.equal(Number.isSafeInteger(candidate.ino), true);
+  assert.match(candidate.dev, /^(?:0|[1-9][0-9]*)$/u);
+  assert.match(candidate.ino, /^(?:0|[1-9][0-9]*)$/u);
   assert.equal(candidate.ageMs >= OLD_MS, true);
   assert.equal(candidate.sizeBytes > 0, true);
   assert.equal(candidate.active, false);
@@ -478,6 +635,13 @@ test("cleanup safety guards fail closed for recent, active, registered, linked, 
   assert.ok(record(result, linked).reasons.includes("external-worktree-link"));
   assert.ok(record(result, symlink).reasons.includes("not-real-directory"));
 
+  const registeredAncestor = cleanupTestTemp(options(root, {
+    worktreeProvider: () => ({ available: true, paths: [root] })
+  }));
+  assert.ok(
+    record(registeredAncestor, registered).reasons.includes("registered-worktree")
+  );
+
   const ownership = cleanupTestTemp(options(root, { expectedUid: process.getuid() + 1 }));
   assert.ok(record(ownership, active).reasons.includes("owner-mismatch"));
   assert.equal(fs.readFileSync(path.join(outside, "keep"), "utf8"), "keep");
@@ -530,6 +694,718 @@ test("worktree visibility uses a bounded scan window", () => {
   assert.equal(calls[0].options.timeout, 120_000);
 });
 
+test("worktree metadata cache reuses a cryptographically bound snapshot and copy-protects paths", (t) => {
+  const fixture = worktreeMetadataFixture(t);
+  let calls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run(_binary, _args, options) {
+      calls += 1;
+      assert.deepEqual(Object.keys(options.env).sort(), [
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_OPTIONAL_LOCKS",
+        "GIT_TERMINAL_PROMPT",
+        "LANG",
+        "LC_ALL"
+      ]);
+      assert.equal(options.env.GIT_DIR, undefined);
+      return { status: 0, stdout: worktreePorcelain([fixture.repo]) };
+    }
+  });
+
+  const first = provider();
+  assert.equal(first.available, true);
+  assert.ok(first.paths.includes(fixture.repo));
+  first.paths.push("/cache-poison");
+  for (let index = 0; index < 20; index += 1) {
+    const current = provider();
+    assert.equal(current.available, true);
+    assert.equal(current.paths.includes("/cache-poison"), false);
+  }
+  assert.equal(calls, 1);
+});
+
+test("worktree metadata cache freshly hashes the Git executable on every proof pass", (t) => {
+  const fixture = worktreeMetadataFixture(t);
+  const originalOpenSync = fs.openSync;
+  const originalReadFileSync = fs.readFileSync;
+  const originalCloseSync = fs.closeSync;
+  const executableDescriptors = new Set();
+  let executableReads = 0;
+  fs.openSync = (...args) => {
+    const descriptor = originalOpenSync(...args);
+    if (args[0] === fixture.gitExecutable) executableDescriptors.add(descriptor);
+    return descriptor;
+  };
+  fs.readFileSync = (target, ...args) => {
+    if (executableDescriptors.has(target)) executableReads += 1;
+    return originalReadFileSync(target, ...args);
+  };
+  fs.closeSync = (descriptor, ...args) => {
+    try {
+      return originalCloseSync(descriptor, ...args);
+    } finally {
+      executableDescriptors.delete(descriptor);
+    }
+  };
+  t.after(() => {
+    fs.openSync = originalOpenSync;
+    fs.readFileSync = originalReadFileSync;
+    fs.closeSync = originalCloseSync;
+  });
+
+  let calls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run() {
+      calls += 1;
+      return { status: 0, stdout: worktreePorcelain([fixture.repo]) };
+    }
+  });
+  assert.equal(provider().available, true);
+  assert.equal(provider().available, true);
+  assert.equal(calls, 1);
+  assert.equal(executableReads, 6);
+});
+
+test("one cleanup invocation enumerates Git once across many stable candidates and safety rechecks", (t) => {
+  const fixture = worktreeMetadataFixture(t);
+  const cleanupRoot = path.join(fixture.root, "many-candidates");
+  fs.mkdirSync(cleanupRoot);
+  const targets = Array.from({ length: 12 }, () => legacy(cleanupRoot));
+  for (const target of targets) age(target);
+  let gitCalls = 0;
+  let quarantineSequence = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run() {
+      gitCalls += 1;
+      return { status: 0, stdout: worktreePorcelain([fixture.repo]) };
+    }
+  });
+  const result = cleanupTestTemp(options(cleanupRoot, {
+    apply: true,
+    snapshotRefreshMs: 0,
+    worktreeProvider: provider,
+    removeRoot(candidate, _identity, { afterQuarantine }) {
+      quarantineSequence += 1;
+      const quarantine = path.join(cleanupRoot, `.fixture-quarantine-${quarantineSequence}`);
+      fs.renameSync(candidate, quarantine);
+      try {
+        afterQuarantine(quarantine);
+        fs.rmSync(quarantine, { recursive: true });
+        return true;
+      } catch (error) {
+        fs.renameSync(quarantine, candidate);
+        throw error;
+      }
+    }
+  }));
+  assert.equal(result.removed, targets.length);
+  assert.equal(gitCalls, 1);
+  assert.equal(targets.some((target) => fs.existsSync(target)), false);
+});
+
+test("worktree metadata cache refreshes for registration changes but ignores pure mtime touches", (t) => {
+  const fixture = worktreeMetadataFixture(t);
+  const listed = [fixture.repo];
+  let calls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run() {
+      calls += 1;
+      return { status: 0, stdout: worktreePorcelain(listed) };
+    }
+  });
+  assert.equal(provider().available, true);
+  assert.equal(calls, 1);
+
+  const external = path.join(fixture.root, "external-one");
+  const registration = fixture.addRegistration("external", external);
+  listed.push(external);
+  assert.equal(provider().available, true);
+  assert.equal(calls, 2);
+
+  const gitdir = path.join(registration, "gitdir");
+  const initial = fs.lstatSync(gitdir);
+  const replacement = Buffer.from(fs.readFileSync(gitdir));
+  const originalMarker = "external-one";
+  const replacementMarker = "external-two";
+  assert.equal(originalMarker.length, replacementMarker.length);
+  const rewritten = Buffer.from(
+    replacement.toString("utf8").replace(originalMarker, replacementMarker)
+  );
+  assert.equal(rewritten.length, replacement.length);
+  fs.writeFileSync(gitdir, rewritten);
+  fs.utimesSync(gitdir, initial.atime, initial.mtime);
+  assert.equal(provider().available, true);
+  assert.equal(calls, 3);
+
+  const touched = new Date(Date.now() - 10_000);
+  fs.utimesSync(gitdir, touched, touched);
+  assert.equal(provider().available, true);
+  assert.equal(calls, 3);
+
+  const renamed = path.join(fixture.commonDir, "worktrees", "renamed");
+  fs.renameSync(registration, renamed);
+  assert.equal(provider().available, true);
+  assert.equal(calls, 4);
+  fs.rmSync(renamed, { recursive: true });
+  listed.pop();
+  assert.equal(provider().available, true);
+  assert.equal(calls, 5);
+});
+
+test("worktree metadata cache brackets Git with matching proofs and fails closed after repeated churn", (t) => {
+  const fixture = worktreeMetadataFixture(t);
+  const registration = fixture.addRegistration("churn", path.join(fixture.root, "churn-one"));
+  const gitdir = path.join(registration, "gitdir");
+  let calls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run() {
+      calls += 1;
+      const current = fs.readFileSync(gitdir, "utf8");
+      fs.writeFileSync(
+        gitdir,
+        current.includes("churn-one")
+          ? current.replace("churn-one", "churn-two")
+          : current.replace("churn-two", "churn-one")
+      );
+      return { status: 0, stdout: worktreePorcelain([fixture.repo]) };
+    }
+  });
+  assert.deepEqual(provider(), {
+    available: false,
+    paths: [],
+    reason: "worktree-metadata-unstable"
+  });
+  assert.equal(calls, 2);
+});
+
+test("worktree metadata cache rejects a registration removed and restored during Git enumeration", (t) => {
+  const fixture = worktreeMetadataFixture(t);
+  const external = path.join(fixture.root, "external-aba");
+  const registration = fixture.addRegistration("aba", external);
+  const holding = path.join(fixture.root, "aba-holding");
+  let calls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run() {
+      calls += 1;
+      fs.renameSync(registration, holding);
+      fs.renameSync(holding, registration);
+      const generationTime = new Date(Date.now() - calls * 1_000);
+      fs.utimesSync(registration, generationTime, generationTime);
+      return { status: 0, stdout: worktreePorcelain([fixture.repo]) };
+    }
+  });
+  assert.deepEqual(provider(), {
+    available: false,
+    paths: [],
+    reason: "worktree-metadata-unstable"
+  });
+  assert.equal(calls, 2);
+});
+
+test("worktree metadata proof supports linked checkouts and scrubs ambient Git authority", (t) => {
+  const fixture = worktreeMetadataFixture(t, { linked: true });
+  const calls = [];
+  const previousGitDir = process.env.GIT_DIR;
+  let result;
+  try {
+    process.env.GIT_DIR = path.join(fixture.root, "poisoned-git-dir");
+    const provider = createRegisteredWorktreeProvider(fixture.repo, {
+      gitCandidates: [fixture.gitExecutable],
+      run(binary, args, options) {
+        calls.push({ args, binary, options });
+        return { status: 0, stdout: worktreePorcelain([fixture.repo]) };
+      }
+    });
+    result = provider();
+  } finally {
+    if (previousGitDir === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = previousGitDir;
+  }
+  assert.equal(result.available, true);
+  assert.ok(result.paths.includes(fixture.repo));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.env.GIT_DIR, undefined);
+  assert.equal(calls[0].options.env.GIT_CONFIG_GLOBAL, "/dev/null");
+  assert.deepEqual(calls[0].args, ["worktree", "list", "--porcelain"]);
+});
+
+test("worktree metadata proof accepts a bare main record with a linked checkout", (t) => {
+  const fixture = worktreeMetadataFixture(t, { linked: true });
+  let calls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run() {
+      calls += 1;
+      return {
+        status: 0,
+        stdout: [
+          `worktree ${fixture.commonDir}`,
+          "bare",
+          "",
+          worktreePorcelain([fixture.repo])
+        ].join("\n")
+      };
+    }
+  });
+  const result = provider();
+  assert.equal(result.available, true);
+  assert.ok(result.paths.includes(fixture.commonDir));
+  assert.ok(result.paths.includes(fixture.repo));
+  assert.equal(calls, 1);
+});
+
+test("worktree metadata proof supports a live relative registration gitdir", (t) => {
+  const fixture = worktreeMetadataFixture(t, { linked: true });
+  const relativeWorktree = path.join(fixture.root, "relative-worktree");
+  fs.mkdirSync(relativeWorktree, { mode: 0o700 });
+  const registration = fixture.addRegistration("relative", relativeWorktree);
+  const marker = path.join(relativeWorktree, ".git");
+  fs.writeFileSync(marker, `gitdir: ${registration}\n`, { mode: 0o600 });
+  fs.writeFileSync(
+    path.join(registration, "gitdir"),
+    `${path.relative(registration, marker)}\n`,
+    { mode: 0o600 }
+  );
+  let calls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run() {
+      calls += 1;
+      return {
+        status: 0,
+        stdout: worktreePorcelain([fixture.repo, relativeWorktree])
+      };
+    }
+  });
+  const result = provider();
+  assert.equal(result.available, true);
+  assert.ok(result.paths.includes(fs.realpathSync(relativeWorktree)));
+  assert.equal(calls, 1);
+});
+
+test("worktree metadata proof binds a fixed executable symlink and its canonical target", (t) => {
+  const fixture = worktreeMetadataFixture(t);
+  const gitAuthority = path.join(fixture.root, "git-authority");
+  fs.symlinkSync(path.basename(fixture.gitExecutable), gitAuthority);
+  const calls = [];
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [gitAuthority],
+    run(binary) {
+      calls.push(binary);
+      return { status: 0, stdout: worktreePorcelain([fixture.repo]) };
+    }
+  });
+  assert.equal(provider().available, true);
+  assert.deepEqual(calls, [fs.realpathSync(fixture.gitExecutable)]);
+});
+
+test("worktree metadata proof fails closed when its executable symlink is retargeted", (t) => {
+  const fixture = worktreeMetadataFixture(t);
+  const alternateGit = path.join(fixture.root, "alternate-git");
+  const gitAuthority = path.join(fixture.root, "git-authority");
+  fs.writeFileSync(alternateGit, "#!/bin/sh\nexit 2\n", { mode: 0o755 });
+  fs.symlinkSync(path.basename(fixture.gitExecutable), gitAuthority);
+  let calls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [gitAuthority],
+    run() {
+      calls += 1;
+      fs.rmSync(gitAuthority);
+      fs.symlinkSync(
+        path.basename(calls % 2 === 1 ? alternateGit : fixture.gitExecutable),
+        gitAuthority
+      );
+      return { status: 0, stdout: worktreePorcelain([fixture.repo]) };
+    }
+  });
+  assert.deepEqual(provider(), {
+    available: false,
+    paths: [],
+    reason: "worktree-metadata-unstable"
+  });
+  assert.equal(calls, 2);
+});
+
+test("worktree metadata cache rematerializes registered path aliases after symlink retarget", (t) => {
+  const fixture = worktreeMetadataFixture(t);
+  const firstTarget = path.join(fixture.root, "first-target");
+  const secondTarget = path.join(fixture.root, "second-target");
+  const registeredLink = path.join(fixture.root, "registered-link");
+  const firstWorktree = path.join(firstTarget, "worktree");
+  const secondWorktree = path.join(secondTarget, "worktree");
+  fs.mkdirSync(firstWorktree, { recursive: true });
+  fs.mkdirSync(secondWorktree, { recursive: true });
+  fs.symlinkSync(firstTarget, registeredLink);
+  const rawWorktree = path.join(registeredLink, "worktree");
+  fixture.addRegistration("retargeted", rawWorktree);
+  let calls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run() {
+      calls += 1;
+      return {
+        status: 0,
+        stdout: worktreePorcelain([fixture.repo, rawWorktree])
+      };
+    }
+  });
+
+  const first = provider();
+  assert.equal(first.available, true);
+  assert.ok(first.paths.includes(fs.realpathSync(firstWorktree)));
+  fs.unlinkSync(registeredLink);
+  fs.symlinkSync(secondTarget, registeredLink);
+  const second = provider();
+  assert.equal(second.available, true);
+  assert.ok(second.paths.includes(fs.realpathSync(secondWorktree)));
+  assert.equal(second.paths.includes(fs.realpathSync(firstWorktree)), false);
+  assert.equal(calls, 1);
+});
+
+test("worktree metadata cache resolves missing suffixes but fails closed on a dangling alias", (t) => {
+  const fixture = worktreeMetadataFixture(t);
+  const candidate = path.join(fixture.root, "candidate");
+  const moved = path.join(fixture.root, "candidate-moved");
+  const registeredLink = path.join(fixture.root, "registered-link");
+  fs.mkdirSync(candidate);
+  fs.symlinkSync(candidate, registeredLink);
+  const rawNestedWorktree = path.join(registeredLink, "missing-nested-worktree");
+  fixture.addRegistration("nested", rawNestedWorktree);
+  let calls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run() {
+      calls += 1;
+      return {
+        status: 0,
+        stdout: worktreePorcelain([fixture.repo, rawNestedWorktree])
+      };
+    }
+  });
+
+  const first = provider();
+  assert.equal(first.available, true);
+  assert.ok(first.paths.includes(path.join(candidate, "missing-nested-worktree")));
+  fs.renameSync(candidate, moved);
+  assert.deepEqual(provider(), {
+    available: false,
+    paths: [],
+    reason: "worktree-path-alias-unavailable"
+  });
+  assert.equal(calls, 1);
+});
+
+test("worktree metadata cache revalidates the active checkout after alias retarget", (t) => {
+  const fixture = worktreeMetadataFixture(t);
+  const activeAlias = path.join(fixture.root, "active-alias");
+  const unrelated = path.join(fixture.root, "unrelated");
+  fs.mkdirSync(unrelated);
+  fs.symlinkSync(fixture.repo, activeAlias);
+  let calls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run() {
+      calls += 1;
+      return { status: 0, stdout: worktreePorcelain([activeAlias]) };
+    }
+  });
+  assert.equal(provider().available, true);
+  fs.unlinkSync(activeAlias);
+  fs.symlinkSync(unrelated, activeAlias);
+  assert.deepEqual(provider(), {
+    available: false,
+    paths: [],
+    reason: "worktree-path-alias-unavailable"
+  });
+  assert.equal(calls, 1);
+});
+
+test("non-normal registered worktree paths fail closed before cleanup", (t) => {
+  const fixture = worktreeMetadataFixture(t);
+  const cleanupRoot = path.join(fixture.root, "physical-parent");
+  fs.mkdirSync(cleanupRoot, { recursive: true });
+  const target = legacy(cleanupRoot);
+  const ambiguousPath = [
+    path.dirname(target),
+    ".",
+    path.basename(target)
+  ].join(path.sep);
+  assert.equal(fs.realpathSync(ambiguousPath), fs.realpathSync(target));
+  fixture.addRegistration("ambiguous", ambiguousPath);
+  age(target);
+  let calls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run() {
+      calls += 1;
+      return {
+        status: 0,
+        stdout: worktreePorcelain([fixture.repo, ambiguousPath])
+      };
+    }
+  });
+
+  const result = cleanupTestTemp(options(cleanupRoot, {
+    apply: true,
+    worktreeProvider: provider
+  }));
+  assert.equal(result.aborted, true);
+  assert.equal(result.reason, "worktree-visibility-unavailable");
+  assert.equal(fs.existsSync(target), true);
+  assert.equal(calls, 1);
+});
+
+test("worktree metadata proof fails closed for unsafe metadata and Git failure", async (t) => {
+  await t.test("symlinked registration control", (subtest) => {
+    const fixture = worktreeMetadataFixture(subtest);
+    const registration = fixture.addRegistration("unsafe", path.join(fixture.root, "unsafe"));
+    fs.rmSync(path.join(registration, "gitdir"));
+    fs.symlinkSync(path.join(fixture.root, "outside"), path.join(registration, "gitdir"));
+    let calls = 0;
+    const provider = createRegisteredWorktreeProvider(fixture.repo, {
+      gitCandidates: [fixture.gitExecutable],
+      run() { calls += 1; return { status: 0, stdout: "" }; }
+    });
+    assert.equal(provider().available, false);
+    assert.equal(calls, 0);
+  });
+
+  await t.test("owner mismatch", (subtest) => {
+    const fixture = worktreeMetadataFixture(subtest);
+    let calls = 0;
+    const provider = createRegisteredWorktreeProvider(fixture.repo, {
+      expectedUid: process.getuid() + 1,
+      gitCandidates: [fixture.gitExecutable],
+      run() { calls += 1; return { status: 0, stdout: "" }; }
+    });
+    assert.equal(provider().available, false);
+    assert.equal(calls, 0);
+  });
+
+  await t.test("oversized config", (subtest) => {
+    const fixture = worktreeMetadataFixture(subtest);
+    fs.writeFileSync(path.join(fixture.commonDir, "config"), Buffer.alloc(1024 * 1024 + 1));
+    let calls = 0;
+    const provider = createRegisteredWorktreeProvider(fixture.repo, {
+      gitCandidates: [fixture.gitExecutable],
+      run() { calls += 1; return { status: 0, stdout: "" }; }
+    });
+    assert.equal(provider().available, false);
+    assert.equal(calls, 0);
+  });
+
+  await t.test("config include and lock", (subtest) => {
+    const fixture = worktreeMetadataFixture(subtest);
+    fs.writeFileSync(path.join(fixture.commonDir, "config"), "[include]\n\tpath = /outside\n");
+    let calls = 0;
+    const provider = createRegisteredWorktreeProvider(fixture.repo, {
+      gitCandidates: [fixture.gitExecutable],
+      run() { calls += 1; return { status: 0, stdout: "" }; }
+    });
+    assert.equal(provider().available, false);
+    fs.writeFileSync(path.join(fixture.commonDir, "config"), "[core]\n\tbare = false\n");
+    fs.writeFileSync(path.join(fixture.commonDir, "config.lock"), "locked");
+    assert.equal(provider().available, false);
+    assert.equal(calls, 0);
+  });
+
+  await t.test("gitfile surrounding whitespace", (subtest) => {
+    const fixture = worktreeMetadataFixture(subtest, { linked: true });
+    fs.writeFileSync(
+      path.join(fixture.repo, ".git"),
+      `gitdir: ${fixture.activeGitDir} \n`
+    );
+    let calls = 0;
+    const provider = createRegisteredWorktreeProvider(fixture.repo, {
+      gitCandidates: [fixture.gitExecutable],
+      run() { calls += 1; return { status: 0, stdout: "" }; }
+    });
+    assert.equal(provider().available, false);
+    assert.equal(calls, 0);
+  });
+
+  await t.test("gitfile symlink parent traversal", (subtest) => {
+    const fixture = worktreeMetadataFixture(subtest, { linked: true });
+    const physical = path.join(fixture.root, "physical-gitdir");
+    const hop = path.join(physical, "hop");
+    const actual = path.join(physical, "active");
+    const decoy = path.join(fixture.repo, "active");
+    fs.mkdirSync(hop, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(actual, { mode: 0o700 });
+    fs.mkdirSync(decoy, { mode: 0o700 });
+    fs.writeFileSync(path.join(actual, "config"), "[core]\n\tbare = false\n", {
+      mode: 0o600
+    });
+    fs.writeFileSync(path.join(decoy, "config"), "[core]\n\tbare = false\n", {
+      mode: 0o600
+    });
+    fs.symlinkSync(hop, path.join(fixture.repo, "control-link"));
+    fs.writeFileSync(
+      path.join(fixture.repo, ".git"),
+      `gitdir: control-link${path.sep}..${path.sep}active\n`
+    );
+    let calls = 0;
+    const provider = createRegisteredWorktreeProvider(fixture.repo, {
+      gitCandidates: [fixture.gitExecutable],
+      run() { calls += 1; return { status: 0, stdout: "" }; }
+    });
+    assert.equal(provider().available, false);
+    assert.equal(calls, 0);
+  });
+
+  await t.test("commondir symlink parent traversal", (subtest) => {
+    const fixture = worktreeMetadataFixture(subtest, { linked: true });
+    const physical = path.join(fixture.root, "physical-common");
+    const hop = path.join(physical, "hop");
+    const actual = path.join(physical, "common");
+    const decoy = path.join(fixture.activeGitDir, "info", "common");
+    fs.mkdirSync(hop, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(actual, { mode: 0o700 });
+    fs.mkdirSync(decoy, { mode: 0o700 });
+    fs.writeFileSync(path.join(actual, "config"), "[core]\n\tbare = false\n", {
+      mode: 0o600
+    });
+    fs.writeFileSync(path.join(decoy, "config"), "[core]\n\tbare = false\n", {
+      mode: 0o600
+    });
+    fs.symlinkSync(hop, path.join(fixture.activeGitDir, "info", "control-link"));
+    fs.writeFileSync(
+      path.join(fixture.activeGitDir, "commondir"),
+      `info${path.sep}control-link${path.sep}..${path.sep}common\n`
+    );
+    let calls = 0;
+    const provider = createRegisteredWorktreeProvider(fixture.repo, {
+      gitCandidates: [fixture.gitExecutable],
+      run() { calls += 1; return { status: 0, stdout: "" }; }
+    });
+    assert.equal(provider().available, false);
+    assert.equal(calls, 0);
+  });
+
+  await t.test("missing relative registration gitdir", (subtest) => {
+    const fixture = worktreeMetadataFixture(subtest);
+    const registration = fixture.addRegistration(
+      "relative",
+      path.join(fixture.root, "relative")
+    );
+    fs.writeFileSync(path.join(registration, "gitdir"), "../relative/.git\n");
+    let calls = 0;
+    const provider = createRegisteredWorktreeProvider(fixture.repo, {
+      gitCandidates: [fixture.gitExecutable],
+      run() { calls += 1; return { status: 0, stdout: "" }; }
+    });
+    assert.equal(provider().available, false);
+    assert.equal(calls, 0);
+  });
+
+  await t.test("symlinked relative registration gitdir", (subtest) => {
+    const fixture = worktreeMetadataFixture(subtest);
+    const actual = path.join(fixture.root, "actual-relative-worktree");
+    const alias = path.join(fixture.root, "relative-worktree-alias");
+    fs.mkdirSync(actual, { mode: 0o700 });
+    fs.symlinkSync(actual, alias);
+    const registration = fixture.addRegistration("relative", alias);
+    const marker = path.join(actual, ".git");
+    fs.writeFileSync(marker, `gitdir: ${registration}\n`, { mode: 0o600 });
+    fs.writeFileSync(
+      path.join(registration, "gitdir"),
+      `${path.relative(registration, path.join(alias, ".git"))}\n`,
+      { mode: 0o600 }
+    );
+    let calls = 0;
+    const provider = createRegisteredWorktreeProvider(fixture.repo, {
+      gitCandidates: [fixture.gitExecutable],
+      run() { calls += 1; return { status: 0, stdout: "" }; }
+    });
+    assert.equal(provider().available, false);
+    assert.equal(calls, 0);
+  });
+
+  await t.test("relative registration symlink parent traversal", (subtest) => {
+    const fixture = worktreeMetadataFixture(subtest);
+    const registration = fixture.addRegistration(
+      "relative-traversal",
+      path.join(fixture.root, "relative-traversal")
+    );
+    const info = path.join(registration, "info");
+    const physical = path.join(fixture.root, "physical-relative");
+    const hop = path.join(physical, "hop");
+    const actual = path.join(physical, "marker.git");
+    const decoy = path.join(info, "marker.git");
+    fs.mkdirSync(info, { mode: 0o700 });
+    fs.mkdirSync(hop, { recursive: true, mode: 0o700 });
+    fs.symlinkSync(hop, path.join(info, "control-link"));
+    fs.writeFileSync(actual, `gitdir: ${registration}\n`, { mode: 0o600 });
+    fs.writeFileSync(decoy, `gitdir: ${registration}\n`, { mode: 0o600 });
+    fs.writeFileSync(
+      path.join(registration, "gitdir"),
+      `info${path.sep}control-link${path.sep}..${path.sep}marker.git\n`
+    );
+    let calls = 0;
+    const provider = createRegisteredWorktreeProvider(fixture.repo, {
+      gitCandidates: [fixture.gitExecutable],
+      run() { calls += 1; return { status: 0, stdout: "" }; }
+    });
+    assert.equal(provider().available, false);
+    assert.equal(calls, 0);
+  });
+
+  await t.test("Git failure", (subtest) => {
+    const fixture = worktreeMetadataFixture(subtest);
+    const provider = createRegisteredWorktreeProvider(fixture.repo, {
+      gitCandidates: [fixture.gitExecutable],
+      run() { return { status: 1, stderr: "failure" }; }
+    });
+    assert.deepEqual(provider(), {
+      available: false,
+      paths: [],
+      reason: "git-worktree-list-failed"
+    });
+  });
+});
+
+test("post-quarantine registration change refreshes Git and restores the outside-canary candidate", (t) => {
+  const fixture = worktreeMetadataFixture(t);
+  const cleanupRoot = path.join(fixture.root, "cleanup");
+  fs.mkdirSync(cleanupRoot);
+  const target = legacy(cleanupRoot);
+  const canary = path.join(target, "keep");
+  fs.writeFileSync(canary, "keep");
+  age(target);
+  const listed = [fixture.repo];
+  let gitCalls = 0;
+  let openCalls = 0;
+  const provider = createRegisteredWorktreeProvider(fixture.repo, {
+    gitCandidates: [fixture.gitExecutable],
+    run() {
+      gitCalls += 1;
+      return { status: 0, stdout: worktreePorcelain(listed) };
+    }
+  });
+  const result = cleanupTestTemp(options(cleanupRoot, {
+    apply: true,
+    worktreeProvider: provider,
+    openPathsProvider() {
+      openCalls += 1;
+      if (openCalls === 3) {
+        fixture.addRegistration("late", target);
+        listed.push(target);
+      }
+      return closedPaths();
+    }
+  }));
+  assert.equal(gitCalls, 2);
+  assert.ok(record(result, target).reasons.includes("registered-worktree"));
+  assert.equal(fs.readFileSync(canary, "utf8"), "keep");
+});
+
 test("apply refreshes process visibility and aborts remaining deletions on refresh failure", (t) => {
   const root = sandbox(t);
   const target = legacy(root);
@@ -567,6 +1443,91 @@ test("standalone repositories with linked-worktree metadata and external canarie
   assert.equal(fs.readFileSync(sentinel, "utf8"), "keep");
 });
 
+test("legacy and managed candidates scan for nested external worktree links", (t) => {
+  const root = sandbox(t);
+  const targets = [
+    legacy(root),
+    createOwnedTestTempRoot({
+      base: root,
+      prefix: TEST_TEMP_RUN_PREFIX,
+      kind: "run",
+      pid: process.pid,
+      startToken: "stale-nested-worktree-owner"
+    })
+  ];
+  const outside = path.join(root, "nested-worktree-outside");
+  const sentinel = path.join(outside, "keep");
+  fs.mkdirSync(outside);
+  for (const [index, target] of targets.entries()) {
+    const checkout = path.join(target, "checkout");
+    fs.mkdirSync(checkout);
+    fs.writeFileSync(
+      path.join(checkout, index === 0 ? ".git" : ".GiT"),
+      `gitdir: ${path.join(outside, ".git", "worktrees", `checkout-${index}`)}\n`
+    );
+    age(target);
+  }
+  fs.writeFileSync(sentinel, "keep");
+  const result = cleanupTestTemp(options(root, {
+    apply: true,
+    tokenForPid: () => "live-nested-worktree-owner"
+  }));
+  for (const target of targets) {
+    assert.ok(record(result, target).reasons.includes("external-worktree-link"));
+    assert.equal(fs.existsSync(target), true);
+  }
+  assert.equal(fs.readFileSync(sentinel, "utf8"), "keep");
+});
+
+test("nested Git directories and bare common dirs preserve external registrations", (t) => {
+  const root = sandbox(t);
+  const controlTarget = legacy(root);
+  const controlGit = path.join(controlTarget, "checkout", ".git");
+  fs.mkdirSync(controlGit, { recursive: true });
+  fs.writeFileSync(path.join(controlGit, "commondir"), "/outside/common.git\n");
+  age(controlTarget);
+
+  const bareTarget = legacy(root);
+  const bare = path.join(bareTarget, "nested-common.git");
+  const registration = path.join(bare, "worktrees", "outside");
+  fs.mkdirSync(path.join(bare, "objects"), { recursive: true });
+  fs.mkdirSync(path.join(bare, "refs"));
+  fs.mkdirSync(registration, { recursive: true });
+  fs.writeFileSync(path.join(bare, "HEAD"), "ref: refs/heads/main\n");
+  fs.writeFileSync(path.join(bare, "config"), "[core]\n\tbare = true\n");
+  fs.writeFileSync(path.join(registration, "gitdir"), "/outside/checkout/.git\n");
+  fs.writeFileSync(path.join(registration, "commondir"), "../..\n");
+  age(bareTarget);
+
+  const result = cleanupTestTemp(options(root, { apply: true }));
+  assert.ok(record(result, controlTarget).reasons.includes("external-worktree-link"));
+  assert.ok(record(result, bareTarget).reasons.includes("git-worktree-metadata"));
+  assert.equal(fs.existsSync(controlTarget), true);
+  assert.equal(fs.existsSync(bareTarget), true);
+});
+
+test("legacy standalone Git directories preserve external core.worktree targets", (t) => {
+  const root = sandbox(t);
+  const target = legacy(root);
+  const outside = fs.mkdtempSync(path.join(root, "outside-legacy-worktree-"));
+  const sentinel = path.join(outside, "keep");
+  const bare = path.join(target, "standalone.git");
+  fs.mkdirSync(path.join(bare, "objects"), { recursive: true });
+  fs.mkdirSync(path.join(bare, "refs"));
+  fs.writeFileSync(path.join(bare, "HEAD"), "ref: refs/heads/main\n");
+  fs.writeFileSync(
+    path.join(bare, "config"),
+    `[core]\n\tworktree = ${outside}\n`
+  );
+  fs.writeFileSync(sentinel, "keep");
+  age(target);
+
+  const result = cleanupTestTemp(options(root, { apply: true }));
+  assert.ok(record(result, target).reasons.includes("external-worktree-link"));
+  assert.equal(fs.existsSync(target), true);
+  assert.equal(fs.readFileSync(sentinel, "utf8"), "keep");
+});
+
 test("apply rechecks inode identity and preserves a rename-swap replacement", (t) => {
   const root = sandbox(t);
   const target = legacy(root);
@@ -585,6 +1546,53 @@ test("apply rechecks inode identity and preserves a rename-swap replacement", (t
   assert.ok(record(result, target).reasons.includes("identity-changed"));
   assert.equal(fs.readFileSync(path.join(target, "replacement"), "utf8"), "replacement");
   assert.equal(fs.readFileSync(path.join(moved, "original"), "utf8"), "original");
+});
+
+test("apply distinguishes exact inode identities above Number precision", (t) => {
+  const root = sandbox(t);
+  const target = legacy(root);
+  age(target);
+  const firstInode = 2n ** 60n + 1n;
+  const replacementInode = firstInode + 1n;
+  assert.equal(Number(firstInode), Number(replacementInode));
+  const originalLstat = fs.lstatSync;
+  let replaced = false;
+  let removalCalls = 0;
+  fs.lstatSync = (selected, options_) => {
+    const stat = originalLstat(selected, options_);
+    if (
+      path.resolve(String(selected)) !== target
+      || options_?.bigint !== true
+    ) {
+      return stat;
+    }
+    const clone = Object.assign(
+      Object.create(Object.getPrototypeOf(stat)),
+      stat
+    );
+    clone.ino = replaced ? replacementInode : firstInode;
+    return clone;
+  };
+  try {
+    const result = cleanupTestTemp(options(root, {
+      apply: true,
+      beforeDelete(candidate) {
+        if (candidate.path === target) replaced = true;
+      },
+      removeRoot() {
+        removalCalls += 1;
+        return true;
+      }
+    }));
+    const candidate = record(result, target);
+    assert.equal(candidate.ino, String(firstInode));
+    assert.ok(candidate.reasons.includes("identity-changed"));
+    assert.equal(removalCalls, 0);
+    assert.equal(result.removed, 0);
+    assert.equal(fs.existsSync(target), true);
+  } finally {
+    fs.lstatSync = originalLstat;
+  }
 });
 
 test("apply preserves a replacement swapped after the final path identity check", (t) => {
@@ -760,20 +1768,427 @@ test("verified recursive removal has no timeout that can orphan a descendant hel
   const root = sandbox(t);
   const target = legacy(root);
   fs.writeFileSync(path.join(target, "payload"), "payload");
-  const identity = fs.lstatSync(target);
+  const identity = fs.lstatSync(target, { bigint: true });
   let helperOptions;
+  let helperArguments;
   assert.equal(removeInventoriedTestTempRoot(target, identity, {
-    run(_executable, _arguments, options) {
+    run(_executable, arguments_, options) {
+      helperArguments = arguments_;
       helperOptions = options;
       fs.rmSync(options.cwd, { recursive: true, force: true });
       return { status: 0, error: null, signal: null };
     }
   }), true);
+  assert.deepEqual(helperArguments.slice(1), [
+    String(identity.dev),
+    String(identity.ino),
+    String(identity.dev),
+    "guarded",
+    "none"
+  ]);
   assert.equal(Object.hasOwn(helperOptions, "timeout"), false);
   assert.doesNotMatch(
     fs.readFileSync(path.join(ROOT, "scripts/lib/test-temp-remove-helper.cjs"), "utf8"),
     /\btimeout\s*:/u
   );
+});
+
+test("guarded recursive removal keeps descendant helper argv child-hook compatible", (t) => {
+  if (process.platform === "win32") return;
+  const root = sandbox(t);
+  const target = legacy(root);
+  const nested = path.join(target, "nested");
+  const log = path.join(root, "recursive-spawn.jsonl");
+  const preload = path.join(root, "recursive-spawn-preload.cjs");
+  fs.mkdirSync(nested);
+  fs.writeFileSync(path.join(nested, "payload"), "payload");
+  fs.writeFileSync(preload, [
+    '"use strict";',
+    'const childProcess = require("node:child_process");',
+    'const fs = require("node:fs");',
+    'const { syncBuiltinESMExports } = require("node:module");',
+    `const log = ${JSON.stringify(log)};`,
+    "const originalSpawnSync = childProcess.spawnSync;",
+    "childProcess.spawnSync = function(file, args, options) {",
+    "  fs.appendFileSync(log, `${JSON.stringify(args)}\\n`);",
+    "  return originalSpawnSync.call(this, file, args, options);",
+    "};",
+    "syncBuiltinESMExports();",
+    ""
+  ].join("\n"));
+  const targetIdentity = fs.lstatSync(target, { bigint: true });
+  const nestedIdentity = fs.lstatSync(nested, { bigint: true });
+  const result = spawnSync(process.execPath, [
+    REMOVE_HELPER,
+    String(targetIdentity.dev),
+    String(targetIdentity.ino),
+    String(targetIdentity.dev),
+    "guarded",
+    "none"
+  ], {
+    cwd: target,
+    env: {
+      GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1",
+      NODE_OPTIONS: `--require=${preload}`
+    },
+    encoding: "utf8",
+    shell: false
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const launches = fs.readFileSync(log, "utf8")
+    .trim()
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(launches, [[
+    REMOVE_HELPER,
+    String(nestedIdentity.dev),
+    String(nestedIdentity.ino),
+    String(targetIdentity.dev),
+    "guarded",
+    "none"
+  ]]);
+  assert.equal(fs.existsSync(target), false);
+});
+
+test("recursive remover refuses late Git controls but permits a standalone .git directory", (t) => {
+  const root = sandbox(t);
+  const linked = legacy(root);
+  fs.writeFileSync(path.join(linked, ".GiT"), "gitdir: /outside/worktrees/late\n");
+  const linkedIdentity = fs.lstatSync(linked, { bigint: true });
+  assert.throws(
+    () => removeInventoriedTestTempRoot(linked, linkedIdentity),
+    (error) => error?.code === "E_TEST_TEMP_IDENTITY_CHANGED"
+  );
+  assert.equal(
+    fs.readFileSync(path.join(linked, ".GiT"), "utf8"),
+    "gitdir: /outside/worktrees/late\n"
+  );
+
+  const controlled = legacy(root);
+  fs.mkdirSync(path.join(controlled, ".git"));
+  fs.writeFileSync(
+    path.join(controlled, ".git", "commondir"),
+    "/outside/common.git\n"
+  );
+  const controlledIdentity = fs.lstatSync(controlled, { bigint: true });
+  assert.throws(
+    () => removeInventoriedTestTempRoot(controlled, controlledIdentity),
+    (error) => error?.code === "E_TEST_TEMP_IDENTITY_CHANGED"
+  );
+  assert.equal(
+    fs.readFileSync(path.join(controlled, ".git", "commondir"), "utf8"),
+    "/outside/common.git\n"
+  );
+
+  const bareControlled = legacy(root);
+  const bare = path.join(bareControlled, "common.git");
+  const bareRegistration = path.join(bare, "worktrees", "outside");
+  fs.mkdirSync(path.join(bare, "objects"), { recursive: true });
+  fs.mkdirSync(path.join(bare, "refs"));
+  fs.mkdirSync(bareRegistration, { recursive: true });
+  fs.writeFileSync(path.join(bare, "HEAD"), "ref: refs/heads/main\n");
+  fs.writeFileSync(path.join(bare, "config"), "[core]\n\tbare = true\n");
+  fs.writeFileSync(path.join(bareRegistration, "gitdir"), "/outside/.git\n");
+  fs.writeFileSync(path.join(bareRegistration, "commondir"), "../..\n");
+  const bareIdentity = fs.lstatSync(bareControlled, { bigint: true });
+  assert.throws(
+    () => removeInventoriedTestTempRoot(bareControlled, bareIdentity),
+    (error) => error?.code === "E_TEST_TEMP_IDENTITY_CHANGED"
+  );
+  assert.equal(
+    fs.readFileSync(path.join(bareRegistration, "gitdir"), "utf8"),
+    "/outside/.git\n"
+  );
+
+  const standaloneCore = legacy(root);
+  const standaloneBare = path.join(standaloneCore, "standalone.git");
+  fs.mkdirSync(path.join(standaloneBare, "objects"), { recursive: true });
+  fs.mkdirSync(path.join(standaloneBare, "refs"));
+  fs.writeFileSync(
+    path.join(standaloneBare, "HEAD"),
+    "ref: refs/heads/main\n"
+  );
+  fs.writeFileSync(
+    path.join(standaloneBare, "config"),
+    "[core]\n\tworktree = /outside/checkout\n"
+  );
+  const standaloneCoreIdentity = fs.lstatSync(standaloneCore, {
+    bigint: true
+  });
+  assert.throws(
+    () => removeInventoriedTestTempRoot(
+      standaloneCore,
+      standaloneCoreIdentity
+    ),
+    (error) => error?.code === "E_TEST_TEMP_IDENTITY_CHANGED"
+  );
+  assert.match(
+    fs.readFileSync(path.join(standaloneBare, "config"), "utf8"),
+    /worktree/u
+  );
+
+  const standalone = legacy(root);
+  fs.mkdirSync(path.join(standalone, ".git"));
+  fs.writeFileSync(path.join(standalone, ".git", "HEAD"), "ref: refs/heads/main\n");
+  const standaloneIdentity = fs.lstatSync(standalone, { bigint: true });
+  assert.equal(
+    removeInventoriedTestTempRoot(standalone, standaloneIdentity),
+    true
+  );
+  assert.equal(fs.existsSync(standalone), false);
+});
+
+test("exact owned-root cleanup permits internal linked-worktree metadata", (t) => {
+  const root = sandbox(t);
+  const owned = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_PROCESS_PREFIX,
+    kind: "process",
+    pid: process.pid,
+    startToken: "owned-internal-worktree"
+  });
+  addInternalLinkedWorktree(owned);
+  assert.equal(removeOwnedTestTempRoot(owned), true);
+  assert.equal(fs.existsSync(owned), false);
+});
+
+test("exact owned-root cleanup unlinks descendant symlinks without following them", (t) => {
+  const root = sandbox(t);
+  const owned = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_PROCESS_PREFIX,
+    kind: "process",
+    pid: process.pid,
+    startToken: "owned-descendant-symlinks"
+  });
+  const carrier = path.join(owned, "provider");
+  const outside = fs.mkdtempSync(path.join(root, "owned-symlink-canary-"));
+  const canary = path.join(outside, "keep");
+  fs.mkdirSync(carrier);
+  fs.writeFileSync(path.join(carrier, "provider.mjs"), "export {};\n");
+  fs.symlinkSync("provider.mjs", path.join(carrier, "grok"));
+  fs.symlinkSync("missing-provider", path.join(carrier, "dangling"));
+  fs.writeFileSync(canary, "keep");
+  fs.symlinkSync(outside, path.join(owned, "outside-link"));
+
+  assert.equal(removeOwnedTestTempRoot(owned), true);
+  assert.equal(fs.existsSync(owned), false);
+  assert.equal(fs.readFileSync(canary, "utf8"), "keep");
+});
+
+test("managed cleanup canonicalizes Darwin system-temp aliases end to end", (t) => {
+  const root = sandbox(t);
+  const aliasRoot = darwinSystemAlias(root);
+  if (!aliasRoot) return;
+  const target = legacy(aliasRoot);
+  addInternalLinkedWorktree(target);
+  const canary = path.join(root, "darwin-alias-canary");
+  fs.writeFileSync(canary, "keep");
+  const proof = inspectContainedGitMetadata({
+    root: target,
+    expectedUid: process.getuid()
+  });
+  assert.equal(proof.available, true);
+  const identity = fs.lstatSync(target, { bigint: true });
+  assert.equal(removeInventoriedTestTempRoot(target, identity, {
+    gitContainment: {
+      digest: proof.digest,
+      expectedUid: process.getuid(),
+      originalRoot: target
+    }
+  }), true);
+  assert.equal(fs.existsSync(target), false);
+  assert.equal(fs.readFileSync(canary, "utf8"), "keep");
+});
+
+test("Darwin path aliases never authorize external or arbitrary-symlink roots", (t) => {
+  const root = sandbox(t);
+  const aliasRoot = darwinSystemAlias(root);
+  if (!aliasRoot) return;
+  const owned = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_PROCESS_PREFIX,
+    kind: "process",
+    pid: process.pid,
+    startToken: "owned-darwin-external-alias"
+  });
+  const outside = fs.mkdtempSync(path.join(root, "darwin-alias-outside-"));
+  const canary = path.join(outside, "keep");
+  fs.writeFileSync(canary, "keep");
+  const outsideAlias = darwinSystemAlias(outside);
+  assert.ok(outsideAlias);
+  fs.writeFileSync(path.join(owned, ".git"), `gitdir: ${outsideAlias}\n`);
+  assert.throws(
+    () => removeOwnedTestTempRoot(owned),
+    /unproven Git metadata/u
+  );
+  assert.equal(fs.existsSync(owned), true);
+  assert.equal(fs.readFileSync(canary, "utf8"), "keep");
+
+  const physicalParent = path.join(root, "physical-parent");
+  const symlinkParent = path.join(root, "symlink-parent");
+  const managed = path.join(physicalParent, "managed");
+  fs.mkdirSync(managed, { recursive: true });
+  fs.symlinkSync(physicalParent, symlinkParent);
+  const ambiguous = inspectContainedGitMetadata({
+    root: path.join(symlinkParent, "managed"),
+    expectedUid: process.getuid()
+  });
+  assert.equal(ambiguous.available, false);
+  assert.equal(fs.existsSync(managed), true);
+});
+
+test("exact owned-root cleanup permits ordinary application worktrees directories", (t) => {
+  const root = sandbox(t);
+  const owned = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_PROCESS_PREFIX,
+    kind: "process",
+    pid: process.pid,
+    startToken: "owned-ordinary-worktrees-directory"
+  });
+  const checkout = path.join(owned, "state", "worktrees", "checkout");
+  fs.mkdirSync(checkout, { recursive: true });
+  fs.writeFileSync(path.join(checkout, "config"), "application-config\n");
+  for (const name of ["toString", "constructor", "__proto__"]) {
+    fs.mkdirSync(path.join(owned, name));
+    fs.writeFileSync(path.join(owned, name, "payload"), "ordinary-entry\n");
+  }
+  assert.equal(removeOwnedTestTempRoot(owned), true);
+  assert.equal(fs.existsSync(owned), false);
+});
+
+test("exact owned-root cleanup preserves Git metadata that escapes its root", (t) => {
+  const root = sandbox(t);
+  const owned = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_PROCESS_PREFIX,
+    kind: "process",
+    pid: process.pid,
+    startToken: "owned-external-worktree"
+  });
+  const outside = fs.mkdtempSync(path.join(root, "outside-common-"));
+  const canary = path.join(outside, "keep");
+  fs.writeFileSync(canary, "keep");
+  fs.writeFileSync(path.join(owned, ".git"), `gitdir: ${outside}\n`);
+  assert.throws(
+    () => removeOwnedTestTempRoot(owned),
+    /unproven Git metadata/u
+  );
+  assert.equal(fs.existsSync(owned), true);
+  assert.equal(fs.readFileSync(canary, "utf8"), "keep");
+});
+
+test("exact owned-root cleanup rejects symlink-parent Git control traversal", (t) => {
+  const root = sandbox(t);
+  const owned = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_PROCESS_PREFIX,
+    kind: "process",
+    pid: process.pid,
+    startToken: "owned-symlink-parent-traversal"
+  });
+  const outside = fs.mkdtempSync(path.join(root, "outside-control-traversal-"));
+  const outsideHop = path.join(outside, "hop");
+  const outsideTarget = path.join(outside, "actual");
+  const canary = path.join(outsideTarget, "keep");
+  fs.mkdirSync(outsideHop);
+  fs.mkdirSync(outsideTarget);
+  fs.writeFileSync(canary, "keep");
+  fs.mkdirSync(path.join(owned, "actual"));
+  fs.symlinkSync(outsideHop, path.join(owned, "control-link"));
+  fs.writeFileSync(
+    path.join(owned, ".git"),
+    `gitdir: control-link${path.sep}..${path.sep}actual\n`
+  );
+  assert.throws(
+    () => removeOwnedTestTempRoot(owned),
+    /unproven Git metadata/u
+  );
+  assert.equal(fs.existsSync(owned), true);
+  assert.equal(fs.readFileSync(canary, "utf8"), "keep");
+});
+
+test("exact owned-root cleanup preserves an external core.worktree", (t) => {
+  const root = sandbox(t);
+  const owned = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_PROCESS_PREFIX,
+    kind: "process",
+    pid: process.pid,
+    startToken: "owned-external-core-worktree"
+  });
+  const outside = fs.mkdtempSync(path.join(root, "outside-worktree-"));
+  const canary = path.join(outside, "keep");
+  fs.writeFileSync(canary, "keep");
+  fs.mkdirSync(path.join(owned, ".git"));
+  fs.writeFileSync(
+    path.join(owned, ".git", "config"),
+    `[core]\n\tworktree = ${outside}\n`
+  );
+  assert.throws(
+    () => removeOwnedTestTempRoot(owned),
+    /unproven Git metadata/u
+  );
+  assert.equal(fs.existsSync(owned), true);
+  assert.equal(fs.readFileSync(canary, "utf8"), "keep");
+});
+
+test("owned cleanup rejects external worktrees in nested and standalone Git directories", (t) => {
+  const root = sandbox(t);
+  const outside = fs.mkdtempSync(path.join(root, "outside-nested-worktree-"));
+  const canary = path.join(outside, "keep");
+  fs.writeFileSync(canary, "keep");
+
+  for (const [token, gitDirectory] of [
+    ["owned-external-submodule-worktree", [".git", "modules", "submodule"]],
+    ["owned-external-standalone-worktree", ["standalone.git"]]
+  ]) {
+    const owned = createOwnedTestTempRoot({
+      base: root,
+      prefix: TEST_TEMP_PROCESS_PREFIX,
+      kind: "process",
+      pid: process.pid,
+      startToken: token
+    });
+    const gitRoot = path.join(owned, ...gitDirectory);
+    fs.mkdirSync(path.join(gitRoot, "objects"), { recursive: true });
+    fs.mkdirSync(path.join(gitRoot, "refs"));
+    fs.writeFileSync(path.join(gitRoot, "HEAD"), "ref: refs/heads/main\n");
+    fs.writeFileSync(
+      path.join(gitRoot, "config"),
+      `[core]\n\tworktree = ${outside}\n`
+    );
+    assert.throws(
+      () => removeOwnedTestTempRoot(owned),
+      /unproven Git metadata/u
+    );
+    assert.equal(fs.existsSync(owned), true);
+  }
+  assert.equal(fs.readFileSync(canary, "utf8"), "keep");
+});
+
+test("owned cleanup rejects Git-expanded core.worktree path syntax", (t) => {
+  const root = sandbox(t);
+  const owned = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_PROCESS_PREFIX,
+    kind: "process",
+    pid: process.pid,
+    startToken: "owned-expanded-core-worktree"
+  });
+  const gitDirectory = path.join(owned, ".git");
+  fs.mkdirSync(path.join(gitDirectory, "~", "outside"), { recursive: true });
+  fs.writeFileSync(
+    path.join(gitDirectory, "config"),
+    "[core]\n\tworktree = ~/outside\n"
+  );
+  assert.throws(
+    () => removeOwnedTestTempRoot(owned),
+    /unproven Git metadata/u
+  );
+  assert.equal(fs.existsSync(owned), true);
 });
 
 test("apply does not count a candidate that disappears during removal", (t) => {
@@ -795,7 +2210,7 @@ test("apply does not count a candidate that disappears during removal", (t) => {
   assert.equal(result.reclaimedBytes, 0);
 });
 
-test("restricted descendant cleanup is inode-pinned on Linux and otherwise reports safely", (t) => {
+test("unreadable descendants fail closed before recursive removal", (t) => {
   const root = sandbox(t);
   const target = legacy(root);
   const restricted = path.join(target, "restricted");
@@ -807,15 +2222,62 @@ test("restricted descendant cleanup is inode-pinned on Linux and otherwise repor
   fs.chmodSync(restricted, 0o000);
   age(target);
   const result = cleanupTestTemp(options(root, { apply: true }));
-  if (process.platform === "linux") {
-    assert.equal(record(result, target).removed, true);
-    assert.equal(fs.existsSync(target), false);
-  } else {
-    assert.ok(record(result, target).reasons.includes("remove-failed"));
-    assert.equal(fs.existsSync(target), true);
-    fs.chmodSync(restricted, 0o700);
-  }
+  assert.ok(record(result, target).reasons.includes("git-metadata-ambiguous"));
+  assert.equal(record(result, target).removed, undefined);
+  assert.equal(fs.existsSync(target), true);
+  fs.chmodSync(restricted, 0o700);
   assert.equal(fs.readFileSync(path.join(outside, "keep"), "utf8"), "keep");
+});
+
+test("candidate and descendant device changes fail closed before removal", (t) => {
+  const root = sandbox(t);
+  const mountedCandidate = legacy(root);
+  const nestedCandidate = legacy(root);
+  const mountedDescendant = path.join(nestedCandidate, "mounted-descendant");
+  fs.writeFileSync(path.join(mountedCandidate, "keep"), "candidate");
+  fs.mkdirSync(mountedDescendant);
+  fs.writeFileSync(path.join(mountedDescendant, "keep"), "descendant");
+  age(mountedCandidate);
+  age(nestedCandidate);
+
+  const originalLstat = fs.lstatSync;
+  const crossDevicePaths = new Set([
+    path.resolve(mountedCandidate),
+    path.resolve(mountedDescendant)
+  ]);
+  fs.lstatSync = (target, ...args) => {
+    const stat = originalLstat.call(fs, target, ...args);
+    if (
+      typeof target !== "string"
+      || !crossDevicePaths.has(path.resolve(target))
+    ) {
+      return stat;
+    }
+    const changed = Object.assign(
+      Object.create(Object.getPrototypeOf(stat)),
+      stat
+    );
+    changed.dev = typeof stat.dev === "bigint" ? stat.dev + 1n : stat.dev + 1;
+    return changed;
+  };
+  let result;
+  try {
+    result = cleanupTestTemp(options(root, { apply: true }));
+  } finally {
+    fs.lstatSync = originalLstat;
+  }
+
+  assert.ok(
+    record(result, mountedCandidate).reasons.includes("cross-device-candidate")
+  );
+  assert.ok(
+    record(result, nestedCandidate).reasons.includes("cross-device-descendant")
+  );
+  assert.equal(fs.readFileSync(path.join(mountedCandidate, "keep"), "utf8"), "candidate");
+  assert.equal(
+    fs.readFileSync(path.join(mountedDescendant, "keep"), "utf8"),
+    "descendant"
+  );
 });
 
 test("recursive permission repair cannot chmod through a raced symlink", (t) => {
@@ -864,7 +2326,7 @@ test("recursive permission repair cannot chmod through a raced symlink", (t) => 
     "}",
     ""
   ].join("\n"));
-  const identity = fs.lstatSync(target);
+  const identity = fs.lstatSync(target, { bigint: true });
   const result = spawnSync(process.execPath, [
     REMOVE_HELPER,
     String(identity.dev),
@@ -916,7 +2378,7 @@ test("recursive permission repair cannot chmod a raced real-directory replacemen
     "};",
     ""
   ].join("\n"));
-  const identity = fs.lstatSync(target);
+  const identity = fs.lstatSync(target, { bigint: true });
   const result = spawnSync(process.execPath, [
     REMOVE_HELPER,
     String(identity.dev),
@@ -936,6 +2398,26 @@ test("recursive permission repair cannot chmod a raced real-directory replacemen
   fs.chmodSync(moved, 0o700);
 });
 
+test("recursive removal restores readable ancestor modes after a deeper guard failure", (t) => {
+  if (process.platform === "win32") return;
+  const root = sandbox(t);
+  const target = legacy(root);
+  const readonly = path.join(target, "readonly");
+  fs.mkdirSync(readonly);
+  fs.writeFileSync(
+    path.join(readonly, ".git"),
+    "gitdir: /outside/worktrees/late\n"
+  );
+  fs.chmodSync(readonly, 0o500);
+  const identity = fs.lstatSync(target, { bigint: true });
+  assert.throws(
+    () => removeInventoriedTestTempRoot(target, identity),
+    (error) => error?.code === "E_TEST_TEMP_IDENTITY_CHANGED"
+  );
+  assert.equal(fs.statSync(readonly).mode & 0o777, 0o500);
+  fs.chmodSync(readonly, 0o700);
+});
+
 test("stale manifest-backed crash roots are reaped while an active owner sibling is preserved", (t) => {
   const root = sandbox(t);
   const token = processStartToken(process.pid) || "active-fixture-start-token";
@@ -953,6 +2435,7 @@ test("stale manifest-backed crash roots are reaped while an active owner sibling
     pid: process.pid,
     startToken: token
   });
+  addInternalLinkedWorktree(stale);
   age(stale);
   age(active);
   const result = cleanupTestTemp(options(root, {
@@ -964,6 +2447,38 @@ test("stale manifest-backed crash roots are reaped while an active owner sibling
   assert.ok(record(result, active).reasons.includes("active-owner"));
   assert.equal(fs.existsSync(stale), false);
   assert.equal(fs.existsSync(active), true);
+});
+
+test("Linux stale managed cleanup safely repairs a permission-locked descendant", (t) => {
+  if (process.platform !== "linux") return;
+  const root = sandbox(t);
+  const token = processStartToken(process.pid) || "active-fixture-start-token";
+  const stale = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_RUN_PREFIX,
+    kind: "run",
+    pid: process.pid,
+    startToken: `${token}-stale-permission`
+  });
+  const restricted = path.join(stale, "restricted");
+  fs.mkdirSync(restricted);
+  fs.writeFileSync(path.join(restricted, "payload"), "payload");
+  fs.chmodSync(restricted, 0o000);
+  t.after(() => {
+    try {
+      if (fs.existsSync(restricted)) fs.chmodSync(restricted, 0o700);
+    } catch {
+      // The assertion below reports a failed or partially restored cleanup.
+    }
+  });
+  age(stale);
+  const result = cleanupTestTemp(options(root, {
+    apply: true,
+    legacy: false,
+    tokenForPid: () => token
+  }));
+  assert.equal(record(result, stale).removed, true);
+  assert.equal(fs.existsSync(stale), false);
 });
 
 test("managed cleanup binds each direct prefix to its exact manifest kind", (t) => {

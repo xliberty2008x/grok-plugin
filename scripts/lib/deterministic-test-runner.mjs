@@ -35,12 +35,20 @@ const TEST_PRE_COMMAND_DIAGNOSTIC =
 const MAX_TEST_PRE_COMMAND_DELAY_MS = 60_000;
 const CONTAINMENT_REASON_PATTERN =
   /(?:^|\n)grok-plugin-containment-v1:(unsupported-platform|startup-visibility|visibility-monitor-token|visibility-monitor-proc|visibility-monitor-unknown|post-close-inspection|termination-incomplete-group|termination-incomplete-owned|termination-incomplete-unknown)(?:\n|$)/u;
+const TEMP_CLEANUP_REASON_PATTERN =
+  /^(?:external-worktree-link|git-metadata-ambiguous|git-metadata-scan-truncated|helper-(?:(?:arguments|root-identity|mount-boundary|managed-proof|directory-inventory|entry-validation|recursive-removal|file-removal|directory-open|child-removal|root-removal)-(?:1|42|43|44)|launch-error|signal|result-unavailable|exit-(?:1|42|43|44)))$/u;
 const NONPASS_FIELDS = Object.freeze([
   "failed",
   "cancelled",
   "skipped",
   "todo"
 ]);
+
+function cleanupReasonSuffix(error) {
+  return TEMP_CLEANUP_REASON_PATTERN.test(String(error?.cleanupReason || ""))
+    ? ` (${error.cleanupReason})`
+    : "";
+}
 
 function parseZeroSkipSummary(output, root, knownSecrets) {
   if (typeof output !== "string") return null;
@@ -377,8 +385,10 @@ export async function runDeterministicTestFilesCli({
             if (!removeOwnedTestTempRoot(fileRoot)) {
               throw new Error("The owned file root identity was unavailable.");
             }
-          } catch {
-            stderr.write(`Deterministic test child ${childOrdinal} temp cleanup failed.\n`);
+          } catch (error) {
+            stderr.write(
+              `Deterministic test child ${childOrdinal} temp cleanup failed${cleanupReasonSuffix(error)}.\n`
+            );
             preserveRunRoot = true;
             failed = true;
           }
@@ -449,8 +459,10 @@ export async function runDeterministicTestFilesCli({
         if (!removeOwnedTestTempRoot(runRoot)) {
           throw new Error("The owned run root identity was unavailable.");
         }
-      } catch {
-        stderr.write("The deterministic test run temp cleanup failed.\n");
+      } catch (error) {
+        stderr.write(
+          `The deterministic test run temp cleanup failed${cleanupReasonSuffix(error)}.\n`
+        );
         failed = true;
       }
     }
@@ -615,8 +627,10 @@ export function runDeterministicTestFiles({
             if (!removeOwnedTestTempRoot(fileRoot)) {
               throw new Error("The owned file root identity was unavailable.");
             }
-          } catch {
-            stderr.write(`Deterministic test child ${child} temp cleanup failed.\n`);
+          } catch (error) {
+            stderr.write(
+              `Deterministic test child ${child} temp cleanup failed${cleanupReasonSuffix(error)}.\n`
+            );
             preserveRunRoot = true;
             failed = true;
           }
@@ -695,8 +709,10 @@ export function runDeterministicTestFiles({
         if (!removeOwnedTestTempRoot(runRoot)) {
           throw new Error("The owned run root identity was unavailable.");
         }
-      } catch {
-        stderr.write("The deterministic test run temp cleanup failed.\n");
+      } catch (error) {
+        stderr.write(
+          `The deterministic test run temp cleanup failed${cleanupReasonSuffix(error)}.\n`
+        );
         failed = true;
       }
     }
