@@ -394,6 +394,7 @@ function inspectContainedGitMetadata({
         throw new Error("Contained Git endpoint is invalid.");
       }
       let target;
+      let physicalTarget;
       if (path.isAbsolute(rawValue)) {
         if (path.normalize(rawValue) !== rawValue) {
           throw new Error("Contained Git absolute endpoint is non-normal.");
@@ -408,8 +409,10 @@ function inspectContainedGitMetadata({
             "Git endpoint escapes the managed root."
           );
         }
+        physicalTarget = target;
       } else {
         target = path.resolve(base, rawValue);
+        physicalTarget = `${base}${base.endsWith(path.sep) ? "" : path.sep}${rawValue}`;
       }
       if (!isWithin(currentRoot, target)) {
         throw containmentError(
@@ -417,7 +420,7 @@ function inspectContainedGitMetadata({
           "Git endpoint escapes the managed root."
         );
       }
-      const canonical = fs.realpathSync(target);
+      const canonical = fs.realpathSync.native(physicalTarget);
       if (canonical !== target) {
         throw new Error("Contained Git endpoint is physically ambiguous.");
       }

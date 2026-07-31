@@ -622,7 +622,7 @@ function resolveControlPath(base, value) {
   const rawTarget = path.isAbsolute(value)
     ? value
     : `${base}${base.endsWith(path.sep) ? "" : path.sep}${value}`;
-  if (fs.realpathSync(rawTarget) !== lexicalTarget) {
+  if (fs.realpathSync.native(rawTarget) !== lexicalTarget) {
     throw new Error("Git control-directory path is physically ambiguous.");
   }
   return lexicalTarget;
@@ -962,8 +962,13 @@ function captureWorktreeMetadataProofPass(repoRoot, {
   let registrationsRootProof = null;
   let registrationsRootGeneration = null;
   const registrations = [];
+  let registrationsBefore = null;
   try {
-    const registrationsBefore = stableDirectory(registrationsRoot, expectedUid);
+    registrationsBefore = stableDirectory(registrationsRoot, expectedUid);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  if (registrationsBefore) {
     const names = boundedDirectoryNames(
       registrationsRoot,
       WORKTREE_REGISTRATION_MAX_ENTRIES
@@ -985,8 +990,6 @@ function captureWorktreeMetadataProofPass(repoRoot, {
     }
     registrationsRootProof = semanticDirectoryIdentity(registrationsAfter);
     registrationsRootGeneration = bigintIdentity(registrationsAfter);
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
   }
 
   const activeAfter = stableDirectory(activeGitDir, expectedUid);

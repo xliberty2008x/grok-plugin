@@ -126,10 +126,11 @@ const WORKER_BROKER_EVIDENCE_PARTITION_RANGES = Object.freeze({
   2: Object.freeze([90, 93]),
   3: Object.freeze([102, 115]),
   4: Object.freeze([115, 126]),
-  5: Object.freeze([45, 90]),
+  5: Object.freeze([45, 67]),
   6: Object.freeze([93, 96]),
   7: Object.freeze([96, 99]),
-  8: Object.freeze([99, 102])
+  8: Object.freeze([99, 102]),
+  9: Object.freeze([67, 90])
 });
 const WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT = 125;
 const workerBrokerEvidencePartitionCoverage = new Uint8Array(
@@ -304,6 +305,7 @@ test("deterministic zero-skip runner excludes only explicit external boundaries"
   expected.push("tests/worker-broker-evidence_part6.mjs");
   expected.push("tests/worker-broker-evidence_part7.mjs");
   expected.push("tests/worker-broker-evidence_part8.mjs");
+  expected.push("tests/worker-broker-evidence_part9.mjs");
   expected.push("tests/worker-mutation_part1.mjs");
   expected.push("tests/worker-mutation_part2.mjs");
   expected.sort();
@@ -453,6 +455,7 @@ test("deterministic runner executes static partition wrappers as exact ordinary 
     "tests/worker-broker-evidence_part6.mjs",
     "tests/worker-broker-evidence_part7.mjs",
     "tests/worker-broker-evidence_part8.mjs",
+    "tests/worker-broker-evidence_part9.mjs",
     "tests/worker-mutation_part1.mjs",
     "tests/worker-mutation_part2.mjs"
   ];

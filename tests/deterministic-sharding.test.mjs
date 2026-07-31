@@ -34,6 +34,7 @@ const PROCESS_HEAVY_TEST_FILES = Object.freeze([
   "tests/worker-broker-evidence_part6.mjs",
   "tests/worker-broker-evidence_part7.mjs",
   "tests/worker-broker-evidence_part8.mjs",
+  "tests/worker-broker-evidence_part9.mjs",
   "tests/worker-mutation_part1.mjs",
   "tests/worker-mutation_part2.mjs"
 ]);
@@ -74,6 +75,7 @@ test("deterministic partition harnesses replace only their ordinary aggregate fi
     "tests/worker-broker-evidence_part6.mjs",
     "tests/worker-broker-evidence_part7.mjs",
     "tests/worker-broker-evidence_part8.mjs",
+    "tests/worker-broker-evidence_part9.mjs",
     "tests/worker-mutation_part1.mjs",
     "tests/worker-mutation_part2.mjs"
   ]);
@@ -96,7 +98,7 @@ test("process-heavy cleanup and evidence files are distributed across all shards
   const heavyCounts = DETERMINISTIC_TEST_SHARDS.map((files) =>
     files.filter((file) => PROCESS_HEAVY_TEST_FILES.includes(file)).length
   );
-  assert.deepEqual(heavyCounts, [4, 5, 4, 2]);
+  assert.deepEqual(heavyCounts, [4, 5, 4, 3]);
 });
 
 test("deterministic shard CLI accepts only one exact four-way shard specification", () => {

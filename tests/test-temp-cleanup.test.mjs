@@ -182,6 +182,10 @@ function addInternalLinkedWorktree(root) {
     `${path.join(linked, ".git")}\n`
   );
   fs.writeFileSync(path.join(registration, "commondir"), "../..\n");
+  fs.writeFileSync(
+    path.join(registration, "config.worktree"),
+    "[core]\n\tsparseCheckout = false\n"
+  );
   fs.writeFileSync(path.join(registration, "HEAD"), "1".repeat(40) + "\n");
   const submodule = path.join(primary, "submodule");
   const submoduleGit = path.join(common, "modules", "submodule");
@@ -1923,6 +1927,36 @@ test("exact owned-root cleanup preserves Git metadata that escapes its root", (t
   const canary = path.join(outside, "keep");
   fs.writeFileSync(canary, "keep");
   fs.writeFileSync(path.join(owned, ".git"), `gitdir: ${outside}\n`);
+  assert.throws(
+    () => removeOwnedTestTempRoot(owned),
+    /unproven Git metadata/u
+  );
+  assert.equal(fs.existsSync(owned), true);
+  assert.equal(fs.readFileSync(canary, "utf8"), "keep");
+});
+
+test("exact owned-root cleanup rejects symlink-parent Git control traversal", (t) => {
+  const root = sandbox(t);
+  const owned = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_PROCESS_PREFIX,
+    kind: "process",
+    pid: process.pid,
+    startToken: "owned-symlink-parent-traversal"
+  });
+  const outside = fs.mkdtempSync(path.join(root, "outside-control-traversal-"));
+  const outsideHop = path.join(outside, "hop");
+  const outsideTarget = path.join(outside, "actual");
+  const canary = path.join(outsideTarget, "keep");
+  fs.mkdirSync(outsideHop);
+  fs.mkdirSync(outsideTarget);
+  fs.writeFileSync(canary, "keep");
+  fs.mkdirSync(path.join(owned, "actual"));
+  fs.symlinkSync(outsideHop, path.join(owned, "control-link"));
+  fs.writeFileSync(
+    path.join(owned, ".git"),
+    `gitdir: control-link${path.sep}..${path.sep}actual\n`
+  );
   assert.throws(
     () => removeOwnedTestTempRoot(owned),
     /unproven Git metadata/u

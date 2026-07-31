@@ -726,6 +726,27 @@ if (cleanupMode === "managed-contained") {
       childManagedProof(right).restricted
     ).length > 0;
     if (leftRestricted !== rightRestricted) return leftRestricted ? -1 : 1;
+    const registrationRemovalRank = (entry) => {
+      if (gitContext !== "registration") return 1;
+      if (
+        ["config", "config.worktree"].some(
+          (control) => asciiCaseEqual(entry, control)
+        )
+      ) {
+        return 0;
+      }
+      if (
+        ["gitdir", "commondir"].some(
+          (control) => asciiCaseEqual(entry, control)
+        )
+      ) {
+        return 2;
+      }
+      return 1;
+    };
+    const leftRank = registrationRemovalRank(left);
+    const rightRank = registrationRemovalRank(right);
+    if (leftRank !== rightRank) return leftRank - rightRank;
     return left < right ? -1 : (left > right ? 1 : 0);
   });
 }
