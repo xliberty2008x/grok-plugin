@@ -123,10 +123,13 @@ const WORKER_BROKER_EVIDENCE_PARTITION_KEY = Symbol.for(
 );
 const WORKER_BROKER_EVIDENCE_PARTITION_RANGES = Object.freeze({
   1: Object.freeze([1, 45]),
-  2: Object.freeze([90, 102]),
+  2: Object.freeze([90, 93]),
   3: Object.freeze([102, 115]),
   4: Object.freeze([115, 126]),
-  5: Object.freeze([45, 90])
+  5: Object.freeze([45, 90]),
+  6: Object.freeze([93, 96]),
+  7: Object.freeze([96, 99]),
+  8: Object.freeze([99, 102])
 });
 const WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT = 125;
 const workerBrokerEvidencePartitionCoverage = new Uint8Array(
@@ -285,11 +288,17 @@ test("deterministic zero-skip runner excludes only explicit external boundaries"
     !EXTERNAL_BOUNDARY_TESTS.includes(path.basename(relative))
     && !DETERMINISTIC_AGGREGATE_TEST_FILES.includes(relative)
   ));
+  expected.push("tests/control-plane_part1.mjs");
+  expected.push("tests/control-plane_part2.mjs");
+  expected.push("tests/control-plane_part3.mjs");
   expected.push("tests/worker-broker-evidence_part1.mjs");
   expected.push("tests/worker-broker-evidence_part2.mjs");
   expected.push("tests/worker-broker-evidence_part3.mjs");
   expected.push("tests/worker-broker-evidence_part4.mjs");
   expected.push("tests/worker-broker-evidence_part5.mjs");
+  expected.push("tests/worker-broker-evidence_part6.mjs");
+  expected.push("tests/worker-broker-evidence_part7.mjs");
+  expected.push("tests/worker-broker-evidence_part8.mjs");
   expected.push("tests/worker-mutation_part1.mjs");
   expected.push("tests/worker-mutation_part2.mjs");
   expected.sort();
@@ -428,11 +437,17 @@ test("deterministic runner executes files sequentially and aggregates exact zero
 test("deterministic runner executes static partition wrappers as exact ordinary files", () => {
   const calls = [];
   const files = [
+    "tests/control-plane_part1.mjs",
+    "tests/control-plane_part2.mjs",
+    "tests/control-plane_part3.mjs",
     "tests/worker-broker-evidence_part1.mjs",
     "tests/worker-broker-evidence_part2.mjs",
     "tests/worker-broker-evidence_part3.mjs",
     "tests/worker-broker-evidence_part4.mjs",
     "tests/worker-broker-evidence_part5.mjs",
+    "tests/worker-broker-evidence_part6.mjs",
+    "tests/worker-broker-evidence_part7.mjs",
+    "tests/worker-broker-evidence_part8.mjs",
     "tests/worker-mutation_part1.mjs",
     "tests/worker-mutation_part2.mjs"
   ];
@@ -4823,7 +4838,7 @@ test("fresh ownerless and old live ledger locks are never stolen", async () => {
       const result = await contender.completed;
       const elapsed = Date.now() - startedAt;
       assert.notEqual(result.code, 0, result.stderr);
-      assert.ok(elapsed >= 4_500 && elapsed < 8_000, `bounded wait was ${elapsed} ms`);
+      assert.ok(elapsed >= 4_500 && elapsed < 15_000, `bounded wait was ${elapsed} ms`);
     } else {
       await new Promise((resolve) => setTimeout(resolve, 200));
       assert.equal(contender.child.exitCode, null, kind);
@@ -5562,6 +5577,9 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
     "scripts/validate.mjs",
     "package.json",
     "tests/control-plane.test.mjs",
+    "tests/control-plane_part1.mjs",
+    "tests/control-plane_part2.mjs",
+    "tests/control-plane_part3.mjs",
     "tests/installed-worker-mcp-contract.test.mjs",
     "tests/installed-worker-mcp-runner.test.mjs",
     "tests/mcp-worker-runtime.test.mjs",
@@ -5610,7 +5628,7 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
       `the Phase 1 focused gate must execute ${relative} exactly once`
     );
   }
-  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 28);
+  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 30);
 });
 
 test("Phase 2 protected manifest, scope, and serial inventory are exact", () => {

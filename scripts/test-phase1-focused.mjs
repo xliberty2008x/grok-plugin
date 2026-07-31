@@ -11,7 +11,9 @@ import {
 
 /** Fixed Phase 1 proof inventory; callers cannot add, remove, or reorder tests. */
 export const PHASE1_FOCUSED_TEST_FILES = Object.freeze([
-  "tests/control-plane.test.mjs",
+  "tests/control-plane_part1.mjs",
+  "tests/control-plane_part2.mjs",
+  "tests/control-plane_part3.mjs",
   "tests/process-control.test.mjs",
   "tests/provider.test.mjs",
   "tests/recursion-guard.test.mjs",

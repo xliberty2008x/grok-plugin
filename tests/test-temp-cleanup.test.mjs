@@ -26,6 +26,7 @@ import {
 import {
   LEGACY_REPOSITORY_PREFIX,
   LEGACY_TEST_TEMP_PREFIXES,
+  captureRegisteredWorktrees,
   cleanupTestTemp,
   removeInventoriedTestTempRoot
 } from "../scripts/lib/test-temp-cleanup.mjs";
@@ -503,6 +504,27 @@ test("cleanup aborts before inventory when worktree visibility is unavailable", 
   assert.equal(result.aborted, true);
   assert.equal(result.reason, "worktree-visibility-unavailable");
   assert.equal(fs.existsSync(target), true);
+});
+
+test("worktree visibility uses a bounded scan window", () => {
+  const calls = [];
+  const result = captureRegisteredWorktrees(ROOT, {
+    run(binary, args, options) {
+      calls.push({ binary, args, options });
+      return {
+        status: 0,
+        stdout: "worktree /private/tmp/grok-plugin-visible\n"
+      };
+    }
+  });
+  assert.deepEqual(result, {
+    available: true,
+    paths: ["/private/tmp/grok-plugin-visible"]
+  });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args, ["worktree", "list", "--porcelain"]);
+  assert.equal(calls[0].options.cwd, ROOT);
+  assert.equal(calls[0].options.timeout, 120_000);
 });
 
 test("apply refreshes process visibility and aborts remaining deletions on refresh failure", (t) => {

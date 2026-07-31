@@ -17,6 +17,7 @@ import {
 export const DEFAULT_TEST_TEMP_MAX_AGE_MS = 60 * 60_000;
 export const TEST_TEMP_SIZE_SCAN_ENTRY_BUDGET = 10_000;
 export const TEST_TEMP_SNAPSHOT_REFRESH_MS = 10_000;
+const TEST_TEMP_WORKTREE_SCAN_TIMEOUT_MS = 120_000;
 export const LEGACY_REPOSITORY_PREFIX = "grok-plugin-repo-";
 // Every entry is an exact literal prefix used by tests in this repository.
 // Legacy cleanup is opt-in and accepts only prefix + mkdtemp's six-character suffix.
@@ -341,7 +342,7 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
 
 const LSOF_CANDIDATES = Object.freeze(["/usr/sbin/lsof", "/usr/bin/lsof"]);
 const PS_CANDIDATES = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
-const GIT_CANDIDATES = Object.freeze(["/usr/bin/git", "/opt/homebrew/bin/git"]);
+const GIT_CANDIDATES = Object.freeze(["/opt/homebrew/bin/git", "/usr/bin/git"]);
 const SIX_CHARACTER_SUFFIX = /^[A-Za-z0-9]{6}$/u;
 const MANAGED_PREFIX_KINDS = new Map([
   [TEST_TEMP_RUN_PREFIX, "run"],
@@ -678,7 +679,7 @@ export function captureRegisteredWorktrees(repoRoot, { run = spawnSync } = {}) {
       cwd: repoRoot,
       encoding: "utf8",
       shell: false,
-      timeout: 10_000,
+      timeout: TEST_TEMP_WORKTREE_SCAN_TIMEOUT_MS,
       maxBuffer: 4 * 1024 * 1024
     });
     if (result?.status !== 0 || result?.error || result?.signal) continue;

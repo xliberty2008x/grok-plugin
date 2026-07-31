@@ -1,27 +1,34 @@
 export const DETERMINISTIC_TEST_SHARD_COUNT = 3;
 export const DETERMINISTIC_AGGREGATE_TEST_FILES = Object.freeze([
+  "tests/control-plane.test.mjs",
   "tests/worker-broker-evidence.test.mjs",
   "tests/worker-mutation.test.mjs"
 ]);
 export const DETERMINISTIC_SUPPORT_TEST_FILES = Object.freeze([
+  "tests/control-plane_part1.mjs",
+  "tests/control-plane_part2.mjs",
+  "tests/control-plane_part3.mjs",
   "tests/worker-broker-evidence_part1.mjs",
   "tests/worker-broker-evidence_part2.mjs",
   "tests/worker-broker-evidence_part3.mjs",
   "tests/worker-broker-evidence_part4.mjs",
   "tests/worker-broker-evidence_part5.mjs",
+  "tests/worker-broker-evidence_part6.mjs",
+  "tests/worker-broker-evidence_part7.mjs",
+  "tests/worker-broker-evidence_part8.mjs",
   "tests/worker-mutation_part1.mjs",
   "tests/worker-mutation_part2.mjs"
 ]);
 
-// Duration-balanced from the macOS and Linux lanes in Actions run 30516745831.
-// The process-heavy cleanup test and partition wrappers are spread so every
-// shard has two or three, rather than serializing them in one job.
+// Duration-balanced from the macOS and Linux lanes in Actions runs
+// 30516745831 and 30567663739. The process-heavy cleanup tests and partition
+// wrappers are spread instead of serializing the oversized aggregates.
 // Keep this manifest explicit: validation must fail when the deterministic
 // inventory changes until the new file is deliberately assigned.
 export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
   Object.freeze([
     "tests/ci-post-grok-review.test.mjs",
-    "tests/control-plane.test.mjs",
+    "tests/control-plane_part1.mjs",
     "tests/deterministic-sharding.test.mjs",
     "tests/git-review.test.mjs",
     "tests/grok-review-app-target-collector.test.mjs",
@@ -31,7 +38,8 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/provider-capability.test.mjs",
     "tests/version-policy.test.mjs",
     "tests/worker-broker-evidence_part2.mjs",
-    "tests/worker-broker-evidence_part5.mjs",
+    "tests/worker-broker-evidence_part3.mjs",
+    "tests/worker-broker-evidence_part6.mjs",
     "tests/worker-broker-phase3-evidence.test.mjs",
     "tests/worker-execution-binding.test.mjs",
     "tests/worker-host-actions.test.mjs",
@@ -47,6 +55,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
   ]),
   Object.freeze([
     "tests/acp-client.test.mjs",
+    "tests/control-plane_part2.mjs",
     "tests/grok-review-app-runner.test.mjs",
     "tests/grok-review-app-worker.test.mjs",
     "tests/hooks.test.mjs",
@@ -60,7 +69,8 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/state.test.mjs",
     "tests/stdin.test.mjs",
     "tests/worker-broker-evidence_part1.mjs",
-    "tests/worker-broker-evidence_part3.mjs",
+    "tests/worker-broker-evidence_part5.mjs",
+    "tests/worker-broker-evidence_part7.mjs",
     "tests/worker-context-roles.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
     "tests/worker-mutation_part1.mjs",
@@ -72,6 +82,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/args-redaction-profiles.test.mjs",
     "tests/ci-auth-sync.test.mjs",
     "tests/codex-support.test.mjs",
+    "tests/control-plane_part3.mjs",
     "tests/deep-research.test.mjs",
     "tests/executable-identity.test.mjs",
     "tests/grok-review-app-github.test.mjs",
@@ -87,6 +98,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/test-temp-cleanup.test.mjs",
     "tests/windows-neutral.test.mjs",
     "tests/worker-broker-evidence_part4.mjs",
+    "tests/worker-broker-evidence_part8.mjs",
     "tests/worker-cli-authority.test.mjs",
     "tests/worker-mailbox.test.mjs",
     "tests/worker-mutation_part2.mjs",
