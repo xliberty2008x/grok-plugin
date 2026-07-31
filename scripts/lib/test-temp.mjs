@@ -7,7 +7,10 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import gitContainment from "./test-temp-git-containment.cjs";
 
-const { inspectContainedGitMetadata } = gitContainment;
+const {
+  canonicalContainedPath,
+  inspectContainedGitMetadata
+} = gitContainment;
 
 export const TEST_TEMP_MANIFEST = ".grok-test-temp-owner.json";
 export const TEST_TEMP_SCHEMA_VERSION = 1;
@@ -248,6 +251,7 @@ export function removeOwnedTestTempRoot(root) {
   const expected = createdRootIdentities.get(root);
   if (!expected) return false;
   verifyCreatedRoot(root, expected);
+  const canonicalOriginalRoot = canonicalContainedPath(root);
   const quarantine = path.join(
     path.dirname(root),
     `.grok-plugin-owned-quarantine-${crypto.randomUUID()}`
@@ -259,9 +263,10 @@ export function removeOwnedTestTempRoot(root) {
   }
   try {
     verifyCreatedRoot(quarantine, expected);
+    const canonicalQuarantine = canonicalContainedPath(quarantine);
     const gitProof = inspectContainedGitMetadata({
-      root: quarantine,
-      originalRoot: root,
+      root: canonicalQuarantine,
+      originalRoot: canonicalOriginalRoot,
       expectedUid: expected.root.uid,
       expectedDev: expected.root.dev
     });
@@ -278,12 +283,12 @@ export function removeOwnedTestTempRoot(root) {
       expected.root.dev,
       "managed-contained",
       "none",
-      root,
-      quarantine,
+      canonicalOriginalRoot,
+      canonicalQuarantine,
       expected.root.uid,
       gitProof.digest
     ], {
-      cwd: quarantine,
+      cwd: canonicalQuarantine,
       env: { GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1" },
       encoding: "utf8",
       shell: false,

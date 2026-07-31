@@ -36,6 +36,26 @@ function isWithin(root, target) {
   );
 }
 
+function normalizeDarwinSystemPath(value) {
+  const resolved = path.resolve(value);
+  if (process.platform !== "darwin") return resolved;
+  for (const prefix of [`${path.sep}var`, `${path.sep}tmp`]) {
+    if (resolved === prefix || resolved.startsWith(`${prefix}${path.sep}`)) {
+      return `${path.sep}private${resolved}`;
+    }
+  }
+  return resolved;
+}
+
+function canonicalContainedPath(value) {
+  const normalized = normalizeDarwinSystemPath(value);
+  const canonical = fs.realpathSync.native(normalized);
+  if (canonical !== normalized) {
+    throw new Error("Contained path has an unsupported physical alias.");
+  }
+  return canonical;
+}
+
 function exactUnsigned(value) {
   if (typeof value === "bigint" && value >= 0n) return value;
   if (
@@ -324,15 +344,13 @@ function inspectContainedGitMetadata({
   expectedDev
 }) {
   try {
-    const currentRoot = path.resolve(root);
-    const priorRoot = path.resolve(originalRoot);
-    const currentScanRoot = path.resolve(scanRoot);
+    const currentRoot = canonicalContainedPath(root);
+    const priorRoot = normalizeDarwinSystemPath(originalRoot);
+    const currentScanRoot = canonicalContainedPath(scanRoot);
     if (
       !path.isAbsolute(root)
       || !path.isAbsolute(originalRoot)
       || !path.isAbsolute(scanRoot)
-      || fs.realpathSync(currentRoot) !== currentRoot
-      || fs.realpathSync(currentScanRoot) !== currentScanRoot
       || !isWithin(currentRoot, currentScanRoot)
     ) {
       throw new Error("Contained Git root is not canonical.");
@@ -399,10 +417,20 @@ function inspectContainedGitMetadata({
         if (path.normalize(rawValue) !== rawValue) {
           throw new Error("Contained Git absolute endpoint is non-normal.");
         }
-        if (isWithin(currentRoot, rawValue)) {
-          target = rawValue;
-        } else if (currentRoot !== priorRoot && isWithin(priorRoot, rawValue)) {
-          target = path.join(currentRoot, path.relative(priorRoot, rawValue));
+        const normalizedValue = normalizeDarwinSystemPath(rawValue);
+        if (isWithin(currentRoot, normalizedValue)) {
+          target = path.join(
+            currentRoot,
+            path.relative(currentRoot, normalizedValue)
+          );
+        } else if (
+          currentRoot !== priorRoot
+          && isWithin(priorRoot, normalizedValue)
+        ) {
+          target = path.join(
+            currentRoot,
+            path.relative(priorRoot, normalizedValue)
+          );
         } else {
           throw containmentError(
             "E_TEST_TEMP_EXTERNAL_WORKTREE",
@@ -751,8 +779,10 @@ function stablePathProof(target, expectedUid, expectedDev) {
 
 module.exports = {
   PROOF_SCHEMA,
+  canonicalContainedPath,
   gitConfigSemantics,
   inspectMountBoundary,
   inspectContainedGitMetadata,
+  normalizeDarwinSystemPath,
   stablePathProof
 };

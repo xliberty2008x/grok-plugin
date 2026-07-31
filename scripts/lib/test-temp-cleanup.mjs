@@ -15,7 +15,12 @@ import {
   validateTestTempManifest
 } from "./test-temp.mjs";
 
-const { gitConfigSemantics, inspectContainedGitMetadata } = gitContainment;
+const {
+  canonicalContainedPath,
+  gitConfigSemantics,
+  inspectContainedGitMetadata,
+  normalizeDarwinSystemPath
+} = gitContainment;
 
 export const DEFAULT_TEST_TEMP_MAX_AGE_MS = 60 * 60_000;
 export const TEST_TEMP_SIZE_SCAN_ENTRY_BUDGET = 10_000;
@@ -1490,6 +1495,14 @@ export function removeInventoriedTestTempRoot(
     error.code = "E_TEST_TEMP_IDENTITY_CHANGED";
     throw error;
   }
+  let canonicalOriginalRoot;
+  try {
+    canonicalOriginalRoot = canonicalContainedPath(root);
+  } catch {
+    const error = new Error("The cleanup candidate path is not canonical.");
+    error.code = "E_TEST_TEMP_IDENTITY_CHANGED";
+    throw error;
+  }
   const quarantine = path.join(
     path.dirname(root),
     `.grok-plugin-cleanup-quarantine-${randomUUID()}`
@@ -1502,7 +1515,13 @@ export function removeInventoriedTestTempRoot(
   }
 
   try {
-    if (afterQuarantine) afterQuarantine(quarantine);
+    const canonicalQuarantine = canonicalContainedPath(quarantine);
+    if (afterQuarantine) {
+      afterQuarantine(quarantine, {
+        canonicalOriginalRoot,
+        canonicalQuarantine
+      });
+    }
     const managedContainment = gitContainment
       && gitContainment.originalRoot === root
       && Number.isSafeInteger(gitContainment.expectedUid)
@@ -1518,14 +1537,14 @@ export function removeInventoriedTestTempRoot(
     ];
     if (managedContainment) {
       helperArguments.push(
-        root,
-        quarantine,
+        canonicalOriginalRoot,
+        canonicalQuarantine,
         String(gitContainment.expectedUid),
         gitContainment.digest
       );
     }
     const result = run(process.execPath, helperArguments, {
-      cwd: quarantine,
+      cwd: canonicalQuarantine,
       env: { GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1" },
       encoding: "utf8",
       shell: false,
@@ -2393,7 +2412,11 @@ export function cleanupTestTemp({
                 originalRoot: record.path
               }
             : null,
-          afterQuarantine(quarantine) {
+          afterQuarantine(quarantine, canonicalRoots = null) {
+            const canonicalQuarantine = canonicalRoots?.canonicalQuarantine
+              ?? canonicalContainedPath(quarantine);
+            const canonicalOriginalRoot = canonicalRoots?.canonicalOriginalRoot
+              ?? normalizeDarwinSystemPath(record.path);
             let quarantinedRoot;
             try {
               quarantinedRoot = fs.lstatSync(quarantine, { bigint: true });
@@ -2464,9 +2487,9 @@ export function cleanupTestTemp({
               postRenameWorktrees
             );
             const quarantinedGitInspection = record.family === "managed"
-              ? managedWorktreeInspection(quarantine, postRenameWorktrees, {
+              ? managedWorktreeInspection(canonicalQuarantine, postRenameWorktrees, {
                   expectedUid,
-                  originalRoot: record.path
+                  originalRoot: canonicalOriginalRoot
                 })
               : null;
             const postRenameGitReason = record.family === "managed"

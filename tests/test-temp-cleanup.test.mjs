@@ -8,6 +8,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import gitContainment from "../scripts/lib/test-temp-git-containment.cjs";
 
 import { cleanupExitCode, parseCleanupArgs } from "../scripts/cleanup-test-temp.mjs";
 import {
@@ -40,6 +41,7 @@ import {
   removeOwnedTestTempRoot
 } from "../scripts/lib/test-temp.mjs";
 
+const { inspectContainedGitMetadata } = gitContainment;
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
 const REMOVE_HELPER = path.join(ROOT, "scripts/lib/test-temp-remove-helper.cjs");
@@ -70,6 +72,20 @@ function age(target, nowMs = Date.now(), ageMs = OLD_MS) {
 
 function legacy(root, prefix = LEGACY_REPOSITORY_PREFIX) {
   return fs.mkdtempSync(path.join(root, prefix));
+}
+
+function darwinSystemAlias(target) {
+  if (process.platform !== "darwin") return null;
+  const resolved = path.resolve(target);
+  for (const prefix of [
+    `${path.sep}private${path.sep}var`,
+    `${path.sep}private${path.sep}tmp`
+  ]) {
+    if (resolved === prefix || resolved.startsWith(`${prefix}${path.sep}`)) {
+      return resolved.slice(`${path.sep}private`.length);
+    }
+  }
+  return null;
 }
 
 function closedPaths() {
@@ -1935,6 +1951,68 @@ test("exact owned-root cleanup permits internal linked-worktree metadata", (t) =
   addInternalLinkedWorktree(owned);
   assert.equal(removeOwnedTestTempRoot(owned), true);
   assert.equal(fs.existsSync(owned), false);
+});
+
+test("managed cleanup canonicalizes Darwin system-temp aliases end to end", (t) => {
+  const root = sandbox(t);
+  const aliasRoot = darwinSystemAlias(root);
+  if (!aliasRoot) return;
+  const target = legacy(aliasRoot);
+  addInternalLinkedWorktree(target);
+  const canary = path.join(root, "darwin-alias-canary");
+  fs.writeFileSync(canary, "keep");
+  const proof = inspectContainedGitMetadata({
+    root: target,
+    expectedUid: process.getuid()
+  });
+  assert.equal(proof.available, true);
+  const identity = fs.lstatSync(target, { bigint: true });
+  assert.equal(removeInventoriedTestTempRoot(target, identity, {
+    gitContainment: {
+      digest: proof.digest,
+      expectedUid: process.getuid(),
+      originalRoot: target
+    }
+  }), true);
+  assert.equal(fs.existsSync(target), false);
+  assert.equal(fs.readFileSync(canary, "utf8"), "keep");
+});
+
+test("Darwin path aliases never authorize external or arbitrary-symlink roots", (t) => {
+  const root = sandbox(t);
+  const aliasRoot = darwinSystemAlias(root);
+  if (!aliasRoot) return;
+  const owned = createOwnedTestTempRoot({
+    base: root,
+    prefix: TEST_TEMP_PROCESS_PREFIX,
+    kind: "process",
+    pid: process.pid,
+    startToken: "owned-darwin-external-alias"
+  });
+  const outside = fs.mkdtempSync(path.join(root, "darwin-alias-outside-"));
+  const canary = path.join(outside, "keep");
+  fs.writeFileSync(canary, "keep");
+  const outsideAlias = darwinSystemAlias(outside);
+  assert.ok(outsideAlias);
+  fs.writeFileSync(path.join(owned, ".git"), `gitdir: ${outsideAlias}\n`);
+  assert.throws(
+    () => removeOwnedTestTempRoot(owned),
+    /unproven Git metadata/u
+  );
+  assert.equal(fs.existsSync(owned), true);
+  assert.equal(fs.readFileSync(canary, "utf8"), "keep");
+
+  const physicalParent = path.join(root, "physical-parent");
+  const symlinkParent = path.join(root, "symlink-parent");
+  const managed = path.join(physicalParent, "managed");
+  fs.mkdirSync(managed, { recursive: true });
+  fs.symlinkSync(physicalParent, symlinkParent);
+  const ambiguous = inspectContainedGitMetadata({
+    root: path.join(symlinkParent, "managed"),
+    expectedUid: process.getuid()
+  });
+  assert.equal(ambiguous.available, false);
+  assert.equal(fs.existsSync(managed), true);
 });
 
 test("exact owned-root cleanup permits ordinary application worktrees directories", (t) => {

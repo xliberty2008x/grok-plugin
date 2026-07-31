@@ -5,9 +5,11 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const {
   PROOF_SCHEMA,
+  canonicalContainedPath,
   gitConfigSemantics,
   inspectMountBoundary,
   inspectContainedGitMetadata,
+  normalizeDarwinSystemPath,
   stablePathProof
 } = require("./test-temp-git-containment.cjs");
 
@@ -449,6 +451,24 @@ const expectedTreeDev = BigInt(rawExpectedTreeDev);
 const expectedUid = cleanupMode === "managed-contained"
   ? BigInt(rawExpectedUid)
   : null;
+let canonicalManagedRoot = null;
+let canonicalOriginalManagedRoot = null;
+if (cleanupMode === "managed-contained") {
+  try {
+    canonicalManagedRoot = canonicalContainedPath(managedRoot);
+    canonicalOriginalManagedRoot = normalizeDarwinSystemPath(
+      originalManagedRoot
+    );
+    if (
+      path.resolve(managedRoot) !== canonicalManagedRoot
+      || path.resolve(originalManagedRoot) !== canonicalOriginalManagedRoot
+    ) {
+      process.exit(43);
+    }
+  } catch {
+    process.exit(43);
+  }
+}
 removeDiagnosticStage = "root-identity";
 const original = fs.lstatSync(".", { bigint: true });
 if (
@@ -505,13 +525,12 @@ if (!mountBoundary.available || mountBoundary.nested.length > 0) {
 let managedProof = null;
 if (cleanupMode === "managed-contained") {
   removeDiagnosticStage = "managed-proof";
-  const canonicalManagedRoot = path.resolve(managedRoot);
-  const currentDirectory = fs.realpathSync(".");
+  const currentDirectory = canonicalContainedPath(".");
   if (!isWithin(canonicalManagedRoot, currentDirectory)) process.exit(43);
   if (currentDirectory === canonicalManagedRoot) {
     const inspection = inspectContainedGitMetadata({
       root: canonicalManagedRoot,
-      originalRoot: originalManagedRoot,
+      originalRoot: canonicalOriginalManagedRoot,
       expectedUid,
       expectedDev: expectedTreeDev
     });
@@ -545,10 +564,14 @@ if (cleanupMode === "managed-contained") {
 }
 
 function managedRelative(target) {
-  const root = path.resolve(managedRoot);
-  const resolved = path.resolve(target);
-  if (!isWithin(root, resolved)) process.exit(43);
-  return path.relative(root, resolved);
+  let resolved;
+  try {
+    resolved = canonicalContainedPath(target);
+  } catch {
+    process.exit(43);
+  }
+  if (!isWithin(canonicalManagedRoot, resolved)) process.exit(43);
+  return path.relative(canonicalManagedRoot, resolved);
 }
 
 function expectedManagedProof(target) {
@@ -643,9 +666,9 @@ function expandRestrictedManagedProof() {
   const relative = managedRelative(".");
   if (!Object.hasOwn(managedProof.restricted, relative)) return;
   const inspection = inspectContainedGitMetadata({
-    root: managedRoot,
-    originalRoot: originalManagedRoot,
-    scanRoot: fs.realpathSync("."),
+    root: canonicalManagedRoot,
+    originalRoot: canonicalOriginalManagedRoot,
+    scanRoot: canonicalContainedPath("."),
     expectedUid,
     expectedDev: expectedTreeDev
   });
@@ -979,8 +1002,8 @@ for (const { entry, stat } of entries) {
     ];
     if (cleanupMode === "managed-contained") {
       childArguments.push(
-        originalManagedRoot,
-        managedRoot,
+        canonicalOriginalManagedRoot,
+        canonicalManagedRoot,
         rawExpectedUid,
         expectedGitDigest
       );
