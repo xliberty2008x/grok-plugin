@@ -357,6 +357,56 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
 const LSOF_CANDIDATES = Object.freeze(["/usr/sbin/lsof", "/usr/bin/lsof"]);
 const PS_CANDIDATES = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
 const GIT_CANDIDATES = Object.freeze(["/opt/homebrew/bin/git", "/usr/bin/git"]);
+const WORKTREE_PROOF_SCHEMA = "grok-worktree-registration-proof-v1";
+const WORKTREE_METADATA_FILE_MAX_BYTES = 1024 * 1024;
+const WORKTREE_METADATA_TOTAL_MAX_BYTES = 16 * 1024 * 1024;
+const WORKTREE_GIT_EXECUTABLE_MAX_BYTES = 128 * 1024 * 1024;
+const WORKTREE_GIT_EXECUTABLE_LINK_MAX_BYTES = 4 * 1024;
+const WORKTREE_REGISTRATION_MAX_ENTRIES = 4096;
+const WORKTREE_REGISTRATION_CONTROL_MAX_ENTRIES = 64;
+const WORKTREE_DESCENDANT_GIT_SCAN_MAX_ENTRIES = 10_000;
+const WORKTREE_REGISTRATION_RELEVANT_FILES = new Set([
+  "commondir",
+  "config.worktree",
+  "gitdir",
+  "locked"
+]);
+const WORKTREE_REGISTRATION_IGNORED_FILES = new Set([
+  "AUTO_MERGE",
+  "CHERRY_PICK_HEAD",
+  "COMMIT_EDITMSG",
+  "FETCH_HEAD",
+  "HEAD",
+  "ORIG_HEAD",
+  "REBASE_HEAD",
+  "REVERT_HEAD",
+  "SQUASH_MSG",
+  "codex-synced-branch.json",
+  "codex-thread.json",
+  "index"
+]);
+const WORKTREE_REGISTRATION_IGNORED_DIRECTORIES = new Set([
+  "info",
+  "logs",
+  "rebase-apply",
+  "rebase-merge",
+  "refs",
+  "sequencer"
+]);
+const NESTED_WORKTREE_PARENT_PREFIXES = new Set([
+  "grok-plugin-linked-parent-",
+  "grok-readonly-legacy-linked-parent-",
+  "grok-readonly-linked-parent-",
+  "grok-readonly-missing-linked-parent-"
+]);
+const WORKTREE_GIT_ENV = Object.freeze({
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_OPTIONAL_LOCKS: "0",
+  GIT_TERMINAL_PROMPT: "0",
+  LANG: "C",
+  LC_ALL: "C"
+});
 const SIX_CHARACTER_SUFFIX = /^[A-Za-z0-9]{6}$/u;
 const MANAGED_PREFIX_KINDS = new Map([
   [TEST_TEMP_RUN_PREFIX, "run"],
@@ -373,6 +423,861 @@ function trustedExecutable(candidates) {
       return false;
     }
   }) || null;
+}
+
+function bigintIdentity(stat, { semantic = false } = {}) {
+  const identity = {
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+    mode: String(stat.mode),
+    uid: String(stat.uid),
+    nlink: String(stat.nlink),
+    size: String(stat.size)
+  };
+  if (!semantic) {
+    identity.mtimeNs = String(stat.mtimeNs);
+    identity.ctimeNs = String(stat.ctimeNs);
+  }
+  return identity;
+}
+
+function sameBigintIdentity(left, right) {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.nlink === right.nlink
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+function semanticDirectoryIdentity(stat) {
+  return {
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+    mode: String(stat.mode),
+    uid: String(stat.uid)
+  };
+}
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function stableDirectory(target, expectedUid) {
+  const stat = fs.lstatSync(target, { bigint: true });
+  if (
+    !stat.isDirectory()
+    || stat.isSymbolicLink()
+    || stat.uid !== BigInt(expectedUid)
+    || (stat.mode & 0o022n) !== 0n
+  ) {
+    throw new Error("Unsafe worktree metadata directory.");
+  }
+  const resolved = path.resolve(target);
+  if (fs.realpathSync(resolved) !== resolved) {
+    throw new Error("Worktree metadata directory is not canonical.");
+  }
+  return stat;
+}
+
+function unstableWorktreeMetadata(message) {
+  const error = new Error(message);
+  error.code = "E_WORKTREE_METADATA_CHANGED";
+  return error;
+}
+
+function stableFileOnce(
+  target,
+  expectedUid,
+  budget,
+  {
+    maxBytes = WORKTREE_METADATA_FILE_MAX_BYTES,
+    allowMultipleLinks = false,
+    allowRootOwner = false,
+    digestCache = null
+  } = {}
+) {
+  if (!Number.isInteger(fs.constants.O_NOFOLLOW)) {
+    throw new Error("No-follow metadata reads are unavailable.");
+  }
+  const before = fs.lstatSync(target, { bigint: true });
+  if (
+    !before.isFile()
+    || before.isSymbolicLink()
+    || (before.uid !== BigInt(expectedUid) && !(allowRootOwner && before.uid === 0n))
+    || (!allowMultipleLinks && before.nlink !== 1n)
+    || (allowMultipleLinks && before.nlink < 1n)
+    || before.size < 0n
+    || before.size > BigInt(maxBytes)
+    || (before.mode & 0o022n) !== 0n
+  ) {
+    throw new Error("Unsafe worktree metadata file.");
+  }
+  let descriptor;
+  try {
+    descriptor = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const openedBefore = fs.fstatSync(descriptor, { bigint: true });
+    if (!sameBigintIdentity(bigintIdentity(before), bigintIdentity(openedBefore))) {
+      throw unstableWorktreeMetadata("Worktree metadata changed before it was opened.");
+    }
+    const cachedDigest = digestCache?.identity
+      && sameBigintIdentity(digestCache.identity, bigintIdentity(openedBefore))
+      ? digestCache.digest
+      : null;
+    let contents = null;
+    let contentDigest = cachedDigest;
+    if (!contentDigest) {
+      contents = fs.readFileSync(descriptor);
+      if (contents.length !== Number(openedBefore.size)) {
+        throw unstableWorktreeMetadata(
+          "Worktree metadata length changed while it was read."
+        );
+      }
+      if (budget) {
+        budget.remaining -= contents.length;
+        if (budget.remaining < 0) throw new Error("Worktree metadata budget exceeded.");
+      }
+      contentDigest = sha256(contents);
+    }
+    const openedAfter = fs.fstatSync(descriptor, { bigint: true });
+    const after = fs.lstatSync(target, { bigint: true });
+    if (
+      !sameBigintIdentity(bigintIdentity(openedBefore), bigintIdentity(openedAfter))
+      || !sameBigintIdentity(bigintIdentity(openedAfter), bigintIdentity(after))
+    ) {
+      throw unstableWorktreeMetadata("Worktree metadata changed while it was read.");
+    }
+    return {
+      contents,
+      digest: contentDigest,
+      identity: bigintIdentity(openedAfter),
+      semanticIdentity: bigintIdentity(openedAfter, { semantic: true })
+    };
+  } finally {
+    if (Number.isInteger(descriptor)) fs.closeSync(descriptor);
+  }
+}
+
+function stableFile(target, expectedUid, budget, options = {}) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return stableFileOnce(target, expectedUid, budget, options);
+    } catch (error) {
+      if (error?.code !== "E_WORKTREE_METADATA_CHANGED" || attempt === 1) {
+        throw error;
+      }
+    }
+  }
+  throw new Error("Worktree metadata did not stabilize.");
+}
+
+function optionalStableFile(target, expectedUid, budget, options = {}) {
+  try {
+    return stableFile(target, expectedUid, budget, options);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function decodeMetadataFile(file) {
+  if (!file?.contents) throw new Error("Worktree metadata contents are unavailable.");
+  const text = file.contents.toString("utf8");
+  if (text.includes("\u0000") || !Buffer.from(text, "utf8").equals(file.contents)) {
+    throw new Error("Worktree metadata text is invalid.");
+  }
+  return text;
+}
+
+function exactControlLine(file) {
+  const text = decodeMetadataFile(file);
+  let line = text;
+  if (line.endsWith("\r\n")) line = line.slice(0, -2);
+  else if (line.endsWith("\n")) line = line.slice(0, -1);
+  if (
+    !line
+    || /[\r\n]/u.test(line)
+    || line !== line.trim()
+  ) {
+    throw new Error("Git control metadata must contain one exact line.");
+  }
+  return line;
+}
+
+function rejectConfigIncludes(file) {
+  if (!file) return;
+  const text = decodeMetadataFile(file);
+  if (
+    /^\s*\[\s*include(?:if)?(?:\s|\])/imu.test(text)
+    || /^\s*include(?:if)?\s*\./imu.test(text)
+  ) {
+    throw new Error("Included Git configuration is unsupported for cleanup proofing.");
+  }
+}
+
+function resolveControlDirectory(base, value) {
+  if (!value || value.includes("\u0000") || /[\r\n]/u.test(value)) {
+    throw new Error("Invalid Git control-directory path.");
+  }
+  const resolved = path.resolve(base, value);
+  if (fs.realpathSync(resolved) !== resolved) {
+    throw new Error("Git control-directory path is not canonical.");
+  }
+  return resolved;
+}
+
+function relevantFileProof(file) {
+  return file
+    ? {
+        digest: file.digest,
+        identity: file.semanticIdentity
+      }
+    : null;
+}
+
+function generationFileProof(file) {
+  return file ? file.identity : null;
+}
+
+function boundedDirectoryNames(target, maximum) {
+  const directory = fs.opendirSync(target);
+  const names = [];
+  try {
+    while (true) {
+      const entry = directory.readSync();
+      if (!entry) break;
+      if (names.length >= maximum) {
+        throw new Error("Worktree metadata directory exceeds its entry budget.");
+      }
+      names.push(entry.name);
+    }
+  } finally {
+    directory.closeSync();
+  }
+  return names.sort();
+}
+
+function captureRelativeRegistrationGitDir(
+  registrationDirectory,
+  gitdirFile,
+  expectedUid,
+  budget
+) {
+  const value = exactControlLine(gitdirFile);
+  if (path.isAbsolute(value)) return null;
+  const lexicalTarget = path.resolve(registrationDirectory, value);
+  const canonicalTarget = fs.realpathSync(lexicalTarget);
+  if (canonicalTarget !== lexicalTarget) {
+    throw new Error("Relative worktree registration crosses a symlink.");
+  }
+  const parentPath = path.dirname(canonicalTarget);
+  const parentBefore = stableDirectory(parentPath, expectedUid);
+  const targetFile = stableFile(canonicalTarget, expectedUid, budget);
+  const marker = exactControlLine(targetFile);
+  if (!/^gitdir: [^\r\n]+$/u.test(marker)) {
+    throw new Error("Relative worktree registration target is not a linked gitfile.");
+  }
+  const parentAfter = stableDirectory(parentPath, expectedUid);
+  if (!sameBigintIdentity(
+    bigintIdentity(parentBefore),
+    bigintIdentity(parentAfter)
+  )) {
+    throw unstableWorktreeMetadata(
+      "Relative worktree registration target changed while it was captured."
+    );
+  }
+  return {
+    semantic: {
+      lexicalPath: lexicalTarget,
+      parent: {
+        identity: semanticDirectoryIdentity(parentAfter),
+        path: parentPath
+      },
+      target: {
+        file: relevantFileProof(targetFile),
+        path: canonicalTarget
+      }
+    },
+    generation: {
+      parent: bigintIdentity(parentAfter),
+      target: generationFileProof(targetFile)
+    }
+  };
+}
+
+function registrationIgnoredEntryIsKnown(name, stat) {
+  if (stat.isDirectory()) return WORKTREE_REGISTRATION_IGNORED_DIRECTORIES.has(name);
+  if (!stat.isFile()) return false;
+  return WORKTREE_REGISTRATION_IGNORED_FILES.has(name)
+    || /^(?:BISECT|MERGE)_[A-Z0-9_]+$/u.test(name)
+    || /^sharedindex\.[a-fA-F0-9]{40,64}$/u.test(name);
+}
+
+function captureRegistrationDirectory(target, name, expectedUid, budget) {
+  const directoryBefore = stableDirectory(target, expectedUid);
+  const entries = boundedDirectoryNames(
+    target,
+    WORKTREE_REGISTRATION_CONTROL_MAX_ENTRIES
+  );
+  const files = {};
+  for (const entry of entries) {
+    const entryPath = path.join(target, entry);
+    const stat = fs.lstatSync(entryPath, { bigint: true });
+    if (stat.isSymbolicLink() || stat.uid !== BigInt(expectedUid)) {
+      throw new Error("Unsafe worktree registration control entry.");
+    }
+    if (entry.endsWith(".lock")) {
+      throw new Error("Worktree registration mutation is in progress.");
+    }
+    if (WORKTREE_REGISTRATION_RELEVANT_FILES.has(entry)) {
+      if (!stat.isFile()) throw new Error("Invalid worktree registration control file.");
+      files[entry] = stableFile(entryPath, expectedUid, budget);
+      if (entry === "config.worktree") rejectConfigIncludes(files[entry]);
+      continue;
+    }
+    if (!registrationIgnoredEntryIsKnown(entry, stat)) {
+      throw new Error("Unexpected worktree registration control entry.");
+    }
+  }
+  if (!files.gitdir || !files.commondir) {
+    throw new Error("Incomplete worktree registration metadata.");
+  }
+  const relativeGitDir = captureRelativeRegistrationGitDir(
+    target,
+    files.gitdir,
+    expectedUid,
+    budget
+  );
+  const directoryAfter = stableDirectory(target, expectedUid);
+  if (!sameBigintIdentity(bigintIdentity(directoryBefore), bigintIdentity(directoryAfter))) {
+    throw new Error("Worktree registration changed while it was captured.");
+  }
+  return {
+    name,
+    identity: semanticDirectoryIdentity(directoryAfter),
+    commondir: relevantFileProof(files.commondir),
+    configWorktree: relevantFileProof(files["config.worktree"]),
+    gitdir: relevantFileProof(files.gitdir),
+    relativeGitDir: relativeGitDir?.semantic ?? null,
+    locked: relevantFileProof(files.locked),
+    generation: {
+      identity: bigintIdentity(directoryAfter),
+      commondir: generationFileProof(files.commondir),
+      configWorktree: generationFileProof(files["config.worktree"]),
+      gitdir: generationFileProof(files.gitdir),
+      relativeGitDir: relativeGitDir?.generation ?? null,
+      locked: generationFileProof(files.locked)
+    }
+  };
+}
+
+function stableExecutableDirectory(target, expectedUid) {
+  const stat = fs.lstatSync(target, { bigint: true });
+  if (
+    !stat.isDirectory()
+    || stat.isSymbolicLink()
+    || (stat.uid !== BigInt(expectedUid) && stat.uid !== 0n)
+    || (stat.mode & 0o022n) !== 0n
+  ) {
+    throw new Error("Unsafe Git executable directory.");
+  }
+  const resolved = path.resolve(target);
+  if (fs.realpathSync(resolved) !== resolved) {
+    throw new Error("Git executable directory is not canonical.");
+  }
+  return stat;
+}
+
+function stableExecutableLink(target, expectedUid) {
+  const before = fs.lstatSync(target, { bigint: true });
+  if (
+    !before.isSymbolicLink()
+    || (before.uid !== BigInt(expectedUid) && before.uid !== 0n)
+    || before.nlink < 1n
+    || before.size < 1n
+    || before.size > BigInt(WORKTREE_GIT_EXECUTABLE_LINK_MAX_BYTES)
+  ) {
+    throw new Error("Unsafe Git executable symlink.");
+  }
+  const rawTarget = fs.readlinkSync(target, { encoding: "buffer" });
+  if (
+    !Buffer.isBuffer(rawTarget)
+    || rawTarget.length !== Number(before.size)
+    || rawTarget.includes(0)
+  ) {
+    throw new Error("Invalid Git executable symlink.");
+  }
+  const linkTarget = rawTarget.toString("utf8");
+  if (
+    !linkTarget
+    || /[\r\n]/u.test(linkTarget)
+    || !Buffer.from(linkTarget, "utf8").equals(rawTarget)
+  ) {
+    throw new Error("Invalid Git executable symlink text.");
+  }
+  const after = fs.lstatSync(target, { bigint: true });
+  if (!sameBigintIdentity(bigintIdentity(before), bigintIdentity(after))) {
+    throw new Error("Git executable symlink changed while it was read.");
+  }
+  return {
+    identity: bigintIdentity(after),
+    linkTarget,
+    semanticIdentity: bigintIdentity(after, { semantic: true })
+  };
+}
+
+function selectGitExecutable(candidates, expectedUid, executableCache) {
+  for (const candidate of candidates) {
+    try {
+      const authority = fs.lstatSync(candidate, { bigint: true });
+      let link = null;
+      let executablePath = candidate;
+      if (authority.isSymbolicLink()) {
+        link = stableExecutableLink(candidate, expectedUid);
+        executablePath = fs.realpathSync(candidate);
+      } else if (!authority.isFile()) {
+        continue;
+      }
+      if (!path.isAbsolute(executablePath) || fs.realpathSync(executablePath) !== executablePath) {
+        throw new Error("Git executable target is not canonical.");
+      }
+      const executableParent = path.dirname(executablePath);
+      const parent = stableExecutableDirectory(executableParent, expectedUid);
+      const file = stableFile(executablePath, expectedUid, null, {
+        allowMultipleLinks: true,
+        allowRootOwner: true,
+        digestCache: executableCache.value,
+        maxBytes: WORKTREE_GIT_EXECUTABLE_MAX_BYTES
+      });
+      if ((BigInt(file.identity.mode) & 0o111n) === 0n) continue;
+      executableCache.value = { digest: file.digest, identity: file.identity };
+      return {
+        path: executablePath,
+        proof: {
+          authorityPath: candidate,
+          link: link
+            ? {
+                identity: link.semanticIdentity,
+                target: link.linkTarget
+              }
+            : null,
+          parent: {
+            identity: semanticDirectoryIdentity(parent),
+            path: executableParent
+          },
+          target: {
+            digest: file.digest,
+            identity: file.semanticIdentity,
+            path: executablePath
+          }
+        },
+        generation: {
+          link: link?.identity ?? null,
+          parent: bigintIdentity(parent),
+          target: file.identity
+        }
+      };
+    } catch {
+      // Try the next fixed executable authority.
+    }
+  }
+  throw new Error("A trusted Git executable is unavailable.");
+}
+
+function captureWorktreeMetadataProofPass(repoRoot, {
+  expectedUid,
+  gitCandidates,
+  executableCache
+}) {
+  const budget = { remaining: WORKTREE_METADATA_TOTAL_MAX_BYTES };
+  const canonicalRepoRoot = fs.realpathSync(path.resolve(repoRoot));
+  if (canonicalRepoRoot !== path.resolve(canonicalRepoRoot)) {
+    throw new Error("Repository root is not canonical.");
+  }
+  const rootBefore = stableDirectory(canonicalRepoRoot, expectedUid);
+  const markerPath = path.join(canonicalRepoRoot, ".git");
+  const markerStat = fs.lstatSync(markerPath, { bigint: true });
+  let activeGitDir;
+  let markerGeneration;
+  let markerProof;
+  if (markerStat.isDirectory() && !markerStat.isSymbolicLink()) {
+    activeGitDir = markerPath;
+    const markerDirectory = stableDirectory(markerPath, expectedUid);
+    markerProof = {
+      kind: "directory",
+      identity: semanticDirectoryIdentity(markerDirectory)
+    };
+    markerGeneration = bigintIdentity(markerDirectory);
+  } else if (markerStat.isFile() && !markerStat.isSymbolicLink()) {
+    const markerFile = stableFile(markerPath, expectedUid, budget);
+    const markerText = exactControlLine(markerFile);
+    const match = /^gitdir: ([^\r\n]+)$/u.exec(markerText);
+    if (!match || match[1] !== match[1].trim()) {
+      throw new Error("Invalid linked-worktree gitfile.");
+    }
+    activeGitDir = resolveControlDirectory(canonicalRepoRoot, match[1]);
+    markerProof = {
+      kind: "file",
+      file: relevantFileProof(markerFile)
+    };
+    markerGeneration = generationFileProof(markerFile);
+  } else {
+    throw new Error("Unsupported or bare repository layout.");
+  }
+  const activeBefore = stableDirectory(activeGitDir, expectedUid);
+  const commonLink = optionalStableFile(
+    path.join(activeGitDir, "commondir"),
+    expectedUid,
+    budget
+  );
+  const commonDir = commonLink
+    ? resolveControlDirectory(activeGitDir, exactControlLine(commonLink))
+    : activeGitDir;
+  const commonBefore = stableDirectory(commonDir, expectedUid);
+
+  for (const lockPath of [
+    path.join(commonDir, "config.lock"),
+    path.join(activeGitDir, "config.worktree.lock")
+  ]) {
+    try {
+      fs.lstatSync(lockPath);
+      throw new Error("Git configuration mutation is in progress.");
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+
+  const commonConfig = stableFile(path.join(commonDir, "config"), expectedUid, budget);
+  const activeWorktreeConfig = optionalStableFile(
+    path.join(activeGitDir, "config.worktree"),
+    expectedUid,
+    budget
+  );
+  rejectConfigIncludes(commonConfig);
+  rejectConfigIncludes(activeWorktreeConfig);
+
+  const registrationsRoot = path.join(commonDir, "worktrees");
+  let registrationsRootProof = null;
+  let registrationsRootGeneration = null;
+  const registrations = [];
+  try {
+    const registrationsBefore = stableDirectory(registrationsRoot, expectedUid);
+    const names = boundedDirectoryNames(
+      registrationsRoot,
+      WORKTREE_REGISTRATION_MAX_ENTRIES
+    );
+    for (const name of names) {
+      registrations.push(captureRegistrationDirectory(
+        path.join(registrationsRoot, name),
+        name,
+        expectedUid,
+        budget
+      ));
+    }
+    const registrationsAfter = stableDirectory(registrationsRoot, expectedUid);
+    if (!sameBigintIdentity(
+      bigintIdentity(registrationsBefore),
+      bigintIdentity(registrationsAfter)
+    )) {
+      throw new Error("Worktree registrations changed while they were captured.");
+    }
+    registrationsRootProof = semanticDirectoryIdentity(registrationsAfter);
+    registrationsRootGeneration = bigintIdentity(registrationsAfter);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+
+  const activeAfter = stableDirectory(activeGitDir, expectedUid);
+  const commonAfter = stableDirectory(commonDir, expectedUid);
+  const rootAfter = stableDirectory(canonicalRepoRoot, expectedUid);
+  if (
+    !sameBigintIdentity(bigintIdentity(rootBefore), bigintIdentity(rootAfter))
+    || !sameBigintIdentity(bigintIdentity(activeBefore), bigintIdentity(activeAfter))
+    || !sameBigintIdentity(bigintIdentity(commonBefore), bigintIdentity(commonAfter))
+  ) {
+    throw new Error("Git metadata changed while the proof was captured.");
+  }
+  const gitExecutable = selectGitExecutable(gitCandidates, expectedUid, executableCache);
+  const semantic = {
+    schema: WORKTREE_PROOF_SCHEMA,
+    repoRoot: {
+      path: canonicalRepoRoot,
+      identity: semanticDirectoryIdentity(rootAfter)
+    },
+    marker: markerProof,
+    activeGitDir: {
+      path: activeGitDir,
+      identity: semanticDirectoryIdentity(activeAfter),
+      commondir: relevantFileProof(commonLink),
+      configWorktree: relevantFileProof(activeWorktreeConfig)
+    },
+    commonDir: {
+      path: commonDir,
+      identity: semanticDirectoryIdentity(commonAfter),
+      config: relevantFileProof(commonConfig),
+      worktrees: registrationsRootProof
+    },
+    registrations: registrations.map((registration) => ({
+      name: registration.name,
+      identity: registration.identity,
+      commondir: registration.commondir,
+      configWorktree: registration.configWorktree,
+      gitdir: registration.gitdir,
+      relativeGitDir: registration.relativeGitDir,
+      locked: registration.locked
+    })),
+    gitExecutable: gitExecutable.proof
+  };
+  const generation = {
+    schema: WORKTREE_PROOF_SCHEMA,
+    repoRoot: bigintIdentity(rootAfter),
+    marker: markerGeneration,
+    activeGitDir: {
+      identity: bigintIdentity(activeAfter),
+      commondir: generationFileProof(commonLink),
+      configWorktree: generationFileProof(activeWorktreeConfig)
+    },
+    commonDir: {
+      identity: bigintIdentity(commonAfter),
+      config: generationFileProof(commonConfig),
+      worktrees: registrationsRootGeneration
+    },
+    registrations: registrations.map((registration) => ({
+      name: registration.name,
+      ...registration.generation
+    })),
+    gitExecutable: gitExecutable.generation
+  };
+  return {
+    canonicalRepoRoot,
+    digest: sha256(JSON.stringify(semantic)),
+    generationDigest: sha256(JSON.stringify(generation)),
+    gitExecutable: gitExecutable.path
+  };
+}
+
+function captureWorktreeMetadataProof(repoRoot, options) {
+  const first = captureWorktreeMetadataProofPass(repoRoot, options);
+  const second = captureWorktreeMetadataProofPass(repoRoot, options);
+  if (
+    !sameDigest(first.digest, second.digest)
+    || !sameDigest(first.generationDigest, second.generationDigest)
+  ) {
+    throw new Error("Git metadata changed across the stable proof boundary.");
+  }
+  return second;
+}
+
+function canonicalRegisteredPath(value) {
+  let cursor = path.resolve(value);
+  const missingSuffix = [];
+  while (true) {
+    try {
+      return path.join(fs.realpathSync(cursor), ...missingSuffix);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      let missing = false;
+      try {
+        const stat = fs.lstatSync(cursor);
+        if (stat.isSymbolicLink()) {
+          throw new Error("Registered worktree path has a dangling symlink.");
+        }
+      } catch (lstatError) {
+        if (lstatError?.code !== "ENOENT") throw lstatError;
+        missing = true;
+      }
+      if (!missing) throw error;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) throw error;
+      missingSuffix.unshift(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+function registeredPathAliases(value) {
+  const aliases = new Set([
+    path.resolve(value),
+    canonicalRegisteredPath(value)
+  ]);
+  for (const alias of [...aliases]) {
+    if (alias.startsWith(`/private${path.sep}`)) aliases.add(alias.slice("/private".length));
+    if (
+      process.platform === "darwin"
+      && (alias.startsWith(`${path.sep}tmp${path.sep}`) || alias.startsWith(`${path.sep}var${path.sep}`))
+    ) {
+      aliases.add(`/private${alias}`);
+    }
+  }
+  return [...aliases];
+}
+
+function materializeRegisteredPathAliasesOnce(rawPaths) {
+  return [...new Set(rawPaths.flatMap((value) => registeredPathAliases(value)))].sort();
+}
+
+function materializeRegisteredPathAliases(rawPaths) {
+  const first = materializeRegisteredPathAliasesOnce(rawPaths);
+  const second = materializeRegisteredPathAliasesOnce(rawPaths);
+  if (!sameDigest(sha256(JSON.stringify(first)), sha256(JSON.stringify(second)))) {
+    throw new Error("Registered worktree path aliases changed while they were captured.");
+  }
+  return second;
+}
+
+function materializeRegisteredPathSnapshot(rawPaths, canonicalRepoRoot) {
+  const paths = materializeRegisteredPathAliases(rawPaths);
+  if (rawPaths.length === 0 || !paths.includes(canonicalRepoRoot)) {
+    throw new Error("Git did not report the active repository worktree.");
+  }
+  return paths;
+}
+
+function parseRegisteredWorktreeOutput(stdout, canonicalRepoRoot) {
+  const rawPaths = [];
+  let inRecord = false;
+  for (const line of String(stdout || "").split(/\r?\n/u)) {
+    if (line === "") {
+      inRecord = false;
+      continue;
+    }
+    if (line.startsWith("worktree ")) {
+      const value = line.slice("worktree ".length);
+      if (!path.isAbsolute(value) || value.includes("\u0000")) {
+        throw new Error("Git returned an invalid worktree path.");
+      }
+      rawPaths.push(path.resolve(value));
+      inRecord = true;
+      continue;
+    }
+    if (!inRecord || line === "bare" || !(
+      /^(?:HEAD [a-fA-F0-9]{40,64}|branch \S+|detached|locked(?: .*)?|prunable(?: .*)?)$/u.test(line)
+    )) {
+      throw new Error("Git returned invalid worktree porcelain output.");
+    }
+  }
+  const normalized = [...new Set(rawPaths)].sort();
+  materializeRegisteredPathSnapshot(normalized, canonicalRepoRoot);
+  return normalized;
+}
+
+function enumerateRegisteredWorktrees(proof, run) {
+  const result = run(proof.gitExecutable, ["worktree", "list", "--porcelain"], {
+    cwd: proof.canonicalRepoRoot,
+    encoding: "utf8",
+    env: { ...WORKTREE_GIT_ENV },
+    shell: false,
+    timeout: TEST_TEMP_WORKTREE_SCAN_TIMEOUT_MS,
+    maxBuffer: 4 * 1024 * 1024
+  });
+  if (result?.status !== 0 || result?.error || result?.signal) {
+    throw new Error("Git worktree enumeration failed.");
+  }
+  return parseRegisteredWorktreeOutput(result.stdout, proof.canonicalRepoRoot);
+}
+
+export function createRegisteredWorktreeProvider(repoRoot, {
+  run = spawnSync,
+  expectedUid = typeof process.getuid === "function" ? process.getuid() : null,
+  gitCandidates = GIT_CANDIDATES
+} = {}) {
+  let cached = null;
+  const executableCache = { value: null };
+  return function registeredWorktrees() {
+    if (!Number.isSafeInteger(expectedUid) || expectedUid < 0) {
+      cached = null;
+      return { available: false, paths: [], reason: "owner-visibility-unavailable" };
+    }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let before;
+      try {
+        before = captureWorktreeMetadataProof(repoRoot, {
+          expectedUid,
+          gitCandidates,
+          executableCache
+        });
+      } catch {
+        if (attempt === 0) continue;
+        cached = null;
+        return { available: false, paths: [], reason: "worktree-metadata-unavailable" };
+      }
+      if (cached && sameDigest(before.digest, cached.metadataDigest)) {
+        const expectedBinding = sha256(
+          `${WORKTREE_PROOF_SCHEMA}\u0000${before.digest}\u0000${cached.rawPathsDigest}`
+        );
+        if (sameDigest(expectedBinding, cached.bindingDigest)) {
+          try {
+            return {
+              available: true,
+              paths: materializeRegisteredPathSnapshot(
+                cached.rawPaths,
+                before.canonicalRepoRoot
+              )
+            };
+          } catch {
+            return {
+              available: false,
+              paths: [],
+              reason: "worktree-path-alias-unavailable"
+            };
+          }
+        }
+        cached = null;
+      }
+      let rawPaths;
+      try {
+        rawPaths = enumerateRegisteredWorktrees(before, run);
+      } catch {
+        cached = null;
+        return { available: false, paths: [], reason: "git-worktree-list-failed" };
+      }
+      let after;
+      try {
+        after = captureWorktreeMetadataProof(repoRoot, {
+          expectedUid,
+          gitCandidates,
+          executableCache
+        });
+      } catch {
+        if (attempt === 0) continue;
+        cached = null;
+        return { available: false, paths: [], reason: "worktree-metadata-unstable" };
+      }
+      if (
+        !sameDigest(before.digest, after.digest)
+        || !sameDigest(before.generationDigest, after.generationDigest)
+      ) {
+        if (attempt === 0) continue;
+        cached = null;
+        return { available: false, paths: [], reason: "worktree-metadata-unstable" };
+      }
+      const rawPathsDigest = sha256(JSON.stringify(rawPaths));
+      let paths;
+      try {
+        paths = materializeRegisteredPathSnapshot(rawPaths, after.canonicalRepoRoot);
+      } catch {
+        cached = null;
+        return {
+          available: false,
+          paths: [],
+          reason: "worktree-path-alias-unavailable"
+        };
+      }
+      cached = Object.freeze({
+        bindingDigest: sha256(
+          `${WORKTREE_PROOF_SCHEMA}\u0000${after.digest}\u0000${rawPathsDigest}`
+        ),
+        metadataDigest: after.digest,
+        rawPaths: Object.freeze([...rawPaths]),
+        rawPathsDigest
+      });
+      return { available: true, paths };
+    }
+    cached = null;
+    return { available: false, paths: [], reason: "worktree-metadata-unstable" };
+  };
 }
 
 function canonicalRoot(root) {
@@ -692,6 +1597,7 @@ export function captureRegisteredWorktrees(repoRoot, { run = spawnSync } = {}) {
     const result = run(binary, ["worktree", "list", "--porcelain"], {
       cwd: repoRoot,
       encoding: "utf8",
+      env: { ...WORKTREE_GIT_ENV },
       shell: false,
       timeout: TEST_TEMP_WORKTREE_SCAN_TIMEOUT_MS,
       maxBuffer: 4 * 1024 * 1024
@@ -761,20 +1667,7 @@ function activeReferencesForRoot(root, snapshot) {
   return active;
 }
 
-function worktreeReason(candidate, snapshot) {
-  if (!snapshot.available) return "worktree-visibility-unavailable";
-  if (snapshot.paths.some((worktree) => isWithin(candidate, worktree))) {
-    return "registered-worktree";
-  }
-  const gitDirectory = path.join(candidate, ".git");
-  try {
-    const gitMarker = fs.lstatSync(gitDirectory);
-    if (gitMarker.isFile() || gitMarker.isSymbolicLink()) return "external-worktree-link";
-    if (!gitMarker.isDirectory()) return "git-metadata-ambiguous";
-  } catch (error) {
-    if (error?.code !== "ENOENT") return "git-metadata-ambiguous";
-    return null;
-  }
+function linkedWorktreeMetadataReason(gitDirectory) {
   try {
     const linkedWorktrees = fs.lstatSync(path.join(gitDirectory, "worktrees"));
     if (linkedWorktrees.isDirectory() && !linkedWorktrees.isSymbolicLink()) {
@@ -785,6 +1678,79 @@ function worktreeReason(candidate, snapshot) {
     if (error?.code !== "ENOENT") return "git-metadata-ambiguous";
   }
   return null;
+}
+
+function descendantGitMetadataReason(candidate, rootGitDirectory) {
+  try {
+    const rootStat = fs.lstatSync(candidate);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      return "git-metadata-ambiguous";
+    }
+  } catch (error) {
+    return error?.code === "ENOENT" ? null : "git-metadata-ambiguous";
+  }
+  const stack = [candidate];
+  let remaining = WORKTREE_DESCENDANT_GIT_SCAN_MAX_ENTRIES;
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let directory;
+    try {
+      directory = fs.opendirSync(current);
+      while (true) {
+        const entry = directory.readSync();
+        if (!entry) break;
+        if (remaining <= 0) return "git-metadata-scan-truncated";
+        remaining -= 1;
+        const entryPath = path.join(current, entry.name);
+        let stat;
+        try {
+          stat = fs.lstatSync(entryPath);
+        } catch {
+          return "git-metadata-ambiguous";
+        }
+        if (entryPath === rootGitDirectory) continue;
+        if (entry.name === ".git") {
+          if (stat.isFile() || stat.isSymbolicLink()) {
+            return "external-worktree-link";
+          }
+          if (!stat.isDirectory()) return "git-metadata-ambiguous";
+          const reason = linkedWorktreeMetadataReason(entryPath);
+          if (reason) return reason;
+          continue;
+        }
+        if (stat.isDirectory() && !stat.isSymbolicLink()) stack.push(entryPath);
+      }
+    } catch {
+      return "git-metadata-ambiguous";
+    } finally {
+      try {
+        directory?.closeSync();
+      } catch {
+        return "git-metadata-ambiguous";
+      }
+    }
+  }
+  return null;
+}
+
+function worktreeReason(candidate, snapshot, { scanDescendants = false } = {}) {
+  if (!snapshot.available) return "worktree-visibility-unavailable";
+  if (snapshot.paths.some((worktree) => isWithin(candidate, worktree))) {
+    return "registered-worktree";
+  }
+  const gitDirectory = path.join(candidate, ".git");
+  try {
+    const gitMarker = fs.lstatSync(gitDirectory);
+    if (gitMarker.isFile() || gitMarker.isSymbolicLink()) return "external-worktree-link";
+    if (!gitMarker.isDirectory()) return "git-metadata-ambiguous";
+    const reason = linkedWorktreeMetadataReason(gitDirectory);
+    if (reason) return reason;
+  } catch (error) {
+    if (error?.code !== "ENOENT") return "git-metadata-ambiguous";
+  }
+  return scanDescendants
+    ? descendantGitMetadataReason(candidate, gitDirectory)
+    : null;
 }
 
 function candidateRecord({
@@ -822,7 +1788,9 @@ function candidateRecord({
   if (!owner.known) reasons.push("owner-identity-unavailable");
   if (owner.active) reasons.push("active-owner");
   if (activeReferences.has(candidate)) reasons.push("active-process-reference");
-  const gitReason = worktreeReason(candidate, worktrees);
+  const gitReason = worktreeReason(candidate, worktrees, {
+    scanDescendants: NESTED_WORKTREE_PARENT_PREFIXES.has(family.prefix)
+  });
   if (gitReason) reasons.push(gitReason);
 
   const size = treeSize(candidate, sizeBudget);
@@ -857,7 +1825,7 @@ export function cleanupTestTemp({
   nowMs = Date.now(),
   expectedUid = typeof process.getuid === "function" ? process.getuid() : null,
   openPathsProvider = captureOpenPathSnapshot,
-  worktreeProvider = () => captureRegisteredWorktrees(repoRoot),
+  worktreeProvider = null,
   tokenForPid = processStartToken,
   beforeDelete = null,
   removeRoot = removeInventoriedTestTempRoot,
@@ -887,6 +1855,8 @@ export function cleanupTestTemp({
       reclaimedBytes: 0
     };
   }
+  const registeredWorktrees = worktreeProvider
+    ?? createRegisteredWorktreeProvider(repoRoot, { expectedUid });
 
   const openSnapshot = openPathsProvider();
   if (
@@ -904,7 +1874,7 @@ export function cleanupTestTemp({
       reclaimedBytes: 0
     };
   }
-  const worktrees = worktreeProvider();
+  const worktrees = registeredWorktrees();
   if (!worktrees?.available || !Array.isArray(worktrees.paths)) {
     return {
       root,
@@ -959,7 +1929,7 @@ export function cleanupTestTemp({
       };
     }
     let finalActiveReferences = activeReferencesForRoot(root, finalOpenSnapshot);
-    let finalWorktrees = worktreeProvider();
+    let finalWorktrees = registeredWorktrees();
     if (!finalWorktrees?.available || !Array.isArray(finalWorktrees.paths)) {
       return {
         root,
@@ -991,7 +1961,7 @@ export function cleanupTestTemp({
             reclaimedBytes
           };
         }
-        finalWorktrees = worktreeProvider();
+        finalWorktrees = registeredWorktrees();
         if (!finalWorktrees?.available || !Array.isArray(finalWorktrees.paths)) {
           return {
             root,
@@ -1025,7 +1995,9 @@ export function cleanupTestTemp({
         record.reasons.push("active-process-reference");
         continue;
       }
-      const finalGitReason = worktreeReason(record.path, finalWorktrees);
+      const finalGitReason = worktreeReason(record.path, finalWorktrees, {
+        scanDescendants: NESTED_WORKTREE_PARENT_PREFIXES.has(record.prefix)
+      });
       if (finalGitReason) {
         record.eligible = false;
         record.reasons.push(finalGitReason);
@@ -1087,7 +2059,7 @@ export function cleanupTestTemp({
               error.code = "E_TEST_TEMP_ACTIVE_AFTER_QUARANTINE";
               throw error;
             }
-            const postRenameWorktrees = worktreeProvider();
+            const postRenameWorktrees = registeredWorktrees();
             if (
               !postRenameWorktrees?.available
               || !Array.isArray(postRenameWorktrees.paths)
@@ -1099,8 +2071,12 @@ export function cleanupTestTemp({
               throw error;
             }
             if (
-              worktreeReason(record.path, postRenameWorktrees)
-              || worktreeReason(quarantine, postRenameWorktrees)
+              worktreeReason(record.path, postRenameWorktrees, {
+                scanDescendants: NESTED_WORKTREE_PARENT_PREFIXES.has(record.prefix)
+              })
+              || worktreeReason(quarantine, postRenameWorktrees, {
+                scanDescendants: NESTED_WORKTREE_PARENT_PREFIXES.has(record.prefix)
+              })
             ) {
               const error = new Error(
                 "The cleanup candidate became a registered worktree after quarantine."
