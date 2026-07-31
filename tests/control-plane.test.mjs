@@ -5942,21 +5942,29 @@ test("integration: malformed task report gets one same-session format repair", {
   assert.equal(repairProfile.includes("GrokBuild:search_replace"), false);
 });
 
+function waitForBackgroundFailure(root, env, id) {
+  const job = parseJson(runCompanion([
+    "status",
+    id,
+    "--wait",
+    "--timeout-ms",
+    "10000",
+    "--json"
+  ], { cwd: root, env }));
+  assert.equal(job.status, "failed");
+  return job;
+}
+
 test("integration: two invalid task reports fail with E_SCHEMA and retain bounded repair evidence", {
   skip: !PROVIDER_LIFECYCLE_AVAILABLE && "process start tokens unavailable (ps denied in this environment)"
-}, async () => {
+}, () => {
   const root = initRepo();
   const { env, fake } = fixture({ taskTexts: ["not a worker report", "still not a worker report"] });
   const started = parseJson(runCompanion(
     ["task", "--background", "exercise invalid report failure", "--json"],
     { cwd: root, env }
   ));
-  const failed = await waitFor(() => {
-    const status = runCompanion(["status", started.id, "--json"], { cwd: root, env });
-    if (status.status !== 0) return null;
-    const job = JSON.parse(status.stdout);
-    return job.status === "failed" ? job : null;
-  }, { timeoutMs: 10000 });
+  const failed = waitForBackgroundFailure(root, env, started.id);
   assert.equal(failed.error.code, "E_SCHEMA");
   assert.equal(failed.result.workerReport.valid, false);
   assert.equal(failed.result.providerClaims.success, false);
@@ -5975,7 +5983,7 @@ test("integration: two invalid task reports fail with E_SCHEMA and retain bounde
 
 test("integration: report-repair transport failures preserve their operational error code", {
   skip: !PROVIDER_LIFECYCLE_AVAILABLE && "process start tokens unavailable (ps denied in this environment)"
-}, async () => {
+}, () => {
   const root = initRepo();
   const { env } = fixture({
     taskTexts: ["not a worker report"],
@@ -5985,12 +5993,7 @@ test("integration: report-repair transport failures preserve their operational e
     ["task", "--background", "exercise report repair auth failure", "--json"],
     { cwd: root, env }
   ));
-  const failed = await waitFor(() => {
-    const status = runCompanion(["status", started.id, "--json"], { cwd: root, env });
-    if (status.status !== 0) return null;
-    const job = JSON.parse(status.stdout);
-    return job.status === "failed" ? job : null;
-  }, { timeoutMs: 10000 });
+  const failed = waitForBackgroundFailure(root, env, started.id);
   assert.equal(failed.error.code, "E_AUTH_REQUIRED");
   assert.equal(failed.result.workerReport.valid, false);
   assert.equal(failed.result.reportRepair.attempted, true);
