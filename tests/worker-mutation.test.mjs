@@ -127,10 +127,10 @@ const WORKER_MUTATION_PARTITION_KEY = Symbol.for(
   "grok-plugin.worker-mutation-partition"
 );
 const WORKER_MUTATION_PARTITION_RANGES = Object.freeze({
-  1: Object.freeze([1, 32]),
-  2: Object.freeze([32, 63])
+  1: Object.freeze([1, 33]),
+  2: Object.freeze([33, 64])
 });
-const WORKER_MUTATION_TEST_REGISTRATION_COUNT = 62;
+const WORKER_MUTATION_TEST_REGISTRATION_COUNT = 63;
 const workerMutationPartitionCoverage = new Uint8Array(
   WORKER_MUTATION_TEST_REGISTRATION_COUNT + 1
 );
