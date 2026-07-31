@@ -1730,6 +1730,64 @@ test("verified recursive removal has no timeout that can orphan a descendant hel
   );
 });
 
+test("guarded recursive removal keeps descendant helper argv child-hook compatible", (t) => {
+  if (process.platform === "win32") return;
+  const root = sandbox(t);
+  const target = legacy(root);
+  const nested = path.join(target, "nested");
+  const log = path.join(root, "recursive-spawn.jsonl");
+  const preload = path.join(root, "recursive-spawn-preload.cjs");
+  fs.mkdirSync(nested);
+  fs.writeFileSync(path.join(nested, "payload"), "payload");
+  fs.writeFileSync(preload, [
+    '"use strict";',
+    'const childProcess = require("node:child_process");',
+    'const fs = require("node:fs");',
+    'const { syncBuiltinESMExports } = require("node:module");',
+    `const log = ${JSON.stringify(log)};`,
+    "const originalSpawnSync = childProcess.spawnSync;",
+    "childProcess.spawnSync = function(file, args, options) {",
+    "  fs.appendFileSync(log, `${JSON.stringify(args)}\\n`);",
+    "  return originalSpawnSync.call(this, file, args, options);",
+    "};",
+    "syncBuiltinESMExports();",
+    ""
+  ].join("\n"));
+  const targetIdentity = fs.lstatSync(target, { bigint: true });
+  const nestedIdentity = fs.lstatSync(nested, { bigint: true });
+  const result = spawnSync(process.execPath, [
+    REMOVE_HELPER,
+    String(targetIdentity.dev),
+    String(targetIdentity.ino),
+    String(targetIdentity.dev),
+    "guarded",
+    "none"
+  ], {
+    cwd: target,
+    env: {
+      GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1",
+      NODE_OPTIONS: `--require=${preload}`
+    },
+    encoding: "utf8",
+    shell: false
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const launches = fs.readFileSync(log, "utf8")
+    .trim()
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(launches, [[
+    REMOVE_HELPER,
+    String(nestedIdentity.dev),
+    String(nestedIdentity.ino),
+    String(targetIdentity.dev),
+    "guarded",
+    "none"
+  ]]);
+  assert.equal(fs.existsSync(target), false);
+});
+
 test("recursive remover refuses late Git controls but permits a standalone .git directory", (t) => {
   const root = sandbox(t);
   const linked = legacy(root);

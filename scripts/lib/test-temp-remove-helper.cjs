@@ -948,18 +948,23 @@ for (const { entry, stat } of entries) {
   let result;
   try {
     removeDiagnosticStage = "child-removal";
-    result = spawnSync(process.execPath, [
+    const childArguments = [
       __filename,
       String(stat.dev),
       String(stat.ino),
       String(expectedTreeDev),
       cleanupMode,
-      childGitContext(entry),
-      originalManagedRoot,
-      managedRoot,
-      rawExpectedUid,
-      expectedGitDigest
-    ], {
+      childGitContext(entry)
+    ];
+    if (cleanupMode === "managed-contained") {
+      childArguments.push(
+        originalManagedRoot,
+        managedRoot,
+        rawExpectedUid,
+        expectedGitDigest
+      );
+    }
+    result = spawnSync(process.execPath, childArguments, {
       cwd: entry,
       env: {
         GROK_PLUGIN_TEST_CHILD_HOOK_BYPASS: "1",
