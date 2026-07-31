@@ -1,4 +1,4 @@
-export const DETERMINISTIC_TEST_SHARD_COUNT = 3;
+export const DETERMINISTIC_TEST_SHARD_COUNT = 4;
 export const DETERMINISTIC_AGGREGATE_TEST_FILES = Object.freeze([
   "tests/control-plane.test.mjs",
   "tests/worker-broker-evidence.test.mjs",
@@ -21,8 +21,9 @@ export const DETERMINISTIC_SUPPORT_TEST_FILES = Object.freeze([
 ]);
 
 // Duration-balanced from the macOS and Linux lanes in Actions runs
-// 30516745831 and 30567663739. The process-heavy cleanup tests and partition
-// wrappers are spread instead of serializing the oversized aggregates.
+// 30516745831, 30567663739, and 30604307011. Shards 1 and 2 retain their
+// successful assignments; the two largest whole-file costs from the old
+// shard 3 moved to shard 4 after both macOS lanes reached the 30-minute bound.
 // Keep this manifest explicit: validation must fail when the deterministic
 // inventory changes until the new file is deliberately assigned.
 export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
@@ -94,21 +95,23 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/provider-startup-cancel.test.mjs",
     "tests/recursion-guard.test.mjs",
     "tests/redact.test.mjs",
-    "tests/runtime.test.mjs",
     "tests/test-temp-cleanup.test.mjs",
     "tests/windows-neutral.test.mjs",
     "tests/worker-broker-evidence_part4.mjs",
     "tests/worker-broker-evidence_part8.mjs",
     "tests/worker-cli-authority.test.mjs",
     "tests/worker-mailbox.test.mjs",
-    "tests/worker-mutation_part2.mjs",
     "tests/worker-owner-lifecycle.test.mjs",
     "tests/worker-provider-rotation-intent.test.mjs",
     "tests/worker-startup-crash-window.test.mjs"
+  ]),
+  Object.freeze([
+    "tests/runtime.test.mjs",
+    "tests/worker-mutation_part2.mjs"
   ])
 ]);
 
-const SHARD_SPECIFICATION = /^([1-3])\/3$/u;
+const SHARD_SPECIFICATION = /^([1-4])\/4$/u;
 
 export function parseDeterministicShardArgument(argv = []) {
   if (!Array.isArray(argv)) throw new TypeError("Deterministic test arguments must be an array.");
@@ -118,7 +121,7 @@ export function parseDeterministicShardArgument(argv = []) {
   }
   const match = /^--shard=(.+)$/u.exec(argv[0]);
   if (!match || !SHARD_SPECIFICATION.test(match[1])) {
-    throw new Error("The deterministic shard must be one of 1/3, 2/3, or 3/3.");
+    throw new Error("The deterministic shard must be one of 1/4, 2/4, 3/4, or 4/4.");
   }
   return Number(match[1][0]);
 }

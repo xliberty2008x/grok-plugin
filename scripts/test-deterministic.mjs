@@ -48,7 +48,7 @@ function selectedDeterministicTestFiles(argv) {
     shard = parseDeterministicShardArgument(argv);
   } catch {
     process.stderr.write(
-      "Usage: node scripts/test-deterministic.mjs [--shard=1/3|--shard=2/3|--shard=3/3]\n"
+      "Usage: node scripts/test-deterministic.mjs [--shard=1/4|--shard=2/4|--shard=3/4|--shard=4/4]\n"
     );
     return null;
   }
