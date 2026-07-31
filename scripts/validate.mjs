@@ -286,6 +286,7 @@ if (!versionsOnly) {
     ".agents/plugins/marketplace.json",
     ".github/workflows/ci.yml",
     "scripts/validate.mjs",
+    "scripts/cleanup-test-temp.mjs",
     "scripts/lib/ci-workflow-contract.mjs",
     "scripts/test-deterministic.mjs",
     "scripts/lib/deterministic-test-runner.mjs",
@@ -298,22 +299,43 @@ if (!versionsOnly) {
     "scripts/lib/installed-worker-mcp-mailbox-poll.mjs",
     "scripts/lib/installed-worker-mcp-setup-boundary.mjs",
     "scripts/lib/installed-worker-mcp-session-boundary.mjs",
+    "scripts/lib/test-temp.mjs",
+    "scripts/lib/test-temp-child-hook.cjs",
+    "scripts/lib/test-temp-cleanup.mjs",
+    "scripts/lib/test-temp-pidfd-signal.py",
+    "scripts/lib/test-temp-remove-helper.cjs",
+    "scripts/lib/test-temp-supervisor.mjs",
     "scripts/trusted/worker-broker-review-operation.cjs",
     "scripts/trusted/worker-broker-review.mjs",
     "tests/live-grok.test.mjs",
+    "tests/direct-temp-fallback-child.mjs",
     "tests/installed-codex.test.mjs",
     "tests/installed-worker-mcp-runner.test.mjs",
     "tests/installed-worker-mcp-setup-boundary.test.mjs",
     "tests/installed-worker-mcp-session-boundary.test.mjs",
     "tests/natural-codex-output.schema.json",
+    "tests/control-plane_part1.mjs",
+    "tests/control-plane_part2.mjs",
+    "tests/control-plane_part3.mjs",
     "tests/deterministic-sharding.test.mjs",
     "tests/worker-broker-evidence.test.mjs",
+    "tests/worker-broker-evidence_part1.mjs",
+    "tests/worker-broker-evidence_part2.mjs",
+    "tests/worker-broker-evidence_part3.mjs",
+    "tests/worker-broker-evidence_part4.mjs",
+    "tests/worker-broker-evidence_part5.mjs",
+    "tests/worker-broker-evidence_part6.mjs",
+    "tests/worker-broker-evidence_part7.mjs",
+    "tests/worker-broker-evidence_part8.mjs",
+    "tests/worker-mutation_part1.mjs",
+    "tests/worker-mutation_part2.mjs",
     "tests/worker-broker-protected-review.test.mjs",
     "tests/worker-protocol.test.mjs",
     "tests/nonblocking-stdin-child.mjs",
     "tests/pty-ingress.test.mjs",
     "tests/pty-stdin-driver.py",
     "tests/stdin.test.mjs",
+    "tests/test-temp-cleanup.test.mjs",
     "tests/e2e-results/macos-0.2.99-2026-07-13.json",
     "tests/e2e-results/worker-broker/phase-1-readonly-dcb78b8.json",
     "tests/windows-neutral.test.mjs",
@@ -450,7 +472,7 @@ if (!versionsOnly) {
     if (packageJson.type !== "module") problem("The package must use ESM (`type: module`).", "package.json");
     if (packageJson.license !== "Apache-2.0") problem("Package license must be Apache-2.0.", "package.json");
     if (packageJson.engines?.node !== ">=18.18") problem("Node engine must remain >=18.18.", "package.json");
-    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "test:protected-review", "test:installed-worker-mcp", "codex:update-local", "validate", "version:check", "version:bump", "check"]) {
+    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "test:protected-review", "test:installed-worker-mcp", "test:temp:cleanup", "codex:update-local", "validate", "version:check", "version:bump", "check"]) {
       if (!packageJson.scripts?.[script]) problem(`Missing npm script: ${script}.`, "package.json");
     }
     if (packageJson.scripts?.["test:pty-ingress"] !== "node --test tests/pty-ingress.test.mjs") {
@@ -468,6 +490,9 @@ if (!versionsOnly) {
     }
     if (packageJson.scripts?.["test:deterministic"] !== "node scripts/test-deterministic.mjs") {
       problem("test:deterministic must execute the zero-skip deterministic runner directly.", "package.json");
+    }
+    if (packageJson.scripts?.["test:temp:cleanup"] !== "node scripts/cleanup-test-temp.mjs") {
+      problem("test:temp:cleanup must execute the guarded test-temp cleanup command directly.", "package.json");
     }
     if (packageJson.scripts?.check !== "npm run validate && npm run test:deterministic") {
       problem("check must run validation and the zero-skip deterministic suite.", "package.json");

@@ -1,8 +1,9 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+
+import { createTestFixtureDirectory } from "../scripts/lib/test-temp.mjs";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const COMPANION = path.join(ROOT, "plugins", "grok", "scripts", "grok-companion.mjs");
@@ -23,7 +24,7 @@ function withoutProofPythonControl(env = process.env) {
 }
 
 export function tempDir(prefix = "grok-plugin-test-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  return createTestFixtureDirectory(prefix);
 }
 
 export function run(command, args = [], options = {}) {
@@ -90,9 +91,18 @@ export function runCompanion(args, {
   input,
   companionScript = COMPANION
 } = {}) {
-  return run(process.execPath, [companionScript, ...args], {
+  const companionPreload = env?.GROK_TEST_COMPANION_PRELOAD;
+  const childEnv = { ...(env || process.env) };
+  delete childEnv.GROK_TEST_COMPANION_PRELOAD;
+  return run(process.execPath, [
+    ...(path.isAbsolute(companionPreload || "")
+      ? [`--require=${companionPreload}`]
+      : []),
+    companionScript,
+    ...args
+  ], {
     cwd,
-    env,
+    env: childEnv,
     timeout,
     input
   });

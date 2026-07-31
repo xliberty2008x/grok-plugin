@@ -14,6 +14,7 @@ import {
   buildWorkflowStopSlashCommand,
   cleanupResearchRuntimeArtifacts,
   collectResearchReport,
+  createWebOnlyCwd,
   createWorkflowBinder,
   createWorkspaceSnapshot,
   DEEP_RESEARCH_KIND,
@@ -37,7 +38,7 @@ import {
 import { profileFor, sameSecurityProfile } from "../plugins/grok/scripts/lib/profiles.mjs";
 import { generateId, readJob, writeJob } from "../plugins/grok/scripts/lib/state.mjs";
 import { projectWorkerSnapshot } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
-import { assertSafeJobId } from "../plugins/grok/scripts/lib/workspace.mjs";
+import { assertSafeJobId, workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 import { integritySnapshot } from "../plugins/grok/scripts/lib/git-review.mjs";
 import { resolveProviderExecutablePin } from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
 import { git, initRepo, tempDir, ROOT, testEnvironment } from "./helpers.mjs";
@@ -48,6 +49,16 @@ function fixtureHome(t) {
   const root = tempDir("deep-research-home-");
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return root;
+}
+
+function assertFakeProviderCwdKeyFits(stateDir, jobMarker) {
+  const providerCwd = createWebOnlyCwd(stateDir, jobMarker);
+  const key = encodeURIComponent(fs.realpathSync(providerCwd));
+  const keyBytes = Buffer.byteLength(key, "utf8");
+  assert.ok(
+    keyBytes <= 255,
+    `Fake-provider cwd key exceeds the macOS filename-component limit: ${keyBytes} bytes`
+  );
 }
 
 test("parseDeepResearchOptions defaults to background and web-only", () => {
@@ -895,7 +906,9 @@ test("fake-ACP lifecycle: session-scoped capability, launch-ack nonterminal, rep
 test("detached deep-research uses the setup-pinned provider instead of ambient discovery", (t) => {
   if (process.platform === "win32") return;
   const root = initRepo();
-  const pluginData = tempDir("deep-research-pinned-plugin-");
+  // Keep fixture-owned roots short: the provider stores an encoded cwd as one
+  // filename component, whose portable/macOS limit is 255 bytes.
+  const pluginData = tempDir("grok-plugin-data-");
   const fakeRoot = tempDir("deep-research-pinned-fake-");
   const poisonRoot = tempDir("deep-research-poison-fake-");
   const fake = installFakeGrok(fakeRoot, {
@@ -944,6 +957,10 @@ test("detached deep-research uses the setup-pinned provider instead of ambient d
   );
   assert.equal(setup.status, 0, setup.stderr || setup.stdout);
   assert.equal(JSON.parse(setup.stdout).grok.version, "0.2.99");
+  assertFakeProviderCwdKeyFits(
+    workspaceState(root, pinned.env),
+    `deep-research-${"0".repeat(24)}`
+  );
 
   const poisonedEnv = {
     ...pinned.env,
@@ -1211,7 +1228,9 @@ test("fake-ACP capability evidence is paired and bound to the newly-created sess
     }
   ];
 
-  for (const fixture of cases) {
+  for (const [fixtureIndex, fixture] of cases.entries()) {
+    const fixtureId = String(fixtureIndex + 1).padStart(2, "0");
+    const jobMarker = `deep-research-cap-${fixtureId}`;
     const fakeRoot = tempDir(`deep-research-capability-${fixture.name}-fake-`);
     const logFile = path.join(fakeRoot, "provider.jsonl");
     const fake = installFakeGrok(fakeRoot, {
@@ -1221,22 +1240,23 @@ test("fake-ACP capability evidence is paired and bound to the newly-created sess
       authMethods: [{ id: "local", name: "Local test auth" }],
       ...fixture.config
     });
-    const pluginData = tempDir(`deep-research-capability-${fixture.name}-plugin-`);
+    const pluginData = tempDir("grok-plugin-data-");
     const root = initRepo();
-    const state = tempDir(`deep-research-capability-${fixture.name}-state-`);
+    const state = tempDir("deep-research-state-");
     Object.assign(process.env, testEnvironment({
       fake,
       pluginData,
-      sessionId: `deep-research-capability-${fixture.name}`
+      sessionId: `deep-research-cap-${fixtureId}`
     }));
     try {
+      assertFakeProviderCwdKeyFits(state, jobMarker);
       const invocation = () => runDeepResearch({
         root,
         profile: profileFor("deep-research"),
         query: `capability ${fixture.name}`,
         options: { "web-only": true },
         stateDir: state,
-        jobMarker: `deep-research-capability-${fixture.name}`,
+        jobMarker,
         timeoutMs: 5_000,
         testHooks: {
           allowUnpinnedProvider: true,

@@ -50,9 +50,19 @@ function hook(script, phase, event, { cwd, env, timeout = 15000 } = {}) {
 }
 
 function spawnHook(script, phase, event, { cwd, env }) {
-  const child = spawn(process.execPath, [script, ...(phase ? [phase] : [])], {
+  const signalInjectionPreload =
+    env.GROK_TEST_SESSION_END_SIGNAL_PRELOAD;
+  const childEnv = { ...env };
+  delete childEnv.GROK_TEST_SESSION_END_SIGNAL_PRELOAD;
+  const child = spawn(process.execPath, [
+    ...(path.isAbsolute(signalInjectionPreload || "")
+      ? [`--require=${signalInjectionPreload}`]
+      : []),
+    script,
+    ...(phase ? [phase] : [])
+  ], {
     cwd,
-    env,
+    env: childEnv,
     shell: false,
     stdio: ["pipe", "pipe", "pipe"]
   });
@@ -199,10 +209,7 @@ function injectedSessionEndSignalEnv(env, mode, privatePath) {
   ].join("\n"), { mode: 0o600 });
   return {
     ...env,
-    NODE_OPTIONS: [
-      env.NODE_OPTIONS,
-      `--require=${preload}`
-    ].filter(Boolean).join(" "),
+    GROK_TEST_SESSION_END_SIGNAL_PRELOAD: preload,
     GROK_TEST_SESSION_END_SIGNAL_MODE: mode,
     GROK_TEST_SESSION_END_PRIVATE_PATH: privatePath
   };

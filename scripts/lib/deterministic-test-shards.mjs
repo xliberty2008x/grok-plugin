@@ -1,13 +1,35 @@
-export const DETERMINISTIC_TEST_SHARD_COUNT = 3;
+export const DETERMINISTIC_TEST_SHARD_COUNT = 4;
+export const DETERMINISTIC_AGGREGATE_TEST_FILES = Object.freeze([
+  "tests/control-plane.test.mjs",
+  "tests/worker-broker-evidence.test.mjs",
+  "tests/worker-mutation.test.mjs"
+]);
+export const DETERMINISTIC_SUPPORT_TEST_FILES = Object.freeze([
+  "tests/control-plane_part1.mjs",
+  "tests/control-plane_part2.mjs",
+  "tests/control-plane_part3.mjs",
+  "tests/worker-broker-evidence_part1.mjs",
+  "tests/worker-broker-evidence_part2.mjs",
+  "tests/worker-broker-evidence_part3.mjs",
+  "tests/worker-broker-evidence_part4.mjs",
+  "tests/worker-broker-evidence_part5.mjs",
+  "tests/worker-broker-evidence_part6.mjs",
+  "tests/worker-broker-evidence_part7.mjs",
+  "tests/worker-broker-evidence_part8.mjs",
+  "tests/worker-mutation_part1.mjs",
+  "tests/worker-mutation_part2.mjs"
+]);
 
-// Duration-balanced with longest-processing-time assignment from the
-// macOS / Node 22 lane in Actions run 30382034077 on 2026-07-28. Keep this
-// manifest explicit: validation must fail when the deterministic inventory
-// changes until the new file is deliberately assigned.
+// Duration-balanced from the macOS and Linux lanes in Actions runs
+// 30516745831, 30567663739, and 30604307011. Shards 1 and 2 retain their
+// successful assignments; the two largest whole-file costs from the old
+// shard 3 moved to shard 4 after both macOS lanes reached the 30-minute bound.
+// Keep this manifest explicit: validation must fail when the deterministic
+// inventory changes until the new file is deliberately assigned.
 export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
   Object.freeze([
     "tests/ci-post-grok-review.test.mjs",
-    "tests/control-plane.test.mjs",
+    "tests/control-plane_part1.mjs",
     "tests/deterministic-sharding.test.mjs",
     "tests/git-review.test.mjs",
     "tests/grok-review-app-target-collector.test.mjs",
@@ -16,6 +38,9 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/process-control-owned-identity.test.mjs",
     "tests/provider-capability.test.mjs",
     "tests/version-policy.test.mjs",
+    "tests/worker-broker-evidence_part2.mjs",
+    "tests/worker-broker-evidence_part3.mjs",
+    "tests/worker-broker-evidence_part6.mjs",
     "tests/worker-broker-phase3-evidence.test.mjs",
     "tests/worker-execution-binding.test.mjs",
     "tests/worker-host-actions.test.mjs",
@@ -31,6 +56,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
   ]),
   Object.freeze([
     "tests/acp-client.test.mjs",
+    "tests/control-plane_part2.mjs",
     "tests/grok-review-app-runner.test.mjs",
     "tests/grok-review-app-worker.test.mjs",
     "tests/hooks.test.mjs",
@@ -43,9 +69,12 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/readonly-status.test.mjs",
     "tests/state.test.mjs",
     "tests/stdin.test.mjs",
-    "tests/worker-broker-evidence.test.mjs",
+    "tests/worker-broker-evidence_part1.mjs",
+    "tests/worker-broker-evidence_part5.mjs",
+    "tests/worker-broker-evidence_part7.mjs",
     "tests/worker-context-roles.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
+    "tests/worker-mutation_part1.mjs",
     "tests/worker-presentation.test.mjs",
     "tests/worker-reconcile-safety.test.mjs",
     "tests/worker-session-close-environment.test.mjs"
@@ -54,6 +83,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/args-redaction-profiles.test.mjs",
     "tests/ci-auth-sync.test.mjs",
     "tests/codex-support.test.mjs",
+    "tests/control-plane_part3.mjs",
     "tests/deep-research.test.mjs",
     "tests/executable-identity.test.mjs",
     "tests/grok-review-app-github.test.mjs",
@@ -65,18 +95,23 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/provider-startup-cancel.test.mjs",
     "tests/recursion-guard.test.mjs",
     "tests/redact.test.mjs",
-    "tests/runtime.test.mjs",
+    "tests/test-temp-cleanup.test.mjs",
     "tests/windows-neutral.test.mjs",
+    "tests/worker-broker-evidence_part4.mjs",
+    "tests/worker-broker-evidence_part8.mjs",
     "tests/worker-cli-authority.test.mjs",
     "tests/worker-mailbox.test.mjs",
-    "tests/worker-mutation.test.mjs",
     "tests/worker-owner-lifecycle.test.mjs",
     "tests/worker-provider-rotation-intent.test.mjs",
     "tests/worker-startup-crash-window.test.mjs"
+  ]),
+  Object.freeze([
+    "tests/runtime.test.mjs",
+    "tests/worker-mutation_part2.mjs"
   ])
 ]);
 
-const SHARD_SPECIFICATION = /^([1-3])\/3$/u;
+const SHARD_SPECIFICATION = /^([1-4])\/4$/u;
 
 export function parseDeterministicShardArgument(argv = []) {
   if (!Array.isArray(argv)) throw new TypeError("Deterministic test arguments must be an array.");
@@ -86,7 +121,7 @@ export function parseDeterministicShardArgument(argv = []) {
   }
   const match = /^--shard=(.+)$/u.exec(argv[0]);
   if (!match || !SHARD_SPECIFICATION.test(match[1])) {
-    throw new Error("The deterministic shard must be one of 1/3, 2/3, or 3/3.");
+    throw new Error("The deterministic shard must be one of 1/4, 2/4, 3/4, or 4/4.");
   }
   return Number(match[1][0]);
 }
@@ -123,8 +158,9 @@ export function validateDeterministicTestShards({
       errors.push(`Deterministic shard ${index + 1} must be a nonempty array.`);
       continue;
     }
+    const supportFiles = new Set(DETERMINISTIC_SUPPORT_TEST_FILES);
     if (files.some((file) => typeof file !== "string"
-      || !/^tests\/[^/]+\.test\.mjs$/u.test(file))) {
+      || (!/^tests\/[^/]+\.test\.mjs$/u.test(file) && !supportFiles.has(file)))) {
       errors.push(`Deterministic shard ${index + 1} contains an invalid test path.`);
       continue;
     }

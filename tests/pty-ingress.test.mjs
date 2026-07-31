@@ -50,6 +50,17 @@ function jobRecordFiles(root) {
   return found;
 }
 
+function removeFixtureDirectories(directories) {
+  for (const directory of directories) {
+    fs.rmSync(directory, {
+      recursive: true,
+      force: true,
+      maxRetries: 100,
+      retryDelay: 25
+    });
+  }
+}
+
 test("PTY harness uses but does not expose the proof-only Python binding", {
   skip: process.platform === "win32"
     ? "PTY harness is POSIX-only"
@@ -60,7 +71,7 @@ test("PTY harness uses but does not expose the proof-only Python binding", {
   const wrapper = path.join(root, "bound-python-wrapper");
   const argumentLog = path.join(root, "python-arguments.log");
   const exposedMarker = path.join(root, "proof-python-was-exposed");
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeFixtureDirectories([root]));
   fs.writeFileSync(wrapper, [
     "#!/bin/sh",
     `printf '%s\\n' "$*" >> ${shellSingleQuote(argumentLog)}`,
@@ -111,9 +122,7 @@ test("source Codex wrapper survives delayed input on a genuinely nonblocking PTY
   const root = initRepo();
   const pluginData = tempDir("grok-source-pty-data-");
   const fakeRoot = tempDir("grok-source-pty-fake-");
-  t.after(() => {
-    for (const directory of [root, pluginData, fakeRoot]) fs.rmSync(directory, { recursive: true, force: true });
-  });
+  t.after(() => removeFixtureDirectories([root, pluginData, fakeRoot]));
 
   const fake = installFakeGrok(fakeRoot, {
     taskText: `GROK_WORKER_REPORT: ${JSON.stringify({
@@ -259,9 +268,7 @@ test("original issue #2 invocation waits for a delayed PTY writer without a read
   const root = initRepo();
   const pluginData = tempDir("grok-source-pty-no-ready-data-");
   const fakeRoot = tempDir("grok-source-pty-no-ready-fake-");
-  t.after(() => {
-    for (const directory of [root, pluginData, fakeRoot]) fs.rmSync(directory, { recursive: true, force: true });
-  });
+  t.after(() => removeFixtureDirectories([root, pluginData, fakeRoot]));
   const fake = installFakeGrok(fakeRoot, {
     taskText: `GROK_WORKER_REPORT: ${JSON.stringify({
       outcome: "complete",
@@ -363,9 +370,7 @@ test("task envelope stdin keeps empty, malformed, and oversized failures as publ
   const root = initRepo();
   const pluginData = tempDir("grok-source-stdin-negative-data-");
   const fakeRoot = tempDir("grok-source-stdin-negative-fake-");
-  t.after(() => {
-    for (const directory of [root, pluginData, fakeRoot]) fs.rmSync(directory, { recursive: true, force: true });
-  });
+  t.after(() => removeFixtureDirectories([root, pluginData, fakeRoot]));
   const fake = installFakeGrok(fakeRoot);
   const env = testEnvironment({
     fake,

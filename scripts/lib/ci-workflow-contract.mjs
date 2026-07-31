@@ -9,32 +9,76 @@ function workflowJob(source, jobId) {
 }
 
 function containsContinueOnError(job) {
-  return /^\s+continue-on-error\s*:/imu.test(job);
+  return /^\s+(?:"continue-on-error"|'continue-on-error'|continue-on-error)\s*:/imu.test(job);
+}
+
+function hasExactJobLevelFields(job, expectedLines) {
+  const actualLines = job
+    .split("\n")
+    .filter((line) => /^    \S/u.test(line) && !line.trimStart().startsWith("#"));
+  return JSON.stringify(actualLines) === JSON.stringify(expectedLines);
 }
 
 function workflowMatrix(job) {
-  return /strategy:\s*\n[\s\S]*?matrix:\s*\n([\s\S]*?)\n\s{4}steps:/u.exec(job)?.[1] ?? "";
+  const lines = job.split("\n");
+  const strategyIndexes = [];
+  const stepsIndexes = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index] === "    strategy:") strategyIndexes.push(index);
+    if (lines[index] === "    steps:") stepsIndexes.push(index);
+  }
+  if (
+    strategyIndexes.length !== 1
+    || stepsIndexes.length !== 1
+    || strategyIndexes[0] >= stepsIndexes[0]
+    || lines[strategyIndexes[0] + 1] !== "      fail-fast: false"
+    || lines[strategyIndexes[0] + 2] !== "      matrix:"
+  ) {
+    return null;
+  }
+  return lines
+    .slice(strategyIndexes[0] + 3, stepsIndexes[0])
+    .join("\n")
+    .trimEnd();
 }
 
 function workflowStep(job, stepName) {
+  const stepsMarker = "\n    steps:\n";
+  const stepsStart = job.indexOf(stepsMarker);
+  if (
+    stepsStart < 0
+    || job.indexOf(stepsMarker, stepsStart + stepsMarker.length) >= 0
+  ) {
+    return null;
+  }
+  const remainder = job.slice(stepsStart + stepsMarker.length);
+  const nextJobField = /^    \S.*$/mu.exec(remainder);
+  const steps = nextJobField == null
+    ? remainder
+    : remainder.slice(0, nextJobField.index);
   const marker = `      - name: ${stepName}\n`;
-  const start = job.indexOf(marker);
+  const start = steps.indexOf(marker);
   if (start < 0) return null;
+  if (steps.indexOf(marker, start + marker.length) >= 0) return null;
   const bodyStart = start + marker.length;
-  const nextStep = /^      - name:\s+/imu.exec(job.slice(bodyStart));
-  const end = nextStep ? bodyStart + nextStep.index : job.length;
-  return job.slice(start, end);
+  const nextStep = /^      - name:\s+/imu.exec(steps.slice(bodyStart));
+  const end = nextStep ? bodyStart + nextStep.index : steps.length;
+  return steps.slice(start, end);
 }
 
-function isExactMatrix(matrix, checks) {
-  return !/^\s*(?:include|exclude)\s*:/imu.test(matrix)
-    && checks.every((check) => check.test(matrix));
+function isExactMatrix(matrix, expectedLines) {
+  return typeof matrix === "string"
+    && matrix === expectedLines.join("\n");
 }
 
 function isUnconditionalRunStep(step, command) {
-  return step != null
-    && !/^\s+(?:if|continue-on-error|shell)\s*:/imu.test(step)
-    && new RegExp(`^\\s{8}run:\\s*${command}\\s*$`, "mu").test(step);
+  if (step == null) return false;
+  const lines = step
+    .split("\n")
+    .filter((line) => line.trim() !== "" && !line.trimStart().startsWith("#"));
+  return lines.length === 2
+    && /^      - name:\s+\S/u.test(lines[0])
+    && new RegExp(`^\\s{8}run:\\s*${command}\\s*$`, "u").test(lines[1]);
 }
 
 function isShardOneValidationStep(step) {
@@ -45,7 +89,7 @@ function isShardOneValidationStep(step) {
   ].join("\n");
 }
 
-export function validateHostedCiWorkflow(source, { shardCount = 3 } = {}) {
+export function validateHostedCiWorkflow(source, { shardCount = 4 } = {}) {
   source = source.replace(/\r\n?/gu, "\n");
   const errors = [];
   const expectedTriggers = [
@@ -66,8 +110,18 @@ export function validateHostedCiWorkflow(source, { shardCount = 3 } = {}) {
     : workflowStep(ptyJob, "Run source PTY ingress regression");
   if (ptyJob == null
     || containsContinueOnError(ptyJob)
+    || !hasExactJobLevelFields(ptyJob, [
+      "    name: PTY ingress / ${{ matrix.os }}",
+      "    runs-on: ${{ matrix.os }}",
+      "    timeout-minutes: 10",
+      "    strategy:",
+      "    steps:"
+    ])
+    || !/^    runs-on:\s*\$\{\{\s*matrix\.os\s*\}\}\s*$/mu.test(ptyJob)
+    || !/^    timeout-minutes:\s*10\s*$/mu.test(ptyJob)
+    || !/^      fail-fast:\s*false\s*$/mu.test(ptyJob)
     || !isExactMatrix(ptyMatrix, [
-      /os:\s*\[ubuntu-latest,\s*macos-latest\]/u
+      "        os: [ubuntu-latest, macos-latest]"
     ])
     || !isUnconditionalRunStep(ptyRun, "npm run test:pty-ingress")) {
     errors.push("CI must preserve both fail-closed hosted PTY ingress gates.");
@@ -80,27 +134,34 @@ export function validateHostedCiWorkflow(source, { shardCount = 3 } = {}) {
     const matrix = workflowMatrix(unixJob);
     const validationRun = workflowStep(unixJob, "Validate release structure");
     const deterministicRun = workflowStep(unixJob, "Run deterministic zero-skip shard");
-    if (!/runs-on:\s*\$\{\{\s*matrix\.os\s*\}\}/u.test(unixJob)
+    if (!hasExactJobLevelFields(unixJob, [
+      `    name: \${{ matrix.os }} / Node \${{ matrix.node }} / shard \${{ matrix.shard }}/${shardCount}`,
+      "    runs-on: ${{ matrix.os }}",
+      "    timeout-minutes: 30",
+      "    strategy:",
+      "    steps:"
+    ])
+      || !/^    runs-on:\s*\$\{\{\s*matrix\.os\s*\}\}\s*$/mu.test(unixJob)
       || !/^    timeout-minutes:\s*30\s*$/mu.test(unixJob)
-      || !/fail-fast:\s*false\b/u.test(unixJob)
+      || !/^      fail-fast:\s*false\s*$/mu.test(unixJob)
       || containsContinueOnError(unixJob)
       || /windows-latest/u.test(matrix)
       || !isExactMatrix(matrix, [
-        /os:\s*\[ubuntu-latest,\s*macos-latest\]/u,
-        /node:\s*\[18\.18\.2,\s*22\.x\]/u,
-        new RegExp(`shard:\\s*\\[${Array.from(
+        "        os: [ubuntu-latest, macos-latest]",
+        "        node: [18.18.2, 22.x]",
+        `        shard: [${Array.from(
           { length: shardCount },
           (_, index) => index + 1
-        ).join(",\\s*")}\\]`, "u")
+        ).join(", ")}]`
       ])) {
-      errors.push("The Unix deterministic matrix must remain OS x Node x three exact shards with a 30-minute budget and fail-fast disabled.");
+      errors.push(`The Unix deterministic matrix must remain OS x Node x ${shardCount} exact shards with a 30-minute budget and fail-fast disabled.`);
     }
     if (!isShardOneValidationStep(validationRun)) {
       errors.push("Each Unix OS/Node combination must run structural validation only on shard 1.");
     }
     if (!isUnconditionalRunStep(
       deterministicRun,
-      "npm run test:deterministic -- --shard=\\$\\{\\{\\s*matrix\\.shard\\s*\\}\\}/3"
+      `npm run test:deterministic -- --shard=\\$\\{\\{\\s*matrix\\.shard\\s*\\}\\}/${shardCount}`
     )) {
       errors.push("Each Unix matrix cell must run its exact deterministic shard.");
     }
@@ -116,10 +177,18 @@ export function validateHostedCiWorkflow(source, { shardCount = 3 } = {}) {
     : workflowStep(windowsJob, "Run provider-neutral tests (Windows; provider unverified)");
   if (windowsJob == null
     || containsContinueOnError(windowsJob)
-    || !/runs-on:\s*windows-latest/u.test(windowsJob)
-    || !/timeout-minutes:\s*45\b/u.test(windowsJob)
+    || !hasExactJobLevelFields(windowsJob, [
+      "    name: windows-latest / Node ${{ matrix.node }}",
+      "    runs-on: windows-latest",
+      "    timeout-minutes: 45",
+      "    strategy:",
+      "    steps:"
+    ])
+    || !/^    runs-on:\s*windows-latest\s*$/mu.test(windowsJob)
+    || !/^    timeout-minutes:\s*45\s*$/mu.test(windowsJob)
+    || !/^      fail-fast:\s*false\s*$/mu.test(windowsJob)
     || !isExactMatrix(windowsMatrix, [
-      /node:\s*\[18\.18\.2,\s*22\.x\]/u
+      "        node: [18.18.2, 22.x]"
     ])
     || !isUnconditionalRunStep(windowsValidate, "npm run validate")
     || !isUnconditionalRunStep(windowsRun, "node --test tests/windows-neutral\\.test\\.mjs")) {

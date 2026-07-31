@@ -549,10 +549,7 @@ function injectedImportSignalEnv(env, mode, privatePath) {
   return {
     env: {
       ...env,
-      NODE_OPTIONS: [
-        env.NODE_OPTIONS,
-        `--require=${preload}`
-      ].filter(Boolean).join(" "),
+      GROK_TEST_COMPANION_PRELOAD: preload,
       GROK_TEST_IMPORT_SIGNAL_LOG: logFile,
       GROK_TEST_IMPORT_SIGNAL_MODE: mode,
       GROK_TEST_IMPORT_SIGNAL_PRIVATE_PATH: privatePath
@@ -1443,43 +1440,30 @@ test("static human launch surfaces use public worker projections", () => {
 });
 
 test("foreground launch-unsettled failures retain a public durable job handle", (t) => {
-  const launcherHook = path.join(
-    tempDir("grok-launch-unsettled-hook-"),
-    "force-launcher-exit.cjs"
-  );
-  fs.writeFileSync(
-    launcherHook,
-    [
-      'if (process.argv.includes("--launch-worker")) {',
-      '  process.stderr.write("forced launcher exit\\n");',
-      "  process.exit(42);",
-      "}",
-      ""
-    ].join("\n"),
-    { mode: 0o600 }
-  );
-  const launchEnv = (env) => ({
-    ...env,
-    NODE_OPTIONS: [
-      env.NODE_OPTIONS,
-      `--require=${launcherHook}`
-    ].filter(Boolean).join(" ")
-  });
   const forcedLauncherFixture = () => {
     const runtime = fixture();
     const pinned = installPinnedFakeCompanion(runtime.fake, runtime.env);
     t.after(pinned.cleanup);
     const source = fs.readFileSync(pinned.companionScript, "utf8");
-    const needle = "const allowed = new Set([";
-    assert.equal(source.split(needle).length - 1, 1);
+    const injection = [
+      'if (process.argv.includes("--launch-worker")) {',
+      '  process.stderr.write("forced launcher exit\\n");',
+      "  process.exit(42);",
+      "}",
+      ""
+    ].join("\n");
+    const firstNewline = source.indexOf("\n");
+    const injectedSource = source.startsWith("#!") && firstNewline !== -1
+      ? `${source.slice(0, firstNewline + 1)}${injection}${source.slice(firstNewline + 1)}`
+      : `${injection}${source}`;
     fs.writeFileSync(
       pinned.companionScript,
-      source.replace(needle, 'const allowed = new Set(["NODE_OPTIONS", '),
+      injectedSource,
       "utf8"
     );
     return {
       ...runtime,
-      env: launchEnv(pinned.env),
+      env: pinned.env,
       companionScript: pinned.companionScript
     };
   };
@@ -2106,9 +2090,7 @@ test("legacy CLI cancel extracts the broker object authorization nonce", async (
 });
 
 test("CLI cancel terminalizes only cleanup-proven broker boundaries and retains ambiguous launch states", { timeout: 60_000 }, async () => {
-  const root = fs.realpathSync(initRepo());
   const runtime = codexBrokerFixture();
-  const stateRoot = workspaceState(root, runtime.env);
   const cases = [
     {
       name: "pending",
@@ -2137,10 +2119,19 @@ test("CLI cancel terminalizes only cleanup-proven broker boundaries and retains 
     }
   ];
 
+  // These cases assert independent launch-boundary semantics. Give each one a
+  // private workspace so parallel CLI recovery cannot turn the test into a
+  // shared state-lock scheduling benchmark.
   for (const fixture of cases) {
-    const spawned = spawnPendingBrokerJob(root, runtime, `runtime-cancel-settlement-${fixture.name}`);
+    fixture.root = fs.realpathSync(initRepo());
+    fixture.stateRoot = workspaceState(fixture.root, runtime.env);
+    const spawned = spawnPendingBrokerJob(
+      fixture.root,
+      runtime,
+      `runtime-cancel-settlement-${fixture.name}`
+    );
     fixture.id = spawned.handle.id;
-    updateJob(root, fixture.id, (job) => {
+    updateJob(fixture.root, fixture.id, (job) => {
       const spawnState = { ...job.request.spawn };
       if (fixture.launch) Object.assign(spawnState, fixture.launch);
       else {
@@ -2153,16 +2144,25 @@ test("CLI cancel terminalizes only cleanup-proven broker boundaries and retains 
         request: { ...job.request, spawn: spawnState }
       };
     }, runtime.env);
-    fixture.before = readJob(root, fixture.id, runtime.env);
+    fixture.before = readJob(fixture.root, fixture.id, runtime.env);
     fixture.nonce = fixture.before.workerAuthorization.nonce;
-    fixture.runtimeFile = path.join(stateRoot, "task-homes", fixture.id, ".grok", "auth.json");
+    fixture.runtimeFile = path.join(
+      fixture.stateRoot,
+      "task-homes",
+      fixture.id,
+      ".grok",
+      "auth.json"
+    );
     fs.mkdirSync(path.dirname(fixture.runtimeFile), { recursive: true, mode: 0o700 });
     fs.writeFileSync(fixture.runtimeFile, `private-${fixture.name}-runtime\n`, { mode: 0o600 });
   }
 
   const canceling = cases.map((fixture) => ({
     fixture,
-    process: spawnCompanion(["cancel", fixture.id, "--json"], { cwd: root, env: runtime.env })
+    process: spawnCompanion(
+      ["cancel", fixture.id, "--json"],
+      { cwd: fixture.root, env: runtime.env }
+    )
   }));
 
   const outcomes = await Promise.all(canceling.map(async ({ fixture, process: running }) => ({
@@ -2172,8 +2172,8 @@ test("CLI cancel terminalizes only cleanup-proven broker boundaries and retains 
   for (const { fixture, completed } of outcomes) {
     assert.equal(completed.code, 0, completed.stderr || completed.stdout);
     const projected = JSON.parse(completed.stdout);
-    const stored = readJob(root, fixture.id, runtime.env);
-    const marker = path.join(stateRoot, "jobs", `${fixture.id}.cancel`);
+    const stored = readJob(fixture.root, fixture.id, runtime.env);
+    const marker = path.join(fixture.stateRoot, "jobs", `${fixture.id}.cancel`);
     assert.equal(fs.readFileSync(marker, "utf8"), `${fixture.nonce}\n`);
 
     if (!fixture.retained) {
@@ -2202,7 +2202,10 @@ test("CLI cancel terminalizes only cleanup-proven broker boundaries and retains 
     assert.equal(fs.existsSync(fixture.runtimeFile), true, `${fixture.name} runtime must be retained`);
     assert.doesNotMatch(stored.error?.message || "", new RegExp(fixture.id));
     assert.doesNotMatch(stored.error?.message || "", new RegExp(fixture.nonce));
-    assert.doesNotMatch(completed.stdout, new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.doesNotMatch(
+      completed.stdout,
+      new RegExp(fixture.root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    );
     assert.doesNotMatch(completed.stderr, new RegExp(fixture.nonce));
   }
 });

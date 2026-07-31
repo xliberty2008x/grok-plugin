@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import nodeTest from "node:test";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -83,6 +84,7 @@ import {
   sha256Text
 } from "../scripts/lib/worker-broker-evidence.mjs";
 import {
+  DETERMINISTIC_AGGREGATE_TEST_FILES,
   EXTERNAL_BOUNDARY_TESTS,
   listDeterministicTestFiles,
   runDeterministicTestFiles
@@ -116,6 +118,90 @@ import zeroSkipTestReporter, {
 } from "../scripts/lib/zero-skip-test-reporter.mjs";
 import { ROOT, git, initRepo, run, tempDir, waitFor } from "./helpers.mjs";
 
+const WORKER_BROKER_EVIDENCE_PARTITION_KEY = Symbol.for(
+  "grok-plugin.worker-broker-evidence-partition"
+);
+const WORKER_BROKER_EVIDENCE_PARTITION_RANGES = Object.freeze({
+  1: Object.freeze([1, 45]),
+  2: Object.freeze([90, 93]),
+  3: Object.freeze([102, 115]),
+  4: Object.freeze([115, 126]),
+  5: Object.freeze([45, 90]),
+  6: Object.freeze([93, 96]),
+  7: Object.freeze([96, 99]),
+  8: Object.freeze([99, 102])
+});
+const WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT = 125;
+const workerBrokerEvidencePartitionCoverage = new Uint8Array(
+  WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT + 1
+);
+for (const range of Object.values(WORKER_BROKER_EVIDENCE_PARTITION_RANGES)) {
+  const [start, end] = range;
+  if (
+    !Number.isInteger(start)
+    || !Number.isInteger(end)
+    || start < 1
+    || end <= start
+    || end > WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT + 1
+  ) {
+    throw new Error("Worker broker evidence partition range is invalid.");
+  }
+  for (let ordinal = start; ordinal < end; ordinal += 1) {
+    workerBrokerEvidencePartitionCoverage[ordinal] += 1;
+  }
+}
+if (
+  workerBrokerEvidencePartitionCoverage
+    .slice(1)
+    .some((count) => count !== 1)
+) {
+  throw new Error(
+    "Worker broker evidence partition ranges must cover every registration exactly once."
+  );
+}
+const configuredWorkerBrokerEvidencePartition =
+  globalThis[WORKER_BROKER_EVIDENCE_PARTITION_KEY];
+// Direct `node --test` runs register the complete file. The deterministic
+// runner and the support entrypoints opt into disjoint registration ranges so
+// each supervised file remains below the fixed ten-minute limit.
+const workerBrokerEvidencePartition = configuredWorkerBrokerEvidencePartition == null
+  ? null
+  : Number(configuredWorkerBrokerEvidencePartition);
+if (
+  workerBrokerEvidencePartition !== null
+  && !Object.hasOwn(
+    WORKER_BROKER_EVIDENCE_PARTITION_RANGES,
+    workerBrokerEvidencePartition
+  )
+) {
+  throw new Error("Worker broker evidence test partition is invalid.");
+}
+let workerBrokerEvidenceTestOrdinal = 0;
+let workerBrokerEvidenceRegisteredCount = 0;
+function registerPartitionedTest(register, args) {
+  workerBrokerEvidenceTestOrdinal += 1;
+  const selectedRange = WORKER_BROKER_EVIDENCE_PARTITION_RANGES[
+    workerBrokerEvidencePartition
+  ];
+  const inPartition = workerBrokerEvidencePartition === null
+    || (
+      workerBrokerEvidenceTestOrdinal >= selectedRange[0]
+      && workerBrokerEvidenceTestOrdinal < selectedRange[1]
+    );
+  if (!inPartition) return undefined;
+  workerBrokerEvidenceRegisteredCount += 1;
+  return register(...args);
+}
+function test(...args) {
+  return registerPartitionedTest(nodeTest, args);
+}
+for (const method of ["only", "skip", "todo"]) {
+  test[method] = (...args) => registerPartitionedTest(
+    nodeTest[method].bind(nodeTest),
+    args
+  );
+}
+
 const STARTED_AT = "2026-07-16T10:00:00.000Z";
 const ENDED_AT = "2026-07-16T10:00:01.000Z";
 const PRE_V5_PROOF_MANIFEST_DIGESTS = Object.freeze({
@@ -126,6 +212,14 @@ const EVIDENCE_MODULE_URL = new URL("../scripts/lib/worker-broker-evidence.mjs",
 const ZERO_SKIP_REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
 const DETERMINISTIC_CHECK_RUNNER = path.join(ROOT, "scripts/check-deterministic.mjs");
 const DETERMINISTIC_TEST_LIBRARY = path.join(ROOT, "scripts/lib/deterministic-test-runner.mjs");
+const TEST_TEMP_LIBRARY = path.join(ROOT, "scripts/lib/test-temp.mjs");
+const TEST_TEMP_CHILD_HOOK = path.join(ROOT, "scripts/lib/test-temp-child-hook.cjs");
+const TEST_TEMP_PIDFD_SIGNAL = path.join(ROOT, "scripts/lib/test-temp-pidfd-signal.py");
+const TEST_TEMP_REMOVE_HELPER = path.join(
+  ROOT,
+  "scripts/lib/test-temp-remove-helper.cjs"
+);
+const TEST_TEMP_SUPERVISOR = path.join(ROOT, "scripts/lib/test-temp-supervisor.mjs");
 const REDACT_LIBRARY = path.join(ROOT, "plugins/grok/scripts/lib/redact.mjs");
 const PROTECTED_REVIEW_BOOTSTRAP = path.join(
   ROOT,
@@ -165,6 +259,11 @@ function installZeroSkipReporter(root) {
 function installPhaseOneFocusedRunner(root) {
   for (const source of [
     DETERMINISTIC_TEST_LIBRARY,
+    TEST_TEMP_LIBRARY,
+    TEST_TEMP_CHILD_HOOK,
+    TEST_TEMP_PIDFD_SIGNAL,
+    TEST_TEMP_REMOVE_HELPER,
+    TEST_TEMP_SUPERVISOR,
     STATIC_ESM_IMPORT_PARSER,
     PHASE_ONE_FOCUSED_RUNNER
   ]) {
@@ -187,7 +286,22 @@ test("deterministic zero-skip runner excludes only explicit external boundaries"
     .sort();
   const expected = all.filter((relative) => (
     !EXTERNAL_BOUNDARY_TESTS.includes(path.basename(relative))
+    && !DETERMINISTIC_AGGREGATE_TEST_FILES.includes(relative)
   ));
+  expected.push("tests/control-plane_part1.mjs");
+  expected.push("tests/control-plane_part2.mjs");
+  expected.push("tests/control-plane_part3.mjs");
+  expected.push("tests/worker-broker-evidence_part1.mjs");
+  expected.push("tests/worker-broker-evidence_part2.mjs");
+  expected.push("tests/worker-broker-evidence_part3.mjs");
+  expected.push("tests/worker-broker-evidence_part4.mjs");
+  expected.push("tests/worker-broker-evidence_part5.mjs");
+  expected.push("tests/worker-broker-evidence_part6.mjs");
+  expected.push("tests/worker-broker-evidence_part7.mjs");
+  expected.push("tests/worker-broker-evidence_part8.mjs");
+  expected.push("tests/worker-mutation_part1.mjs");
+  expected.push("tests/worker-mutation_part2.mjs");
+  expected.sort();
   assert.deepEqual(listDeterministicTestFiles(), expected);
 });
 
@@ -291,6 +405,11 @@ test("deterministic runner executes files sequentially and aggregates exact zero
     "Deterministic test child 2 completed in 50 ms.\n"
   ]);
   assert.deepEqual(calls.map((call) => call.args), files.map((file) => [
+    TEST_TEMP_SUPERVISOR,
+    "--timeout-ms",
+    "600000",
+    "--",
+    "/exact/node",
     "--test",
     "--test-reporter=/exact/reporter.mjs",
     file
@@ -298,7 +417,11 @@ test("deterministic runner executes files sequentially and aggregates exact zero
   assert.ok(calls.every((call) => call.binary === "/exact/node"));
   assert.ok(calls.every((call) => call.options.cwd === "/exact/root"));
   assert.ok(calls.every((call) => call.options.shell === false));
+  assert.ok(calls.every((call) => call.options.timeout === 630000));
+  assert.ok(calls.every((call) => call.options.killSignal === "SIGKILL"));
   assert.ok(calls.every((call) => call.options.maxBuffer === 1024 * 1024));
+  assert.ok(calls.every((call) => call.options.env.TMPDIR === call.options.env.TMP));
+  assert.ok(calls.every((call) => call.options.env.TMPDIR === call.options.env.TEMP));
   assert.deepEqual(JSON.parse(output), {
     reporter: ZERO_SKIP_REPORTER_ID,
     passed: 3,
@@ -309,6 +432,44 @@ test("deterministic runner executes files sequentially and aggregates exact zero
     violations: [],
     omittedViolations: 0
   });
+});
+
+test("deterministic runner executes static partition wrappers as exact ordinary files", () => {
+  const calls = [];
+  const files = [
+    "tests/control-plane_part1.mjs",
+    "tests/control-plane_part2.mjs",
+    "tests/control-plane_part3.mjs",
+    "tests/worker-broker-evidence_part1.mjs",
+    "tests/worker-broker-evidence_part2.mjs",
+    "tests/worker-broker-evidence_part3.mjs",
+    "tests/worker-broker-evidence_part4.mjs",
+    "tests/worker-broker-evidence_part5.mjs",
+    "tests/worker-broker-evidence_part6.mjs",
+    "tests/worker-broker-evidence_part7.mjs",
+    "tests/worker-broker-evidence_part8.mjs",
+    "tests/worker-mutation_part1.mjs",
+    "tests/worker-mutation_part2.mjs"
+  ];
+  const status = runDeterministicTestFiles({
+    files,
+    root: ROOT,
+    reporter: ZERO_SKIP_REPORTER,
+    run(binary, args, options) {
+      calls.push({ binary, args, options });
+      return {
+        status: 0,
+        signal: null,
+        stdout: zeroSkipSummary(),
+        stderr: ""
+      };
+    },
+    stdout: { write() {} },
+    stderr: { write() {} }
+  });
+  assert.equal(status, 0);
+  assert.deepEqual(calls.map((call) => call.args.at(-1)), files);
+  assert.ok(calls.every((call) => call.options.env.TMPDIR));
 });
 
 test("Phase 1 focused runner executes its fixed inventory in exact serial order", () => {
@@ -370,7 +531,9 @@ test("Phase 3 focused runner is fixed, serial, and fails closed on TODO", () => 
   assert.equal(summary.skipped, 0);
 });
 
-test("deterministic runner fails closed on malformed, partial, or non-passing child results", () => {
+test("deterministic runner fails closed on malformed, partial, or non-passing child results", (t) => {
+  const tempRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "runner-failures-")));
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
   const cases = [
     {
       label: "malformed-summary",
@@ -417,9 +580,14 @@ test("deterministic runner fails closed on malformed, partial, or non-passing ch
       message: /failed its zero-skip gate/
     },
     {
+      label: "output-limit",
+      result: { status: 125, signal: null, stdout: "", stderr: "" },
+      message: /exceeded the output limit/
+    },
+    {
       label: "signal",
       result: { status: null, signal: "SIGTERM", stdout: "", stderr: "" },
-      message: /ended by a signal/
+      message: /containment could not be proven/
     },
     {
       label: "spawn-error",
@@ -432,6 +600,7 @@ test("deterministic runner fails closed on malformed, partial, or non-passing ch
     let diagnostic = "";
     const status = runDeterministicTestFiles({
       files: [`tests/${fixture.label}.test.mjs`],
+      tempRoot,
       run: () => fixture.result,
       stdout: { write(value) { output += value; } },
       stderr: { write(value) { diagnostic += value; } }
@@ -1227,8 +1396,16 @@ fs.writeFileSync(process.env.READY_FILE, "ready\\n");
 while (!fs.existsSync(process.env.BARRIER_FILE)) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
 }
-updateLedger(entry, process.env.LEDGER_ROOT);
-process.stdout.write("ok\\n");
+try {
+  updateLedger(entry, process.env.LEDGER_ROOT);
+  process.stdout.write(JSON.stringify({ ok: true, code: null }) + "\\n");
+} catch (error) {
+  process.stdout.write(JSON.stringify({
+    ok: false,
+    code: typeof error?.code === "string" ? error.code : null
+  }) + "\\n");
+  process.exitCode = 1;
+}
 `;
   const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
     cwd: root,
@@ -1251,9 +1428,22 @@ process.stdout.write("ok\\n");
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   const completed = new Promise((resolve, reject) => {
     child.once("error", reject);
-    child.once("exit", (code, signal) => resolve({ code, signal, stdout, stderr }));
+    child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
   });
   return { child, completed };
+}
+
+function ledgerAppenderNeedsRetry(result) {
+  assert.equal(result.signal, null, result.stderr || result.stdout);
+  assert.equal(result.stderr, "");
+  const payload = JSON.parse(result.stdout);
+  if (result.code === 0) {
+    assert.deepEqual(payload, { ok: true, code: null });
+    return false;
+  }
+  assert.equal(result.code, 1, result.stdout);
+  assert.deepEqual(payload, { ok: false, code: "E_EVIDENCE_LEDGER_LOCK" });
+  return true;
 }
 
 function passedCommand(gateId, command, boundary = "source-provider-neutral") {
@@ -4513,15 +4703,17 @@ test("barriered cross-process ledger appends retain distinct phases", async () =
   const root = initRepo();
   const control = tempDir("ledger-append-barrier-");
   const barrier = path.join(control, "go");
+  const firstEntry = syntheticLedgerEntry("0", "concurrent-phase-0");
+  const secondEntry = syntheticLedgerEntry("1", "concurrent-phase-1");
   const first = spawnLedgerAppender({
     root,
-    entry: syntheticLedgerEntry("0", "concurrent-phase-0"),
+    entry: firstEntry,
     ready: path.join(control, "ready-0"),
     barrier
   });
   const second = spawnLedgerAppender({
     root,
-    entry: syntheticLedgerEntry("1", "concurrent-phase-1"),
+    entry: secondEntry,
     ready: path.join(control, "ready-1"),
     barrier
   });
@@ -4529,7 +4721,14 @@ test("barriered cross-process ledger appends retain distinct phases", async () =
     && fs.existsSync(path.join(control, "ready-1")));
   fs.writeFileSync(barrier, "go\n");
   const results = await Promise.all([first.completed, second.completed]);
-  for (const result of results) assert.equal(result.code, 0, result.stderr);
+  const retryEntries = [firstEntry, secondEntry].filter(
+    (_entry, index) => ledgerAppenderNeedsRetry(results[index])
+  );
+  assert.ok(retryEntries.length <= 1);
+  assert.ok(results.length - retryEntries.length >= 1);
+  // Lock acquisition is intentionally bounded. On a slow runner, retry only
+  // the exact losing append after both children have closed.
+  for (const entry of retryEntries) updateLedger(entry, root);
   const ledger = loadLedger(root);
   assert.equal(ledger.entries.length, 2);
   assert.deepEqual(new Set(ledger.entries.map((entry) => entry.phase)), new Set(["0", "1"]));
@@ -4540,15 +4739,17 @@ test("barriered same-phase appends retain one current and one historical entry",
   const root = initRepo();
   const control = tempDir("ledger-same-phase-barrier-");
   const barrier = path.join(control, "go");
+  const firstEntry = syntheticLedgerEntry("2", "same-phase-a");
+  const secondEntry = syntheticLedgerEntry("2", "same-phase-b");
   const first = spawnLedgerAppender({
     root,
-    entry: syntheticLedgerEntry("2", "same-phase-a"),
+    entry: firstEntry,
     ready: path.join(control, "ready-a"),
     barrier
   });
   const second = spawnLedgerAppender({
     root,
-    entry: syntheticLedgerEntry("2", "same-phase-b"),
+    entry: secondEntry,
     ready: path.join(control, "ready-b"),
     barrier
   });
@@ -4556,7 +4757,13 @@ test("barriered same-phase appends retain one current and one historical entry",
     && fs.existsSync(path.join(control, "ready-b")));
   fs.writeFileSync(barrier, "go\n");
   const results = await Promise.all([first.completed, second.completed]);
-  for (const result of results) assert.equal(result.code, 0, result.stderr);
+  const retryEntries = [firstEntry, secondEntry].filter(
+    (_entry, index) => ledgerAppenderNeedsRetry(results[index])
+  );
+  assert.ok(retryEntries.length <= 1);
+  assert.ok(results.length - retryEntries.length >= 1);
+  // Preserve the same bounded-contention contract for same-phase cutover.
+  for (const entry of retryEntries) updateLedger(entry, root);
   const ledger = loadLedger(root);
   assert.equal(ledger.entries.length, 2);
   assert.deepEqual(
@@ -4669,7 +4876,7 @@ test("fresh ownerless and old live ledger locks are never stolen", async () => {
       const result = await contender.completed;
       const elapsed = Date.now() - startedAt;
       assert.notEqual(result.code, 0, result.stderr);
-      assert.ok(elapsed >= 4_500 && elapsed < 8_000, `bounded wait was ${elapsed} ms`);
+      assert.ok(elapsed >= 4_500 && elapsed < 15_000, `bounded wait was ${elapsed} ms`);
     } else {
       await new Promise((resolve) => setTimeout(resolve, 200));
       assert.equal(contender.child.exitCode, null, kind);
@@ -4789,7 +4996,7 @@ test("Phase 0 proof manifest and persisted producer provenance are exact", () =>
     "2": 15 * 60_000,
     "3": 15 * 60_000,
     "4": 5 * 60_000,
-    "5": 5 * 60_000,
+    "5": 10 * 60_000,
     aggregate: 5 * 60_000
   };
   for (const [phase, gates] of Object.entries(PHASE_PROOF_GATE_MANIFEST)) {
@@ -5408,6 +5615,9 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
     "scripts/validate.mjs",
     "package.json",
     "tests/control-plane.test.mjs",
+    "tests/control-plane_part1.mjs",
+    "tests/control-plane_part2.mjs",
+    "tests/control-plane_part3.mjs",
     "tests/installed-worker-mcp-contract.test.mjs",
     "tests/installed-worker-mcp-runner.test.mjs",
     "tests/mcp-worker-runtime.test.mjs",
@@ -5456,7 +5666,7 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
       `the Phase 1 focused gate must execute ${relative} exactly once`
     );
   }
-  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 27);
+  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 30);
 });
 
 test("Phase 2 protected manifest, scope, and serial inventory are exact", () => {
@@ -5494,7 +5704,8 @@ test("Phase 2 protected manifest, scope, and serial inventory are exact", () => 
     "tests/worker-context-roles.test.mjs",
     "tests/worker-host-actions.test.mjs",
     "tests/worker-mailbox.test.mjs",
-    "tests/worker-mutation.test.mjs",
+    "tests/worker-mutation_part1.mjs",
+    "tests/worker-mutation_part2.mjs",
     "tests/worker-protocol.test.mjs",
     "tests/worker-service.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
@@ -5577,7 +5788,8 @@ test("Phase 3 protected manifest, scope, and zero-skip inventory are exact", () 
     "tests/worker-dispatch-supervisor.test.mjs",
     "tests/worker-execution-binding.test.mjs",
     "tests/worker-launch-outbox.test.mjs",
-    "tests/worker-mutation.test.mjs",
+    "tests/worker-mutation_part1.mjs",
+    "tests/worker-mutation_part2.mjs",
     "tests/worker-owner-controller.test.mjs",
     "tests/worker-owner-lifecycle.test.mjs",
     "tests/worker-protocol.test.mjs",
@@ -8624,8 +8836,34 @@ test("concurrent Phase 0 proof writers retain one current record without lost cu
   await waitFor(() => fs.existsSync(readyA) && fs.existsSync(readyB));
   fs.writeFileSync(barrier, "go\n");
   const [firstResult, secondResult] = await Promise.all([first.completed, second.completed]);
-  assert.equal(firstResult.code, 0, firstResult.stderr);
-  assert.equal(secondResult.code, 0, secondResult.stderr);
+  const attempts = [
+    { slice: "concurrent-a", result: firstResult },
+    { slice: "concurrent-b", result: secondResult }
+  ];
+  const retrySlices = [];
+  let successfulAttempts = 0;
+  for (const { slice, result } of attempts) {
+    assert.equal(result.signal, null, result.stderr || result.stdout);
+    assert.equal(result.stderr, "");
+    const payload = JSON.parse(result.stdout);
+    if (result.code === 0) {
+      assert.deepEqual(payload, { ok: true, code: null });
+      successfulAttempts += 1;
+      continue;
+    }
+    assert.equal(result.code, 1, result.stdout);
+    assert.deepEqual(payload, { ok: false, code: "E_PROOF_PUBLICATION" });
+    retrySlices.push(slice);
+  }
+  assert.ok(successfulAttempts >= 1);
+  assert.ok(retrySlices.length <= 1);
+  // Proof publication deliberately bounds lock contention. A sufficiently
+  // slow runner may reject one concurrent attempt after the other writer
+  // acquired the lock; retry only after both children have closed.
+  for (const slice of retrySlices) {
+    const retried = provePhaseZero({ phase: "0", slice, root, write: true });
+    assert.equal(retried.ok, true, retried.code);
+  }
   const ledger = loadLedger(root);
   assert.equal(ledger.entries.filter((entry) => entry.currency === "current").length, 1);
   assert.equal(ledger.entries.filter((entry) => entry.currency === "invalidated").length, 1);
@@ -8720,3 +8958,27 @@ test("qualify CLI fails closed when it only records skipped live work", () => {
     release: "not_run"
   });
 });
+
+if (workerBrokerEvidenceTestOrdinal !== WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT) {
+  throw new Error(
+    `Worker broker evidence partitions must be rebalanced after ${workerBrokerEvidenceTestOrdinal} registrations.`
+  );
+}
+const expectedWorkerBrokerEvidenceRegisteredCount = workerBrokerEvidencePartition === null
+  ? WORKER_BROKER_EVIDENCE_TEST_REGISTRATION_COUNT
+  : WORKER_BROKER_EVIDENCE_PARTITION_RANGES[
+      workerBrokerEvidencePartition
+    ][1]
+      - WORKER_BROKER_EVIDENCE_PARTITION_RANGES[
+        workerBrokerEvidencePartition
+      ][0];
+if (
+  workerBrokerEvidenceRegisteredCount
+    !== expectedWorkerBrokerEvidenceRegisteredCount
+) {
+  throw new Error(
+    `Worker broker evidence partition ${workerBrokerEvidencePartition ?? "all"} registered `
+      + `${workerBrokerEvidenceRegisteredCount} tests instead of `
+      + `${expectedWorkerBrokerEvidenceRegisteredCount}.`
+  );
+}

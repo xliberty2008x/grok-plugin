@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import nodeTest from "node:test";
 
 import {
   appendLifecycleEvent,
@@ -37,6 +37,75 @@ import {
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import { installPinnedFakeCompanion } from "./pinned-fake-grok.mjs";
 import { missingInvalidProviderCapabilityReceiptMessage } from "../plugins/grok/scripts/lib/host.mjs";
+
+const CONTROL_PLANE_PARTITION_KEY = Symbol.for(
+  "grok-plugin.control-plane-partition"
+);
+const CONTROL_PLANE_PARTITION_RANGES = Object.freeze({
+  1: Object.freeze([1, 25]),
+  2: Object.freeze([25, 49]),
+  3: Object.freeze([49, 74])
+});
+const CONTROL_PLANE_TEST_REGISTRATION_COUNT = 73;
+const controlPlanePartitionCoverage = new Uint8Array(
+  CONTROL_PLANE_TEST_REGISTRATION_COUNT + 1
+);
+for (const range of Object.values(CONTROL_PLANE_PARTITION_RANGES)) {
+  const [start, end] = range;
+  if (
+    !Number.isInteger(start)
+    || !Number.isInteger(end)
+    || start < 1
+    || end <= start
+    || end > CONTROL_PLANE_TEST_REGISTRATION_COUNT + 1
+  ) {
+    throw new Error("Control-plane partition range is invalid.");
+  }
+  for (let ordinal = start; ordinal < end; ordinal += 1) {
+    controlPlanePartitionCoverage[ordinal] += 1;
+  }
+}
+if (controlPlanePartitionCoverage.slice(1).some((count) => count !== 1)) {
+  throw new Error(
+    "Control-plane partition ranges must cover every registration exactly once."
+  );
+}
+const configuredControlPlanePartition = globalThis[CONTROL_PLANE_PARTITION_KEY];
+// Direct `node --test` runs register the complete file. Deterministic and
+// focused runners use the static wrappers so every supervised file remains
+// below the fixed ten-minute limit.
+const controlPlanePartition = configuredControlPlanePartition == null
+  ? null
+  : Number(configuredControlPlanePartition);
+if (
+  controlPlanePartition !== null
+  && !Object.hasOwn(CONTROL_PLANE_PARTITION_RANGES, controlPlanePartition)
+) {
+  throw new Error("Control-plane test partition is invalid.");
+}
+let controlPlaneTestOrdinal = 0;
+let controlPlaneRegisteredCount = 0;
+function registerPartitionedTest(register, args) {
+  controlPlaneTestOrdinal += 1;
+  const selectedRange = CONTROL_PLANE_PARTITION_RANGES[controlPlanePartition];
+  const inPartition = controlPlanePartition === null
+    || (
+      controlPlaneTestOrdinal >= selectedRange[0]
+      && controlPlaneTestOrdinal < selectedRange[1]
+    );
+  if (!inPartition) return undefined;
+  controlPlaneRegisteredCount += 1;
+  return register(...args);
+}
+function test(...args) {
+  return registerPartitionedTest(nodeTest, args);
+}
+for (const method of ["only", "skip", "todo"]) {
+  test[method] = (...args) => registerPartitionedTest(
+    nodeTest[method].bind(nodeTest),
+    args
+  );
+}
 
 /** Provider lifecycle needs process start tokens via `ps`; some sandboxes deny that. */
 const PROVIDER_LIFECYCLE_AVAILABLE = Boolean(processStartToken(process.pid));
@@ -5873,21 +5942,29 @@ test("integration: malformed task report gets one same-session format repair", {
   assert.equal(repairProfile.includes("GrokBuild:search_replace"), false);
 });
 
+function waitForBackgroundFailure(root, env, id) {
+  const job = parseJson(runCompanion([
+    "status",
+    id,
+    "--wait",
+    "--timeout-ms",
+    "10000",
+    "--json"
+  ], { cwd: root, env }));
+  assert.equal(job.status, "failed");
+  return job;
+}
+
 test("integration: two invalid task reports fail with E_SCHEMA and retain bounded repair evidence", {
   skip: !PROVIDER_LIFECYCLE_AVAILABLE && "process start tokens unavailable (ps denied in this environment)"
-}, async () => {
+}, () => {
   const root = initRepo();
   const { env, fake } = fixture({ taskTexts: ["not a worker report", "still not a worker report"] });
   const started = parseJson(runCompanion(
     ["task", "--background", "exercise invalid report failure", "--json"],
     { cwd: root, env }
   ));
-  const failed = await waitFor(() => {
-    const status = runCompanion(["status", started.id, "--json"], { cwd: root, env });
-    if (status.status !== 0) return null;
-    const job = JSON.parse(status.stdout);
-    return job.status === "failed" ? job : null;
-  }, { timeoutMs: 10000 });
+  const failed = waitForBackgroundFailure(root, env, started.id);
   assert.equal(failed.error.code, "E_SCHEMA");
   assert.equal(failed.result.workerReport.valid, false);
   assert.equal(failed.result.providerClaims.success, false);
@@ -5906,7 +5983,7 @@ test("integration: two invalid task reports fail with E_SCHEMA and retain bounde
 
 test("integration: report-repair transport failures preserve their operational error code", {
   skip: !PROVIDER_LIFECYCLE_AVAILABLE && "process start tokens unavailable (ps denied in this environment)"
-}, async () => {
+}, () => {
   const root = initRepo();
   const { env } = fixture({
     taskTexts: ["not a worker report"],
@@ -5916,12 +5993,7 @@ test("integration: report-repair transport failures preserve their operational e
     ["task", "--background", "exercise report repair auth failure", "--json"],
     { cwd: root, env }
   ));
-  const failed = await waitFor(() => {
-    const status = runCompanion(["status", started.id, "--json"], { cwd: root, env });
-    if (status.status !== 0) return null;
-    const job = JSON.parse(status.stdout);
-    return job.status === "failed" ? job : null;
-  }, { timeoutMs: 10000 });
+  const failed = waitForBackgroundFailure(root, env, started.id);
   assert.equal(failed.error.code, "E_AUTH_REQUIRED");
   assert.equal(failed.result.workerReport.valid, false);
   assert.equal(failed.result.reportRepair.attempted, true);
@@ -6404,3 +6476,20 @@ test("integration: interim/final separation, resume by job ID, context drift", {
   assert.notEqual(drift.status, 0, drift.stdout);
   assert.match(`${drift.stderr}\n${drift.stdout}`, /E_CONTEXT_DRIFT/);
 });
+
+if (controlPlaneTestOrdinal !== CONTROL_PLANE_TEST_REGISTRATION_COUNT) {
+  throw new Error(
+    `Control-plane partitions must be rebalanced after ${controlPlaneTestOrdinal} registrations.`
+  );
+}
+const expectedControlPlaneRegisteredCount = controlPlanePartition === null
+  ? CONTROL_PLANE_TEST_REGISTRATION_COUNT
+  : CONTROL_PLANE_PARTITION_RANGES[controlPlanePartition][1]
+    - CONTROL_PLANE_PARTITION_RANGES[controlPlanePartition][0];
+if (controlPlaneRegisteredCount !== expectedControlPlaneRegisteredCount) {
+  throw new Error(
+    `Control-plane partition ${controlPlanePartition ?? "all"} registered `
+      + `${controlPlaneRegisteredCount} tests instead of `
+      + `${expectedControlPlaneRegisteredCount}.`
+  );
+}
