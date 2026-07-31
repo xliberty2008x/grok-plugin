@@ -2086,7 +2086,7 @@ test("an asynchronously launched supervisor copy executes only the canonical con
   const root = sandbox(t);
   const copiedSupervisor = path.join(root, "test-temp-supervisor.mjs");
   const copiedHookMarker = path.join(root, "copied-hook-ran");
-  const fixtureMarker = path.join(root, "canonical-supervisor-ran");
+  const authorityMarker = path.join(root, "canonical-supervisor-authority.json");
   fs.copyFileSync(SUPERVISOR, copiedSupervisor);
   fs.writeFileSync(path.join(root, "test-temp-child-hook.cjs"), [
     'const fs = require("node:fs");',
@@ -2111,7 +2111,12 @@ test("an asynchronously launched supervisor copy executes only the canonical con
     "--",
     process.execPath,
     "--eval",
-    `require("node:fs").writeFileSync(${JSON.stringify(fixtureMarker)}, "canonical\\n")`
+    `require("node:fs").writeFileSync(${JSON.stringify(authorityMarker)}, JSON.stringify({`
+      + "parentPid: process.ppid,"
+      + "supervisorPid: Number(process.env.GROK_PLUGIN_TEST_SUPERVISOR_PID),"
+      + "tempRoot: process.env.GROK_PLUGIN_TEST_TEMP_ROOT,"
+      + "registry: process.env.GROK_PLUGIN_TEST_PID_REGISTRY"
+      + '}) + "\\n")'
   ], {
     cwd: ROOT,
     env: {
@@ -2130,7 +2135,10 @@ test("an asynchronously launched supervisor copy executes only the canonical con
   });
   assert.deepEqual(outcome, { code: 0, signal: null });
   assert.equal(fs.existsSync(copiedHookMarker), false);
-  assert.equal(fs.readFileSync(fixtureMarker, "utf8"), "canonical\n");
+  const authority = JSON.parse(fs.readFileSync(authorityMarker, "utf8"));
+  assert.equal(authority.supervisorPid, authority.parentPid);
+  assert.equal(authority.tempRoot, nestedRoot);
+  assert.equal(path.dirname(authority.registry), nestedRoot);
 });
 
 test("supervisor ownership propagates through an async execFile chain", async (t) => {
