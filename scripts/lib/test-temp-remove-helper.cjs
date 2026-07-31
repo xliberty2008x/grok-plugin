@@ -16,6 +16,28 @@ const GIT_MARKER_MAX_BYTES = 1024n * 1024n;
 const WORKTREE_REGISTRATION_MAX_ENTRIES = 4096;
 const TREE_FS_TYPE_ENV = "GROK_PLUGIN_TEST_TREE_FS_TYPE";
 const TREE_MOUNT_ID_ENV = "GROK_PLUGIN_TEST_TREE_MOUNT_ID";
+const REMOVE_DIAGNOSTIC_PATTERN =
+  /(?:^|\n)grok-plugin-test-temp-remove-v1:(arguments|root-identity|mount-boundary|managed-proof|directory-inventory|entry-validation|recursive-removal|file-removal|directory-open|child-removal|root-removal):(1|42|43|44)(?=\n|$)/gu;
+let removeDiagnosticStage = "arguments";
+
+function writeRemoveDiagnostic(stage, status) {
+  try {
+    fs.writeSync(
+      2,
+      `grok-plugin-test-temp-remove-v1:${stage}:${status}\n`,
+      null,
+      "utf8"
+    );
+  } catch {
+    // Diagnostics never weaken or replace the fail-closed removal result.
+  }
+}
+
+process.once("exit", (code) => {
+  if (code !== 0) {
+    writeRemoveDiagnostic(removeDiagnosticStage, code);
+  }
+});
 
 function asciiCaseEqual(left, right) {
   return left.length === right.length && left.toLowerCase() === right;
@@ -427,6 +449,7 @@ const expectedTreeDev = BigInt(rawExpectedTreeDev);
 const expectedUid = cleanupMode === "managed-contained"
   ? BigInt(rawExpectedUid)
   : null;
+removeDiagnosticStage = "root-identity";
 const original = fs.lstatSync(".", { bigint: true });
 if (
   !original.isDirectory()
@@ -438,6 +461,7 @@ if (
   process.exit(42);
 }
 const ownerUid = original.uid;
+removeDiagnosticStage = "mount-boundary";
 const currentFsType = fs.statfsSync(".", { bigint: true }).type;
 const inheritedFsType = process.env[TREE_FS_TYPE_ENV];
 if (
@@ -480,6 +504,7 @@ if (!mountBoundary.available || mountBoundary.nested.length > 0) {
 
 let managedProof = null;
 if (cleanupMode === "managed-contained") {
+  removeDiagnosticStage = "managed-proof";
   const canonicalManagedRoot = path.resolve(managedRoot);
   const currentDirectory = fs.realpathSync(".");
   if (!isWithin(canonicalManagedRoot, currentDirectory)) process.exit(43);
@@ -657,6 +682,7 @@ function childGitContext(entry) {
 }
 
 expandRestrictedManagedProof();
+removeDiagnosticStage = "directory-inventory";
 
 if (
   cleanupMode === "guarded"
@@ -700,6 +726,7 @@ if (cleanupMode === "managed-contained") {
     return left < right ? -1 : (left > right ? 1 : 0);
   });
 }
+removeDiagnosticStage = "entry-validation";
 const entries = entryNames.map((entry) => {
   const stat = fs.lstatSync(entry, { bigint: true });
   if (!onTreeDevice(stat, expectedTreeDev)) process.exit(43);
@@ -839,8 +866,10 @@ if (cleanupMode === "managed-contained" && registrationControlsPresent) {
   }
 }
 
+removeDiagnosticStage = "recursive-removal";
 for (const { entry, stat } of entries) {
   if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    removeDiagnosticStage = "file-removal";
     const current = fs.lstatSync(entry, { bigint: true });
     if (
       !onTreeDevice(current, expectedTreeDev)
@@ -879,6 +908,7 @@ for (const { entry, stat } of entries) {
     continue;
   }
 
+  removeDiagnosticStage = "directory-open";
   const openedDirectory = openVerifiedDirectory(
     entry,
     stat,
@@ -914,6 +944,7 @@ for (const { entry, stat } of entries) {
 
   let result;
   try {
+    removeDiagnosticStage = "child-removal";
     result = spawnSync(process.execPath, [
       __filename,
       String(stat.dev),
@@ -952,6 +983,15 @@ for (const { entry, stat } of entries) {
     throw error;
   }
   if (result.status !== 0 || result.error || result.signal) {
+    const nestedDiagnostics = [
+      ...String(result.stderr || "").matchAll(REMOVE_DIAGNOSTIC_PATTERN)
+    ];
+    if (nestedDiagnostics.length > 0) {
+      writeRemoveDiagnostic(
+        nestedDiagnostics[0][1],
+        nestedDiagnostics[0][2]
+      );
+    }
     if (openedDirectory.repaired || openedDirectory.modeChanged) {
       try {
         const current = fs.lstatSync(entry, { bigint: true });
@@ -972,6 +1012,7 @@ for (const { entry, stat } of entries) {
   }
 }
 
+removeDiagnosticStage = "root-removal";
 const basename = path.basename(process.cwd());
 process.chdir("..");
 const emptied = fs.lstatSync(basename, { bigint: true });

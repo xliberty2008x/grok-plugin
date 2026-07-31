@@ -24,6 +24,28 @@ const createdRootIdentities = new Map();
 const REMOVE_OWNED_ROOT_HELPER = fileURLToPath(
   new URL("./test-temp-remove-helper.cjs", import.meta.url)
 );
+const REMOVE_DIAGNOSTIC_PATTERN =
+  /(?:^|\n)grok-plugin-test-temp-remove-v1:(arguments|root-identity|mount-boundary|managed-proof|directory-inventory|entry-validation|recursive-removal|file-removal|directory-open|child-removal|root-removal):(1|42|43|44)(?=\n|$)/gu;
+
+function ownedCleanupError(message, cleanupReason) {
+  const error = new Error(message);
+  error.cleanupReason = cleanupReason;
+  return error;
+}
+
+function helperCleanupReason(result) {
+  const diagnostics = [
+    ...String(result?.stderr || "").matchAll(REMOVE_DIAGNOSTIC_PATTERN)
+  ];
+  if (diagnostics.length > 0) {
+    const [, stage, status] = diagnostics[0];
+    return `helper-${stage}-${status}`;
+  }
+  if (result?.error) return "helper-launch-error";
+  if (result?.signal) return "helper-signal";
+  if (Number.isInteger(result?.status)) return `helper-exit-${result.status}`;
+  return "helper-result-unavailable";
+}
 
 function systemPsBinary() {
   if (process.platform === "win32") return null;
@@ -244,7 +266,10 @@ export function removeOwnedTestTempRoot(root) {
       expectedDev: expected.root.dev
     });
     if (!gitProof.available) {
-      throw new Error("The test-temp root contains unproven Git metadata.");
+      throw ownedCleanupError(
+        "The test-temp root contains unproven Git metadata.",
+        gitProof.reason || "git-metadata-ambiguous"
+      );
     }
     const result = spawnSync(process.execPath, [
       REMOVE_OWNED_ROOT_HELPER,
@@ -265,7 +290,10 @@ export function removeOwnedTestTempRoot(root) {
       maxBuffer: 8 * 1024
     });
     if (result?.status !== 0 || result?.error || result?.signal) {
-      throw new Error("The identity-pinned test-temp root could not be removed.");
+      throw ownedCleanupError(
+        "The identity-pinned test-temp root could not be removed.",
+        helperCleanupReason(result)
+      );
     }
     try {
       fs.lstatSync(quarantine);

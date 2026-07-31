@@ -8,6 +8,16 @@ const PROOF_SCHEMA = "grok-test-temp-contained-git-v1";
 const MAX_ENTRIES = 10_000;
 const MAX_CONTROL_BYTES = 1024n * 1024n;
 const CONTROL_NAMES = new Set(["commondir", "gitdir"]);
+const CONTAINMENT_REASON_CODES = Object.freeze({
+  E_TEST_TEMP_EXTERNAL_WORKTREE: "external-worktree-link",
+  E_TEST_TEMP_GIT_SCAN_BUDGET: "git-metadata-scan-truncated"
+});
+
+function containmentError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
 
 function asciiLower(value) {
   return value.replace(/[A-Z]/gu, (character) => character.toLowerCase());
@@ -270,7 +280,10 @@ function boundedNames(target, budget) {
       if (!entry) break;
       budget.remaining -= 1;
       if (budget.remaining < 0) {
-        throw new Error("Contained Git scan exceeded its entry budget.");
+        throw containmentError(
+          "E_TEST_TEMP_GIT_SCAN_BUDGET",
+          "Contained Git scan exceeded its entry budget."
+        );
       }
       names.push(entry.name);
     }
@@ -390,13 +403,19 @@ function inspectContainedGitMetadata({
         } else if (currentRoot !== priorRoot && isWithin(priorRoot, rawValue)) {
           target = path.join(currentRoot, path.relative(priorRoot, rawValue));
         } else {
-          throw new Error("Git endpoint escapes the managed root.");
+          throw containmentError(
+            "E_TEST_TEMP_EXTERNAL_WORKTREE",
+            "Git endpoint escapes the managed root."
+          );
         }
       } else {
         target = path.resolve(base, rawValue);
       }
       if (!isWithin(currentRoot, target)) {
-        throw new Error("Git endpoint escapes the managed root.");
+        throw containmentError(
+          "E_TEST_TEMP_EXTERNAL_WORKTREE",
+          "Git endpoint escapes the managed root."
+        );
       }
       const canonical = fs.realpathSync(target);
       if (canonical !== target) {
@@ -702,12 +721,13 @@ function inspectContainedGitMetadata({
       digest: sha256(JSON.stringify(proof)),
       proof
     };
-  } catch {
+  } catch (error) {
     return {
       available: false,
       digest: null,
       proof: null,
-      reason: "git-metadata-ambiguous"
+      reason: CONTAINMENT_REASON_CODES[error?.code]
+        || "git-metadata-ambiguous"
     };
   }
 }
