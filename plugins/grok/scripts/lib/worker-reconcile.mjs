@@ -6,7 +6,8 @@
 import { CompanionError, asErrorPayload } from "./errors.mjs";
 import { sameHostSession } from "./host.mjs";
 import { listJobs, now, terminal, updateJob } from "./state.mjs";
-import { appendLifecycleEvent, scrubStoredJob } from "./task-contract.mjs";
+import { scrubStoredJob } from "./task-contract.mjs";
+import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import {
   captureTerminalEvidence,
   normalizeTerminalProcessSignalError,

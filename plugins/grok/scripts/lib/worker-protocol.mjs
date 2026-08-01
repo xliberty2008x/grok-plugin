@@ -24,7 +24,7 @@ import {
   LIFECYCLE_EVENT_TYPES,
   MAX_LIFECYCLE_EVENTS,
   normalizeLifecycleEventSequences
-} from "./task-contract.mjs";
+} from "./task-lifecycle.mjs";
 
 /** Public protocol version for handle, snapshot, and cursor projections. */
 export const WORKER_PROTOCOL_VERSION = 1;

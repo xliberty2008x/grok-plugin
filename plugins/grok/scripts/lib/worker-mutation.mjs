@@ -35,7 +35,6 @@ import {
   withWorkspaceStateTransaction
 } from "./state.mjs";
 import {
-  appendLifecycleEvent,
   assertContextCompatible,
   assertContextManifestIntegrity,
   assertTaskEnvelope,
@@ -47,10 +46,11 @@ import {
   composeProviderPrompt,
   CONTEXT_MANIFEST_VERSION,
   CONTEXT_METADATA_POLICIES,
-  evaluateScope,
   observeChangedPaths,
   scrubStoredJob
 } from "./task-contract.mjs";
+import { appendLifecycleEvent } from "./task-lifecycle.mjs";
+import { evaluateScope } from "./task-scope.mjs";
 import {
   CONTEXT_BINDING_MODE,
   assertContextPacket,
