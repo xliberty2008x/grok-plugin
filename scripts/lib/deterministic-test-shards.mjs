@@ -41,6 +41,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/plugin-inventory.test.mjs",
     "tests/process-control-owned-identity.test.mjs",
     "tests/provider-capability.test.mjs",
+    "tests/source-structure-policy.test.mjs",
     "tests/version-policy.test.mjs",
     "tests/worker-broker-evidence_part2.mjs",
     "tests/worker-broker-evidence_part3.mjs",

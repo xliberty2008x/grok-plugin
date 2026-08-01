@@ -54,6 +54,7 @@ test("deterministic shard manifest is an exact nonempty partition of the invento
   const combined = DETERMINISTIC_TEST_SHARDS.flat();
   assert.equal(new Set(combined).size, combined.length);
   assert.deepEqual([...combined].sort(), inventory);
+  assert.equal(combined.includes("tests/source-structure-policy.test.mjs"), true);
   assert.ok(EXTERNAL_BOUNDARY_TESTS.every((file) => !combined.includes(`tests/${file}`)));
 });
 
