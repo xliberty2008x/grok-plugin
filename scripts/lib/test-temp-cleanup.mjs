@@ -154,7 +154,7 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "grok-readonly-missing-linked-parent-",
   "grok-readonly-status-",
   "grok-reconcile-safety-data-",
-  "grok-recursion-guard-",
+  "grok-recursion-guard-", "grok-release-tag-ref-",
   "grok-retain-admission-lock-",
   "grok-review-model-",
   "grok-runner-credential-test-",
