@@ -915,6 +915,8 @@ function initPhaseOneSignedReviewFixture(name = "signed-review") {
   fs.appendFileSync(reviewedFile, `\n// ${name} reviewed source delta\n`);
   git(fixture.root, "add", "plugins/grok/scripts/lib/errors.mjs");
   git(fixture.root, "commit", "-m", `add ${name} reviewed delta`);
+  // Keep each signed-review fixture below the cleanup proof scanner's fixed entry budget.
+  git(fixture.root, "gc", "--quiet");
 
   let phaseZero = buildEvidenceRecord({
     root: fixture.root,
