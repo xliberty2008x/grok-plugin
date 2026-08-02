@@ -13,16 +13,24 @@ Raw user request:
 
 Control-plane rules:
 
-- Parse routing flags: `--wait` / `--background` (default background), `--web-only` / `--workspace` (default web-only), optional `--model` and `--effort` (`low|medium|high` only when the user requested them).
+- Parse routing flags and select exactly one flag from each pair before launch: `--wait` / `--background` (default background), and `--web-only` / `--workspace` (default web-only). Explicit `--wait` replaces `--background`; explicit `--workspace` replaces `--web-only`. Never combine either mutually exclusive pair. Forward optional `--model` and `--effort` (`low|medium|high` only when the user requested them).
 - Remaining text after flags is the research query. If no query remains, ask what to research.
 - Resolve `"${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs"`.
-- Start exactly one process:
+- Start exactly one process using the selected complete form.
+
+  Default public-web form:
 
   ```text
-  node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" deep-research --background --web-only --query-stdin --stdin-ready [--model <id>] [--effort <low|medium|high>] [--workspace]
+  node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" deep-research --background --web-only --query-stdin --stdin-ready [--model <id>] [--effort <low|medium|high>]
   ```
 
-  Prefer the user-selected mode flags over the defaults above when they were explicit. Launch with a private stdin path for the query (never put the query on argv). After the runtime writes `GROK_COMPANION_STDIN_READY` on stderr, write the UTF-8 query followed by a terminating frame as the host's stdin contract requires. Reject empty queries and never include NUL bytes.
+  Explicit workspace form:
+
+  ```text
+  node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" deep-research --background --workspace --query-stdin --stdin-ready [--model <id>] [--effort <low|medium|high>]
+  ```
+
+  In either form, explicit `--wait` replaces `--background`; it never supplements it. Launch with a private stdin path for the query (never put the query on argv). After the runtime writes `GROK_COMPANION_STDIN_READY` on stderr, write the UTF-8 query followed by a terminating frame as the host's stdin contract requires. Reject empty queries and never include NUL bytes.
 - Record the returned job ID immediately. Follow with `status <job-id> --wait` / `result <job-id>` / `cancel <job-id>` as needed.
 - Do **not** use TaskEnvelope, rescue resume, report repair, mailbox follow-ups, or `record-verification` for deep-research.
 - Provider report status `verified` / `partial` is not host verification; `hostVerification` remains `not_run`.

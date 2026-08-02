@@ -31,14 +31,25 @@ Use this skill when the user wants Grok's built-in `/deep-research` workflow. Th
 ## Invocation contract
 
 1. Resolve `../../scripts/grok-codex.mjs` from this `SKILL.md`. Do not search `PATH`.
-2. Start exactly one process with private query stdin:
+2. Select exactly one execution mode and one research surface before starting:
+   - use `--background` by default, or replace it with `--wait` when the user explicitly requests foreground completion;
+   - use `--web-only` by default; explicit `--workspace` replaces `--web-only` when the user requests the tracked-files snapshot.
+   Never combine the two flags in either pair.
+3. Start exactly one process with private query stdin using the selected complete form:
 
+   Default public-web form:
    ```text
-   node <resolved-grok-codex.mjs> deep-research --background --web-only --query-stdin --stdin-ready [--workspace] [--model <id>] [--effort low|medium|high]
+   node <resolved-grok-codex.mjs> deep-research --background --web-only --query-stdin --stdin-ready [--model <id>] [--effort low|medium|high]
    ```
 
-3. Codex unified execution: launch with `tty: true`, wait for `GROK_COMPANION_STDIN_READY` on stderr, then one `write_stdin` of the UTF-8 query plus `\n\u0004`.
-4. Record the job ID (`deep-research-*`). Follow with:
+   Explicit workspace form:
+   ```text
+   node <resolved-grok-codex.mjs> deep-research --background --workspace --query-stdin --stdin-ready [--model <id>] [--effort low|medium|high]
+   ```
+
+   In either form, explicit `--wait` replaces `--background`; it never supplements it.
+4. Codex unified execution: launch with `tty: true`, wait for `GROK_COMPANION_STDIN_READY` on stderr, then one `write_stdin` of the UTF-8 query plus `\n\u0004`.
+5. Record the job ID (`deep-research-*`). Follow with:
 
    ```text
    node <resolved-grok-codex.mjs> status <job-id> [--wait] [--timeout-ms <ms>]
@@ -46,7 +57,7 @@ Use this skill when the user wants Grok's built-in `/deep-research` workflow. Th
    node <resolved-grok-codex.mjs> cancel <job-id>
    ```
 
-5. Surface phase, workflow run ID/revision/status, provider report status (`verified`|`partial`), source count, coverage notes, and exact stable errors. Provider status is not host verification.
+6. Surface phase, workflow run ID/revision/status, provider report status (`verified`|`partial`), source count, coverage notes, and exact stable errors. Provider status is not host verification.
 
 ## Honest limits
 

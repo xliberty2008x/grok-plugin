@@ -4,6 +4,14 @@
 
 Status: hardening candidate; not release-qualified.
 
+- Fixed the installed Codex and Claude deep-research instructions so they
+  select exactly one execution mode and exactly one research surface before
+  starting a job. Public-web requests still default to `--background` plus
+  `--web-only`; explicit foreground or workspace requests replace those
+  defaults with `--wait` or `--workspace` instead of combining mutually
+  exclusive flags. The runtime's fail-closed argument validation, private
+  query ingress, profiles, provider lifecycle, and qualification status are
+  unchanged.
 - Replaced the stale exact-version setup ceiling with forward admission for
   stable Grok Build 0.2.99 and newer. Recorded release digests remain the
   stronger `known-digest` path; unfamiliar versions are accepted only from the
