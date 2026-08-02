@@ -15,20 +15,32 @@ import { spawnSync } from "node:child_process";
 import process from "node:process";
 import {
   REPO_ROOT,
-  buildEvidenceRecord,
+  sha256Text
+} from "./lib/worker-broker-evidence-core.mjs";
+import {
   computeInventoryDigest,
   computePhaseScopeDigest,
-  createPhaseOneReviewRequest,
-  evidenceStatus,
-  gitIdentity,
-  proveWorkerBrokerPhase,
-  sha256Text,
-  updateLedger,
+  gitIdentity
+} from "./lib/worker-broker-evidence-inventory.mjs";
+import {
+  updateLedger
+} from "./lib/worker-broker-evidence-ledger.mjs";
+import {
+  proveWorkerBrokerPhase
+} from "./lib/worker-broker-evidence-proof-runner.mjs";
+import {
+  buildEvidenceRecord,
   validateEvidenceRecord,
-  verifyLedger,
-  verifyPhase,
   writeEvidenceRecord
-} from "./lib/worker-broker-evidence.mjs";
+} from "./lib/worker-broker-evidence-record.mjs";
+import {
+  createPhaseOneReviewRequest
+} from "./lib/worker-broker-evidence-review-request.mjs";
+import {
+  evidenceStatus,
+  verifyLedger,
+  verifyPhase
+} from "./lib/worker-broker-evidence-verification.mjs";
 
 function usage(exitCode = 2) {
   process.stderr.write(`Usage:

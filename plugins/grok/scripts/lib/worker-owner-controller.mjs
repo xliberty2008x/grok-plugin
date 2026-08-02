@@ -13,23 +13,12 @@ import {
   providerLaunchBindingDigest as digestProviderLaunchBinding,
   resolveProviderExecutablePin
 } from "./provider-executable-pin.mjs";
-import {
-  assertProviderPlatform,
-  authenticateBoundBootstrapGuard,
-  captureSpawnIdentity,
-  createProviderBootstrapLaunch,
-  discoverGrok,
-  ensureChildExit,
-  inspectIsolation,
-  promoteProviderBootstrap,
-  providerCleanupIdentity,
-  publishProviderBootstrapSpec,
-  waitForProviderBootstrapReady,
-  workerOwnerControllerEnvironment,
-  workerOwnerControllerSpawnArgs,
-  workerSessionCloseControllerEnvironment,
-  WORKTREE_INTEGRATION_REQUEST_ALLOWLIST
-} from "./grok-provider.mjs";
+import { assertProviderPlatform, discoverGrok } from "./provider-core.mjs";
+import { authenticateBoundBootstrapGuard, createProviderBootstrapLaunch, promoteProviderBootstrap, publishProviderBootstrapSpec, waitForProviderBootstrapReady } from "./provider-bootstrap-client.mjs";
+import { captureSpawnIdentity, ensureChildExit, providerCleanupIdentity } from "./provider-process.mjs";
+import { inspectIsolation, workerOwnerControllerSpawnArgs } from "./provider-profile.mjs";
+import { workerOwnerControllerEnvironment, workerSessionCloseControllerEnvironment } from "./provider-controller-environments.mjs";
+import { WORKTREE_INTEGRATION_REQUEST_ALLOWLIST } from "./provider-worktree-contract.mjs";
 import { GrokWorktreeAcp } from "./grok-worktree-acp.mjs";
 import { hostContext, pluginDataRoot } from "./host.mjs";
 import { processGroupGone } from "./process-control.mjs";
@@ -692,7 +681,7 @@ export async function openWorkerOwnerController({
         },
         clientInfo: {
           name: "grok-companion-owner-controller",
-          version: "0.3.0-dev.1"
+          version: "0.3.0-dev.2"
         }
       },
       30_000

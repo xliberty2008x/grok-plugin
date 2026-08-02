@@ -1007,7 +1007,7 @@ test("protected runtime owns the exact fixed Phase 2 and Phase 3 modes", () => {
     "utf8"
   );
   const evidenceRuntime = fs.readFileSync(
-    path.join(ROOT, "scripts/lib/worker-broker-evidence.mjs"),
+    path.join(ROOT, "scripts/lib/worker-broker-evidence-authority.mjs"),
     "utf8"
   );
   assert.equal(PHASE_TWO_SLICE, "mailbox-context-roles");
@@ -1032,7 +1032,7 @@ test("protected runtime owns the exact fixed Phase 2 and Phase 3 modes", () => {
   for (const marker of [
     "if (require.main === module)",
     "Object.freeze(module.exports)",
-    "worker-broker-evidence.mjs",
+    "worker-broker-evidence-authority.mjs",
     "GROK_PROTECTED_OPERATION_CHILD"
   ]) {
     assert.equal(operation.includes(marker), true, marker);

@@ -29,11 +29,24 @@ const OPERATION_RELATIVE_PATH =
   "scripts/trusted/worker-broker-review-operation.cjs";
 const SHA256 = /^[0-9a-f]{64}$/;
 const RUNTIME_BUNDLE_PATHS = Object.freeze([
+  "package-lock.json",
+  "package.json",
   "plugins/grok/scripts/lib/redact.mjs",
   "scripts/lib/plugin-inventory.mjs",
   "scripts/lib/static-esm-import-parser.mjs",
-  "scripts/lib/worker-broker-evidence.mjs",
-  OPERATION_RELATIVE_PATH,
+  "scripts/lib/worker-broker-evidence-authority.mjs",
+  "scripts/lib/worker-broker-evidence-core.mjs",
+  "scripts/lib/worker-broker-evidence-files.mjs",
+  "scripts/lib/worker-broker-evidence-inventory.mjs",
+  "scripts/lib/worker-broker-evidence-ledger.mjs",
+  "scripts/lib/worker-broker-evidence-proof.mjs",
+  "scripts/lib/worker-broker-evidence-protected-trust.mjs",
+  "scripts/lib/worker-broker-evidence-record.mjs",
+  "scripts/lib/worker-broker-evidence-review.mjs",
+  "scripts/lib/worker-broker-evidence-toolchain.mjs",
+  "scripts/lib/worker-broker-evidence-verification.mjs",
+  "scripts/lib/worker-mutation-test-inventory.mjs",
+  "scripts/trusted/worker-broker-review-operation.cjs",
   "scripts/trusted/worker-broker-review.mjs"
 ]);
 const DESCRIPTOR_FIELDS = Object.freeze([

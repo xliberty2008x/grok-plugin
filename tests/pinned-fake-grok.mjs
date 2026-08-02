@@ -35,6 +35,63 @@ function fakeOfficialRelease(fileIdentity) {
   });
 }
 
+export function patchPinnedFakeProviderCommands(pluginRoot, wrapper) {
+  const libraryRoot = path.join(pluginRoot, "scripts", "lib");
+  const wrapperLiteral = JSON.stringify(wrapper);
+  const replacements = [
+    [
+      "provider-core.mjs",
+      'spawnSync(binary, ["--version"],',
+      `spawnSync(binary, [${wrapperLiteral}, "--version"],`
+    ],
+    [
+      "provider-profile.mjs",
+      'spawnSync(binary, ["inspect", "--json"],',
+      `spawnSync(binary, [${wrapperLiteral}, "inspect", "--json"],`
+    ],
+    [
+      "provider-profile.mjs",
+      'const args = ["--cwd", root,',
+      `const args = [${wrapperLiteral}, "--cwd", root,`
+    ],
+    [
+      "provider-headless-runtime.mjs",
+      'const args = ["--cwd", root,',
+      `const args = [${wrapperLiteral}, "--cwd", root,`
+    ],
+    [
+      "provider-sessions.mjs",
+      'spawnSync(binary, ["--help"],',
+      `spawnSync(binary, [${wrapperLiteral}, "--help"],`
+    ],
+    [
+      "provider-sessions.mjs",
+      'spawnSync(binary, ["agent", "--help"],',
+      `spawnSync(binary, [${wrapperLiteral}, "agent", "--help"],`
+    ],
+    [
+      "provider-sessions.mjs",
+      'spawnSync(binary, ["models"],',
+      `spawnSync(binary, [${wrapperLiteral}, "models"],`
+    ]
+  ];
+  const sources = new Map();
+  for (const [file, needle, replacement] of replacements) {
+    const providerFile = path.join(libraryRoot, file);
+    const source = sources.get(providerFile)
+      ?? fs.readFileSync(providerFile, "utf8");
+    assert.equal(
+      source.split(needle).length - 1,
+      1,
+      `setup fixture provider command inventory drifted: ${file}:${needle}`
+    );
+    sources.set(providerFile, source.replace(needle, replacement));
+  }
+  for (const [providerFile, source] of sources) {
+    fs.writeFileSync(providerFile, source, "utf8");
+  }
+}
+
 export function installPinnedFakeCompanion(
   fake,
   env,
@@ -127,52 +184,7 @@ export function installPinnedFakeCompanion(
     "utf8"
   );
 
-  const providerFile = path.join(
-    pluginRoot,
-    "scripts",
-    "lib",
-    "grok-provider.mjs"
-  );
-  let providerSource = fs.readFileSync(providerFile, "utf8");
-  const wrapperLiteral = JSON.stringify(wrapper);
-  const replacements = [
-    [
-      'spawnSync(binary, ["--version"],',
-      `spawnSync(binary, [${wrapperLiteral}, "--version"],`
-    ],
-    [
-      'spawnSync(binary, ["inspect", "--json"],',
-      `spawnSync(binary, [${wrapperLiteral}, "inspect", "--json"],`
-    ],
-    [
-      'const args = ["--cwd", root,',
-      `const args = [${wrapperLiteral}, "--cwd", root,`
-    ],
-    [
-      'spawnSync(binary, ["--help"],',
-      `spawnSync(binary, [${wrapperLiteral}, "--help"],`
-    ],
-    [
-      'spawnSync(binary, ["agent", "--help"],',
-      `spawnSync(binary, [${wrapperLiteral}, "agent", "--help"],`
-    ],
-    [
-      'spawnSync(binary, ["models"],',
-      `spawnSync(binary, [${wrapperLiteral}, "models"],`
-    ]
-  ];
-  for (const [needle, replacement] of replacements) {
-    const expectedOccurrences = needle === 'const args = ["--cwd", root,'
-      ? 2
-      : 1;
-    assert.equal(
-      providerSource.split(needle).length - 1,
-      expectedOccurrences,
-      `setup fixture provider command inventory drifted: ${needle}`
-    );
-    providerSource = providerSource.replaceAll(needle, replacement);
-  }
-  fs.writeFileSync(providerFile, providerSource, "utf8");
+  patchPinnedFakeProviderCommands(pluginRoot, wrapper);
 
   return Object.freeze({
     pluginRoot,

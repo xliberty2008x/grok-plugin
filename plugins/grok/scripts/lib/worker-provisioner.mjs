@@ -12,12 +12,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { CompanionError } from "./errors.mjs";
-import {
-  ensureChildExit,
-  openProvider,
-  providerCleanupIdentity,
-  taskEnvironment
-} from "./grok-provider.mjs";
+import { openProvider } from "./provider-acp-runtime.mjs";
+import { ensureChildExit, providerCleanupIdentity } from "./provider-process.mjs";
+import { taskEnvironment } from "./provider-task-environment.mjs";
 import { GrokWorktreeAcp } from "./grok-worktree-acp.mjs";
 import { processGroupGone } from "./process-control.mjs";
 import {
@@ -29,19 +26,11 @@ import {
   readJob,
   withWorkspaceStateTransaction
 } from "./state.mjs";
-import { captureContextManifest } from "./task-contract.mjs";
-import {
-  activateWriteProvisioningAttempt,
-  adoptWriteProvisioningEffect,
-  assertMutationOwnership,
-  assertWriteExecutionJob,
-  prepareWriteProvisionerIntent,
-  prepareWriteProvisioningReissue,
-  promoteWriteWorkerReady,
-  recordOfficialWorktreeReceipt,
-  recordWriteProvisionerNoChild,
-  retainWriteProvisioningCleanupPending
-} from "./worker-mutation.mjs";
+import { captureContextManifest } from "./task-context-manifest.mjs";
+import { activateWriteProvisioningAttempt, prepareWriteProvisionerIntent, prepareWriteProvisioningReissue, promoteWriteWorkerReady, recordOfficialWorktreeReceipt } from "./worker-mutation-write-provisioning.mjs";
+import { adoptWriteProvisioningEffect, recordWriteProvisionerNoChild, retainWriteProvisioningCleanupPending } from "./worker-mutation-write-recovery.mjs";
+import { assertMutationOwnership } from "./worker-mutation-primitives.mjs";
+import { assertWriteExecutionJob } from "./worker-mutation-write-runtime-contract.mjs";
 import {
   assertManagedWorkerWorktree,
   classifyWorkerWorktreeEffect

@@ -3,13 +3,16 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 
-const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*))?$/;
+const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
 const CHANGE_CLASSES = new Set(["patch", "feature", "breaking"]);
 const STAGES = new Set(["development", "release_candidate", "release"]);
 
 export function parseSemver(value) {
   const match = String(value || "").match(SEMVER);
   if (!match) return null;
+  if (match[4]?.split(".").some((identifier) => /^\d+$/.test(identifier) && !/^(?:0|[1-9]\d*)$/.test(identifier))) {
+    return null;
+  }
   return {
     major: Number(match[1]),
     minor: Number(match[2]),
@@ -30,6 +33,204 @@ export function expectedTargetVersion(baseVersion, changeClass) {
 export function activeVersionForPlan(plan) {
   if (!plan || plan.stage === "release") return plan?.targetVersion || null;
   return plan.preRelease ? `${plan.targetVersion}-${plan.preRelease}` : null;
+}
+
+export function releaseTagForVersion(version) {
+  return parseSemver(version) ? `v${version}` : null;
+}
+
+export function validateReleaseTag(tag, plan, activeVersion) {
+  const errors = [];
+  const plannedVersion = activeVersionForPlan(plan);
+  if (plannedVersion !== activeVersion) {
+    errors.push(`Active release-plan version (${plannedVersion ?? "invalid"}) must match package version ${activeVersion ?? "missing"} before tagging.`);
+  }
+  const expectedTag = releaseTagForVersion(activeVersion);
+  if (expectedTag == null) {
+    errors.push("Plugin release tags require a valid active SemVer package version.");
+  } else if (tag !== expectedTag) {
+    errors.push(`Plugin release tag must be ${expectedTag}; received ${tag || "missing"}.`);
+  }
+  if (String(tag || "").startsWith("grok-review-runtime-")) {
+    errors.push("grok-review-runtime-<commit> is the separate infrastructure-pin namespace, not a plugin release tag.");
+  }
+  if (plan?.stage !== "development") {
+    errors.push("RC and stable tags require a protected external release attestation bound to the exact version, source commit, source digest, both supported hosts, and authoritative receipt digests; repository-authored qualification JSON is necessary but not sufficient.");
+  }
+  return errors;
+}
+
+export function validateReleaseTagRef(root, tag, mainRef) {
+  const errors = [];
+  const runGit = (args, description, { trim = true } = {}) => {
+    try {
+      const output = execFileSync("git", args, {
+        cwd: root,
+        encoding: "utf8",
+        maxBuffer: 8 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      return trim ? output.trim() : output;
+    } catch (error) {
+      const detail = String(error?.stderr || error?.stdout || error?.message || error).trim();
+      errors.push(`${description}: ${detail || "unknown git failure"}`);
+      return null;
+    }
+  };
+
+  const status = runGit(
+    ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    "Could not inspect release-tag worktree cleanliness",
+    { trim: false }
+  );
+  if (status != null && status.length !== 0) {
+    errors.push("Release-tag object validation requires a clean tracked and untracked working tree so validated files are exactly the tagged HEAD payload.");
+  }
+  const trackedFlags = runGit(
+    ["ls-files", "-v", "-z"],
+    "Could not inspect release-tag index visibility flags",
+    { trim: false }
+  );
+  const hiddenTrackedPath = trackedFlags?.split("\0").filter(Boolean).some((entry) => {
+    const flag = entry[0] || "";
+    return flag === "S" || flag !== flag.toUpperCase();
+  });
+  if (hiddenTrackedPath) {
+    errors.push("Release-tag object validation forbids skip-worktree and assume-unchanged index flags because they can hide payload drift from Git status.");
+  }
+
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/@{}~^+-]*$/.test(String(mainRef || ""))) {
+    errors.push(`Release tag main ref is invalid: ${mainRef || "missing"}.`);
+    return errors;
+  }
+
+  const tagRef = `refs/tags/${tag}`;
+  const tagType = runGit(["cat-file", "-t", tagRef], `Could not inspect ${tagRef}`);
+  if (tagType != null && tagType !== "tag") {
+    errors.push(`${tagRef} must be an annotated tag object; found ${tagType || "missing"}.`);
+  }
+  const tagCommit = runGit(["rev-parse", "--verify", `${tagRef}^{commit}`], `Could not dereference ${tagRef}`);
+  const headCommit = runGit(["rev-parse", "--verify", "HEAD^{commit}"], "Could not resolve HEAD");
+  const mainCommit = runGit(["rev-parse", "--verify", `${mainRef}^{commit}`], `Could not resolve ${mainRef}`);
+  if (tagCommit && headCommit && tagCommit !== headCommit) {
+    errors.push(`${tagRef} targets ${tagCommit}, but the checked-out HEAD is ${headCommit}.`);
+  }
+  if (tagCommit && mainCommit && tagCommit !== mainCommit) {
+    errors.push(`${tagRef} targets ${tagCommit}, but ${mainRef} is ${mainCommit}.`);
+  }
+  return errors;
+}
+
+export function validateReleaseScripts(scripts) {
+  const expected = {
+    "release:history:check": "node scripts/check-release-history.mjs",
+    "release:tag:check": "node scripts/check-release-tag.mjs"
+  };
+  const errors = [];
+  for (const [name, command] of Object.entries(expected)) {
+    if (scripts?.[name] !== command) {
+      errors.push(`${name} must execute ${command} directly.`);
+    }
+  }
+  return errors;
+}
+
+export function validateRepositoryNpmConfig(npmrc) {
+  if (npmrc == null) return [];
+  const unsafe = String(npmrc)
+    .split(/\r?\n/u)
+    .some((line) => !/^\s*[#;]/u.test(line) && /^\s*script[-_]shell\s*=/iu.test(line));
+  return unsafe
+    ? ["Repository .npmrc must not set script-shell; authoritative release gates invoke Node entrypoints directly."]
+    : [];
+}
+
+function comparePrerelease(left, right) {
+  if (left == null && right == null) return 0;
+  if (left == null) return 1;
+  if (right == null) return -1;
+  const leftParts = left.split(".");
+  const rightParts = right.split(".");
+  const count = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < count; index += 1) {
+    if (leftParts[index] == null) return -1;
+    if (rightParts[index] == null) return 1;
+    const leftNumeric = /^\d+$/.test(leftParts[index]);
+    const rightNumeric = /^\d+$/.test(rightParts[index]);
+    if (leftNumeric && rightNumeric) {
+      const difference = Number(leftParts[index]) - Number(rightParts[index]);
+      if (difference !== 0) return difference;
+      continue;
+    }
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    if (leftParts[index] !== rightParts[index]) {
+      return leftParts[index] < rightParts[index] ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+function compareParsedSemver(left, right) {
+  for (const key of ["major", "minor", "patch"]) {
+    const difference = left[key] - right[key];
+    if (difference !== 0) return difference;
+  }
+  return comparePrerelease(left.preRelease, right.preRelease);
+}
+
+function changelogVersionEntries(changelog) {
+  const entries = [];
+  const pattern = /^##\s+([^\s]+)\s*$/gmu;
+  for (let match = pattern.exec(String(changelog || "")); match; match = pattern.exec(String(changelog || ""))) {
+    entries.push({ version: match[1], index: match.index });
+  }
+  return entries;
+}
+
+export function validateChangelogVersionHistory(activeVersion, changelog) {
+  const errors = [];
+  const entries = changelogVersionEntries(changelog);
+  if (entries.length === 0) return ["Changelog must contain at least one version heading."];
+  if (entries[0].version !== activeVersion) {
+    errors.push(`First changelog version (${entries[0].version}) must match active package version ${activeVersion}.`);
+  }
+  const seen = new Set();
+  let newer = null;
+  for (const entry of entries) {
+    const parsed = parseSemver(entry.version);
+    if (!parsed) {
+      errors.push(`Changelog version heading ${entry.version} is not valid SemVer.`);
+      newer = null;
+      continue;
+    }
+    if (seen.has(entry.version)) errors.push(`Changelog version heading ${entry.version} must be unique.`);
+    seen.add(entry.version);
+    if (newer && compareParsedSemver(newer.parsed, parsed) <= 0) {
+      errors.push(`Changelog versions must be strictly newest-first; ${newer.version} must be newer than ${entry.version}.`);
+    }
+    newer = { version: entry.version, parsed };
+  }
+  return errors;
+}
+
+export function validateChangelogHistoryAgainstBase(currentChangelog, baseChangelog) {
+  const current = String(currentChangelog || "");
+  const base = String(baseChangelog || "");
+  const currentEntries = changelogVersionEntries(current);
+  const baseEntries = changelogVersionEntries(base);
+  if (currentEntries.length === 0 || baseEntries.length === 0) {
+    return ["Current and base changelogs must each contain a version heading."];
+  }
+  if (currentEntries[0].version === baseEntries[0].version) {
+    return current === base
+      ? []
+      : [`Published changelog version ${baseEntries[0].version} must remain byte-for-byte unchanged; add a newer version section instead.`];
+  }
+  const baseSuffix = base.slice(baseEntries[0].index);
+  if (!current.endsWith(baseSuffix)) {
+    return [`Previously merged changelog history beginning at ${baseEntries[0].version} must remain byte-for-byte unchanged.`];
+  }
+  return [];
 }
 
 export function expectedReadmeStatusForStage(stage) {
@@ -151,10 +352,10 @@ export function validateReleasePlan(plan) {
   }
 
   if (!STAGES.has(plan.stage)) errors.push("stage must be development, release_candidate, or release.");
-  if (plan.stage === "development" && !/^dev\.\d+$/.test(String(plan.preRelease || ""))) {
+  if (plan.stage === "development" && !/^dev\.(?:0|[1-9]\d*)$/.test(String(plan.preRelease || ""))) {
     errors.push("development stage requires preRelease dev.N.");
   }
-  if (plan.stage === "release_candidate" && !/^rc\.\d+$/.test(String(plan.preRelease || ""))) {
+  if (plan.stage === "release_candidate" && !/^rc\.(?:0|[1-9]\d*)$/.test(String(plan.preRelease || ""))) {
     errors.push("release_candidate stage requires preRelease rc.N.");
   }
   if (plan.stage === "release" && plan.preRelease != null) {

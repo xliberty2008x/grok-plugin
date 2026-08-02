@@ -99,7 +99,7 @@ function main() {
   }
   const runtime = path.resolve(
     __dirname,
-    "../lib/worker-broker-evidence.mjs"
+    "../lib/worker-broker-evidence-authority.mjs"
   );
   const result = spawnSync(
     process.execPath,

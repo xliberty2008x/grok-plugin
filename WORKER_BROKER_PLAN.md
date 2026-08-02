@@ -434,12 +434,7 @@ Delivery states remain `accepted`, `pending`, `delivered`, `delivery_unknown`, a
 ### Phase 2 authoritative checks
 
 ```sh
-node --test \
-  tests/worker-mailbox.test.mjs \
-  tests/worker-context-roles.test.mjs \
-  tests/worker-mutation.test.mjs \
-  tests/worker-protocol.test.mjs \
-  tests/mcp-worker-runtime.test.mjs
+node scripts/test-phase2-focused.mjs
 npm run check
 git show --check --format= HEAD
 npm run worker:verify -- --phase 2 --strict
@@ -510,7 +505,6 @@ Never automatically cherry-pick or apply worker output into the parent checkout.
 node --test tests/worker-broker-phase3-evidence.test.mjs
 npm run test:phase3-focused
 node --test tests/worker-worktree.test.mjs
-node --test tests/worker-mutation.test.mjs
 node --test tests/worker-safety-proofs.test.mjs
 npm run check
 git show --check --format= HEAD

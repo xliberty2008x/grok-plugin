@@ -4,7 +4,7 @@
   "changeClass": "breaking",
   "targetVersion": "0.3.0",
   "stage": "development",
-  "preRelease": "dev.1",
+  "preRelease": "dev.2",
   "supportedHosts": [
     "codex",
     "claude-code"
@@ -13,6 +13,8 @@
     "Replace the profile-v2 rescue path with the TaskEnvelope and ContextManifest control plane.",
     "Change persistent jobs and security profiles to schema and contract version 3.",
     "Change write verification, credential isolation, lifecycle, resume, and transfer contracts.",
-    "Repair the Codex runtime-ingress contract and add boundary-scoped host-orchestration and installed-artifact qualification rules."
+    "Repair the Codex runtime-ingress contract and add boundary-scoped host-orchestration and installed-artifact qualification rules.",
+    "Decompose oversized lifecycle, provider, mutation, evidence, and qualification modules behind stable facades and add executable source-structure guardrails.",
+    "Publish the development snapshot through monotonic version history, exact annotated-main tags, hosted tag validation, and fail-closed RC or stable attestation gates."
   ]
 }

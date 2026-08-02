@@ -12,13 +12,17 @@ import path from "node:path";
 
 import {
   EVIDENCE_ROOT,
+  sha256Text
+} from "./worker-broker-evidence-core.mjs";
+import {
+  publishImmutableEvidenceArtifact
+} from "./worker-broker-evidence-files.mjs";
+import {
   computeInventoryDigest,
   computePhaseScopeDigest,
   gitIdentity,
-  isNonEvidenceTreeClean,
-  publishImmutableEvidenceArtifact,
-  sha256Text
-} from "./worker-broker-evidence.mjs";
+  isNonEvidenceTreeClean
+} from "./worker-broker-evidence-inventory.mjs";
 import {
   createPluginInventory,
   digestInventory

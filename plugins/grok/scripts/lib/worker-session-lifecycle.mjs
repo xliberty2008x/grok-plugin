@@ -5,11 +5,8 @@ import { CompanionError } from "./errors.mjs";
 import {
   sameExecutableAttestation
 } from "./executable-identity.mjs";
-import {
-  deleteSession,
-  inspectImportedSessionPresence,
-  taskCredentialEnvironment
-} from "./grok-provider.mjs";
+import { taskCredentialEnvironment } from "./provider-controller-environments.mjs";
+import { deleteSession, inspectImportedSessionPresence } from "./provider-sessions.mjs";
 import { sameHostSession } from "./host.mjs";
 import { processGroupGone } from "./process-control.mjs";
 import {

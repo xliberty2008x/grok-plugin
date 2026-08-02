@@ -21,14 +21,12 @@ const {
   inspectContainedGitMetadata,
   normalizeDarwinSystemPath
 } = gitContainment;
-
 export const DEFAULT_TEST_TEMP_MAX_AGE_MS = 60 * 60_000;
 export const TEST_TEMP_SIZE_SCAN_ENTRY_BUDGET = 10_000;
 export const TEST_TEMP_SNAPSHOT_REFRESH_MS = 10_000;
 const TEST_TEMP_WORKTREE_SCAN_TIMEOUT_MS = 120_000;
 export const LEGACY_REPOSITORY_PREFIX = "grok-plugin-repo-";
-// Every entry is an exact literal prefix used by tests in this repository.
-// Legacy cleanup is opt-in and accepts only prefix + mkdtemp's six-character suffix.
+// Exact test prefixes; opt-in cleanup accepts only prefix + mkdtemp's six-character suffix.
 export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "controller-startup-crash-",
   "external-ledger-lock-",
@@ -52,9 +50,11 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "fake-ps-path-",
   "gated-cleanup-",
   "grok-artifact-readonly-",
+  "grok-auth-refresh-",
   "grok-bad-git-",
   "grok-ci-auth-installer-",
   "grok-ci-auth-test-",
+  "grok-ci-prompt-",
   "grok-cli-authority-data-",
   "grok-cli-cancel-data-",
   "grok-codex-converted-",
@@ -121,7 +121,7 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "grok-mutation-data-",
   "grok-natural-codex-",
   "grok-owner-lifecycle-data-",
-  "grok-phase-scope-closure-",
+  "grok-phase-scope-closure-", "grok-phase-scope-pinned-external-",
   "grok-pinned-setup-plugin-",
   "grok-plugin-data-",
   "grok-plugin-e2e-",
@@ -156,6 +156,7 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "grok-reconcile-safety-data-",
   "grok-recursion-guard-",
   "grok-retain-admission-lock-",
+  "grok-review-model-",
   "grok-runner-credential-test-",
   "grok-runtime-data-",
   "grok-safety-data-",
@@ -171,7 +172,7 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "grok-state-data-",
   "grok-state-outside-",
   "grok-state-owner-publish-race-",
-  "grok-state-release-race-",
+  "grok-state-release-race-", "grok-structure-policy-",
   "grok-terminal-intent-data-",
   "grok-test-cleanup-sandbox-",
   "grok-transfer-cap-home-",
@@ -415,7 +416,6 @@ const MANAGED_PREFIX_KINDS = new Map([
   [TEST_TEMP_PROCESS_PREFIX, "process"]
 ]);
 const LEGACY_PREFIX_SET = new Set(LEGACY_TEST_TEMP_PREFIXES);
-
 function trustedExecutable(candidates) {
   return candidates.find((candidate) => {
     try {

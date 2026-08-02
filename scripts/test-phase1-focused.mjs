@@ -8,16 +8,25 @@ import {
   runDeterministicTestFiles,
   runDeterministicTestFilesCli
 } from "./lib/deterministic-test-runner.mjs";
+import {
+  WORKER_MUTATION_SEMANTIC_TEST_FILES
+} from "./lib/worker-mutation-test-inventory.mjs";
 
 /** Fixed Phase 1 proof inventory; callers cannot add, remove, or reorder tests. */
 export const PHASE1_FOCUSED_TEST_FILES = Object.freeze([
-  "tests/control-plane_part1.mjs",
-  "tests/control-plane_part2.mjs",
-  "tests/control-plane_part3.mjs",
+  "tests/control-plane-context-manifest.test.mjs",
+  "tests/control-plane-git-refs.test.mjs",
+  "tests/control-plane-lifecycle.test.mjs",
+  "tests/control-plane-metadata-races.test.mjs",
+  "tests/control-plane-worker-contracts.test.mjs",
   "tests/process-control.test.mjs",
   "tests/provider.test.mjs",
   "tests/recursion-guard.test.mjs",
-  "tests/runtime.test.mjs",
+  "tests/runtime-admission.test.mjs",
+  "tests/runtime-cancellation.test.mjs",
+  "tests/runtime-recovery.test.mjs",
+  "tests/runtime-task-lifecycle.test.mjs",
+  "tests/runtime-transfer.test.mjs",
   "tests/worker-protocol.test.mjs",
   "tests/worker-service.test.mjs",
   "tests/worker-mailbox.test.mjs",
@@ -37,9 +46,9 @@ export const PHASE1_FOCUSED_TEST_FILES = Object.freeze([
   "tests/worker-recovery-fence.test.mjs",
   "tests/worker-cli-authority.test.mjs",
   "tests/worker-terminal-intent.test.mjs",
+  "tests/worker-mutation-boundaries.test.mjs",
   "tests/process-control-owned-identity.test.mjs",
-  "tests/worker-mutation_part1.mjs",
-  "tests/worker-mutation_part2.mjs",
+  ...WORKER_MUTATION_SEMANTIC_TEST_FILES,
   "tests/worker-safety-proofs.test.mjs"
 ]);
 

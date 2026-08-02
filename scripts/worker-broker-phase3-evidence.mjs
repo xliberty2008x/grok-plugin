@@ -15,7 +15,7 @@ import {
   validatePhaseThreeLiveReceipt,
   writePhaseThreeLiveReceipt
 } from "./lib/worker-broker-phase3-evidence.mjs";
-import { REPO_ROOT } from "./lib/worker-broker-evidence.mjs";
+import { REPO_ROOT } from "./lib/worker-broker-evidence-core.mjs";
 
 const MAX_INPUT_BYTES = 256 * 1024;
 const HELP = `Usage:

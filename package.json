@@ -1,6 +1,6 @@
 {
   "name": "grok-plugin",
-  "version": "0.3.0-dev.1",
+  "version": "0.3.0-dev.2",
   "private": true,
   "type": "module",
   "description": "Claude Code and Codex companion plugin for the official Grok Build CLI",
@@ -8,7 +8,7 @@
     "node": ">=18.18"
   },
   "scripts": {
-    "test": "node --test tests/*.test.mjs",
+    "test": "node scripts/test-deterministic.mjs",
     "test:deterministic": "node scripts/test-deterministic.mjs",
     "test:temp:cleanup": "node scripts/cleanup-test-temp.mjs",
     "test:e2e": "node --test tests/live-grok.test.mjs",
@@ -20,9 +20,12 @@
     "test:phase3-focused": "node scripts/test-phase3-focused.mjs",
     "test:natural-codex": "node scripts/test-natural-codex.mjs",
     "codex:update-local": "node scripts/update-local-codex.mjs",
+    "structure:check": "node scripts/check-source-structure.mjs",
     "validate": "node scripts/validate.mjs",
     "version:check": "node scripts/validate.mjs --versions-only",
     "version:bump": "node scripts/bump-version.mjs",
+    "release:history:check": "node scripts/check-release-history.mjs",
+    "release:tag:check": "node scripts/check-release-tag.mjs",
     "check": "npm run validate && npm run test:deterministic",
     "worker:evidence": "node scripts/worker-broker-evidence.mjs",
     "worker:prove": "node scripts/worker-broker-evidence.mjs prove",
@@ -34,5 +37,8 @@
     "grok:ci-auth:status": "node scripts/install-grok-ci-auth-sync.mjs status",
     "grok:ci-auth:uninstall": "node scripts/install-grok-ci-auth-sync.mjs uninstall"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "acorn": "8.15.0"
+  }
 }

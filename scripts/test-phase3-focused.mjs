@@ -8,6 +8,9 @@ import {
   runDeterministicTestFiles,
   runDeterministicTestFilesCli
 } from "./lib/deterministic-test-runner.mjs";
+import {
+  WORKER_MUTATION_SEMANTIC_TEST_FILES
+} from "./lib/worker-mutation-test-inventory.mjs";
 
 /**
  * Fixed Phase 3 proof inventory. It covers execution binding, managed-root
@@ -26,8 +29,7 @@ export const PHASE3_FOCUSED_TEST_FILES = Object.freeze([
   "tests/worker-dispatch-supervisor.test.mjs",
   "tests/worker-execution-binding.test.mjs",
   "tests/worker-launch-outbox.test.mjs",
-  "tests/worker-mutation_part1.mjs",
-  "tests/worker-mutation_part2.mjs",
+  ...WORKER_MUTATION_SEMANTIC_TEST_FILES,
   "tests/worker-owner-controller.test.mjs",
   "tests/worker-owner-lifecycle.test.mjs",
   "tests/worker-protocol.test.mjs",

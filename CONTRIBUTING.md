@@ -17,6 +17,53 @@ Release versioning, qualification evidence, and host-boundary rules below still
 apply to any release-bearing change; this section only documents the fork-PR
 merge gates for protected `main`.
 
+## Source-structure policy
+
+Run the executable structure policy directly when adding or moving JavaScript:
+
+```text
+npm run structure:check
+```
+
+The checked-in policy scans handwritten `.js`, `.mjs`, and `.cjs` under the
+application, plugin, script, and test roots. It measures physical lines and
+Acorn function spans, static ESM cycles, facade direction, and ordinal
+fragments. The budgets are 1,500/250 lines for product files/functions,
+2,000/350 for tooling, 2,000/400 for tests, and 300 lines for registered
+facades and entrypoints with a 250-line function budget. Canonical roots and
+extensions are fixed; nested `build`, `coverage`, `dist`, and `vendor`
+directories do not create an exemption. Relative static imports into `.git`
+or `node_modules` fail the ratchet.
+
+Each source is capped at 2 MiB before parsing, and a handwritten physical line
+may not exceed 4 KiB. This prevents minification or line packing from bypassing
+the file/function budgets and keeps adversarial source from exhausting Acorn.
+
+The repository is initially in `observe` mode: existing debt is visible as
+warnings, while malformed policy, parser failure, unreadable source, or a
+symlink inside a source root fails closed. `ratchet` behavior is already tested
+but MUST NOT become the checked-in mode until the promotion conditions in
+`docs/issues/56-source-structure-policy.md` are satisfied.
+
+Legacy allowances are exact paths, not patterns. Their original line count is
+immutable and protected by the repository-pinned baseline digest; the separate
+current cap cannot grow, and a reduction must lower or resolve the cap in the
+same change. The complete current policy boundary has its own repository-pinned
+digest so active caps, facade registration, provenance, scan coverage, and
+resource limits cannot be silently weakened. A resolved file cap is `null`;
+resolved function caps are removed from the active vector while their
+immutable history remains. Long-function
+allowances are sorted per-function vectors. Every allowance needs an issue,
+rationale, and observable removal criterion.
+Do not add spare capacity, wildcard exceptions, fake `part1`/`part2` modules,
+empty facade indirection, or generated-file headers to evade the policy.
+
+Entrypoints and orchestrators own argument handling and sequencing only.
+Validation, protocol, identity, persistence, atomic mutation, and cleanup
+authority belong in named domain modules. A structural extraction MUST NOT
+create a second lifecycle authority, durable store, or hidden implementation
+dependency routed back through a public facade.
+
 ## Versioning convention and change taxonomy
 
 The repository follows Semantic Versioning, with an explicit rule for the
@@ -49,8 +96,65 @@ npm run version:check
 ```
 
 The changelog's first version heading MUST match the active package version.
-Previously merged stable sections are immutable history; new work goes above
-them under the new development version.
+All previously merged version sections are immutable history; new work goes
+above them under a monotonically newer development version. Hosted CI compares
+the complete previously merged suffix byte-for-byte with the pull-request base:
+
+```text
+node scripts/check-release-history.mjs <base-ref>
+```
+
+### Git tag strategy
+
+Plugin releases and development snapshots use one exact tag namespace:
+`v<active package version>`. For example, development snapshot
+`0.3.0-dev.2` is tagged `v0.3.0-dev.2`, a release candidate is tagged
+`v0.3.0-rc.1`, and the qualified stable release is tagged `v0.3.0`.
+Development and release-candidate tags remain prereleases and MUST NOT be
+described as stable or release-qualified.
+
+The private review control plane uses the separate immutable infrastructure
+namespace `grok-review-runtime-<full commit SHA>`. It is not a package version
+and MUST NOT be treated as a plugin release tag. Do not create mutable aliases
+such as `v0` or `v0.3`.
+
+Every version tag MUST:
+
+1. be an annotated tag on the exact merged `main` commit whose package,
+   marketplaces, manifests, changelog, notices, and runtime client versions
+   agree;
+2. be created only after the exact post-merge `main` CI run succeeds;
+3. be created from a clean release worktree whose `HEAD` is the freshly fetched
+   main commit, then pass the following object-and-target check before push.
+   Substitute the actual local remote name (`actions/checkout` uses `origin`):
+
+   ```text
+   git fetch <remote> main
+   git tag -a v<active package version> <remote>/main -m "Grok Companion <active package version>"
+   node scripts/check-release-tag.mjs v<active package version> --require-ref --main-ref <remote>/main
+   ```
+
+4. pass both the hosted matrix and the dedicated `Release tag required` job
+   through the checked-in `v*` tag trigger; and
+5. remain immutable: never move, delete, reuse, or replace a published version
+   tag.
+
+Advance `dev.N` and `rc.N` monotonically within the target core. An RC or
+stable tag remains fail-closed until a protected external release attestation
+is implemented. Repository-authored qualification JSON is necessary but is not
+sufficient authority to publish one of those tags. The protected attestation
+must bind the exact version, source commit, source digest, both supported hosts,
+and authoritative receipt digests. Tag rules do not weaken the existing
+qualification gates.
+
+Repository code proves tag naming, annotated-object type, exact `HEAD` and
+fetched-`main` identity, version-history ordering, and the immutable changelog
+suffix. It cannot prevent a GitHub administrator from deleting or moving a
+remote tag, and it cannot retroactively prove that post-merge CI was green.
+Those remain external gates: the repository tag ruleset must block update and
+deletion for `v*`, and the release operator must inspect the exact successful
+post-merge `main` run before creating the tag. Never describe these controls as
+repository-enforced until the corresponding GitHub ruleset is confirmed live.
 
 Promotion to `release_candidate` or `release` also requires
 `tests/e2e-results/qualification-<target>.json`. The aggregate record binds the

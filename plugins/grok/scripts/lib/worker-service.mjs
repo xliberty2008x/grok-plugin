@@ -20,11 +20,11 @@ import {
 } from "./worker-authority.mjs";
 import {
   cancelWorker,
-  authorizeReadyWriteWorkerDispatch,
-  providerLaunchState,
-  projectCancellationReceipt,
-  spawnReadOnlyWorker
-} from "./worker-mutation.mjs";
+  projectCancellationReceipt
+} from "./worker-mutation-cancellation.mjs";
+import { providerLaunchState } from "./worker-mutation-dispatch-contract.mjs";
+import { spawnReadOnlyWorker } from "./worker-mutation-spawn.mjs";
+import { authorizeReadyWriteWorkerDispatch } from "./worker-mutation-write-admission.mjs";
 import { launchCommittedWorker } from "./worker-runtime.mjs";
 import { provisionWriteWorkerWorktree } from "./worker-provisioner.mjs";
 import {
@@ -37,9 +37,9 @@ import {
 } from "./worker-host-actions.mjs";
 import {
   assertTaskEnvelope,
-  buildTaskEnvelope,
-  captureContextManifest
-} from "./task-contract.mjs";
+  buildTaskEnvelope
+} from "./task-envelope.mjs";
+import { captureContextManifest } from "./task-context-manifest.mjs";
 import {
   EXACT_WRITE_VERTICAL_SCOPE,
   assertExactWriteVerticalScope,

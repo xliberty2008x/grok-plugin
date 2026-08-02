@@ -40,6 +40,7 @@ import {
   processStartToken,
   removeOwnedTestTempRoot
 } from "../scripts/lib/test-temp.mjs";
+import { evaluateSourceStructure, loadSourceStructurePolicy } from "../scripts/lib/source-structure-policy.mjs";
 
 const { inspectContainedGitMetadata } = gitContainment;
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -538,18 +539,17 @@ test("legacy allowlist exactly covers checked-in literal system-temp allocation 
     "worker-supervisor-scan-safety-data-",
     "worker-supervisor-terminal-data-"
   ]) proven.add(prefix);
-  const files = [
-    ...fs.readdirSync(path.join(ROOT, "tests"))
-      .filter((name) => name.endsWith(".mjs"))
-      .map((name) => path.join(ROOT, "tests", name)),
-    ...fs.readdirSync(path.join(ROOT, "scripts"))
-      .filter((name) => name.endsWith(".mjs"))
-      .map((name) => path.join(ROOT, "scripts", name)),
-    path.join(ROOT, "scripts/lib/worker-broker-evidence.mjs")
-  ];
+  const sourceInventory = evaluateSourceStructure({
+    root: ROOT,
+    config: loadSourceStructurePolicy({
+      root: ROOT
+    })
+  });
+  assert.equal(sourceInventory.ok, true);
+  const files = sourceInventory.files.map((entry) => entry.absolute);
   for (const file of files) {
     const source = fs.readFileSync(file, "utf8");
-    const usesSharedHelper = /import\s*\{[\s\S]*?\btempDir\b[\s\S]*?\}\s*from\s*["']\.\/helpers\.mjs["']/u.test(source)
+    const usesSharedHelper = /import\s*\{[\s\S]*?\btempDir\b[\s\S]*?\}\s*from\s*["']\.\/(?:helpers|[A-Za-z0-9._-]*test-support)\.mjs["']/u.test(source)
       || file === path.join(ROOT, "tests/helpers.mjs");
     const definesSystemTempHelper = /function\s+tempDir\s*\([^)]*\)\s*\{[\s\S]{0,300}?os\.tmpdir\(\)/u.test(source);
     if (usesSharedHelper || definesSystemTempHelper) {

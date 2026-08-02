@@ -454,7 +454,7 @@ test("Codex manifest, marketplace, public skills, hooks, and wrapper form one in
   // Issue #32: capability-receipt remediation is a skill contract, not a general orchestrator.
   const rescueSkill = read("plugins/grok/skills/rescue/SKILL.md");
   const readme = read("README.md");
-  const companion = read("plugins/grok/scripts/grok-companion.mjs");
+  const companion = read("plugins/grok/scripts/lib/companion-provider-admission.mjs");
   const canonicalCodex = missingInvalidProviderCapabilityReceiptMessage({
     CODEX_THREAD_ID: "codex-thread"
   });

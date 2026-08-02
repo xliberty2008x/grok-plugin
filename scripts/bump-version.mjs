@@ -4,14 +4,19 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { activeVersionForPlan, validateReleasePlan } from "./lib/version-policy.mjs";
+import {
+  activeVersionForPlan,
+  expectedReadmeStatusForStage,
+  parseSemver,
+  validateReleasePlan
+} from "./lib/version-policy.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const [nextVersion, ...flags] = process.argv.slice(2);
 const dryRun = flags.includes("--dry-run");
 const invalidFlags = flags.filter((flag) => flag !== "--dry-run");
 
-if (!nextVersion || invalidFlags.length || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(nextVersion)) {
+if (!nextVersion || invalidFlags.length || !parseSemver(nextVersion)) {
   process.stderr.write("Usage: node scripts/bump-version.mjs <semver> [--dry-run]\n");
   process.exit(2);
 }
@@ -37,6 +42,22 @@ function atomicWrite(relative, contents) {
   fs.writeFileSync(temporary, contents, { encoding: "utf8", mode, flag: "wx" });
   fs.renameSync(temporary, destination);
   return true;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function updateRuntimeClientVersion(relative, clientName) {
+  let source = fs.readFileSync(file(relative), "utf8");
+  const pattern = new RegExp(
+    `(clientInfo\\s*:\\s*\\{[\\s\\S]{0,300}?name\\s*:\\s*["']${escapeRegExp(clientName)}["'][\\s\\S]{0,180}?version\\s*:\\s*["'])[^"']+(["'])`
+  );
+  if (!pattern.test(source)) {
+    throw new Error(`Could not find ${clientName} ACP clientInfo version in ${relative}.`);
+  }
+  source = source.replace(pattern, `$1${nextVersion}$2`);
+  return source;
 }
 
 const packageJson = readJson("package.json");
@@ -84,11 +105,35 @@ if (!/^Grok Companion for Claude Code and Codex \d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)
 }
 notice = notice.replace(/^Grok Companion for Claude Code and Codex \d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\./m, `Grok Companion for Claude Code and Codex ${nextVersion}.`);
 
-const providerPath = "plugins/grok/scripts/lib/grok-provider.mjs";
-let provider = fs.readFileSync(file(providerPath), "utf8");
-const clientVersionPattern = /(clientInfo\s*:\s*\{[\s\S]{0,300}?version\s*:\s*["'])[^"']+(["'])/;
-if (!clientVersionPattern.test(provider)) throw new Error("Could not find ACP clientInfo version.");
-provider = provider.replace(clientVersionPattern, `$1${nextVersion}$2`);
+const readmePath = "README.md";
+let readme = fs.readFileSync(file(readmePath), "utf8");
+const readmeVersionPattern = /^(\|\s*\*\*Version\*\*\s*\|\s*`)[^`]+(`\s*\|)$/m;
+const readmeStatusPattern = /^(\|\s*\*\*Status\*\*\s*\|\s*).*?(\s*\|)$/m;
+if (!readmeVersionPattern.test(readme) || !readmeStatusPattern.test(readme)) {
+  throw new Error("README.md must contain the current Version and Status table rows.");
+}
+const readmeStatus = expectedReadmeStatusForStage(releasePlan.stage);
+if (!readmeStatus) throw new Error(`Unsupported README release stage: ${releasePlan.stage}`);
+readme = readme
+  .replace(readmeVersionPattern, `$1${nextVersion}$2`)
+  .replace(readmeStatusPattern, `$1${readmeStatus}$2`);
+
+const planPath = "PLAN.md";
+let projectPlan = fs.readFileSync(file(planPath), "utf8");
+if (releasePlan.stage === "development") {
+  const planVersionPattern = new RegExp(
+    "(promote `)" + escapeRegExp(previousVersion) + "(` to a release candidate)"
+  );
+  if (!planVersionPattern.test(projectPlan)) {
+    throw new Error(`PLAN.md must identify the current development version ${previousVersion}.`);
+  }
+  projectPlan = projectPlan.replace(planVersionPattern, `$1${nextVersion}$2`);
+}
+
+const providerRuntimePath = "plugins/grok/scripts/lib/provider-acp-runtime.mjs";
+const providerRuntime = updateRuntimeClientVersion(providerRuntimePath, "grok-companion");
+const ownerControllerPath = "plugins/grok/scripts/lib/worker-owner-controller.mjs";
+const ownerController = updateRuntimeClientVersion(ownerControllerPath, "grok-companion-owner-controller");
 
 const updates = [
   ["package.json", serializeJson(packageJson)],
@@ -99,7 +144,10 @@ const updates = [
   ["plugins/grok/.codex-plugin/plugin.json", serializeJson(codexPluginManifest)],
   [changelogPath, changelog],
   [noticePath, notice],
-  [providerPath, provider]
+  [readmePath, readme],
+  [planPath, projectPlan],
+  [providerRuntimePath, providerRuntime],
+  [ownerControllerPath, ownerController]
 ];
 
 const changed = updates.filter(([relative, contents]) => atomicWrite(relative, contents)).map(([relative]) => relative);
