@@ -756,11 +756,30 @@ test("packaging surfaces exist for Codex skill and Claude command", () => {
     assert.equal(fs.existsSync(file), true, file);
   }
   const skillText = fs.readFileSync(skill, "utf8");
-  assert.match(skillText, /--background/);
-  assert.match(skillText, /--web-only/);
-  assert.match(skillText, /--workspace/);
+  const assertExclusiveInvocationForms = (text, label) => {
+    const invocationLines = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("node ") && line.includes(" deep-research ") && line.includes("--query-stdin"));
+    assert.equal(invocationLines.length, 2, `${label} must publish exactly two complete invocation forms`);
+    assert.ok(invocationLines.some((line) => line.includes("--background --web-only")), `${label} is missing the default web-only form`);
+    assert.ok(invocationLines.some((line) => line.includes("--background --workspace")), `${label} is missing the explicit workspace form`);
+    for (const line of invocationLines) {
+      const executionModes = ["--background", "--wait"].filter((flag) => line.includes(flag));
+      const researchModes = ["--web-only", "--workspace"].filter((flag) => line.includes(flag));
+      assert.equal(executionModes.length, 1, `${label} combines or omits execution modes: ${line}`);
+      assert.equal(researchModes.length, 1, `${label} combines or omits research modes: ${line}`);
+    }
+    assert.doesNotMatch(text, /--web-only[^\n]*\[--workspace\]/, `${label} retains the conflicting default-plus-optional workspace shape`);
+    assert.doesNotMatch(text, /--background[^\n]*\[--wait\]/, `${label} retains the conflicting default-plus-optional wait shape`);
+    assert.match(text, /exactly one/i, `${label} does not state the exclusive selection contract`);
+    assert.match(text, /`--workspace` replaces `--web-only`/i, `${label} does not say workspace replaces web-only`);
+    assert.match(text, /`--wait` replaces `--background`/i, `${label} does not say wait replaces background`);
+  };
+  assertExclusiveInvocationForms(skillText, "Codex skill");
   assert.match(skillText, /hostVerification/);
   const commandText = fs.readFileSync(command, "utf8");
+  assertExclusiveInvocationForms(commandText, "Claude command");
   assert.match(commandText, /deep-research/);
   assert.match(commandText, /query-stdin/);
 });
