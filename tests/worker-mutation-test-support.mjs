@@ -777,14 +777,27 @@ export async function loadWorkerProvisionerWithProviderSeam(seam) {
   const shimUrl = `data:text/javascript;base64,${
     Buffer.from(shimSource).toString("base64")
   }`;
+  const providerSeamSpecifiers = new Set([
+    "./provider-acp-runtime.mjs",
+    "./provider-process.mjs",
+    "./provider-task-environment.mjs"
+  ]);
+  const replacedProviderSeams = new Set();
   const moduleBase = pathToFileURL(moduleFile);
   const source = fs.readFileSync(moduleFile, "utf8").replace(
     /from "(\.\/[^"]+)"/g,
-    (_match, specifier) => `from "${
-      specifier === "./grok-provider.mjs"
-        ? shimUrl
-        : new URL(specifier, moduleBase).href
-    }"`
+    (_match, specifier) => {
+      if (providerSeamSpecifiers.has(specifier)) {
+        replacedProviderSeams.add(specifier);
+        return `from "${shimUrl}"`;
+      }
+      return `from "${new URL(specifier, moduleBase).href}"`;
+    }
+  );
+  assert.deepEqual(
+    [...replacedProviderSeams].sort(),
+    [...providerSeamSpecifiers].sort(),
+    "worker provisioner provider seams must cover the exact leaf imports"
   );
   try {
     const loaded = await import(`data:text/javascript;base64,${
