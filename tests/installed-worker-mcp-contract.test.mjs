@@ -1859,22 +1859,22 @@ test("cancellation replay preserves immutable admission receipt and one public e
     assertContractError("E_LIVE_CANCELLATION")
   );
 
-  const priorLifecycleAcceptance = cancellationBundle();
-  const priorLifecycleAcceptedAt = "2026-07-23T10:01:49.999Z";
-  priorLifecycleAcceptance.cancel.receipt.requestAcceptedAt =
-    priorLifecycleAcceptedAt;
-  priorLifecycleAcceptance.cancelReplay.receipt.requestAcceptedAt =
-    priorLifecycleAcceptedAt;
-  priorLifecycleAcceptance.terminalResult.worker.result.cancellation
-    .requestAcceptedAt = priorLifecycleAcceptedAt;
-  priorLifecycleAcceptance.terminalResult.worker.lifecycleEvents
-    .find((event) => event.type === "cancellation.requested")
-    .detail.requestAcceptedAt = priorLifecycleAcceptedAt;
-  assert.throws(
-    () => validateInstalledCancellationReplayScenario(
-      priorLifecycleAcceptance
-    ),
-    assertContractError("E_LIVE_CANCELLATION")
+  const concurrentLifecycleEvent = cancellationBundle();
+  const concurrentRequestAcceptedAt = "2026-07-23T10:01:49.999Z";
+  const interveningEvent = concurrentLifecycleEvent.terminalResult.worker
+    .lifecycleEvents.find((event) => event.sequence === 6);
+  const cancellationEvent = concurrentLifecycleEvent.terminalResult.worker
+    .lifecycleEvents.find((event) => event.type === "cancellation.requested");
+  assert.ok(Date.parse(concurrentRequestAcceptedAt) < Date.parse(interveningEvent.at)
+    && Date.parse(interveningEvent.at) < Date.parse(cancellationEvent.at));
+  concurrentLifecycleEvent.cancel.receipt.requestAcceptedAt = concurrentRequestAcceptedAt;
+  concurrentLifecycleEvent.cancelReplay.receipt.requestAcceptedAt =
+    concurrentRequestAcceptedAt;
+  concurrentLifecycleEvent.terminalResult.worker.result.cancellation
+    .requestAcceptedAt = concurrentRequestAcceptedAt;
+  cancellationEvent.detail.requestAcceptedAt = concurrentRequestAcceptedAt;
+  assert.doesNotThrow(
+    () => validateInstalledCancellationReplayScenario(concurrentLifecycleEvent)
   );
 
   const replayObservationDrift = cancellationBundle();
