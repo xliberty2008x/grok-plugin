@@ -26,16 +26,10 @@ import {
   readJob,
   withWorkspaceStateTransaction
 } from "./state.mjs";
-import {
-  assertContextManifestIntegrity,
-  captureContextManifest
-} from "./task-context-manifest.mjs";
-import { bindContextMetadataCompleteness } from "./task-context-metadata.mjs";
+import { captureContextManifest } from "./task-context-manifest.mjs";
 import {
   activateWriteProvisioningAttempt,
   adoptWriteProvisioningEffect,
-  assertMutationOwnership,
-  assertWriteExecutionJob,
   prepareWriteProvisionerIntent,
   prepareWriteProvisioningReissue,
   promoteWriteWorkerReady,
@@ -43,16 +37,14 @@ import {
   recordWriteProvisionerNoChild,
   retainWriteProvisioningCleanupPending
 } from "./worker-mutation.mjs";
+import { assertMutationOwnership } from "./worker-mutation-primitives.mjs";
+import { assertWriteExecutionJob } from "./worker-mutation-write-runtime-contract.mjs";
 import {
   assertManagedWorkerWorktree,
   classifyWorkerWorktreeEffect
 } from "./worker-worktree.mjs";
 import { workspaceState } from "./workspace.mjs";
 
-const { captureCompleteContextManifest } = bindContextMetadataCompleteness({
-  captureContextManifest,
-  assertContextManifestIntegrity
-});
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const ERROR_CODE = /^E_[A-Z0-9_]{1,62}[A-Z0-9]$/;
 const MAX_PROVISIONING_LEASE_MS = 300_000;
@@ -1017,8 +1009,8 @@ export async function provisionWriteWorkerWorktree({
     });
     provider = null;
 
-    const executionContextManifest = captureCompleteContextManifest(
-      initial.binding.expectedExecutionRoot, { contextPhase: "execute" }
+    const executionContextManifest = captureContextManifest(
+      initial.binding.expectedExecutionRoot
     );
     const promoted = promoteWriteWorkerReady({
       ...mutationBase,

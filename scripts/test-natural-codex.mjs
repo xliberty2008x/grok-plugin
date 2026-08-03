@@ -9,38 +9,15 @@ import { fileURLToPath } from "node:url";
 
 import { readValidProviderCapabilityReceipt } from "../plugins/grok/scripts/lib/provider-capability.mjs";
 import { providerLaunchBindingDigest } from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
-import { assertDispatchContract } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
+import { assertDispatchContract } from "../plugins/grok/scripts/lib/worker-mutation-dispatch-contract.mjs";
 
-const SCRIPT = fileURLToPath(import.meta.url);
-const ROOT = path.resolve(path.dirname(SCRIPT), "..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CODEX_BIN = process.env.CODEX_BIN || "codex";
 const MODEL = process.env.CODEX_E2E_MODEL || "gpt-5.5";
 const SCHEMA = path.join(ROOT, "tests", "natural-codex-output.schema.json");
 const CODEX_HOME = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
 const DATA_ROOT = path.join(CODEX_HOME, "plugins", "data", "grok-grok-companion");
 const SHA256_HEX = /^[a-f0-9]{64}$/;
-const CODEX_REASONING_EFFORTS = new Set([
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-  "ultra"
-]);
-
-export function resolveNaturalCodexReasoningEffort(value) {
-  const effort = value || "xhigh";
-  if (!CODEX_REASONING_EFFORTS.has(effort)) {
-    throw new Error(`Natural Codex reasoning effort ${effort} is unsupported.`);
-  }
-  return effort;
-}
-
-const REASONING_EFFORT = resolveNaturalCodexReasoningEffort(
-  process.env.CODEX_E2E_REASONING_EFFORT
-);
 
 function fail(message, details = "") {
   throw new Error(`${message}${details.trim() ? `\n${details.trim()}` : ""}`);
@@ -184,39 +161,6 @@ function checked(command, args, options) {
   return result;
 }
 
-function codexRunMetadata(result) {
-  return JSON.stringify({
-    status: result?.status ?? null,
-    signal: result?.signal ?? null,
-    stdoutBytes: Buffer.byteLength(result?.stdout || "", "utf8"),
-    stderrBytes: Buffer.byteLength(result?.stderr || "", "utf8")
-  });
-}
-
-export function naturalCodexExecArgs({
-  model,
-  reasoningEffort,
-  root,
-  schema,
-  outputFile,
-  prompt
-}) {
-  const resolvedReasoningEffort = resolveNaturalCodexReasoningEffort(reasoningEffort);
-  return [
-    "exec",
-    "--ephemeral",
-    "--dangerously-bypass-hook-trust",
-    "--model", model,
-    "--config", `model_reasoning_effort="${resolvedReasoningEffort}"`,
-    "--sandbox", "danger-full-access",
-    "--cd", root,
-    "--color", "never",
-    "--output-schema", schema,
-    "--output-last-message", outputFile,
-    prompt
-  ];
-}
-
 function findJobFile(directory, name) {
   if (!fs.existsSync(directory)) return null;
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
@@ -247,14 +191,18 @@ function main() {
   ].join("\n");
 
   try {
-    const codexRun = checked(CODEX_BIN, naturalCodexExecArgs({
-      model: MODEL,
-      reasoningEffort: REASONING_EFFORT,
-      root: ROOT,
-      schema: SCHEMA,
-      outputFile,
+    checked(CODEX_BIN, [
+      "exec",
+      "--ephemeral",
+      "--dangerously-bypass-hook-trust",
+      "--model", MODEL,
+      "--sandbox", "danger-full-access",
+      "--cd", ROOT,
+      "--color", "never",
+      "--output-schema", SCHEMA,
+      "--output-last-message", outputFile,
       prompt
-    }), { timeout: 20 * 60_000 });
+    ], { timeout: 20 * 60_000 });
 
     if (!fs.existsSync(outputFile)) fail("Codex did not write its schema-constrained final result.");
     let reported;
@@ -266,12 +214,7 @@ function main() {
     }
 
     const jobFile = findJobFile(DATA_ROOT, `${reported.jobId}.json`);
-    if (!jobFile) {
-      fail(
-        `Persisted Grok job ${reported.jobId} was not found beneath ${DATA_ROOT}.`,
-        codexRunMetadata(codexRun)
-      );
-    }
+    if (!jobFile) fail(`Persisted Grok job ${reported.jobId} was not found beneath ${DATA_ROOT}.`);
     const job = JSON.parse(fs.readFileSync(jobFile, "utf8"));
     if (job.id !== reported.jobId || job.status !== "completed" || job.phase !== "done") fail("Persisted Grok job did not complete successfully.", JSON.stringify({ id: job.id, status: job.status, phase: job.phase, error: job.error }));
     if (job.profile?.id !== "rescue-read-v3") fail(`Natural task used unexpected profile ${job.profile?.id || "missing"}.`);
@@ -333,18 +276,15 @@ function main() {
       providerLaunchBindingDigest: spawn.providerLaunchBindingDigest,
       codexVersion,
       grokVersion: job.profile.grokVersion || null,
-      model: MODEL,
-      reasoningEffort: REASONING_EFFORT
+      model: MODEL
     }, null, 2)}\n`);
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === SCRIPT) {
-  try { main(); }
-  catch (error) {
-    process.stderr.write(`Natural Codex/Grok E2E failed: ${error.message}\n`);
-    process.exitCode = 1;
-  }
+try { main(); }
+catch (error) {
+  process.stderr.write(`Natural Codex/Grok E2E failed: ${error.message}\n`);
+  process.exitCode = 1;
 }
