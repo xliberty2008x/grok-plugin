@@ -23,7 +23,7 @@ const FUNCTION_TYPES = new Set([
   "FunctionDeclaration",
   "FunctionExpression"
 ]);
-const ORDINAL_FRAGMENT = /(?:^|[_-])(?:part|segment|chunk)?[_-]?\d+$/iu;
+const ORDINAL_FRAGMENT = /(?:^|[_-])(?:part|segment|chunk)[_-]?\d+$/iu;
 
 function portable(value) {
   return value.replace(/\\/gu, "/");
@@ -423,8 +423,8 @@ export function validateSourceStructurePolicy(config, {
   if (config.budgets?.product?.fileLines !== 1500 || config.budgets?.product?.functionLines !== 250
     || config.budgets?.tooling?.fileLines !== 2000 || config.budgets?.tooling?.functionLines !== 350
     || config.budgets?.tests?.fileLines !== 2000 || config.budgets?.tests?.functionLines !== 400
-    || config.budgets?.facade?.fileLines !== 300) {
-    errors.push("The canonical budgets are product 1500/250, tooling 2000/350, tests 2000/400, and facades 300 lines.");
+    || config.budgets?.facade?.fileLines !== 300 || config.budgets?.facade?.functionLines !== 250) {
+    errors.push("The canonical budgets are product 1500/250, tooling 2000/350, tests 2000/400, and facades 300/250 lines.");
   }
   validateExactKeys(config.baseline, ["date", "initialDigest", "revision"], "baseline", errors);
   if (!isPlainObject(config.baseline)

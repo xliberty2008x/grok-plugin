@@ -163,6 +163,10 @@ test("configuration fails closed on changed budgets, wildcard paths, and unsorte
   const wrongBudget = policy();
   wrongBudget.budgets.product.fileLines = 1501;
   assert.ok(validateSourceStructurePolicy(wrongBudget).some((message) => /canonical budgets/u.test(message)));
+  const wrongFacadeFunctionBudget = policy();
+  wrongFacadeFunctionBudget.budgets.facade.functionLines = 251;
+  assert.ok(validateSourceStructurePolicy(wrongFacadeFunctionBudget)
+    .some((message) => /canonical budgets/u.test(message)));
 
   const rootExtra = policy();
   rootExtra.unexpected = true;
@@ -318,6 +322,17 @@ test("ordinal fragments are observed, exactly baselined, and rejected when new",
   write(root, "plugins/domain_part1.mjs", "export const value = 1;");
   assert.ok(codes(evaluateSourceStructure({ root, config: reduced, mode: "ratchet" }), "error")
     .has("new-ordinal-fragment"));
+
+  write(root, "plugins/handler_2.mjs", "export const handler = 2;");
+  write(root, "plugins/utils_2024.mjs", "export const utility = 2024;");
+  const legitimateNumericSuffixes = evaluateSourceStructure({ root, config: legacy, mode: "ratchet" });
+  assert.equal(legitimateNumericSuffixes.ok, true);
+  assert.equal(
+    legitimateNumericSuffixes.findings.some((entry) =>
+      entry.code === "new-ordinal-fragment"
+      && ["plugins/handler_2.mjs", "plugins/utils_2024.mjs"].includes(entry.path)),
+    false
+  );
 }));
 
 test("ratchet rejects implementation imports through a registered facade", () => withRepository((root) => {
