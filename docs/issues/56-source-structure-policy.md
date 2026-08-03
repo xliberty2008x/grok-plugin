@@ -40,7 +40,9 @@ U+2029 without counting a phantom line after a trailing terminator. Acorn
 8.15.0 is exact-pinned and measures function declarations, expressions,
 arrows, object and class methods, getters, setters, async functions, and
 generators. Static dependency edges include `import` and re-export sources;
-dynamic import and `require` do not masquerade as static edges.
+query strings, fragments, and safe percent encoding follow Node file-URL
+semantics before graph matching. Dynamic import and `require` do not masquerade
+as static edges.
 
 ### Stable function-debt identities
 
@@ -76,6 +78,14 @@ untracked source cannot escape. Paths are sorted and rendered with `/` on every
 platform. A source-root symlink, unreadable path, parser failure, or malformed
 configuration is a hard error even in `observe` mode.
 
+The four scan roots and three JavaScript extensions are exact canonical sets.
+Every root must remain a real directory. Nested `build`, `coverage`, `dist`,
+and `vendor` directories are scanned as project source; only `.git` and
+`node_modules` are skipped, and relative static edges into either are policy
+findings. Files larger than 2 MiB and physical source lines above 4 KiB fail
+before Acorn parsing, so minification cannot disguise complexity or exhaust the
+parser.
+
 ### Observe mode
 
 Current file/function debt, cap drift, cycles, ordinal fragments, and reverse
@@ -106,6 +116,12 @@ remains in `initialDebt`. Regressions against resolved caps fail in ratchet
 mode. Each active debt record also carries its issue, rationale, and observable
 removal criterion.
 
+A separate repository-pinned current-policy digest binds the active caps,
+cycle/fragment caps, dispositions, facade registry, canonical scan boundary,
+resource ceilings, mode, and baseline provenance. Lowering or resolving debt
+therefore requires an explicit digest update; silently reopening a previously
+lowered cap fails validation.
+
 ## Anti-gaming rules
 
 - There is no minimum module size and no target module count. Split by domain,
@@ -116,11 +132,13 @@ removal criterion.
   import domain modules, not route dependencies back through a facade.
 - Moving code into one giant function does not help because function spans are
   independently budgeted.
+- Packing code onto one giant physical line does not help because the 4 KiB
+  line ceiling is independent of LOC and function spans.
 - Comments and positional aliases cannot create function-debt identities; a
   long function needs one unique syntactic name in its file.
-- Adding a generated-file comment does not exempt a file. Standard output and
-  dependency directories are outside the handwritten scan; source roots remain
-  fail closed.
+- Adding a generated-file comment or moving code below a directory named
+  `build`, `coverage`, `dist`, or `vendor` does not exempt it. Canonical source
+  roots remain fail closed.
 - A cohesive exception is possible only as an exact, reviewed entry with a
   concrete removal condition. `worker-owner-lifecycle.mjs` is the current
   example that may justify a temporary cohesive disposition, but it still has

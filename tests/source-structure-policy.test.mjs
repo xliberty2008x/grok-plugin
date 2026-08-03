@@ -16,8 +16,14 @@ import {
   normalizePortableRelative,
   parseSourceStructure,
   physicalLineCount,
+  SOURCE_STRUCTURE_EXTENSIONS,
   SOURCE_STRUCTURE_INITIAL_DIGEST,
+  SOURCE_STRUCTURE_MAX_PHYSICAL_LINE_BYTES,
+  SOURCE_STRUCTURE_MAX_SOURCE_BYTES,
+  SOURCE_STRUCTURE_POLICY_DIGEST,
+  SOURCE_STRUCTURE_ROOTS,
   sourceStructureInitialDigest,
+  sourceStructurePolicyDigest,
   validateSourceStructurePolicy
 } from "../scripts/lib/source-structure-policy.mjs";
 
@@ -28,8 +34,10 @@ function policy(overrides = {}) {
   const config = {
     schemaVersion: 1,
     mode: "observe",
-    extensions: [".cjs", ".js", ".mjs"],
-    roots: ["plugins"],
+    extensions: [...SOURCE_STRUCTURE_EXTENSIONS],
+    roots: [...SOURCE_STRUCTURE_ROOTS],
+    maxPhysicalLineBytes: SOURCE_STRUCTURE_MAX_PHYSICAL_LINE_BYTES,
+    maxSourceBytes: SOURCE_STRUCTURE_MAX_SOURCE_BYTES,
     facadePaths: [],
     budgets: {
       product: { fileLines: 1500, functionLines: 250 },
@@ -37,7 +45,7 @@ function policy(overrides = {}) {
       tests: { fileLines: 2000, functionLines: 400 },
       facade: { fileLines: 300, functionLines: 250 }
     },
-    baseline: { date: "2026-08-01", revision: REVISION, initialDigest: "" },
+    baseline: { date: "2026-08-01", revision: REVISION, initialDigest: "", policyDigest: "" },
     dispositions: {},
     initialDebt: {},
     legacyDebt: {},
@@ -51,6 +59,7 @@ function policy(overrides = {}) {
     date: "2026-08-01",
     revision: REVISION,
     initialDigest: "",
+    policyDigest: "",
     ...(overrides.baseline || {})
   };
   if (!Object.prototype.hasOwnProperty.call(overrides, "initialDebt")) {
@@ -61,12 +70,20 @@ function policy(overrides = {}) {
     }]));
   }
   config.baseline.initialDigest = sourceStructureInitialDigest(config);
+  config.baseline.policyDigest = sourceStructurePolicyDigest(config);
+  return config;
+}
+
+function refreshPolicyDigest(config) {
+  config.baseline.policyDigest = sourceStructurePolicyDigest(config);
   return config;
 }
 
 function withRepository(run) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "grok-structure-policy-"));
-  fs.mkdirSync(path.join(root, "plugins"), { recursive: true });
+  for (const directory of SOURCE_STRUCTURE_ROOTS) {
+    fs.mkdirSync(path.join(root, directory), { recursive: true });
+  }
   try {
     return run(root);
   } finally {
@@ -246,6 +263,7 @@ test("exact file caps reject growth and require same-change reduction", () => wi
     .has("stale-file-exception"));
   const loweredInBudgetCap = structuredClone(config);
   loweredInBudgetCap.legacyDebt["plugins/large.mjs"].lineCap = 1500;
+  refreshPolicyDigest(loweredInBudgetCap);
   assert.ok(codes(evaluateSourceStructure({ root, config: loweredInBudgetCap, mode: "ratchet" }), "error")
     .has("stale-file-exception"));
 }));
@@ -262,6 +280,7 @@ test("per-function vectors reject new, grown, reduced, and stale long functions"
 
   const staleFileCap = structuredClone(config);
   staleFileCap.legacyDebt["plugins/functions.mjs"].lineCap = 251;
+  refreshPolicyDigest(staleFileCap);
   assert.ok(codes(evaluateSourceStructure({ root, config: staleFileCap, mode: "ratchet" }), "error")
     .has("stale-file-exception"));
 
@@ -438,6 +457,7 @@ test("resolved file and function caps stay immutable and reject regression", () 
   assert.equal(evaluateSourceStructure({ root, config, mode: "ratchet" }).ok, true);
   const active = structuredClone(config);
   active.legacyDebt["plugins/resolved.mjs"].lineCap = 1501;
+  refreshPolicyDigest(active);
   assert.ok(codes(evaluateSourceStructure({ root, config: active, mode: "ratchet" }), "error")
     .has("stale-file-exception"));
 }));
@@ -510,11 +530,35 @@ test("ratchet rejects implementation imports through a registered facade", () =>
   assert.ok(codes(evaluateSourceStructure({ root, config, mode: "ratchet" }), "error").has("reverse-facade-import"));
 }));
 
-test("immutable digest pins initial debt and topology while caps may only shrink", () => {
+test("file-URL query, fragment, and percent encoding cannot hide facade cycles", () => withRepository((root) => {
+  write(root, "plugins/facade name.mjs", "export { value } from './implementation.mjs';\n");
+  const config = policy({ facadePaths: ["plugins/facade name.mjs"] });
+  for (const specifier of [
+    "./facade%20name.mjs?bypass",
+    "./facade%20name.mjs#bypass"
+  ]) {
+    write(root, "plugins/implementation.mjs", `import { value } from '${specifier}';\nexport { value };\n`);
+    const result = evaluateSourceStructure({ root, config, mode: "ratchet" });
+    assert.ok(codes(result, "error").has("reverse-facade-import"), specifier);
+    assert.ok(codes(result, "error").has("new-cycle"), specifier);
+  }
+}));
+
+test("immutable and active digests pin history and the shrink-only policy boundary", () => {
   const config = loadSourceStructurePolicy({ root: ROOT });
   assert.equal(SOURCE_STRUCTURE_INITIAL_DIGEST, "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b");
   assert.equal(config.baseline.initialDigest, SOURCE_STRUCTURE_INITIAL_DIGEST);
   assert.equal(sourceStructureInitialDigest(config), SOURCE_STRUCTURE_INITIAL_DIGEST);
+  assert.equal(config.baseline.policyDigest, SOURCE_STRUCTURE_POLICY_DIGEST);
+  assert.equal(sourceStructurePolicyDigest(config), SOURCE_STRUCTURE_POLICY_DIGEST);
+
+  const selfReference = structuredClone(config);
+  selfReference.baseline.policyDigest = "0".repeat(64);
+  assert.equal(sourceStructurePolicyDigest(selfReference), SOURCE_STRUCTURE_POLICY_DIGEST);
+
+  const changedHistoryBoundary = structuredClone(config);
+  changedHistoryBoundary.initialDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].initialLines += 1;
+  assert.notEqual(sourceStructurePolicyDigest(changedHistoryBoundary), SOURCE_STRUCTURE_POLICY_DIGEST);
 
   const raised = structuredClone(config);
   raised.initialDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].initialLines += 1;
@@ -526,14 +570,18 @@ test("immutable digest pins initial debt and topology while caps may only shrink
 
   const lowerCap = structuredClone(config);
   lowerCap.legacyDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].lineCap -= 1;
+  refreshPolicyDigest(lowerCap);
   assert.deepEqual(validateSourceStructurePolicy(lowerCap, {
-    expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST
+    expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST,
+    expectedPolicyDigest: lowerCap.baseline.policyDigest
   }), []);
 
   const removedCap = structuredClone(config);
   delete removedCap.legacyDebt["plugins/grok/scripts/lib/worker-mutation.mjs"];
+  refreshPolicyDigest(removedCap);
   assert.deepEqual(validateSourceStructurePolicy(removedCap, {
-    expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST
+    expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST,
+    expectedPolicyDigest: removedCap.baseline.policyDigest
   }), []);
 
   const splitCycleCap = structuredClone(config);
@@ -541,9 +589,27 @@ test("immutable digest pins initial debt and topology while caps may only shrink
     "plugins/grok/scripts/lib/state.mjs",
     "plugins/grok/scripts/lib/task-contract.mjs"
   ]];
+  refreshPolicyDigest(splitCycleCap);
   assert.deepEqual(validateSourceStructurePolicy(splitCycleCap, {
-    expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST
+    expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST,
+    expectedPolicyDigest: splitCycleCap.baseline.policyDigest
   }), []);
+
+  const reopenedCap = structuredClone(lowerCap);
+  reopenedCap.legacyDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].lineCap += 1;
+  refreshPolicyDigest(reopenedCap);
+  assert.ok(validateSourceStructurePolicy(reopenedCap, {
+    expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST,
+    expectedPolicyDigest: lowerCap.baseline.policyDigest
+  }).some((message) => /repository-pinned policy boundary/u.test(message)));
+
+  const rewrittenProvenance = structuredClone(config);
+  rewrittenProvenance.baseline.date = "2026-08-04";
+  rewrittenProvenance.baseline.revision = "1".repeat(40);
+  assert.ok(validateSourceStructurePolicy(rewrittenProvenance, {
+    expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST,
+    expectedPolicyDigest: SOURCE_STRUCTURE_POLICY_DIGEST
+  }).some((message) => /policyDigest/u.test(message)));
 
   const invalidCycleCap = structuredClone(config);
   invalidCycleCap.capCycleComponents = [[
@@ -586,6 +652,70 @@ test("every giga file needs an exact disposition and stale dispositions fail", (
     }
   });
   assert.ok(codes(evaluateSourceStructure({ root, config: stale, mode: "ratchet" }), "error").has("stale-giga-disposition"));
+}));
+
+test("canonical source roots, extensions, and resource ceilings cannot be narrowed", () => {
+  const narrowedRoots = policy();
+  narrowedRoots.roots.pop();
+  refreshPolicyDigest(narrowedRoots);
+  assert.ok(validateSourceStructurePolicy(narrowedRoots, {
+    expectedPolicyDigest: narrowedRoots.baseline.policyDigest
+  }).some((message) => /canonical set/u.test(message)));
+
+  const narrowedExtensions = policy();
+  narrowedExtensions.extensions.shift();
+  refreshPolicyDigest(narrowedExtensions);
+  assert.ok(validateSourceStructurePolicy(narrowedExtensions, {
+    expectedPolicyDigest: narrowedExtensions.baseline.policyDigest
+  }).some((message) => /canonical set/u.test(message)));
+
+  const raisedSourceLimit = policy({ maxSourceBytes: SOURCE_STRUCTURE_MAX_SOURCE_BYTES + 1 });
+  assert.ok(validateSourceStructurePolicy(raisedSourceLimit).some((message) => /maxSourceBytes/u.test(message)));
+
+  const raisedLineLimit = policy({
+    maxPhysicalLineBytes: SOURCE_STRUCTURE_MAX_PHYSICAL_LINE_BYTES + 1
+  });
+  assert.ok(validateSourceStructurePolicy(raisedLineLimit).some((message) => /maxPhysicalLineBytes/u.test(message)));
+});
+
+test("nested build, coverage, dist, and vendor source cannot escape the scan", () => withRepository((root) => {
+  for (const directory of ["build", "coverage", "dist", "vendor"]) {
+    const relative = `scripts/${directory}/giga.mjs`;
+    write(root, relative, sourceLines(6001));
+    const result = evaluateSourceStructure({ root, config: policy(), mode: "ratchet" });
+    assert.equal(result.files.some((entry) => entry.file === relative), true, relative);
+    assert.ok(codes(result, "error").has("missing-giga-disposition"), relative);
+    fs.rmSync(path.join(root, "scripts", directory), { force: true, recursive: true });
+  }
+}));
+
+test("excluded and outside source edges plus replaced roots fail closed", () => withRepository((root) => {
+  write(root, "scripts/main.mjs", [
+    "import './node_modules/hidden.mjs';",
+    "import '../../outside.mjs';"
+  ].join("\n"));
+  write(root, "scripts/node_modules/hidden.mjs", "export const hidden = true;\n");
+  const unsafeEdges = evaluateSourceStructure({ root, config: policy(), mode: "ratchet" });
+  assert.ok(codes(unsafeEdges, "error").has("excluded-source-edge"));
+  assert.ok(codes(unsafeEdges, "error").has("outside-source-root-edge"));
+
+  fs.rmSync(path.join(root, "apps"), { recursive: true });
+  fs.writeFileSync(path.join(root, "apps"), "not a directory\n");
+  const replacedRoot = evaluateSourceStructure({ root, config: policy() });
+  assert.ok(codes(replacedRoot, "error").has("invalid-scan-root"));
+}));
+
+test("source byte and physical-line bounds fail before policy parsing can be gamed", () => withRepository((root) => {
+  const oversized = path.join(root, "plugins", "oversized.mjs");
+  fs.writeFileSync(oversized, Buffer.alloc(SOURCE_STRUCTURE_MAX_SOURCE_BYTES + 1, 0x20));
+  const byteLimited = evaluateSourceStructure({ root, config: policy() });
+  assert.ok(codes(byteLimited, "error").has("source-byte-limit"));
+  assert.equal(byteLimited.files.some((entry) => entry.file === "plugins/oversized.mjs"), false);
+
+  fs.rmSync(oversized);
+  write(root, "plugins/packed.mjs", `export const packed = [${"0,".repeat(5000)}];`);
+  const packed = evaluateSourceStructure({ root, config: policy(), mode: "ratchet" });
+  assert.ok(codes(packed, "error").has("physical-line-byte-limit"));
 }));
 
 test("parser, symlink, and unreadable source failures are hard errors in observe mode", () => withRepository((root) => {
@@ -744,6 +874,13 @@ test("portable paths normalize Windows separators", () => {
 test("checked-in observe baseline exactly covers all current file and function debt", () => {
   const config = loadSourceStructurePolicy({ root: ROOT });
   assert.equal(config.mode, "observe");
+  assert.deepEqual(config.extensions, [...SOURCE_STRUCTURE_EXTENSIONS]);
+  assert.deepEqual(config.roots, [...SOURCE_STRUCTURE_ROOTS]);
+  assert.equal(config.maxPhysicalLineBytes, SOURCE_STRUCTURE_MAX_PHYSICAL_LINE_BYTES);
+  assert.equal(config.maxSourceBytes, SOURCE_STRUCTURE_MAX_SOURCE_BYTES);
+  assert.equal(config.baseline.revision, "ffa84d4ce22252777d887e8ab6616c7155b40da7");
+  assert.equal(config.baseline.initialDigest, SOURCE_STRUCTURE_INITIAL_DIGEST);
+  assert.equal(config.baseline.policyDigest, SOURCE_STRUCTURE_POLICY_DIGEST);
   assert.deepEqual(config.facadePaths, [
     "apps/grok-review-app/src/actions/runner-cli.mjs",
     "apps/grok-review-app/src/index.mjs",
@@ -756,6 +893,10 @@ test("checked-in observe baseline exactly covers all current file and function d
   ]);
   const result = evaluateSourceStructure({ root: ROOT, config });
   assert.equal(result.ok, true);
+  assert.equal(result.files.length, 220);
+  assert.equal(result.warnings.length, 59);
+  assert.equal(result.cycles.length, 0);
+  assert.equal(result.fragments.length, 14);
   const debtPaths = result.files.filter((entry) => {
     if (!entry.category) return entry.lines > 5000;
     const budget = config.budgets[entry.category];

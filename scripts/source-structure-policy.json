@@ -12,6 +12,8 @@
     "scripts",
     "tests"
   ],
+  "maxPhysicalLineBytes": 4096,
+  "maxSourceBytes": 2097152,
   "facadePaths": [
     "apps/grok-review-app/src/actions/runner-cli.mjs",
     "apps/grok-review-app/src/index.mjs",
@@ -43,7 +45,8 @@
   "baseline": {
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
-    "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b"
+    "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b",
+    "policyDigest": "dcd1a6e7a176e85b438ff85675be97053a7b90b8eafb60888d0b052015c07399"
   },
   "dispositions": {
     "plugins/grok/scripts/grok-companion.mjs": {
