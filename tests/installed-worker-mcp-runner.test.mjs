@@ -79,6 +79,13 @@ function staticSpecifiers(relative) {
   ].map((match) => match[1]).sort();
 }
 
+function sideEffectSpecifiers(relative) {
+  return [
+    ...fs.readFileSync(path.join(ROOT, relative), "utf8")
+      .matchAll(/^import\s+["']([^"']+)["'];$/gmu)
+  ].map((match) => match[1]).sort();
+}
+
 test("setup-boundary diagnostics accept only exact runner stack frames", () => {
   assert.equal(
     setupBoundaryDiagnosticSourceLine({
@@ -1269,7 +1276,10 @@ test("write-smoke emergency cleanup is exact, session-bound, and cannot hide a m
   const source = readInstalledWorkerMcpRunnerSource();
   const evaluatePureRunnerFunction = (name, nextName) => {
     const start = source.indexOf(`function ${name}(`);
-    const end = source.indexOf(`function ${nextName}(`, start + 1);
+    const exportedNext = source.indexOf(`\nexport function ${nextName}(`, start + 1);
+    const end = exportedNext >= 0
+      ? exportedNext
+      : source.indexOf(`\nfunction ${nextName}(`, start + 1);
     assert.ok(start >= 0 && end > start, `missing pure helper ${name}`);
     return Function(`"use strict"; return (${source.slice(start, end).trim()});`)();
   };
@@ -1290,7 +1300,7 @@ test("write-smoke emergency cleanup is exact, session-bound, and cannot hide a m
     "durableSessionDeletionAcknowledged"
   );
   const helper = source.slice(
-    source.indexOf("async function cleanupExactWorkerBoundary("),
+    source.indexOf("async function scanExactWorkerBoundaryClosure("),
     source.indexOf("function proveEmergencyWriteWorktreeAbsent(")
   );
   const worktreeProof = source.slice(
@@ -1483,24 +1493,26 @@ test("package and repository validator pin the installed Worker MCP runner wirin
     "utf8"
   );
   const runner = fs.readFileSync(RUNNER, "utf8");
-  for (const specifier of [
+  assert.deepEqual(staticSpecifiers("scripts/test-installed-worker-mcp.mjs"), [
+    "./lib/installed-worker-mcp-failure.mjs",
+    "./lib/installed-worker-mcp-runner-cancellation-cleanup.mjs",
     "./lib/installed-worker-mcp-runner-core.mjs",
-    "./lib/installed-worker-mcp-runner-runtime.mjs",
-    "./lib/installed-worker-mcp-runner-setup.mjs",
+    "./lib/installed-worker-mcp-runner-qualification.mjs",
+    "node:path",
+    "node:process",
+    "node:url"
+  ].sort());
+  assert.deepEqual(sideEffectSpecifiers("scripts/test-installed-worker-mcp.mjs"), [
     "./lib/installed-worker-mcp-runner-observation.mjs",
+    "./lib/installed-worker-mcp-runner-runtime.mjs",
     "./lib/installed-worker-mcp-runner-session-read.mjs",
+    "./lib/installed-worker-mcp-runner-setup.mjs",
     "./lib/installed-worker-mcp-runner-write-scenarios.mjs",
     "./lib/installed-worker-mcp-runner-write-two.mjs"
-  ]) {
-    assert.match(
-      runner,
-      new RegExp(`from ["']${specifier.replaceAll(".", "\\.")}["']`),
-      specifier
-    );
-  }
-  assert.match(
+  ].sort());
+  assert.doesNotMatch(
     runner,
-    /import \{ setupCleanupRequiresObservation \} from "\.\/lib\/installed-worker-mcp-setup-boundary\.mjs";/
+    /installed-worker-mcp-(?:setup-boundary|session-boundary)\.mjs/u
   );
   for (const stale of [
     "boundedSetupScanDiagnosticCode",
@@ -1539,8 +1551,10 @@ test("package and repository validator pin the installed Worker MCP runner wirin
   );
   for (const required of [
     '"scripts/test-installed-worker-mcp.mjs"',
+    '"scripts/lib/installed-worker-mcp-runner-cancellation-cleanup.mjs"',
     '"scripts/lib/installed-worker-mcp-runner-core.mjs"',
     '"scripts/lib/installed-worker-mcp-runner-observation.mjs"',
+    '"scripts/lib/installed-worker-mcp-runner-qualification.mjs"',
     '"scripts/lib/installed-worker-mcp-runner-runtime.mjs"',
     '"scripts/lib/installed-worker-mcp-runner-session-read.mjs"',
     '"scripts/lib/installed-worker-mcp-runner-setup.mjs"',
@@ -1562,7 +1576,7 @@ test("package and repository validator pin the installed Worker MCP runner wirin
   );
 });
 
-test("installed runner scenario modules keep the exact Slice 3 boundary", () => {
+test("installed runner modules keep the exact final ownership boundary", () => {
   assert.deepEqual(
     INSTALLED_WORKER_MCP_RUNNER_MODULES.map((file) => path.basename(file)),
     [
@@ -1572,7 +1586,9 @@ test("installed runner scenario modules keep the exact Slice 3 boundary", () => 
       "installed-worker-mcp-runner-observation.mjs",
       "installed-worker-mcp-runner-session-read.mjs",
       "installed-worker-mcp-runner-write-two.mjs",
-      "installed-worker-mcp-runner-write-scenarios.mjs"
+      "installed-worker-mcp-runner-write-scenarios.mjs",
+      "installed-worker-mcp-runner-cancellation-cleanup.mjs",
+      "installed-worker-mcp-runner-qualification.mjs"
     ]
   );
   assert.deepEqual(
@@ -1619,42 +1635,111 @@ test("installed runner scenario modules keep the exact Slice 3 boundary", () => 
       "node:path"
     ].sort()
   );
+  assert.deepEqual(
+    staticSpecifiers(
+      "scripts/lib/installed-worker-mcp-runner-cancellation-cleanup.mjs"
+    ),
+    [
+      "./installed-worker-mcp-contract.mjs",
+      "./installed-worker-mcp-runner-core.mjs",
+      "./installed-worker-mcp-runner-observation.mjs",
+      "./installed-worker-mcp-runner-runtime.mjs",
+      "./installed-worker-mcp-runner-session-read.mjs",
+      "./installed-worker-mcp-runner-setup.mjs",
+      "node:child_process",
+      "node:crypto",
+      "node:fs",
+      "node:path"
+    ].sort()
+  );
+  assert.deepEqual(
+    staticSpecifiers(
+      "scripts/lib/installed-worker-mcp-runner-qualification.mjs"
+    ),
+    [
+      "./installed-worker-mcp-contract.mjs",
+      "./installed-worker-mcp-runner-cancellation-cleanup.mjs",
+      "./installed-worker-mcp-runner-core.mjs",
+      "./installed-worker-mcp-runner-runtime.mjs",
+      "./installed-worker-mcp-runner-session-read.mjs",
+      "./installed-worker-mcp-runner-setup.mjs",
+      "./installed-worker-mcp-runner-write-scenarios.mjs",
+      "./installed-worker-mcp-runner-write-two.mjs",
+      "./installed-worker-mcp-setup-boundary.mjs",
+      "./plugin-inventory.mjs",
+      "./worker-broker-evidence.mjs",
+      "node:crypto",
+      "node:fs",
+      "node:os",
+      "node:path",
+      "node:process"
+    ].sort()
+  );
 
   const runner = fs.readFileSync(RUNNER, "utf8");
-  const scenarioSources = [
-    "session-read",
-    "write-scenarios",
-    "write-two"
-  ].map((domain) => fs.readFileSync(
-    path.join(
-      ROOT,
-      "scripts",
-      "lib",
-      `installed-worker-mcp-runner-${domain}.mjs`
-    ),
-    "utf8"
-  ));
+  const sources = new Map([
+    ["facade", runner],
+    ...INSTALLED_WORKER_MCP_RUNNER_MODULES.map((file) => [
+      path.basename(file, ".mjs").replace("installed-worker-mcp-runner-", ""),
+      fs.readFileSync(file, "utf8")
+    ])
+  ]);
+  const owners = (name) => [...sources.entries()]
+    .filter(([, source]) => new RegExp(
+      `(?:export )?(?:async )?function ${name}\\b`,
+      "u"
+    ).test(source))
+    .map(([domain]) => domain);
+
   assert.doesNotMatch(
     runner,
-    /(?:async )?function (?:runCompletionScenario|runWriteSmokeScenario|runWriteCancellationScenario|runTwoWriterScenario)\b/u
+    /(?:export )?(?:async )?function (?:runCompletionScenario|runWriteSmokeScenario|runWriteCancellationScenario|runTwoWriterScenario|runCancellationScenario|cleanupExactWorkerBoundary|emergencyCleanup|ensurePublicationDirectory|publishReceipt|buildReceipt|qualify)\b/u
   );
   assert.doesNotMatch(
     runner,
     /from ["']\.\/lib\/(?:installed-worker-mcp-mailbox-poll|installed-worker-mcp-session-boundary)\.mjs["']/u
   );
-  for (const source of scenarioSources) {
-    assert.doesNotMatch(
-      source,
-      /(?:async )?function (?:runCancellationScenario|cleanupExactWorkerBoundary|emergencyCleanup|ensurePublicationDirectory|publishReceipt|buildReceipt|qualify|main)\b/u
-    );
-  }
-  for (const retained of [
+  assert.deepEqual(owners("main"), ["facade"]);
+  for (const name of [
     "runCancellationScenario",
     "cleanupExactWorkerBoundary",
-    "emergencyCleanup",
-    "qualify",
-    "main"
+    "emergencyCleanup"
   ]) {
-    assert.match(runner, new RegExp(`(?:async )?function ${retained}\\b`, "u"));
+    assert.deepEqual(owners(name), ["cancellation-cleanup"], name);
+  }
+  for (const name of [
+    "ensurePublicationDirectory",
+    "publishReceipt",
+    "buildReceipt",
+    "qualify"
+  ]) {
+    assert.deepEqual(owners(name), ["qualification"], name);
+  }
+  for (const name of [
+    "runCompletionScenario",
+    "runWriteSmokeScenario",
+    "runWriteCancellationScenario",
+    "runTwoWriterScenario"
+  ]) {
+    assert.equal(owners(name).length, 1, name);
+  }
+  assert.equal(
+    (readInstalledWorkerMcpRunnerSource().match(
+      /(?:export )?function enterQualificationStage\(/gu
+    ) || []).length,
+    1,
+    "qualification stages must remain owned by one controller"
+  );
+  assert.match(
+    sources.get("qualification"),
+    /from "\.\/installed-worker-mcp-runner-cancellation-cleanup\.mjs";/u
+  );
+  assert.doesNotMatch(
+    sources.get("cancellation-cleanup"),
+    /installed-worker-mcp-runner-qualification\.mjs/u
+  );
+  for (const [domain, source] of sources) {
+    if (domain === "facade") continue;
+    assert.doesNotMatch(source, /test-installed-worker-mcp\.mjs/u, domain);
   }
 });
