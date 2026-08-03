@@ -17,6 +17,9 @@ import {
 import {
   decideInstalledWorkerMcpMailboxPoll
 } from "../scripts/lib/installed-worker-mcp-mailbox-poll.mjs";
+import {
+  readInstalledWorkerMcpRunnerSource
+} from "./lib/installed-worker-mcp-runner-source.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RUNNER = path.join(ROOT, "scripts", "test-installed-worker-mcp.mjs");
@@ -142,7 +145,7 @@ test("installed Worker MCP runner requires all three exact gates without npm byp
 });
 
 test("installed Worker MCP runner owns fixed metadata, installed imports, and private publication", function installedWorkerMcpRunnerOwnershipTest() {
-  const source = fs.readFileSync(RUNNER, "utf8");
+  const source = readInstalledWorkerMcpRunnerSource();
   const recordKeySource = source.match(
     /const SPAWN_IDEMPOTENCY_RECORD_KEYS = new Set\(\[([\s\S]*?)\]\);/
   )?.[1] || "";
@@ -209,7 +212,7 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /turn_id: turnId/);
   assert.match(source, /crypto\.randomUUID\(\)/);
   assert.match(source, /sandboxCwd: pathToFileURL\(fixtureRoot\)\.href/);
-  assert.match(source, /import \{ spawnMcpStdioClient \} from "\.\/lib\/mcp-stdio-client\.mjs";/);
+  assert.match(source, /import \{ spawnMcpStdioClient \} from "\.\/mcp-stdio-client\.mjs";/);
   assert.match(source, /async function importInstalled\(installedRoot, relative/);
   for (const relative of [
     "scripts/lib/provider-capability.mjs",
@@ -742,7 +745,7 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
 });
 
 test("installed Worker MCP live gate poisons ambient Grok discovery and proves one pin", () => {
-  const source = fs.readFileSync(RUNNER, "utf8");
+  const source = readInstalledWorkerMcpRunnerSource();
   assert.ok(
     source.includes('"scripts/lib/provider-executable-pin.mjs"'),
     "runner must import the installed pin resolver"
@@ -959,7 +962,7 @@ test("installed Worker MCP runner preserves original stages and lets cleanup fai
     TypeError
   );
 
-  const source = fs.readFileSync(RUNNER, "utf8");
+  const source = readInstalledWorkerMcpRunnerSource();
   assert.match(source, /const QUALIFICATION_STAGES = new Set\(\[/);
   assert.match(source, /this\.stage = QUALIFICATION_STAGES\.has\(stage\) \? stage : "startup";/);
   assert.doesNotMatch(source, /error\.(?:message|stack|details).*stage=/);
@@ -1031,7 +1034,7 @@ test("installed Worker MCP mailbox polling tolerates valid pre-provider state", 
     TypeError
   );
 
-  const source = fs.readFileSync(RUNNER, "utf8");
+  const source = readInstalledWorkerMcpRunnerSource();
   const start = source.indexOf(
     "async function waitForInstalledMailboxOpen(context, tracker) {"
   );
@@ -1078,7 +1081,7 @@ test("installed Worker MCP mailbox polling tolerates valid pre-provider state", 
 });
 
 test("installed Worker MCP terminal results converge after private cleanup", () => {
-  const source = fs.readFileSync(RUNNER, "utf8");
+  const source = readInstalledWorkerMcpRunnerSource();
   const observerStart = source.indexOf(
     "function observeTerminalResultWorker(tracker, worker, terminalStreamCursor) {"
   );
@@ -1169,7 +1172,7 @@ test("installed Worker MCP terminal results converge after private cleanup", () 
 });
 
 test("installed Worker MCP cleanup waits for exact process closure and proves durable cancellation markers", () => {
-  const source = fs.readFileSync(RUNNER, "utf8");
+  const source = readInstalledWorkerMcpRunnerSource();
   assert.match(
     source,
     /const TERMINAL_PROCESS_CLOSURE_TIMEOUT_MS = 30_000;/
@@ -1213,7 +1216,7 @@ test("installed Worker MCP cleanup waits for exact process closure and proves du
 });
 
 test("write-smoke emergency cleanup is exact, session-bound, and cannot hide a managed worktree", () => {
-  const source = fs.readFileSync(RUNNER, "utf8");
+  const source = readInstalledWorkerMcpRunnerSource();
   const evaluatePureRunnerFunction = (name, nextName) => {
     const start = source.indexOf(`function ${name}(`);
     const end = source.indexOf(`function ${nextName}(`, start + 1);
@@ -1429,13 +1432,27 @@ test("package and repository validator pin the installed Worker MCP runner wirin
     path.join(ROOT, "scripts", "validate.mjs"),
     "utf8"
   );
+  const runner = fs.readFileSync(RUNNER, "utf8");
+  for (const specifier of [
+    "./lib/installed-worker-mcp-runner-core.mjs",
+    "./lib/installed-worker-mcp-runner-runtime.mjs"
+  ]) {
+    assert.match(
+      runner,
+      new RegExp(`from ["']${specifier.replaceAll(".", "\\.")}["']`),
+      specifier
+    );
+  }
   for (const required of [
     '"scripts/test-installed-worker-mcp.mjs"',
+    '"scripts/lib/installed-worker-mcp-runner-core.mjs"',
+    '"scripts/lib/installed-worker-mcp-runner-runtime.mjs"',
     '"scripts/lib/installed-worker-mcp-setup-boundary.mjs"',
     '"scripts/lib/installed-worker-mcp-session-boundary.mjs"',
     '"tests/installed-worker-mcp-runner.test.mjs"',
     '"tests/installed-worker-mcp-setup-boundary.test.mjs"',
     '"tests/installed-worker-mcp-session-boundary.test.mjs"',
+    '"tests/lib/installed-worker-mcp-runner-source.mjs"',
     '"test:installed-worker-mcp"'
   ]) {
     assert.ok(validator.includes(required), required);
