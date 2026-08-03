@@ -7,7 +7,7 @@ const require = createRequire(import.meta.url);
 const { parse } = require("acorn");
 
 export const SOURCE_STRUCTURE_POLICY_PATH = "scripts/source-structure-policy.json";
-export const SOURCE_STRUCTURE_INITIAL_DIGEST = "96b5c74f6b04a6f586361c323a0b64d7581eb62c4e0bb45f190896a525d8b0de";
+export const SOURCE_STRUCTURE_INITIAL_DIGEST = "42d182f28170c985d3d12ff1fa55ead2214b5d84c43ff10b6102b5fe6242abf2";
 const POLICY_MODES = new Set(["observe", "ratchet"]);
 const CATEGORY_NAMES = Object.freeze(["product", "tooling", "tests", "facade"]);
 const DEFAULT_EXCLUDED_DIRECTORIES = new Set([

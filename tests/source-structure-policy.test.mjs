@@ -330,7 +330,7 @@ test("ordinal fragments are observed, exactly baselined, and rejected when new",
   assert.equal(
     legitimateNumericSuffixes.findings.some((entry) =>
       entry.code === "new-ordinal-fragment"
-      && ["plugins/handler_2.mjs", "plugins/utils_2024.mjs"].includes(entry.path)),
+      && ["plugins/handler_2.mjs", "plugins/utils_2024.mjs"].includes(entry.file)),
     false
   );
 }));
@@ -346,7 +346,7 @@ test("ratchet rejects implementation imports through a registered facade", () =>
 
 test("immutable digest pins initial debt and topology while caps may only shrink", () => {
   const config = loadSourceStructurePolicy({ root: ROOT });
-  assert.equal(SOURCE_STRUCTURE_INITIAL_DIGEST, "96b5c74f6b04a6f586361c323a0b64d7581eb62c4e0bb45f190896a525d8b0de");
+  assert.equal(SOURCE_STRUCTURE_INITIAL_DIGEST, "42d182f28170c985d3d12ff1fa55ead2214b5d84c43ff10b6102b5fe6242abf2");
   assert.equal(config.baseline.initialDigest, SOURCE_STRUCTURE_INITIAL_DIGEST);
   assert.equal(sourceStructureInitialDigest(config), SOURCE_STRUCTURE_INITIAL_DIGEST);
 

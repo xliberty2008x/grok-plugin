@@ -43,7 +43,7 @@
   "baseline": {
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
-    "initialDigest": "96b5c74f6b04a6f586361c323a0b64d7581eb62c4e0bb45f190896a525d8b0de"
+    "initialDigest": "42d182f28170c985d3d12ff1fa55ead2214b5d84c43ff10b6102b5fe6242abf2"
   },
   "dispositions": {
     "plugins/grok/scripts/grok-companion.mjs": {
@@ -342,7 +342,7 @@
           "key": "function:reconcileOwnedWorkers#1"
         }
       ],
-      "initialLines": 365
+      "initialLines": 364
     },
     "plugins/grok/scripts/lib/worker-recovery.mjs": {
       "category": "product",
@@ -940,8 +940,8 @@
     },
     "plugins/grok/scripts/lib/worker-reconcile.mjs": {
       "category": "product",
-      "initialLines": 365,
-      "lineCap": 365,
+      "initialLines": 364,
+      "lineCap": 364,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
