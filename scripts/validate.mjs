@@ -326,6 +326,7 @@ if (!versionsOnly) {
     "scripts/lib/installed-worker-mcp-runner-core.mjs",
     "scripts/lib/installed-worker-mcp-runner-observation.mjs",
     "scripts/lib/installed-worker-mcp-runner-runtime.mjs",
+    "scripts/lib/installed-worker-mcp-runner-session-read.mjs",
     "scripts/lib/installed-worker-mcp-runner-setup.mjs",
     "scripts/lib/installed-worker-mcp-setup-boundary.mjs",
     "scripts/lib/installed-worker-mcp-session-boundary.mjs",

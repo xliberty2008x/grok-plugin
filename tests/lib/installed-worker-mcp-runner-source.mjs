@@ -12,7 +12,8 @@ export const INSTALLED_WORKER_MCP_RUNNER_MODULES = [
   "core",
   "setup",
   "runtime",
-  "observation"
+  "observation",
+  "session-read"
 ].map((domain) => path.join(
   ROOT,
   "scripts",
