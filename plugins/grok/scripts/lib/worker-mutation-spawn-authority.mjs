@@ -661,7 +661,7 @@ export function assertManagedWritePostBindingObservation(observed) {
       { paths }
     );
   }
-  if (observed.incompleteComponents?.length) {
+  if (observed.incompleteComponents.length) {
     throw contextIncompleteError("terminal", observed.incompleteComponents);
   }
   return observed;
