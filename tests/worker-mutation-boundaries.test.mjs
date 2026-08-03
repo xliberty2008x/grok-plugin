@@ -16,8 +16,10 @@ const LEAVES = Object.freeze([
   "worker-mutation-request-contract.mjs",
   "worker-mutation-spawn-authority.mjs",
   "worker-mutation-spawn.mjs",
+  "worker-mutation-terminal.mjs",
   "worker-mutation-write-admission.mjs",
   "worker-mutation-write-contract.mjs",
+  "worker-mutation-write-provisioning.mjs",
   "worker-mutation-write-recovery.mjs",
   "worker-mutation-write-runtime-contract.mjs"
 ]);
@@ -118,9 +120,25 @@ const MOVED_PUBLIC_BINDINGS = Object.freeze({
   "worker-mutation-spawn.mjs": Object.freeze([
     "spawnReadOnlyWorker"
   ]),
+  "worker-mutation-terminal.mjs": Object.freeze([
+    "persistCompletedWriteArtifact",
+    "settleFailedDispatchCleanup",
+    "settlePreProviderWorkerFinalization",
+    "settleProviderStartedWorkerFinalization",
+    "settleStartedWorkerLoss",
+    "settleUnstartedDispatchLoss",
+    "settleWriteArtifactAfterRuntimeCleanup"
+  ]),
   "worker-mutation-write-admission.mjs": Object.freeze([
     "admitWriteWorkerPlan",
     "authorizeReadyWriteWorkerDispatch"
+  ]),
+  "worker-mutation-write-provisioning.mjs": Object.freeze([
+    "activateWriteProvisioningAttempt",
+    "prepareWriteProvisionerIntent",
+    "prepareWriteProvisioningReissue",
+    "promoteWriteWorkerReady",
+    "recordOfficialWorktreeReceipt"
   ]),
   "worker-mutation-write-recovery.mjs": Object.freeze([
     "adoptWriteProvisioningEffect",
@@ -138,11 +156,13 @@ const DIRECT_IMPORTS = Object.freeze([
   ["plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs", "./worker-mutation-dispatch-contract.mjs", ["assertDispatchContract"]],
   ["plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs", "./worker-mutation-primitives.mjs", ["FOLLOWUP_SPAWN_OWNERSHIP_MODE", "SPAWN_OWNERSHIP_MODE", "SPAWN_SUCCESS_DEFINITION"]],
   ["plugins/grok/scripts/lib/worker-provisioner.mjs", "./worker-mutation-primitives.mjs", ["assertMutationOwnership"]],
+  ["plugins/grok/scripts/lib/worker-provisioner.mjs", "./worker-mutation-write-provisioning.mjs", ["activateWriteProvisioningAttempt", "prepareWriteProvisionerIntent", "prepareWriteProvisioningReissue", "promoteWriteWorkerReady", "recordOfficialWorktreeReceipt"]],
   ["plugins/grok/scripts/lib/worker-provisioner.mjs", "./worker-mutation-write-recovery.mjs", ["adoptWriteProvisioningEffect", "recordWriteProvisionerNoChild", "retainWriteProvisioningCleanupPending"]],
   ["plugins/grok/scripts/lib/worker-provisioner.mjs", "./worker-mutation-write-runtime-contract.mjs", ["assertWriteExecutionJob"]],
   ["plugins/grok/scripts/lib/worker-recovery.mjs", "./worker-mutation-dispatch-admission.mjs", ["acquireRecoveryCleanupFence", "recordWorkerProviderSpawnNoChild", "verifyRecoveryCleanupFence"]],
   ["plugins/grok/scripts/lib/worker-recovery.mjs", "./worker-mutation-dispatch-contract.mjs", ["assertDispatchContract"]],
   ["plugins/grok/scripts/lib/worker-recovery.mjs", "./worker-mutation-primitives.mjs", ["cancellationNonce"]],
+  ["plugins/grok/scripts/lib/worker-recovery.mjs", "./worker-mutation-terminal.mjs", ["settleFailedDispatchCleanup", "settleStartedWorkerLoss", "settleUnstartedDispatchLoss"]],
   ["plugins/grok/scripts/lib/worker-runtime.mjs", "./worker-mutation-dispatch-admission.mjs", ["prepareDispatchProcessSpawn", "recordDispatchProcessNoChild"]],
   ["plugins/grok/scripts/lib/worker-runtime.mjs", "./worker-mutation-dispatch-contract.mjs", ["providerLaunchState"]],
   ["plugins/grok/scripts/lib/worker-runtime.mjs", "./worker-mutation-primitives.mjs", ["assertMutationOwnership"]],
@@ -207,10 +227,15 @@ test("selected implementation consumers import extracted contracts directly", ()
   }
 });
 
-test("the mutation monolith consumes both write contracts without redeclaring their authority", () => {
-  const source = fs.readFileSync(path.join(LIB, FACADE), "utf8");
-  assert.match(source, /from\s+"\.\/worker-mutation-write-contract\.mjs"/u);
-  assert.match(source, /from\s+"\.\/worker-mutation-write-runtime-contract\.mjs"/u);
-  assert.doesNotMatch(source, /^function assertWriteExecutionJob\b/mu);
-  assert.doesNotMatch(source, /^function assertWriteProvisioningRuntime\b/mu);
+test("the extracted provisioning domain consumes write contracts without redeclaring authority", () => {
+  const facade = fs.readFileSync(path.join(LIB, FACADE), "utf8");
+  const provisioning = fs.readFileSync(
+    path.join(LIB, "worker-mutation-write-provisioning.mjs"),
+    "utf8"
+  );
+  assert.doesNotMatch(facade, /from\s+"\.\/worker-mutation-write-contract\.mjs"/u);
+  assert.match(provisioning, /from\s+"\.\/worker-mutation-write-contract\.mjs"/u);
+  assert.match(provisioning, /from\s+"\.\/worker-mutation-write-runtime-contract\.mjs"/u);
+  assert.doesNotMatch(provisioning, /^function assertWriteExecutionJob\b/mu);
+  assert.doesNotMatch(provisioning, /^function assertWriteProvisioningRuntime\b/mu);
 });

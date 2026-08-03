@@ -33,7 +33,7 @@ import {
   prepareWriteProvisioningReissue,
   promoteWriteWorkerReady,
   recordOfficialWorktreeReceipt
-} from "./worker-mutation.mjs";
+} from "./worker-mutation-write-provisioning.mjs";
 import {
   adoptWriteProvisioningEffect, recordWriteProvisionerNoChild, retainWriteProvisioningCleanupPending
 } from "./worker-mutation-write-recovery.mjs";
