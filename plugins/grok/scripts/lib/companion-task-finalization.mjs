@@ -4,7 +4,7 @@ import { gatedCleanupReviewEnvironment } from "./provider-credentials.mjs";
 import { updateJob, readJob, terminal, now, retain } from "./state.mjs";
 import { redact, redactText } from "./redact.mjs";
 import { resolveProviderCleanupTarget } from "./recursion-guard.mjs";
-import { settlePreProviderWorkerFinalization, settleProviderStartedWorkerFinalization } from "./worker-mutation.mjs";
+import { settlePreProviderWorkerFinalization, settleProviderStartedWorkerFinalization } from "./worker-mutation-terminal.mjs";
 import { captureTerminalEvidence, selectTaskTerminalError, terminalTaskProgress } from "./task-terminal-evidence.mjs";
 import { applyReviewPrivacy, applyTaskPrivacy, includeGuardCleanup, reconcileTerminalStopReason, stateDir } from "./companion-shared.mjs";
 

@@ -17,7 +17,7 @@ const { captureCompleteContextManifest } = bindContextMetadataCompleteness({
 import { composeProviderPrompt } from "./task-provider-prompt.mjs";
 import { scrubStoredJob } from "./task-envelope.mjs";
 import { CONTEXT_BINDING_MODE, verifyJobEffectivePrompt } from "./worker-context.mjs";
-import { assertDispatchContract } from "./worker-mutation.mjs";
+import { assertDispatchContract } from "./worker-mutation-dispatch-contract.mjs";
 import { assertWorkerAuthorization, isDispatchV2, isSupportedWorkerDispatch } from "./worker-launch-contract.mjs";
 import { assertExecutableWorkerBinding, touchJob } from "./companion-shared.mjs";
 

@@ -18,7 +18,9 @@ import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import { scrubStoredJob } from "./task-envelope.mjs";
 import { projectWorkerDiagnosticText, projectWorkerHandle, projectWorkerError, projectWorkerPublicText, projectWorkerSnapshot } from "./worker-protocol.mjs";
 import { CONTEXT_BINDING_MODE } from "./worker-context.mjs";
-import { assertDispatchContract, assertWorkerProviderLaunchPreparation, recordWorkerProviderRotationNoChild, recordUnsettledProviderProcess, transitionWorkerDispatch } from "./worker-mutation.mjs";
+import { assertDispatchContract } from "./worker-mutation-dispatch-contract.mjs";
+import { recordWorkerProviderRotationNoChild, recordUnsettledProviderProcess, transitionWorkerDispatch } from "./worker-mutation-dispatch-transition.mjs";
+import { assertWorkerProviderLaunchPreparation } from "./worker-mutation-spawn-authority.mjs";
 import { providerLaunchCleanupBlocked } from "./worker-reconcile.mjs";
 import { isDispatchV2 } from "./worker-launch-contract.mjs";
 const SCRIPT = path.resolve(
@@ -28,17 +30,15 @@ const SCRIPT = path.resolve(
 );
 const PLUGIN_ROOT = path.resolve(path.dirname(SCRIPT), "..");
 const VALID_EFFORTS = new Set(["low", "medium", "high"]);
-export function usage() {
+function usage() {
   return ["Usage:", "  grok-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]", "  grok-companion.mjs review|adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]", "  grok-companion.mjs task [--wait|--background] [--write] [--resume|--fresh] [--job-id <id>] [--model <id>] [--effort low|medium|high] [--envelope-stdin [--stdin-ready] | --envelope-file <private-path> | -- <task>]", "  grok-companion.mjs deep-research [--wait|--background] [--web-only|--workspace] [--model <id>] [--effort low|medium|high] [--query-stdin [--stdin-ready]] [--json]", "  grok-companion.mjs transfer [--source <claude-or-codex-jsonl>] [--model <id>] [--effort low|medium|high] [--json]", "  grok-companion.mjs status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--readonly] [--json]", "  grok-companion.mjs result [job-id] [--json]", "  grok-companion.mjs cancel [job-id] [--json]"].join("\n");
 }
 
-
-export function stdinReadySignal(enabled) {
+function stdinReadySignal(enabled) {
   return enabled ? () => process.stderr.write(`${STDIN_READY_MARKER}\n`) : null;
 }
 
-
-export function parseVerificationRecord(text, requiredVerification = []) {
+function parseVerificationRecord(text, requiredVerification = []) {
   let value;
   try { value = JSON.parse(String(text || "")); }
   catch (error) { throw new CompanionError("E_USAGE", `Host verification input is not valid JSON: ${error.message}`); }
@@ -87,19 +87,13 @@ export function parseVerificationRecord(text, requiredVerification = []) {
   return { outcome: anyFailed ? "failed" : "passed", commandOutcomes };
 }
 
+function argvFrom(raw) { return raw.length === 1 && /\s/.test(raw[0]) ? splitArgs(raw[0]) : raw; }
+function out(value, json = false) { process.stdout.write(`${json ? JSON.stringify(value, null, 2) : value}\n`); }
+function currentHost() { return hostContext(); }
+function sessionId() { return currentHost().sessionId; }
+function stateDir(root) { return workspaceState(root); }
 
-export function argvFrom(raw) { return raw.length === 1 && /\s/.test(raw[0]) ? splitArgs(raw[0]) : raw; }
-
-export function out(value, json = false) { process.stdout.write(`${json ? JSON.stringify(value, null, 2) : value}\n`); }
-
-export function currentHost() { return hostContext(); }
-
-export function sessionId() { return currentHost().sessionId; }
-
-export function stateDir(root) { return workspaceState(root); }
-
-
-export function primaryTurnAdmissionTestHooks() {
+function primaryTurnAdmissionTestHooks() {
   const directory = process.env.GROK_COMPANION_TEST_PRIMARY_TURN_BARRIER_DIR;
   if (!directory) return null;
   if (!path.isAbsolute(directory)) {
@@ -138,20 +132,16 @@ export function primaryTurnAdmissionTestHooks() {
     }
   });
 }
-
 /** Public job JSON shares Worker Protocol v1 snapshot projection with future brokers. */
-export function publicJob(job, options = {}) {
+function publicJob(job, options = {}) {
   return projectWorkerSnapshot(job, options);
 }
+function publicJson(value, options = {}) { return Array.isArray(value) ? value.map((job) => publicJob(job, options)) : publicJob(value, options); }
 
-export function publicJson(value, options = {}) { return Array.isArray(value) ? value.map((job) => publicJob(job, options)) : publicJob(value, options); }
-
-
-export const TRANSFER_SESSION_ID_PATTERN =
+const TRANSFER_SESSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-
-export function projectTransferCliError(error) {
+function projectTransferCliError(error) {
   const projected = projectWorkerError(error);
   if (!projected
     || !["E_IMPORT_RESULT", "E_STATE"].includes(error?.code)
@@ -201,8 +191,7 @@ export function projectTransferCliError(error) {
   };
 }
 
-
-export function researchResultJson(job) {
+function researchResultJson(job) {
   const projected = publicJob(job);
   const markdown = job?.result?.researchReport?.markdown || job?.result?.researchReport?.text || null;
   if (job?.jobClass !== "research"
@@ -225,8 +214,7 @@ export function researchResultJson(job) {
     }
   };
 }
-
-export function assertHostJobAccess(job, operation) {
+function assertHostJobAccess(job, operation) {
   const host = currentHost();
   const recorded = jobHostContext(job);
   const scoped = Boolean(host.sessionId || recorded.sessionId);
@@ -235,8 +223,7 @@ export function assertHostJobAccess(job, operation) {
   }
   return job;
 }
-
-export function readPrivateEnvelopeFile(file) {
+function readPrivateEnvelopeFile(file) {
   const resolved = path.resolve(file);
   const configuredRoot = path.resolve(pluginDataRoot());
   fs.mkdirSync(configuredRoot, { recursive: true, mode: 0o700 });
@@ -265,19 +252,16 @@ export function readPrivateEnvelopeFile(file) {
     try { fs.unlinkSync(candidate); } catch {}
   }
 }
-
-export function loadTemplate(name, values) {
+function loadTemplate(name, values) {
   const text = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", `${name}.md`), "utf8");
   return text.replace(/\{\{([A-Z0-9_]+)\}\}/g, (match, key) => Object.hasOwn(values, key) ? String(values[key]) : match);
 }
-
-export function appendLog(root, id, entry) {
+function appendLog(root, id, entry) {
   const line = `${JSON.stringify({ at: now(), ...entry })}\n`;
   if (Buffer.byteLength(line, "utf8") > 16 * 1024) return;
   appendJobLog(root, id, line);
 }
-
-export function boundedLogEvent(event) {
+function boundedLogEvent(event) {
   if (!event || typeof event !== "object") return { type: "unknown" };
   if (event.type === "message") {
     const text = String(event.text || "");
@@ -295,8 +279,7 @@ export function boundedLogEvent(event) {
   if (event.type === "session") return { type: "session", sessionId: event.sessionId || null };
   return { type: event.type || "unknown" };
 }
-
-export function redactProviderEvent(event) {
+function redactProviderEvent(event) {
   const safe = redact(event);
   // Provider process identity is created by the local broker, not by model
   // output. Preserve its OS birth token only when the live PID still proves the
@@ -314,11 +297,9 @@ export function redactProviderEvent(event) {
   }
   return safe;
 }
+function validateModelEffort(options) { if (options.effort && !VALID_EFFORTS.has(options.effort)) throw new CompanionError("E_USAGE", "--effort must be low, medium, or high."); }
 
-export function validateModelEffort(options) { if (options.effort && !VALID_EFFORTS.has(options.effort)) throw new CompanionError("E_USAGE", "--effort must be low, medium, or high."); }
-
-
-export function boundedProviderText(value, limitBytes = 64 * 1024) {
+function boundedProviderText(value, limitBytes = 64 * 1024) {
   const text = sanitizeDisplayText(value);
   const buffer = Buffer.from(text, "utf8");
   const retained = buffer.length > limitBytes ? buffer.subarray(0, limitBytes).toString("utf8") : text;
@@ -330,8 +311,7 @@ export function boundedProviderText(value, limitBytes = 64 * 1024) {
   };
 }
 
-
-export function textEvidence(value) {
+function textEvidence(value) {
   const text = String(value || "");
   return {
     bytes: Buffer.byteLength(text, "utf8"),
@@ -339,8 +319,7 @@ export function textEvidence(value) {
   };
 }
 
-
-export function exactProviderRotationIntentStatus({ root, workerId, attemptId, fence, intentId }) {
+function exactProviderRotationIntentStatus({ root, workerId, attemptId, fence, intentId }) {
   const current = readJob(root, workerId);
   assertDispatchContract(current);
   const dispatch = current.request?.spawn?.dispatch;
@@ -359,8 +338,7 @@ export function exactProviderRotationIntentStatus({ root, workerId, attemptId, f
   return intent.status;
 }
 
-
-export function settlePendingProviderRotationNoChild({ root, workerId, attemptId, fence, intentId }) {
+function settlePendingProviderRotationNoChild({ root, workerId, attemptId, fence, intentId }) {
   const status = exactProviderRotationIntentStatus({
     root,
     workerId,
@@ -402,8 +380,7 @@ export function settlePendingProviderRotationNoChild({ root, workerId, attemptId
   }
 }
 
-
-export function workerEnvironment(nonce, dispatchAttemptId = null, dispatchFence = null) {
+function workerEnvironment(nonce, dispatchAttemptId = null, dispatchFence = null) {
   const env = {};
   const allowed = new Set(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "COLORTERM", "NO_COLOR", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "SystemRoot", "ComSpec", "PATHEXT"]);
   for (const [key, value] of Object.entries(process.env)) if ((allowed.has(key) || key.startsWith("LC_")) && value != null) env[key] = value;
@@ -437,8 +414,7 @@ export function workerEnvironment(nonce, dispatchAttemptId = null, dispatchFence
   return env;
 }
 
-
-export function applyReviewPrivacy(result, cleanup, retentionNote = null) {
+function applyReviewPrivacy(result, cleanup, retentionNote = null) {
   const next = { ...(result || {}) };
   if (cleanup) {
     next.providerSessionDeleted = cleanup.ok;
@@ -458,8 +434,7 @@ export function applyReviewPrivacy(result, cleanup, retentionNote = null) {
   return next;
 }
 
-
-export function applyTaskPrivacy(result, cleanup, retentionNote = null) {
+function applyTaskPrivacy(result, cleanup, retentionNote = null) {
   const next = { ...(result || {}) };
   if (cleanup) {
     next.taskRuntimeCleaned = cleanup.ok;
@@ -477,8 +452,7 @@ export function applyTaskPrivacy(result, cleanup, retentionNote = null) {
   return next;
 }
 
-
-export function reconcileTerminalStopReason(result, status) {
+function reconcileTerminalStopReason(result, status) {
   const next = { ...(result || {}) };
   if (status !== "cancelled" && next.stopReason === "cancelled") {
     delete next.stopReason;
@@ -486,8 +460,7 @@ export function reconcileTerminalStopReason(result, status) {
   return next;
 }
 
-
-export function recheckCancelLaunchSettlement(root, id) {
+function recheckCancelLaunchSettlement(root, id) {
   let retained = false;
   const job = updateJob(root, id, (current) => {
     if (terminal(current) || !providerLaunchCleanupBlocked(current)) return current;
@@ -515,8 +488,7 @@ export function recheckCancelLaunchSettlement(root, id) {
   return { job, retained };
 }
 
-
-export function includeGuardCleanup(root, id, cleanup, { inWorkspaceTransaction = false } = {}) {
+function includeGuardCleanup(root, id, cleanup, { inWorkspaceTransaction = false } = {}) {
   if (!cleanup?.ok) return cleanup;
   try {
     if (inWorkspaceTransaction) {
@@ -533,8 +505,7 @@ export function includeGuardCleanup(root, id, cleanup, { inWorkspaceTransaction 
   }
 }
 
-
-export async function terminateProviderCleanupTarget(root, job) {
+async function terminateProviderCleanupTarget(root, job) {
   const { identity, kind } = resolveProviderCleanupTarget(root, job);
   await terminateVerified(identity, job.id, kind);
   // Only allow guard/home teardown after the original process group is verified gone.
@@ -549,16 +520,14 @@ export async function terminateProviderCleanupTarget(root, job) {
 }
 
 
-
-export async function terminateVerified(identity, marker, kind) {
+async function terminateVerified(identity, marker, kind) {
   // Defense in depth: retain the provider-level platform classification while
   // sharing the exact identity/termination implementation with broker recovery.
   assertProviderPlatform();
   return terminateOwnedProcess(identity, marker, kind);
 }
 
-
-export function baseRecord({ id, kind, root, profile, title, request, write, model, effort, lifecycleEvents = null }) {
+function baseRecord({ id, kind, root, profile, title, request, write, model, effort, lifecycleEvents = null }) {
   const timestamp = now();
   return {
     schemaVersion: 3,
@@ -595,16 +564,14 @@ export function baseRecord({ id, kind, root, profile, title, request, write, mod
   };
 }
 
-
-export function touchJob(job, patch = {}) {
+function touchJob(job, patch = {}) {
   const next = { ...job, ...patch };
   next.heartbeatAt = now();
   next.updatedAt = next.heartbeatAt;
   return next;
 }
 
-
-export function recordLifecycle(root, id, type, summary, detail = undefined) {
+function recordLifecycle(root, id, type, summary, detail = undefined) {
   return updateJob(root, id, (job) => {
     job.lifecycleEvents = appendLifecycleEvent(job.lifecycleEvents, type, summary, detail);
     job.heartbeatAt = now();
@@ -613,8 +580,7 @@ export function recordLifecycle(root, id, type, summary, detail = undefined) {
   });
 }
 
-
-export function renderReviewSession(job) {
+function renderReviewSession(job) {
   const sessionLabel = projectWorkerDiagnosticText(job?.grokSessionId, {
     job,
     maxBytes: 256
@@ -631,8 +597,7 @@ export function renderReviewSession(job) {
   return "Grok session: not created";
 }
 
-
-export function renderReview(job) {
+function renderReview(job) {
   const projected = publicJob(job);
   const review = projected.result?.review;
   if (!review) return renderJob(job);
@@ -647,14 +612,13 @@ export function renderReview(job) {
   return lines.join("\n");
 }
 
-
 const HUMAN_PUBLIC_ONLY_ERROR_CODES = new Set([
   "E_CONTEXT_DRIFT",
   "E_SCOPE_VIOLATION",
   "E_PROCESS_IDENTITY"
 ]);
 
-export function resultRequiresPublicOnlyProjection(job, projected) {
+function resultRequiresPublicOnlyProjection(job, projected) {
   const publicErrors = [
     projectWorkerError(job?.pendingTerminal?.error),
     projectWorkerError(job?.error)
@@ -667,8 +631,7 @@ export function resultRequiresPublicOnlyProjection(job, projected) {
     && storedWarning !== projected?.result?.privacyWarning;
 }
 
-
-export function renderJob(job, { includeResearchReport = false } = {}) {
+function renderJob(job, { includeResearchReport = false } = {}) {
   const projected = publicJob(job);
   const result = projected.result;
   const publicOnlyResult = resultRequiresPublicOnlyProjection(job, projected);
@@ -757,8 +720,7 @@ export function renderJob(job, { includeResearchReport = false } = {}) {
   return lines.join("\n");
 }
 
-
-export function renderStatusTable(jobs) {
+function renderStatusTable(jobs) {
   const handles = jobs.map((job) => projectWorkerHandle(job));
   return [
     "| Job | Kind | Status | Phase | Progress | Heartbeat |",
@@ -771,8 +733,7 @@ export function renderStatusTable(jobs) {
   ];
 }
 
-
-export function eventUpdater(root, id, dispatchAttemptId = null, providerGeneration = null, dispatchFence = null) {
+function eventUpdater(root, id, dispatchAttemptId = null, providerGeneration = null, dispatchFence = null) {
   let lastMessageUpdate = 0;
   return (event) => {
     const trustedProviderProcess = event?.type === "provider" && event.process
@@ -904,8 +865,7 @@ export function eventUpdater(root, id, dispatchAttemptId = null, providerGenerat
   };
 }
 
-
-export function providerOutputSchemaDigest(outputSchema) {
+function providerOutputSchemaDigest(outputSchema) {
   if (outputSchema == null) return null;
   let serialized;
   try {
@@ -919,8 +879,7 @@ export function providerOutputSchemaDigest(outputSchema) {
   return crypto.createHash("sha256").update(serialized).digest("hex");
 }
 
-
-export function providerLaunchBinding(profile, prompt, outputSchema = null) {
+function providerLaunchBinding(profile, prompt, outputSchema = null) {
   return Object.freeze({
     promptDigest: crypto.createHash("sha256").update(String(prompt || "")).digest("hex"),
     profileId: profile?.id || null,
@@ -930,8 +889,7 @@ export function providerLaunchBinding(profile, prompt, outputSchema = null) {
   });
 }
 
-
-export function assertPromptProviderLaunchBinding(
+function assertPromptProviderLaunchBinding(
   observed,
   expected,
   expectedExecutableBinding = null
@@ -973,8 +931,7 @@ export function assertPromptProviderLaunchBinding(
   return observed;
 }
 
-
-export function assertExecutableWorkerBinding(job, {
+function assertExecutableWorkerBinding(job, {
   dispatchAttemptId = null,
   dispatchFence = null,
   providerGeneration = null
@@ -997,4 +954,51 @@ export function assertExecutableWorkerBinding(job, {
   }
   return job;
 }
-
+export {
+  TRANSFER_SESSION_ID_PATTERN,
+  appendLog,
+  applyReviewPrivacy,
+  applyTaskPrivacy,
+  argvFrom,
+  assertExecutableWorkerBinding,
+  assertHostJobAccess,
+  assertPromptProviderLaunchBinding,
+  baseRecord,
+  boundedLogEvent,
+  boundedProviderText,
+  currentHost,
+  eventUpdater,
+  exactProviderRotationIntentStatus,
+  includeGuardCleanup,
+  loadTemplate,
+  out,
+  parseVerificationRecord,
+  primaryTurnAdmissionTestHooks,
+  projectTransferCliError,
+  providerLaunchBinding,
+  providerOutputSchemaDigest,
+  publicJob,
+  publicJson,
+  readPrivateEnvelopeFile,
+  recheckCancelLaunchSettlement,
+  reconcileTerminalStopReason,
+  recordLifecycle,
+  redactProviderEvent,
+  renderJob,
+  renderReview,
+  renderReviewSession,
+  renderStatusTable,
+  researchResultJson,
+  resultRequiresPublicOnlyProjection,
+  sessionId,
+  settlePendingProviderRotationNoChild,
+  stateDir,
+  stdinReadySignal,
+  terminateProviderCleanupTarget,
+  terminateVerified,
+  textEvidence,
+  touchJob,
+  usage,
+  validateModelEffort,
+  workerEnvironment
+};

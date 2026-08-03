@@ -11,7 +11,8 @@ import { redact } from "./redact.mjs";
 import { hostCommand, sameHostSession } from "./host.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import { scrubStoredJob } from "./task-envelope.mjs";
-import { cancelWorker, cancellationNonce } from "./worker-mutation.mjs";
+import { cancelWorker } from "./worker-mutation-cancellation.mjs";
+import { cancellationNonce } from "./worker-mutation-primitives.mjs";
 import { reconcileBrokerWorkers } from "./worker-recovery.mjs";
 import { captureTerminalEvidence, selectTaskTerminalError, terminalTaskProgress } from "./task-terminal-evidence.mjs";
 import { isSupportedWorkerDispatch } from "./worker-launch-contract.mjs";
@@ -19,7 +20,7 @@ import { applyReviewPrivacy, applyTaskPrivacy, argvFrom, assertHostJobAccess, cu
 
 import { recoverActiveJobs } from "./companion-recovery.mjs";
 
-export async function handleStatus(raw) {
+async function handleStatus(raw) {
   const { options, positionals } = parseArgs(argvFrom(raw), {
     values: ["timeout-ms", "cwd"],
     booleans: ["wait", "all", "json", "readonly"]
@@ -92,8 +93,7 @@ export async function handleStatus(raw) {
   }
 }
 
-
-export async function handleResult(raw) {
+async function handleResult(raw) {
   const { options, positionals } = parseArgs(argvFrom(raw), { values: ["cwd"], booleans: ["json"] }); const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd()); await recoverActiveJobs(root); const job = assertHostJobAccess(selectJob(root, { id: positionals[0], host: currentHost(), finished: !positionals[0] }), "result");
   if (!terminal(job)) throw new CompanionError("E_JOB_ACTIVE", `Job ${job.id} is still ${job.status}; run ${hostCommand("status", `${job.id} --wait`)}.`);
   out(
@@ -106,8 +106,7 @@ export async function handleResult(raw) {
   );
 }
 
-
-export async function handleCancel(raw) {
+async function handleCancel(raw) {
   const { options, positionals } = parseArgs(argvFrom(raw), { values: ["cwd"], booleans: ["json"] }); const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd()); await recoverActiveJobs(root); const job = assertHostJobAccess(selectJob(root, { id: positionals[0], host: currentHost(), active: !positionals[0] }), "active");
   if (isSupportedWorkerDispatch(job.request?.spawn?.dispatch)) {
     const host = currentHost();
@@ -291,7 +290,7 @@ export async function handleCancel(raw) {
         ? "cancelled"
         : "failed";
       value.status = finalStatus;
-      value.phase = ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(selectedError?.code)
+      value.phase = selectedError?.code === "E_CONTEXT_DRIFT"
         ? "context-rejected"
         : selectedError?.code === "E_SCOPE_VIOLATION"
           ? "scope-rejected"
@@ -330,4 +329,4 @@ export async function handleCancel(raw) {
   out(options.json ? publicJson(current) : `Cancellation requested.\n${renderJob(current)}`, options.json);
 }
 
-
+export { handleCancel, handleResult, handleStatus };

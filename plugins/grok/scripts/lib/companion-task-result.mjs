@@ -18,7 +18,7 @@ const { captureCompleteContextManifest } = bindContextMetadataCompleteness({
   assertContextManifestIntegrity
 });
 import { evaluateScope } from "./task-scope.mjs";
-import { authorizeWorkerProviderRotation } from "./worker-mutation.mjs";
+import { authorizeWorkerProviderRotation } from "./worker-mutation-dispatch-transition.mjs";
 import { isDispatchV2 } from "./worker-launch-contract.mjs";
 import { attachHostActionRequestToJob } from "./worker-host-actions.mjs";
 import { assertNoRetainedBodies, readAttemptMailbox } from "./worker-mailbox.mjs";
