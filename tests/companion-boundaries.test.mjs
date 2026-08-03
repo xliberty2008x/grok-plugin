@@ -57,9 +57,9 @@ function visitCycles(graph) {
   return cycles;
 }
 
-test("grok-companion keeps its executable contract while shared domains move behind boundaries", () => {
+test("grok-companion keeps its executable contract while shared and task domains move behind boundaries", () => {
   const source = fs.readFileSync(ENTRY, "utf8");
-  assert.ok(physicalLineCount(source) <= 3545, "grok-companion.mjs exceeded 3545 lines");
+  assert.ok(physicalLineCount(source) <= 1800, "grok-companion.mjs exceeded 1800 lines");
   assert.match(source, /^#!\/usr\/bin\/env node/u);
   assert.match(source, /\bmain\(\)\.catch\(/u);
   assert.doesNotMatch(source, /\bexport\b/u);
@@ -86,7 +86,7 @@ test("grok-companion keeps its executable contract while shared domains move beh
 });
 
 test("companion domains stay bounded, acyclic, and independent of the executable", () => {
-  assert.ok(DOMAIN_FILES.length >= 4, "companion domains were not discovered");
+  assert.ok(DOMAIN_FILES.length >= 9, "companion domains were not discovered");
   for (const file of DOMAIN_FILES) {
     const source = fs.readFileSync(path.join(LIB, file), "utf8");
     const parsed = parseSourceStructure(source, file);

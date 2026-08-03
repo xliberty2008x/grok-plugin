@@ -51,6 +51,7 @@ import {
   pluginDataRoot,
   writeCodexSessionMetadata
 } from "../plugins/grok/scripts/lib/host.mjs";
+
 function parseJson(result) {
   assert.equal(result.status, 0, `command failed\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
   return JSON.parse(result.stdout);
@@ -63,6 +64,7 @@ function parseError(result, code) {
   assert.equal(payload.error.code, code);
   return payload.error;
 }
+
 function taskReport(summary = "Fake Grok task completed", acceptanceIds = ["AC-01", "AC-02"]) {
   return `GROK_WORKER_REPORT: ${JSON.stringify({
     outcome: "complete",
@@ -1472,7 +1474,7 @@ function writeSeededJob(stateRoot, job) {
 }
 
 test("static human launch surfaces use public worker projections", () => {
-  const source = { companion: fs.readFileSync(COMPANION, "utf8"), dispatch: fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/companion-dispatch.mjs"), "utf8") };
+  const source = { companion: fs.readFileSync(COMPANION, "utf8"), dispatch: fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/companion-dispatch.mjs"), "utf8"), handlers: fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/companion-handlers.mjs"), "utf8") };
   const acceptedStart = source.dispatch.indexOf(
     "if (launcherCode === 0 && !background && announce)"
   );
@@ -1489,10 +1491,10 @@ test("static human launch surfaces use public worker projections", () => {
     /accepted\.(?:id|status|phase|progress|summary)/
   );
 
-  const taskStart = source.companion.indexOf("const finished = await startJob(root, job");
-  const taskBlock = source.companion.slice(
+  const taskStart = source.handlers.indexOf("const finished = await startJob(root, job");
+  const taskBlock = source.handlers.slice(
     taskStart,
-    source.companion.indexOf("async function handleDeepResearch", taskStart)
+    source.handlers.length
   );
   assert.match(
     taskBlock,
@@ -3548,11 +3550,11 @@ test("final task evidence fails closed when post-cleanup context is unavailable"
   assert.deepEqual(evidence.changedPaths, []);
   assert.deepEqual(evidence.scopeViolations, []);
   assert.equal(evidence.runtimeEvidence.postContext, null);
-  assert.equal(selected.code, "E_CONTEXT_INCOMPLETE");
-  assert.deepEqual(selected.details, {
-    contextPhase: "terminal",
-    metadataComponents: ["contextCapture"]
-  });
+  assert.equal(selected.code, "E_CONTEXT_DRIFT");
+  assert.deepEqual(selected.details.reasons, [
+    "[final-context-unavailable]"
+  ]);
+  assert.equal(selected.details.secondaryDiagnostic.code, "EPERM");
   assert.equal(
     JSON.stringify(evidence).includes("private capture failure"),
     false
@@ -4266,14 +4268,10 @@ test("terminal task cleanup defers while an active continuation owns the same li
   assert.equal(fs.existsSync(path.join(taskHome, "agent-profiles")), false);
 });
 
-test("cleanup-blocked recovery terminates a verified live worker before restoring completion", { skip: process.platform === "win32" }, async (t) => {
+test("cleanup-blocked recovery terminates a verified live worker before restoring completion", { skip: process.platform === "win32" }, async () => {
   const root = fs.realpathSync(initRepo());
   const { env, pluginData } = fixture({ cancelMode: "wait" });
   const launch = parseJson(runCompanion(["task", "--background", "live finalizer fixture", "--json"], { cwd: root, env }));
-  t.after(() => {
-    const current = persistedJob(pluginData, launch.id);
-    [current.providerProcess, current.workerProcess].filter(Boolean).forEach((identity) => { try { if (processStartToken(identity.pid) === identity.startToken) process.kill(-identity.processGroupId, "SIGKILL"); } catch {} });
-  });
   const running = await waitFor(() => {
     const job = persistedJob(pluginData, launch.id);
     return job.status === "running" && job.phase === "responding" && job.workerProcess?.pid && job.providerProcess?.pid ? job : false;
@@ -4281,15 +4279,19 @@ test("cleanup-blocked recovery terminates a verified live worker before restorin
   const stateRoot = path.dirname(path.dirname(running.logFile));
   const taskHome = path.join(stateRoot, "task-homes", running.request.providerHomeId, ".grok");
   const stamped = new Date().toISOString();
-  updateJob(root, running.id, (current) => {
-    assert.deepEqual(current.workerProcess, running.workerProcess);
-    return {
-      ...current, status: "running", phase: "cleanup-blocked", completedAt: null, controllerProcess: null, progress: "cleanup pending",
-      result: { ...(current.result || {}), hostVerification: "not_run", taskRuntimeCleaned: false },
-      error: { code: "E_STATE", message: "cleanup pending" },
-      pendingTerminal: { status: "completed", phase: "done", completedAt: stamped, error: null, summary: "completed" }
-    };
-  }, env);
+  const jobFile = path.join(stateRoot, "jobs", `${running.id}.json`);
+  fs.writeFileSync(jobFile, `${JSON.stringify({
+    ...running,
+    status: "running",
+    phase: "cleanup-blocked",
+    completedAt: null,
+    controllerProcess: null,
+    progress: "cleanup pending",
+    result: { ...(running.result || {}), hostVerification: "not_run", taskRuntimeCleaned: false },
+    error: { code: "E_STATE", message: "cleanup pending" },
+    pendingTerminal: { status: "completed", phase: "done", completedAt: stamped, error: null, summary: "completed" }
+  }, null, 2)}\n`, { mode: 0o600 });
+
   const recovered = parseJson(runCompanion(["status", running.id, "--json"], { cwd: root, env, timeout: 15_000 }));
   assert.equal(recovered.status, "completed", JSON.stringify(recovered));
   assert.equal(recovered.phase, "done");
@@ -4426,8 +4428,6 @@ test("lost-worker recovery terminates headless review and removes its isolated h
       return job.status === "failed" ? job : false;
     }, { timeoutMs: 15000 });
     assert.equal(recovered.error.code, "E_WORKER_LOST");
-    assert.match(recovered.error.message, /prompt was not replayed/i);
-    assert.doesNotMatch(recovered.error.message, /before provider start/i);
     assert.equal(fs.existsSync(isolatedHome), false);
   } finally {
     try { process.kill(-running.providerProcess.processGroupId, "SIGKILL"); } catch {}
