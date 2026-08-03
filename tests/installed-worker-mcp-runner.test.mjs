@@ -18,6 +18,9 @@ import {
   decideInstalledWorkerMcpMailboxPoll
 } from "../scripts/lib/installed-worker-mcp-mailbox-poll.mjs";
 import {
+  setupBoundaryDiagnosticSourceLine
+} from "../scripts/lib/installed-worker-mcp-runner-setup.mjs";
+import {
   readInstalledWorkerMcpRunnerSource
 } from "./lib/installed-worker-mcp-runner-source.mjs";
 
@@ -67,6 +70,45 @@ function runRunner(root, args = [], values = {}) {
 function assertNoSideEffects(root) {
   assert.deepEqual(fs.readdirSync(root), []);
 }
+
+test("setup-boundary diagnostics accept only exact runner stack frames", () => {
+  assert.equal(
+    setupBoundaryDiagnosticSourceLine({
+      stack: "Error: setup scan failed\n    at scanSetupBoundary (file:///repo/scripts/lib/installed-worker-mcp-runner-setup.mjs:581:13)"
+    }),
+    581
+  );
+  assert.equal(
+    setupBoundaryDiagnosticSourceLine({
+      stack: "Error: setup scan failed\n    at scanSetupBoundary (file:///repo/scripts/test-installed-worker-mcp.mjs:626:9)"
+    }),
+    626
+  );
+  for (const stack of [
+    "Error: setup scan failed",
+    "Error: setup scan failed in file:///repo/scripts/lib/installed-worker-mcp-runner-setup.mjs:581:13",
+    "at scanSetupBoundary (file:///repo/scripts/lib/foreign-installed-worker-mcp-runner-setup.mjs:581:13)",
+    "at scanSetupBoundary (file:///repo/scripts/lib/installed-worker-mcp-runner-observation.mjs:581:13)",
+    "at scanSetupBoundary (file:///repo/scripts/lib/installed-worker-mcp-runner-setup.mjs:not-a-line:13)",
+    "at scanSetupBoundary (file:///repo/scripts/lib/installed-worker-mcp-runner-setup.mjs:581:0)"
+  ]) {
+    assert.equal(setupBoundaryDiagnosticSourceLine({ stack }), null, stack);
+  }
+  assert.equal(
+    setupBoundaryDiagnosticSourceLine({
+      stack: `${"x".repeat(64 * 1024)}\n    at scanSetupBoundary (file:///repo/scripts/lib/installed-worker-mcp-runner-setup.mjs:581:13)`
+    }),
+    null
+  );
+  assert.equal(
+    setupBoundaryDiagnosticSourceLine(Object.defineProperty({}, "stack", {
+      get() {
+        throw new Error("hostile stack accessor");
+      }
+    })),
+    null
+  );
+});
 
 test("installed Worker MCP runner import is inert and exposes no named authority", async (t) => {
   const root = tempRoot();
@@ -1085,7 +1127,7 @@ test("installed Worker MCP terminal results converge after private cleanup", () 
   const observerStart = source.indexOf(
     "function observeTerminalResultWorker(tracker, worker, terminalStreamCursor) {"
   );
-  const observerEnd = source.indexOf("\nconst SNAPSHOT_KEYS", observerStart);
+  const observerEnd = source.indexOf("\nexport const SNAPSHOT_KEYS", observerStart);
   assert.ok(observerStart >= 0 && observerEnd > observerStart);
   const observer = source.slice(observerStart, observerEnd);
   assert.doesNotMatch(
@@ -1435,7 +1477,9 @@ test("package and repository validator pin the installed Worker MCP runner wirin
   const runner = fs.readFileSync(RUNNER, "utf8");
   for (const specifier of [
     "./lib/installed-worker-mcp-runner-core.mjs",
-    "./lib/installed-worker-mcp-runner-runtime.mjs"
+    "./lib/installed-worker-mcp-runner-runtime.mjs",
+    "./lib/installed-worker-mcp-runner-setup.mjs",
+    "./lib/installed-worker-mcp-runner-observation.mjs"
   ]) {
     assert.match(
       runner,
@@ -1443,10 +1487,55 @@ test("package and repository validator pin the installed Worker MCP runner wirin
       specifier
     );
   }
+  assert.match(
+    runner,
+    /import \{ setupCleanupRequiresObservation \} from "\.\/lib\/installed-worker-mcp-setup-boundary\.mjs";/
+  );
+  for (const stale of [
+    "boundedSetupScanDiagnosticCode",
+    "captureSetupCommandIdentityWithPolling",
+    "decideSetupScanObservationDisposition",
+    "SETUP_COMMAND_IDENTITY_INTERVAL_MS",
+    "SETUP_COMMAND_IDENTITY_TIMEOUT_MS",
+    "unownedSetupCommandGroupGone",
+    "validateInstalledTerminalEventHistory"
+  ]) {
+    assert.equal(runner.includes(stale), false, stale);
+  }
+  const staticSpecifiers = (relative) => [
+    ...fs.readFileSync(path.join(ROOT, relative), "utf8")
+      .matchAll(/\bfrom\s+["']([^"']+)["']/gu)
+  ].map((match) => match[1]).sort();
+  assert.deepEqual(
+    staticSpecifiers("scripts/lib/installed-worker-mcp-runner-setup.mjs"),
+    [
+      "./installed-worker-mcp-runner-core.mjs",
+      "./installed-worker-mcp-runner-observation.mjs",
+      "./installed-worker-mcp-setup-boundary.mjs",
+      "node:child_process",
+      "node:crypto",
+      "node:fs",
+      "node:os",
+      "node:path",
+      "node:process"
+    ].sort()
+  );
+  assert.deepEqual(
+    staticSpecifiers("scripts/lib/installed-worker-mcp-runner-observation.mjs"),
+    [
+      "./installed-worker-mcp-contract.mjs",
+      "./installed-worker-mcp-runner-core.mjs",
+      "./installed-worker-mcp-runner-runtime.mjs",
+      "node:crypto",
+      "node:fs"
+    ].sort()
+  );
   for (const required of [
     '"scripts/test-installed-worker-mcp.mjs"',
     '"scripts/lib/installed-worker-mcp-runner-core.mjs"',
+    '"scripts/lib/installed-worker-mcp-runner-observation.mjs"',
     '"scripts/lib/installed-worker-mcp-runner-runtime.mjs"',
+    '"scripts/lib/installed-worker-mcp-runner-setup.mjs"',
     '"scripts/lib/installed-worker-mcp-setup-boundary.mjs"',
     '"scripts/lib/installed-worker-mcp-session-boundary.mjs"',
     '"tests/installed-worker-mcp-runner.test.mjs"',
