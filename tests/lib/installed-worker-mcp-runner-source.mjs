@@ -10,7 +10,9 @@ export const INSTALLED_WORKER_MCP_RUNNER = path.join(
 );
 export const INSTALLED_WORKER_MCP_RUNNER_MODULES = [
   "core",
-  "runtime"
+  "setup",
+  "runtime",
+  "observation"
 ].map((domain) => path.join(
   ROOT,
   "scripts",
