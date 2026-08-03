@@ -1,8 +1,10 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 
-import { parse } from "acorn";
+const require = createRequire(import.meta.url);
+const { parse } = require("acorn");
 
 export const SOURCE_STRUCTURE_POLICY_PATH = "scripts/source-structure-policy.json";
 export const SOURCE_STRUCTURE_INITIAL_DIGEST = "96b5c74f6b04a6f586361c323a0b64d7581eb62c4e0bb45f190896a525d8b0de";
