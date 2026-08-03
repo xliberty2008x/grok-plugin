@@ -328,6 +328,8 @@ if (!versionsOnly) {
     "scripts/lib/installed-worker-mcp-runner-runtime.mjs",
     "scripts/lib/installed-worker-mcp-runner-session-read.mjs",
     "scripts/lib/installed-worker-mcp-runner-setup.mjs",
+    "scripts/lib/installed-worker-mcp-runner-write-scenarios.mjs",
+    "scripts/lib/installed-worker-mcp-runner-write-two.mjs",
     "scripts/lib/installed-worker-mcp-setup-boundary.mjs",
     "scripts/lib/installed-worker-mcp-session-boundary.mjs",
     "scripts/lib/test-temp.mjs",

@@ -1488,7 +1488,9 @@ test("package and repository validator pin the installed Worker MCP runner wirin
     "./lib/installed-worker-mcp-runner-runtime.mjs",
     "./lib/installed-worker-mcp-runner-setup.mjs",
     "./lib/installed-worker-mcp-runner-observation.mjs",
-    "./lib/installed-worker-mcp-runner-session-read.mjs"
+    "./lib/installed-worker-mcp-runner-session-read.mjs",
+    "./lib/installed-worker-mcp-runner-write-scenarios.mjs",
+    "./lib/installed-worker-mcp-runner-write-two.mjs"
   ]) {
     assert.match(
       runner,
@@ -1542,6 +1544,8 @@ test("package and repository validator pin the installed Worker MCP runner wirin
     '"scripts/lib/installed-worker-mcp-runner-runtime.mjs"',
     '"scripts/lib/installed-worker-mcp-runner-session-read.mjs"',
     '"scripts/lib/installed-worker-mcp-runner-setup.mjs"',
+    '"scripts/lib/installed-worker-mcp-runner-write-scenarios.mjs"',
+    '"scripts/lib/installed-worker-mcp-runner-write-two.mjs"',
     '"scripts/lib/installed-worker-mcp-setup-boundary.mjs"',
     '"scripts/lib/installed-worker-mcp-session-boundary.mjs"',
     '"tests/installed-worker-mcp-runner.test.mjs"',
@@ -1558,7 +1562,7 @@ test("package and repository validator pin the installed Worker MCP runner wirin
   );
 });
 
-test("installed runner session-read module keeps the exact Slice 3a boundary", () => {
+test("installed runner scenario modules keep the exact Slice 3 boundary", () => {
   assert.deepEqual(
     INSTALLED_WORKER_MCP_RUNNER_MODULES.map((file) => path.basename(file)),
     [
@@ -1566,7 +1570,9 @@ test("installed runner session-read module keeps the exact Slice 3a boundary", (
       "installed-worker-mcp-runner-setup.mjs",
       "installed-worker-mcp-runner-runtime.mjs",
       "installed-worker-mcp-runner-observation.mjs",
-      "installed-worker-mcp-runner-session-read.mjs"
+      "installed-worker-mcp-runner-session-read.mjs",
+      "installed-worker-mcp-runner-write-two.mjs",
+      "installed-worker-mcp-runner-write-scenarios.mjs"
     ]
   );
   assert.deepEqual(
@@ -1585,37 +1591,64 @@ test("installed runner session-read module keeps the exact Slice 3a boundary", (
       "node:process"
     ].sort()
   );
+  assert.deepEqual(
+    staticSpecifiers("scripts/lib/installed-worker-mcp-runner-write-scenarios.mjs"),
+    [
+      "./installed-worker-mcp-runner-core.mjs",
+      "./installed-worker-mcp-runner-observation.mjs",
+      "./installed-worker-mcp-runner-runtime.mjs",
+      "./installed-worker-mcp-runner-session-read.mjs",
+      "./installed-worker-mcp-runner-write-two.mjs",
+      "node:child_process",
+      "node:crypto",
+      "node:fs",
+      "node:path",
+      "node:process"
+    ].sort()
+  );
+  assert.deepEqual(
+    staticSpecifiers("scripts/lib/installed-worker-mcp-runner-write-two.mjs"),
+    [
+      "./installed-worker-mcp-runner-core.mjs",
+      "./installed-worker-mcp-runner-observation.mjs",
+      "./installed-worker-mcp-runner-runtime.mjs",
+      "./installed-worker-mcp-runner-session-read.mjs",
+      "node:child_process",
+      "node:crypto",
+      "node:fs",
+      "node:path"
+    ].sort()
+  );
 
   const runner = fs.readFileSync(RUNNER, "utf8");
-  const sessionRead = fs.readFileSync(
+  const scenarioSources = [
+    "session-read",
+    "write-scenarios",
+    "write-two"
+  ].map((domain) => fs.readFileSync(
     path.join(
       ROOT,
       "scripts",
       "lib",
-      "installed-worker-mcp-runner-session-read.mjs"
+      `installed-worker-mcp-runner-${domain}.mjs`
     ),
     "utf8"
-  );
+  ));
   assert.doesNotMatch(
     runner,
-    /(?:async )?function runCompletionScenario\b/u
+    /(?:async )?function (?:runCompletionScenario|runWriteSmokeScenario|runWriteCancellationScenario|runTwoWriterScenario)\b/u
   );
   assert.doesNotMatch(
     runner,
     /from ["']\.\/lib\/(?:installed-worker-mcp-mailbox-poll|installed-worker-mcp-session-boundary)\.mjs["']/u
   );
-  assert.match(
-    sessionRead,
-    /export async function runCompletionScenario\b/u
-  );
-  assert.doesNotMatch(
-    sessionRead,
-    /(?:async )?function (?:runWriteSmokeScenario|runWriteCancellationScenario|runTwoWriterScenario|runCancellationScenario|cleanupExactWorkerBoundary|emergencyCleanup|ensurePublicationDirectory|publishReceipt|buildReceipt|qualify|main)\b/u
-  );
+  for (const source of scenarioSources) {
+    assert.doesNotMatch(
+      source,
+      /(?:async )?function (?:runCancellationScenario|cleanupExactWorkerBoundary|emergencyCleanup|ensurePublicationDirectory|publishReceipt|buildReceipt|qualify|main)\b/u
+    );
+  }
   for (const retained of [
-    "runWriteSmokeScenario",
-    "runWriteCancellationScenario",
-    "runTwoWriterScenario",
     "runCancellationScenario",
     "cleanupExactWorkerBoundary",
     "emergencyCleanup",
