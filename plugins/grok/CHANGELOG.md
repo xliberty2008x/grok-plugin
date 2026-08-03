@@ -26,6 +26,36 @@ Status: development snapshot; not release-qualified.
 
 Status: hardening candidate; not release-qualified.
 
+- Fixed managed Codex setup so the installed `$grok:setup` skill requests
+  approval before its one exact process. The approved action is explicitly a
+  one-time, command-scoped unsandboxed setup execution because the host tool
+  does not expose a literal exact-path writable grant. It creates no reusable
+  `prefix_rule`, disables login/interactive shell semantics and PTY framing,
+  makes no sandboxed probe or retry, and never extends approval to status, tasks, reviews,
+  providers, retries, or verification. Denial or an unavailable approval
+  starts no setup/provider process. The rescue skill may use the same bounded
+  action only for the exact missing capability-receipt prerequisite; its
+  identical task retry remains un-escalated and `E_STORAGE_READONLY` stays
+  terminal. Runtime guidance distinguishes the managed host boundary from
+  genuine storage media/mode failures. This does not widen provider
+  permissions or claim path-scoped authority.
+- Fixed Claude Code plugin installation so the conventional shared
+  `hooks/hooks.json` (`SessionStart`, `Stop`) is no longer listed in the Claude
+  manifest. Claude Code 2.1.220 already auto-loads that path once; explicit
+  registration duplicated the load and failed with an already-loaded file
+  error. The manifest now registers only the Claude-only supplemental
+  `./hooks/claude-hooks.json` (`SessionEnd`). Standard and Claude-only hook
+  file contents are unchanged. Packaging validation and the Codex-support
+  regression enforce the supplemental-only contract. This is a packaging
+  declaration fix only; it is not installed Claude lifecycle qualification.
+- Fixed the installed Codex and Claude deep-research instructions so they
+  select exactly one execution mode and exactly one research surface before
+  starting a job. Public-web requests still default to `--background` plus
+  `--web-only`; explicit foreground or workspace requests replace those
+  defaults with `--wait` or `--workspace` instead of combining mutually
+  exclusive flags. The runtime's fail-closed argument validation, private
+  query ingress, profiles, provider lifecycle, and qualification status are
+  unchanged.
 - Replaced the stale exact-version setup ceiling with forward admission for
   stable Grok Build 0.2.99 and newer. Recorded release digests remain the
   stronger `known-digest` path; unfamiliar versions are accepted only from the

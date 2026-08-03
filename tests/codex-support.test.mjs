@@ -475,11 +475,31 @@ test("Codex manifest, marketplace, public skills, hooks, and wrapper form one in
   assert.match(readme, /Sole setup-recoverable path/i);
   assert.doesNotMatch(rescueSkill, /general orchestration framework/i);
 
+  // Issue #58: Claude Code auto-loads conventional hooks/hooks.json; the Claude
+  // manifest must register only the supplemental Claude-only SessionEnd file.
   assert.deepEqual(Object.keys(defaultHooks.hooks).sort(), ["SessionStart", "Stop"]);
   assert.deepEqual(Object.keys(claudeHooks.hooks), ["SessionEnd"]);
-  assert.deepEqual(claudeManifest.hooks, ["./hooks/hooks.json", "./hooks/claude-hooks.json"]);
+  assert.deepEqual(claudeManifest.hooks, ["./hooks/claude-hooks.json"]);
+  const conventionalHooksPath = path.resolve(PLUGIN_ROOT, "hooks/hooks.json");
+  const manifestHookPaths = claudeManifest.hooks.map((hookPath) => path.resolve(PLUGIN_ROOT, hookPath));
+  assert.equal(manifestHookPaths.includes(conventionalHooksPath), false, "Claude manifest must not re-register conventional hooks/hooks.json");
+  for (const hookPath of manifestHookPaths) {
+    assert.ok(hookPath.startsWith(`${PLUGIN_ROOT}${path.sep}`), "Claude manifest hook files must remain inside the plugin root");
+  }
+  const defaultHookEvents = Object.keys(defaultHooks.hooks);
+  const supplementalHookEvents = Object.keys(claudeHooks.hooks);
+  assert.equal(new Set([...defaultHookEvents, ...supplementalHookEvents]).size, defaultHookEvents.length + supplementalHookEvents.length, "default and supplemental hook events must be disjoint");
+  assert.deepEqual(
+    [...defaultHookEvents, ...supplementalHookEvents].sort(),
+    ["SessionEnd", "SessionStart", "Stop"]
+  );
+  for (const [event, groups] of Object.entries({ ...defaultHooks.hooks, ...claudeHooks.hooks })) {
+    assert.equal(groups.length, 1, `${event} must be registered exactly once`);
+    assert.equal(groups[0].hooks.length, 1, `${event} must contain exactly one command hook`);
+  }
   assert.match(defaultHooks.hooks.SessionStart[0].hooks[0].command, /\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/session-lifecycle-hook\.mjs/);
   assert.match(defaultHooks.hooks.Stop[0].hooks[0].command, /\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/stop-review-gate-hook\.mjs/);
+  assert.match(claudeHooks.hooks.SessionEnd[0].hooks[0].command, /\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/session-lifecycle-hook\.mjs/);
 
   const wrapper = read("plugins/grok/scripts/grok-codex.mjs");
   // Source contract: only set host when unset (preserve explicit), claim codex only under CODEX_THREAD_ID,
@@ -516,4 +536,45 @@ test("Codex manifest, marketplace, public skills, hooks, and wrapper form one in
   assert.match(run.stdout, /^Usage:/);
   assert.match(run.stdout, /transfer \[--source <claude-or-codex-jsonl>\] \[--model <id>\] \[--effort low\|medium\|high\] \[--json\]/);
   assert.doesNotMatch(run.stdout, /task-resume-candidate/);
+});
+
+test("Codex setup requests one-time command approval before its only process", () => {
+  const setup = read("plugins/grok/skills/setup/SKILL.md");
+  const rescue = read("plugins/grok/skills/rescue/SKILL.md");
+  const setupArgv = "node <resolved-grok-codex.mjs> setup [--enable-review-gate|--disable-review-gate]";
+  const rescueArgv = "node <resolved-grok-codex.mjs> setup";
+
+  assert.equal(setup.split(setupArgv).length - 1, 1, "setup must declare one exact argv shape");
+  assert.ok(setup.indexOf("Resolve `../../scripts/grok-codex.mjs`") < setup.indexOf(setupArgv));
+  assert.match(setup, /sandbox_permissions: "require_escalated"/);
+  assert.equal(setup.split("`login: false`").length - 1, 1);
+  assert.equal(setup.split("`tty: false`").length - 1, 1);
+  assert.match(setup, /disables the tool's login\/interactive shell semantics and PTY framing[\s\S]*host defaults do not add work around the requested command/i);
+  assert.match(setup, /Omit `prefix_rule`; do not create a persistent approval rule/i);
+  assert.doesNotMatch(setup, /prefix_rule\s*:/);
+  assert.match(setup, /one-time, command-scoped unsandboxed execution/i);
+  assert.match(setup, /not a literal exact-path grant/i);
+  assert.match(setup, /Do not make a sandboxed first attempt/i);
+  assert.match(setup, /approval request must complete before process execution/i);
+  assert.match(setup, /denied or unavailable[\s\S]*?no setup or provider process has started/i);
+  assert.match(setup, /only the setup flag the user explicitly requested/i);
+  assert.match(setup, /mutually exclusive; omit both unless the user requested exactly one/i);
+  assert.match(setup, /Return the runtime output unchanged/i);
+  assert.doesNotMatch(setup, /(?:\$|\b)HOME\b|~\//);
+
+  const recovery = rescue.slice(rescue.indexOf("## Recoverable setup prerequisite"), rescue.indexOf("## `record-verification` input contract"));
+  assert.equal(recovery.split(rescueArgv).length - 1, 1, "rescue may declare one setup action");
+  assert.equal(recovery.split('sandbox_permissions: "require_escalated"').length - 1, 1);
+  assert.equal(recovery.split("`login: false`").length - 1, 1);
+  assert.equal(recovery.split("`tty: false`").length - 1, 1);
+  assert.match(recovery, /disables the tool's login\/interactive shell semantics and PTY framing[\s\S]*host defaults do not add work around the requested command/i);
+  assert.match(recovery, /Omit `prefix_rule`; do not create a persistent approval rule/i);
+  assert.doesNotMatch(recovery, /prefix_rule\s*:/);
+  assert.match(recovery, /Never escalate status, task\/job, provider, retry, monitoring, result, cancellation, or verification calls/i);
+  assert.match(recovery, /approval must complete before process execution[\s\S]*?no setup or provider process has started/i);
+  assert.match(recovery, /Approval denied or unavailable:[\s\S]*?then \*\*stop\*\*/i);
+  assert.match(recovery, /Setup success:[\s\S]*?identical\*\* bounded task launch \*\*exactly once\*\*/i);
+  assert.match(recovery, /`E_STORAGE_READONLY` on the identical retry[\s\S]*?terminal/i);
+  assert.match(recovery, /Return the retry error unchanged/i);
+  assert.doesNotMatch(recovery, /(?:\$|\b)HOME\b|~\//);
 });

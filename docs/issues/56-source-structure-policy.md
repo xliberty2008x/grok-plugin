@@ -157,7 +157,7 @@ while importing nine named semantic suites in their original registration
 order. The former `_part1` through `_part9` files are gone; the structure suite
 remains a separate ordinary deterministic test.
 
-The ratchet engine now scans 314 files with zero errors, zero dependency
+The ratchet engine now scans 316 files with zero errors, zero dependency
 cycles, zero ordinal fragments, and 35 explicitly capped legacy warnings. No
 handwritten JavaScript file exceeds 5,000 lines; the largest remaining file is
 `tests/worker-protocol.test.mjs` at 4,635 lines. Immutable initial debt, cycle,

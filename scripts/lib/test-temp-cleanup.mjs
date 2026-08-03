@@ -5,7 +5,6 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import gitContainment from "./test-temp-git-containment.cjs";
-
 import {
   TEST_TEMP_MANIFEST,
   TEST_TEMP_PROCESS_PREFIX,
@@ -167,6 +166,7 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "grok-source-pty-no-ready-fake-",
   "grok-source-stdin-negative-data-",
   "grok-source-stdin-negative-fake-",
+  "grok-setup-storage-injection-",
   "grok-state-alias-",
   "grok-state-barrier-",
   "grok-state-data-",

@@ -656,13 +656,23 @@ if (!versionsOnly) {
     }
   }
   if (pluginManifest?.name !== "grok") problem("Plugin manifest name must be grok.", "plugins/grok/.claude-plugin/plugin.json");
+  // Claude Code auto-loads the conventional hooks/hooks.json once. The manifest must
+  // register only the Claude-only supplemental SessionEnd file (issue #58).
   if (
     !Array.isArray(pluginManifest?.hooks)
-    || pluginManifest.hooks.length !== 2
-    || pluginManifest.hooks[0] !== "./hooks/hooks.json"
-    || pluginManifest.hooks[1] !== "./hooks/claude-hooks.json"
+    || pluginManifest.hooks.length !== 1
+    || pluginManifest.hooks[0] !== "./hooks/claude-hooks.json"
   ) {
-    problem("Claude plugin manifest must load the shared and Claude-only hooks files.", "plugins/grok/.claude-plugin/plugin.json");
+    problem(
+      "Claude plugin manifest hooks must be exactly [\"./hooks/claude-hooks.json\"] (supplemental-only; conventional hooks/hooks.json is auto-discovered).",
+      "plugins/grok/.claude-plugin/plugin.json"
+    );
+  }
+  if (Array.isArray(pluginManifest?.hooks) && pluginManifest.hooks.includes("./hooks/hooks.json")) {
+    problem(
+      "Claude plugin manifest must not explicitly register ./hooks/hooks.json; Claude Code auto-loads that conventional file.",
+      "plugins/grok/.claude-plugin/plugin.json"
+    );
   }
   if (codexMarketplace) {
     if (codexMarketplace.name !== "grok-companion") problem("Codex marketplace name must be grok-companion.", ".agents/plugins/marketplace.json");

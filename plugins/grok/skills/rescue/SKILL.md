@@ -86,15 +86,17 @@ The sole host-local variable is the setup command token (`$grok:setup` in this C
 
 **One setup, one identical retry, no duplicate launch:**
 
-1. Invoke the authoritative setup action **at most once**:
+1. Invoke the authoritative setup action **at most once**. The installed wrapper was already resolved in the native-like workflow. Make one approval-coupled unified execution call whose command is exactly:
 
    ```text
    node <resolved-grok-codex.mjs> setup
    ```
 
-2. **Setup failure:** surface the setup failure unchanged and **stop**. Do not retry the task, do not run setup again, and do not conceal the failure via worker fallback.
-3. **Setup success:** retry the **identical** bounded task launch **exactly once**. Preserve the original TaskEnvelope (same user request, objective, scope, mode, freshness facts, model, effort, acceptance criteria, required verification, process/PTY framing, and write profile). Do not start a concurrent second process, do not change argv flags that define mode/model/effort/fresh/job-id, and do not re-run setup before or after this single retry.
-4. **Persistent receipt error after that one retry**, or **any non-receipt `E_CAPABILITY`** at any step: remain **terminal** and eligible for the documented fallback policy. Do not auto-setup again; do not auto-retry again; do not mask the error as success.
+   Use `sandbox_permissions: "require_escalated"`, `login: false`, and `tty: false` with the narrow justification `Allow this one Grok setup command to access Grok Companion's private plugin data outside the managed workspace so it can validate readiness and write owner-only state.` This disables the tool's login/interactive shell semantics and PTY framing so those host defaults do not add work around the requested command. This is one-time, command-scoped unsandboxed execution, not a literal exact-path grant. Omit `prefix_rule`; do not create a persistent approval rule, and do not make a sandboxed setup attempt first. This approval applies only to this missing-receipt setup action. Never escalate status, task/job, provider, retry, monitoring, result, cancellation, or verification calls.
+2. **Approval denied or unavailable:** the approval must complete before process execution, so no setup or provider process has started. Report that automatic setup reached a managed Codex capability boundary and can be retried only where one-time command approval is available, then **stop**. Do not retry the task or conceal the denial via worker fallback.
+3. **Setup failure:** surface the setup failure unchanged and **stop**. Do not retry the task, do not run setup again, and do not conceal the failure via worker fallback.
+4. **Setup success:** retry the **identical** bounded task launch **exactly once**. Preserve the original TaskEnvelope (same user request, objective, scope, mode, freshness facts, model, effort, acceptance criteria, required verification, process/PTY framing, and write profile). Do not start a concurrent second process, do not change argv flags that define mode/model/effort/fresh/job-id, and do not re-run setup before or after this single retry.
+5. **Persistent receipt error after that one retry**, **`E_STORAGE_READONLY` on the identical retry**, or **any non-receipt `E_CAPABILITY`** at any step: remain **terminal** and eligible for the documented fallback policy. Return the retry error unchanged. Do not auto-setup again; do not auto-retry again; do not mask the error as success.
 
 ## `record-verification` input contract
 

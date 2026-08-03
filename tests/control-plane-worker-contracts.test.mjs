@@ -702,6 +702,16 @@ test("rescue skill remediates only the exact missing capability-receipt admissio
   // AC-2: setup success → one identical bounded task retry; preserve envelope bounds.
   assert.match(rescue, /authoritative setup action \*\*at most once\*\*/i);
   assert.match(rescue, /node <resolved-grok-codex\.mjs> setup/);
+  assert.equal(rescue.split("node <resolved-grok-codex.mjs> setup").length - 1, 1);
+  assert.match(rescue, /sandbox_permissions: "require_escalated"/);
+  assert.match(rescue, /`login: false`/);
+  assert.match(rescue, /`tty: false`/);
+  assert.match(rescue, /disables the tool's login\/interactive shell semantics and PTY framing[\s\S]*host defaults do not add work around the requested command/i);
+  assert.match(rescue, /Omit `prefix_rule`; do not create a persistent approval rule/i);
+  assert.doesNotMatch(rescue, /prefix_rule\s*:/);
+  assert.match(rescue, /one-time, command-scoped unsandboxed execution, not a literal exact-path grant/i);
+  assert.match(rescue, /do not make a sandboxed setup attempt first/i);
+  assert.match(rescue, /Never escalate status, task\/job, provider, retry, monitoring, result, cancellation, or verification calls/i);
   assert.match(rescue, /Setup success:[\s\S]*?identical\*\* bounded task launch \*\*exactly once\*\*/i);
   assert.match(rescue, /Preserve the original TaskEnvelope/i);
   assert.match(
@@ -725,6 +735,8 @@ test("rescue skill remediates only the exact missing capability-receipt admissio
     /Persistent receipt error after that one retry[\s\S]*?any non-receipt `E_CAPABILITY`[\s\S]*?\*\*terminal\*\* and eligible for the documented fallback policy/i
   );
   assert.match(rescue, /Do not auto-setup again; do not auto-retry again/i);
+  assert.match(rescue, /Approval denied or unavailable:[\s\S]*?no setup or provider process has started[\s\S]*?\*\*stop\*\*/i);
+  assert.match(rescue, /`E_STORAGE_READONLY` on the identical retry[\s\S]*?Return the retry error unchanged/i);
 
   // AC-5 / AC-6 bounds: pre-launch receipt gate; status --readonly is neither capability nor writability.
   assert.match(rescue, /fail-closed pre-launch provider capability receipt gate/i);
