@@ -239,8 +239,8 @@ setup command. Approval gives that command one-time, command-scoped
 unsandboxed execution so the installed wrapper can reach Grok Companion's
 user-owned private plugin data outside the workspace. The host API does not
 provide a literal exact-path writable grant, so this approval is deliberately
-not described as one. The skill does not create a reusable `prefix_rule`, does
-uses neither login/interactive shell semantics nor PTY framing, does not make a
+not described as one. The skill does not create a reusable `prefix_rule`, uses
+neither login/interactive shell semantics nor PTY framing, does not make a
 failing sandboxed probe first, and does not extend this approval to status,
 task, review, provider, retry, or verification commands. If approval is denied
 or unavailable, no setup or provider process starts.
