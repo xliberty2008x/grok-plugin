@@ -234,6 +234,17 @@ $grok:setup
 
 Codex installs a **versioned snapshot**. After you change the source checkout, update or reinstall the plugin, then run `$grok:setup` again.
 
+In managed Codex, `$grok:setup` asks for approval before starting one exact
+setup command. Approval gives that command one-time, command-scoped
+unsandboxed execution so the installed wrapper can reach Grok Companion's
+user-owned private plugin data outside the workspace. The host API does not
+provide a literal exact-path writable grant, so this approval is deliberately
+not described as one. The skill does not create a reusable `prefix_rule`, uses
+neither login/interactive shell semantics nor PTY framing, does not make a
+failing sandboxed probe first, and does not extend this approval to status,
+task, review, provider, retry, or verification commands. If approval is denied
+or unavailable, no setup or provider process starts.
+
 ### What setup checks
 
 Both `/grok:setup` and `$grok:setup` probe:
@@ -452,7 +463,7 @@ Normal `/grok:review` does **not** accept custom focus text; use adversarial rev
 - Without a job ID, `result` selects the newest finished job for the exact current host session; `cancel` selects the newest active job in that session.
 - Explicit job IDs remain scoped to the exact host task that created them; another task cannot use an ID to read, cancel, verify, or continue that job.
 - Unwritable workspace control state (EPERM/EACCES/EROFS during state initialization/repair, migration, durable lock, or atomic admission write) surfaces as **`E_STORAGE_READONLY`** (prerequisite) before worker/provider launch, not generic `E_STATE`.
-- Codex task admission keeps a **fail-closed pre-launch provider capability receipt gate**. A missing or invalid setup-owned receipt fails closed as **`E_CAPABILITY`** with message `Valid provider capability receipt is missing or invalid; run $grok:setup before admitting a Codex task.` The rescue control plane may run authoritative `$grok:setup` **once** for that exact message only, then retry the **identical** task **once** on setup success; setup failure is surfaced unchanged and stops; a persistent receipt error after that retry, or any other `E_CAPABILITY`, remains terminal and fallback-eligible. The runtime receipt gate itself is not weakened.
+- Codex task admission keeps a **fail-closed pre-launch provider capability receipt gate**. A missing or invalid setup-owned receipt fails closed as **`E_CAPABILITY`** with message `Valid provider capability receipt is missing or invalid; run $grok:setup before admitting a Codex task.` The rescue control plane may request one-time, command-scoped unsandboxed execution for authoritative `$grok:setup` **once** for that exact message only, then retry the **identical** task **once** on setup success. It never creates a persistent approval rule or escalates the task retry. Approval denial starts no setup/provider process and stops; setup failure is surfaced unchanged and stops; `E_STORAGE_READONLY` or a persistent receipt error after the one retry, or any other `E_CAPABILITY`, remains terminal and fallback-eligible. The runtime receipt gate itself is not weakened.
 
 ### Rescue (investigation vs implementation)
 
@@ -617,14 +628,14 @@ Do not delegate secrets, regulated data, or third-party material that must not b
 | Setup: executable identity failure (`E_PROCESS_IDENTITY`) | Known-release bytes differ, or the managed source/private pin changed during capture or launch | Restore a stable active managed link and executable, inspect for unexpected replacement, then retry setup |
 | Auth required (`E_AUTH_REQUIRED`) | No/expired cached login; env-key-only mode | Run `grok login`, then `/grok:setup` or `$grok:setup` again |
 | Isolation / capability failure (any other `E_CAPABILITY` message) | External extensions in Grok home, missing ACP flags, unsupported model/effort/platform, executable identity drift, or Windows provider path | Remove external hooks/skills/plugins/MCP from the isolated profile; confirm 0.2.99+; on Windows treat provider execution as unsupported. Do **not** auto-setup for arbitrary / non-receipt `E_CAPABILITY` |
-| Missing/invalid provider capability receipt (`E_CAPABILITY`, exact setup-recoverable message only) | Codex pre-launch receipt gate: setup-owned provider capability receipt is missing or invalid | **Sole setup-recoverable path:** run `$grok:setup` once; on success, retry the identical rescue task once. Surface setup failure unchanged and stop. A persistent receipt error after that one retry remains terminal |
+| Missing/invalid provider capability receipt (`E_CAPABILITY`, exact setup-recoverable message only) | Codex pre-launch receipt gate: setup-owned provider capability receipt is missing or invalid | **Sole setup-recoverable path:** request one-time command approval and run `$grok:setup` once; on success, retry the identical un-escalated rescue task once. Approval denial starts no setup/provider process. Surface setup failure unchanged and stop. `E_STORAGE_READONLY` or a persistent receipt error after that one retry remains terminal |
 | Codex transfer needs `--source` | SessionStart has not run or hooks untrusted | New Codex task, trust hooks in `/hooks`, or pass a real `.jsonl` under `${CODEX_HOME:-~/.codex}/sessions` |
 | Claude transfer rejected | Source outside `~/.claude/projects`, symlink, or non-`.jsonl` | Use a real regular `.jsonl` under the Claude projects root |
 | `E_NO_RESUME_CANDIDATE` | Explicit prior job lacks a resumable same-profile Grok session | Use `--fresh` or pass an eligible finished job ID from this exact host task |
 | `E_REVIEW_TOO_LARGE` | Diff/untracked evidence exceeds limits | Narrow scope/base, or shrink untracked files |
 | `E_REVIEW_MUTATED_WORKSPACE` | Review process changed the repo | Treat as hard failure; do not trust a verdict; inspect Git status |
 | `E_WORKER_LOST` | Background worker disappeared | Inspect job status/result; do not expect automatic replay (prompts are not re-run) |
-| `E_STORAGE_READONLY` | Workspace control-state storage is not writable (EPERM/EACCES/EROFS) | Fix ownership/permissions or mount media writable for private mode 0700 state; retry |
+| `E_STORAGE_READONLY` | Workspace control state or the user-owned plugin-data root is not writable (EPERM/EACCES/EROFS) | For `$grok:setup` in managed Codex, use its one-time command approval; this is command-scoped unsandboxed execution, not an exact-path grant. If the approved setup or an un-escalated task still fails, inspect ownership and writable media outside the plugin flow and preserve private 0700 directories / 0600 files; do not widen task authority or create a reusable approval rule |
 | `E_PROCESS_IDENTITY` | Could not verify process-group ownership/shutdown | Leave guards/state for manual inspection; do not force-kill arbitrary PIDs |
 | Raw `EAGAIN` while dispatching from Codex | An older cached runtime or an already-open task is still active | From this checkout run `npm run codex:update-local`, then test from a newly started Codex task |
 | Grok reports `Operation not permitted` for `--agent-profile` | The installed snapshot still points Grok at a host plugin-cache path | Update to `0.3.0-dev.1` or newer with `npm run codex:update-local`, start a new task, and rerun `$grok:setup` |
