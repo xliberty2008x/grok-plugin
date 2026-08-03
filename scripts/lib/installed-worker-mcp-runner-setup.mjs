@@ -1,7 +1,7 @@
 // Installed Worker MCP qualification domain. Keep import-time behavior inert.
 import { fail, failSetupScan, hasExactKeys, MAX_COMMAND_OUTPUT_BYTES, QualificationError, runBounded, safeParseJson, sameJson, STATE_POLL_MS } from "./installed-worker-mcp-runner-core.mjs";
 import { canonicalTimestamp } from "./installed-worker-mcp-runner-observation.mjs";
-import { boundedSetupScanDiagnosticCode, captureSetupCommandIdentityWithPolling, decideSetupScanObservationDisposition, SETUP_COMMAND_IDENTITY_INTERVAL_MS, SETUP_COMMAND_IDENTITY_TIMEOUT_MS, unownedSetupCommandGroupGone } from "./installed-worker-mcp-setup-boundary.mjs";
+import { advanceSetupGuardTransition, boundedSetupScanDiagnosticCode, captureSetupCommandIdentityWithPolling, SETUP_COMMAND_IDENTITY_INTERVAL_MS, SETUP_COMMAND_IDENTITY_TIMEOUT_MS, SETUP_GUARD_TRANSITION_TIMEOUT_MS, unownedSetupCommandGroupGone } from "./installed-worker-mcp-setup-boundary.mjs";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -73,6 +73,11 @@ export function createSetupBoundary({
     commandPids: new Set(),
     identities: new Map(),
     guardRecords: new Map(),
+    staleGuardRecords: new Map(),
+    pendingGuardTransitions: new Map(),
+    closedGuardMarkers: new Set(),
+    scanEpoch: 0,
+    now: Date.now,
     observedProvider: false,
     observedGuard: false,
     scanFailed: false,
@@ -128,26 +133,10 @@ export function validateSetupGuard(boundary, marker, record) {
   } catch {
     failSetupScan("guard-identity-match-probe");
   }
-  if (verifiedMatch) return;
-  let firstProcessGroupGone = false;
-  let secondProcessGroupGone = false;
-  try {
-    firstProcessGroupGone = boundary.processControl.processGroupGone(
-      record.providerProcess
-    );
-    secondProcessGroupGone = boundary.processControl.processGroupGone(
-      record.providerProcess
-    );
-  } catch {
-    failSetupScan("guard-identity-mismatch-gone-proof");
-  }
-  if (decideSetupScanObservationDisposition({
-    verifiedMatch,
-    firstProcessGroupGone,
-    secondProcessGroupGone
-  }) !== "ignore-stale") {
-    failSetupScan("guard-identity-mismatch-live-or-ambiguous");
-  }
+  return Object.freeze({
+    identity: record.providerProcess,
+    verifiedMatch
+  });
 }
 
 export function setupMarkerFromCommand(boundary, command) {
@@ -165,8 +154,186 @@ export function setupMarkerFromCommand(boundary, command) {
   return new Set(markers).size === 1 ? markers[0] : null;
 }
 
-export function scanSetupBoundary(boundary) {
+function processGroupGoneForSetupTransition(boundary, identity) {
+  try {
+    return boundary.processControl.processGroupGone(identity) === true;
+  } catch {
+    failSetupScan("guard-identity-mismatch-gone-proof");
+  }
+}
+
+function recordVerifiedSetupGuard(boundary, marker, record) {
+  if (
+    boundary.pendingGuardTransitions.has(marker)
+    || boundary.staleGuardRecords.has(marker)
+    || boundary.closedGuardMarkers.has(marker)
+  ) {
+    failSetupScan("guard-identity-drift");
+  }
+  const previous = boundary.guardRecords.get(marker);
+  if (previous && !sameJson(previous, record)) {
+    failSetupScan("guard-record-drift");
+  }
+  const priorIdentity = boundary.identities.get(marker);
+  if (
+    priorIdentity
+    && !sameJson(priorIdentity, record.providerProcess)
+  ) {
+    failSetupScan("guard-identity-drift");
+  }
+  boundary.guardRecords.set(marker, structuredClone(record));
+  boundary.identities.set(
+    marker,
+    structuredClone(record.providerProcess)
+  );
+  boundary.observedGuard = true;
+  boundary.observedProvider = true;
+}
+
+function advanceBoundaryGuardTransition(boundary, marker, {
+  record = null,
+  guardPresent,
+  exactIdentityMatch = false,
+  scanEpoch,
+  observedAt
+}) {
+  const pending = boundary.pendingGuardTransitions.get(marker) || null;
+  const selectedRecord = record || pending?.record || null;
+  const identity = selectedRecord?.providerProcess || pending?.identity || null;
+  if (!selectedRecord || !identity) {
+    failSetupScan("guard-validation");
+  }
+  const sameRecord = !pending || sameJson(pending.record, selectedRecord);
+  const sameIdentity = !pending
+    || sameJson(pending.identity, identity);
+  if (!sameRecord) failSetupScan("guard-record-drift");
+  if (!sameIdentity) failSetupScan("guard-identity-drift");
+  const priorRecord = boundary.guardRecords.get(marker);
+  const priorIdentity = boundary.identities.get(marker);
+  if (priorRecord && !sameJson(priorRecord, selectedRecord)) {
+    failSetupScan("guard-record-drift");
+  }
+  if (priorIdentity && !sameJson(priorIdentity, identity)) {
+    failSetupScan("guard-identity-drift");
+  }
+  const processGroupGone = exactIdentityMatch
+    ? false
+    : processGroupGoneForSetupTransition(boundary, identity);
+  const proofCompletedAt = boundary.now();
+  const outcome = advanceSetupGuardTransition({
+    transition: pending?.proof || null,
+    scanEpoch,
+    observedAt,
+    proofCompletedAt,
+    guardPresent,
+    exactIdentityMatch,
+    processGroupGone,
+    sameRecord,
+    sameIdentity,
+    correlatedMarkerIdentity: true
+  });
+  if (outcome.status === "fail-closed") {
+    if (outcome.reason === "drift") {
+      failSetupScan("guard-record-drift");
+    }
+    if (outcome.reason === "reappearance") {
+      failSetupScan("guard-identity-drift");
+    }
+    failSetupScan("guard-identity-mismatch-live-or-ambiguous");
+  }
+  if (outcome.status === "pending") {
+    boundary.pendingGuardTransitions.set(marker, {
+      record: structuredClone(selectedRecord),
+      identity: structuredClone(identity),
+      proof: outcome.transition
+    });
+    return;
+  }
+  boundary.pendingGuardTransitions.delete(marker);
+  if (outcome.status === "stale-present") {
+    boundary.staleGuardRecords.set(
+      marker,
+      structuredClone(selectedRecord)
+    );
+    return;
+  }
+  if (outcome.status === "closed") {
+    boundary.closedGuardMarkers.add(marker);
+    return;
+  }
+  failSetupScan("guard-validation");
+}
+
+function reconcileSetupGuardObservations(
+  boundary,
+  observations,
+  scanEpoch,
+  observedAt
+) {
   const activeGuardMarkers = new Set();
+  const markers = new Set([
+    ...observations.keys(),
+    ...boundary.guardRecords.keys(),
+    ...boundary.staleGuardRecords.keys(),
+    ...boundary.pendingGuardTransitions.keys()
+  ]);
+  for (const marker of markers) {
+    const observation = observations.get(marker) || null;
+    if (boundary.closedGuardMarkers.has(marker)) {
+      if (observation) failSetupScan("guard-identity-drift");
+      continue;
+    }
+    const staleRecord = boundary.staleGuardRecords.get(marker) || null;
+    if (staleRecord) {
+      if (!observation) {
+        boundary.staleGuardRecords.delete(marker);
+        boundary.closedGuardMarkers.add(marker);
+        continue;
+      }
+      if (!sameJson(staleRecord, observation.record)) {
+        failSetupScan("guard-record-drift");
+      }
+      if (observation.verifiedMatch) {
+        failSetupScan("guard-identity-drift");
+      }
+      if (!processGroupGoneForSetupTransition(
+        boundary,
+        staleRecord.providerProcess
+      )) {
+        failSetupScan("guard-identity-mismatch-live-or-ambiguous");
+      }
+      continue;
+    }
+    if (observation?.verifiedMatch) {
+      recordVerifiedSetupGuard(boundary, marker, observation.record);
+      activeGuardMarkers.add(marker);
+      continue;
+    }
+    if (
+      observation
+      || boundary.pendingGuardTransitions.has(marker)
+      || boundary.guardRecords.has(marker)
+    ) {
+      advanceBoundaryGuardTransition(boundary, marker, {
+        record: observation?.record
+          || boundary.guardRecords.get(marker)
+          || null,
+        guardPresent: Boolean(observation),
+        exactIdentityMatch: false,
+        scanEpoch,
+        observedAt
+      });
+      continue;
+    }
+  }
+  return activeGuardMarkers;
+}
+
+export function scanSetupBoundary(boundary) {
+  const scanEpoch = boundary.scanEpoch + 1;
+  boundary.scanEpoch = scanEpoch;
+  const observedAt = boundary.now();
+  const guardObservations = new Map();
   for (const directory of boundary.guardDirectories) {
     let names;
     try {
@@ -193,8 +360,9 @@ export function scanSetupBoundary(boundary) {
       // state; successful setup still has to produce another validated guard
       // observation before cleanup can pass.
       if (!record) continue;
+      let validated;
       try {
-        validateSetupGuard(boundary, marker, record);
+        validated = validateSetupGuard(boundary, marker, record);
       } catch (error) {
         if (boundedSetupScanDiagnosticCode(
           error?.diagnostic?.setupScanCode
@@ -203,27 +371,31 @@ export function scanSetupBoundary(boundary) {
         }
         failSetupScan("guard-validation");
       }
-      const previous = boundary.guardRecords.get(marker);
-      if (previous && !sameJson(previous, record)) {
+      const previous = guardObservations.get(marker);
+      if (previous && !sameJson(previous.record, record)) {
         failSetupScan("guard-record-drift");
       }
-      const priorIdentity = boundary.identities.get(marker);
       if (
-        priorIdentity
-        && !sameJson(priorIdentity, record.providerProcess)
+        previous
+        && !sameJson(previous.identity, validated.identity)
       ) {
         failSetupScan("guard-identity-drift");
       }
-      boundary.guardRecords.set(marker, structuredClone(record));
-      boundary.identities.set(
-        marker,
-        structuredClone(record.providerProcess)
-      );
-      boundary.observedGuard = true;
-      boundary.observedProvider = true;
-      activeGuardMarkers.add(marker);
+      guardObservations.set(marker, {
+        record: structuredClone(record),
+        identity: structuredClone(validated.identity),
+        verifiedMatch: Boolean(
+          previous?.verifiedMatch || validated.verifiedMatch
+        )
+      });
     }
   }
+  const activeGuardMarkers = reconcileSetupGuardObservations(
+    boundary,
+    guardObservations,
+    scanEpoch,
+    observedAt
+  );
 
   const listed = boundary.processControl.runSystemPs([
     "-axo",
@@ -246,30 +418,17 @@ export function scanSetupBoundary(boundary) {
     const command = match[2].trim();
     const marker = setupMarkerFromCommand(boundary, command);
     if (!marker) continue;
+    const pending = boundary.pendingGuardTransitions.get(marker) || null;
+    const staleRecord = boundary.staleGuardRecords.get(marker) || null;
+    if (boundary.closedGuardMarkers.has(marker)) {
+      failSetupScan("process-identity-drift");
+    }
     const startToken = boundary.processControl.processStartToken(pid);
     if (!startToken) {
-      const incompleteIdentity = {
-        pid,
-        startToken: null,
-        processGroupId: pid
-      };
-      let firstProcessGroupGone = false;
-      let secondProcessGroupGone = false;
-      try {
-        firstProcessGroupGone = boundary.processControl.processGroupGone(
-          incompleteIdentity
-        );
-        secondProcessGroupGone = boundary.processControl.processGroupGone(
-          incompleteIdentity
-        );
-      } catch {
-        failSetupScan("leader-token-gone-proof");
-      }
-      if (decideSetupScanObservationDisposition({
-        verifiedMatch: false,
-        firstProcessGroupGone,
-        secondProcessGroupGone
-      }) === "ignore-stale") {
+      if (
+        pending?.identity?.pid === pid
+        || staleRecord?.providerProcess?.pid === pid
+      ) {
         continue;
       }
       failSetupScan("leader-token-live-or-ambiguous");
@@ -290,26 +449,16 @@ export function scanSetupBoundary(boundary) {
     } catch {
       failSetupScan("identity-match-probe");
     }
+    const transitionIdentity = pending?.identity
+      || staleRecord?.providerProcess
+      || null;
+    if (transitionIdentity) {
+      if (!sameJson(transitionIdentity, identity) || verifiedMatch) {
+        failSetupScan("process-identity-drift");
+      }
+      continue;
+    }
     if (!verifiedMatch) {
-      let firstProcessGroupGone = false;
-      let secondProcessGroupGone = false;
-      try {
-        firstProcessGroupGone = boundary.processControl.processGroupGone(
-          identity
-        );
-        secondProcessGroupGone = boundary.processControl.processGroupGone(
-          identity
-        );
-      } catch {
-        failSetupScan("identity-mismatch-gone-proof");
-      }
-      if (decideSetupScanObservationDisposition({
-        verifiedMatch,
-        firstProcessGroupGone,
-        secondProcessGroupGone
-      }) === "ignore-stale") {
-        continue;
-      }
       failSetupScan("identity-mismatch-live-or-ambiguous");
     }
     const previous = boundary.identities.get(marker);
@@ -373,12 +522,23 @@ export async function cleanupSetupBoundary(boundary, {
   requireObservation = false
 } = {}) {
   if (!boundary) return true;
-  let clean = true;
-  if (terminate && !await stopSetupCommand(boundary)) clean = false;
-  for (let pass = 0; pass < 4; pass += 1) {
+  let clean = boundary.scanFailed !== true;
+  if (
+    terminate
+    && boundary.scanFailed !== true
+    && !await stopSetupCommand(boundary)
+  ) {
+    clean = false;
+  }
+  const maximumPasses = Math.ceil(
+    SETUP_GUARD_TRANSITION_TIMEOUT_MS / STATE_POLL_MS
+  ) + 4;
+  for (let pass = 0; pass < maximumPasses; pass += 1) {
+    if (boundary.scanFailed === true) break;
     try {
       scanSetupBoundary(boundary);
     } catch {
+      boundary.scanFailed = true;
       clean = false;
       break;
     }
@@ -386,6 +546,10 @@ export async function cleanupSetupBoundary(boundary, {
       try {
         if (
           terminate
+          && boundary.scanFailed !== true
+          && !boundary.pendingGuardTransitions.has(marker)
+          && !boundary.staleGuardRecords.has(marker)
+          && !boundary.closedGuardMarkers.has(marker)
           && !boundary.processControl.processGroupGone(identity)
         ) {
           await boundary.processControl.terminateOwnedProcess(
@@ -398,13 +562,35 @@ export async function cleanupSetupBoundary(boundary, {
         clean = false;
       }
     }
+    if (
+      pass >= 3
+      && boundary.pendingGuardTransitions.size === 0
+    ) {
+      break;
+    }
     await new Promise((resolve) => setTimeout(resolve, STATE_POLL_MS));
   }
-  for (const [marker, record] of boundary.guardRecords) {
-    const identity = boundary.identities.get(marker);
+  const cleanupRecords = new Map(boundary.guardRecords);
+  for (const [marker, record] of boundary.staleGuardRecords) {
+    const previous = cleanupRecords.get(marker);
+    if (previous && !sameJson(previous, record)) {
+      clean = false;
+      continue;
+    }
+    cleanupRecords.set(marker, record);
+  }
+  for (const [marker, record] of cleanupRecords) {
+    const identity = boundary.identities.get(marker)
+      || boundary.staleGuardRecords.get(marker)?.providerProcess
+      || null;
     try {
+      if (boundary.scanFailed === true) {
+        clean = false;
+        continue;
+      }
       if (
-        !identity
+        boundary.pendingGuardTransitions.has(marker)
+        || !identity
         || !boundary.processControl.processGroupGone(identity)
       ) {
         clean = false;
@@ -431,20 +617,29 @@ export async function cleanupSetupBoundary(boundary, {
           !== null
       ) {
         clean = false;
+      } else if (boundary.staleGuardRecords.has(marker)) {
+        boundary.staleGuardRecords.delete(marker);
+        boundary.closedGuardMarkers.add(marker);
       }
     } catch {
       clean = false;
     }
   }
   let finalScan = null;
-  try {
-    finalScan = scanSetupBoundary(boundary);
-  } catch {
-    clean = false;
+  if (boundary.scanFailed !== true) {
+    try {
+      finalScan = scanSetupBoundary(boundary);
+    } catch {
+      boundary.scanFailed = true;
+      clean = false;
+    }
   }
   if (
     finalScan?.activeGuardMarkers.size
     || finalScan?.liveMarkers.size
+    || boundary.scanFailed === true
+    || boundary.pendingGuardTransitions.size
+    || boundary.staleGuardRecords.size
     || [...boundary.identities.values()].some(
       (identity) => !boundary.processControl.processGroupGone(identity)
     )
@@ -499,6 +694,8 @@ export async function runSetupJson(command, args, {
     let stdout = "";
     let stderr = "";
     let abortCode = null;
+    let abortIssued = false;
+    let diagnosticReported = false;
     let settled = false;
     const child = spawn(command, args, {
       cwd,
@@ -510,8 +707,15 @@ export async function runSetupJson(command, args, {
     boundary.child = child;
     boundary.commandPath = path.resolve(command);
     let commandCapture = Promise.resolve({ status: "invalid-pid" });
+    const reportDiagnosticOnce = (phase, error = null) => {
+      if (diagnosticReported) return;
+      diagnosticReported = true;
+      reportSetupBoundaryDiagnostic(phase, error);
+    };
     const abort = (code) => {
+      if (boundary.scanFailed === true || abortIssued) return false;
       abortCode ||= code;
+      abortIssued = true;
       const identity = boundary.commandIdentity;
       try {
         if (
@@ -527,6 +731,7 @@ export async function runSetupJson(command, args, {
           child.kill("SIGTERM");
         }
       } catch {}
+      return true;
     };
     if (Number.isSafeInteger(child.pid) && child.pid > 0) {
       boundary.commandPids.add(child.pid);
@@ -550,8 +755,9 @@ export async function runSetupJson(command, args, {
         intervalMs: SETUP_COMMAND_IDENTITY_INTERVAL_MS
       }).catch(() => ({ status: "incomplete-live" }));
       commandCapture.then((outcome) => {
+        if (boundary.scanFailed === true) return;
         if (outcome.status === "incomplete-live") {
-          reportSetupBoundaryDiagnostic("command-identity-incomplete");
+          reportDiagnosticOnce("command-identity-incomplete");
           abort("E_CLEANUP");
         }
         else if (outcome.status === "invalid-pid") abort("E_SETUP");
@@ -560,6 +766,7 @@ export async function runSetupJson(command, args, {
       abortCode = "E_SETUP";
     }
     const collect = (kind, chunk) => {
+      if (boundary.scanFailed === true) return;
       if (kind === "stdout") stdout += String(chunk);
       else stderr += String(chunk);
       if (
@@ -571,35 +778,46 @@ export async function runSetupJson(command, args, {
     };
     child.stdout.on("data", (chunk) => collect("stdout", chunk));
     child.stderr.on("data", (chunk) => collect("stderr", chunk));
-    child.on("error", () => abort("E_SETUP"));
+    child.on("error", () => {
+      if (boundary.scanFailed !== true) abort("E_SETUP");
+    });
     const poll = setInterval(() => {
+      if (boundary.scanFailed === true) {
+        clearInterval(poll);
+        return;
+      }
       if (runner.interrupted) abort("E_INTERRUPTED");
       try {
         scanSetupBoundary(boundary);
       } catch (error) {
-        boundary.scanFailed = true;
-        reportSetupBoundaryDiagnostic("active-scan", error);
+        clearInterval(poll);
         abort("E_CLEANUP");
+        boundary.scanFailed = true;
+        reportDiagnosticOnce("active-scan", error);
       }
     }, 25);
-    const timeout = setTimeout(() => abort("E_SETUP"), timeoutMs);
+    const timeout = setTimeout(() => {
+      if (boundary.scanFailed !== true) abort("E_SETUP");
+    }, timeoutMs);
     const hardTimeout = setTimeout(() => {
       if (settled) return;
-      try {
-        if (
-          boundary.commandIdentity
-          && boundary.processControl.processStartToken(
-            boundary.commandIdentity.pid
-          ) === boundary.commandIdentity.startToken
-        ) {
-          process.kill(
-            -boundary.commandIdentity.processGroupId,
-            "SIGKILL"
-          );
-        } else {
-          child.kill("SIGKILL");
-        }
-      } catch {}
+      if (boundary.scanFailed !== true) {
+        try {
+          if (
+            boundary.commandIdentity
+            && boundary.processControl.processStartToken(
+              boundary.commandIdentity.pid
+            ) === boundary.commandIdentity.startToken
+          ) {
+            process.kill(
+              -boundary.commandIdentity.processGroupId,
+              "SIGKILL"
+            );
+          } else {
+            child.kill("SIGKILL");
+          }
+        } catch {}
+      }
       settled = true;
       clearInterval(poll);
       clearTimeout(timeout);
@@ -619,12 +837,16 @@ export async function runSetupJson(command, args, {
         } else if (commandCaptureOutcome.status === "invalid-pid") {
           abortCode ||= "E_SETUP";
         }
-        try {
-          scanSetupBoundary(boundary);
-        } catch (error) {
-          boundary.scanFailed = true;
-          reportSetupBoundaryDiagnostic("final-scan", error);
+        if (boundary.scanFailed === true) {
           abortCode ||= "E_CLEANUP";
+        } else {
+          try {
+            scanSetupBoundary(boundary);
+          } catch (error) {
+            boundary.scanFailed = true;
+            reportDiagnosticOnce("final-scan", error);
+            abortCode ||= "E_CLEANUP";
+          }
         }
         if (
           abortCode

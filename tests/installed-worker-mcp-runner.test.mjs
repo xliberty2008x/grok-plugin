@@ -560,7 +560,7 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   );
   assert.match(source, /const setupJson = await runSetupJson\(/);
   assert.match(source, /captureSetupCommandIdentityWithPolling\(\{/);
-  assert.match(source, /decideSetupScanObservationDisposition\(\{/);
+  assert.match(source, /advanceSetupGuardTransition\(\{/);
   assert.match(
     source,
     /setupScanCode = boundedSetupScanDiagnosticCode\(\s*error\?\.diagnostic\?\.setupScanCode\s*\)/
