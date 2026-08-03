@@ -157,12 +157,19 @@ while importing nine named semantic suites in their original registration
 order. The former `_part1` through `_part9` files are gone; the structure suite
 remains a separate ordinary deterministic test.
 
-The ratchet engine now scans 316 files with zero errors, zero dependency
+The ratchet engine now scans 317 files with zero errors, zero dependency
 cycles, zero ordinal fragments, and 35 explicitly capped legacy warnings. No
 handwritten JavaScript file exceeds 5,000 lines; the largest remaining file is
 `tests/worker-protocol.test.mjs` at 4,635 lines. Immutable initial debt, cycle,
 and ordinal history remains digest-pinned even though the targeted giga-file,
 cycle, and ordinal caps have been retired.
+
+A final review found that the temporary cleanup prefix registry had been packed
+to preserve its legacy cap. The registry now lives in the one-way
+`test-temp-legacy-prefixes.mjs` leaf, the cleanup facade re-exports the exact
+frozen binding, and its active cap dropped from 2,630 to 2,295 lines. The 4 KiB
+resource ceiling remains a bound on extreme single-line input, not a formatting
+waiver for moderate line packing.
 
 Checked-in mode intentionally remains `observe`. Promotion to `ratchet` still
 requires the two consecutive `main` CI runs below across the supported Node and

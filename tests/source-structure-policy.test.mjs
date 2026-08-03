@@ -30,6 +30,12 @@ import {
   INSTALLED_WORKER_MCP_RUNNER,
   INSTALLED_WORKER_MCP_RUNNER_MODULES
 } from "./lib/installed-worker-mcp-runner-source.mjs";
+import {
+  LEGACY_TEST_TEMP_PREFIXES as CLEANUP_LEGACY_TEST_TEMP_PREFIXES
+} from "../scripts/lib/test-temp-cleanup.mjs";
+import {
+  LEGACY_TEST_TEMP_PREFIXES as LEAF_LEGACY_TEST_TEMP_PREFIXES
+} from "../scripts/lib/test-temp-legacy-prefixes.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REVISION = "7301afbbbf29afc3690c9d1d4458b8c394bed2bc";
@@ -902,4 +908,23 @@ test("checked-in observe baseline exactly covers all current file and function d
     "stale-function-exception"
   ]);
   assert.equal(result.warnings.some((entry) => driftCodes.has(entry.code)), false);
+});
+
+test("test temp cleanup re-exports its one-way legacy prefix leaf", () => {
+  assert.strictEqual(
+    CLEANUP_LEGACY_TEST_TEMP_PREFIXES,
+    LEAF_LEGACY_TEST_TEMP_PREFIXES
+  );
+  assert.deepEqual(
+    [...LEAF_LEGACY_TEST_TEMP_PREFIXES],
+    [...LEAF_LEGACY_TEST_TEMP_PREFIXES].sort()
+  );
+  const leaf = fs.readFileSync(
+    path.join(ROOT, "scripts/lib/test-temp-legacy-prefixes.mjs"),
+    "utf8"
+  );
+  assert.doesNotMatch(leaf, /test-temp-cleanup/u);
+  const prefixLines = leaf.split("\n").filter((line) => line.trimStart().startsWith('"'));
+  assert.equal(prefixLines.length, LEAF_LEGACY_TEST_TEMP_PREFIXES.length);
+  assert.equal(prefixLines.every((line) => /^  "[^"]+",$/u.test(line)), true);
 });

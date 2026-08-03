@@ -36,8 +36,10 @@ directories do not create an exemption. Relative static imports into `.git`
 or `node_modules` fail the ratchet.
 
 Each source is capped at 2 MiB before parsing, and a handwritten physical line
-may not exceed 4 KiB. This prevents minification or line packing from bypassing
-the file/function budgets and keeps adversarial source from exhausting Acorn.
+may not exceed 4 KiB. This rejects single-line source blobs and bounds parser
+input; it is not permission to compress ordinary declarations to preserve a
+legacy cap. Reviewers should require a named extraction when a cohesive data or
+behavior domain would otherwise make a capped file grow.
 
 The repository is initially in `observe` mode: existing debt is visible as
 warnings, while malformed policy, parser failure, unreadable source, or a
