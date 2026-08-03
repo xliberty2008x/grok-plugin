@@ -85,7 +85,7 @@ Parity means:
 3. **Independent Claude Code natural host-orchestration E2E** remains outstanding. The natural installed-Codex boundary passed for issue #25, but it cannot be promoted across the second host boundary.
 4. Cross-platform authenticated provider qualification beyond historical macOS evidence remains open.
 
-Remaining release work: independently qualify Claude Code, record the dual-host release-candidate evidence, keep Linux provider-unverified and Windows provider-unsupported until evidence exists, perform clean-profile marketplace installs, and only then decide whether to promote `0.3.0-dev.1` to a release candidate.
+Remaining release work: independently qualify Claude Code, record the dual-host release-candidate evidence, keep Linux provider-unverified and Windows provider-unsupported until evidence exists, perform clean-profile marketplace installs, and only then decide whether to promote `0.3.0-dev.2` to a release candidate.
 
 Promotion evidence is an aggregate dual-host record bound to a deterministic
 source inventory digest. The record itself is excluded from that digest to

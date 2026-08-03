@@ -8,7 +8,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { CompanionError } from "./errors.mjs";
-import { evaluateScope } from "./task-contract.mjs";
+import { evaluateScope } from "./task-scope.mjs";
 import {
   controlStateDir,
   controlStateSegment,

@@ -14,11 +14,27 @@ import {
   DETERMINISTIC_TEST_SHARDS,
   validateDeterministicTestShards
 } from "./lib/deterministic-test-shards.mjs";
-import { activeVersionForPlan, qualificationEvidencePath, qualificationSourceDigest, validateQualificationEvidence, validateReadmeReleaseStatus, validateReleasePlan } from "./lib/version-policy.mjs";
+import {
+  activeVersionForPlan,
+  parseSemver,
+  qualificationEvidencePath,
+  qualificationSourceDigest,
+  validateChangelogVersionHistory,
+  validateQualificationEvidence,
+  validateReadmeReleaseStatus,
+  validateReleasePlan,
+  validateReleaseScripts,
+  validateReleaseTag,
+  validateRepositoryNpmConfig
+} from "./lib/version-policy.mjs";
 import {
   EXTERNAL_BOUNDARY_TESTS,
   listDeterministicTestFiles
 } from "./test-deterministic.mjs";
+import {
+  evaluateSourceStructure,
+  loadSourceStructurePolicy
+} from "./lib/source-structure-policy.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = new Set(process.argv.slice(2));
@@ -158,8 +174,23 @@ function versionChecks() {
   const releasePlan = readJson("release-plan.json");
   if (!packageJson || !packageLock || !marketplace || !codexMarketplace || !pluginManifest || !codexPluginManifest || !releasePlan) return;
 
+  const exactDevelopmentDependencies = { acorn: "8.15.0" };
+  if (["dependencies", "optionalDependencies", "peerDependencies"].some(
+    (field) => Object.keys(packageJson[field] || {}).length > 0
+  )
+    || (packageJson.bundledDependencies || []).length > 0
+    || JSON.stringify(packageJson.devDependencies) !== JSON.stringify(exactDevelopmentDependencies)) {
+    problem("Acorn 8.15.0 must remain the sole exact-pinned implementation dependency.", "package.json");
+  }
+  if (JSON.stringify(packageLock.packages?.[""]?.devDependencies) !== JSON.stringify(exactDevelopmentDependencies)
+    || packageLock.packages?.["node_modules/acorn"]?.version !== "8.15.0"
+    || packageLock.packages?.["node_modules/acorn"]?.dev !== true
+    || Object.keys(packageLock.packages || {}).some((entry) => !["", "node_modules/acorn"].includes(entry))) {
+    problem("package-lock.json must resolve only the exact Acorn 8.15.0 development dependency.", "package-lock.json");
+  }
+
   const version = packageJson.version;
-  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(String(version))) {
+  if (!parseSemver(version)) {
     problem("package.json version is not a supported SemVer value.", "package.json");
     return;
   }
@@ -188,11 +219,18 @@ function versionChecks() {
   if (plannedVersion !== version) {
     problem(`Active release-plan version (${plannedVersion ?? "invalid"}) does not match package version ${version}.`, "release-plan.json");
   }
+  if (process.env.GITHUB_REF_TYPE === "tag") {
+    const tag = process.env.GITHUB_REF_NAME;
+    for (const message of validateReleaseTag(tag, releasePlan, version)) {
+      problem(message, "release-plan.json");
+    }
+  }
 
   const changelog = readText("plugins/grok/CHANGELOG.md");
-  const firstChangelogVersion = changelog?.match(/^##\s+([^\s]+)\s*$/m)?.[1] || null;
-  if (changelog != null && firstChangelogVersion !== version) {
-    problem(`First changelog version (${firstChangelogVersion ?? "missing"}) must match active package version ${version}.`, "plugins/grok/CHANGELOG.md");
+  if (changelog != null) {
+    for (const message of validateChangelogVersionHistory(version, changelog)) {
+      problem(message, "plugins/grok/CHANGELOG.md");
+    }
   }
   if (changelog != null && !new RegExp(`^## ${releasePlan.baseVersion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m").test(changelog)) {
     problem(`Changelog must retain stable base version ${releasePlan.baseVersion} as immutable history.`, "plugins/grok/CHANGELOG.md");
@@ -258,10 +296,18 @@ function versionChecks() {
     problem(`Plugin NOTICE does not identify release ${version}.`, "plugins/grok/NOTICE");
   }
 
-  const provider = readText("plugins/grok/scripts/lib/grok-provider.mjs");
-  const clientVersion = provider?.match(/clientInfo\s*:\s*\{[\s\S]{0,300}?version\s*:\s*["']([^"']+)["']/)?.[1];
-  if (clientVersion !== version) {
-    problem(`ACP clientInfo version (${clientVersion ?? "missing"}) does not match package version ${version}.`, "plugins/grok/scripts/lib/grok-provider.mjs");
+  const runtimeClients = [
+    ["plugins/grok/scripts/lib/provider-acp-runtime.mjs", "grok-companion"],
+    ["plugins/grok/scripts/lib/worker-owner-controller.mjs", "grok-companion-owner-controller"]
+  ];
+  for (const [relative, clientName] of runtimeClients) {
+    const source = readText(relative);
+    const clientVersion = source?.match(new RegExp(
+      `clientInfo\\s*:\\s*\\{[\\s\\S]{0,300}?name\\s*:\\s*["']${clientName}["'][\\s\\S]{0,180}?version\\s*:\\s*["']([^"']+)["']`
+    ))?.[1];
+    if (clientVersion !== version) {
+      problem(`${clientName} ACP clientInfo version (${clientVersion ?? "missing"}) does not match package version ${version}.`, relative);
+    }
   }
 }
 
@@ -286,17 +332,31 @@ if (!versionsOnly) {
     ".agents/plugins/marketplace.json",
     ".github/workflows/ci.yml",
     "scripts/validate.mjs",
+    "scripts/check-source-structure.mjs",
+    "scripts/source-structure-policy.json",
     "scripts/cleanup-test-temp.mjs",
     "scripts/lib/ci-workflow-contract.mjs",
+    "scripts/lib/source-structure-policy.mjs",
     "scripts/test-deterministic.mjs",
     "scripts/lib/deterministic-test-runner.mjs",
     "scripts/lib/deterministic-test-shards.mjs",
     "scripts/bump-version.mjs",
+    "scripts/check-release-history.mjs",
+    "scripts/check-release-tag.mjs",
     "scripts/update-local-codex.mjs",
     "scripts/test-natural-codex.mjs",
     "scripts/test-installed-worker-mcp.mjs",
     "scripts/lib/installed-worker-mcp-failure.mjs",
     "scripts/lib/installed-worker-mcp-mailbox-poll.mjs",
+    "scripts/lib/installed-worker-mcp-runner-cancellation-cleanup.mjs",
+    "scripts/lib/installed-worker-mcp-runner-core.mjs",
+    "scripts/lib/installed-worker-mcp-runner-observation.mjs",
+    "scripts/lib/installed-worker-mcp-runner-qualification.mjs",
+    "scripts/lib/installed-worker-mcp-runner-runtime.mjs",
+    "scripts/lib/installed-worker-mcp-runner-session-read.mjs",
+    "scripts/lib/installed-worker-mcp-runner-setup.mjs",
+    "scripts/lib/installed-worker-mcp-runner-write-scenarios.mjs",
+    "scripts/lib/installed-worker-mcp-runner-write-two.mjs",
     "scripts/lib/installed-worker-mcp-setup-boundary.mjs",
     "scripts/lib/installed-worker-mcp-session-boundary.mjs",
     "scripts/lib/test-temp.mjs",
@@ -312,24 +372,47 @@ if (!versionsOnly) {
     "tests/direct-temp-fallback-child.mjs",
     "tests/installed-codex.test.mjs",
     "tests/installed-worker-mcp-runner.test.mjs",
+    "tests/lib/installed-worker-mcp-runner-source.mjs",
     "tests/installed-worker-mcp-setup-boundary.test.mjs",
     "tests/installed-worker-mcp-session-boundary.test.mjs",
     "tests/natural-codex-output.schema.json",
-    "tests/control-plane_part1.mjs",
-    "tests/control-plane_part2.mjs",
-    "tests/control-plane_part3.mjs",
+    "tests/control-plane-context-manifest.test.mjs",
+    "tests/control-plane-git-refs.test.mjs",
+    "tests/control-plane-lifecycle.test.mjs",
+    "tests/control-plane-metadata-races.test.mjs",
+    "tests/control-plane-test-support.mjs",
+    "tests/control-plane-worker-contracts.test.mjs",
     "tests/deterministic-sharding.test.mjs",
+    "tests/runtime-admission.test.mjs",
+    "tests/runtime-cancellation.test.mjs",
+    "tests/runtime-recovery.test.mjs",
+    "tests/runtime-task-lifecycle.test.mjs",
+    "tests/runtime-test-support.mjs",
+    "tests/runtime-transfer.test.mjs",
+    "tests/source-structure-policy.test.mjs",
+    "tests/worker-broker-evidence-cutover-cli.test.mjs",
     "tests/worker-broker-evidence.test.mjs",
-    "tests/worker-broker-evidence_part1.mjs",
-    "tests/worker-broker-evidence_part2.mjs",
-    "tests/worker-broker-evidence_part3.mjs",
-    "tests/worker-broker-evidence_part4.mjs",
-    "tests/worker-broker-evidence_part5.mjs",
-    "tests/worker-broker-evidence_part6.mjs",
-    "tests/worker-broker-evidence_part7.mjs",
-    "tests/worker-broker-evidence_part8.mjs",
-    "tests/worker-mutation_part1.mjs",
-    "tests/worker-mutation_part2.mjs",
+    "tests/worker-broker-evidence-deterministic-runner.test.mjs",
+    "tests/worker-broker-evidence-immutable-ledger.test.mjs",
+    "tests/worker-broker-evidence-live-receipts.test.mjs",
+    "tests/worker-broker-evidence-private-harness.mjs",
+    "tests/worker-broker-evidence-proof-chain.test.mjs",
+    "tests/worker-broker-evidence-proof-toolchain.test.mjs",
+    "tests/worker-broker-evidence-protected-publication.test.mjs",
+    "tests/worker-broker-evidence-review-attestations.test.mjs",
+    "tests/worker-broker-evidence-source-records.test.mjs",
+    "tests/worker-broker-evidence-structure.test.mjs",
+    "tests/worker-broker-evidence-test-support.mjs",
+    "tests/worker-mutation-admission-dispatch.test.mjs",
+    "tests/worker-mutation-cancellation-recovery.test.mjs",
+    "tests/worker-mutation-provisioning-adoption.test.mjs",
+    "tests/worker-mutation-provisioning-intent.test.mjs",
+    "tests/worker-mutation-provisioning-test-support.mjs",
+    "tests/worker-mutation-service-mcp.test.mjs",
+    "tests/worker-mutation-spawn-context.test.mjs",
+    "tests/worker-mutation-terminal-evidence.test.mjs",
+    "tests/worker-mutation-terminal-test-support.mjs",
+    "tests/worker-mutation-test-support.mjs",
     "tests/worker-broker-protected-review.test.mjs",
     "tests/worker-protocol.test.mjs",
     "tests/nonblocking-stdin-child.mjs",
@@ -426,6 +509,15 @@ if (!versionsOnly) {
   for (const name of commandNames) required.push(`plugins/grok/skills/${name}/SKILL.md`);
   for (const file of required) requiredFile(file);
 
+  try {
+    const structurePolicy = loadSourceStructurePolicy({ root: ROOT });
+    const structure = evaluateSourceStructure({ root: ROOT, config: structurePolicy });
+    for (const entry of structure.errors) problem(entry.message, entry.file);
+    for (const entry of structure.warnings) warn(entry.message, entry.file);
+  } catch (error) {
+    problem(error.message, "scripts/source-structure-policy.json");
+  }
+
   const appManifest = readJson("apps/grok-review-app/github-app-manifest.template.json");
   if (appManifest) {
     const file = "apps/grok-review-app/github-app-manifest.template.json";
@@ -468,14 +560,17 @@ if (!versionsOnly) {
   }
 
   const packageJson = readJson("package.json");
+  const npmConfig = readText(".npmrc", { required: false });
+  for (const message of validateRepositoryNpmConfig(npmConfig)) problem(message, ".npmrc");
   if (packageJson) {
     if (packageJson.private !== true) problem("The implementation package must remain private.", "package.json");
     if (packageJson.type !== "module") problem("The package must use ESM (`type: module`).", "package.json");
     if (packageJson.license !== "Apache-2.0") problem("Package license must be Apache-2.0.", "package.json");
     if (packageJson.engines?.node !== ">=18.18") problem("Node engine must remain >=18.18.", "package.json");
-    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "test:protected-review", "test:installed-worker-mcp", "test:temp:cleanup", "codex:update-local", "validate", "version:check", "version:bump", "check"]) {
+    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "test:protected-review", "test:installed-worker-mcp", "test:temp:cleanup", "codex:update-local", "structure:check", "validate", "version:check", "version:bump", "release:history:check", "release:tag:check", "check"]) {
       if (!packageJson.scripts?.[script]) problem(`Missing npm script: ${script}.`, "package.json");
     }
+    for (const message of validateReleaseScripts(packageJson.scripts)) problem(message, "package.json");
     if (packageJson.scripts?.["test:pty-ingress"] !== "node --test tests/pty-ingress.test.mjs") {
       problem("test:pty-ingress must execute the dedicated nonblocking PTY regression directly.", "package.json");
     }
@@ -492,8 +587,14 @@ if (!versionsOnly) {
     if (packageJson.scripts?.["test:deterministic"] !== "node scripts/test-deterministic.mjs") {
       problem("test:deterministic must execute the zero-skip deterministic runner directly.", "package.json");
     }
+    if (packageJson.scripts?.test !== "node scripts/test-deterministic.mjs") {
+      problem("test must execute the zero-skip deterministic inventory without aggregate duplication.", "package.json");
+    }
     if (packageJson.scripts?.["test:temp:cleanup"] !== "node scripts/cleanup-test-temp.mjs") {
       problem("test:temp:cleanup must execute the guarded test-temp cleanup command directly.", "package.json");
+    }
+    if (packageJson.scripts?.["structure:check"] !== "node scripts/check-source-structure.mjs") {
+      problem("structure:check must execute the source-structure policy directly.", "package.json");
     }
     if (packageJson.scripts?.check !== "npm run validate && npm run test:deterministic") {
       problem("check must run validation and the zero-skip deterministic suite.", "package.json");
@@ -519,7 +620,13 @@ if (!versionsOnly) {
     || !/Evidence may no longer|Do not promote evidence across boundaries/i.test(contributing)
     || !/npm run test:installed-codex/.test(contributing)
     || !/npm run codex:update-local/.test(contributing)
-    || !/CODEX_PLUGIN_RUNNER_ENABLED/.test(contributing))) {
+    || !/CODEX_PLUGIN_RUNNER_ENABLED/.test(contributing)
+    || !/Git tag strategy/i.test(contributing)
+    || !/check-release-history\.mjs/.test(contributing)
+    || !/check-release-tag\.mjs/.test(contributing)
+    || !/annotated/i.test(contributing)
+    || !/never (?:move|delete|reuse)/i.test(contributing)
+    || !/grok-review-runtime-<full commit SHA>/.test(contributing))) {
     problem("CONTRIBUTING.md must define version governance, boundary-scoped evidence, and the installed-Codex gate.", "CONTRIBUTING.md");
   }
 
@@ -994,10 +1101,23 @@ if (!versionsOnly) {
       position
     ) => index >= 0 && (position === 0 || index > verificationMilestones[position - 1]));
     const requiredRuntimeBundlePaths = [
+      "package-lock.json",
+      "package.json",
       "plugins/grok/scripts/lib/redact.mjs",
       "scripts/lib/plugin-inventory.mjs",
       "scripts/lib/static-esm-import-parser.mjs",
-      "scripts/lib/worker-broker-evidence.mjs",
+      "scripts/lib/worker-broker-evidence-authority.mjs",
+      "scripts/lib/worker-broker-evidence-core.mjs",
+      "scripts/lib/worker-broker-evidence-files.mjs",
+      "scripts/lib/worker-broker-evidence-inventory.mjs",
+      "scripts/lib/worker-broker-evidence-ledger.mjs",
+      "scripts/lib/worker-broker-evidence-proof.mjs",
+      "scripts/lib/worker-broker-evidence-protected-trust.mjs",
+      "scripts/lib/worker-broker-evidence-record.mjs",
+      "scripts/lib/worker-broker-evidence-review.mjs",
+      "scripts/lib/worker-broker-evidence-toolchain.mjs",
+      "scripts/lib/worker-broker-evidence-verification.mjs",
+      "scripts/lib/worker-mutation-test-inventory.mjs",
       "scripts/trusted/worker-broker-review-operation.cjs",
       "scripts/trusted/worker-broker-review.mjs"
     ];
@@ -1059,7 +1179,7 @@ if (!versionsOnly) {
       || protectedReviewOperation == null
       || !protectedReviewOperation.includes("if (require.main === module)")
       || !protectedReviewOperation.includes("Object.freeze(module.exports)")
-      || !protectedReviewOperation.includes("worker-broker-evidence.mjs")
+      || !protectedReviewOperation.includes("worker-broker-evidence-authority.mjs")
       || !protectedReviewOperation.includes("GROK_PROTECTED_OPERATION_CHILD")
       || !protectedReviewOperation.includes("spawnSync(")
       || !verificationOrderIsBound) {
@@ -1384,7 +1504,8 @@ if (!versionsOnly) {
     })) {
       problem(message, ".github/workflows/ci.yml");
     }
-    if (!/CODEX_PLUGIN_RUNNER_ENABLED/.test(workflow) || !/npm run test:installed-codex/.test(workflow)) {
+    if (!/CODEX_PLUGIN_RUNNER_ENABLED/.test(workflow)
+      || !/run:\s*node --test tests\/installed-codex\.test\.mjs/.test(workflow)) {
       problem("CI must define the opt-in Codex-equipped installed-snapshot gate.", ".github/workflows/ci.yml");
     }
     if (!/github\.event_name == 'workflow_dispatch'/.test(workflow)

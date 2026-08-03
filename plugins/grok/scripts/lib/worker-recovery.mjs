@@ -3,7 +3,7 @@
  * an exact lost attempt, but it must never claim, launch, or replay work.
  */
 import { CompanionError } from "./errors.mjs";
-import { cleanupTaskRuntimeArtifacts } from "./grok-provider.mjs";
+import { cleanupTaskRuntimeArtifacts } from "./provider-controller-environments.mjs";
 import { sameHostSession } from "./host.mjs";
 import { processGroupGone, terminateOwnedProcess } from "./process-control.mjs";
 import {
@@ -22,18 +22,12 @@ import {
   updateJob,
   withWorkspaceStateTransaction
 } from "./state.mjs";
-import { appendLifecycleEvent } from "./task-contract.mjs";
-import {
-  assertDispatchContract,
-  acquireRecoveryCleanupFence,
-  cancellationNonce,
-  recordWorkerProviderSpawnNoChild,
-  settleFailedDispatchCleanup,
-  settleStartedWorkerLoss,
-  settleUnstartedDispatchLoss,
-  transitionWorkerDispatch,
-  verifyRecoveryCleanupFence
-} from "./worker-mutation.mjs";
+import { appendLifecycleEvent } from "./task-lifecycle.mjs";
+import { acquireRecoveryCleanupFence, recordWorkerProviderSpawnNoChild, verifyRecoveryCleanupFence } from "./worker-mutation-dispatch-admission.mjs";
+import { assertDispatchContract } from "./worker-mutation-dispatch-contract.mjs";
+import { transitionWorkerDispatch } from "./worker-mutation-dispatch-transition.mjs";
+import { cancellationNonce } from "./worker-mutation-primitives.mjs";
+import { settleFailedDispatchCleanup, settleStartedWorkerLoss, settleUnstartedDispatchLoss } from "./worker-mutation-terminal.mjs";
 import { workspaceState } from "./workspace.mjs";
 import {
   dispatchLeaseExpired,

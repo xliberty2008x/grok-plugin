@@ -6,13 +6,9 @@
 import { CompanionError, asErrorPayload } from "./errors.mjs";
 import { sameHostSession } from "./host.mjs";
 import { listJobs, now, terminal, updateJob } from "./state.mjs";
-import { appendLifecycleEvent, scrubStoredJob } from "./task-contract.mjs";
-import {
-  captureTerminalEvidence,
-  normalizeTerminalProcessSignalError,
-  selectTaskTerminalError,
-  terminalTaskProgress
-} from "./task-terminal-evidence.mjs";
+import { scrubStoredJob } from "./task-envelope.mjs";
+import { appendLifecycleEvent } from "./task-lifecycle.mjs";
+import { captureTerminalEvidence, normalizeTerminalProcessSignalError, selectTaskTerminalError, terminalTaskProgress } from "./task-terminal-evidence.mjs";
 import { isSupportedWorkerDispatch } from "./worker-launch-contract.mjs";
 
 export const RECONCILER_PRIVILEGE = "host-trusted-reconciler";

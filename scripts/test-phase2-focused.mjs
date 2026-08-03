@@ -8,6 +8,9 @@ import {
   runDeterministicTestFiles,
   runDeterministicTestFilesCli
 } from "./lib/deterministic-test-runner.mjs";
+import {
+  WORKER_MUTATION_SEMANTIC_TEST_FILES
+} from "./lib/worker-mutation-test-inventory.mjs";
 
 /** Fixed Phase 2 proof inventory; callers cannot add, remove, or reorder tests. */
 export const PHASE2_FOCUSED_TEST_FILES = Object.freeze([
@@ -18,8 +21,7 @@ export const PHASE2_FOCUSED_TEST_FILES = Object.freeze([
   "tests/worker-context-roles.test.mjs",
   "tests/worker-host-actions.test.mjs",
   "tests/worker-mailbox.test.mjs",
-  "tests/worker-mutation_part1.mjs",
-  "tests/worker-mutation_part2.mjs",
+  ...WORKER_MUTATION_SEMANTIC_TEST_FILES,
   "tests/worker-protocol.test.mjs",
   "tests/worker-service.test.mjs",
   "tests/worker-dispatch-supervisor.test.mjs",

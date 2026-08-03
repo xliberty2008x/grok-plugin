@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { readValidProviderCapabilityReceipt } from "../plugins/grok/scripts/lib/provider-capability.mjs";
 import { providerLaunchBindingDigest } from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
-import { assertDispatchContract } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
+import { assertDispatchContract } from "../plugins/grok/scripts/lib/worker-mutation-dispatch-contract.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CODEX_BIN = process.env.CODEX_BIN || "codex";

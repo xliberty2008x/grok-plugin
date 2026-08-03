@@ -22,14 +22,14 @@ import {
   terminal,
   withWorkspaceStateTransaction
 } from "./state.mjs";
-import { appendLifecycleEvent } from "./task-contract.mjs";
+import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import { workspaceState } from "./workspace.mjs";
 import { isDispatchV2 } from "./worker-launch-contract.mjs";
 import {
   assertMutationOwnership,
-  cancellationNonce,
-  spawnGrantedFollowupWorker
-} from "./worker-mutation.mjs";
+  cancellationNonce
+} from "./worker-mutation-primitives.mjs";
+import { spawnGrantedFollowupWorker } from "./worker-mutation-followup.mjs";
 import {
   MAILBOX_MESSAGE_SCHEMA_VERSION,
   MAX_MAILBOX_MESSAGE_LENGTH,

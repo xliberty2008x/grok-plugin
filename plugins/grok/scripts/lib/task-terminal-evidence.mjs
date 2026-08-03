@@ -2,11 +2,13 @@ import { CompanionError, asErrorPayload } from "./errors.mjs";
 import { redact, redactText } from "./redact.mjs";
 import {
   assertContextManifestIntegrity,
+  captureContextManifest
+} from "./task-context-manifest.mjs";
+import {
   buildRuntimeEvidence,
-  captureContextManifest,
-  evaluateScope,
   observeChangedPaths
-} from "./task-contract.mjs";
+} from "./task-runtime-evidence.mjs";
+import { evaluateScope } from "./task-scope.mjs";
 
 /**
  * Capture the authoritative task observation after runtime cleanup. Capture

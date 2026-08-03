@@ -1,32 +1,27 @@
 export const DETERMINISTIC_TEST_SHARD_COUNT = 4;
 export const DETERMINISTIC_AGGREGATE_TEST_FILES = Object.freeze([
-  "tests/control-plane.test.mjs",
-  "tests/worker-broker-evidence.test.mjs",
-  "tests/worker-mutation.test.mjs"
+  "tests/worker-broker-evidence.test.mjs"
 ]);
-export const DETERMINISTIC_SUPPORT_TEST_FILES = Object.freeze([
-  "tests/control-plane_part1.mjs",
-  "tests/control-plane_part2.mjs",
-  "tests/control-plane_part3.mjs",
-  "tests/worker-broker-evidence_part1.mjs",
-  "tests/worker-broker-evidence_part2.mjs",
-  "tests/worker-broker-evidence_part3.mjs",
-  "tests/worker-broker-evidence_part4.mjs",
-  "tests/worker-broker-evidence_part5.mjs",
-  "tests/worker-broker-evidence_part6.mjs",
-  "tests/worker-broker-evidence_part7.mjs",
-  "tests/worker-broker-evidence_part8.mjs",
-  "tests/worker-broker-evidence_part9.mjs",
-  "tests/worker-mutation_part1.mjs",
-  "tests/worker-mutation_part2.mjs"
+export const DETERMINISTIC_SUPPORT_TEST_FILES = Object.freeze([]);
+export const WORKER_BROKER_EVIDENCE_SEMANTIC_TEST_FILES = Object.freeze([
+  "tests/worker-broker-evidence-deterministic-runner.test.mjs",
+  "tests/worker-broker-evidence-source-records.test.mjs",
+  "tests/worker-broker-evidence-live-receipts.test.mjs",
+  "tests/worker-broker-evidence-immutable-ledger.test.mjs",
+  "tests/worker-broker-evidence-proof-toolchain.test.mjs",
+  "tests/worker-broker-evidence-review-attestations.test.mjs",
+  "tests/worker-broker-evidence-protected-publication.test.mjs",
+  "tests/worker-broker-evidence-proof-chain.test.mjs",
+  "tests/worker-broker-evidence-cutover-cli.test.mjs"
 ]);
 
 // Duration-balanced from the macOS and Linux lanes in Actions runs
 // 30516745831, 30567663739, 30604307011, and 30639026874. The first rebalance
 // retained shards 1 and 2 while moving the old shard 3's two largest whole-file
 // costs to shard 4 after both macOS lanes reached the 30-minute bound. The
-// measured worker-broker evidence partition 5 cleanup exceeded the fixed entry
-// budget in run 30639026874, so its second half runs in shard 4.
+// The evidence split assigns each indivisible semantic suite to the shard that
+// owned most of its former registrations. This retains 113/125 registrations
+// on their prior shard while deleting the ordinal partition machinery.
 // That run also measured mcp-worker-runtime as shard 1's slowest whole file
 // before macOS/Node 18 exceeded 30 minutes, so the file now runs in shard 4.
 // Keep this manifest explicit: validation must fail when the deterministic
@@ -34,21 +29,28 @@ export const DETERMINISTIC_SUPPORT_TEST_FILES = Object.freeze([
 export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
   Object.freeze([
     "tests/ci-post-grok-review.test.mjs",
-    "tests/control-plane_part1.mjs",
+    "tests/companion-boundaries.test.mjs",
+    "tests/control-plane-context-manifest.test.mjs",
     "tests/deterministic-sharding.test.mjs",
     "tests/git-review.test.mjs",
     "tests/grok-review-app-target-collector.test.mjs",
     "tests/plugin-inventory.test.mjs",
     "tests/process-control-owned-identity.test.mjs",
+    "tests/provider-boundaries.test.mjs",
     "tests/provider-capability.test.mjs",
+    "tests/runtime-admission.test.mjs",
+    "tests/source-structure-policy.test.mjs",
+    "tests/task-contract-boundaries.test.mjs",
     "tests/version-policy.test.mjs",
-    "tests/worker-broker-evidence_part2.mjs",
-    "tests/worker-broker-evidence_part3.mjs",
-    "tests/worker-broker-evidence_part6.mjs",
+    "tests/worker-broker-evidence-proof-chain.test.mjs",
+    "tests/worker-broker-evidence-protected-publication.test.mjs",
+    "tests/worker-broker-evidence-structure.test.mjs",
     "tests/worker-broker-phase3-evidence.test.mjs",
     "tests/worker-execution-binding.test.mjs",
     "tests/worker-host-actions.test.mjs",
     "tests/worker-launch-outbox.test.mjs",
+    "tests/worker-mutation-boundaries.test.mjs",
+    "tests/worker-mutation-provisioning-adoption.test.mjs",
     "tests/worker-owner-controller.test.mjs",
     "tests/worker-protocol.test.mjs",
     "tests/worker-recovery-fence.test.mjs",
@@ -60,7 +62,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
   ]),
   Object.freeze([
     "tests/acp-client.test.mjs",
-    "tests/control-plane_part2.mjs",
+    "tests/control-plane-git-refs.test.mjs",
     "tests/grok-review-app-runner.test.mjs",
     "tests/grok-review-app-worker.test.mjs",
     "tests/hooks.test.mjs",
@@ -71,14 +73,17 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/provider.test.mjs",
     "tests/pty-ingress.test.mjs",
     "tests/readonly-status.test.mjs",
+    "tests/runtime-task-lifecycle.test.mjs",
     "tests/state.test.mjs",
     "tests/stdin.test.mjs",
-    "tests/worker-broker-evidence_part1.mjs",
-    "tests/worker-broker-evidence_part5.mjs",
-    "tests/worker-broker-evidence_part7.mjs",
+    "tests/worker-broker-evidence-deterministic-runner.test.mjs",
+    "tests/worker-broker-evidence-immutable-ledger.test.mjs",
+    "tests/worker-broker-evidence-live-receipts.test.mjs",
+    "tests/worker-broker-evidence-source-records.test.mjs",
     "tests/worker-context-roles.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
-    "tests/worker-mutation_part1.mjs",
+    "tests/worker-mutation-provisioning-intent.test.mjs",
+    "tests/worker-mutation-spawn-context.test.mjs",
     "tests/worker-presentation.test.mjs",
     "tests/worker-reconcile-safety.test.mjs",
     "tests/worker-session-close-environment.test.mjs"
@@ -87,7 +92,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/args-redaction-profiles.test.mjs",
     "tests/ci-auth-sync.test.mjs",
     "tests/codex-support.test.mjs",
-    "tests/control-plane_part3.mjs",
+    "tests/control-plane-metadata-races.test.mjs",
     "tests/deep-research.test.mjs",
     "tests/executable-identity.test.mjs",
     "tests/grok-review-app-github.test.mjs",
@@ -99,21 +104,28 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/provider-startup-cancel.test.mjs",
     "tests/recursion-guard.test.mjs",
     "tests/redact.test.mjs",
+    "tests/runtime-cancellation.test.mjs",
     "tests/test-temp-cleanup.test.mjs",
     "tests/windows-neutral.test.mjs",
-    "tests/worker-broker-evidence_part4.mjs",
-    "tests/worker-broker-evidence_part8.mjs",
+    "tests/worker-broker-evidence-cutover-cli.test.mjs",
     "tests/worker-cli-authority.test.mjs",
     "tests/worker-mailbox.test.mjs",
+    "tests/worker-mutation-cancellation-recovery.test.mjs",
     "tests/worker-owner-lifecycle.test.mjs",
     "tests/worker-provider-rotation-intent.test.mjs",
     "tests/worker-startup-crash-window.test.mjs"
   ]),
   Object.freeze([
+    "tests/control-plane-lifecycle.test.mjs",
+    "tests/control-plane-worker-contracts.test.mjs",
     "tests/mcp-worker-runtime.test.mjs",
-    "tests/runtime.test.mjs",
-    "tests/worker-broker-evidence_part9.mjs",
-    "tests/worker-mutation_part2.mjs"
+    "tests/runtime-recovery.test.mjs",
+    "tests/runtime-transfer.test.mjs",
+    "tests/worker-broker-evidence-proof-toolchain.test.mjs",
+    "tests/worker-broker-evidence-review-attestations.test.mjs",
+    "tests/worker-mutation-admission-dispatch.test.mjs",
+    "tests/worker-mutation-service-mcp.test.mjs",
+    "tests/worker-mutation-terminal-evidence.test.mjs"
   ])
 ]);
 

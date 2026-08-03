@@ -17,17 +17,14 @@ import {
 import {
   decideInstalledWorkerMcpMailboxPoll
 } from "../scripts/lib/installed-worker-mcp-mailbox-poll.mjs";
+import { readInstalledWorkerMcpRunnerSource as installedRunnerSource } from "./lib/installed-worker-mcp-runner-source.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RUNNER = path.join(ROOT, "scripts", "test-installed-worker-mcp.mjs");
 const HELP = "Usage: GROK_E2E=1 GROK_INSTALLED_WORKER_MCP_E2E=1 GROK_E2E_CANCEL=1 npm run test:installed-worker-mcp\n";
 const GATE_DIAGNOSTIC = "Installed Worker MCP E2E failed [E_GATE]: All installed Worker MCP live gates must equal 1.\n";
 const ARGUMENT_DIAGNOSTIC = "Installed Worker MCP E2E failed [E_ARGUMENT]: Unsupported runner argument.\n";
-const GATES = [
-  "GROK_E2E",
-  "GROK_INSTALLED_WORKER_MCP_E2E",
-  "GROK_E2E_CANCEL"
-];
+const GATES = ["GROK_E2E", "GROK_INSTALLED_WORKER_MCP_E2E", "GROK_E2E_CANCEL"];
 
 function tempRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "grok-installed-worker-runner-test-"));
@@ -142,7 +139,7 @@ test("installed Worker MCP runner requires all three exact gates without npm byp
 });
 
 test("installed Worker MCP runner owns fixed metadata, installed imports, and private publication", () => {
-  const source = fs.readFileSync(RUNNER, "utf8");
+  const source = installedRunnerSource();
   const recordKeySource = source.match(
     /const SPAWN_IDEMPOTENCY_RECORD_KEYS = new Set\(\[([\s\S]*?)\]\);/
   )?.[1] || "";
@@ -209,7 +206,7 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   assert.match(source, /turn_id: turnId/);
   assert.match(source, /crypto\.randomUUID\(\)/);
   assert.match(source, /sandboxCwd: pathToFileURL\(fixtureRoot\)\.href/);
-  assert.match(source, /import \{ spawnMcpStdioClient \} from "\.\/lib\/mcp-stdio-client\.mjs";/);
+  assert.match(source, /import \{ spawnMcpStdioClient \} from "\.\/mcp-stdio-client\.mjs";/);
   assert.match(source, /async function importInstalled\(installedRoot, relative/);
   for (const relative of [
     "scripts/lib/provider-capability.mjs",
@@ -563,7 +560,7 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
   );
   assert.match(source, /const setupJson = await runSetupJson\(/);
   assert.match(source, /captureSetupCommandIdentityWithPolling\(\{/);
-  assert.match(source, /decideSetupScanObservationDisposition\(\{/);
+  assert.match(source, /advanceSetupGuardTransition\(\{/);
   assert.match(
     source,
     /setupScanCode = boundedSetupScanDiagnosticCode\(\s*error\?\.diagnostic\?\.setupScanCode\s*\)/
@@ -742,7 +739,7 @@ test("installed Worker MCP runner owns fixed metadata, installed imports, and pr
 });
 
 test("installed Worker MCP live gate poisons ambient Grok discovery and proves one pin", () => {
-  const source = fs.readFileSync(RUNNER, "utf8");
+  const source = installedRunnerSource();
   assert.ok(
     source.includes('"scripts/lib/provider-executable-pin.mjs"'),
     "runner must import the installed pin resolver"
@@ -959,7 +956,7 @@ test("installed Worker MCP runner preserves original stages and lets cleanup fai
     TypeError
   );
 
-  const source = fs.readFileSync(RUNNER, "utf8");
+  const source = installedRunnerSource();
   assert.match(source, /const QUALIFICATION_STAGES = new Set\(\[/);
   assert.match(source, /this\.stage = QUALIFICATION_STAGES\.has\(stage\) \? stage : "startup";/);
   assert.doesNotMatch(source, /error\.(?:message|stack|details).*stage=/);
@@ -1031,12 +1028,12 @@ test("installed Worker MCP mailbox polling tolerates valid pre-provider state", 
     TypeError
   );
 
-  const source = fs.readFileSync(RUNNER, "utf8");
+  const source = installedRunnerSource();
   const start = source.indexOf(
     "async function waitForInstalledMailboxOpen(context, tracker) {"
   );
   const end = source.indexOf(
-    "\nfunction snapshotInstalledMailboxProof(",
+    "\nexport function snapshotInstalledMailboxProof(",
     start
   );
   assert.ok(start >= 0 && end > start);
@@ -1078,11 +1075,11 @@ test("installed Worker MCP mailbox polling tolerates valid pre-provider state", 
 });
 
 test("installed Worker MCP terminal results converge after private cleanup", () => {
-  const source = fs.readFileSync(RUNNER, "utf8");
+  const source = installedRunnerSource();
   const observerStart = source.indexOf(
     "function observeTerminalResultWorker(tracker, worker, terminalStreamCursor) {"
   );
-  const observerEnd = source.indexOf("\nconst SNAPSHOT_KEYS", observerStart);
+  const observerEnd = source.indexOf("\nexport const SNAPSHOT_KEYS", observerStart);
   assert.ok(observerStart >= 0 && observerEnd > observerStart);
   const observer = source.slice(observerStart, observerEnd);
   assert.doesNotMatch(
@@ -1169,7 +1166,7 @@ test("installed Worker MCP terminal results converge after private cleanup", () 
 });
 
 test("installed Worker MCP cleanup waits for exact process closure and proves durable cancellation markers", () => {
-  const source = fs.readFileSync(RUNNER, "utf8");
+  const source = installedRunnerSource();
   assert.match(
     source,
     /const TERMINAL_PROCESS_CLOSURE_TIMEOUT_MS = 30_000;/
@@ -1213,10 +1210,13 @@ test("installed Worker MCP cleanup waits for exact process closure and proves du
 });
 
 test("write-smoke emergency cleanup is exact, session-bound, and cannot hide a managed worktree", () => {
-  const source = fs.readFileSync(RUNNER, "utf8");
+  const source = installedRunnerSource();
   const evaluatePureRunnerFunction = (name, nextName) => {
     const start = source.indexOf(`function ${name}(`);
-    const end = source.indexOf(`function ${nextName}(`, start + 1);
+    const exportedNext = source.indexOf(`\nexport function ${nextName}(`, start + 1);
+    const end = exportedNext >= 0
+      ? exportedNext
+      : source.indexOf(`\nfunction ${nextName}(`, start + 1);
     assert.ok(start >= 0 && end > start, `missing pure helper ${name}`);
     return Function(`"use strict"; return (${source.slice(start, end).trim()});`)();
   };
@@ -1237,7 +1237,7 @@ test("write-smoke emergency cleanup is exact, session-bound, and cannot hide a m
     "durableSessionDeletionAcknowledged"
   );
   const helper = source.slice(
-    source.indexOf("async function cleanupExactWorkerBoundary("),
+    source.indexOf("async function scanExactWorkerBoundaryClosure("),
     source.indexOf("function proveEmergencyWriteWorktreeAbsent(")
   );
   const worktreeProof = source.slice(

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.0-dev.2
+
+Status: development snapshot; not release-qualified.
+
+- Decomposed the oversized task-contract, provider, companion, worker-mutation,
+  installed-runner, evidence, and deterministic-test aggregates behind stable
+  compatibility facades. Public exports, canonical digests, durable worker
+  authority, lifecycle error semantics, and deterministic test registration
+  remain unchanged.
+- Added an executable source-structure policy for file and function budgets,
+  static dependency cycles, facade direction, ordinal test fragments, source
+  resource limits, and immutable shrink-only legacy caps. The initial rollout
+  remains in documented observe mode pending the required `main` CI promotion
+  evidence.
+- Added exact `v<package version>` release-tag validation, annotated-tag and
+  exact-`main` proof, byte-preserving version-history checks, and hosted tag CI.
+  RC/stable tags fail closed pending protected external qualification
+  attestation. Review-runtime commit pins stay in their separate namespace, and
+  the repaired version helper synchronizes both extracted ACP clients plus all
+  active package, marketplace, manifest, notice, README, plan, and changelog
+  surfaces.
+
 ## 0.3.0-dev.1
 
 Status: hardening candidate; not release-qualified.

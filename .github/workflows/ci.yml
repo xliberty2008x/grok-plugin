@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -40,7 +41,7 @@ jobs:
       # split writes, the reader-ready handshake, EOT framing, and no echo. It
       # does not claim that Codex marketplace installation itself was tested.
       - name: Run source PTY ingress regression
-        run: npm run test:pty-ingress
+        run: node --test tests/pty-ingress.test.mjs
 
   validate-and-test:
     name: ${{ matrix.os }} / Node ${{ matrix.node }} / shard ${{ matrix.shard }}/4
@@ -59,6 +60,9 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -71,14 +75,18 @@ jobs:
 
       - name: Validate release structure
         if: matrix.shard == 1
-        run: npm run validate
+        run: node scripts/validate.mjs
+
+      - name: Validate immutable release history
+        if: matrix.shard == 1
+        run: node scripts/check-release-history.mjs
 
       - name: Run deterministic zero-skip shard
         # Includes three concurrently accepted structured read jobs, distinct
         # isolated profile paths, terminal cleanup, and bounded exit diagnostics.
         # Installed-host and authenticated-provider tests remain separate
         # qualification boundaries and are not silently counted as skips.
-        run: npm run test:deterministic -- --shard=${{ matrix.shard }}/4
+        run: node scripts/test-deterministic.mjs --shard=${{ matrix.shard }}/4
 
   windows-neutral:
     name: windows-latest / Node ${{ matrix.node }}
@@ -103,13 +111,41 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Validate release structure
-        run: npm run validate
+        run: node scripts/validate.mjs
 
       # The fake Grok executable is a POSIX process fixture. Until a genuine
       # shell:false Windows fixture is added, Windows provider behavior remains
       # explicitly unverified rather than being simulated inaccurately.
       - name: Run provider-neutral tests (Windows; provider unverified)
         run: node --test tests/windows-neutral.test.mjs
+
+  # Version tags are accepted only when the checked-out ref is an annotated
+  # object on the exact fetched main commit. RC and stable tags also remain
+  # fail-closed until protected external qualification attestation exists.
+  release-tag:
+    name: Release tag required
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out complete tag and main history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Verify annotated version tag on exact main
+        run: node scripts/check-release-tag.mjs "$GITHUB_REF_NAME" --require-ref --main-ref origin/main
 
   # Hosted GitHub runners do not provide the Codex plugin CLI. Repositories
   # that configure a Codex-equipped runner with these labels and set the
@@ -141,7 +177,7 @@ jobs:
       - name: Require clean Codex marketplace install and cached PTY execution
         env:
           CODEX_INSTALL_E2E_REQUIRED: "1"
-        run: npm run test:installed-codex
+        run: node --test tests/installed-codex.test.mjs
 
   # This is the boundary the production incidents showed was missing: the real
   # installed Codex skill drives the real Grok CLI, persists a job, records a
@@ -173,12 +209,12 @@ jobs:
         run: codex plugin marketplace add "$GITHUB_WORKSPACE" --json
 
       - name: Verify and install the tested plugin snapshot
-        run: npm run codex:update-local
+        run: node scripts/update-local-codex.mjs
 
       - name: Run natural installed Codex to real Grok qualification
         env:
           CODEX_E2E_MODEL: ${{ vars.CODEX_E2E_MODEL }}
-        run: npm run test:natural-codex
+        run: node scripts/test-natural-codex.mjs
 
   # Stable public branch-protection check. Always runs so a failed hosted job
   # still produces this named result. Self-hosted jobs are intentionally out of

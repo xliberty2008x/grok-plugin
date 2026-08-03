@@ -6,6 +6,8 @@
 
 export const SETUP_COMMAND_IDENTITY_TIMEOUT_MS = 750;
 export const SETUP_COMMAND_IDENTITY_INTERVAL_MS = 25;
+export const SETUP_GUARD_TRANSITION_TIMEOUT_MS = 5_000;
+export const SETUP_GUARD_GONE_INTERVAL_MS = 25;
 export const SETUP_SCAN_DIAGNOSTIC_CODES = Object.freeze([
   "guard-directory-read",
   "guard-load",
@@ -108,6 +110,158 @@ export function decideSetupScanObservationDisposition({
     return "ignore-stale";
   }
   return "fail-closed";
+}
+
+function frozenGuardTransitionResult(status, transition = null, reason = null) {
+  return Object.freeze({
+    status,
+    transition: transition ? Object.freeze({ ...transition }) : null,
+    reason
+  });
+}
+
+/**
+ * Advance one exact setup-guard teardown transition.
+ *
+ * The transition is observation only. It never grants ownership or signal
+ * authority. A mismatched identity becomes stale only after two group-gone
+ * observations from distinct scan epochs at least 25ms apart. Any live group
+ * observation resets that proof. Drift, reappearance, or failure to close
+ * strictly before the fixed five-second deadline fails closed. An observation
+ * whose process-group proof completes at the deadline is already too late,
+ * even if the scan itself began earlier. Scan epochs must increase strictly,
+ * and a later scan cannot begin before the prior proof completed.
+ */
+export function advanceSetupGuardTransition({
+  transition = null,
+  scanEpoch,
+  observedAt,
+  proofCompletedAt = observedAt,
+  guardPresent,
+  exactIdentityMatch = false,
+  processGroupGone = false,
+  sameRecord = true,
+  sameIdentity = true,
+  correlatedMarkerIdentity = true
+} = {}) {
+  if (
+    !Number.isSafeInteger(scanEpoch)
+    || scanEpoch <= 0
+    || !Number.isFinite(observedAt)
+    || observedAt < 0
+    || !Number.isFinite(proofCompletedAt)
+    || proofCompletedAt < observedAt
+    || typeof guardPresent !== "boolean"
+    || typeof exactIdentityMatch !== "boolean"
+    || typeof processGroupGone !== "boolean"
+  ) {
+    return frozenGuardTransitionResult("fail-closed", null, "invalid");
+  }
+  if (!sameRecord || !sameIdentity || !correlatedMarkerIdentity) {
+    return frozenGuardTransitionResult("fail-closed", null, "drift");
+  }
+  if (!transition && exactIdentityMatch) {
+    return frozenGuardTransitionResult("verified");
+  }
+
+  const continuing = transition !== null;
+  const current = continuing ? { ...transition } : {
+    startedAt: observedAt,
+    deadlineAt: observedAt + SETUP_GUARD_TRANSITION_TIMEOUT_MS,
+    lastScanEpoch: scanEpoch,
+    lastObservedAt: observedAt,
+    lastProofCompletedAt: proofCompletedAt,
+    lastGoneAt: null,
+    lastGoneEpoch: null,
+    goneStreak: 0,
+    guardDisappeared: !guardPresent
+  };
+  if (
+    !Number.isFinite(current.startedAt)
+    || !Number.isFinite(current.deadlineAt)
+    || observedAt < current.startedAt
+    || current.deadlineAt - current.startedAt
+      !== SETUP_GUARD_TRANSITION_TIMEOUT_MS
+    || !Number.isSafeInteger(current.lastScanEpoch)
+    || current.lastScanEpoch <= 0
+    || !Number.isFinite(current.lastObservedAt)
+    || current.lastObservedAt < current.startedAt
+    || !Number.isFinite(current.lastProofCompletedAt)
+    || current.lastProofCompletedAt < current.lastObservedAt
+    || !Number.isSafeInteger(current.goneStreak)
+    || current.goneStreak < 0
+    || typeof current.guardDisappeared !== "boolean"
+    || (
+      current.lastGoneAt === null
+      && (
+        current.lastGoneEpoch !== null
+        || current.goneStreak !== 0
+      )
+    )
+    || (
+      current.lastGoneAt !== null
+      && (
+        !Number.isFinite(current.lastGoneAt)
+        || proofCompletedAt < current.lastGoneAt
+        || !Number.isSafeInteger(current.lastGoneEpoch)
+        || current.lastGoneEpoch <= 0
+        || current.goneStreak < 1
+      )
+    )
+  ) {
+    return frozenGuardTransitionResult("fail-closed", null, "invalid");
+  }
+  if (
+    continuing
+    && (
+      scanEpoch <= current.lastScanEpoch
+      || observedAt < current.lastObservedAt
+      || observedAt < current.lastProofCompletedAt
+      || proofCompletedAt < current.lastProofCompletedAt
+    )
+  ) {
+    return frozenGuardTransitionResult("fail-closed", null, "invalid");
+  }
+  if (
+    exactIdentityMatch
+    || (current.guardDisappeared && guardPresent)
+  ) {
+    return frozenGuardTransitionResult("fail-closed", null, "reappearance");
+  }
+  if (!guardPresent) current.guardDisappeared = true;
+
+  current.lastScanEpoch = scanEpoch;
+  current.lastObservedAt = observedAt;
+  current.lastProofCompletedAt = proofCompletedAt;
+
+  if (proofCompletedAt >= current.deadlineAt) {
+    return frozenGuardTransitionResult("fail-closed", null, "timeout");
+  }
+
+  if (!processGroupGone) {
+    current.goneStreak = 0;
+    current.lastGoneAt = null;
+    current.lastGoneEpoch = null;
+  } else if (current.lastGoneAt === null) {
+    current.goneStreak = 1;
+    current.lastGoneAt = proofCompletedAt;
+    current.lastGoneEpoch = scanEpoch;
+  } else if (
+    current.lastGoneEpoch !== scanEpoch
+    && proofCompletedAt - current.lastGoneAt
+      >= SETUP_GUARD_GONE_INTERVAL_MS
+  ) {
+    current.goneStreak += 1;
+    current.lastGoneAt = proofCompletedAt;
+    current.lastGoneEpoch = scanEpoch;
+  }
+
+  if (current.goneStreak >= 2) {
+    return frozenGuardTransitionResult(
+      guardPresent ? "stale-present" : "closed"
+    );
+  }
+  return frozenGuardTransitionResult("pending", current);
 }
 
 /**

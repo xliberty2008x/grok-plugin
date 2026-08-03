@@ -5,11 +5,9 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { CompanionError } from "./errors.mjs";
+import { cleanupTaskRuntimeArtifacts } from "./provider-controller-environments.mjs";
 import {
-  cleanupTaskRuntimeArtifacts,
-  processStartToken
-} from "./grok-provider.mjs";
-import {
+  processStartToken,
   runSystemPs,
   signalOwnedProcess
 } from "./process-control.mjs";
@@ -20,15 +18,17 @@ import {
   terminal,
   withWorkspaceStateTransaction
 } from "./state.mjs";
-import { appendLifecycleEvent } from "./task-contract.mjs";
+import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import {
-  assertMutationOwnership,
-  claimWorkerDispatch,
   prepareDispatchProcessSpawn,
-  providerLaunchState,
-  recordDispatchProcessNoChild,
+  recordDispatchProcessNoChild
+} from "./worker-mutation-dispatch-admission.mjs";
+import { providerLaunchState } from "./worker-mutation-dispatch-contract.mjs";
+import {
+  claimWorkerDispatch,
   transitionWorkerDispatch
-} from "./worker-mutation.mjs";
+} from "./worker-mutation-dispatch-transition.mjs";
+import { assertMutationOwnership } from "./worker-mutation-primitives.mjs";
 import { workspaceState } from "./workspace.mjs";
 
 const COMPANION_SCRIPT = path.resolve(

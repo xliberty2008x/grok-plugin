@@ -14,6 +14,7 @@ import {
   DETERMINISTIC_SUPPORT_TEST_FILES,
   DETERMINISTIC_TEST_SHARD_COUNT,
   DETERMINISTIC_TEST_SHARDS,
+  WORKER_BROKER_EVIDENCE_SEMANTIC_TEST_FILES,
   parseDeterministicShardArgument,
   selectDeterministicTestFiles,
   validateDeterministicTestShards
@@ -21,22 +22,30 @@ import {
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PROCESS_HEAVY_TEST_FILES = Object.freeze([
-  "tests/control-plane_part1.mjs",
-  "tests/control-plane_part2.mjs",
-  "tests/control-plane_part3.mjs",
-  "tests/runtime.test.mjs",
+  "tests/control-plane-context-manifest.test.mjs",
+  "tests/control-plane-git-refs.test.mjs",
+  "tests/control-plane-lifecycle.test.mjs",
+  "tests/control-plane-metadata-races.test.mjs",
+  "tests/control-plane-worker-contracts.test.mjs",
+  "tests/runtime-admission.test.mjs",
+  "tests/runtime-cancellation.test.mjs",
+  "tests/runtime-recovery.test.mjs",
+  "tests/runtime-task-lifecycle.test.mjs",
+  "tests/runtime-transfer.test.mjs",
   "tests/test-temp-cleanup.test.mjs",
-  "tests/worker-broker-evidence_part1.mjs",
-  "tests/worker-broker-evidence_part2.mjs",
-  "tests/worker-broker-evidence_part3.mjs",
-  "tests/worker-broker-evidence_part4.mjs",
-  "tests/worker-broker-evidence_part5.mjs",
-  "tests/worker-broker-evidence_part6.mjs",
-  "tests/worker-broker-evidence_part7.mjs",
-  "tests/worker-broker-evidence_part8.mjs",
-  "tests/worker-broker-evidence_part9.mjs",
-  "tests/worker-mutation_part1.mjs",
-  "tests/worker-mutation_part2.mjs"
+  "tests/worker-broker-evidence-cutover-cli.test.mjs",
+  "tests/worker-broker-evidence-deterministic-runner.test.mjs",
+  "tests/worker-broker-evidence-immutable-ledger.test.mjs",
+  "tests/worker-broker-evidence-live-receipts.test.mjs",
+  "tests/worker-broker-evidence-proof-chain.test.mjs",
+  "tests/worker-broker-evidence-proof-toolchain.test.mjs",
+  "tests/worker-broker-evidence-protected-publication.test.mjs",
+  "tests/worker-broker-evidence-review-attestations.test.mjs",
+  "tests/worker-broker-evidence-source-records.test.mjs",
+  "tests/worker-mutation-cancellation-recovery.test.mjs",
+  "tests/worker-mutation-provisioning-adoption.test.mjs",
+  "tests/worker-mutation-provisioning-intent.test.mjs",
+  "tests/worker-mutation-terminal-evidence.test.mjs"
 ]);
 
 test("deterministic shard manifest is an exact nonempty partition of the inventory", () => {
@@ -54,51 +63,34 @@ test("deterministic shard manifest is an exact nonempty partition of the invento
   const combined = DETERMINISTIC_TEST_SHARDS.flat();
   assert.equal(new Set(combined).size, combined.length);
   assert.deepEqual([...combined].sort(), inventory);
+  assert.equal(combined.includes("tests/source-structure-policy.test.mjs"), true);
   assert.ok(EXTERNAL_BOUNDARY_TESTS.every((file) => !combined.includes(`tests/${file}`)));
 });
 
-test("deterministic partition harnesses replace only their ordinary aggregate files", () => {
+test("deterministic inventory uses ordinary semantic evidence tests without partitions", () => {
   assert.deepEqual(DETERMINISTIC_AGGREGATE_TEST_FILES, [
-    "tests/control-plane.test.mjs",
-    "tests/worker-broker-evidence.test.mjs",
-    "tests/worker-mutation.test.mjs"
+    "tests/worker-broker-evidence.test.mjs"
   ]);
-  assert.deepEqual(DETERMINISTIC_SUPPORT_TEST_FILES, [
-    "tests/control-plane_part1.mjs",
-    "tests/control-plane_part2.mjs",
-    "tests/control-plane_part3.mjs",
-    "tests/worker-broker-evidence_part1.mjs",
-    "tests/worker-broker-evidence_part2.mjs",
-    "tests/worker-broker-evidence_part3.mjs",
-    "tests/worker-broker-evidence_part4.mjs",
-    "tests/worker-broker-evidence_part5.mjs",
-    "tests/worker-broker-evidence_part6.mjs",
-    "tests/worker-broker-evidence_part7.mjs",
-    "tests/worker-broker-evidence_part8.mjs",
-    "tests/worker-broker-evidence_part9.mjs",
-    "tests/worker-mutation_part1.mjs",
-    "tests/worker-mutation_part2.mjs"
-  ]);
-  const ordinary = fs.readdirSync(path.join(ROOT, "tests"))
-    .filter((name) => name.endsWith(".test.mjs"))
-    .map((name) => `tests/${name}`);
-  for (const aggregateFile of DETERMINISTIC_AGGREGATE_TEST_FILES) {
-    assert.equal(ordinary.includes(aggregateFile), true);
-    assert.equal(listDeterministicTestFiles().includes(aggregateFile), false);
-  }
-  for (const supportFile of DETERMINISTIC_SUPPORT_TEST_FILES) {
-    assert.equal(ordinary.includes(supportFile), false);
-    assert.equal(listDeterministicTestFiles().filter(
-      (file) => file === supportFile
-    ).length, 1);
-  }
+  assert.deepEqual(DETERMINISTIC_SUPPORT_TEST_FILES, []);
+  const inventory = listDeterministicTestFiles();
+  assert.ok(WORKER_BROKER_EVIDENCE_SEMANTIC_TEST_FILES.every(
+    (file) => inventory.includes(file)
+  ));
+  assert.equal(inventory.includes(DETERMINISTIC_AGGREGATE_TEST_FILES[0]), false);
+  assert.equal(
+    fs.readdirSync(path.join(ROOT, "tests")).some((name) => (
+      /^worker-broker-evidence_part[0-9]+\.mjs$/u.test(name)
+    )),
+    false
+  );
 });
 
 test("process-heavy cleanup and evidence files are distributed across all shards", () => {
   const heavyCounts = DETERMINISTIC_TEST_SHARDS.map((files) =>
     files.filter((file) => PROCESS_HEAVY_TEST_FILES.includes(file)).length
   );
-  assert.deepEqual(heavyCounts, [4, 5, 4, 3]);
+  assert.deepEqual(heavyCounts, [5, 7, 5, 7]);
+  assert.ok(heavyCounts.every((count) => count >= 5));
 });
 
 test("deterministic shard CLI accepts only one exact four-way shard specification", () => {
@@ -227,6 +219,16 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
       "      fail-fast: true\n      # fail-fast: false"
     ),
     mutateJob(
+      "pty-ingress",
+      "      - name: Run source PTY ingress regression",
+      "      - run: echo 'NODE_OPTIONS=--require ./mutator.cjs' >> \"$GITHUB_ENV\"\n\n      - name: Run source PTY ingress regression"
+    ),
+    mutateJob(
+      "pty-ingress",
+      "      - name: Set up Node.js\n        uses: actions/setup-node@v4",
+      "      - name: Set up Node.js\n        run: echo bypass"
+    ),
+    mutateJob(
       "validate-and-test",
       "    runs-on: ${{ matrix.os }}",
       "    runs-on: self-hosted\n    # runs-on: ${{ matrix.os }}"
@@ -255,6 +257,21 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
       "validate-and-test",
       "    timeout-minutes: 30",
       "    timeout-minutes: 30\n    ? continue-on-error\n    : true"
+    ),
+    mutateJob(
+      "validate-and-test",
+      "        run: node scripts/check-release-history.mjs",
+      "        run: node scripts/validate.mjs --versions-only"
+    ),
+    mutateJob(
+      "validate-and-test",
+      "      - name: Validate immutable release history",
+      "      - name: Rewrite release refs\n        run: git update-ref refs/remotes/origin/main HEAD\n\n      - name: Validate immutable release history"
+    ),
+    mutateJob(
+      "validate-and-test",
+      "      - name: Set up Node.js\n        uses: actions/setup-node@v4",
+      "      - name: Set up Node.js\n        run: git update-ref refs/remotes/origin/main HEAD"
     ),
     mutateJob("validate-and-test", (job) => {
       const canonicalStrategy = [
@@ -298,7 +315,7 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
       .trimEnd()}
     environment: |
       - name: Run deterministic zero-skip shard
-        run: npm run test:deterministic -- --shard=\${{ matrix.shard }}/4
+        run: node scripts/test-deterministic.mjs --shard=\${{ matrix.shard }}/4
 `),
     mutateJob(
       "windows-neutral",
@@ -315,9 +332,59 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
       "      fail-fast: false",
       "      fail-fast: true\n      # fail-fast: false"
     ),
+    mutateJob(
+      "windows-neutral",
+      "      - name: Run provider-neutral tests (Windows; provider unverified)",
+      "      - run: node scripts/mutate-tests.mjs\n\n      - name: Run provider-neutral tests (Windows; provider unverified)"
+    ),
+    mutateJob(
+      "release-tag",
+      "    if: startsWith(github.ref, 'refs/tags/v')",
+      "    if: false"
+    ),
+    mutateJob(
+      "release-tag",
+      "--require-ref --main-ref origin/main",
+      "--main-ref origin/main"
+    ),
+    mutateJob(
+      "release-tag",
+      "          fetch-depth: 0",
+      "          fetch-depth: 1"
+    ),
+    mutateJob(
+      "release-tag",
+      "      - name: Verify annotated version tag on exact main",
+      "      - name: Rewrite release refs\n        run: git update-ref refs/remotes/origin/main HEAD\n\n      - name: Verify annotated version tag on exact main"
+    ),
+    mutateJob(
+      "release-tag",
+      "      - name: Set up Node.js\n        uses: actions/setup-node@v4",
+      "      - name: Set up Node.js\n        run: git update-ref refs/remotes/origin/main HEAD"
+    ),
     workflow.replace(
       "    timeout-minutes: 30",
       "    timeout-minutes: 30\n    continue-on-error: true"
+    ),
+    mutateJob(
+      "installed-codex",
+      "      - name: Require clean Codex marketplace install and cached PTY execution",
+      "      - run: node scripts/exfiltrate.cjs\n\n      - name: Require clean Codex marketplace install and cached PTY execution"
+    ),
+    mutateJob(
+      "natural-codex-grok",
+      "      - name: Run natural installed Codex to real Grok qualification\n        env:",
+      "      - name: Run natural installed Codex to real Grok qualification\n        run: echo bypass\n\n      - name: Duplicate natural qualification\n        env:"
+    ),
+    mutateJob(
+      "ci-required",
+      "    timeout-minutes: 5",
+      "    timeout-minutes: 5\n    defaults:\n      run:\n        shell: /usr/bin/true {0}"
+    ),
+    mutateJob(
+      "ci-required",
+      "      - name: Require hosted CI job groups",
+      "      - run: echo bypass\n\n      - name: Require hosted CI job groups"
     ),
     workflow.replace("    timeout-minutes: 30", "    timeout-minutes: 20"),
     workflow.replace(
@@ -325,8 +392,8 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
       "    timeout-minutes: 20\n    # timeout-minutes: 30"
     ),
     workflow.replace(
-      "        run: npm run test:pty-ingress",
-      "        continue-on-error: true\n        run: npm run test:pty-ingress"
+      "        run: node --test tests/pty-ingress.test.mjs",
+      "        continue-on-error: true\n        run: node --test tests/pty-ingress.test.mjs"
     ),
     workflow.replace(
       "      matrix:\n        os: [ubuntu-latest, macos-latest]",
@@ -389,12 +456,12 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
       "        if: matrix.shard == 1 && false"
     ),
     workflow.replace(
-      "        run: npm run test:deterministic -- --shard=${{ matrix.shard }}/4",
-      "        run: npm run test:deterministic -- --shard=${{ matrix.shard }}/3"
+      "        run: node scripts/test-deterministic.mjs --shard=${{ matrix.shard }}/4",
+      "        run: node scripts/test-deterministic.mjs --shard=${{ matrix.shard }}/3"
     ),
     workflow.replace(
-      "        run: npm run test:deterministic -- --shard=${{ matrix.shard }}/4",
-      "        shell: bash {0} || true\n        run: npm run test:deterministic -- --shard=${{ matrix.shard }}/4"
+      "        run: node scripts/test-deterministic.mjs --shard=${{ matrix.shard }}/4",
+      "        shell: bash {0} || true\n        run: node scripts/test-deterministic.mjs --shard=${{ matrix.shard }}/4"
     ),
     workflow.replace(
       "      - name: Run source PTY ingress regression",
@@ -405,16 +472,48 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
       "      - name: Run provider-neutral tests (Windows; provider unverified)\n        if: false"
     ),
     workflow.replace(
-      "      - name: Validate release structure\n        run: npm run validate",
-      "      - name: Validate release structure\n        if: false\n        run: npm run validate"
+      "      - name: Validate release structure\n        run: node scripts/validate.mjs",
+      "      - name: Validate release structure\n        if: false\n        run: node scripts/validate.mjs"
     ),
     workflow.replace(
       "        run: |\n          if [ \"$PTY_INGRESS_RESULT\"",
       "        run: |\n          if false; then\n            exit 0\n          fi\n          if [ \"$PTY_INGRESS_RESULT\""
     ),
     workflow.replace("  pull_request:\n", ""),
+    workflow.replace(
+      "  workflow_dispatch:\n",
+      "  workflow_dispatch:\n  pull_request_target:\n"
+    ),
     workflow.replace("    branches: [main]\n", "    branches: [release]\n"),
-    workflow.replace("  workflow_dispatch:\n", "")
+    workflow.replace("    tags: [\"v*\"]\n", ""),
+    workflow.replace("  workflow_dispatch:\n", ""),
+    workflow.replace(
+      "permissions:\n  contents: read",
+      "permissions:\n  contents: write"
+    ),
+    workflow.replace(
+      "permissions:\n",
+      "defaults:\n  run:\n    shell: ./scripts/wrapper.sh {0}\n\npermissions:\n"
+    ),
+    workflow.replace(
+      "permissions:\n",
+      "env:\n  BASH_ENV: ./scripts/mutate-release-refs.sh\n  NODE_OPTIONS: --require ./scripts/mutate-release-refs.cjs\n\npermissions:\n"
+    ),
+    workflow.replace(
+      "  ci-required:\n",
+      "  mutate-release-refs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: git update-ref refs/remotes/origin/main HEAD\n\n  ci-required:\n"
+    ),
+    workflow.replace(
+      "  ci-required:\n",
+      "  _mutator:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo bypass\n\n  ci-required:\n"
+    ),
+    workflow.replace(
+      "  ci-required:\n",
+      "  \"Mutator_Job\": { runs-on: ubuntu-latest }\n\n  ci-required:\n"
+    ),
+    `${workflow}\nenv: { BASH_ENV: ./scripts/wrapper.sh }\n`,
+    `${workflow}\ndefaults: { run: { shell: \"/usr/bin/true {0}\" } }\n`,
+    `${workflow}\npermissions:\n  contents: write\n`
   ];
   for (const mutated of mutations) {
     assert.notDeepEqual(validateHostedCiWorkflow(mutated), [], "mutation must fail closed");
