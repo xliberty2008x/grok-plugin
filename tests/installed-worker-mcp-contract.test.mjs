@@ -11,9 +11,8 @@ import {
   CODEX_MCP_EXPERIMENTAL_CAPABILITIES,
   MCP_SANDBOX_STATE_META_CAPABILITY
 } from "../plugins/grok/scripts/lib/worker-authority.mjs";
-import {
-  codexMetadataCapabilityMatrix
-} from "../plugins/grok/scripts/lib/worker-presentation.mjs";
+import { codexMetadataCapabilityMatrix } from "../plugins/grok/scripts/lib/worker-presentation.mjs";
+import { CONTEXT_MANIFEST_VERSION } from "../plugins/grok/scripts/lib/task-contract.mjs";
 import {
   MAX_LIFECYCLE_EVENTS,
   projectWorkerHandle,
@@ -230,7 +229,7 @@ function initializeExpectations() {
 
 function contextManifestFixture() {
   return {
-    schemaVersion: 1,
+    schemaVersion: CONTEXT_MANIFEST_VERSION,
     manifestId: MANIFEST_ID,
     digest: "e".repeat(64),
     capturedAt: "2026-07-23T10:00:00.000Z",
@@ -368,11 +367,13 @@ function lifecycleEvents(status, cancellation) {
         sequence: 7,
         detail: { requestAcceptedAt: "2026-07-23T10:02:00.000Z" }
       },
+      { type: "activity.started", at: "2026-07-23T10:02:10.000Z", summary: "Tool started", sequence: 8 },
+      { type: "plan.updated", at: "2026-07-23T10:02:20.000Z", summary: "Plan updated", sequence: 9, detail: { plan: ["Finish cancellation"] } },
       {
         type: "blocked",
         at: "2026-07-23T10:03:00.000Z",
         summary: "Task runtime cleanup completed",
-        sequence: 8
+        sequence: 10
       }
     );
   }
@@ -1312,13 +1313,14 @@ test("terminal worker_result accepts the production snapshot and rejects private
   const snapshot = actual.terminalResult.worker;
   assert.equal(snapshot.workerProtocolVersion, 1);
   assert.equal(snapshot.snapshotSchemaVersion, 1);
-  assert.equal(snapshot.schemaVersion, 3);
+  assert.deepEqual([snapshot.schemaVersion, CONTEXT_MANIFEST_VERSION, snapshot.context.schemaVersion], [3, 2, 2]);
   assert.equal(snapshot.result.workerReport.outcome, "complete");
   assert.equal(snapshot.result.providerClaims.observedFileAgreement, true);
   assert.equal(snapshot.result.hostVerification, "not_run");
   assert.doesNotThrow(() => validateInstalledCompletionScenario(actual));
 
   const mutations = [
+    (value) => { value.terminalResult.worker.context.schemaVersion = 1; },
     (value) => {
       value.terminalResult.worker.providerProcess = { pid: 42 };
     },
@@ -1801,6 +1803,9 @@ test("terminal scenario validators accept only the canonical retained window", (
 
 test("cancellation replay preserves immutable admission receipt and one public event", () => {
   const valid = validateInstalledCancellationReplayScenario(cancellationBundle());
+  const cancelIndex = valid.terminalResult.worker.lifecycleEvents.findIndex((event) => event.type === "cancellation.requested");
+  const postCancel = valid.terminalResult.worker.lifecycleEvents.slice(cancelIndex + 1, -1);
+  assert.deepEqual(postCancel.map((event) => event.type), ["activity.started", "plan.updated"]);
   assert.equal(valid.cancel.replayed, false);
   assert.equal(valid.cancelReplay.replayed, true);
   assert.equal(valid.cancel.receipt.processGroupGoneAt, null);
@@ -1859,22 +1864,22 @@ test("cancellation replay preserves immutable admission receipt and one public e
     assertContractError("E_LIVE_CANCELLATION")
   );
 
-  const priorLifecycleAcceptance = cancellationBundle();
-  const priorLifecycleAcceptedAt = "2026-07-23T10:01:49.999Z";
-  priorLifecycleAcceptance.cancel.receipt.requestAcceptedAt =
-    priorLifecycleAcceptedAt;
-  priorLifecycleAcceptance.cancelReplay.receipt.requestAcceptedAt =
-    priorLifecycleAcceptedAt;
-  priorLifecycleAcceptance.terminalResult.worker.result.cancellation
-    .requestAcceptedAt = priorLifecycleAcceptedAt;
-  priorLifecycleAcceptance.terminalResult.worker.lifecycleEvents
-    .find((event) => event.type === "cancellation.requested")
-    .detail.requestAcceptedAt = priorLifecycleAcceptedAt;
-  assert.throws(
-    () => validateInstalledCancellationReplayScenario(
-      priorLifecycleAcceptance
-    ),
-    assertContractError("E_LIVE_CANCELLATION")
+  const concurrentLifecycleEvent = cancellationBundle();
+  const concurrentRequestAcceptedAt = "2026-07-23T10:01:49.999Z";
+  const interveningEvent = concurrentLifecycleEvent.terminalResult.worker
+    .lifecycleEvents.find((event) => event.sequence === 6);
+  const cancellationEvent = concurrentLifecycleEvent.terminalResult.worker
+    .lifecycleEvents.find((event) => event.type === "cancellation.requested");
+  assert.ok(Date.parse(concurrentRequestAcceptedAt) < Date.parse(interveningEvent.at)
+    && Date.parse(interveningEvent.at) < Date.parse(cancellationEvent.at));
+  concurrentLifecycleEvent.cancel.receipt.requestAcceptedAt = concurrentRequestAcceptedAt;
+  concurrentLifecycleEvent.cancelReplay.receipt.requestAcceptedAt =
+    concurrentRequestAcceptedAt;
+  concurrentLifecycleEvent.terminalResult.worker.result.cancellation
+    .requestAcceptedAt = concurrentRequestAcceptedAt;
+  cancellationEvent.detail.requestAcceptedAt = concurrentRequestAcceptedAt;
+  assert.doesNotThrow(
+    () => validateInstalledCancellationReplayScenario(concurrentLifecycleEvent)
   );
 
   const replayObservationDrift = cancellationBundle();
@@ -2007,14 +2012,8 @@ test("cancellation replay preserves immutable admission receipt and one public e
     },
     (value) => {
       const event = value.terminalResult.worker.lifecycleEvents.at(-1);
-      event.at = "2026-07-23T10:02:15.000Z";
+      event.at = "2026-07-23T10:02:31.000Z";
       event.type = "activity.started";
-    },
-    (value) => {
-      const event = value.terminalResult.worker.lifecycleEvents.at(-1);
-      event.at = "2026-07-23T10:02:15.000Z";
-      event.type = "plan.updated";
-      event.detail = { plan: ["Late plan"] };
     },
     (value) => {
       value.terminalResult.worker.lifecycleEvents[2].sequence += 1;
@@ -2163,6 +2162,7 @@ test("terminal event history compares the installed projection and rejects malfo
     const marker = events.find((event) => event.sequence === 139);
     marker.type = "cancellation.requested";
     marker.detail = { requestAcceptedAt: marker.at };
+    Object.assign(events.find((event) => event.sequence === 140), { type: "plan.updated", detail: { plan: ["Finish cancellation"] } });
   }
   assert.doesNotThrow(
     () => validateInstalledTerminalEventHistory(retainedCancellation)

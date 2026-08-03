@@ -1630,15 +1630,15 @@ function validLifecycleEvents(events, worker, status) {
       cancellationEvents[0]?.detail?.requestAcceptedAt
     );
     const cancellationEventAt = Date.parse(cancellationEvents[0]?.at);
-    const cancellationEventIndex = events.indexOf(cancellationEvents[0]);
-    const priorEventAt = cancellationEventIndex > 0
-      ? Date.parse(events[cancellationEventIndex - 1].at)
-      : createdAt;
+    // Request acceptance and provider event publication are concurrent.
+    // A provider event can acquire the job lock after request acceptance but
+    // before the cancellation event is durably appended, so its timestamp may
+    // fall between requestAcceptedAt and cancellationEventAt. Only the latter
+    // bound is a causal invariant.
     if (
       cancellationEvents.length !== 1
       || finalReports.length !== 0
       || !Number.isFinite(cancellationAcceptedAt)
-      || cancellationAcceptedAt < priorEventAt
       || cancellationAcceptedAt > cancellationEventAt
       || Date.parse(cancellationEvents[0].at) > completedAt
     ) {
@@ -1651,9 +1651,9 @@ function validLifecycleEvents(events, worker, status) {
   const terminalMarkerIndex = events.indexOf(terminalMarker);
   if (
     terminalMarkerIndex < 0
-    || events.slice(terminalMarkerIndex + 1).some(
+    || (status === "completed" && events.slice(terminalMarkerIndex + 1).some(
       (event) => !POST_COMPLETION_EVENT_TYPES.has(event.type)
-    )
+    ))
   ) {
     return false;
   }
@@ -1766,7 +1766,7 @@ function validNullableCommit(value) {
 function validContextManifest(value, worker) {
   return (
     exactKeys(value, CONTEXT_MANIFEST_KEYS)
-    && value.schemaVersion === 1
+    && value.schemaVersion === 2
     && value.manifestId === worker.contextManifestId
     && value.digest === worker.contextDigest
     && canonicalIsoTimestamp(value.capturedAt)
@@ -2477,9 +2477,9 @@ function validFullTrackedLifecycleHistory(events, cursor, workerId, status) {
             && finalReports.length === 0
           )
     )
-    && events.slice(terminalMarkerIndex + 1).every(
+    && (status !== "completed" || events.slice(terminalMarkerIndex + 1).every(
       (event) => POST_COMPLETION_EVENT_TYPES.has(event.type)
-    )
+    ))
   );
 }
 
