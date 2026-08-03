@@ -54,10 +54,6 @@
       "stage": "4-provider-and-control-plane",
       "target": "Separate environment construction, transport lifecycle, and provider command execution."
     },
-    "plugins/grok/scripts/lib/task-contract.mjs": {
-      "stage": "2-task-context-pilot",
-      "target": "Retain the public facade while extracting scope, context, metadata, and Git observation domains."
-    },
     "plugins/grok/scripts/lib/worker-mutation.mjs": {
       "stage": "5-worker-mutation",
       "target": "Split mutation admission, provisioning, dispatch, cancellation, and terminal transition domains."
@@ -758,7 +754,7 @@
     "plugins/grok/scripts/lib/task-contract.mjs": {
       "category": "product",
       "initialLines": 5494,
-      "lineCap": 5381,
+      "lineCap": 2502,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
@@ -772,11 +768,6 @@
           "key": "function:validateLooseRefsInventory#1",
           "initialLines": 295,
           "capLines": 295
-        },
-        {
-          "key": "function:visitBoundedMetadataTree#1",
-          "initialLines": 347,
-          "capLines": 347
         }
       ]
     },
