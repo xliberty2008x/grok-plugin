@@ -29,7 +29,7 @@ import {
   assertMutationOwnership,
   cancellationNonce
 } from "./worker-mutation-primitives.mjs";
-import { spawnGrantedFollowupWorker } from "./worker-mutation.mjs";
+import { spawnGrantedFollowupWorker } from "./worker-mutation-followup.mjs";
 import {
   MAILBOX_MESSAGE_SCHEMA_VERSION,
   MAX_MAILBOX_MESSAGE_LENGTH,

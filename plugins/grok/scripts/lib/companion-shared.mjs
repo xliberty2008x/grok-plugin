@@ -18,7 +18,9 @@ import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import { scrubStoredJob } from "./task-envelope.mjs";
 import { projectWorkerDiagnosticText, projectWorkerHandle, projectWorkerError, projectWorkerPublicText, projectWorkerSnapshot } from "./worker-protocol.mjs";
 import { CONTEXT_BINDING_MODE } from "./worker-context.mjs";
-import { assertDispatchContract, assertWorkerProviderLaunchPreparation, recordWorkerProviderRotationNoChild, recordUnsettledProviderProcess, transitionWorkerDispatch } from "./worker-mutation.mjs";
+import { assertDispatchContract } from "./worker-mutation-dispatch-contract.mjs";
+import { recordWorkerProviderRotationNoChild, recordUnsettledProviderProcess, transitionWorkerDispatch } from "./worker-mutation-dispatch-transition.mjs";
+import { assertWorkerProviderLaunchPreparation } from "./worker-mutation-spawn-authority.mjs";
 import { providerLaunchCleanupBlocked } from "./worker-reconcile.mjs";
 import { isDispatchV2 } from "./worker-launch-contract.mjs";
 const SCRIPT = path.resolve(

@@ -26,7 +26,7 @@ import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import {
   acquireRecoveryCleanupFence, recordWorkerProviderSpawnNoChild, verifyRecoveryCleanupFence
 } from "./worker-mutation-dispatch-admission.mjs";
-import { transitionWorkerDispatch } from "./worker-mutation.mjs";
+import { transitionWorkerDispatch } from "./worker-mutation-dispatch-transition.mjs";
 import {
   settleFailedDispatchCleanup,
   settleStartedWorkerLoss,

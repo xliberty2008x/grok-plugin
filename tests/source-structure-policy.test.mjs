@@ -550,6 +550,8 @@ test("file-URL query, fragment, and percent encoding cannot hide facade cycles",
 
 test("immutable and active digests pin history and the shrink-only policy boundary", () => {
   const config = loadSourceStructurePolicy({ root: ROOT });
+  const workerMutation = "plugins/grok/scripts/lib/worker-mutation.mjs";
+  const activeDebt = "plugins/grok/scripts/lib/worker-owner-lifecycle.mjs";
   assert.equal(SOURCE_STRUCTURE_INITIAL_DIGEST, "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b");
   assert.equal(config.baseline.initialDigest, SOURCE_STRUCTURE_INITIAL_DIGEST);
   assert.equal(sourceStructureInitialDigest(config), SOURCE_STRUCTURE_INITIAL_DIGEST);
@@ -561,19 +563,21 @@ test("immutable and active digests pin history and the shrink-only policy bounda
   assert.equal(sourceStructurePolicyDigest(selfReference), SOURCE_STRUCTURE_POLICY_DIGEST);
 
   const changedHistoryBoundary = structuredClone(config);
-  changedHistoryBoundary.initialDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].initialLines += 1;
+  changedHistoryBoundary.initialDebt[workerMutation].initialLines += 1;
   assert.notEqual(sourceStructurePolicyDigest(changedHistoryBoundary), SOURCE_STRUCTURE_POLICY_DIGEST);
+  assert.equal(config.initialDebt[workerMutation].initialLines, 11269);
+  assert.equal(config.legacyDebt[workerMutation], undefined);
+  assert.ok(config.facadePaths.includes(workerMutation));
 
   const raised = structuredClone(config);
-  raised.initialDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].initialLines += 1;
-  raised.legacyDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].initialLines += 1;
-  raised.legacyDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].lineCap += 1;
+  raised.initialDebt[workerMutation].initialLines += 1;
+  raised.legacyDebt[activeDebt].lineCap += 1;
   assert.ok(validateSourceStructurePolicy(raised, {
     expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST
   }).some((message) => /initialDigest/u.test(message)));
 
   const lowerCap = structuredClone(config);
-  lowerCap.legacyDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].lineCap -= 1;
+  lowerCap.legacyDebt[activeDebt].lineCap -= 1;
   refreshPolicyDigest(lowerCap);
   assert.deepEqual(validateSourceStructurePolicy(lowerCap, {
     expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST,
@@ -581,7 +585,7 @@ test("immutable and active digests pin history and the shrink-only policy bounda
   }), []);
 
   const removedCap = structuredClone(config);
-  delete removedCap.legacyDebt["plugins/grok/scripts/lib/worker-mutation.mjs"];
+  delete removedCap.legacyDebt[activeDebt];
   refreshPolicyDigest(removedCap);
   assert.deepEqual(validateSourceStructurePolicy(removedCap, {
     expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST,
@@ -600,7 +604,7 @@ test("immutable and active digests pin history and the shrink-only policy bounda
   }), []);
 
   const reopenedCap = structuredClone(lowerCap);
-  reopenedCap.legacyDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].lineCap += 1;
+  reopenedCap.legacyDebt[activeDebt].lineCap += 1;
   refreshPolicyDigest(reopenedCap);
   assert.ok(validateSourceStructurePolicy(reopenedCap, {
     expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST,
@@ -965,6 +969,7 @@ test("checked-in ratchet baseline exactly covers all current file and function d
     "plugins/grok/scripts/grok-companion.mjs",
     "plugins/grok/scripts/lib/grok-provider.mjs",
     "plugins/grok/scripts/lib/task-contract.mjs",
+    "plugins/grok/scripts/lib/worker-mutation.mjs",
     "plugins/grok/scripts/session-lifecycle-hook.mjs",
     "plugins/grok/scripts/stop-review-gate-hook.mjs",
     "scripts/check-source-structure.mjs",
@@ -972,8 +977,8 @@ test("checked-in ratchet baseline exactly covers all current file and function d
   ]);
   const result = evaluateSourceStructure({ root: ROOT, config });
   assert.equal(result.ok, true);
-  assert.equal(result.files.length, 280);
-  assert.equal(result.warnings.length, 55);
+  assert.equal(result.files.length, 283);
+  assert.equal(result.warnings.length, 54);
   assert.equal(result.cycles.length, 0);
   assert.equal(result.fragments.length, 14);
   const debtPaths = result.files.filter((entry) => {
@@ -982,7 +987,7 @@ test("checked-in ratchet baseline exactly covers all current file and function d
     return entry.lines > budget.fileLines
       || entry.functions.some((span) => span.lines > budget.functionLines);
   }).map((entry) => entry.file).sort();
-  assert.equal(debtPaths.length, 41);
+  assert.equal(debtPaths.length, 40);
   assert.deepEqual(debtPaths, Object.keys(config.legacyDebt));
   assert.equal(Object.keys(config.initialDebt).length, 45);
   for (const [file, entry] of Object.entries(config.legacyDebt)) {
