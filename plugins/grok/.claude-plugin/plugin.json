@@ -6,7 +6,6 @@
     "name": "grok-plugin community maintainers"
   },
   "hooks": [
-    "./hooks/hooks.json",
     "./hooks/claude-hooks.json"
   ]
 }

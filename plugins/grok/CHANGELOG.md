@@ -4,6 +4,15 @@
 
 Status: hardening candidate; not release-qualified.
 
+- Fixed Claude Code plugin installation so the conventional shared
+  `hooks/hooks.json` (`SessionStart`, `Stop`) is no longer listed in the Claude
+  manifest. Claude Code 2.1.220 already auto-loads that path once; explicit
+  registration duplicated the load and failed with an already-loaded file
+  error. The manifest now registers only the Claude-only supplemental
+  `./hooks/claude-hooks.json` (`SessionEnd`). Standard and Claude-only hook
+  file contents are unchanged. Packaging validation and the Codex-support
+  regression enforce the supplemental-only contract. This is a packaging
+  declaration fix only; it is not installed Claude lifecycle qualification.
 - Fixed the installed Codex and Claude deep-research instructions so they
   select exactly one execution mode and exactly one research surface before
   starting a job. Public-web requests still default to `--background` plus
