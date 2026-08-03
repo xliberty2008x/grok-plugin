@@ -5684,7 +5684,7 @@ test("Codex control-plane skill contracts describe host authority and explicit j
 test("rescue skill remediates only the exact missing capability-receipt admission error", () => {
   const rescue = fs.readFileSync(path.join(ROOT, "plugins/grok/skills/rescue/SKILL.md"), "utf8");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
-  const companion = fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/grok-companion.mjs"), "utf8");
+  const companion = fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/companion-dispatch.mjs"), "utf8");
   const hostLib = fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/host.mjs"), "utf8");
   const canonicalCodex = missingInvalidProviderCapabilityReceiptMessage({
     CODEX_THREAD_ID: "codex-thread"
