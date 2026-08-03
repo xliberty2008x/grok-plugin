@@ -905,8 +905,8 @@ test("checked-in ratchet baseline exactly covers all current file and function d
   ]);
   const result = evaluateSourceStructure({ root: ROOT, config });
   assert.equal(result.ok, true);
-  assert.equal(result.files.length, 251);
-  assert.equal(result.warnings.length, 57);
+  assert.equal(result.files.length, 255);
+  assert.equal(result.warnings.length, 56);
   assert.equal(result.cycles.length, 0);
   assert.equal(result.fragments.length, 14);
   const debtPaths = result.files.filter((entry) => {
@@ -915,7 +915,7 @@ test("checked-in ratchet baseline exactly covers all current file and function d
     return entry.lines > budget.fileLines
       || entry.functions.some((span) => span.lines > budget.functionLines);
   }).map((entry) => entry.file).sort();
-  assert.equal(debtPaths.length, 43);
+  assert.equal(debtPaths.length, 42);
   assert.deepEqual(debtPaths, Object.keys(config.legacyDebt));
   for (const [file, entry] of Object.entries(config.legacyDebt)) {
     const measured = result.files.find((candidate) => candidate.file === file);
