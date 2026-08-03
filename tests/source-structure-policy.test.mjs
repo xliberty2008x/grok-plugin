@@ -26,6 +26,10 @@ import {
   sourceStructurePolicyDigest,
   validateSourceStructurePolicy
 } from "../scripts/lib/source-structure-policy.mjs";
+import {
+  INSTALLED_WORKER_MCP_RUNNER,
+  INSTALLED_WORKER_MCP_RUNNER_MODULES
+} from "./lib/installed-worker-mcp-runner-source.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REVISION = "7301afbbbf29afc3690c9d1d4458b8c394bed2bc";
@@ -881,6 +885,68 @@ test("canonical source-structure command is pinned by project validation", () =>
   assert.match(validationSource, /\["check:source-structure"\] !== "node scripts\/check-source-structure\.mjs"/u);
 });
 
+test("checked-in installed runner is a bounded one-way facade with immutable history", () => {
+  const config = loadSourceStructurePolicy({ root: ROOT });
+  const result = evaluateSourceStructure({ root: ROOT, config });
+  assert.ok(config.facadePaths.includes("scripts/test-installed-worker-mcp.mjs"));
+  const runnerSource = fs.readFileSync(INSTALLED_WORKER_MCP_RUNNER, "utf8");
+  const runnerStructure = parseSourceStructure(
+    runnerSource,
+    INSTALLED_WORKER_MCP_RUNNER
+  );
+  assert.ok(physicalLineCount(runnerSource) <= config.budgets.facade.fileLines);
+  assert.equal(
+    runnerStructure.ast.body.some((node) => node.type.startsWith("Export")),
+    false
+  );
+  assert.deepEqual(
+    runnerStructure.specifiers.filter((specifier) => (
+      specifier.includes("installed-worker-mcp-runner-")
+    )).sort(),
+    INSTALLED_WORKER_MCP_RUNNER_MODULES
+      .map((file) => `./lib/${path.basename(file)}`)
+      .sort()
+  );
+  for (const file of INSTALLED_WORKER_MCP_RUNNER_MODULES) {
+    const source = fs.readFileSync(file, "utf8");
+    const structure = parseSourceStructure(source, file);
+    assert.ok(physicalLineCount(source) <= config.budgets.tooling.fileLines);
+    assert.equal(
+      structure.functions.some(
+        (entry) => entry.lines > config.budgets.tooling.functionLines
+      ),
+      false,
+      path.basename(file)
+    );
+  }
+  assert.equal(
+    [...result.errors, ...result.warnings].some((entry) => (
+      entry.code === "reverse-facade-import"
+      && /installed-worker-mcp/u.test(`${entry.file} ${entry.message}`)
+    )),
+    false
+  );
+  assert.deepEqual(config.initialDebt["scripts/test-installed-worker-mcp.mjs"], {
+    category: "tooling",
+    functions: [
+      { initialLines: 467, key: "function:cleanupExactWorkerBoundary#1" },
+      { initialLines: 493, key: "function:qualify#1" },
+      { initialLines: 504, key: "function:runTwoWriterScenario#1" },
+      { initialLines: 445, key: "function:runWriteCancellationScenario#1" },
+      { initialLines: 959, key: "function:runWriteSmokeScenario#1" }
+    ],
+    initialLines: 9698
+  });
+  assert.equal(
+    Object.hasOwn(config.legacyDebt, "scripts/test-installed-worker-mcp.mjs"),
+    false
+  );
+  assert.equal(
+    Object.hasOwn(config.dispositions, "scripts/test-installed-worker-mcp.mjs"),
+    false
+  );
+});
+
 test("checked-in ratchet baseline exactly covers all current file and function debt", () => {
   const config = loadSourceStructurePolicy({ root: ROOT });
   assert.equal(config.mode, "ratchet");
@@ -901,12 +967,13 @@ test("checked-in ratchet baseline exactly covers all current file and function d
     "plugins/grok/scripts/lib/task-contract.mjs",
     "plugins/grok/scripts/session-lifecycle-hook.mjs",
     "plugins/grok/scripts/stop-review-gate-hook.mjs",
-    "scripts/check-source-structure.mjs"
+    "scripts/check-source-structure.mjs",
+    "scripts/test-installed-worker-mcp.mjs"
   ]);
   const result = evaluateSourceStructure({ root: ROOT, config });
   assert.equal(result.ok, true);
-  assert.equal(result.files.length, 263);
-  assert.equal(result.warnings.length, 56);
+  assert.equal(result.files.length, 265);
+  assert.equal(result.warnings.length, 55);
   assert.equal(result.cycles.length, 0);
   assert.equal(result.fragments.length, 14);
   const debtPaths = result.files.filter((entry) => {
@@ -915,8 +982,9 @@ test("checked-in ratchet baseline exactly covers all current file and function d
     return entry.lines > budget.fileLines
       || entry.functions.some((span) => span.lines > budget.functionLines);
   }).map((entry) => entry.file).sort();
-  assert.equal(debtPaths.length, 42);
+  assert.equal(debtPaths.length, 41);
   assert.deepEqual(debtPaths, Object.keys(config.legacyDebt));
+  assert.equal(Object.keys(config.initialDebt).length, 45);
   for (const [file, entry] of Object.entries(config.legacyDebt)) {
     const measured = result.files.find((candidate) => candidate.file === file);
     const fileBudget = config.budgets[entry.category].fileLines;
