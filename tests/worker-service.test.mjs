@@ -5,6 +5,7 @@ import test from "node:test";
 import { pathToFileURL } from "node:url";
 
 import { WORKER_SPAWN_TOOL } from "../plugins/grok/mcp/broker.mjs";
+import { CompanionError } from "../plugins/grok/scripts/lib/errors.mjs";
 import { resolveWorkerAuthority } from "../plugins/grok/scripts/lib/worker-authority.mjs";
 import {
   assertTaskEnvelope,
@@ -18,8 +19,13 @@ import {
 import {
   providerLaunchBindingDigest
 } from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
-import { tryReadJob, updateJob } from "../plugins/grok/scripts/lib/state.mjs";
+import {
+  jobFile,
+  tryReadJob,
+  updateJob
+} from "../plugins/grok/scripts/lib/state.mjs";
 import { createWorkerService } from "../plugins/grok/scripts/lib/worker-service.mjs";
+import { projectWorkerError } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
 import {
   claimWorkerDispatch,
   providerLaunchState,
@@ -201,6 +207,14 @@ function awaitingRoleAdmissionParent(root, env) {
     workerId,
     binding: readHostActionRequestBinding(tryReadJob(root, workerId, env))
   };
+}
+
+function installOversizeGitHook(root, label) {
+  const hooksRoot = path.join(root, ".git", "hooks");
+  fs.mkdirSync(hooksRoot, { recursive: true });
+  const hook = path.join(hooksRoot, `issue55-${label}`);
+  fs.writeFileSync(hook, Buffer.alloc((4 * 1024 * 1024) + 1, 0x61));
+  return hook;
 }
 
 test("Codex MCP authority requires matching per-call identity and a trusted Git workspace", () => {
@@ -692,6 +706,94 @@ test("worker service closes a broker-to-admission receipt race without durable c
   assert.deepEqual(fs.readdirSync(fixture.jobs), []);
 });
 
+test("worker service classifies only fresh context capture failures as incomplete before mutation", () => {
+  const root = initRepo();
+  const fixture = stateFixture(root);
+  const idempotencyRoot = path.join(path.dirname(fixture.jobs), "idempotency");
+  let dispatches = 0;
+
+  for (const thrown of [
+    new Error("raw capture failed at /Users/alice/private providerPid=410030"),
+    new CompanionError(
+      "E_CONTEXT_DRIFT",
+      "typed capture failed at /Users/alice/private providerPid=410031",
+      { privatePath: "/Users/alice/private", providerPid: 410031 }
+    )
+  ]) {
+    const service = createWorkerService({
+      root,
+      principal: { hostKind: "codex", threadId: THREAD_A },
+      env: fixture.env,
+      captureContext() {
+        throw thrown;
+      },
+      dispatchWorker() {
+        dispatches += 1;
+        return { providerLaunchState: "pending", providerLaunched: false };
+      }
+    });
+    let observed = null;
+    try {
+      service.spawn({
+        userRequest: "Reject a failed fresh context capture",
+        idempotencyKey: `service-capture-failure-${thrown instanceof CompanionError ? "typed" : "raw"}`
+      });
+    } catch (error) {
+      observed = error;
+    }
+    assert.equal(observed?.code, "E_CONTEXT_INCOMPLETE");
+    assert.deepEqual(observed?.details, {
+      contextPhase: "admission",
+      metadataComponents: ["contextCapture"]
+    });
+    const projected = projectWorkerError({
+      code: observed.code,
+      message: observed.message,
+      details: observed.details
+    });
+    assert.deepEqual(Object.keys(projected).sort(), ["code", "message"]);
+    assert.match(projected.message, /contextCapture/);
+    const serialized = JSON.stringify({ observed, projected });
+    for (const privateValue of ["/Users/alice", "410030", "410031", "privatePath"]) {
+      assert.equal(serialized.includes(privateValue), false);
+    }
+    assert.deepEqual(fs.readdirSync(fixture.jobs), []);
+    assert.equal(fs.existsSync(idempotencyRoot), false);
+  }
+  assert.equal(dispatches, 0);
+
+  const malformed = {
+    ...captureContextManifest(root),
+    digest: "0".repeat(64)
+  };
+  let captures = 0;
+  const supplied = createWorkerService({
+    root,
+    principal: { hostKind: "codex", threadId: THREAD_A },
+    env: fixture.env,
+    captureContext() {
+      captures += 1;
+      throw new Error("supplied manifests must not trigger fresh capture");
+    },
+    dispatchWorker() {
+      dispatches += 1;
+      return { providerLaunchState: "pending", providerLaunched: false };
+    }
+  });
+  assert.throws(
+    () => supplied.spawn({
+      userRequest: "Reject a malformed supplied context",
+      contextManifest: malformed,
+      idempotencyKey: "service-malformed-supplied-context"
+    }),
+    (error) => error?.code === "E_CONTEXT_DRIFT"
+  );
+  assert.equal(captures, 0);
+  assert.equal(dispatches, 0);
+  assert.deepEqual(fs.readdirSync(fixture.jobs), []);
+  assert.equal(fs.existsSync(idempotencyRoot), false);
+});
+
 test("receipt drift after durable admission leaves a recoverable pending launch outbox", async () => {
   const root = initRepo();
   const fixture = stateFixture(root);
@@ -1028,6 +1130,84 @@ test("WorkerService resolves private decision bindings after owner authorization
   assert.equal(child.role.id, "security");
   assert.equal(child.request.resumeSessionId, FOLLOWUP_SESSION);
   assert.equal(child.request.spawn.providerCapabilityDigest, capabilityDigest);
+});
+
+test("WorkerService rejects incomplete follow-up admission and replay without mutating durable state", () => {
+  const root = initRepo();
+  const fixture = stateFixture(root);
+  const parent = awaitingRoleAdmissionParent(root, fixture.env);
+  let dispatches = 0;
+  const service = createWorkerService({
+    root,
+    principal: parent.principal,
+    env: fixture.env,
+    dispatchWorker() {
+      dispatches += 1;
+      return { providerLaunchState: "pending", providerLaunched: false };
+    }
+  });
+  const decision = service.decideRoleAdmission({
+    id: parent.workerId,
+    requestId: parent.binding.requestId,
+    decision: "grant",
+    idempotencyKey: "service-incomplete-followup-decision"
+  });
+  const request = {
+    id: parent.workerId,
+    grantId: decision.grant.grantId,
+    message: "Perform the bounded security review",
+    idempotencyKey: "service-incomplete-followup-admission"
+  };
+  const parentFile = jobFile(root, parent.workerId, fixture.env);
+  const jobsRoot = path.dirname(parentFile);
+  const beforeAdmission = fs.readFileSync(parentFile);
+  const admissionHook = installOversizeGitHook(root, "followup-admission");
+  assert.throws(
+    () => service.followup(request),
+    (error) => error?.code === "E_CONTEXT_INCOMPLETE"
+      && error?.details?.contextPhase === "resume"
+      && error?.details?.metadataComponents?.includes("hooks")
+  );
+  assert.equal(dispatches, 0);
+  assert.equal(fs.readFileSync(parentFile).equals(beforeAdmission), true);
+  assert.deepEqual(fs.readdirSync(jobsRoot), [`${parent.workerId}.json`]);
+  fs.unlinkSync(admissionHook);
+
+  const admitted = service.followup(request);
+  assert.equal(dispatches, 1);
+  const childFile = jobFile(root, admitted.handle.id, fixture.env);
+  const childBytes = fs.readFileSync(childFile);
+  const parentBytes = fs.readFileSync(parentFile);
+  const followupSidecarRoot = path.join(
+    path.dirname(jobsRoot),
+    "idempotency",
+    "followup"
+  );
+  const sidecarNames = fs.readdirSync(followupSidecarRoot).sort();
+  assert.equal(sidecarNames.length, 1);
+  const sidecarBytes = sidecarNames.map((name) => ({
+    name,
+    bytes: fs.readFileSync(path.join(followupSidecarRoot, name))
+  }));
+
+  const replayHook = installOversizeGitHook(root, "followup-replay");
+  assert.throws(
+    () => service.followup(request),
+    (error) => error?.code === "E_CONTEXT_INCOMPLETE"
+      && error?.details?.contextPhase === "resume"
+      && error?.details?.metadataComponents?.includes("hooks")
+  );
+  assert.equal(dispatches, 1);
+  assert.equal(fs.readFileSync(parentFile).equals(parentBytes), true);
+  assert.equal(fs.readFileSync(childFile).equals(childBytes), true);
+  assert.deepEqual(fs.readdirSync(followupSidecarRoot).sort(), sidecarNames);
+  for (const sidecar of sidecarBytes) {
+    assert.equal(
+      fs.readFileSync(path.join(followupSidecarRoot, sidecar.name)).equals(sidecar.bytes),
+      true
+    );
+  }
+  fs.unlinkSync(replayHook);
 });
 
 test("WorkerService preserves a committed followup outbox when capability expires at dispatch", () => {

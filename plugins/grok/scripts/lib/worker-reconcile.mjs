@@ -274,7 +274,7 @@ export function reconcileOwnedWorkers({
       const outcomeChanged = finalStatus !== intendedTerminal.status
         || selectedError?.code !== intendedTerminal.error?.code
         || selectedError?.message !== intendedTerminal.error?.message;
-      const finalPhase = selectedError?.code === "E_CONTEXT_DRIFT"
+      const finalPhase = ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(selectedError?.code)
         ? "context-rejected"
         : selectedError?.code === "E_SCOPE_VIOLATION"
           ? "scope-rejected"
@@ -282,10 +282,7 @@ export function reconcileOwnedWorkers({
             ? finalStatus
             : intendedTerminal.phase;
       const settledAt = now();
-      const finalCompletedAt = [
-        "E_CONTEXT_DRIFT",
-        "E_SCOPE_VIOLATION"
-      ].includes(selectedError?.code)
+      const finalCompletedAt = ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE", "E_SCOPE_VIOLATION"].includes(selectedError?.code)
         ? settledAt
         : intendedTerminal.completedAt;
       const finalSummary = outcomeChanged

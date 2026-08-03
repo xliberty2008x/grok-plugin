@@ -67,6 +67,19 @@ Status: hardening candidate; not release-qualified.
   stable Grok 0.2.112 build used for development did not advertise the
   workflow commands in an isolated ACP session, so real completion,
   cancellation, and crash/restart remain unqualified on that build.
+- Fixed incomplete Git-context observation being misreported as workspace
+  drift after task acceptance. New ContextManifest v2 captures authenticate
+  bounded completeness for non-ref metadata, operational state, hooks, config,
+  index flags, refs, and configured upstream, cross-bound to the existing
+  shared-ref identity. Initial incompleteness now fails before durable direct
+  or broker acceptance; execute, resume, replay, managed-write, and terminal
+  checks return `E_CONTEXT_INCOMPLETE` with only the bounded phase and component
+  names. Comparable identity changes, malformed stored authority, and concrete
+  scope violations retain drift/scope precedence. Genuine v1 and complete old
+  v2 records remain compatible; incomplete old v2 records use the generic
+  `gitMetadata` component. Runtime evidence keeps issue #34's
+  `sharedRefObservation` unchanged and adds a separate completeness observation;
+  durable public incomplete errors selectively use error schema v2.
 - Fixed linked-worktree ContextManifest Git-metadata comparison so provably
   unrelated shared-ref churn (other local branches, unrelated remote-tracking
   refs, and `refs/codex/turn-diffs/**`) no longer surfaces as out-of-scope

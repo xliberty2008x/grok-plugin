@@ -22,6 +22,11 @@ import {
 } from "../plugins/grok/scripts/lib/task-contract.mjs";
 import { validateReview, REVIEW_SCHEMA } from "../plugins/grok/scripts/lib/grok-provider.mjs";
 import { processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
+import {
+  jobFile,
+  tryReadJob,
+  updateJob
+} from "../plugins/grok/scripts/lib/state.mjs";
 import { STDIN_READY_MARKER } from "../plugins/grok/scripts/lib/stdin.mjs";
 import {
   initRepo,
@@ -110,6 +115,25 @@ for (const method of ["only", "skip", "todo"]) {
 /** Provider lifecycle needs process start tokens via `ps`; some sandboxes deny that. */
 const PROVIDER_LIFECYCLE_AVAILABLE = Boolean(processStartToken(process.pid));
 
+function assertGitMetadataIncomplete(preContext, postContext, component = null) {
+  const changedPaths = observeChangedPaths(preContext, postContext);
+  assert.ok(changedPaths.includes("[GIT_METADATA_INCOMPLETE]"));
+  assert.equal(changedPaths.includes("[GIT_METADATA]"), false);
+  const evidence = buildRuntimeEvidence({
+    preContext,
+    postContext,
+    changedPaths
+  });
+  assert.equal(evidence.sharedRefObservation, undefined);
+  assert.equal(evidence.metadataCompletenessObservation?.complete, false);
+  if (component) {
+    assert.ok(
+      evidence.metadataCompletenessObservation.metadataComponents.includes(component)
+    );
+  }
+  return evidence;
+}
+
 function fixture(config = {}) {
   const data = tempDir("grok-cp-data-");
   const fake = installFakeGrok(tempDir("grok-cp-fake-"), config);
@@ -143,6 +167,18 @@ function stableDigestForTest(value) {
     .createHash("sha256")
     .update(JSON.stringify(canonicalizeForDigest(value)))
     .digest("hex");
+}
+
+function rebindContextManifestForTest(value) {
+  const body = structuredClone(value);
+  delete body.manifestId;
+  delete body.digest;
+  const digest = stableDigestForTest(body);
+  return {
+    ...body,
+    manifestId: `ctx-${digest.slice(0, 24)}`,
+    digest
+  };
 }
 
 function workerReport(overrides = {}) {
@@ -218,6 +254,20 @@ test("ContextManifest captures workspace identity and E_CONTEXT_DRIFT is stable"
   assert.ok(manifest.git.dirtyDigest);
   assert.match(manifest.digest, /^[a-f0-9]{64}$/);
   assert.match(manifest.manifestId, /^ctx-[a-f0-9]{24}$/);
+  assert.deepEqual(
+    Object.keys(manifest.git.taskRelevantMetadataObservation).sort(),
+    ["complete", "components", "schemaVersion"]
+  );
+  assert.deepEqual(
+    Object.keys(manifest.git.taskRelevantMetadataObservation.components).sort(),
+    ["config", "hooks", "indexFlags", "nonRef", "operational", "refs", "upstream"]
+  );
+  assert.equal(manifest.git.taskRelevantMetadataObservation.schemaVersion, 1);
+  assert.equal(manifest.git.taskRelevantMetadataObservation.complete, true);
+  assert.equal(
+    manifest.git.taskRelevantMetadataObservation.complete,
+    manifest.git.sharedRefIdentity.complete
+  );
   assert.equal(assertContextManifestIntegrity(manifest), manifest);
   assert.equal(
     assertContextCompatible(root, manifest, { mode: "execute" }),
@@ -255,6 +305,76 @@ test("ContextManifest captures workspace identity and E_CONTEXT_DRIFT is stable"
     (error) => error?.code === "E_CONTEXT_DRIFT"
       && /legacy resume/i.test(error.message)
   );
+
+  const oldV2Body = structuredClone(manifest);
+  delete oldV2Body.git.taskRelevantMetadataObservation;
+  const oldV2 = rebindContextManifestForTest(oldV2Body);
+  assert.doesNotThrow(
+    () => assertContextCompatible(root, oldV2, { mode: "execute" })
+  );
+  const oldV2Incomplete = rebindContextManifestForTest({
+    ...oldV2,
+    git: {
+      ...oldV2.git,
+      sharedRefIdentity: {
+        ...oldV2.git.sharedRefIdentity,
+        complete: false,
+        attributable: false,
+        taskRelevantRefs: [],
+        unrelatedRefs: []
+      }
+    }
+  });
+  assert.throws(
+    () => assertContextCompatible(root, oldV2Incomplete, { mode: "resume" }),
+    (error) => error?.code === "E_CONTEXT_INCOMPLETE"
+      && error.details?.contextPhase === "resume"
+      && JSON.stringify(error.details?.metadataComponents) === JSON.stringify(["gitMetadata"])
+  );
+
+  const crossBound = rebindContextManifestForTest({
+    ...manifest,
+    git: {
+      ...manifest.git,
+      taskRelevantMetadataObservation: {
+        ...manifest.git.taskRelevantMetadataObservation,
+        complete: false,
+        components: {
+          ...manifest.git.taskRelevantMetadataObservation.components,
+          refs: "incomplete"
+        }
+      }
+    }
+  });
+  assert.throws(
+    () => assertContextManifestIntegrity(crossBound),
+    (error) => error?.code === "E_CONTEXT_DRIFT"
+      && error.details?.reasons?.includes("manifestIntegrity")
+  );
+  const orphanObservation = structuredClone(manifest);
+  delete orphanObservation.git.taskRelevantMetadataIdentity;
+  delete orphanObservation.git.sharedRefIdentity;
+  assert.throws(
+    () => assertContextManifestIntegrity(
+      rebindContextManifestForTest(orphanObservation)
+    ),
+    (error) => error?.code === "E_CONTEXT_DRIFT"
+      && error.details?.reasons?.includes("manifestIntegrity")
+  );
+
+  const transientHook = path.join(root, ".git", "hooks", "issue55-oversize");
+  fs.writeFileSync(transientHook, Buffer.alloc((4 * 1024 * 1024) + 1, 0x61));
+  try {
+    assert.throws(
+      () => assertContextCompatible(root, manifest, { mode: "resume" }),
+      (error) => error?.code === "E_CONTEXT_INCOMPLETE"
+        && error.details?.contextPhase === "resume"
+        && JSON.stringify(error.details?.metadataComponents) === JSON.stringify(["hooks"])
+        && !/drifted|different checkout/i.test(error.message)
+    );
+  } finally {
+    fs.unlinkSync(transientHook);
+  }
 });
 
 test("ContextManifest capturedAt is authenticated with an explicit legacy version boundary", () => {
@@ -290,6 +410,7 @@ test("ContextManifest capturedAt is authenticated with an explicit legacy versio
   legacyBody.schemaVersion = 1;
   delete legacyBody.git.taskRelevantMetadataIdentity;
   delete legacyBody.git.sharedRefIdentity;
+  delete legacyBody.git.taskRelevantMetadataObservation;
   const legacyDigest = stableDigestForTest(legacyBody);
   const legacy = {
     ...legacyBody,
@@ -821,16 +942,8 @@ test("effective core.hooksPath contents are task-relevant without exposing paths
     const afterUnreadable = captureContextManifest(root);
     assert.equal(afterUnreadable.git.sharedRefIdentity.complete, false);
     assert.equal(afterUnreadable.git.sharedRefIdentity.attributable, false);
-    assert.ok(observeChangedPaths(beforeUnreadable, afterUnreadable).includes("[GIT_METADATA]"));
-    assert.ok(observeChangedPaths(afterUnreadable, afterUnreadable).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterUnreadable,
-        postContext: afterUnreadable,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(beforeUnreadable, afterUnreadable, "hooks");
+    assertGitMetadataIncomplete(afterUnreadable, afterUnreadable, "hooks");
     const unreadableSerialized = JSON.stringify(buildRuntimeEvidence({
       preContext: beforeUnreadable,
       postContext: afterUnreadable,
@@ -890,16 +1003,8 @@ test("effective hooksPath directory symlink and cycle-safe target follow (issue 
   fs.symlinkSync(brokenTarget, path.join(realHooks, "broken-hook"));
   const afterBroken = captureContextManifest(root);
   assert.equal(afterBroken.git.sharedRefIdentity.complete, false);
-  assert.ok(observeChangedPaths(beforeBroken, afterBroken).includes("[GIT_METADATA]"));
-  assert.ok(observeChangedPaths(afterBroken, afterBroken).includes("[GIT_METADATA]"));
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: afterBroken,
-      postContext: afterBroken,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(beforeBroken, afterBroken, "hooks");
+  assertGitMetadataIncomplete(afterBroken, afterBroken, "hooks");
   assert.equal(JSON.stringify(buildRuntimeEvidence({
     preContext: beforeBroken,
     postContext: afterBroken,
@@ -915,16 +1020,8 @@ test("effective hooksPath directory symlink and cycle-safe target follow (issue 
   const afterCycle = captureContextManifest(root);
   assert.equal(afterCycle.git.sharedRefIdentity.complete, false);
   assert.equal(afterCycle.git.sharedRefIdentity.attributable, false);
-  assert.ok(observeChangedPaths(beforeCycle, afterCycle).includes("[GIT_METADATA]"));
-  assert.ok(observeChangedPaths(afterCycle, afterCycle).includes("[GIT_METADATA]"));
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: afterCycle,
-      postContext: afterCycle,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(beforeCycle, afterCycle, "hooks");
+  assertGitMetadataIncomplete(afterCycle, afterCycle, "hooks");
   const cycleSerialized = JSON.stringify(buildRuntimeEvidence({
     preContext: beforeCycle,
     postContext: afterCycle,
@@ -1187,15 +1284,8 @@ test("top-level optional root present/absent races fail closed; stable absence r
     assert.equal(fs.existsSync(mergeHeadPath), true);
     assert.equal(afterAppearRace.git.sharedRefIdentity.complete, false);
     assert.equal(afterAppearRace.git.sharedRefIdentity.attributable, false);
-    assert.ok(observeChangedPaths(baseline, afterAppearRace).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterAppearRace,
-        postContext: afterAppearRace,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(baseline, afterAppearRace, "operational");
+    assertGitMetadataIncomplete(afterAppearRace, afterAppearRace, "operational");
     // Must not publish the stale complete baseline identity under a race.
     assert.notEqual(
       afterAppearRace.git.taskRelevantMetadataIdentity,
@@ -1245,15 +1335,8 @@ test("top-level optional root present/absent races fail closed; stable absence r
     assert.equal(fs.existsSync(mergeHeadPath), false);
     assert.equal(afterRemovalRace.git.sharedRefIdentity.complete, false);
     assert.equal(afterRemovalRace.git.sharedRefIdentity.attributable, false);
-    assert.ok(observeChangedPaths(presentBaseline, afterRemovalRace).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterRemovalRace,
-        postContext: afterRemovalRace,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(presentBaseline, afterRemovalRace, "operational");
+    assertGitMetadataIncomplete(afterRemovalRace, afterRemovalRace, "operational");
   } finally {
     fs.lstatSync = originalLstatSync;
   }
@@ -1324,14 +1407,7 @@ test("top-level optional root present/absent races fail closed; stable absence r
     );
     assert.equal(afterHooksAppear.git.sharedRefIdentity.complete, false);
     assert.equal(afterHooksAppear.git.sharedRefIdentity.attributable, false);
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterHooksAppear,
-        postContext: afterHooksAppear,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(afterHooksAppear, afterHooksAppear, "hooks");
     const hooksEvidence = JSON.stringify(buildRuntimeEvidence({
       preContext: missingHooksBaseline,
       postContext: afterHooksAppear,
@@ -1475,14 +1551,7 @@ test("bisect control inventory binds BISECT_HEAD/NAMES/FIRST_PARENT/ANCESTORS_OK
   const malformedRoot = captureContextManifest(linkedRoot);
   assert.equal(malformedRoot.git.sharedRefIdentity.complete, false);
   assert.equal(malformedRoot.git.sharedRefIdentity.attributable, false);
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: malformedRoot,
-      postContext: malformedRoot,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(malformedRoot, malformedRoot, "operational");
   assert.equal(
     JSON.stringify(buildRuntimeEvidence({
       preContext: before,
@@ -1694,15 +1763,8 @@ test("broken file refs and dangling symbolic refs fail closed (issue #34)", () =
   const afterBroken = captureContextManifest(root);
   assert.equal(afterBroken.git.sharedRefIdentity.complete, false);
   assert.equal(afterBroken.git.sharedRefIdentity.attributable, false);
-  assert.ok(observeChangedPaths(before, afterBroken).includes("[GIT_METADATA]"));
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: afterBroken,
-      postContext: afterBroken,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(before, afterBroken, "refs");
+  assertGitMetadataIncomplete(afterBroken, afterBroken, "refs");
   // Linked tolerance must not apply to broken inventories.
   const linkedBroken = {
     git: {
@@ -1710,14 +1772,7 @@ test("broken file refs and dangling symbolic refs fail closed (issue #34)", () =
       linkedWorktree: true
     }
   };
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: linkedBroken,
-      postContext: linkedBroken,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(linkedBroken, linkedBroken, "refs");
   const brokenEvidence = JSON.stringify(buildRuntimeEvidence({
     preContext: before,
     postContext: afterBroken,
@@ -1733,15 +1788,8 @@ test("broken file refs and dangling symbolic refs fail closed (issue #34)", () =
   const afterDangling = captureContextManifest(root);
   assert.equal(afterDangling.git.sharedRefIdentity.complete, false);
   assert.equal(afterDangling.git.sharedRefIdentity.attributable, false);
-  assert.ok(observeChangedPaths(before, afterDangling).includes("[GIT_METADATA]"));
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: afterDangling,
-      postContext: afterDangling,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(before, afterDangling, "refs");
+  assertGitMetadataIncomplete(afterDangling, afterDangling, "refs");
   const danglingEvidence = JSON.stringify(buildRuntimeEvidence({
     preContext: before,
     postContext: afterDangling,
@@ -1758,14 +1806,7 @@ test("broken file refs and dangling symbolic refs fail closed (issue #34)", () =
   const afterSymlink = captureContextManifest(root);
   assert.equal(afterSymlink.git.sharedRefIdentity.complete, false);
   assert.equal(afterSymlink.git.sharedRefIdentity.attributable, false);
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: afterSymlink,
-      postContext: afterSymlink,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(afterSymlink, afterSymlink, "refs");
   const symlinkEvidence = JSON.stringify(buildRuntimeEvidence({
     preContext: before,
     postContext: afterSymlink,
@@ -1835,9 +1876,7 @@ test("linked worktree-private refs are bounded, effective, and fail closed when 
       const malformed = captureContextManifest(linkedRoot);
       assert.equal(malformed.git.sharedRefIdentity.complete, false);
       assert.equal(malformed.git.sharedRefIdentity.attributable, false);
-      assert.ok(
-        observeChangedPaths(baseline, malformed).includes("[GIT_METADATA]")
-      );
+      assertGitMetadataIncomplete(baseline, malformed, "refs");
       const evidence = JSON.stringify(buildRuntimeEvidence({
         preContext: baseline,
         postContext: malformed,
@@ -1979,15 +2018,8 @@ test("semantic ref target mutation between inventories fails closed (issue #34 A
       baselineIdentity,
       "must not return the baseline complete identity after a raced target mutation"
     );
-    assert.ok(observeChangedPaths(baseline, afterRace).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterRace,
-        postContext: afterRace,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(baseline, afterRace, "refs");
+    assertGitMetadataIncomplete(afterRace, afterRace, "refs");
     const evidence = JSON.stringify(buildRuntimeEvidence({
       preContext: baseline,
       postContext: afterRace,
@@ -2057,7 +2089,7 @@ test("dangling loose symref injected after the first stable scan fails closed (i
   assert.ok(mainRefOpens >= 4);
   assert.equal(raced.git.sharedRefIdentity.complete, false);
   assert.equal(raced.git.sharedRefIdentity.attributable, false);
-  assert.ok(observeChangedPaths(baseline, raced).includes("[GIT_METADATA]"));
+  assertGitMetadataIncomplete(baseline, raced, "refs");
   const evidence = JSON.stringify(buildRuntimeEvidence({
     preContext: baseline,
     postContext: raced,
@@ -2141,18 +2173,11 @@ test("reftable BISECT_HEAD DWIM tag ambiguity fails closed (issue #34 AC-2)", ()
       tagOnly.git.taskRelevantMetadataIdentity,
       "root BISECT_HEAD create must change identity when tag already exists"
     );
+    assert.ok(observeChangedPaths(tagOnly, both).includes("[GIT_METADATA]"));
   } else {
     assert.equal(both.git.sharedRefIdentity.attributable, false);
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: both,
-        postContext: both,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(tagOnly, both, "operational");
   }
-  assert.ok(observeChangedPaths(tagOnly, both).includes("[GIT_METADATA]"));
 
   // Root removal must not leave a DWIM tag resolution that pretends root still exists.
   git(root, "update-ref", "-d", "BISECT_HEAD");
@@ -2173,7 +2198,7 @@ test("reftable BISECT_HEAD DWIM tag ambiguity fails closed (issue #34 AC-2)", ()
   const evidence = JSON.stringify(buildRuntimeEvidence({
     preContext: tagOnly,
     postContext: both,
-    changedPaths: ["[GIT_METADATA]"]
+    changedPaths: observeChangedPaths(tagOnly, both)
   }));
   assert.equal(evidence.includes("BISECT_HEAD"), false);
   assert.equal(evidence.includes(path.join(root, ".git")), false);
@@ -2319,15 +2344,8 @@ test("ordinary hooksPath ancestor swapped to symlink fails closed (issue #34 AC-
       "ordinary→symlink swap during capture must fail closed"
     );
     assert.equal(afterRace.git.sharedRefIdentity.attributable, false);
-    assert.ok(observeChangedPaths(midBaseline, afterRace).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterRace,
-        postContext: afterRace,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(midBaseline, afterRace, "hooks");
+    assertGitMetadataIncomplete(afterRace, afterRace, "hooks");
     const evidence = JSON.stringify(buildRuntimeEvidence({
       preContext: midBaseline,
       postContext: afterRace,
@@ -2653,15 +2671,8 @@ test("oversize reftable marker and loose ref bodies fail closed with bounded rea
     const afterLoose = captureContextManifest(root);
     assert.equal(afterLoose.git.sharedRefIdentity.complete, false);
     assert.equal(afterLoose.git.sharedRefIdentity.attributable, false);
-    assert.ok(observeChangedPaths(baseline, afterLoose).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterLoose,
-        postContext: afterLoose,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(baseline, afterLoose, "refs");
+    assertGitMetadataIncomplete(afterLoose, afterLoose, "refs");
     assert.equal(
       readFileSyncOnRefs,
       false,
@@ -3237,16 +3248,8 @@ test("operational and non-ref symlink target contents bind identity (issue #34 A
   const afterBroken = captureContextManifest(root);
   assert.equal(afterBroken.git.sharedRefIdentity.complete, false);
   assert.equal(afterBroken.git.sharedRefIdentity.attributable, false);
-  assert.ok(observeChangedPaths(beforeBroken, afterBroken).includes("[GIT_METADATA]"));
-  assert.ok(observeChangedPaths(afterBroken, afterBroken).includes("[GIT_METADATA]"));
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: afterBroken,
-      postContext: afterBroken,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(beforeBroken, afterBroken, "operational");
+  assertGitMetadataIncomplete(afterBroken, afterBroken, "operational");
   assert.equal(JSON.stringify(buildRuntimeEvidence({
     preContext: beforeBroken,
     postContext: afterBroken,
@@ -3267,15 +3270,7 @@ test("operational and non-ref symlink target contents bind identity (issue #34 A
   fs.symlinkSync("cycle-a", excludePath);
   const afterCycle = captureContextManifest(root);
   assert.equal(afterCycle.git.sharedRefIdentity.complete, false);
-  assert.ok(observeChangedPaths(afterCycle, afterCycle).includes("[GIT_METADATA]"));
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: afterCycle,
-      postContext: afterCycle,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(afterCycle, afterCycle, "nonRef");
   const cycleSerialized = JSON.stringify(buildRuntimeEvidence({
     preContext: beforeBroken,
     postContext: afterCycle,
@@ -3370,15 +3365,8 @@ test("metadata hashing and directory walks enforce hard byte/entry bounds (issue
   const afterOversize = captureContextManifest(root);
   assert.equal(afterOversize.git.sharedRefIdentity.complete, false);
   assert.equal(afterOversize.git.sharedRefIdentity.attributable, false);
-  assert.ok(observeChangedPaths(first, afterOversize).includes("[GIT_METADATA]"));
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: afterOversize,
-      postContext: afterOversize,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(first, afterOversize, "hooks");
+  assertGitMetadataIncomplete(afterOversize, afterOversize, "hooks");
   assert.equal(JSON.stringify(afterOversize).includes(externalHooks), false);
   assert.equal(JSON.stringify(afterOversize).includes("oversize-hook"), false);
   fs.unlinkSync(oversizePath);
@@ -3395,15 +3383,8 @@ test("metadata hashing and directory walks enforce hard byte/entry bounds (issue
   );
   assert.equal(afterEntries.git.sharedRefIdentity.complete, false);
   assert.equal(afterEntries.git.sharedRefIdentity.attributable, false);
-  assert.ok(observeChangedPaths(first, afterEntries).includes("[GIT_METADATA]"));
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: afterEntries,
-      postContext: afterEntries,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(first, afterEntries, "hooks");
+  assertGitMetadataIncomplete(afterEntries, afterEntries, "hooks");
   const entriesSerialized = JSON.stringify(buildRuntimeEvidence({
     preContext: first,
     postContext: afterEntries,
@@ -3435,15 +3416,8 @@ test("metadata hashing and directory walks enforce hard byte/entry bounds (issue
     "s"
   );
   assert.equal(afterOp.git.sharedRefIdentity.complete, false);
-  assert.ok(observeChangedPaths(beforeOp, afterOp).includes("[GIT_METADATA]"));
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: afterOp,
-      postContext: afterOp,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(beforeOp, afterOp, "operational");
+  assertGitMetadataIncomplete(afterOp, afterOp, "operational");
   assert.equal(JSON.stringify(afterOp).includes(sequencer), false);
 });
 
@@ -3532,15 +3506,8 @@ test("metadata hashing fails closed on path replacement and same-size mutation (
     const afterReplace = captureContextManifest(root);
     assert.equal(afterReplace.git.sharedRefIdentity.complete, false);
     assert.equal(afterReplace.git.sharedRefIdentity.attributable, false);
-    assert.ok(observeChangedPaths(baseline, afterReplace).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterReplace,
-        postContext: afterReplace,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(baseline, afterReplace, "hooks");
+    assertGitMetadataIncomplete(afterReplace, afterReplace, "hooks");
     assert.equal(JSON.stringify(afterReplace).includes(externalHooks), false);
     assert.equal(JSON.stringify(afterReplace).includes("race-hook"), false);
     assert.equal(JSON.stringify(afterReplace).includes(".race-hook-replacement"), false);
@@ -3586,15 +3553,8 @@ test("metadata hashing fails closed on path replacement and same-size mutation (
     assert.equal(mutatedDuringRead, true, "harness must inject during the first production read");
     assert.equal(afterMutation.git.sharedRefIdentity.complete, false);
     assert.equal(afterMutation.git.sharedRefIdentity.attributable, false);
-    assert.ok(observeChangedPaths(mid, afterMutation).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterMutation,
-        postContext: afterMutation,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(mid, afterMutation, "hooks");
+    assertGitMetadataIncomplete(afterMutation, afterMutation, "hooks");
     assert.equal(JSON.stringify(afterMutation).includes(externalHooks), false);
   } finally {
     restoreFs();
@@ -3623,14 +3583,7 @@ test("metadata hashing fails closed on path replacement and same-size mutation (
   try {
     const afterSymlink = captureContextManifest(root);
     assert.equal(afterSymlink.git.sharedRefIdentity.complete, false);
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterSymlink,
-        postContext: afterSymlink,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(afterSymlink, afterSymlink, "hooks");
     assert.equal(JSON.stringify(afterSymlink).includes(symlinkTarget), false);
     assert.equal(JSON.stringify(afterSymlink).includes(externalHooks), false);
   } finally {
@@ -3705,15 +3658,8 @@ test("symlink hop revalidation fails closed on file/dir retarget races (issue #3
     assert.equal(fileRetargeted, true, "harness must retarget file hop during open of old target");
     assert.equal(afterFileRace.git.sharedRefIdentity.complete, false);
     assert.equal(afterFileRace.git.sharedRefIdentity.attributable, false);
-    assert.ok(observeChangedPaths(beforeFile, afterFileRace).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterFileRace,
-        postContext: afterFileRace,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(beforeFile, afterFileRace, "hooks");
+    assertGitMetadataIncomplete(afterFileRace, afterFileRace, "hooks");
     const fileRaceSerialized = JSON.stringify(afterFileRace);
     assert.equal(fileRaceSerialized.includes(targetA), false);
     assert.equal(fileRaceSerialized.includes(targetB), false);
@@ -3785,15 +3731,8 @@ test("symlink hop revalidation fails closed on file/dir retarget races (issue #3
     assert.equal(dirRetargeted, true, "harness must retarget directory hop during traversal");
     assert.equal(afterDirRace.git.sharedRefIdentity.complete, false);
     assert.equal(afterDirRace.git.sharedRefIdentity.attributable, false);
-    assert.ok(observeChangedPaths(beforeDir, afterDirRace).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterDirRace,
-        postContext: afterDirRace,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(beforeDir, afterDirRace, "hooks");
+    assertGitMetadataIncomplete(afterDirRace, afterDirRace, "hooks");
     const dirRaceSerialized = JSON.stringify(afterDirRace);
     assert.equal(dirRaceSerialized.includes(hooksDirA), false);
     assert.equal(dirRaceSerialized.includes(hooksDirB), false);
@@ -3914,15 +3853,8 @@ test("ordinary non-symlink directory growth and listed-child disappearance fail 
     assert.equal(growthInjected, true, "harness must inject directory growth after EOF");
     assert.equal(afterGrowth.git.sharedRefIdentity.complete, false);
     assert.equal(afterGrowth.git.sharedRefIdentity.attributable, false);
-    assert.ok(observeChangedPaths(emptyBaseline, afterGrowth).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterGrowth,
-        postContext: afterGrowth,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(emptyBaseline, afterGrowth, "hooks");
+    assertGitMetadataIncomplete(afterGrowth, afterGrowth, "hooks");
     const growthEvidence = JSON.stringify(buildRuntimeEvidence({
       preContext: emptyBaseline,
       postContext: afterGrowth,
@@ -3966,15 +3898,8 @@ test("ordinary non-symlink directory growth and listed-child disappearance fail 
     assert.equal(childRemoved, true, "harness must remove listed child during capture");
     assert.equal(afterRemoval.git.sharedRefIdentity.complete, false);
     assert.equal(afterRemoval.git.sharedRefIdentity.attributable, false);
-    assert.ok(observeChangedPaths(listedBaseline, afterRemoval).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterRemoval,
-        postContext: afterRemoval,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(listedBaseline, afterRemoval, "hooks");
+    assertGitMetadataIncomplete(afterRemoval, afterRemoval, "hooks");
     const removalEvidence = JSON.stringify(buildRuntimeEvidence({
       preContext: listedBaseline,
       postContext: afterRemoval,
@@ -4068,19 +3993,13 @@ test("ordinary file mode at open and sibling-after-hash drift fail closed (issue
       modeBaseline.git.taskRelevantMetadataIdentity,
       "mode-at-open must not publish stale pre-open mode identity"
     );
-    assert.ok(observeChangedPaths(modeBaseline, afterModeRace).includes("[GIT_METADATA]"));
     if (afterModeRace.git.sharedRefIdentity.complete === false) {
       assert.equal(afterModeRace.git.sharedRefIdentity.attributable, false);
-      assert.equal(
-        buildRuntimeEvidence({
-          preContext: afterModeRace,
-          postContext: afterModeRace,
-          changedPaths: ["[GIT_METADATA]"]
-        }).sharedRefObservation.classification,
-        "fail_closed"
-      );
+      assertGitMetadataIncomplete(modeBaseline, afterModeRace, "hooks");
+      assertGitMetadataIncomplete(afterModeRace, afterModeRace, "hooks");
     } else {
       // Complete with bound mode: still task-relevant drift vs baseline.
+      assert.ok(observeChangedPaths(modeBaseline, afterModeRace).includes("[GIT_METADATA]"));
       assert.equal(
         buildRuntimeEvidence({
           preContext: modeBaseline,
@@ -4186,15 +4105,8 @@ test("ordinary file mode at open and sibling-after-hash drift fail closed (issue
     );
     assert.equal(afterSiblingRace.git.sharedRefIdentity.complete, false);
     assert.equal(afterSiblingRace.git.sharedRefIdentity.attributable, false);
-    assert.ok(observeChangedPaths(siblingBaseline, afterSiblingRace).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterSiblingRace,
-        postContext: afterSiblingRace,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(siblingBaseline, afterSiblingRace, "hooks");
+    assertGitMetadataIncomplete(afterSiblingRace, afterSiblingRace, "hooks");
     const siblingEvidence = JSON.stringify(buildRuntimeEvidence({
       preContext: siblingBaseline,
       postContext: afterSiblingRace,
@@ -4267,15 +4179,8 @@ test("ordinary file mode at open and sibling-after-hash drift fail closed (issue
     );
     assert.equal(afterSiblingMode.git.sharedRefIdentity.complete, false);
     assert.equal(afterSiblingMode.git.sharedRefIdentity.attributable, false);
-    assert.ok(observeChangedPaths(siblingModeBaseline, afterSiblingMode).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterSiblingMode,
-        postContext: afterSiblingMode,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(siblingModeBaseline, afterSiblingMode, "hooks");
+    assertGitMetadataIncomplete(afterSiblingMode, afterSiblingMode, "hooks");
     const modeSiblingEvidence = JSON.stringify(buildRuntimeEvidence({
       preContext: siblingModeBaseline,
       postContext: afterSiblingMode,
@@ -4375,15 +4280,8 @@ test("ordinary file mode at open and sibling-after-hash drift fail closed (issue
     );
     assert.equal(afterLinkSibling.git.sharedRefIdentity.complete, false);
     assert.equal(afterLinkSibling.git.sharedRefIdentity.attributable, false);
-    assert.ok(observeChangedPaths(linkSiblingBaseline, afterLinkSibling).includes("[GIT_METADATA]"));
-    assert.equal(
-      buildRuntimeEvidence({
-        preContext: afterLinkSibling,
-        postContext: afterLinkSibling,
-        changedPaths: ["[GIT_METADATA]"]
-      }).sharedRefObservation.classification,
-      "fail_closed"
-    );
+    assertGitMetadataIncomplete(linkSiblingBaseline, afterLinkSibling, "hooks");
+    assertGitMetadataIncomplete(afterLinkSibling, afterLinkSibling, "hooks");
     const linkEvidence = JSON.stringify(buildRuntimeEvidence({
       preContext: linkSiblingBaseline,
       postContext: afterLinkSibling,
@@ -4428,15 +4326,8 @@ test("legacy metadataIdentity bounds default hooks and refs without unbounded wa
   const afterHooksFlood = captureContextManifest(root);
   assert.equal(afterHooksFlood.git.sharedRefIdentity.complete, false);
   assert.equal(afterHooksFlood.git.sharedRefIdentity.attributable, false);
-  assert.ok(observeChangedPaths(baseline, afterHooksFlood).includes("[GIT_METADATA]"));
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: afterHooksFlood,
-      postContext: afterHooksFlood,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(baseline, afterHooksFlood, "hooks");
+  assertGitMetadataIncomplete(afterHooksFlood, afterHooksFlood, "hooks");
   // Legacy identity must also change under truncation/fail-closed (not hang).
   assert.notEqual(afterHooksFlood.git.metadataIdentity, baseline.git.metadataIdentity);
   const hooksFloodEvidence = JSON.stringify(buildRuntimeEvidence({
@@ -4478,7 +4369,8 @@ test("legacy metadataIdentity bounds default hooks and refs without unbounded wa
     mid.git.metadataIdentity,
     "legacy metadataIdentity must bound default refs walks"
   );
-  assert.ok(observeChangedPaths(mid, afterRefsFlood).includes("[GIT_METADATA]"));
+  assertGitMetadataIncomplete(mid, afterRefsFlood, "refs");
+  assertGitMetadataIncomplete(afterRefsFlood, afterRefsFlood, "refs");
   const refsEvidence = JSON.stringify(buildRuntimeEvidence({
     preContext: mid,
     postContext: afterRefsFlood,
@@ -4513,15 +4405,8 @@ test("legacy metadataIdentity bounds default hooks and refs without unbounded wa
   const afterOversizeDefault = captureContextManifest(root);
   assert.equal(afterOversizeDefault.git.sharedRefIdentity.complete, false);
   assert.notEqual(afterOversizeDefault.git.metadataIdentity, afterRefsCleanup.git.metadataIdentity);
-  assert.ok(observeChangedPaths(afterRefsCleanup, afterOversizeDefault).includes("[GIT_METADATA]"));
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: afterOversizeDefault,
-      postContext: afterOversizeDefault,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(afterRefsCleanup, afterOversizeDefault, "hooks");
+  assertGitMetadataIncomplete(afterOversizeDefault, afterOversizeDefault, "hooks");
   const oversizeEvidence = JSON.stringify(buildRuntimeEvidence({
     preContext: afterRefsCleanup,
     postContext: afterOversizeDefault,
@@ -4990,23 +4875,17 @@ test("shared-ref identity support is fail-closed for legacy, mixed, malformed, a
   const unresolvedCapture = captureContextManifest(root);
   assert.equal(unresolvedCapture.git.sharedRefIdentity.complete, false);
   assert.equal(unresolvedCapture.git.sharedRefIdentity.attributable, false);
-  assert.ok(observeChangedPaths(unresolvedCapture, unresolvedCapture).includes("[GIT_METADATA]"));
-  assert.equal(
-    buildRuntimeEvidence({
-      preContext: unresolvedCapture,
-      postContext: unresolvedCapture,
-      changedPaths: ["[GIT_METADATA]"]
-    }).sharedRefObservation.classification,
-    "fail_closed"
-  );
+  assertGitMetadataIncomplete(unresolvedCapture, unresolvedCapture, "upstream");
   // Unrelated-looking remote-tracking churn must not be tolerated while support
   // is incomplete from unresolved upstream classification.
   const head = git(root, "rev-parse", "HEAD");
   git(root, "update-ref", "refs/remotes/origin/other", head);
   const afterUnrelatedWhileUnresolved = captureContextManifest(root);
   assert.equal(afterUnrelatedWhileUnresolved.git.sharedRefIdentity.complete, false);
-  assert.ok(
-    observeChangedPaths(unresolvedCapture, afterUnrelatedWhileUnresolved).includes("[GIT_METADATA]")
+  assertGitMetadataIncomplete(
+    unresolvedCapture,
+    afterUnrelatedWhileUnresolved,
+    "upstream"
   );
 
   // Positive control: fully resolved upstream remains complete + attributable.
@@ -6100,6 +5979,51 @@ test("integration: recorded host verification creates one scoped host-asserted c
   );
   assert.notEqual(premature.status, 0);
   assert.match(premature.stdout, /E_CONTEXT_DRIFT/);
+
+  const privateJobFile = jobFile(root, job.id, env);
+  const originalPrivateJobBytes = fs.readFileSync(privateJobFile);
+  const originalPrivateJob = tryReadJob(root, job.id, env);
+  const oldV2Body = structuredClone(originalPrivateJob.completionContextManifest);
+  delete oldV2Body.git.taskRelevantMetadataObservation;
+  const oldV2Incomplete = rebindContextManifestForTest({
+    ...oldV2Body,
+    git: {
+      ...oldV2Body.git,
+      sharedRefIdentity: {
+        ...oldV2Body.git.sharedRefIdentity,
+        complete: false,
+        attributable: false,
+        taskRelevantRefs: [],
+        unrelatedRefs: []
+      }
+    }
+  });
+  updateJob(root, job.id, (current) => ({
+    ...current,
+    completionContextManifest: oldV2Incomplete
+  }), env);
+  const incompleteBaselineBytes = fs.readFileSync(privateJobFile);
+  const incompleteRecord = runCompanion(
+    ["record-verification", job.id, "--verification-stdin", "--json"],
+    {
+      cwd: root,
+      env,
+      input: JSON.stringify({
+        commandOutcomes: [{ command: "node verify-fixture.mjs", status: "failed", exitCode: 1 }]
+      })
+    }
+  );
+  assert.notEqual(incompleteRecord.status, 0);
+  const incompleteError = JSON.parse(incompleteRecord.stdout).error;
+  assert.deepEqual(Object.keys(incompleteError).sort(), ["code", "message"]);
+  assert.equal(incompleteError.code, "E_CONTEXT_INCOMPLETE");
+  assert.match(incompleteError.message, /gitMetadata/);
+  assert.equal(fs.readFileSync(privateJobFile).equals(incompleteBaselineBytes), true);
+  assert.equal(
+    Object.hasOwn(tryReadJob(root, job.id, env), "verificationContextManifest"),
+    false
+  );
+  fs.writeFileSync(privateJobFile, originalPrivateJobBytes, { mode: 0o600 });
 
   const recorded = parseJson(runCompanion(
     ["record-verification", job.id, "--verification-stdin", "--json"],

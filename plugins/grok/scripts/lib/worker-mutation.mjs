@@ -49,6 +49,11 @@ import { boundPathEvidence } from "./task-contract-primitives.mjs";
 import { CONTEXT_MANIFEST_VERSION, CONTEXT_METADATA_POLICIES } from "./task-context-policy.mjs";
 import { buildRuntimeEvidence, observeChangedPaths } from "./task-runtime-evidence.mjs";
 import { composeProviderPrompt } from "./task-provider-prompt.mjs";
+import {
+  bindContextMetadataCompleteness,
+  contextIncompleteError,
+  observeContextMetadataCompleteness
+} from "./task-context-metadata.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import { evaluateScope } from "./task-scope.mjs";
 import {
@@ -102,6 +107,7 @@ import {
 import {
   captureTerminalEvidence,
   normalizeTerminalProcessSignalError,
+  preferProvenTerminalSafetyPending,
   selectTaskTerminalError,
   terminalTaskProgress
 } from "./task-terminal-evidence.mjs";
@@ -121,6 +127,27 @@ import {
   launchContractDigest,
   providerLaunchBindingForJob
 } from "./worker-launch-contract.mjs";
+import { knownManagedWriteSafetyTerminalObservation } from "./worker-terminal-safety.mjs";
+
+const {
+  assertContextMetadataComplete,
+  captureCompleteContextManifest
+} = bindContextMetadataCompleteness({
+  captureContextManifest,
+  assertContextManifestIntegrity
+});
+
+function resolveAdmissionContext(root, manifest, metadataPolicy = null) {
+  const options = {
+    mode: "execute",
+    contextPhase: "admission",
+    ...(metadataPolicy ? { metadataPolicy } : {})
+  };
+  const accepted = manifest
+    ? assertContextCompatible(root, manifest, options)
+    : captureCompleteContextManifest(root, { contextPhase: "admission" });
+  return assertContextMetadataComplete(accepted, { contextPhase: "admission" });
+}
 
 export const SPAWN_OWNERSHIP_MODE = "exact-thread-or-host-attested-parent";
 export const FOLLOWUP_SPAWN_OWNERSHIP_MODE = "exact-root-owner-grant";
@@ -3697,7 +3724,7 @@ function reconcileTerminalCleanupSignal(
   if (!signalError) return terminalIntent;
   const secondaryDiagnostic =
     cleanupSignalSecondaryDiagnostic(signalError);
-  if (["E_CONTEXT_DRIFT", "E_SCOPE_VIOLATION"].includes(
+  if (["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE", "E_SCOPE_VIOLATION"].includes(
     terminalIntent?.error?.code
   )) {
     const priorDetails = isPlainRecord(terminalIntent.error.details)
@@ -4089,7 +4116,7 @@ export function settlePreProviderWorkerFinalization({
  * credential/profile deletion.
  */
 export function persistCompletedWriteArtifact(job, pending, env) {
-  if (job?.write !== true || pending?.status !== "completed") return null;
+  if (job?.write !== true || pending?.status !== "completed" || pending?.error != null) return null;
   assertDispatchContract(job);
   assertExactWriteVerticalScope(job.request?.envelope?.scope);
   const binding = job.executionBinding;
@@ -4207,117 +4234,6 @@ function unavailableManagedWriteTerminalObservation(job) {
   });
 }
 
-function knownManagedWriteSafetyTerminalObservation(job, error) {
-  if (!["E_CONTEXT_DRIFT", "E_SCOPE_VIOLATION"].includes(error?.code)) {
-    return null;
-  }
-  let preContext = null;
-  try {
-    preContext = assertContextManifestIntegrity(
-      job.request?.contextManifest
-    );
-  } catch {
-    // The independently classified final safety error remains authoritative.
-    // Do not invent a replacement pre-context merely to populate evidence.
-  }
-  const contextMarkers = () => {
-    const reasons = Array.isArray(error.details?.reasons)
-      ? error.details.reasons.map((item) => String(item))
-      : [];
-    const markers = [];
-    if (reasons.some((reason) => ["head", "branch"].includes(reason))) {
-      markers.push("[HEAD]");
-    }
-    if (reasons.some((reason) => [
-      "taskRelevantMetadataIdentity",
-      "metadataIdentity",
-      "upstreamRef",
-      "upstreamCommit"
-    ].includes(reason))) {
-      markers.push("[GIT_METADATA]");
-    }
-    if (reasons.some((reason) => [
-      "trackedTreeIdentity",
-      "dirtyDigest",
-      "ignoredDigest"
-    ].includes(reason))) {
-      markers.push("[INDEX]");
-    }
-    if (reasons.some((reason) => reason === "projectMarkers")) {
-      markers.push("[PROJECT_MARKERS]");
-    }
-    if (markers.length === 0) {
-      if (/\b(?:HEAD|branch)\b/i.test(error.message || "")) {
-        markers.push("[HEAD]");
-      } else if (/\bindex\b/i.test(error.message || "")) {
-        markers.push("[INDEX]");
-      } else {
-        markers.push("[CONTEXT_DRIFT]");
-      }
-    }
-    return [...new Set(markers)].slice(0, 8);
-  };
-  const scopePaths = () => {
-    const provided = Array.isArray(error.details?.paths)
-      ? boundPathEvidence(error.details.paths, {
-          max: 64,
-          marker: "[SCOPE_VIOLATIONS_OVERFLOW]"
-        })
-      : [];
-    if (provided.length > 0) return provided;
-    return [
-      /\bindex\b/i.test(error.message || "")
-        ? "[INDEX]"
-        : "[SCOPE_VIOLATION]"
-    ];
-  };
-  const code = error.code;
-  const observedChangedPaths = code === "E_CONTEXT_DRIFT"
-    ? contextMarkers()
-    : scopePaths();
-  const scopeViolations = code === "E_SCOPE_VIOLATION"
-    ? observedChangedPaths
-    : [];
-  const details = code === "E_CONTEXT_DRIFT"
-    ? { reasons: Object.freeze(observedChangedPaths) }
-    : { paths: Object.freeze(scopeViolations) };
-  const completedAt = now();
-  const message = code === "E_CONTEXT_DRIFT"
-    ? "Final managed-write context drift was observed after runtime cleanup."
-    : "Final managed-write scope violation was observed after runtime cleanup.";
-  return Object.freeze({
-    pending: Object.freeze({
-      status: "failed",
-      phase: code === "E_CONTEXT_DRIFT"
-        ? "context-rejected"
-        : "scope-rejected",
-      completedAt,
-      error: Object.freeze({
-        code,
-        message,
-        details: Object.freeze(details)
-      }),
-      summary: message
-    }),
-    job: {
-      ...job,
-      completionContextManifest: null,
-      result: {
-        ...(job.result || {}),
-        runtimeEvidence: buildRuntimeEvidence({
-          preContext,
-          postContext: null,
-          changedPaths: observedChangedPaths,
-          commandOutcomes: job.commandOutcomes || [],
-          scopeViolations,
-          executionStatus: "failed"
-        }),
-        hostVerification: "not_run"
-      }
-    }
-  });
-}
-
 /**
  * Publish one authoritative post-cleanup workspace observation for every task
  * that does not yet have provider-started managed-write output authority.
@@ -4363,6 +4279,7 @@ function reconcileCleanupSafeTerminalObservation(
     executionStatus,
     managedAuthorityUnavailable
       ? {
+          captureFailureKind: "evidenceAssembly",
           captureContext() {
             throw new CompanionError(
               "E_CONTEXT_DRIFT",
@@ -4384,6 +4301,7 @@ function reconcileCleanupSafeTerminalObservation(
     : null;
   const safetyFailure = [
     "E_CONTEXT_DRIFT",
+    "E_CONTEXT_INCOMPLETE",
     "E_SCOPE_VIOLATION"
   ].includes(selectedError?.code);
   const selectedStatus = selectedError
@@ -4401,7 +4319,7 @@ function reconcileCleanupSafeTerminalObservation(
   const reconciledPending = selectedError
     ? Object.freeze({
         status: selectedStatus,
-        phase: selectedError.code === "E_CONTEXT_DRIFT"
+        phase: ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(selectedError.code)
           ? "context-rejected"
           : selectedError.code === "E_SCOPE_VIOLATION"
             ? "scope-rejected"
@@ -4489,40 +4407,77 @@ function reconcileProviderStartedWriteCompletion(job, pending, env) {
   } catch (error) {
     const safetyObservation =
       knownManagedWriteSafetyTerminalObservation(job, error);
-    if (safetyObservation) return safetyObservation;
+    if (safetyObservation) {
+      return Object.freeze({
+        ...safetyObservation,
+        pending: preferProvenTerminalSafetyPending(
+          safetyObservation.pending,
+          pending
+        )
+      });
+    }
     return unavailableManagedWriteTerminalObservation(job);
   }
   const contextDrift = observed.coreReasons.length > 0
     || observed.metadataMarkers.length > 0;
-  const scopeDrift = observed.scopeViolations.length > 0;
-  const rejected = contextDrift || scopeDrift;
+  const concreteScopeViolations = observed.scopeViolations.filter(
+    (item) => item !== "[GIT_METADATA_INCOMPLETE]"
+  );
+  const scopeDrift = concreteScopeViolations.length > 0;
+  const contextIncomplete = observed.incompleteComponents.length > 0;
+  const rejected = contextDrift || scopeDrift || contextIncomplete;
   const contextReasons = [...new Set([
     ...(observed.controlContextMarkers || []),
     ...observed.metadataMarkers
   ])].slice(0, 8);
-  const reconciledPending = rejected
+  const observedPending = rejected
     ? Object.freeze({
         status: "failed",
-        phase: contextDrift ? "context-rejected" : "scope-rejected",
+        phase: contextDrift
+          ? "context-rejected"
+          : scopeDrift
+            ? "scope-rejected"
+            : "context-rejected",
         completedAt: now(),
         error: Object.freeze({
-          code: contextDrift ? "E_CONTEXT_DRIFT" : "E_SCOPE_VIOLATION",
+          code: contextDrift
+            ? "E_CONTEXT_DRIFT"
+            : scopeDrift
+              ? "E_SCOPE_VIOLATION"
+              : "E_CONTEXT_INCOMPLETE",
           message: contextDrift
             ? "Worker output failed final execution-context reconciliation."
-            : "Worker output changed paths outside the delegated scope.",
+            : scopeDrift
+              ? "Worker output changed paths outside the delegated scope."
+              : "Worker execution context could not be observed completely.",
           ...(contextDrift && contextReasons.length
             ? {
                 details: Object.freeze({
                   reasons: Object.freeze(contextReasons)
                 })
               }
-            : {})
+            : contextIncomplete && !scopeDrift
+              ? {
+                  details: Object.freeze({
+                    contextPhase: "terminal",
+                    metadataComponents: Object.freeze(
+                      [...observed.incompleteComponents]
+                    )
+                  })
+                }
+              : {})
         }),
         summary: contextDrift
           ? "Worker output failed final execution-context reconciliation."
-          : "Worker output changed paths outside the delegated scope."
+          : scopeDrift
+            ? "Worker output changed paths outside the delegated scope."
+            : "Worker execution context could not be observed completely."
       })
     : pending;
+  const reconciledPending = preferProvenTerminalSafetyPending(
+    observedPending,
+    pending
+  );
   const runtimeEvidence = buildRuntimeEvidence({
     preContext: observed.requestContextManifest,
     postContext: observed.currentContextManifest,
@@ -4531,7 +4486,7 @@ function reconcileProviderStartedWriteCompletion(job, pending, env) {
       ? observed.observedChangedPaths.join("\n")
       : "No workspace changes observed.",
     commandOutcomes: job.commandOutcomes || [],
-    scopeViolations: observed.scopeViolations,
+    scopeViolations: concreteScopeViolations,
     executionStatus: rejected
       ? "failed"
       : pending?.status === "cancelled"
@@ -8710,8 +8665,8 @@ export function adoptWriteProvisioningEffect({
     }
 
     const verification = managedWorktreeVerification(verified.binding, env);
-    const executionContextManifest = captureContextManifest(
-      verified.binding.expectedExecutionRoot
+    const executionContextManifest = captureCompleteContextManifest(
+      verified.binding.expectedExecutionRoot, { contextPhase: "execute" }
     );
     const currentManifest = assertContextCompatible(
       verified.binding.expectedExecutionRoot,
@@ -9401,13 +9356,10 @@ export function admitWriteWorkerPlan({
   const rebindWriteAdmissionEnvelope = (storedAdmission) => {
     // Integrity + supervisory primary-control recheck against immutable stored
     // admission; never rebuild replayExpected from a fresh control capture.
-    assertContextCompatible(
+    resolveAdmissionContext(
       control.controlRoot,
       storedAdmission,
-      {
-        mode: "execute",
-        metadataPolicy: CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE
-      }
+      CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE
     );
     const admissionEnvelope = bindTaskEnvelopeContext(
       validatedEnvelope,
@@ -9438,7 +9390,9 @@ export function admitWriteWorkerPlan({
         || record.controlWorkspaceId !== control.controlWorkspaceId) {
         idempotencyConflict("idempotencyKey was reused with a different write-spawn owner.");
       }
-      const committed = transaction.tryReadJob(record.workerId);
+      const committed = transaction.tryReadJob(
+        record.workerId
+      );
       if (!committed || digestOwners.length !== 1 || digestOwners[0].id !== record.workerId) {
         spawnIdempotencyStateError("Write-spawn idempotency ownership is missing or ambiguous.");
       }
@@ -9447,7 +9401,8 @@ export function admitWriteWorkerPlan({
       );
       const { replayExpected } = rebindWriteAdmissionEnvelope(storedAdmission);
       assertWriteAdmissionReplayCandidate(committed, replayExpected, env);
-      if (record.admissionRequestDigest !== committed.request.spawn.admissionRequestDigest) {
+      if (record.admissionRequestDigest
+        !== committed.request.spawn.admissionRequestDigest) {
         spawnIdempotencyStateError("Write-spawn idempotency record disagrees with its durable job.");
       }
       assertSpawnIdempotencyJobBinding(record, committed, { keyDigest });
@@ -9513,16 +9468,11 @@ export function admitWriteWorkerPlan({
 
     // New managed write: integrity-check caller capture (or take one now) and
     // supervisory-compare current control; persist that original stored object.
-    const admissionContextManifest = callerAdmissionManifest
-      ? assertContextCompatible(
-        control.controlRoot,
-        callerAdmissionManifest,
-        {
-          mode: "execute",
-          metadataPolicy: CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE
-        }
-      )
-      : captureContextManifest(control.controlRoot);
+    const admissionContextManifest = resolveAdmissionContext(
+      control.controlRoot,
+      callerAdmissionManifest,
+      CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE
+    );
     if (validatedEnvelope.contextManifestId != null
       && validatedEnvelope.contextManifestId !== admissionContextManifest.manifestId) {
       throw new CompanionError(
@@ -9541,13 +9491,10 @@ export function admitWriteWorkerPlan({
         "Write worker admission requires a completely clean control checkout."
       );
     }
-    assertContextCompatible(
+    resolveAdmissionContext(
       control.controlRoot,
       admissionContextManifest,
-      {
-        mode: "execute",
-        metadataPolicy: CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE
-      }
+      CONTEXT_METADATA_POLICIES.SUPERVISORY_LINKED_WRITE
     );
     const id = generateId("task");
     const createdAt = now();
@@ -9782,9 +9729,7 @@ export function spawnReadOnlyWorker({
   assertRoleDigest(role);
   const controlWorkspace = resolveControlWorkspace(root, env);
   const { controlWorkspaceId, executionRoot } = controlWorkspace;
-  const acceptedContextManifest = contextManifest
-    ? assertContextCompatible(executionRoot, contextManifest, { mode: "execute" })
-    : captureContextManifest(executionRoot);
+  const acceptedContextManifest = resolveAdmissionContext(executionRoot, contextManifest);
   if (validatedEnvelope.contextManifestId != null
     && validatedEnvelope.contextManifestId !== acceptedContextManifest.manifestId) {
     throw new CompanionError(
@@ -9863,7 +9808,7 @@ export function spawnReadOnlyWorker({
       }
       assertSpawnIdempotencyJobBinding(record, committed, { keyDigest });
       assertDispatchContract(committed);
-      assertDurableSpawnRequestBinding(committed, env);
+      assertDurableSpawnRequestBinding(committed, env, { contextPhase: "admission" });
       assertMutationOwnership(committed, principal);
       const replayRequestDigest = storedSpawnReplayRequestDigest({
         job: committed,
@@ -9929,7 +9874,7 @@ export function spawnReadOnlyWorker({
         idempotencyConflict("idempotencyKey was reused with a different spawn owner or request.");
       }
       assertDispatchContract(orphan);
-      assertDurableSpawnRequestBinding(orphan, env);
+      assertDurableSpawnRequestBinding(orphan, env, { contextPhase: "admission" });
       assertMutationOwnership(orphan, principal);
       const replayRequestDigest = storedSpawnReplayRequestDigest({
         job: orphan,
@@ -10424,7 +10369,8 @@ function assertManagedWriteImmutableAuthority(
       }
     );
   } catch (error) {
-    if (!allowFinalControlContextDrift || error?.code !== "E_CONTEXT_DRIFT") {
+    if (!allowFinalControlContextDrift
+      || !["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(error?.code)) {
       throw error;
     }
     controlContextError = error;
@@ -10485,12 +10431,30 @@ function captureManagedWritePostBindingContext(
     env,
     { allowFinalControlContextDrift: true }
   );
-  const currentContextManifest = observedContextManifest == null
-    ? captureContextManifest(binding.expectedExecutionRoot)
-    : assertContextManifestIntegrity(observedContextManifest);
+  let currentContextManifest;
+  if (observedContextManifest == null) {
+    try {
+      currentContextManifest = captureContextManifest(
+        binding.expectedExecutionRoot
+      );
+    } catch {
+      throw contextIncompleteError("terminal", ["contextCapture"]);
+    }
+    currentContextManifest = assertContextManifestIntegrity(
+      currentContextManifest
+    );
+  } else {
+    currentContextManifest = assertContextManifestIntegrity(
+      observedContextManifest
+    );
+  }
+  const controlIncompleteComponents = controlContextError?.code === "E_CONTEXT_INCOMPLETE"
+    && Array.isArray(controlContextError?.details?.metadataComponents)
+    ? [...controlContextError.details.metadataComponents]
+    : [];
   const controlReasons = Array.isArray(controlContextError?.details?.reasons)
     ? [...controlContextError.details.reasons]
-    : controlContextError
+    : controlContextError && controlContextError.code !== "E_CONTEXT_INCOMPLETE"
       ? ["controlContext"]
       : [];
   const coreReasons = [
@@ -10572,7 +10536,16 @@ function captureManagedWritePostBindingContext(
   );
   const metadataMarkers = scopeViolations.filter(
     (item) => String(item).startsWith("[")
+      && item !== "[GIT_METADATA_INCOMPLETE]"
   );
+  const completeness = observeContextMetadataCompleteness(
+    requestContextManifest,
+    currentContextManifest
+  );
+  const incompleteComponents = [...new Set([
+    ...controlIncompleteComponents,
+    ...(completeness.metadataComponents || [])
+  ])];
   return Object.freeze({
     binding,
     journal,
@@ -10586,7 +10559,8 @@ function captureManagedWritePostBindingContext(
     scopeViolations,
     coreReasons,
     controlContextMarkers,
-    metadataMarkers
+    metadataMarkers,
+    incompleteComponents
   });
 }
 
@@ -10604,9 +10578,12 @@ function assertManagedWritePostBindingObservation(observed) {
       }
     );
   }
-  if (observed.scopeViolations.length) {
+  const concreteScopeViolations = observed.scopeViolations.filter(
+    (item) => item !== "[GIT_METADATA_INCOMPLETE]"
+  );
+  if (concreteScopeViolations.length) {
     const paths = boundPathEvidence(
-      observed.scopeViolations,
+      concreteScopeViolations,
       { marker: "[SCOPE_VIOLATIONS_OVERFLOW]" }
     );
     throw new CompanionError(
@@ -10614,6 +10591,9 @@ function assertManagedWritePostBindingObservation(observed) {
       "Managed write execution produced changes outside its exact delegated scope.",
       { paths }
     );
+  }
+  if (observed.incompleteComponents.length) {
+    throw contextIncompleteError("terminal", observed.incompleteComponents);
   }
   return observed;
 }
@@ -10702,7 +10682,9 @@ function assertManagedWriteReplayContext(job, env = process.env) {
   return completionObservation;
 }
 
-export function assertDurableSpawnRequestBinding(job, env = process.env) {
+export function assertDurableSpawnRequestBinding(job, env = process.env, {
+  contextPhase = null
+} = {}) {
   const spawn = job?.request?.spawn;
   const executionRoot = spawn?.executionRoot;
   const isGrantedFollowup = job?.request?.followup !== undefined;
@@ -10748,7 +10730,10 @@ export function assertDurableSpawnRequestBinding(job, env = process.env) {
       acceptedContext = assertContextCompatible(
         executionRoot,
         job.request?.contextManifest,
-        { mode: isGrantedFollowup ? "resume" : "execute" }
+        {
+          mode: isGrantedFollowup ? "resume" : "execute",
+          ...(contextPhase ? { contextPhase } : {})
+        }
       );
     }
   } catch (error) {

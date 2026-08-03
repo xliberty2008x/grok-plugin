@@ -1809,16 +1809,16 @@ test("cancellation replay preserves immutable admission receipt and one public e
   assert.equal(valid.cancel.replayed, false);
   assert.equal(valid.cancelReplay.replayed, true);
   assert.equal(valid.cancel.receipt.processGroupGoneAt, null);
-  assert.ok(
-    Date.parse(valid.terminalResult.worker.lifecycleEvents.at(-1).at)
-      > Date.parse(valid.terminalResult.worker.completedAt)
-  );
-  assert.deepEqual(clone(valid.terminalResult.worker.error), {
-    workerProtocolVersion: 1,
-    errorSchemaVersion: 1,
-    code: "E_CANCELLED",
-    message: "Cancelled."
-  });
+  assert.ok(Date.parse(valid.terminalResult.worker.lifecycleEvents.at(-1).at)
+    > Date.parse(valid.terminalResult.worker.completedAt));
+  assert.deepEqual(clone(valid.terminalResult.worker.error),
+    { workerProtocolVersion: 1, errorSchemaVersion: 1, code: "E_CANCELLED", message: "Cancelled." });
+  const contextErrorInCancellation = cancellationBundle();
+  contextErrorInCancellation.terminalResult.worker.error = { workerProtocolVersion: 1,
+    errorSchemaVersion: 2, code: "E_CONTEXT_INCOMPLETE", message: "Incomplete.",
+    details: { contextPhase: "terminal", metadataComponents: ["refs"] } };
+  assert.throws(() => validateInstalledCancellationReplayScenario(contextErrorInCancellation),
+    assertContractError("E_LIVE_CANCELLATION"));
 
   const delayedLifecycleEvent = cancellationBundle();
   const delayedAcceptedAt = "2026-07-23T10:01:59.963Z";

@@ -18,9 +18,11 @@ export const PHASE2_FOCUSED_TEST_FILES = Object.freeze([
   "tests/worker-context-roles.test.mjs",
   "tests/worker-host-actions.test.mjs",
   "tests/worker-mailbox.test.mjs",
+  "tests/worker-admission-context-incomplete.test.mjs",
   "tests/worker-mutation_part1.mjs",
   "tests/worker-mutation_part2.mjs",
   "tests/worker-protocol.test.mjs",
+  "tests/worker-context-incomplete-protocol.test.mjs",
   "tests/worker-service.test.mjs",
   "tests/worker-dispatch-supervisor.test.mjs",
   "tests/worker-terminal-intent.test.mjs",
@@ -28,6 +30,7 @@ export const PHASE2_FOCUSED_TEST_FILES = Object.freeze([
   "tests/worker-provider-rotation-intent.test.mjs",
   "tests/mcp-worker-broker.test.mjs",
   "tests/mcp-worker-runtime.test.mjs",
+  "tests/installed-context-incomplete-contract.test.mjs",
   "tests/installed-worker-mcp-contract.test.mjs",
   "tests/installed-worker-mcp-runner.test.mjs"
 ]);

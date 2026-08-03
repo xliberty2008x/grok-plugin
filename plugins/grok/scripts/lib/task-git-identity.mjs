@@ -7,9 +7,6 @@ import {
   CONTEXT_METADATA_POLICIES,
   GIT_METADATA_CLASSIFICATIONS,
   LEGACY_CONTEXT_MANIFEST_VERSION,
-  SHARED_REF_CLASS_TASK_RELEVANT,
-  SHARED_REF_CLASS_UNRELATED,
-  SHARED_REF_IDENTITY_SCHEMA_VERSION,
   SHARED_REF_OBSERVATION_SCHEMA_VERSION
 } from "./task-context-policy.mjs";
 import {
@@ -19,13 +16,16 @@ import {
   captureWorktreeOperationalIdentity
 } from "./task-git-controls.mjs";
 import {
-  MAX_SHARED_REFS,
-  MAX_SHARED_REF_ATTRIBUTABLE,
-  MAX_SHARED_REF_FIELD_BYTES,
   buildSharedRefIdentity,
   captureIndexFlagObservation,
   captureSemanticSharedRefs
 } from "./task-git-refs.mjs";
+import {
+  buildTaskRelevantMetadataObservation,
+  hasComparableRefIdentityDrift,
+  inspectTaskRelevantMetadataSupport,
+  observeContextMetadataCompleteness
+} from "./task-context-metadata.mjs";
 
 function captureTaskRelevantGitMetadata(gitDir, commonDir, workspaceRoot, {
   currentBranchRef = null,
@@ -83,81 +83,26 @@ function captureTaskRelevantGitMetadata(gitDir, commonDir, workspaceRoot, {
     sharedRefAttributable: sharedRefIdentity.attributable,
     upstreamUnresolved
   }));
-  return { taskRelevantMetadataIdentity, sharedRefIdentity };
+  const taskRelevantMetadataObservation = buildTaskRelevantMetadataObservation({
+    nonRef,
+    operational,
+    hooks,
+    config,
+    indexFlags,
+    semanticRefs,
+    upstreamConfigured,
+    upstreamFullRef,
+    sharedRefIdentity
+  });
+  return {
+    taskRelevantMetadataIdentity,
+    sharedRefIdentity,
+    taskRelevantMetadataObservation
+  };
 }
 
 function isSha256Hex(value) {
   return typeof value === "string" && SHA256_HEX.test(value);
-}
-
-function isPublicRefSnapshotEntry(entry) {
-  return entry
-    && typeof entry === "object"
-    && !Array.isArray(entry)
-    && typeof entry.name === "string"
-    && entry.name.startsWith("refs/")
-    && entry.name.length > 0
-    && entry.name.length <= MAX_SHARED_REF_FIELD_BYTES
-    && typeof entry.target === "string"
-    && entry.target.length > 0
-    && entry.target.length <= MAX_SHARED_REF_FIELD_BYTES
-    && typeof entry.resolvedOid === "string"
-    && /^[a-f0-9]{40,64}$/.test(entry.resolvedOid)
-    && (entry.class === SHARED_REF_CLASS_TASK_RELEVANT || entry.class === SHARED_REF_CLASS_UNRELATED)
-    && !entry.name.includes("\0")
-    && !entry.target.includes("\0")
-    && (entry.target.startsWith("refs/")
-      || entry.target.toLowerCase() === entry.resolvedOid)
-    && !/^(?:\/|[A-Za-z]:[\\/]|~\/)/.test(entry.target);
-}
-
-/**
- * Inspect explicit task-relevant metadata support on a stored git manifest.
- * Returns "absent" | "valid" | "malformed".
- */
-function inspectTaskRelevantMetadataSupport(gitManifest) {
-  if (!gitManifest || typeof gitManifest !== "object") return "absent";
-  const hasTaskIdentity = Object.hasOwn(gitManifest, "taskRelevantMetadataIdentity");
-  const hasShared = Object.hasOwn(gitManifest, "sharedRefIdentity");
-  if (!hasTaskIdentity && !hasShared) return "absent";
-  if (!hasTaskIdentity || !hasShared) return "malformed";
-  if (!isSha256Hex(gitManifest.taskRelevantMetadataIdentity)) return "malformed";
-  const identity = gitManifest.sharedRefIdentity;
-  if (!identity || typeof identity !== "object" || Array.isArray(identity)) return "malformed";
-  if (identity.schemaVersion !== SHARED_REF_IDENTITY_SCHEMA_VERSION) return "malformed";
-  if (typeof identity.complete !== "boolean" || typeof identity.attributable !== "boolean") return "malformed";
-  if (!Number.isInteger(identity.refCount) || identity.refCount < 0) return "malformed";
-  if (!Number.isInteger(identity.taskRelevantRefCount) || identity.taskRelevantRefCount < 0) return "malformed";
-  if (!Number.isInteger(identity.unrelatedRefCount) || identity.unrelatedRefCount < 0) return "malformed";
-  if (identity.taskRelevantRefCount + identity.unrelatedRefCount !== identity.refCount) return "malformed";
-  if (!isSha256Hex(identity.taskRelevantRefIdentity) || !isSha256Hex(identity.unrelatedRefIdentity)) {
-    return "malformed";
-  }
-  if (!Array.isArray(identity.taskRelevantRefs) || !Array.isArray(identity.unrelatedRefs)) return "malformed";
-  // complete ⇒ within inventory budget; attributable ⇒ complete and within
-  // per-entry evidence budget. Reject impossible combinations.
-  if (identity.complete && identity.refCount > MAX_SHARED_REFS) return "malformed";
-  if (identity.attributable !== (identity.complete && identity.refCount <= MAX_SHARED_REF_ATTRIBUTABLE)) {
-    return "malformed";
-  }
-  if (identity.taskRelevantRefs.length !== (identity.attributable ? identity.taskRelevantRefCount : 0)) {
-    return "malformed";
-  }
-  if (identity.unrelatedRefs.length !== (identity.attributable ? identity.unrelatedRefCount : 0)) {
-    return "malformed";
-  }
-  const names = new Set();
-  for (const entry of [...identity.taskRelevantRefs, ...identity.unrelatedRefs]) {
-    if (!isPublicRefSnapshotEntry(entry) || names.has(entry.name)) return "malformed";
-    names.add(entry.name);
-  }
-  for (const entry of identity.taskRelevantRefs) {
-    if (entry.class !== SHARED_REF_CLASS_TASK_RELEVANT) return "malformed";
-  }
-  for (const entry of identity.unrelatedRefs) {
-    if (entry.class !== SHARED_REF_CLASS_UNRELATED) return "malformed";
-  }
-  return "valid";
 }
 
 /**
@@ -337,6 +282,28 @@ function classifyContextGitMetadataObservation(
   const legacyBoundary = preContext?.schemaVersion === LEGACY_CONTEXT_MANIFEST_VERSION
     || postContext?.schemaVersion === LEGACY_CONTEXT_MANIFEST_VERSION;
   if (!legacyBoundary) {
+    if (hasComparableRefIdentityDrift(preContext?.git, postContext?.git, {
+      includeUnrelated: metadataPolicy === CONTEXT_METADATA_POLICIES.DEFAULT
+        && preContext?.git?.linkedWorktree === false
+        && postContext?.git?.linkedWorktree === false
+    })) {
+      return {
+        schemaVersion: SHARED_REF_OBSERVATION_SCHEMA_VERSION,
+        classification: GIT_METADATA_CLASSIFICATIONS.TASK_RELEVANT_METADATA_DRIFT,
+        toleratedUnrelatedSharedRefChurn: false,
+        taskRelevantMetadataDrift: true
+      };
+    }
+    // Incomplete-but-well-formed observations are not comparable metadata
+    // drift. They are surfaced independently as E_CONTEXT_INCOMPLETE.
+    if (!observeContextMetadataCompleteness(preContext, postContext).complete) {
+      return {
+        schemaVersion: SHARED_REF_OBSERVATION_SCHEMA_VERSION,
+        classification: GIT_METADATA_CLASSIFICATIONS.UNCHANGED,
+        toleratedUnrelatedSharedRefChurn: false,
+        taskRelevantMetadataDrift: false
+      };
+    }
     return classifyGitMetadataObservation(
       preContext?.git,
       postContext?.git,
@@ -373,6 +340,10 @@ function classifyContextGitMetadataObservation(
 }
 
 function observeContextGitMetadataDrift(preContext, postContext, changed) {
+  const completeness = observeContextMetadataCompleteness(preContext, postContext);
+  if (!completeness.complete) {
+    changed.add("[GIT_METADATA_INCOMPLETE]");
+  }
   const observation = classifyContextGitMetadataObservation(
     preContext,
     postContext

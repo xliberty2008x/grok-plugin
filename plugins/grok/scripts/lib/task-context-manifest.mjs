@@ -25,6 +25,10 @@ import {
   classifyContextGitMetadataObservation,
   inspectTaskRelevantMetadataSupport
 } from "./task-git-identity.mjs";
+import {
+  contextIncompleteError,
+  observeContextMetadataCompleteness
+} from "./task-context-metadata.mjs";
 
 const timestamp = () => new Date().toISOString();
 
@@ -150,6 +154,7 @@ export function captureContextManifest(root) {
       // unrelated shared refs when both sides are structurally valid.
       taskRelevantMetadataIdentity: taskMetadata.taskRelevantMetadataIdentity,
       sharedRefIdentity: taskMetadata.sharedRefIdentity,
+      taskRelevantMetadataObservation: taskMetadata.taskRelevantMetadataObservation,
       insideWorktree,
       linkedWorktree: isLinkedWorktree,
       sparse,
@@ -295,6 +300,10 @@ export function assertContextManifestIntegrity(manifest) {
   if (!manifest.git || typeof manifest.git !== "object" || Array.isArray(manifest.git)) {
     contextManifestIntegrityError();
   }
+  if (manifest.schemaVersion === CONTEXT_MANIFEST_VERSION) {
+    const metadataSupport = inspectTaskRelevantMetadataSupport(manifest.git);
+    if (metadataSupport === "malformed") contextManifestIntegrityError();
+  }
   if (!Array.isArray(manifest.projectMarkers)) {
     contextManifestIntegrityError();
   }
@@ -347,7 +356,8 @@ export function assertContextManifestIntegrity(manifest) {
  */
 export function assertContextCompatible(root, expected, {
   mode = "execute",
-  metadataPolicy = CONTEXT_METADATA_POLICIES.DEFAULT
+  metadataPolicy = CONTEXT_METADATA_POLICIES.DEFAULT,
+  contextPhase = mode === "resume" || mode === "legacy-resume" ? "resume" : "execute"
 } = {}) {
   if (!CONTEXT_METADATA_POLICY_VALUES.has(metadataPolicy)) {
     throw new CompanionError(
@@ -365,7 +375,14 @@ export function assertContextCompatible(root, expected, {
     );
   }
   const stored = assertContextManifestIntegrity(expected);
-  const current = captureContextManifest(root);
+  let currentCapture;
+  try {
+    currentCapture = captureContextManifest(root);
+  } catch {
+    throw contextIncompleteError(contextPhase, ["contextCapture"]);
+  }
+  const current = assertContextManifestIntegrity(currentCapture);
+  const completeness = observeContextMetadataCompleteness(stored, current);
   const reasons = [];
   if (current.workspaceRoot !== stored.workspaceRoot) reasons.push("workspaceRoot");
   if (Boolean(current.git?.linkedWorktree) !== Boolean(stored.git?.linkedWorktree)) reasons.push("linkedWorktree");
@@ -420,6 +437,9 @@ export function assertContextCompatible(root, expected, {
         }
       }
     );
+  }
+  if (!completeness.complete) {
+    throw contextIncompleteError(contextPhase, completeness.metadataComponents);
   }
   // Immutable stored authority: never rebind callers to a fresh capture.
   return stored;
