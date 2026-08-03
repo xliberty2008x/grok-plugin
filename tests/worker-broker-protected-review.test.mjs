@@ -1056,7 +1056,7 @@ test("protected runtime owns the exact fixed Phase 2 and Phase 3 modes", () => {
 test("root-owned protected review runtime promotes and replays exact signed evidence", {
   skip: !REQUIRED,
   timeout: 60 * 60_000
-}, (t) => {
+}, function protectedReviewPromotionReplayTest(t) {
   dockerAuthority = establishDockerAuthority();
   try {
     hostGitAuthority = establishHostGitAuthority();

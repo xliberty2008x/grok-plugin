@@ -230,8 +230,8 @@ async function createBoundedGitHubSmartHttpProxy(options) {
     requestTimeout: timeoutMs,
     headersTimeout: Math.min(timeoutMs, 15_000),
     keepAliveTimeout: 1_000
-  }, (request, response) => {
-    const task = (async () => {
+  }, function handleProxyRequest(request, response) {
+    const task = (async function runProxyRequestTask() {
       request.setTimeout(Math.max(1, deadline - Date.now()), () => {
         markFatal("request_timeout");
         request.destroy();

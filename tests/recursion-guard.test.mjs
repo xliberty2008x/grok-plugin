@@ -714,7 +714,7 @@ test("write provider guard is schema-4 bound and rejects missing, mismatch, down
   assert.equal(loadProviderGuard(root, workerId), null);
 });
 
-test("worktree provisioning guard authenticates only canonical admitted and activated state", async (t) => {
+test("worktree provisioning guard authenticates only canonical admitted and activated state", async function worktreeProvisioningGuardAuthenticationTest(t) {
   const root = initRepo();
   const scratch = tempDir("grok-guard-worktree-provisioning-");
   const env = {

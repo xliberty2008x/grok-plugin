@@ -141,7 +141,7 @@ test("installed Worker MCP runner requires all three exact gates without npm byp
   }
 });
 
-test("installed Worker MCP runner owns fixed metadata, installed imports, and private publication", () => {
+test("installed Worker MCP runner owns fixed metadata, installed imports, and private publication", function installedWorkerMcpRunnerOwnershipTest() {
   const source = fs.readFileSync(RUNNER, "utf8");
   const recordKeySource = source.match(
     /const SPAWN_IDEMPOTENCY_RECORD_KEYS = new Set\(\[([\s\S]*?)\]\);/

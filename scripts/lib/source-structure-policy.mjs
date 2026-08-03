@@ -7,7 +7,7 @@ const require = createRequire(import.meta.url);
 const { parse } = require("acorn");
 
 export const SOURCE_STRUCTURE_POLICY_PATH = "scripts/source-structure-policy.json";
-export const SOURCE_STRUCTURE_INITIAL_DIGEST = "42d182f28170c985d3d12ff1fa55ead2214b5d84c43ff10b6102b5fe6242abf2";
+export const SOURCE_STRUCTURE_INITIAL_DIGEST = "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b";
 const POLICY_MODES = new Set(["observe", "ratchet"]);
 const CATEGORY_NAMES = Object.freeze(["product", "tooling", "tests", "facade"]);
 const DEFAULT_EXCLUDED_DIRECTORIES = new Set([
@@ -78,41 +78,58 @@ export function normalizePortableRelative(root, file, pathApi = path) {
 
 function propertyName(node) {
   if (!node) return null;
-  if (node.type === "Identifier" || node.type === "PrivateIdentifier") return node.name;
+  if (node.type === "Identifier") return node.name;
+  if (node.type === "PrivateIdentifier") return `#${node.name}`;
   if (node.type === "Literal") return String(node.value);
-  return "[computed]";
+  return null;
+}
+
+function staticPropertyName(node, computed = false) {
+  if (computed && node?.type !== "Literal") return null;
+  return propertyName(node);
+}
+
+function describedFunction(kind, name) {
+  return {
+    kind,
+    name: name ?? "anonymous",
+    named: name != null
+  };
 }
 
 function functionDescriptor(node, parent) {
   if (parent?.type === "MethodDefinition" && parent.value === node) {
     const prefix = parent.kind === "get" || parent.kind === "set" ? parent.kind : "method";
-    return { kind: prefix, name: propertyName(parent.key) || "anonymous" };
+    return describedFunction(prefix, staticPropertyName(parent.key, parent.computed));
   }
-  if (parent?.type === "Property" && parent.value === node) {
-    const prefix = parent.kind === "get" || parent.kind === "set"
+  if ((parent?.type === "Property" || parent?.type === "PropertyDefinition")
+    && parent.value === node) {
+    const prefix = parent.type === "Property" && (parent.kind === "get" || parent.kind === "set")
       ? parent.kind
-      : parent.method ? "method" : node.type === "ArrowFunctionExpression" ? "arrow" : "function";
-    return { kind: prefix, name: propertyName(parent.key) || "anonymous" };
+      : parent.type === "Property" && parent.method
+        ? "method"
+        : node.type === "ArrowFunctionExpression" ? "arrow" : "function";
+    return describedFunction(prefix, staticPropertyName(parent.key, parent.computed));
   }
   if (parent?.type === "VariableDeclarator" && parent.init === node) {
-    return {
-      kind: node.type === "ArrowFunctionExpression" ? "arrow" : "function",
-      name: propertyName(parent.id) || "anonymous"
-    };
+    return describedFunction(
+      node.type === "ArrowFunctionExpression" ? "arrow" : "function",
+      propertyName(parent.id)
+    );
   }
   if (parent?.type === "AssignmentExpression" && parent.right === node) {
     const name = parent.left?.type === "MemberExpression"
-      ? propertyName(parent.left.property)
+      ? staticPropertyName(parent.left.property, parent.left.computed)
       : propertyName(parent.left);
-    return {
-      kind: node.type === "ArrowFunctionExpression" ? "arrow" : "function",
-      name: name || "anonymous"
-    };
+    return describedFunction(
+      node.type === "ArrowFunctionExpression" ? "arrow" : "function",
+      name
+    );
   }
-  return {
-    kind: node.type === "ArrowFunctionExpression" ? "arrow" : "function",
-    name: node.id?.name || "anonymous"
-  };
+  return describedFunction(
+    node.type === "ArrowFunctionExpression" ? "arrow" : "function",
+    node.id?.name ?? null
+  );
 }
 
 function childNodes(node) {
@@ -151,12 +168,29 @@ export function collectFunctionSpans(ast) {
     || left.endLine - right.endLine
     || left.kind.localeCompare(right.kind)
     || left.name.localeCompare(right.name));
+  const identityCounts = new Map();
+  for (const entry of raw) {
+    if (!entry.named) continue;
+    const base = `${entry.kind}:${entry.name}`;
+    identityCounts.set(base, (identityCounts.get(base) || 0) + 1);
+  }
   const occurrences = new Map();
   return raw.map((entry) => {
-    const base = `${entry.kind}:${entry.name}`;
+    const base = entry.named
+      ? `${entry.kind}:${entry.name}`
+      : `${entry.kind}:<anonymous>`;
     const ordinal = (occurrences.get(base) || 0) + 1;
     occurrences.set(base, ordinal);
-    return { ...entry, key: `${base}#${ordinal}` };
+    const identityCount = entry.named ? identityCounts.get(base) : null;
+    return {
+      ...entry,
+      identityCount,
+      key: `${base}#${ordinal}`,
+      stableIdentity: entry.named
+        && entry.name !== "anonymous"
+        && entry.name !== "<anonymous>"
+        && identityCount === 1
+    };
   });
 }
 
@@ -199,6 +233,12 @@ function validateBudget(name, value, errors) {
   }
 }
 
+function isStableFunctionDebtKey(value) {
+  if (typeof value !== "string") return false;
+  const match = /^(?:arrow|function|get|method|set):(.+)#1$/u.exec(value);
+  return match != null && match[1] !== "anonymous" && match[1] !== "<anonymous>";
+}
+
 function validateLegacyFunctionVector(file, functions, errors) {
   if (!Array.isArray(functions)) {
     errors.push(`legacyDebt.${file}.functions must be an array.`);
@@ -214,6 +254,9 @@ function validateLegacyFunctionVector(file, functions, errors) {
       || entry.capLines > entry.initialLines) {
       errors.push(`legacyDebt.${file}.functions contains an invalid function cap.`);
       continue;
+    }
+    if (!isStableFunctionDebtKey(entry.key)) {
+      errors.push(`legacyDebt.${file}.functions may persist only unique named function keys ending in #1.`);
     }
     keys.push(entry.key);
   }
@@ -278,6 +321,9 @@ function validateInitialDebt(config, errors) {
       if (!isPlainObject(span) || typeof span.key !== "string" || !isPositiveInteger(span.initialLines)) {
         errors.push(`initialDebt.${file}.functions contains an invalid initial span.`);
         continue;
+      }
+      if (!isStableFunctionDebtKey(span.key)) {
+        errors.push(`initialDebt.${file}.functions may persist only unique named function keys ending in #1.`);
       }
       keys.push(span.key);
     }
@@ -649,6 +695,9 @@ function dependencyAnalysis(files) {
 }
 
 function policySeverity(mode, code) {
+  if (code === "ambiguous-function-identity" || code === "unstable-function-identity") {
+    return "error";
+  }
   if (mode === "observe") return "warning";
   if (code === "legacy-cycle"
     || code === "legacy-ordinal-fragment"
@@ -663,10 +712,48 @@ function addPolicyFinding(findings, mode, code, file, message, details = {}) {
 }
 
 function assessFunctionDebt(entry, legacy, initial, budget, mode, findings) {
-  const current = entry.functions
-    .filter((span) => span.lines > budget.functionLines)
-    .map((span) => ({ key: span.key, lines: span.lines }))
-    .sort((left, right) => left.key.localeCompare(right.key));
+  const overBudget = entry.functions.filter((span) => span.lines > budget.functionLines);
+  const reportedAmbiguities = new Set();
+  const persistedKeys = new Set([
+    ...(initial?.functions || []).map((span) => span.key),
+    ...(legacy?.functions || []).map((span) => span.key)
+  ]);
+  for (const key of persistedKeys) {
+    const base = key.slice(0, -2);
+    const matches = entry.functions.filter((span) => (
+      span.named && `${span.kind}:${span.name}` === base
+    ));
+    if (matches.length < 2) continue;
+    reportedAmbiguities.add(base);
+    addPolicyFinding(findings, mode, "ambiguous-function-identity", entry.file,
+      `${base} occurs ${matches.length} times in this file; persisted function debt requires a unique named identity.`, {
+        functionKey: key
+      });
+  }
+  const current = [];
+  for (const span of overBudget) {
+    if (!span.stableIdentity) {
+      const ambiguous = span.named
+        && span.name !== "anonymous"
+        && span.name !== "<anonymous>"
+        && span.identityCount > 1;
+      const code = ambiguous ? "ambiguous-function-identity" : "unstable-function-identity";
+      const base = `${span.kind}:${span.name}`;
+      if (ambiguous && reportedAmbiguities.has(base)) continue;
+      if (ambiguous) reportedAmbiguities.add(base);
+      const message = ambiguous
+        ? `${span.kind}:${span.name} occurs ${span.identityCount} times in this file; long-function debt requires a unique named identity.`
+        : `${span.key} is ${span.lines} lines but has no unique syntactic name; anonymous long functions cannot be baselined.`;
+      addPolicyFinding(findings, mode, code, entry.file, message, {
+        endLine: span.endLine,
+        functionKey: span.key,
+        startLine: span.startLine
+      });
+      continue;
+    }
+    current.push({ key: span.key, lines: span.lines });
+  }
+  current.sort((left, right) => left.key.localeCompare(right.key));
   const baseline = new Map((legacy?.functions || []).map((span) => [span.key, span]));
   const initialKeys = new Set((initial?.functions || []).map((span) => span.key));
   for (const span of current) {
@@ -688,7 +775,7 @@ function assessFunctionDebt(entry, legacy, initial, budget, mode, findings) {
     addPolicyFinding(findings, mode, "stale-function-exception", entry.file,
       `${key} is no longer over budget; remove its legacy function exception.`, { functionKey: key });
   }
-  return current.length;
+  return overBudget.length;
 }
 
 function assessFileDebt(entry, config, mode, findings) {

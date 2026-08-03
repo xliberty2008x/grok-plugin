@@ -43,7 +43,7 @@
   "baseline": {
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
-    "initialDigest": "42d182f28170c985d3d12ff1fa55ead2214b5d84c43ff10b6102b5fe6242abf2"
+    "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b"
   },
   "dispositions": {
     "plugins/grok/scripts/grok-companion.mjs": {
@@ -102,20 +102,20 @@
       "category": "product",
       "functions": [
         {
-          "initialLines": 288,
-          "key": "arrow:anonymous#6"
-        },
-        {
-          "initialLines": 277,
-          "key": "arrow:anonymous#7"
-        },
-        {
           "initialLines": 449,
           "key": "function:createBoundedGitHubSmartHttpProxy#1"
         },
         {
+          "initialLines": 288,
+          "key": "function:handleProxyRequest#1"
+        },
+        {
           "initialLines": 272,
           "key": "function:openExactHeadRepositoryInternal#1"
+        },
+        {
+          "initialLines": 277,
+          "key": "function:runProxyRequestTask#1"
         }
       ],
       "initialLines": 1846
@@ -241,20 +241,8 @@
       "category": "product",
       "functions": [
         {
-          "initialLines": 309,
-          "key": "arrow:anonymous#105"
-        },
-        {
-          "initialLines": 296,
-          "key": "arrow:anonymous#32"
-        },
-        {
-          "initialLines": 361,
-          "key": "arrow:anonymous#78"
-        },
-        {
           "initialLines": 256,
-          "key": "arrow:anonymous#95"
+          "key": "function:admitWritePlanTransaction#1"
         },
         {
           "initialLines": 378,
@@ -277,6 +265,14 @@
           "key": "function:cancelWorker#1"
         },
         {
+          "initialLines": 309,
+          "key": "function:cancelWorkerTransaction#1"
+        },
+        {
+          "initialLines": 361,
+          "key": "function:prepareProvisioningReissueTransaction#1"
+        },
+        {
           "initialLines": 386,
           "key": "function:prepareWriteProvisioningReissue#1"
         },
@@ -291,6 +287,10 @@
         {
           "initialLines": 380,
           "key": "function:spawnReadOnlyWorker#1"
+        },
+        {
+          "initialLines": 296,
+          "key": "function:transitionDispatchTransaction#1"
         },
         {
           "initialLines": 359,
@@ -493,7 +493,7 @@
       "functions": [
         {
           "initialLines": 599,
-          "key": "arrow:anonymous#15"
+          "key": "function:installedWorkerMcpRunnerOwnershipTest#1"
         }
       ],
       "initialLines": 1447
@@ -513,7 +513,7 @@
       "functions": [
         {
           "initialLines": 476,
-          "key": "arrow:anonymous#38"
+          "key": "function:worktreeProvisioningGuardAuthenticationTest#1"
         }
       ],
       "initialLines": 1296
@@ -523,11 +523,11 @@
       "functions": [
         {
           "initialLines": 544,
-          "key": "arrow:anonymous#142"
+          "key": "function:cleanupBlockedRecoveryContextDriftTest#1"
         },
         {
           "initialLines": 472,
-          "key": "arrow:anonymous#79"
+          "key": "function:humanCliDiagnosticProjectionTest#1"
         }
       ],
       "initialLines": 5427
@@ -547,7 +547,7 @@
       "functions": [
         {
           "initialLines": 592,
-          "key": "arrow:anonymous#8"
+          "key": "function:protectedReviewPromotionReplayTest#1"
         }
       ],
       "initialLines": 1650
@@ -562,15 +562,15 @@
       "functions": [
         {
           "initialLines": 541,
-          "key": "arrow:anonymous#183"
-        },
-        {
-          "initialLines": 411,
-          "key": "arrow:anonymous#212"
+          "key": "function:absenceProvenReissueTest#1"
         },
         {
           "initialLines": 1248,
-          "key": "arrow:anonymous#264"
+          "key": "function:exactWriteSpawnReplayTest#1"
+        },
+        {
+          "initialLines": 411,
+          "key": "function:officialWorktreeReceiptPromotionTest#1"
         }
       ],
       "initialLines": 7979
@@ -611,24 +611,24 @@
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
       "functions": [
         {
-          "key": "arrow:anonymous#6",
-          "initialLines": 288,
-          "capLines": 288
-        },
-        {
-          "key": "arrow:anonymous#7",
-          "initialLines": 277,
-          "capLines": 277
-        },
-        {
           "key": "function:createBoundedGitHubSmartHttpProxy#1",
           "initialLines": 449,
           "capLines": 449
         },
         {
+          "key": "function:handleProxyRequest#1",
+          "initialLines": 288,
+          "capLines": 288
+        },
+        {
           "key": "function:openExactHeadRepositoryInternal#1",
           "initialLines": 272,
           "capLines": 272
+        },
+        {
+          "key": "function:runProxyRequestTask#1",
+          "initialLines": 277,
+          "capLines": 277
         }
       ]
     },
@@ -813,22 +813,7 @@
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
       "functions": [
         {
-          "key": "arrow:anonymous#105",
-          "initialLines": 309,
-          "capLines": 309
-        },
-        {
-          "key": "arrow:anonymous#32",
-          "initialLines": 296,
-          "capLines": 296
-        },
-        {
-          "key": "arrow:anonymous#78",
-          "initialLines": 361,
-          "capLines": 361
-        },
-        {
-          "key": "arrow:anonymous#95",
+          "key": "function:admitWritePlanTransaction#1",
           "initialLines": 256,
           "capLines": 256
         },
@@ -858,6 +843,16 @@
           "capLines": 327
         },
         {
+          "key": "function:cancelWorkerTransaction#1",
+          "initialLines": 309,
+          "capLines": 309
+        },
+        {
+          "key": "function:prepareProvisioningReissueTransaction#1",
+          "initialLines": 361,
+          "capLines": 361
+        },
+        {
           "key": "function:prepareWriteProvisioningReissue#1",
           "initialLines": 386,
           "capLines": 386
@@ -876,6 +871,11 @@
           "key": "function:spawnReadOnlyWorker#1",
           "initialLines": 380,
           "capLines": 380
+        },
+        {
+          "key": "function:transitionDispatchTransaction#1",
+          "initialLines": 296,
+          "capLines": 296
         },
         {
           "key": "function:transitionWorkerDispatch#1",
@@ -1181,7 +1181,7 @@
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
       "functions": [
         {
-          "key": "arrow:anonymous#15",
+          "key": "function:installedWorkerMcpRunnerOwnershipTest#1",
           "initialLines": 599,
           "capLines": 599
         }
@@ -1214,7 +1214,7 @@
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
       "functions": [
         {
-          "key": "arrow:anonymous#38",
+          "key": "function:worktreeProvisioningGuardAuthenticationTest#1",
           "initialLines": 476,
           "capLines": 476
         }
@@ -1229,12 +1229,12 @@
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
       "functions": [
         {
-          "key": "arrow:anonymous#142",
+          "key": "function:cleanupBlockedRecoveryContextDriftTest#1",
           "initialLines": 544,
           "capLines": 544
         },
         {
-          "key": "arrow:anonymous#79",
+          "key": "function:humanCliDiagnosticProjectionTest#1",
           "initialLines": 472,
           "capLines": 472
         }
@@ -1267,7 +1267,7 @@
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
       "functions": [
         {
-          "key": "arrow:anonymous#8",
+          "key": "function:protectedReviewPromotionReplayTest#1",
           "initialLines": 592,
           "capLines": 592
         }
@@ -1291,19 +1291,19 @@
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
       "functions": [
         {
-          "key": "arrow:anonymous#183",
+          "key": "function:absenceProvenReissueTest#1",
           "initialLines": 541,
           "capLines": 541
         },
         {
-          "key": "arrow:anonymous#212",
-          "initialLines": 411,
-          "capLines": 411
-        },
-        {
-          "key": "arrow:anonymous#264",
+          "key": "function:exactWriteSpawnReplayTest#1",
           "initialLines": 1248,
           "capLines": 1248
+        },
+        {
+          "key": "function:officialWorktreeReceiptPromotionTest#1",
+          "initialLines": 411,
+          "capLines": 411
         }
       ]
     },

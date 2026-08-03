@@ -5,6 +5,11 @@ Issue: <https://github.com/xliberty2008x/grok-plugin/issues/56>
 Baseline: `ffa84d4ce22252777d887e8ab6616c7155b40da7` (`github/main`,
 captured 2026-08-03).
 
+That revision remains the numeric debt snapshot. Before freezing its digest,
+the policy slice gave each over-budget anonymous callback a same-line function
+name. The identity-only migration preserved every file and function span; the
+exact old-to-new key mapping is recorded below.
+
 ## Decision
 
 Eight-thousand-line handwritten modules are not an acceptable steady state for
@@ -37,6 +42,35 @@ arrows, object and class methods, getters, setters, async functions, and
 generators. Static dependency edges include `import` and re-export sources;
 dynamic import and `require` do not masquerade as static edges.
 
+### Stable function-debt identities
+
+Persisted function debt uses a unique language-level name, never encounter
+order. A key is accepted only when its `(kind, name)` pair occurs exactly once
+in the file, so every immutable and active function key ends in `#1`.
+Anonymous, dynamic-computed, reserved `anonymous`, and colliding long-function
+identities fail even in observe mode and cannot consume a cap. Short anonymous
+callbacks remain allowed because no identity for them is persisted. Adding or
+removing one therefore cannot rename an existing long-function cap.
+
+The baseline migration was:
+
+| File | Old key | Stable key |
+| --- | --- | --- |
+| `apps/grok-review-app/src/actions/exact-head-repository.mjs` | `arrow:anonymous#6` | `function:handleProxyRequest#1` |
+| `apps/grok-review-app/src/actions/exact-head-repository.mjs` | `arrow:anonymous#7` | `function:runProxyRequestTask#1` |
+| `plugins/grok/scripts/lib/worker-mutation.mjs` | `arrow:anonymous#32` | `function:transitionDispatchTransaction#1` |
+| `plugins/grok/scripts/lib/worker-mutation.mjs` | `arrow:anonymous#78` | `function:prepareProvisioningReissueTransaction#1` |
+| `plugins/grok/scripts/lib/worker-mutation.mjs` | `arrow:anonymous#95` | `function:admitWritePlanTransaction#1` |
+| `plugins/grok/scripts/lib/worker-mutation.mjs` | `arrow:anonymous#105` | `function:cancelWorkerTransaction#1` |
+| `tests/installed-worker-mcp-runner.test.mjs` | `arrow:anonymous#15` | `function:installedWorkerMcpRunnerOwnershipTest#1` |
+| `tests/recursion-guard.test.mjs` | `arrow:anonymous#38` | `function:worktreeProvisioningGuardAuthenticationTest#1` |
+| `tests/runtime.test.mjs` | `arrow:anonymous#79` | `function:humanCliDiagnosticProjectionTest#1` |
+| `tests/runtime.test.mjs` | `arrow:anonymous#142` | `function:cleanupBlockedRecoveryContextDriftTest#1` |
+| `tests/worker-broker-protected-review.test.mjs` | `arrow:anonymous#8` | `function:protectedReviewPromotionReplayTest#1` |
+| `tests/worker-mutation.test.mjs` | `arrow:anonymous#183` | `function:absenceProvenReissueTest#1` |
+| `tests/worker-mutation.test.mjs` | `arrow:anonymous#212` | `function:officialWorktreeReceiptPromotionTest#1` |
+| `tests/worker-mutation.test.mjs` | `arrow:anonymous#264` | `function:exactWriteSpawnReplayTest#1` |
+
 The scan walks the filesystem rather than Git's tracked inventory so new and
 untracked source cannot escape. Paths are sorted and rendered with `/` on every
 platform. A source-root symlink, unreadable path, parser failure, or malformed
@@ -60,6 +94,7 @@ The tested ratchet engine fails:
 - a new ordinal fragment such as `domain_part3.mjs`;
 - a stale, missing, or category-drifted exception.
 - a product/tooling dependency routed backward through a registered facade.
+- an anonymous or colliding identity for an over-budget function.
 
 Legacy debt itself remains visible as warnings. An exception cannot be a
 wildcard and cannot reserve spare capacity. `initialDebt`, `initialCycles`, and
@@ -81,6 +116,8 @@ removal criterion.
   import domain modules, not route dependencies back through a facade.
 - Moving code into one giant function does not help because function spans are
   independently budgeted.
+- Comments and positional aliases cannot create function-debt identities; a
+  long function needs one unique syntactic name in its file.
 - Adding a generated-file comment does not exempt a file. Standard output and
   dependency directories are outside the handwritten scan; source roots remain
   fail closed.

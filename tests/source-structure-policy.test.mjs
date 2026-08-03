@@ -93,6 +93,22 @@ function functionLines(count, name = "longFunction") {
   ].join("\n");
 }
 
+function arrowFunctionLines(count, name = "longArrow") {
+  return [
+    `export const ${name} = () => {`,
+    ...Array.from({ length: count - 2 }, () => "  // line"),
+    "};"
+  ].join("\n");
+}
+
+function anonymousArrowLines(count) {
+  return [
+    "export const callbacks = [1].map(() => {",
+    ...Array.from({ length: count - 2 }, () => "  // line"),
+    "});"
+  ].join("\n");
+}
+
 function codes(result, severity = null) {
   const entries = severity === "error" ? result.errors : severity === "warning" ? result.warnings : result.findings;
   return new Set(entries.map((entry) => entry.code));
@@ -131,7 +147,9 @@ test("Acorn spans cover declarations, expressions, arrows, object and class meth
     "const arrow = async () => {", "  return 3;", "};",
     "const object = {", "  method() { return 4; },", "  get value() { return 5; },", "  set value(next) { void next; }", "};",
     "class Example {", "  async *iterate() { return 6; }", "  get item() { return 7; }", "  set item(next) { void next; }", "}",
-    "export { expression, arrow, object, Example };"
+    "class Fields {", "  field = () => 8;", "  [dynamic] = () => 9;", "}",
+    "class PrivateNames {", "  foo() { return 10; }", "  #foo() { return 11; }", "}",
+    "export { expression, arrow, object, Example, Fields, PrivateNames };"
   ].join("\n");
   const parsed = parseSourceStructure(source, "kinds.mjs");
   const spans = collectFunctionSpans(parsed.ast);
@@ -139,9 +157,14 @@ test("Acorn spans cover declarations, expressions, arrows, object and class meth
   assert.ok(spans.some((span) => span.key === "function:expression#1" && span.generator));
   assert.ok(spans.some((span) => span.key === "arrow:arrow#1" && span.async));
   assert.ok(spans.some((span) => span.key === "method:method#1"));
+  assert.ok(spans.some((span) => span.key === "arrow:field#1" && span.stableIdentity));
+  assert.ok(spans.some((span) => span.key === "arrow:<anonymous>#1" && !span.stableIdentity));
+  assert.ok(spans.some((span) => span.key === "method:foo#1" && span.stableIdentity));
+  assert.ok(spans.some((span) => span.key === "method:#foo#1" && span.stableIdentity));
   assert.equal(spans.filter((span) => span.kind === "get").length, 2);
   assert.equal(spans.filter((span) => span.kind === "set").length, 2);
   assert.ok(spans.every((span) => span.lines === span.endLine - span.startLine + 1));
+  assert.ok(spans.filter((span) => span.name !== "anonymous").every((span) => span.stableIdentity));
 });
 
 test("static dependency extraction ignores dynamic import and require", () => {
@@ -242,6 +265,139 @@ test("per-function vectors reject new, grown, reduced, and stale long functions"
 
   const noBaseline = evaluateSourceStructure({ root, config: policy(), mode: "ratchet" });
   assert.equal(noBaseline.ok, true, "a now-within-budget function needs no exception");
+}));
+
+test("long-function caps use unique named identities instead of encounter ordinals", () => withRepository((root) => {
+  const stableCap = {
+    category: "product", initialLines: 252, lineCap: null,
+    issue: "#56", rationale: "Existing named debt.", removalCriterion: "Within budget.",
+    functions: [{ key: "arrow:stableLong#1", initialLines: 251, capLines: 251 }]
+  };
+  const config = policy({ legacyDebt: { "plugins/stable.mjs": stableCap } });
+  const longArrow = arrowFunctionLines(251, "stableLong");
+
+  write(root, "plugins/stable.mjs", `export const short = [1].map(() => 1);\n${longArrow}`);
+  let result = evaluateSourceStructure({ root, config, mode: "ratchet" });
+  assert.equal(result.ok, true);
+  assert.ok(result.files.find((entry) => entry.file === "plugins/stable.mjs")
+    .functions.some((span) => span.key === "arrow:<anonymous>#1" && !span.stableIdentity));
+  assert.equal(
+    result.files.find((entry) => entry.file === "plugins/stable.mjs")
+      .functions.find((span) => span.name === "stableLong").key,
+    "arrow:stableLong#1"
+  );
+
+  write(root, "plugins/stable.mjs", longArrow);
+  result = evaluateSourceStructure({ root, config, mode: "ratchet" });
+  assert.equal(result.ok, true, "removing an unrelated earlier anonymous function must not rename debt");
+}));
+
+test("class-field arrows use static property names and reject dynamic computed identities", () => withRepository((root) => {
+  const staticField = [
+    "export class Example {",
+    "  handler = () => {",
+    ...Array.from({ length: 249 }, () => "    // line"),
+    "  };",
+    "}"
+  ].join("\n");
+  const staticCap = {
+    category: "product", initialLines: physicalLineCount(staticField), lineCap: null,
+    issue: "#56", rationale: "Existing named debt.", removalCriterion: "Within budget.",
+    functions: [{ key: "arrow:handler#1", initialLines: 251, capLines: 251 }]
+  };
+  write(root, "plugins/fields.mjs", staticField);
+  assert.equal(evaluateSourceStructure({
+    root,
+    config: policy({ legacyDebt: { "plugins/fields.mjs": staticCap } }),
+    mode: "ratchet"
+  }).ok, true);
+
+  const dynamicField = `const handlerName = "handler";\n${staticField.replace("handler =", "[handlerName] =")}`;
+  write(root, "plugins/fields.mjs", dynamicField);
+  const dynamic = evaluateSourceStructure({ root, config: policy() });
+  assert.ok(codes(dynamic, "error").has("unstable-function-identity"));
+}));
+
+test("anonymous and colliding long-function identities fail closed and cannot be baselined", () => withRepository((root) => {
+  write(root, "plugins/anonymous.mjs", anonymousArrowLines(251));
+  const anonymous = evaluateSourceStructure({ root, config: policy() });
+  assert.equal(anonymous.ok, false);
+  assert.ok(codes(anonymous, "error").has("unstable-function-identity"));
+
+  write(root, "plugins/anonymous.mjs", [
+    "const handlerName = 'handler';",
+    "export const handlers = {",
+    "  [handlerName]: () => {",
+    ...Array.from({ length: 249 }, () => "    // line"),
+    "  }",
+    "};"
+  ].join("\n"));
+  const dynamicComputed = evaluateSourceStructure({ root, config: policy() });
+  assert.ok(codes(dynamicComputed, "error").has("unstable-function-identity"));
+
+  const anonymousCap = {
+    category: "product", initialLines: 251, lineCap: null,
+    issue: "#56", rationale: "Invalid anonymous debt.", removalCriterion: "Within budget.",
+    functions: [{ key: "arrow:<anonymous>#1", initialLines: 251, capLines: 251 }]
+  };
+  assert.ok(validateSourceStructurePolicy(policy({
+    legacyDebt: { "plugins/anonymous.mjs": anonymousCap }
+  })).some((message) => /unique named function keys ending in #1/u.test(message)));
+  fs.rmSync(path.join(root, "plugins/anonymous.mjs"));
+
+  const duplicateSource = [
+    "{",
+    arrowFunctionLines(251, "repeated").replace("export const", "const"),
+    "}",
+    "{ const repeated = () => 1; void repeated; }"
+  ].join("\n");
+  write(root, "plugins/duplicate.mjs", duplicateSource);
+  const duplicateCap = {
+    category: "product", initialLines: physicalLineCount(duplicateSource), lineCap: null,
+    issue: "#56", rationale: "Existing named debt.", removalCriterion: "Within budget.",
+    functions: [{ key: "arrow:repeated#1", initialLines: 251, capLines: 251 }]
+  };
+  const duplicate = evaluateSourceStructure({
+    root,
+    config: policy({ legacyDebt: { "plugins/duplicate.mjs": duplicateCap } }),
+    mode: "ratchet"
+  });
+  assert.equal(duplicate.ok, false);
+  assert.ok(codes(duplicate, "error").has("ambiguous-function-identity"));
+  assert.ok(codes(duplicate, "error").has("stale-function-exception"));
+
+  const resolvedSource = [
+    "{ const repeated = () => 1; void repeated; }",
+    "{ const repeated = () => 2; void repeated; }"
+  ].join("\n");
+  write(root, "plugins/duplicate.mjs", resolvedSource);
+  const resolvedInitial = {
+    "plugins/duplicate.mjs": {
+      category: "product",
+      functions: [{ initialLines: 251, key: "arrow:repeated#1" }],
+      initialLines: physicalLineCount(duplicateSource)
+    }
+  };
+  const resolvedCap = {
+    ...duplicateCap,
+    functions: []
+  };
+  const resolvedDuplicate = evaluateSourceStructure({
+    root,
+    config: policy({
+      initialDebt: resolvedInitial,
+      legacyDebt: { "plugins/duplicate.mjs": resolvedCap }
+    }),
+    mode: "ratchet"
+  });
+  assert.ok(codes(resolvedDuplicate, "error").has("ambiguous-function-identity"),
+    "resolved immutable identities must remain unique while their file exists");
+
+  const ordinalCap = structuredClone(duplicateCap);
+  ordinalCap.functions[0].key = "arrow:repeated#2";
+  assert.ok(validateSourceStructurePolicy(policy({
+    legacyDebt: { "plugins/duplicate.mjs": ordinalCap }
+  })).some((message) => /unique named function keys ending in #1/u.test(message)));
 }));
 
 test("resolved file and function caps stay immutable and reject regression", () => withRepository((root) => {
@@ -346,7 +502,7 @@ test("ratchet rejects implementation imports through a registered facade", () =>
 
 test("immutable digest pins initial debt and topology while caps may only shrink", () => {
   const config = loadSourceStructurePolicy({ root: ROOT });
-  assert.equal(SOURCE_STRUCTURE_INITIAL_DIGEST, "42d182f28170c985d3d12ff1fa55ead2214b5d84c43ff10b6102b5fe6242abf2");
+  assert.equal(SOURCE_STRUCTURE_INITIAL_DIGEST, "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b");
   assert.equal(config.baseline.initialDigest, SOURCE_STRUCTURE_INITIAL_DIGEST);
   assert.equal(sourceStructureInitialDigest(config), SOURCE_STRUCTURE_INITIAL_DIGEST);
 
@@ -606,10 +762,17 @@ test("checked-in observe baseline exactly covers all current file and function d
   for (const [file, initial] of Object.entries(config.initialDebt)) {
     const cap = config.legacyDebt[file];
     assert.equal(initial.initialLines, cap.initialLines);
+    assert.ok(initial.functions.every((span) => /#1$/u.test(span.key)));
     assert.deepEqual(
       initial.functions,
       cap.functions.map((span) => ({ initialLines: span.initialLines, key: span.key }))
     );
+  }
+  for (const entry of result.files) {
+    if (!entry.category) continue;
+    const budget = config.budgets[entry.category].functionLines;
+    assert.ok(entry.functions.filter((span) => span.lines > budget)
+      .every((span) => span.stableIdentity && span.key.endsWith("#1")), entry.file);
   }
   assert.equal(Object.keys(config.dispositions).length, 10);
   assert.deepEqual(
@@ -619,9 +782,11 @@ test("checked-in observe baseline exactly covers all current file and function d
   assert.deepEqual(result.cycles, config.capCycleComponents);
   assert.deepEqual(result.fragments, config.capOrdinalFragments);
   const driftCodes = new Set([
+    "ambiguous-function-identity",
     "legacy-category-drift", "legacy-file-growth", "legacy-function-growth",
     "missing-legacy-exception", "new-file-overage", "new-function-overage",
-    "stale-file-cap", "stale-function-cap", "stale-function-exception"
+    "stale-file-cap", "stale-function-cap", "stale-function-exception",
+    "unstable-function-identity"
   ]);
   assert.equal(result.warnings.some((entry) => driftCodes.has(entry.code)), false);
 });

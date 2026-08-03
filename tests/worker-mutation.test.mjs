@@ -2883,7 +2883,7 @@ test("reissue registration failure settles the exact activated planned predecess
 
 test("absence-proven reissue archives the prior attempt and activates only a fresh fence", {
   skip: process.platform === "win32"
-}, async (t) => {
+}, async function absenceProvenReissueTest(t) {
   const fixture = plannedWriteProvisioningFixture("absence-reissue");
   const active = await activateRegisteredProvisioning(t, fixture);
   process.kill(-active.child.pid, "SIGKILL");
@@ -3515,7 +3515,7 @@ test("host adoption rejects mismatched evidence and a dirty worktree without mut
 
 test("official worktree receipt and cleanup proof promote only verified-worktree-ready with zero dispatch authority", {
   skip: process.platform === "win32"
-}, async (t) => {
+}, async function officialWorktreeReceiptPromotionTest(t) {
   const fixture = plannedWriteProvisioningFixture("official-ready");
   const prepared = prepareProvisioningIntent(fixture);
   const { child, identity } = await detachedProvisioner(t, fixture.workerId);
@@ -4308,7 +4308,7 @@ test("generation-1 immutable authority rejects corruption; verified target.txt w
 
 test("issue #34 lifecycle exact write spawn replay returns the original handle after dispatch and terminal state", {
   skip: process.platform === "win32"
-}, async (t) => {
+}, async function exactWriteSpawnReplayTest(t) {
   const fixture = plannedWriteVerticalFixture("dispatched-spawn-replay");
   const idempotencyKey = "write-vertical-dispatched-spawn-replay-0001";
   const writeLifecycleCapabilityDigest = "c".repeat(64);
