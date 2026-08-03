@@ -49,13 +49,9 @@
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
     "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b",
-    "policyDigest": "79de8a18d6b115f099749223cc1fe9931ccec460c9e5afab8891ad2b17ec7743"
+    "policyDigest": "5f7db9ef06acfc2fff76bc6ecc6fd3449f6ca8d597581ba6a2ed507d21c7573e"
   },
   "dispositions": {
-    "plugins/grok/scripts/lib/worker-mutation.mjs": {
-      "stage": "5-worker-mutation",
-      "target": "Split mutation admission, provisioning, dispatch, cancellation, and terminal transition domains."
-    },
     "scripts/lib/worker-broker-evidence.mjs": {
       "stage": "6-evidence-last",
       "target": "Separate evidence validation, signing, promotion, and qualification without changing canonical digests."
@@ -712,31 +708,11 @@
     "plugins/grok/scripts/lib/worker-mutation.mjs": {
       "category": "product",
       "initialLines": 11269,
-      "lineCap": 6986,
+      "lineCap": 4840,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
       "functions": [
-        {
-          "key": "function:admitWritePlanTransaction#1",
-          "initialLines": 256,
-          "capLines": 256
-        },
-        {
-          "key": "function:admitWriteWorkerPlan#1",
-          "initialLines": 378,
-          "capLines": 378
-        },
-        {
-          "key": "function:adoptWriteProvisioningEffect#1",
-          "initialLines": 284,
-          "capLines": 284
-        },
-        {
-          "key": "function:authorizeReadyWriteWorkerDispatch#1",
-          "initialLines": 282,
-          "capLines": 282
-        },
         {
           "key": "function:cancelWorker#1",
           "initialLines": 327,
@@ -758,19 +734,9 @@
           "capLines": 386
         },
         {
-          "key": "function:recordWriteProvisionerNoChild#1",
-          "initialLines": 289,
-          "capLines": 289
-        },
-        {
           "key": "function:spawnGrantedFollowupWorker#1",
           "initialLines": 299,
           "capLines": 299
-        },
-        {
-          "key": "function:spawnReadOnlyWorker#1",
-          "initialLines": 380,
-          "capLines": 380
         },
         {
           "key": "function:transitionDispatchTransaction#1",
