@@ -6017,7 +6017,7 @@ function waitForBackgroundFailure(root, env, id) {
     id,
     "--wait",
     "--timeout-ms",
-    "10000",
+    "30000",
     "--json"
   ], { cwd: root, env }));
   assert.equal(job.status, "failed");

@@ -2350,7 +2350,7 @@ test("report-repair provider failure after generation 2 registration preserves t
 test("active cancellation after generation 2 registration preserves E_CANCELLED", { skip: process.platform === "win32" }, async (t) => {
   const { root, fake, env } = fixture({
     taskTexts: ["invalid first worker response", taskReport("Repair must be cancelled")],
-    delayMs: 2_000
+    cancelMode: "wait", cancelModeOnPrompt: 2
   });
   const options = { env };
   let workerId = null;
