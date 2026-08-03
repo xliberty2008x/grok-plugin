@@ -17,6 +17,37 @@ Release versioning, qualification evidence, and host-boundary rules below still
 apply to any release-bearing change; this section only documents the fork-PR
 merge gates for protected `main`.
 
+## Source-structure policy
+
+Run the executable structure policy directly when adding or moving JavaScript:
+
+```text
+npm run structure:check
+```
+
+The checked-in policy scans handwritten `.js`, `.mjs`, and `.cjs` under the
+application, plugin, script, and test roots. It measures physical lines and
+Acorn function spans, static ESM cycles, facade direction, and ordinal
+fragments. The budgets are 1,500/250 lines for product files/functions,
+2,000/350 for tooling, 2,000/400 for tests, and 300 lines for registered
+facades and entrypoints.
+
+The repository is initially in `observe` mode: existing debt is visible as
+warnings, while malformed policy, parser failure, unreadable source, or a
+symlink inside a source root fails closed. `ratchet` behavior is already tested
+but MUST NOT become the checked-in mode until the promotion conditions in
+`docs/issues/56-source-structure-policy.md` are satisfied.
+
+Legacy allowances are exact paths, not patterns. Their original line count is
+immutable and protected by the repository-pinned baseline digest; the separate
+current cap cannot grow, and a reduction must lower or resolve the cap in the
+same change. A resolved file cap is `null`; resolved function caps are removed
+from the active vector while their immutable history remains. Long-function
+allowances are sorted per-function vectors. Every allowance needs an issue,
+rationale, and observable removal criterion.
+Do not add spare capacity, wildcard exceptions, fake `part1`/`part2` modules,
+empty facade indirection, or generated-file headers to evade the policy.
+
 ## Versioning convention and change taxonomy
 
 The repository follows Semantic Versioning, with an explicit rule for the

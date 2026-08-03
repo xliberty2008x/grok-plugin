@@ -1624,7 +1624,7 @@ test("terminal process secondary diagnostics use the authoritative 256-character
   assert.equal(normalized.details.secondaryDiagnostic.message, "x".repeat(256));
 });
 
-test("human CLI process diagnostics stay behind public status, result, review, and table projections", () => {
+test("human CLI process diagnostics stay behind public status, result, review, and table projections", function humanCliDiagnosticProjectionTest() {
   const root = fs.realpathSync(initRepo());
   const { env } = fixture();
   const stateRoot = seedWorkspace(root, env);
@@ -3646,7 +3646,7 @@ test("final task evidence fails closed when post-cleanup context is unavailable"
 
 test("cleanup-blocked recovery lets final context drift override a process signalling failure", {
   skip: process.platform === "win32"
-}, () => {
+}, function cleanupBlockedRecoveryContextDriftTest() {
   const root = fs.realpathSync(initRepo());
   const { env } = fixture();
   const stateRoot = seedWorkspace(root, env);

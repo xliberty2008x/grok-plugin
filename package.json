@@ -20,6 +20,7 @@
     "test:phase3-focused": "node scripts/test-phase3-focused.mjs",
     "test:natural-codex": "node scripts/test-natural-codex.mjs",
     "codex:update-local": "node scripts/update-local-codex.mjs",
+    "structure:check": "node scripts/check-source-structure.mjs",
     "validate": "node scripts/validate.mjs",
     "version:check": "node scripts/validate.mjs --versions-only",
     "version:bump": "node scripts/bump-version.mjs",
@@ -34,5 +35,8 @@
     "grok:ci-auth:status": "node scripts/install-grok-ci-auth-sync.mjs status",
     "grok:ci-auth:uninstall": "node scripts/install-grok-ci-auth-sync.mjs uninstall"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "acorn": "8.15.0"
+  }
 }

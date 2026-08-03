@@ -19,6 +19,10 @@ import {
   EXTERNAL_BOUNDARY_TESTS,
   listDeterministicTestFiles
 } from "./test-deterministic.mjs";
+import {
+  evaluateSourceStructure,
+  loadSourceStructurePolicy
+} from "./lib/source-structure-policy.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = new Set(process.argv.slice(2));
@@ -158,6 +162,21 @@ function versionChecks() {
   const releasePlan = readJson("release-plan.json");
   if (!packageJson || !packageLock || !marketplace || !codexMarketplace || !pluginManifest || !codexPluginManifest || !releasePlan) return;
 
+  const exactDevelopmentDependencies = { acorn: "8.15.0" };
+  if (["dependencies", "optionalDependencies", "peerDependencies"].some(
+    (field) => Object.keys(packageJson[field] || {}).length > 0
+  )
+    || (packageJson.bundledDependencies || []).length > 0
+    || JSON.stringify(packageJson.devDependencies) !== JSON.stringify(exactDevelopmentDependencies)) {
+    problem("Acorn 8.15.0 must remain the sole exact-pinned implementation dependency.", "package.json");
+  }
+  if (JSON.stringify(packageLock.packages?.[""]?.devDependencies) !== JSON.stringify(exactDevelopmentDependencies)
+    || packageLock.packages?.["node_modules/acorn"]?.version !== "8.15.0"
+    || packageLock.packages?.["node_modules/acorn"]?.dev !== true
+    || Object.keys(packageLock.packages || {}).some((entry) => !["", "node_modules/acorn"].includes(entry))) {
+    problem("package-lock.json must resolve only the exact Acorn 8.15.0 development dependency.", "package-lock.json");
+  }
+
   const version = packageJson.version;
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(String(version))) {
     problem("package.json version is not a supported SemVer value.", "package.json");
@@ -286,8 +305,11 @@ if (!versionsOnly) {
     ".agents/plugins/marketplace.json",
     ".github/workflows/ci.yml",
     "scripts/validate.mjs",
+    "scripts/check-source-structure.mjs",
+    "scripts/source-structure-policy.json",
     "scripts/cleanup-test-temp.mjs",
     "scripts/lib/ci-workflow-contract.mjs",
+    "scripts/lib/source-structure-policy.mjs",
     "scripts/test-deterministic.mjs",
     "scripts/lib/deterministic-test-runner.mjs",
     "scripts/lib/deterministic-test-shards.mjs",
@@ -319,6 +341,7 @@ if (!versionsOnly) {
     "tests/control-plane_part2.mjs",
     "tests/control-plane_part3.mjs",
     "tests/deterministic-sharding.test.mjs",
+    "tests/source-structure-policy.test.mjs",
     "tests/worker-broker-evidence.test.mjs",
     "tests/worker-broker-evidence_part1.mjs",
     "tests/worker-broker-evidence_part2.mjs",
@@ -426,6 +449,15 @@ if (!versionsOnly) {
   for (const name of commandNames) required.push(`plugins/grok/skills/${name}/SKILL.md`);
   for (const file of required) requiredFile(file);
 
+  try {
+    const structurePolicy = loadSourceStructurePolicy({ root: ROOT });
+    const structure = evaluateSourceStructure({ root: ROOT, config: structurePolicy });
+    for (const entry of structure.errors) problem(entry.message, entry.file);
+    for (const entry of structure.warnings) warn(entry.message, entry.file);
+  } catch (error) {
+    problem(error.message, "scripts/source-structure-policy.json");
+  }
+
   const appManifest = readJson("apps/grok-review-app/github-app-manifest.template.json");
   if (appManifest) {
     const file = "apps/grok-review-app/github-app-manifest.template.json";
@@ -473,7 +505,7 @@ if (!versionsOnly) {
     if (packageJson.type !== "module") problem("The package must use ESM (`type: module`).", "package.json");
     if (packageJson.license !== "Apache-2.0") problem("Package license must be Apache-2.0.", "package.json");
     if (packageJson.engines?.node !== ">=18.18") problem("Node engine must remain >=18.18.", "package.json");
-    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "test:protected-review", "test:installed-worker-mcp", "test:temp:cleanup", "codex:update-local", "validate", "version:check", "version:bump", "check"]) {
+    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "test:protected-review", "test:installed-worker-mcp", "test:temp:cleanup", "codex:update-local", "structure:check", "validate", "version:check", "version:bump", "check"]) {
       if (!packageJson.scripts?.[script]) problem(`Missing npm script: ${script}.`, "package.json");
     }
     if (packageJson.scripts?.["test:pty-ingress"] !== "node --test tests/pty-ingress.test.mjs") {
@@ -494,6 +526,9 @@ if (!versionsOnly) {
     }
     if (packageJson.scripts?.["test:temp:cleanup"] !== "node scripts/cleanup-test-temp.mjs") {
       problem("test:temp:cleanup must execute the guarded test-temp cleanup command directly.", "package.json");
+    }
+    if (packageJson.scripts?.["structure:check"] !== "node scripts/check-source-structure.mjs") {
+      problem("structure:check must execute the source-structure policy directly.", "package.json");
     }
     if (packageJson.scripts?.check !== "npm run validate && npm run test:deterministic") {
       problem("check must run validation and the zero-skip deterministic suite.", "package.json");

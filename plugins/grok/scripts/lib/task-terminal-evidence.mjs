@@ -4,9 +4,9 @@ import {
   assertContextManifestIntegrity,
   buildRuntimeEvidence,
   captureContextManifest,
-  evaluateScope,
   observeChangedPaths
 } from "./task-contract.mjs";
+import { evaluateScope } from "./task-scope.mjs";
 
 /**
  * Capture the authoritative task observation after runtime cleanup. Capture

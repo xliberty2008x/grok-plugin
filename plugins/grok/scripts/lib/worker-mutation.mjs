@@ -35,7 +35,6 @@ import {
   withWorkspaceStateTransaction
 } from "./state.mjs";
 import {
-  appendLifecycleEvent,
   assertContextCompatible,
   assertContextManifestIntegrity,
   assertTaskEnvelope,
@@ -47,10 +46,11 @@ import {
   composeProviderPrompt,
   CONTEXT_MANIFEST_VERSION,
   CONTEXT_METADATA_POLICIES,
-  evaluateScope,
   observeChangedPaths,
   scrubStoredJob
 } from "./task-contract.mjs";
+import { appendLifecycleEvent } from "./task-lifecycle.mjs";
+import { evaluateScope } from "./task-scope.mjs";
 import {
   CONTEXT_BINDING_MODE,
   assertContextPacket,
@@ -2853,7 +2853,7 @@ export function transitionWorkerDispatch({
     throw new CompanionError("E_PROCESS_IDENTITY", "Worker provider identity requires a positive invocation generation.");
   }
 
-  return withWorkspaceStateTransaction(root, (transaction) => {
+  return withWorkspaceStateTransaction(root, function transitionDispatchTransaction(transaction) {
     const current = transaction.tryReadJob(workerId);
     if (!current) throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
     const dispatch = current.request?.spawn?.dispatch;
@@ -7490,7 +7490,7 @@ export function prepareWriteProvisioningReissue({
   });
   assertExecutableAttestation(executableIdentity);
 
-  return withWorkspaceStateTransaction(root, (transaction) => {
+  return withWorkspaceStateTransaction(root, function prepareProvisioningReissueTransaction(transaction) {
     const current = transaction.tryReadJob(workerId);
     if (!current) throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
     assertMutationOwnership(current, principal);
@@ -9420,7 +9420,7 @@ export function admitWriteWorkerPlan({
     };
   };
 
-  const admitted = withWorkspaceStateTransaction(control.controlRoot, (transaction) => {
+  const admitted = withWorkspaceStateTransaction(control.controlRoot, function admitWritePlanTransaction(transaction) {
     const digestOwners = transaction.listJobs().filter((candidate) => (
       candidate.request?.spawn?.idempotencyKeyDigest === keyDigest
     ));
@@ -10934,7 +10934,7 @@ export function cancelWorker({
 
   const keyDigest = digestKey(idempotencyKey);
   const mutationDigest = cancelRequestDigest({ principal, workerId });
-  return withWorkspaceStateTransaction(root, (transaction) => {
+  return withWorkspaceStateTransaction(root, function cancelWorkerTransaction(transaction) {
     const existing = readIdempotency(root, "cancel", idempotencyKey, env);
     if (existing) {
       if (

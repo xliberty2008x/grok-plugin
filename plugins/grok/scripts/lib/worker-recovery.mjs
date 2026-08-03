@@ -22,7 +22,7 @@ import {
   updateJob,
   withWorkspaceStateTransaction
 } from "./state.mjs";
-import { appendLifecycleEvent } from "./task-contract.mjs";
+import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import {
   assertDispatchContract,
   acquireRecoveryCleanupFence,

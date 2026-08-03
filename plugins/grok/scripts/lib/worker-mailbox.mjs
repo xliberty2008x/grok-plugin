@@ -22,7 +22,7 @@ import {
   terminal,
   withWorkspaceStateTransaction
 } from "./state.mjs";
-import { appendLifecycleEvent } from "./task-contract.mjs";
+import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import { workspaceState } from "./workspace.mjs";
 import { isDispatchV2 } from "./worker-launch-contract.mjs";
 import {
