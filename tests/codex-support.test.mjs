@@ -475,11 +475,31 @@ test("Codex manifest, marketplace, public skills, hooks, and wrapper form one in
   assert.match(readme, /Sole setup-recoverable path/i);
   assert.doesNotMatch(rescueSkill, /general orchestration framework/i);
 
+  // Issue #58: Claude Code auto-loads conventional hooks/hooks.json; the Claude
+  // manifest must register only the supplemental Claude-only SessionEnd file.
   assert.deepEqual(Object.keys(defaultHooks.hooks).sort(), ["SessionStart", "Stop"]);
   assert.deepEqual(Object.keys(claudeHooks.hooks), ["SessionEnd"]);
-  assert.deepEqual(claudeManifest.hooks, ["./hooks/hooks.json", "./hooks/claude-hooks.json"]);
+  assert.deepEqual(claudeManifest.hooks, ["./hooks/claude-hooks.json"]);
+  const conventionalHooksPath = path.resolve(PLUGIN_ROOT, "hooks/hooks.json");
+  const manifestHookPaths = claudeManifest.hooks.map((hookPath) => path.resolve(PLUGIN_ROOT, hookPath));
+  assert.equal(manifestHookPaths.includes(conventionalHooksPath), false, "Claude manifest must not re-register conventional hooks/hooks.json");
+  for (const hookPath of manifestHookPaths) {
+    assert.ok(hookPath.startsWith(`${PLUGIN_ROOT}${path.sep}`), "Claude manifest hook files must remain inside the plugin root");
+  }
+  const defaultHookEvents = Object.keys(defaultHooks.hooks);
+  const supplementalHookEvents = Object.keys(claudeHooks.hooks);
+  assert.equal(new Set([...defaultHookEvents, ...supplementalHookEvents]).size, defaultHookEvents.length + supplementalHookEvents.length, "default and supplemental hook events must be disjoint");
+  assert.deepEqual(
+    [...defaultHookEvents, ...supplementalHookEvents].sort(),
+    ["SessionEnd", "SessionStart", "Stop"]
+  );
+  for (const [event, groups] of Object.entries({ ...defaultHooks.hooks, ...claudeHooks.hooks })) {
+    assert.equal(groups.length, 1, `${event} must be registered exactly once`);
+    assert.equal(groups[0].hooks.length, 1, `${event} must contain exactly one command hook`);
+  }
   assert.match(defaultHooks.hooks.SessionStart[0].hooks[0].command, /\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/session-lifecycle-hook\.mjs/);
   assert.match(defaultHooks.hooks.Stop[0].hooks[0].command, /\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/stop-review-gate-hook\.mjs/);
+  assert.match(claudeHooks.hooks.SessionEnd[0].hooks[0].command, /\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/session-lifecycle-hook\.mjs/);
 
   const wrapper = read("plugins/grok/scripts/grok-codex.mjs");
   // Source contract: only set host when unset (preserve explicit), claim codex only under CODEX_THREAD_ID,
