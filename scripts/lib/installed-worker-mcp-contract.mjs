@@ -1766,7 +1766,7 @@ function validNullableCommit(value) {
 function validContextManifest(value, worker) {
   return (
     exactKeys(value, CONTEXT_MANIFEST_KEYS)
-    && value.schemaVersion === 1
+    && value.schemaVersion === 2
     && value.manifestId === worker.contextManifestId
     && value.digest === worker.contextDigest
     && canonicalIsoTimestamp(value.capturedAt)

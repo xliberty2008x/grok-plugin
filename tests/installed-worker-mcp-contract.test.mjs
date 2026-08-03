@@ -11,9 +11,8 @@ import {
   CODEX_MCP_EXPERIMENTAL_CAPABILITIES,
   MCP_SANDBOX_STATE_META_CAPABILITY
 } from "../plugins/grok/scripts/lib/worker-authority.mjs";
-import {
-  codexMetadataCapabilityMatrix
-} from "../plugins/grok/scripts/lib/worker-presentation.mjs";
+import { codexMetadataCapabilityMatrix } from "../plugins/grok/scripts/lib/worker-presentation.mjs";
+import { CONTEXT_MANIFEST_VERSION } from "../plugins/grok/scripts/lib/task-context-policy.mjs";
 import {
   MAX_LIFECYCLE_EVENTS,
   projectWorkerHandle,
@@ -230,7 +229,7 @@ function initializeExpectations() {
 
 function contextManifestFixture() {
   return {
-    schemaVersion: 1,
+    schemaVersion: CONTEXT_MANIFEST_VERSION,
     manifestId: MANIFEST_ID,
     digest: "e".repeat(64),
     capturedAt: "2026-07-23T10:00:00.000Z",
@@ -1312,13 +1311,14 @@ test("terminal worker_result accepts the production snapshot and rejects private
   const snapshot = actual.terminalResult.worker;
   assert.equal(snapshot.workerProtocolVersion, 1);
   assert.equal(snapshot.snapshotSchemaVersion, 1);
-  assert.equal(snapshot.schemaVersion, 3);
+  assert.deepEqual([snapshot.schemaVersion, CONTEXT_MANIFEST_VERSION, snapshot.context.schemaVersion], [3, 2, 2]);
   assert.equal(snapshot.result.workerReport.outcome, "complete");
   assert.equal(snapshot.result.providerClaims.observedFileAgreement, true);
   assert.equal(snapshot.result.hostVerification, "not_run");
   assert.doesNotThrow(() => validateInstalledCompletionScenario(actual));
 
   const mutations = [
+    (value) => { value.terminalResult.worker.context.schemaVersion = 1; },
     (value) => {
       value.terminalResult.worker.providerProcess = { pid: 42 };
     },
