@@ -2,8 +2,8 @@
 
 Issue: <https://github.com/xliberty2008x/grok-plugin/issues/56>
 
-Baseline: `7301afbbbf29afc3690c9d1d4458b8c394bed2bc` (`github/main`,
-captured 2026-08-01).
+Baseline: `ffa84d4ce22252777d887e8ab6616c7155b40da7` (`github/main`,
+captured 2026-08-03).
 
 ## Decision
 

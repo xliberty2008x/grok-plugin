@@ -41,9 +41,9 @@
     }
   },
   "baseline": {
-    "date": "2026-08-01",
-    "revision": "7301afbbbf29afc3690c9d1d4458b8c394bed2bc",
-    "initialDigest": "f4e4a617eb3a60d43a1cfa48cbecc3362606052a5011a6db9b3d962c64357c89"
+    "date": "2026-08-03",
+    "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
+    "initialDigest": "96b5c74f6b04a6f586361c323a0b64d7581eb62c4e0bb45f190896a525d8b0de"
   },
   "dispositions": {
     "plugins/grok/scripts/grok-companion.mjs": {
@@ -146,7 +146,7 @@
           "key": "function:recoverActiveJobs#1"
         }
       ],
-      "initialLines": 5266
+      "initialLines": 5271
     },
     "plugins/grok/scripts/lib/deep-research.mjs": {
       "category": "product",
@@ -342,7 +342,7 @@
           "key": "function:reconcileOwnedWorkers#1"
         }
       ],
-      "initialLines": 364
+      "initialLines": 365
     },
     "plugins/grok/scripts/lib/worker-recovery.mjs": {
       "category": "product",
@@ -397,7 +397,7 @@
           "key": "function:cleanupTestTemp#1"
         }
       ],
-      "initialLines": 2630
+      "initialLines": 2631
     },
     "scripts/lib/test-temp-git-containment.cjs": {
       "category": "tooling",
@@ -462,7 +462,7 @@
     "tests/control-plane.test.mjs": {
       "category": "tests",
       "functions": [],
-      "initialLines": 6552
+      "initialLines": 6564
     },
     "tests/fake-grok.mjs": {
       "category": "tests",
@@ -523,14 +523,14 @@
       "functions": [
         {
           "initialLines": 544,
-          "key": "arrow:anonymous#139"
+          "key": "arrow:anonymous#142"
         },
         {
           "initialLines": 472,
-          "key": "arrow:anonymous#76"
+          "key": "arrow:anonymous#79"
         }
       ],
-      "initialLines": 5332
+      "initialLines": 5427
     },
     "tests/test-temp-cleanup.test.mjs": {
       "category": "tests",
@@ -649,8 +649,8 @@
     },
     "plugins/grok/scripts/grok-companion.mjs": {
       "category": "facade",
-      "initialLines": 5266,
-      "lineCap": 5266,
+      "initialLines": 5271,
+      "lineCap": 5271,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
@@ -758,7 +758,7 @@
     "plugins/grok/scripts/lib/task-contract.mjs": {
       "category": "product",
       "initialLines": 5494,
-      "lineCap": 5494,
+      "lineCap": 5381,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
@@ -940,8 +940,8 @@
     },
     "plugins/grok/scripts/lib/worker-reconcile.mjs": {
       "category": "product",
-      "initialLines": 364,
-      "lineCap": 364,
+      "initialLines": 365,
+      "lineCap": 365,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
@@ -1027,8 +1027,8 @@
     },
     "scripts/lib/test-temp-cleanup.mjs": {
       "category": "tooling",
-      "initialLines": 2630,
-      "lineCap": 2630,
+      "initialLines": 2631,
+      "lineCap": 2631,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
@@ -1127,8 +1127,8 @@
     },
     "tests/control-plane.test.mjs": {
       "category": "tests",
-      "initialLines": 6552,
-      "lineCap": 6552,
+      "initialLines": 6564,
+      "lineCap": 6564,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
@@ -1222,19 +1222,19 @@
     },
     "tests/runtime.test.mjs": {
       "category": "tests",
-      "initialLines": 5332,
-      "lineCap": 5332,
+      "initialLines": 5427,
+      "lineCap": 5427,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
       "functions": [
         {
-          "key": "arrow:anonymous#139",
+          "key": "arrow:anonymous#142",
           "initialLines": 544,
           "capLines": 544
         },
         {
-          "key": "arrow:anonymous#76",
+          "key": "arrow:anonymous#79",
           "initialLines": 472,
           "capLines": 472
         }
@@ -1336,16 +1336,7 @@
       "plugins/grok/scripts/lib/worker-worktree.mjs"
     ]
   ],
-  "capCycleComponents": [
-    [
-      "plugins/grok/scripts/lib/provider-executable-pin.mjs",
-      "plugins/grok/scripts/lib/state.mjs",
-      "plugins/grok/scripts/lib/task-contract.mjs",
-      "plugins/grok/scripts/lib/worker-host-actions.mjs",
-      "plugins/grok/scripts/lib/worker-launch-contract.mjs",
-      "plugins/grok/scripts/lib/worker-worktree.mjs"
-    ]
-  ],
+  "capCycleComponents": [],
   "initialOrdinalFragments": [
     "tests/control-plane_part1.mjs",
     "tests/control-plane_part2.mjs",

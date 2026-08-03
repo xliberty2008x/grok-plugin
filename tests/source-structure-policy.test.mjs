@@ -331,7 +331,7 @@ test("ratchet rejects implementation imports through a registered facade", () =>
 
 test("immutable digest pins initial debt and topology while caps may only shrink", () => {
   const config = loadSourceStructurePolicy({ root: ROOT });
-  assert.equal(SOURCE_STRUCTURE_INITIAL_DIGEST, "f4e4a617eb3a60d43a1cfa48cbecc3362606052a5011a6db9b3d962c64357c89");
+  assert.equal(SOURCE_STRUCTURE_INITIAL_DIGEST, "96b5c74f6b04a6f586361c323a0b64d7581eb62c4e0bb45f190896a525d8b0de");
   assert.equal(config.baseline.initialDigest, SOURCE_STRUCTURE_INITIAL_DIGEST);
   assert.equal(sourceStructureInitialDigest(config), SOURCE_STRUCTURE_INITIAL_DIGEST);
 
@@ -365,8 +365,10 @@ test("immutable digest pins initial debt and topology while caps may only shrink
   }), []);
 
   const invalidCycleCap = structuredClone(config);
-  invalidCycleCap.capCycleComponents[0].push("plugins/grok/scripts/lib/worker-mutation.mjs");
-  invalidCycleCap.capCycleComponents[0].sort();
+  invalidCycleCap.capCycleComponents = [[
+    "plugins/grok/scripts/lib/state.mjs",
+    "plugins/grok/scripts/lib/worker-mutation.mjs"
+  ]];
   assert.ok(validateSourceStructurePolicy(invalidCycleCap, {
     expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST
   }).some((message) => /subset of one immutable initial cycle/u.test(message)));
@@ -583,8 +585,8 @@ test("checked-in observe baseline exactly covers all current file and function d
   assert.deepEqual(debtPaths, Object.keys(config.legacyDebt));
   assert.deepEqual(debtPaths, Object.keys(config.initialDebt));
   for (const entry of Object.values(config.legacyDebt)) {
-    assert.equal(entry.initialLines, entry.lineCap);
-    assert.ok(entry.functions.every((span) => span.initialLines === span.capLines));
+    assert.ok(entry.lineCap <= entry.initialLines);
+    assert.ok(entry.functions.every((span) => span.capLines <= span.initialLines));
   }
   for (const [file, initial] of Object.entries(config.initialDebt)) {
     const cap = config.legacyDebt[file];

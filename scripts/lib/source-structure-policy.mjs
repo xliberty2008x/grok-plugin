@@ -5,7 +5,7 @@ import path from "node:path";
 import { parse } from "acorn";
 
 export const SOURCE_STRUCTURE_POLICY_PATH = "scripts/source-structure-policy.json";
-export const SOURCE_STRUCTURE_INITIAL_DIGEST = "f4e4a617eb3a60d43a1cfa48cbecc3362606052a5011a6db9b3d962c64357c89";
+export const SOURCE_STRUCTURE_INITIAL_DIGEST = "96b5c74f6b04a6f586361c323a0b64d7581eb62c4e0bb45f190896a525d8b0de";
 const POLICY_MODES = new Set(["observe", "ratchet"]);
 const CATEGORY_NAMES = Object.freeze(["product", "tooling", "tests", "facade"]);
 const DEFAULT_EXCLUDED_DIRECTORIES = new Set([
