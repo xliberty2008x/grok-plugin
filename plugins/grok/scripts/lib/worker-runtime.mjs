@@ -20,9 +20,11 @@ import {
 } from "./state.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import {
-  claimWorkerDispatch,
   prepareDispatchProcessSpawn,
-  recordDispatchProcessNoChild,
+  recordDispatchProcessNoChild
+} from "./worker-mutation-dispatch-admission.mjs";
+import {
+  claimWorkerDispatch,
   transitionWorkerDispatch
 } from "./worker-mutation.mjs";
 import { providerLaunchState } from "./worker-mutation-dispatch-contract.mjs";

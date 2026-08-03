@@ -8,8 +8,13 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const LIB = path.join(ROOT, "plugins", "grok", "scripts", "lib");
 const FACADE = "worker-mutation.mjs";
 const LEAVES = Object.freeze([
+  "worker-mutation-dispatch-admission.mjs",
   "worker-mutation-dispatch-contract.mjs",
+  "worker-mutation-followup-contract.mjs",
+  "worker-mutation-idempotency.mjs",
   "worker-mutation-primitives.mjs",
+  "worker-mutation-request-contract.mjs",
+  "worker-mutation-spawn-authority.mjs",
   "worker-mutation-write-contract.mjs",
   "worker-mutation-write-runtime-contract.mjs"
 ]);
@@ -70,6 +75,14 @@ const PUBLIC_EXPORTS = Object.freeze([
   "verifyRecoveryCleanupFence"
 ].sort());
 const MOVED_PUBLIC_BINDINGS = Object.freeze({
+  "worker-mutation-dispatch-admission.mjs": Object.freeze([
+    "acquireRecoveryCleanupFence",
+    "prepareDispatchProcessSpawn",
+    "prepareWorkerProviderSpawn",
+    "recordDispatchProcessNoChild",
+    "recordWorkerProviderSpawnNoChild",
+    "verifyRecoveryCleanupFence"
+  ]),
   "worker-mutation-dispatch-contract.mjs": Object.freeze([
     "PROVIDER_ROTATION_INTENT_SCHEMA_VERSION",
     "PROVIDER_SPAWN_INTENT_SCHEMA_VERSION",
@@ -80,12 +93,24 @@ const MOVED_PUBLIC_BINDINGS = Object.freeze({
     "assertNoRecoveryCleanupFence",
     "providerLaunchState"
   ]),
+  "worker-mutation-followup-contract.mjs": Object.freeze([
+    "FOLLOWUP_ADMISSION_KIND",
+    "FOLLOWUP_ADMISSION_WITNESS_SCHEMA_VERSION",
+    "assertFollowupAdmissionBinding"
+  ]),
+  "worker-mutation-idempotency.mjs": Object.freeze([
+    "getSpawnIdempotencyRecord"
+  ]),
   "worker-mutation-primitives.mjs": Object.freeze([
     "FOLLOWUP_SPAWN_OWNERSHIP_MODE",
     "SPAWN_OWNERSHIP_MODE",
     "SPAWN_SUCCESS_DEFINITION",
     "assertMutationOwnership",
     "cancellationNonce"
+  ]),
+  "worker-mutation-spawn-authority.mjs": Object.freeze([
+    "assertDurableSpawnRequestBinding",
+    "assertWorkerProviderLaunchPreparation"
   ]),
   "worker-mutation-write-runtime-contract.mjs": Object.freeze([
     "assertWriteExecutionJob"
@@ -94,12 +119,15 @@ const MOVED_PUBLIC_BINDINGS = Object.freeze({
 const DIRECT_IMPORTS = Object.freeze([
   ["plugins/grok/scripts/session-lifecycle-hook.mjs", "./lib/worker-mutation-primitives.mjs", ["cancellationNonce"]],
   ["plugins/grok/scripts/lib/worker-mailbox.mjs", "./worker-mutation-primitives.mjs", ["assertMutationOwnership", "cancellationNonce"]],
+  ["plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs", "./worker-mutation-spawn-authority.mjs", ["assertDurableSpawnRequestBinding"]],
   ["plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs", "./worker-mutation-dispatch-contract.mjs", ["assertDispatchContract"]],
   ["plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs", "./worker-mutation-primitives.mjs", ["FOLLOWUP_SPAWN_OWNERSHIP_MODE", "SPAWN_OWNERSHIP_MODE", "SPAWN_SUCCESS_DEFINITION"]],
   ["plugins/grok/scripts/lib/worker-provisioner.mjs", "./worker-mutation-primitives.mjs", ["assertMutationOwnership"]],
   ["plugins/grok/scripts/lib/worker-provisioner.mjs", "./worker-mutation-write-runtime-contract.mjs", ["assertWriteExecutionJob"]],
+  ["plugins/grok/scripts/lib/worker-recovery.mjs", "./worker-mutation-dispatch-admission.mjs", ["acquireRecoveryCleanupFence", "recordWorkerProviderSpawnNoChild", "verifyRecoveryCleanupFence"]],
   ["plugins/grok/scripts/lib/worker-recovery.mjs", "./worker-mutation-dispatch-contract.mjs", ["assertDispatchContract"]],
   ["plugins/grok/scripts/lib/worker-recovery.mjs", "./worker-mutation-primitives.mjs", ["cancellationNonce"]],
+  ["plugins/grok/scripts/lib/worker-runtime.mjs", "./worker-mutation-dispatch-admission.mjs", ["prepareDispatchProcessSpawn", "recordDispatchProcessNoChild"]],
   ["plugins/grok/scripts/lib/worker-runtime.mjs", "./worker-mutation-dispatch-contract.mjs", ["providerLaunchState"]],
   ["plugins/grok/scripts/lib/worker-runtime.mjs", "./worker-mutation-primitives.mjs", ["assertMutationOwnership"]],
   ["plugins/grok/scripts/lib/worker-service.mjs", "./worker-mutation-dispatch-contract.mjs", ["providerLaunchState"]],
@@ -133,7 +161,7 @@ test("worker mutation compatibility surface preserves all 54 exports and moved i
   }
 });
 
-test("foundation contracts are bounded leaves and never import the mutation monolith", () => {
+test("extracted mutation domains are bounded leaves and never import the mutation monolith", () => {
   for (const leaf of LEAVES) {
     const source = fs.readFileSync(path.join(LIB, leaf), "utf8");
     assert.ok(lineCount(path.join(LIB, leaf)) <= 1500, `${leaf} exceeds 1500 lines`);
