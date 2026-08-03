@@ -16,7 +16,7 @@ import {
   dispatchLeaseExpired,
   isDispatchV2
 } from "./worker-launch-contract.mjs";
-import { assertDurableSpawnRequestBinding } from "./worker-mutation.mjs";
+import { assertDurableSpawnRequestBinding } from "./worker-mutation-spawn-authority.mjs";
 import {
   assertDispatchContract
 } from "./worker-mutation-dispatch-contract.mjs";
