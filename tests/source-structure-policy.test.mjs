@@ -242,12 +242,17 @@ test("exact file caps reject growth and require same-change reduction", () => wi
   assert.ok(codes(evaluateSourceStructure({ root, config, mode: "ratchet" }), "error").has("legacy-file-growth"));
 
   write(root, "plugins/large.mjs", sourceLines(1500));
-  assert.ok(codes(evaluateSourceStructure({ root, config, mode: "ratchet" }), "error").has("stale-file-cap"));
+  assert.ok(codes(evaluateSourceStructure({ root, config, mode: "ratchet" }), "error")
+    .has("stale-file-exception"));
+  const loweredInBudgetCap = structuredClone(config);
+  loweredInBudgetCap.legacyDebt["plugins/large.mjs"].lineCap = 1500;
+  assert.ok(codes(evaluateSourceStructure({ root, config: loweredInBudgetCap, mode: "ratchet" }), "error")
+    .has("stale-file-exception"));
 }));
 
 test("per-function vectors reject new, grown, reduced, and stale long functions", () => withRepository((root) => {
   const exact = {
-    category: "product", initialLines: 251, lineCap: 251,
+    category: "product", initialLines: 251, lineCap: null,
     issue: "#56", rationale: "Existing debt.", removalCriterion: "Within budget.",
     functions: [{ key: "function:longFunction#1", initialLines: 251, capLines: 251 }]
   };
@@ -255,13 +260,18 @@ test("per-function vectors reject new, grown, reduced, and stale long functions"
   const config = policy({ legacyDebt: { "plugins/functions.mjs": exact } });
   assert.equal(evaluateSourceStructure({ root, config, mode: "ratchet" }).ok, true);
 
+  const staleFileCap = structuredClone(config);
+  staleFileCap.legacyDebt["plugins/functions.mjs"].lineCap = 251;
+  assert.ok(codes(evaluateSourceStructure({ root, config: staleFileCap, mode: "ratchet" }), "error")
+    .has("stale-file-exception"));
+
   write(root, "plugins/functions.mjs", functionLines(252));
   assert.ok(codes(evaluateSourceStructure({ root, config, mode: "ratchet" }), "error").has("legacy-function-growth"));
 
   write(root, "plugins/functions.mjs", functionLines(250));
   const reduced = codes(evaluateSourceStructure({ root, config, mode: "ratchet" }), "error");
   assert.ok(reduced.has("stale-function-exception"));
-  assert.ok(reduced.has("stale-file-cap"));
+  assert.equal(reduced.has("stale-file-exception"), false);
 
   const noBaseline = evaluateSourceStructure({ root, config: policy(), mode: "ratchet" });
   assert.equal(noBaseline.ok, true, "a now-within-budget function needs no exception");
@@ -755,8 +765,11 @@ test("checked-in observe baseline exactly covers all current file and function d
   assert.equal(debtPaths.length, 45);
   assert.deepEqual(debtPaths, Object.keys(config.legacyDebt));
   assert.deepEqual(debtPaths, Object.keys(config.initialDebt));
-  for (const entry of Object.values(config.legacyDebt)) {
-    assert.ok(entry.lineCap <= entry.initialLines);
+  for (const [file, entry] of Object.entries(config.legacyDebt)) {
+    const measured = result.files.find((candidate) => candidate.file === file);
+    const fileBudget = config.budgets[entry.category].fileLines;
+    if (measured.lines <= fileBudget) assert.equal(entry.lineCap, null, file);
+    else assert.ok(entry.lineCap <= entry.initialLines, file);
     assert.ok(entry.functions.every((span) => span.capLines <= span.initialLines));
   }
   for (const [file, initial] of Object.entries(config.initialDebt)) {

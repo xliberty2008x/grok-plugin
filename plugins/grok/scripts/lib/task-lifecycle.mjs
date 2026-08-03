@@ -79,21 +79,57 @@ export function appendLifecycleEvent(events, type, summary, detail = undefined) 
   return list;
 }
 
-function boundLifecycleDetail(detail) {
+function isNumericUsageCounter(key, value) {
+  if (!Number.isFinite(value)) return false;
+  const segmented = String(key)
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[-\s]+/g, "_")
+    .toLowerCase();
+  return segmented === "tokens"
+    || segmented.endsWith("_tokens")
+    || segmented === "token_count"
+    || segmented.endsWith("_token_count");
+}
+
+function boundLifecycleDetail(detail, ancestors = new WeakSet()) {
   if (detail == null) return null;
   if (typeof detail === "string") return clip(detail, 1000);
-  if (Array.isArray(detail)) return detail.slice(0, 20).map((item) => boundLifecycleDetail(item));
   if (typeof detail !== "object") return detail;
-  const out = {};
-  for (const [key, value] of Object.entries(detail).slice(0, 20)) {
-    if (/(secret|token|authorization|password|credential|cookie|api[-_]?key)/i.test(key)) {
-      out[key] = "[REDACTED]";
-      continue;
+  if (ancestors.has(detail)) return "[CIRCULAR]";
+  ancestors.add(detail);
+  try {
+    if (Array.isArray(detail)) {
+      return detail.slice(0, 20).map((item) => boundLifecycleDetail(item, ancestors));
     }
-    if (typeof value === "string") out[key] = clip(value, 1000);
-    else if (Array.isArray(value)) out[key] = value.slice(0, 20).map((item) => (typeof item === "string" ? clip(item, 500) : item));
-    else if (value && typeof value === "object") out[key] = boundLifecycleDetail(value);
-    else out[key] = value;
+    const out = {};
+    for (const [key, value] of Object.entries(detail).slice(0, 20)) {
+      if (
+        !isNumericUsageCounter(key, value)
+        && /(secret|token|authorization|password|credential|cookie|api[-_]?key)/i.test(key)
+      ) {
+        out[key] = "[REDACTED]";
+        continue;
+      }
+      if (typeof value === "string") out[key] = clip(value, 1000);
+      else if (Array.isArray(value)) {
+        if (ancestors.has(value)) {
+          out[key] = "[CIRCULAR]";
+          continue;
+        }
+        ancestors.add(value);
+        try {
+          out[key] = value.slice(0, 20).map((item) => (
+            typeof item === "string" ? clip(item, 500) : boundLifecycleDetail(item, ancestors)
+          ));
+        } finally {
+          ancestors.delete(value);
+        }
+      }
+      else if (value && typeof value === "object") out[key] = boundLifecycleDetail(value, ancestors);
+      else out[key] = value;
+    }
+    return out;
+  } finally {
+    ancestors.delete(detail);
   }
-  return out;
 }

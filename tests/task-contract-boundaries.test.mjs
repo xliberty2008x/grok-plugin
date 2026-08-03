@@ -137,6 +137,22 @@ test("lifecycle append redacts, bounds, retains 128 events, and leaves input imm
   const redactionProbe = {
     [["pass", "word"].join("")]: "fixture-value",
     nested: { [["api", "Key"].join("")]: "fixture-value-two" },
+    nestedArrays: Array.from({ length: 25 }, (_, index) => ({
+      [["client", "Secret"].join("")]: `fixture-private-${index}`,
+      inputTokens: 12,
+      output_tokens: 34,
+      tokenCount: 56,
+      tokens: "fixture-token-string",
+      labels: ["z".repeat(700), ...Array.from({ length: 24 }, () => "label")],
+      records: Array.from({ length: 25 }, (_, recordIndex) => ({
+        [["access", "Token"].join("")]: `fixture-token-${recordIndex}`,
+        note: "w".repeat(1200),
+        ...Object.fromEntries(Array.from({ length: 25 }, (__, keyIndex) => [
+          `field${keyIndex}`,
+          keyIndex
+        ]))
+      }))
+    })),
     note: "y".repeat(1200)
   };
   const appended = taskLifecycle.appendLifecycleEvent(
@@ -157,6 +173,20 @@ test("lifecycle append redacts, bounds, retains 128 events, and leaves input imm
   assert.equal(appended[1].detail.nested.apiKey, "[REDACTED]");
   assert.equal(appended[1].detail.note.length, 1001);
   assert.equal(appended[1].detail.note.endsWith("…"), true);
+  assert.equal(appended[1].detail.nestedArrays.length, 20);
+  assert.equal(appended[1].detail.nestedArrays[0].clientSecret, "[REDACTED]");
+  assert.equal(appended[1].detail.nestedArrays[0].inputTokens, 12);
+  assert.equal(appended[1].detail.nestedArrays[0].output_tokens, 34);
+  assert.equal(appended[1].detail.nestedArrays[0].tokenCount, 56);
+  assert.equal(appended[1].detail.nestedArrays[0].tokens, "[REDACTED]");
+  assert.equal(appended[1].detail.nestedArrays[0].labels.length, 20);
+  assert.equal(appended[1].detail.nestedArrays[0].labels[0].length, 501);
+  assert.equal(appended[1].detail.nestedArrays[0].records.length, 20);
+  assert.equal(appended[1].detail.nestedArrays[0].records[0].accessToken, "[REDACTED]");
+  assert.equal(appended[1].detail.nestedArrays[0].records[0].note.length, 1001);
+  assert.equal(Object.keys(appended[1].detail.nestedArrays[0].records[0]).length, 20);
+  assert.equal(JSON.stringify(appended[1].detail).includes("fixture-private-"), false);
+  assert.equal(JSON.stringify(appended[1].detail).includes("fixture-token-"), false);
 
   let retained = [];
   for (let index = 1; index <= taskLifecycle.MAX_LIFECYCLE_EVENTS + 1; index += 1) {
@@ -165,6 +195,19 @@ test("lifecycle append redacts, bounds, retains 128 events, and leaves input imm
   assert.equal(retained.length, 128);
   assert.equal(retained[0].sequence, 2);
   assert.equal(retained.at(-1).sequence, 129);
+});
+
+test("lifecycle detail bounding marks cycles inside arrays without mutating input", () => {
+  const cyclic = { label: "shared" };
+  cyclic.self = cyclic;
+  const detail = { items: [cyclic] };
+
+  const appended = taskLifecycle.appendLifecycleEvent([], "checkpoint", "cycle", detail);
+
+  assert.equal(appended[0].detail.items[0].label, "shared");
+  assert.equal(appended[0].detail.items[0].self, "[CIRCULAR]");
+  assert.equal(detail.items[0], cyclic);
+  assert.equal(cyclic.self, cyclic);
 });
 
 test("lifecycle append rejects unknown event types with the stable state error", () => {

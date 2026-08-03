@@ -812,10 +812,9 @@ function assessFileDebt(entry, config, mode, findings) {
       addPolicyFinding(findings, mode, "current-debt", entry.file,
         `File remains at its ${entry.lines}-line legacy cap.`);
     }
-  } else if (legacy && legacy.lineCap !== null && entry.lines !== legacy.lineCap) {
-    const code = entry.lines < legacy.lineCap ? "stale-file-cap" : "legacy-file-growth";
-    addPolicyFinding(findings, mode, code, entry.file,
-      `File has ${entry.lines} lines but its exact legacy cap is ${legacy.lineCap}.`);
+  } else if (legacy && legacy.lineCap !== null) {
+    addPolicyFinding(findings, mode, "stale-file-exception", entry.file,
+      `File is within its ${budget.fileLines}-line budget; set its legacy lineCap to null.`);
   } else if (legacy && functionDebtCount > 0) {
     addPolicyFinding(findings, mode, "current-debt", entry.file,
       `File retains ${functionDebtCount} exact-capped long function${functionDebtCount === 1 ? "" : "s"}.`);
