@@ -1474,7 +1474,7 @@ function writeSeededJob(stateRoot, job) {
 }
 
 test("static human launch surfaces use public worker projections", () => {
-  const source = { companion: fs.readFileSync(COMPANION, "utf8"), dispatch: fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/companion-dispatch.mjs"), "utf8") };
+  const source = { companion: fs.readFileSync(COMPANION, "utf8"), dispatch: fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/companion-dispatch.mjs"), "utf8"), handlers: fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/companion-handlers.mjs"), "utf8") };
   const acceptedStart = source.dispatch.indexOf(
     "if (launcherCode === 0 && !background && announce)"
   );
@@ -1491,10 +1491,10 @@ test("static human launch surfaces use public worker projections", () => {
     /accepted\.(?:id|status|phase|progress|summary)/
   );
 
-  const taskStart = source.companion.indexOf("const finished = await startJob(root, job");
-  const taskBlock = source.companion.slice(
+  const taskStart = source.handlers.indexOf("const finished = await startJob(root, job");
+  const taskBlock = source.handlers.slice(
     taskStart,
-    source.companion.indexOf("async function handleDeepResearch", taskStart)
+    source.handlers.length
   );
   assert.match(
     taskBlock,
