@@ -3139,6 +3139,9 @@ async function handleSetup(raw) {
     runtime = { ready: false, error: asErrorPayload(error) };
   }
   if (options["enable-review-gate"] && !runtime.error) setConfig(root, { stopReviewGate: true });
+  const storageReadonlyNextStep = currentHost().kind === "codex"
+    ? `If this setup was started from managed Codex without the one-time command approval requested by ${hostCommand("setup")}, retry through that approval; it is command-scoped unsandboxed execution, not an exact-path grant. If the approved setup still fails, verify that the user-owned plugin data directory is on writable media and supports private mode 0700 directories and 0600 files.`
+    : "Verify that the user-owned plugin data directory is on writable media and supports private mode 0700 directories and 0600 files.";
   const nextSteps = !runtime.error
     ? [`Run ${hostCommand("review", "--wait")} or ${hostCommand("rescue", "<task>")}.`]
     : runtime.error.code === "E_GROK_NOT_FOUND"
@@ -3153,7 +3156,9 @@ async function handleSetup(raw) {
               ? ["Restore the active managed link and executable bytes to a stable state, then retry setup."]
               : runtime.error.code === "E_CAPABILITY"
                 ? ["The exact pinned Grok binary is present but did not satisfy a required runtime capability; review the reported probe failure."]
-                : ["Review the reported prerequisite or platform limitation before retrying."];
+                : runtime.error.code === "E_STORAGE_READONLY"
+                  ? [storageReadonlyNextStep]
+                  : ["Review the reported prerequisite or platform limitation before retrying."];
   const result = { ready: !runtime.error, grok: runtime, config: config(root), disclosure: "Grok/xAI may process task prompts, selected repository content, provider-tool output, and imported Claude Code or privacy-filtered Codex transcript context. Each task lineage uses a private Grok home under this workspace's plugin state; its sanitized cached credential is removed before the task prompt is sent, while provider session data may remain for explicit resume. Imported sessions remain under ~/.grok/sessions. Each headless review uses a private per-job home and removes it on completion or verified crash recovery.", nextSteps };
   out(options.json ? result : [`Grok Companion: ${result.ready ? "ready" : "not ready"}`, result.disclosure, ...(result.grok.version ? [`Grok ${result.grok.version}; ACP v${result.grok.protocolVersion}`, `Models: ${result.grok.models.map((x) => x.id).join(", ")}`] : [result.grok.error?.message]), `Stop gate: ${result.config.stopReviewGate ? "enabled" : "disabled"}`, ...result.nextSteps].join("\n"), options.json);
 }

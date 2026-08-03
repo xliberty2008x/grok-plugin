@@ -177,6 +177,101 @@ test("setup validates headless isolation before enabling the stop gate", (t) => 
   assert.equal(failed.config.stopReviewGate, false);
 });
 
+test("setup E_STORAGE_READONLY guidance separates managed command approval from real storage faults", (t) => {
+  const root = initRepo();
+  const runtime = fixture();
+  const pinned = installPinnedFakeCompanion(runtime.fake, runtime.env);
+  t.after(pinned.cleanup);
+
+  const injectionRoot = tempDir("grok-setup-storage-injection-");
+  const preload = path.join(injectionRoot, "storage-injection.cjs");
+  const injectionLog = path.join(injectionRoot, "events.jsonl");
+  fs.writeFileSync(preload, [
+    '"use strict";',
+    'const fs = require("node:fs");',
+    'const { syncBuiltinESMExports } = require("node:module");',
+    'const path = require("node:path");',
+    "const append = (event) => fs.appendFileSync(process.env.GROK_TEST_SETUP_INJECTION_LOG, `${JSON.stringify(event)}\\n`);",
+    "const originalMkdirSync = fs.mkdirSync.bind(fs);",
+    "let injected = false;",
+    "let matchingMkdirs = 0;",
+    'append({ event: "loaded" });',
+    "fs.mkdirSync = (target, options) => {",
+    "  const expected = path.join(process.env.GROK_TEST_SETUP_PLUGIN_DATA, \"state\");",
+    "  const matches = path.resolve(String(target)) === path.resolve(expected);",
+    "  if (matches) matchingMkdirs += 1;",
+    '  append({ event: "mkdir", matches, matchingMkdirs });',
+    "  // The first state-root call is the recursion preflight; inject the setup call itself.",
+    "  if (!injected && matches && matchingMkdirs === 2) {",
+    "    injected = true;",
+    '    append({ event: "injected" });',
+    '    const error = new Error("simulated managed storage boundary");',
+    '    error.code = "EACCES";',
+    "    throw error;",
+    "  }",
+    "  return originalMkdirSync(target, options);",
+    "};",
+    "syncBuiltinESMExports();"
+  ].join("\n"), { mode: 0o600 });
+
+  const pluginData = pluginDataRoot(pinned.env);
+  const env = codexTaskEnv(pinned.env, pluginData, "codex-setup-storage-guidance");
+  env.GROK_TEST_COMPANION_PRELOAD = preload;
+  env.GROK_TEST_SETUP_PLUGIN_DATA = pluginData;
+  env.GROK_TEST_SETUP_INJECTION_LOG = injectionLog;
+  const result = parseJson(runCompanion(
+    ["setup", "--json"],
+    { cwd: root, env, companionScript: pinned.codexCompanionScript }
+  ));
+
+  const injectionEvents = fs.readFileSync(injectionLog, "utf8").trim().split(/\r?\n/u).map(JSON.parse);
+  assert.equal(result.ready, false, `storage injection did not fire: ${JSON.stringify(injectionEvents)}`);
+  assert.equal(injectionEvents.filter((event) => event.event === "injected").length, 1);
+  assert.equal(result.grok.error.code, "E_STORAGE_READONLY");
+  assert.equal(agentStdioCount(runtime.fake.logFile), 0, "storage failure must precede provider launch");
+  assert.equal(result.nextSteps.length, 1);
+  assert.match(result.nextSteps[0], /managed Codex/i);
+  assert.match(result.nextSteps[0], /\$grok:setup/);
+  assert.match(result.nextSteps[0], /one-time command approval/i);
+  assert.match(result.nextSteps[0], /command-scoped unsandboxed execution/i);
+  assert.match(result.nextSteps[0], /not an exact-path grant/i);
+  assert.match(result.nextSteps[0], /If the approved setup still fails/i);
+  assert.match(result.nextSteps[0], /user-owned plugin data directory[\s\S]*writable media[\s\S]*0700[\s\S]*0600/i);
+  assert.equal(JSON.stringify(result).includes(pluginData), false, "public setup guidance must omit the private absolute path");
+  assert.equal(JSON.stringify(result).includes(root), false, "public setup guidance must omit the workspace absolute path");
+
+  const claudeRoot = initRepo();
+  const claudeRuntime = fixture();
+  const claudePinned = installPinnedFakeCompanion(claudeRuntime.fake, claudeRuntime.env);
+  t.after(claudePinned.cleanup);
+  const claudePluginData = pluginDataRoot(claudePinned.env);
+  const claudeInjectionLog = path.join(injectionRoot, "claude-events.jsonl");
+  const claudeEnv = {
+    ...claudePinned.env,
+    GROK_COMPANION_HOST: "claude-code",
+    GROK_COMPANION_HOST_SESSION_ID: "claude-setup-storage-guidance",
+    GROK_COMPANION_PLUGIN_DATA: claudePluginData,
+    GROK_TEST_COMPANION_PRELOAD: preload,
+    GROK_TEST_SETUP_PLUGIN_DATA: claudePluginData,
+    GROK_TEST_SETUP_INJECTION_LOG: claudeInjectionLog
+  };
+  delete claudeEnv.CODEX_THREAD_ID;
+  const claudeResult = parseJson(runCompanion(
+    ["setup", "--json"],
+    { cwd: claudeRoot, env: claudeEnv, companionScript: claudePinned.companionScript }
+  ));
+  const claudeInjectionEvents = fs.readFileSync(claudeInjectionLog, "utf8").trim().split(/\r?\n/u).map(JSON.parse);
+  assert.equal(claudeResult.ready, false, `storage injection did not fire: ${JSON.stringify(claudeInjectionEvents)}`);
+  assert.equal(claudeInjectionEvents.filter((event) => event.event === "injected").length, 1);
+  assert.equal(claudeResult.grok.error.code, "E_STORAGE_READONLY");
+  assert.equal(agentStdioCount(claudeRuntime.fake.logFile), 0, "storage failure must precede provider launch");
+  assert.equal(claudeResult.nextSteps.length, 1);
+  assert.doesNotMatch(claudeResult.nextSteps[0], /managed Codex|command approval|unsandboxed|exact-path grant/i);
+  assert.match(claudeResult.nextSteps[0], /user-owned plugin data directory[\s\S]*writable media[\s\S]*0700[\s\S]*0600/i);
+  assert.equal(JSON.stringify(claudeResult).includes(claudePluginData), false, "public setup guidance must omit the private absolute path");
+  assert.equal(JSON.stringify(claudeResult).includes(claudeRoot), false, "public setup guidance must omit the workspace absolute path");
+});
+
 test("a failed setup attempt revokes the previously published provider capability", (t) => {
   const root = initRepo();
   const readyFixture = fixture();
