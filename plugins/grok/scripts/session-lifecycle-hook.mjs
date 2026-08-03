@@ -17,7 +17,7 @@ import {
 } from "./lib/process-control.mjs";
 import { hasForeignActiveProvider, resolveProviderCleanupTarget, unregisterProviderGuard } from "./lib/recursion-guard.mjs";
 import { pluginDataRoot, sameHostSession, writeCodexSessionMetadata } from "./lib/host.mjs";
-import { cancellationNonce } from "./lib/worker-mutation.mjs";
+import { cancellationNonce } from "./lib/worker-mutation-primitives.mjs";
 import { providerLaunchCleanupBlocked } from "./lib/worker-reconcile.mjs";
 
 if (process.env.GROK_COMPANION_CHILD === "1" || process.env.GROK_COMPANION_JOB_MARKER || process.env.GROK_AGENT || process.env.GROK_LEADER_SOCKET || hasGrokAncestor()) process.exit(0);

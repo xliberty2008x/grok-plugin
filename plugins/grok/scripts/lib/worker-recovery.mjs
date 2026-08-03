@@ -24,9 +24,7 @@ import {
 } from "./state.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import {
-  assertDispatchContract,
   acquireRecoveryCleanupFence,
-  cancellationNonce,
   recordWorkerProviderSpawnNoChild,
   settleFailedDispatchCleanup,
   settleStartedWorkerLoss,
@@ -34,6 +32,8 @@ import {
   transitionWorkerDispatch,
   verifyRecoveryCleanupFence
 } from "./worker-mutation.mjs";
+import { assertDispatchContract } from "./worker-mutation-dispatch-contract.mjs";
+import { cancellationNonce } from "./worker-mutation-primitives.mjs";
 import { workspaceState } from "./workspace.mjs";
 import {
   dispatchLeaseExpired,

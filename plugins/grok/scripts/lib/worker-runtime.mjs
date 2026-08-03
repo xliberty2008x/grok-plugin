@@ -20,13 +20,13 @@ import {
 } from "./state.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import {
-  assertMutationOwnership,
   claimWorkerDispatch,
   prepareDispatchProcessSpawn,
-  providerLaunchState,
   recordDispatchProcessNoChild,
   transitionWorkerDispatch
 } from "./worker-mutation.mjs";
+import { providerLaunchState } from "./worker-mutation-dispatch-contract.mjs";
+import { assertMutationOwnership } from "./worker-mutation-primitives.mjs";
 import { workspaceState } from "./workspace.mjs";
 
 const COMPANION_SCRIPT = path.resolve(

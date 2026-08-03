@@ -17,9 +17,9 @@ import { fileURLToPath } from "node:url";
 
 import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-envelope.mjs";
 import {
-  admitWriteWorkerPlan,
-  assertWriteExecutionJob
+  admitWriteWorkerPlan
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
+import { assertWriteExecutionJob } from "../plugins/grok/scripts/lib/worker-mutation-write-runtime-contract.mjs";
 import { processGroupGone } from "../plugins/grok/scripts/lib/process-control.mjs";
 import { loadProviderGuard } from "../plugins/grok/scripts/lib/recursion-guard.mjs";
 import { provisionWriteWorkerWorktree } from "../plugins/grok/scripts/lib/worker-provisioner.mjs";

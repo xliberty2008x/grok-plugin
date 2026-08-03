@@ -30,8 +30,6 @@ import { captureContextManifest } from "./task-context-manifest.mjs";
 import {
   activateWriteProvisioningAttempt,
   adoptWriteProvisioningEffect,
-  assertMutationOwnership,
-  assertWriteExecutionJob,
   prepareWriteProvisionerIntent,
   prepareWriteProvisioningReissue,
   promoteWriteWorkerReady,
@@ -39,6 +37,8 @@ import {
   recordWriteProvisionerNoChild,
   retainWriteProvisioningCleanupPending
 } from "./worker-mutation.mjs";
+import { assertMutationOwnership } from "./worker-mutation-primitives.mjs";
+import { assertWriteExecutionJob } from "./worker-mutation-write-runtime-contract.mjs";
 import {
   assertManagedWorkerWorktree,
   classifyWorkerWorktreeEffect
