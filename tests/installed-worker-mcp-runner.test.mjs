@@ -21,6 +21,7 @@ import {
   setupBoundaryDiagnosticSourceLine
 } from "../scripts/lib/installed-worker-mcp-runner-setup.mjs";
 import {
+  INSTALLED_WORKER_MCP_RUNNER_MODULES,
   readInstalledWorkerMcpRunnerSource
 } from "./lib/installed-worker-mcp-runner-source.mjs";
 
@@ -69,6 +70,13 @@ function runRunner(root, args = [], values = {}) {
 
 function assertNoSideEffects(root) {
   assert.deepEqual(fs.readdirSync(root), []);
+}
+
+function staticSpecifiers(relative) {
+  return [
+    ...fs.readFileSync(path.join(ROOT, relative), "utf8")
+      .matchAll(/\bfrom\s+["']([^"']+)["']/gu)
+  ].map((match) => match[1]).sort();
 }
 
 test("setup-boundary diagnostics accept only exact runner stack frames", () => {
@@ -1081,7 +1089,7 @@ test("installed Worker MCP mailbox polling tolerates valid pre-provider state", 
     "async function waitForInstalledMailboxOpen(context, tracker) {"
   );
   const end = source.indexOf(
-    "\nfunction snapshotInstalledMailboxProof(",
+    "\nexport function snapshotInstalledMailboxProof(",
     start
   );
   assert.ok(start >= 0 && end > start);
@@ -1479,7 +1487,8 @@ test("package and repository validator pin the installed Worker MCP runner wirin
     "./lib/installed-worker-mcp-runner-core.mjs",
     "./lib/installed-worker-mcp-runner-runtime.mjs",
     "./lib/installed-worker-mcp-runner-setup.mjs",
-    "./lib/installed-worker-mcp-runner-observation.mjs"
+    "./lib/installed-worker-mcp-runner-observation.mjs",
+    "./lib/installed-worker-mcp-runner-session-read.mjs"
   ]) {
     assert.match(
       runner,
@@ -1502,10 +1511,6 @@ test("package and repository validator pin the installed Worker MCP runner wirin
   ]) {
     assert.equal(runner.includes(stale), false, stale);
   }
-  const staticSpecifiers = (relative) => [
-    ...fs.readFileSync(path.join(ROOT, relative), "utf8")
-      .matchAll(/\bfrom\s+["']([^"']+)["']/gu)
-  ].map((match) => match[1]).sort();
   assert.deepEqual(
     staticSpecifiers("scripts/lib/installed-worker-mcp-runner-setup.mjs"),
     [
@@ -1535,6 +1540,7 @@ test("package and repository validator pin the installed Worker MCP runner wirin
     '"scripts/lib/installed-worker-mcp-runner-core.mjs"',
     '"scripts/lib/installed-worker-mcp-runner-observation.mjs"',
     '"scripts/lib/installed-worker-mcp-runner-runtime.mjs"',
+    '"scripts/lib/installed-worker-mcp-runner-session-read.mjs"',
     '"scripts/lib/installed-worker-mcp-runner-setup.mjs"',
     '"scripts/lib/installed-worker-mcp-setup-boundary.mjs"',
     '"scripts/lib/installed-worker-mcp-session-boundary.mjs"',
@@ -1550,4 +1556,72 @@ test("package and repository validator pin the installed Worker MCP runner wirin
     validator,
     /packageJson\.scripts\?\.\["test:installed-worker-mcp"\] !== "node scripts\/test-installed-worker-mcp\.mjs"/
   );
+});
+
+test("installed runner session-read module keeps the exact Slice 3a boundary", () => {
+  assert.deepEqual(
+    INSTALLED_WORKER_MCP_RUNNER_MODULES.map((file) => path.basename(file)),
+    [
+      "installed-worker-mcp-runner-core.mjs",
+      "installed-worker-mcp-runner-setup.mjs",
+      "installed-worker-mcp-runner-runtime.mjs",
+      "installed-worker-mcp-runner-observation.mjs",
+      "installed-worker-mcp-runner-session-read.mjs"
+    ]
+  );
+  assert.deepEqual(
+    staticSpecifiers("scripts/lib/installed-worker-mcp-runner-session-read.mjs"),
+    [
+      "./installed-worker-mcp-contract.mjs",
+      "./installed-worker-mcp-mailbox-poll.mjs",
+      "./installed-worker-mcp-runner-core.mjs",
+      "./installed-worker-mcp-runner-observation.mjs",
+      "./installed-worker-mcp-runner-runtime.mjs",
+      "./installed-worker-mcp-session-boundary.mjs",
+      "node:child_process",
+      "node:crypto",
+      "node:fs",
+      "node:path",
+      "node:process"
+    ].sort()
+  );
+
+  const runner = fs.readFileSync(RUNNER, "utf8");
+  const sessionRead = fs.readFileSync(
+    path.join(
+      ROOT,
+      "scripts",
+      "lib",
+      "installed-worker-mcp-runner-session-read.mjs"
+    ),
+    "utf8"
+  );
+  assert.doesNotMatch(
+    runner,
+    /(?:async )?function runCompletionScenario\b/u
+  );
+  assert.doesNotMatch(
+    runner,
+    /from ["']\.\/lib\/(?:installed-worker-mcp-mailbox-poll|installed-worker-mcp-session-boundary)\.mjs["']/u
+  );
+  assert.match(
+    sessionRead,
+    /export async function runCompletionScenario\b/u
+  );
+  assert.doesNotMatch(
+    sessionRead,
+    /(?:async )?function (?:runWriteSmokeScenario|runWriteCancellationScenario|runTwoWriterScenario|runCancellationScenario|cleanupExactWorkerBoundary|emergencyCleanup|ensurePublicationDirectory|publishReceipt|buildReceipt|qualify|main)\b/u
+  );
+  for (const retained of [
+    "runWriteSmokeScenario",
+    "runWriteCancellationScenario",
+    "runTwoWriterScenario",
+    "runCancellationScenario",
+    "cleanupExactWorkerBoundary",
+    "emergencyCleanup",
+    "qualify",
+    "main"
+  ]) {
+    assert.match(runner, new RegExp(`(?:async )?function ${retained}\\b`, "u"));
+  }
 });
