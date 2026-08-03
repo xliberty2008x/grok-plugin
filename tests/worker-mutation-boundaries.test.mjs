@@ -15,7 +15,10 @@ const LEAVES = Object.freeze([
   "worker-mutation-primitives.mjs",
   "worker-mutation-request-contract.mjs",
   "worker-mutation-spawn-authority.mjs",
+  "worker-mutation-spawn.mjs",
+  "worker-mutation-write-admission.mjs",
   "worker-mutation-write-contract.mjs",
+  "worker-mutation-write-recovery.mjs",
   "worker-mutation-write-runtime-contract.mjs"
 ]);
 const PUBLIC_EXPORTS = Object.freeze([
@@ -112,6 +115,18 @@ const MOVED_PUBLIC_BINDINGS = Object.freeze({
     "assertDurableSpawnRequestBinding",
     "assertWorkerProviderLaunchPreparation"
   ]),
+  "worker-mutation-spawn.mjs": Object.freeze([
+    "spawnReadOnlyWorker"
+  ]),
+  "worker-mutation-write-admission.mjs": Object.freeze([
+    "admitWriteWorkerPlan",
+    "authorizeReadyWriteWorkerDispatch"
+  ]),
+  "worker-mutation-write-recovery.mjs": Object.freeze([
+    "adoptWriteProvisioningEffect",
+    "recordWriteProvisionerNoChild",
+    "retainWriteProvisioningCleanupPending"
+  ]),
   "worker-mutation-write-runtime-contract.mjs": Object.freeze([
     "assertWriteExecutionJob"
   ])
@@ -123,6 +138,7 @@ const DIRECT_IMPORTS = Object.freeze([
   ["plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs", "./worker-mutation-dispatch-contract.mjs", ["assertDispatchContract"]],
   ["plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs", "./worker-mutation-primitives.mjs", ["FOLLOWUP_SPAWN_OWNERSHIP_MODE", "SPAWN_OWNERSHIP_MODE", "SPAWN_SUCCESS_DEFINITION"]],
   ["plugins/grok/scripts/lib/worker-provisioner.mjs", "./worker-mutation-primitives.mjs", ["assertMutationOwnership"]],
+  ["plugins/grok/scripts/lib/worker-provisioner.mjs", "./worker-mutation-write-recovery.mjs", ["adoptWriteProvisioningEffect", "recordWriteProvisionerNoChild", "retainWriteProvisioningCleanupPending"]],
   ["plugins/grok/scripts/lib/worker-provisioner.mjs", "./worker-mutation-write-runtime-contract.mjs", ["assertWriteExecutionJob"]],
   ["plugins/grok/scripts/lib/worker-recovery.mjs", "./worker-mutation-dispatch-admission.mjs", ["acquireRecoveryCleanupFence", "recordWorkerProviderSpawnNoChild", "verifyRecoveryCleanupFence"]],
   ["plugins/grok/scripts/lib/worker-recovery.mjs", "./worker-mutation-dispatch-contract.mjs", ["assertDispatchContract"]],
@@ -131,6 +147,9 @@ const DIRECT_IMPORTS = Object.freeze([
   ["plugins/grok/scripts/lib/worker-runtime.mjs", "./worker-mutation-dispatch-contract.mjs", ["providerLaunchState"]],
   ["plugins/grok/scripts/lib/worker-runtime.mjs", "./worker-mutation-primitives.mjs", ["assertMutationOwnership"]],
   ["plugins/grok/scripts/lib/worker-service.mjs", "./worker-mutation-dispatch-contract.mjs", ["providerLaunchState"]],
+  ["plugins/grok/scripts/lib/worker-service.mjs", "./worker-mutation-spawn.mjs", ["spawnReadOnlyWorker"]],
+  ["plugins/grok/scripts/lib/worker-service.mjs", "./worker-mutation-write-admission.mjs", ["authorizeReadyWriteWorkerDispatch"]],
+  ["scripts/live-worker-provisioner-probe.mjs", "../plugins/grok/scripts/lib/worker-mutation-write-admission.mjs", ["admitWriteWorkerPlan"]],
   ["scripts/live-worker-provisioner-probe.mjs", "../plugins/grok/scripts/lib/worker-mutation-write-runtime-contract.mjs", ["assertWriteExecutionJob"]],
   ["scripts/test-natural-codex.mjs", "../plugins/grok/scripts/lib/worker-mutation-dispatch-contract.mjs", ["assertDispatchContract"]]
 ]);
