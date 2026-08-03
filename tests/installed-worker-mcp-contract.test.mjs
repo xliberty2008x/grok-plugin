@@ -367,11 +367,13 @@ function lifecycleEvents(status, cancellation) {
         sequence: 7,
         detail: { requestAcceptedAt: "2026-07-23T10:02:00.000Z" }
       },
+      { type: "activity.started", at: "2026-07-23T10:02:10.000Z", summary: "Tool started", sequence: 8 },
+      { type: "plan.updated", at: "2026-07-23T10:02:20.000Z", summary: "Plan updated", sequence: 9, detail: { plan: ["Finish cancellation"] } },
       {
         type: "blocked",
         at: "2026-07-23T10:03:00.000Z",
         summary: "Task runtime cleanup completed",
-        sequence: 8
+        sequence: 10
       }
     );
   }
@@ -1801,6 +1803,9 @@ test("terminal scenario validators accept only the canonical retained window", (
 
 test("cancellation replay preserves immutable admission receipt and one public event", () => {
   const valid = validateInstalledCancellationReplayScenario(cancellationBundle());
+  const cancelIndex = valid.terminalResult.worker.lifecycleEvents.findIndex((event) => event.type === "cancellation.requested");
+  const postCancel = valid.terminalResult.worker.lifecycleEvents.slice(cancelIndex + 1, -1);
+  assert.deepEqual(postCancel.map((event) => event.type), ["activity.started", "plan.updated"]);
   assert.equal(valid.cancel.replayed, false);
   assert.equal(valid.cancelReplay.replayed, true);
   assert.equal(valid.cancel.receipt.processGroupGoneAt, null);
@@ -2007,14 +2012,8 @@ test("cancellation replay preserves immutable admission receipt and one public e
     },
     (value) => {
       const event = value.terminalResult.worker.lifecycleEvents.at(-1);
-      event.at = "2026-07-23T10:02:15.000Z";
+      event.at = "2026-07-23T10:02:31.000Z";
       event.type = "activity.started";
-    },
-    (value) => {
-      const event = value.terminalResult.worker.lifecycleEvents.at(-1);
-      event.at = "2026-07-23T10:02:15.000Z";
-      event.type = "plan.updated";
-      event.detail = { plan: ["Late plan"] };
     },
     (value) => {
       value.terminalResult.worker.lifecycleEvents[2].sequence += 1;
@@ -2163,6 +2162,7 @@ test("terminal event history compares the installed projection and rejects malfo
     const marker = events.find((event) => event.sequence === 139);
     marker.type = "cancellation.requested";
     marker.detail = { requestAcceptedAt: marker.at };
+    Object.assign(events.find((event) => event.sequence === 140), { type: "plan.updated", detail: { plan: ["Finish cancellation"] } });
   }
   assert.doesNotThrow(
     () => validateInstalledTerminalEventHistory(retainedCancellation)

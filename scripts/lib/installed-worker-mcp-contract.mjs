@@ -1651,9 +1651,9 @@ function validLifecycleEvents(events, worker, status) {
   const terminalMarkerIndex = events.indexOf(terminalMarker);
   if (
     terminalMarkerIndex < 0
-    || events.slice(terminalMarkerIndex + 1).some(
+    || (status === "completed" && events.slice(terminalMarkerIndex + 1).some(
       (event) => !POST_COMPLETION_EVENT_TYPES.has(event.type)
-    )
+    ))
   ) {
     return false;
   }
@@ -2477,9 +2477,9 @@ function validFullTrackedLifecycleHistory(events, cursor, workerId, status) {
             && finalReports.length === 0
           )
     )
-    && events.slice(terminalMarkerIndex + 1).every(
+    && (status !== "completed" || events.slice(terminalMarkerIndex + 1).every(
       (event) => POST_COMPLETION_EVENT_TYPES.has(event.type)
-    )
+    ))
   );
 }
 
