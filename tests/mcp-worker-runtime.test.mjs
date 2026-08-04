@@ -71,6 +71,7 @@ import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import { ROOT, git, initRepo, tempDir, waitFor } from "./helpers.mjs";
+import { patchPinnedFakeProviderCommands } from "./pinned-fake-grok.mjs";
 
 const THREAD_ID = "019f666a-6469-7cc1-9a8d-8c1adf61e103";
 const TURN_ID = "019f666e-4084-7902-8447-249f72043a37";
@@ -201,48 +202,7 @@ function installPinnedFakeControllerRuntime(fake, env) {
     ),
     "utf8"
   );
-  const fakeScript = JSON.stringify(wrapper);
-  const providerPatches = [
-    [
-      "provider-core.mjs", 1, 'spawnSync(binary, ["--version"],',
-      `spawnSync(binary, [${fakeScript}, "--version"],`
-    ],
-    [
-      "grok-provider.mjs", 1, 'spawnSync(binary, ["inspect", "--json"],',
-      `spawnSync(binary, [${fakeScript}, "inspect", "--json"],`
-    ],
-    [
-      "grok-provider.mjs", 2, 'const args = ["--cwd", root,',
-      `const args = [${fakeScript}, "--cwd", root,`
-    ],
-    [
-      "grok-provider.mjs", 1, 'spawnSync(binary, ["--help"],',
-      `spawnSync(binary, [${fakeScript}, "--help"],`
-    ],
-    [
-      "grok-provider.mjs", 1, 'spawnSync(binary, ["agent", "--help"],',
-      `spawnSync(binary, [${fakeScript}, "agent", "--help"],`
-    ],
-    [
-      "grok-provider.mjs", 1, 'spawnSync(binary, ["models"],',
-      `spawnSync(binary, [${fakeScript}, "models"],`
-    ]
-  ];
-  const providerSources = new Map();
-  for (const [fileName, expectedOccurrences, needle, replacement] of providerPatches) {
-    const providerFile = path.join(pluginRoot, "scripts", "lib", fileName);
-    const providerSource = providerSources.get(providerFile)
-      ?? fs.readFileSync(providerFile, "utf8");
-    assert.equal(
-      providerSource.split(needle).length - 1,
-      expectedOccurrences,
-      `fixture must patch the exact provider command inventory: ${fileName}:${needle}`
-    );
-    providerSources.set(providerFile, providerSource.replaceAll(needle, replacement));
-  }
-  for (const [providerFile, providerSource] of providerSources) {
-    fs.writeFileSync(providerFile, providerSource, "utf8");
-  }
+  patchPinnedFakeProviderCommands(pluginRoot, wrapper);
   const receipt = Object.freeze({
     ...TEST_PROVIDER_RECEIPT,
     providerLaunchBinding: pinned.binding,

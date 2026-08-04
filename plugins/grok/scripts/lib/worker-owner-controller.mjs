@@ -13,23 +13,28 @@ import {
   providerLaunchBindingDigest as digestProviderLaunchBinding,
   resolveProviderExecutablePin
 } from "./provider-executable-pin.mjs";
+import { assertProviderPlatform, discoverGrok } from "./provider-core.mjs";
 import {
-  assertProviderPlatform,
   authenticateBoundBootstrapGuard,
-  captureSpawnIdentity,
   createProviderBootstrapLaunch,
-  discoverGrok,
-  ensureChildExit,
-  inspectIsolation,
   promoteProviderBootstrap,
-  providerCleanupIdentity,
   publishProviderBootstrapSpec,
-  waitForProviderBootstrapReady,
+  waitForProviderBootstrapReady
+} from "./provider-bootstrap-client.mjs";
+import {
+  captureSpawnIdentity,
+  ensureChildExit,
+  providerCleanupIdentity
+} from "./provider-process.mjs";
+import {
+  inspectIsolation,
+  workerOwnerControllerSpawnArgs
+} from "./provider-profile.mjs";
+import {
   workerOwnerControllerEnvironment,
-  workerOwnerControllerSpawnArgs,
-  workerSessionCloseControllerEnvironment,
-  WORKTREE_INTEGRATION_REQUEST_ALLOWLIST
-} from "./grok-provider.mjs";
+  workerSessionCloseControllerEnvironment
+} from "./provider-controller-environments.mjs";
+import { WORKTREE_INTEGRATION_REQUEST_ALLOWLIST } from "./provider-worktree-contract.mjs";
 import { GrokWorktreeAcp } from "./grok-worktree-acp.mjs";
 import { hostContext, pluginDataRoot } from "./host.mjs";
 import { processGroupGone } from "./process-control.mjs";

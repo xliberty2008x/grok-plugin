@@ -5,14 +5,20 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import * as provider from "../plugins/grok/scripts/lib/grok-provider.mjs";
+import * as bootstrapClient from "../plugins/grok/scripts/lib/provider-bootstrap-client.mjs";
+import * as controllerEnvironments from "../plugins/grok/scripts/lib/provider-controller-environments.mjs";
 import * as core from "../plugins/grok/scripts/lib/provider-core.mjs";
 import * as credentials from "../plugins/grok/scripts/lib/provider-credentials.mjs";
 import * as gitController from "../plugins/grok/scripts/lib/provider-git-controller.mjs";
+import * as processRuntime from "../plugins/grok/scripts/lib/provider-process.mjs";
+import * as profile from "../plugins/grok/scripts/lib/provider-profile.mjs";
 import * as reviewContract from "../plugins/grok/scripts/lib/provider-review-contract.mjs";
 import * as taskEnvironment from "../plugins/grok/scripts/lib/provider-task-environment.mjs";
 import * as worktreeContract from "../plugins/grok/scripts/lib/provider-worktree-contract.mjs";
+import { patchPinnedFakeProviderCommands } from "./pinned-fake-grok.mjs";
 
 const LIB = fileURLToPath(new URL("../plugins/grok/scripts/lib/", import.meta.url));
+const SOURCE_PLUGIN = path.resolve(LIB, "../..");
 
 const PROVIDER_EXPORTS = Object.freeze([
   "DEFAULT_REVIEW_REPAIR_PROMPT",
@@ -73,7 +79,7 @@ const PROVIDER_EXPORTS = Object.freeze([
   "workerSessionCloseControllerEnvironment"
 ]);
 
-const PROVIDER_A_OWNERS = Object.freeze(Object.fromEntries([
+const PROVIDER_AB_OWNERS = Object.freeze(Object.fromEntries([
   [core, [
     "assertProviderPlatform",
     "childEnvironment",
@@ -102,13 +108,45 @@ const PROVIDER_A_OWNERS = Object.freeze(Object.fromEntries([
     "reviewEnvironment"
   ]],
   [gitController, ["assertControllerGitCheckoutSafe"]],
-  [taskEnvironment, ["taskEnvironment"]]
+  [taskEnvironment, ["taskEnvironment"]],
+  [controllerEnvironments, [
+    "cleanupTaskRuntimeArtifacts",
+    "revokeTaskCredential",
+    "taskCredentialEnvironment",
+    "workerOwnerControllerEnvironment",
+    "workerSessionCloseControllerEnvironment"
+  ]],
+  [profile, [
+    "inspectIsolation",
+    "workerOwnerControllerSpawnArgs"
+  ]],
+  [processRuntime, [
+    "captureSpawnIdentity",
+    "ensureChildExit",
+    "providerCleanupIdentity"
+  ]],
+  [bootstrapClient, [
+    "assertProviderBootstrapPromotionMessage",
+    "assertProviderBootstrapReadyMessage",
+    "authenticateBoundBootstrapGuard",
+    "cleanupBoundBootstrapStart",
+    "createProviderBootstrapLaunch",
+    "promoteProviderBootstrap",
+    "publishProviderBootstrapSpec",
+    "recordBoundBootstrapNoChild",
+    "settleWorktreeBootstrapRegistrationFailure",
+    "waitForProviderBootstrapReady"
+  ]]
 ].flatMap(([module, names]) => names.map((name) => [name, module[name]]))));
 
-const PROVIDER_A_FILES = Object.freeze([
+const PROVIDER_AB_FILES = Object.freeze([
   "provider-core.mjs",
   "provider-credentials.mjs",
   "provider-git-controller.mjs",
+  "provider-bootstrap-client.mjs",
+  "provider-controller-environments.mjs",
+  "provider-process.mjs",
+  "provider-profile.mjs",
   "provider-review-contract.mjs",
   "provider-task-environment.mjs",
   "provider-worktree-contract.mjs"
@@ -160,17 +198,25 @@ function stronglyConnectedComponents(graph) {
   return components;
 }
 
-test("grok-provider preserves its exact public surface while Provider A moves ownership", () => {
+test("grok-provider preserves its exact public surface while Provider A and B move ownership", () => {
   assert.deepEqual(Object.keys(provider).sort(), PROVIDER_EXPORTS);
   assert.equal(Object.hasOwn(provider, "default"), false);
-  assert.equal(Object.keys(PROVIDER_A_OWNERS).length, 21);
-  for (const [name, owner] of Object.entries(PROVIDER_A_OWNERS)) {
+  assert.equal(Object.hasOwn(profile, "checkedInAgentProfile"), false);
+  assert.equal(Object.keys(PROVIDER_AB_OWNERS).length, 41);
+  for (const [name, owner] of Object.entries(PROVIDER_AB_OWNERS)) {
     assert.equal(provider[name], owner, `${name} lost referential parity`);
   }
 });
 
-test("Provider A domains stay bounded, acyclic, and independent of the compatibility surface", () => {
-  for (const file of PROVIDER_A_FILES) {
+test("pinned fake-provider command patching rejects the source plugin before writing", () => {
+  assert.throws(
+    () => patchPinnedFakeProviderCommands(SOURCE_PLUGIN, "unused-wrapper"),
+    /must never patch the source plugin/u
+  );
+});
+
+test("Provider A and B domains stay bounded, acyclic, and independent of the compatibility surface", () => {
+  for (const file of PROVIDER_AB_FILES) {
     const source = fs.readFileSync(path.join(LIB, file), "utf8");
     assert.ok(source.split("\n").length <= 1500, `${file} exceeded 1500 lines`);
     assert.doesNotMatch(
@@ -183,7 +229,7 @@ test("Provider A domains stay bounded, acyclic, and independent of the compatibi
   const files = [
     "grok-provider.mjs",
     "provider-capability.mjs",
-    ...PROVIDER_A_FILES
+    ...PROVIDER_AB_FILES
   ];
   const knownFiles = new Set(files);
   const graph = new Map(files.map((file) => [file, importEdges(file, knownFiles)]));
@@ -191,4 +237,34 @@ test("Provider A domains stay bounded, acyclic, and independent of the compatibi
     .filter((component) => component.length > 1
       || (graph.get(component[0]) || []).includes(component[0]));
   assert.deepEqual(cycles, []);
+});
+
+test("Provider B consumers import their owning domains instead of the compatibility surface", () => {
+  const cleanupConsumers = [
+    "worker-mutation.mjs",
+    "worker-recovery.mjs",
+    "worker-runtime.mjs"
+  ];
+  for (const file of cleanupConsumers) {
+    const source = fs.readFileSync(path.join(LIB, file), "utf8");
+    assert.match(source, /\bfrom\s+"\.\/provider-controller-environments\.mjs"/u);
+    assert.doesNotMatch(source, /\bfrom\s+"\.\/grok-provider\.mjs"/u);
+  }
+
+  const ownerController = fs.readFileSync(
+    path.join(LIB, "worker-owner-controller.mjs"),
+    "utf8"
+  );
+  for (const domain of [
+    "provider-bootstrap-client.mjs",
+    "provider-controller-environments.mjs",
+    "provider-process.mjs",
+    "provider-profile.mjs"
+  ]) {
+    assert.match(ownerController, new RegExp(
+      `\\bfrom\\s+"\\./${domain.replaceAll(".", "\\.")}"`,
+      "u"
+    ));
+  }
+  assert.doesNotMatch(ownerController, /\bfrom\s+"\.\/grok-provider\.mjs"/u);
 });
