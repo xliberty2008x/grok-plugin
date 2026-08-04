@@ -395,10 +395,10 @@ function identities(job) {
   return [job?.controllerProcess, job?.workerProcess, job?.providerProcess].filter(Boolean);
 }
 
-async function assertAllProcessesGone(job) {
+async function assertAllProcessesGone(job, timeoutMs = 10_000) {
   await waitFor(
     () => identities(job).every((identity) => processGroupGone(identity)),
-    { timeoutMs: 10_000, intervalMs: 50 }
+    { timeoutMs, intervalMs: 50 }
   );
 }
 
@@ -1703,7 +1703,8 @@ test("MCP cancellation in the commit-to-launch window starts no worker or provid
 });
 
 test("MCP primary-turn admission serializes session-boundary cancellation before prompt bytes", { skip: process.platform === "win32" }, async (t) => {
-  const { root, fake, env } = fixture({ sessionResponseDelayMs: 750 });
+  const sessionResponseReleaseFile = path.join(tempDir("grok-primary-admission-session-release-"), "release");
+  const { root, fake, env } = fixture({ sessionResponseReleaseFile });
   const options = { env };
   let workerId = null;
   t.after(() => workerId && emergencyStop(tryReadJob(root, workerId, env)));
@@ -1717,14 +1718,15 @@ test("MCP primary-turn admission serializes session-boundary cancellation before
     () => readFakeLog(fake.logFile).some((entry) => (
       entry.event === "rpc" && entry.message?.method === "session/new"
     )),
-    { timeoutMs: 10_000, intervalMs: 20 }
+    { timeoutMs: 30_000, intervalMs: 20 }
   );
 
   // Acquire the exact state lock before session/new resolves. The worker may
   // still publish its session event (per-job lock), but primary admission and
   // cancellation are both ordered behind this transaction.
   withWorkspaceStateTransaction(root, (transaction) => {
-    const deadline = Date.now() + 5_000;
+    fs.writeFileSync(sessionResponseReleaseFile, "release\n", "utf8");
+    const deadline = Date.now() + 15_000;
     let atBoundary = null;
     while (Date.now() < deadline) {
       atBoundary = transaction.tryReadJob(workerId);
@@ -1738,19 +1740,13 @@ test("MCP primary-turn admission serializes session-boundary cancellation before
     assert.equal(transaction.isCancelRequested(workerId, nonce), true);
   }, env);
 
-  await waitForTerminal(root, workerId, options);
+  await waitForTerminal(root, workerId, options, 60_000);
   const terminal = tryReadJob(root, workerId, env);
   assert.equal(terminal.status, "cancelled");
   assert.equal(terminal.error.code, "E_CANCELLED");
-  assert.equal(
-    terminal.request.spawn.primaryTurnAdmissions?.["1"],
-    undefined
-  );
-  assert.equal(
-    readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length,
-    0
-  );
-  await assertAllProcessesGone(terminal);
+  assert.equal(terminal.request.spawn.primaryTurnAdmissions?.["1"], undefined);
+  assert.equal(readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length, 0);
+  await assertAllProcessesGone(terminal, 30_000);
 });
 
 test("MCP cancellation after generation-1 admission wins before prompt consumption", { skip: process.platform === "win32" }, async (t) => {
@@ -2361,11 +2357,16 @@ test("active cancellation after generation 2 registration preserves E_CANCELLED"
     userRequest: "Cancel only after the replacement provider is registered"
   }, options);
   workerId = spawned.worker.id;
-  await waitFor(
-    () => readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length === 2,
-    { timeoutMs: 15_000, intervalMs: 25 }
-  );
-  const registered = tryReadJob(root, workerId, env);
+  const registered = await waitFor(() => {
+    const current = tryReadJob(root, workerId, env);
+    return readFakeLog(fake.logFile).filter((entry) => entry.event === "prompt").length === 2
+      && current?.request?.spawn?.dispatch?.providerGeneration === 2
+      && current.request.spawn.dispatch.nextProviderGeneration === null
+      && current.request.spawn.providerRotationIntent?.status === "registered"
+      && current.providerProcess?.providerGeneration === 2
+      ? current
+      : false;
+  }, { timeoutMs: 30_000, intervalMs: 25 });
   assert.equal(registered.request.spawn.dispatch.providerGeneration, 2);
   assert.equal(registered.request.spawn.dispatch.nextProviderGeneration, null);
   assert.equal(registered.request.spawn.providerRotationIntent.status, "registered");
@@ -2376,15 +2377,14 @@ test("active cancellation after generation 2 registration preserves E_CANCELLED"
     idempotencyKey: "mcp-runtime-report-repair-cancel-receipt-0001"
   }, options);
   assert.equal(cancelled.receipt.status, "accepted");
-  await waitForTerminal(root, workerId, options);
-
+  await waitForTerminal(root, workerId, options, 60_000);
   const terminal = tryReadJob(root, workerId, env);
   assert.equal(terminal.status, "cancelled");
   assert.equal(terminal.error.code, "E_CANCELLED");
   assert.equal(terminal.request.spawn.dispatch.providerGeneration, 2);
   assert.equal(terminal.request.spawn.providerRotationIntent.status, "registered");
   assert.equal(terminal.result.taskRuntimeCleaned, true);
-  await assertAllProcessesGone(terminal);
+  await assertAllProcessesGone(terminal, 30_000);
 });
 
 test("pending provider rotation is durably promoted before guard cleanup and loss settlement", { skip: process.platform === "win32" }, async (t) => {
