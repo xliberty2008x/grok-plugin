@@ -40,6 +40,7 @@ import {
   buildTaskEnvelope
 } from "./task-envelope.mjs";
 import { captureContextManifest } from "./task-context-manifest.mjs";
+import { contextIncompleteError } from "./task-context-metadata.mjs";
 import {
   EXACT_WRITE_VERTICAL_SCOPE,
   assertExactWriteVerticalScope,
@@ -84,6 +85,14 @@ function assertWaitMs(value) {
     throw new CompanionError("E_USAGE", `Worker wait must be an integer from 0 to ${MAX_WORKER_WAIT_MS} milliseconds.`);
   }
   return timeoutMs;
+}
+
+function captureAdmissionContext(root, captureContext) {
+  try {
+    return captureContext(root);
+  } catch {
+    throw contextIncompleteError("admission", ["contextCapture"]);
+  }
 }
 
 export function createWorkerService({
@@ -619,7 +628,7 @@ export function createWorkerService({
       if (!idempotencyKey) {
         throw new CompanionError("E_USAGE", "idempotencyKey is required for spawn.");
       }
-      const boundContextManifest = contextManifest || captureContext(root);
+      const boundContextManifest = contextManifest || captureAdmissionContext(root, captureContext);
       const taskEnvelope = envelope ? assertTaskEnvelope(envelope) : buildTaskEnvelope({
         userRequest: userRequest || objective || "worker task",
         objective,

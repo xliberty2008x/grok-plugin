@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { validInstalledPublicError, validateContextIncompleteTerminalProjection } from "./installed-context-incomplete-contract.mjs";
 
 const MAX_JSON_BYTES = 1024 * 1024;
 const MAX_JSON_DEPTH = 32;
@@ -554,17 +555,12 @@ const CANCELLATION_RESULT_KEYS = new Set([
   "terminalRecordCommittedAt",
   "receiptId"
 ]);
-const PUBLIC_ERROR_REQUIRED_KEYS = new Set([
-  "workerProtocolVersion",
-  "errorSchemaVersion",
-  "code",
-  "message"
-]);
 const PUBLIC_WORKER_ERROR_CODES = new Set([
   "E_AUTH_REQUIRED",
   "E_CANCELLED",
   "E_CAPABILITY",
   "E_CONTEXT_DRIFT",
+  "E_CONTEXT_INCOMPLETE",
   "E_DELIVERY",
   "E_GIT_REQUIRED",
   "E_GROK_NOT_FOUND",
@@ -1915,15 +1911,7 @@ function validCancellationResult(value) {
 }
 
 function validPublicError(value, status) {
-  if (status === "completed") return value === null;
-  return (
-    exactKeys(value, PUBLIC_ERROR_REQUIRED_KEYS)
-    && value.workerProtocolVersion === 1
-    && value.errorSchemaVersion === 1
-    && value.code === "E_CANCELLED"
-    && validPublicText(value.message)
-    && value.message.length > 0
-  );
+  return validInstalledPublicError(value, status, { validPublicText });
 }
 
 function validPublicResult(value, status, taskContract) {
@@ -2181,6 +2169,14 @@ function validTerminalResult(value, status, code) {
     fail(code);
   }
   assertNoHostVerificationPromotion(value.worker, code);
+}
+
+/**
+ * Reach the installed public contract for a context-rejected terminal without
+ * widening the two live lifecycle qualification scenarios.
+ */
+export function validateInstalledContextIncompleteTerminalProjection(value) {
+  return validateContextIncompleteTerminalProjection(value, { boundedJson, assertNoPrivateProjectionData, fail, validPublicText });
 }
 
 function validSendPayload(value, {

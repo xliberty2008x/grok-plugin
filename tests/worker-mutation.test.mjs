@@ -122,6 +122,14 @@ import {
   testEnvironment,
   waitFor
 } from "./helpers.mjs";
+import {
+  cancelIdempotencyFile,
+  installOversizeGitHook,
+  refreshSpawnWitnessId,
+  spawnIdempotencyFile,
+  spawnResponseWitnessBody,
+  stableDigest
+} from "./worker-mutation-test-helpers.mjs";
 
 const WORKER_MUTATION_PARTITION_KEY = Symbol.for(
   "grok-plugin.worker-mutation-partition"
@@ -301,33 +309,6 @@ function envFor(root) {
   };
 }
 
-function cancelIdempotencyFile(root, key, env) {
-  const keyDigest = crypto.createHash("sha256").update(key).digest("hex");
-  return path.join(workspaceState(root, env), "idempotency", "cancel", `${keyDigest}.json`);
-}
-
-function spawnIdempotencyFile(root, key, env) {
-  const keyDigest = crypto.createHash("sha256").update(key).digest("hex");
-  return path.join(workspaceState(root, env), "idempotency", "spawn", `${keyDigest}.json`);
-}
-
-function canonicalize(value) {
-  if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map((item) => canonicalize(item));
-  return Object.fromEntries(
-    Object.keys(value)
-      .sort()
-      .filter((key) => value[key] !== undefined)
-      .map((key) => [key, canonicalize(value[key])])
-  );
-}
-
-function stableDigest(value) {
-  return crypto
-    .createHash("sha256")
-    .update(JSON.stringify(canonicalize(value)))
-    .digest("hex");
-}
 
 function rebindWorkerLaunchAuthorization(job) {
   return {
@@ -357,18 +338,6 @@ function legacyContextManifest(manifest) {
     digest,
     capturedAt
   };
-}
-
-function spawnResponseWitnessBody(witness) {
-  const { witnessId: _witnessId, ...body } = witness;
-  return body;
-}
-
-function refreshSpawnWitnessId(record) {
-  record.responseWitness.witnessId = `spawnw-${
-    stableDigest(spawnResponseWitnessBody(record.responseWitness)).slice(0, 24)
-  }`;
-  return record;
 }
 
 function providerGuardFile(root, marker) {
@@ -1213,6 +1182,7 @@ test("every representative raw-context rejection leaves no durable job or spawn 
     assert.equal(listJobs(root, env).length, 0);
     assert.equal(fs.existsSync(spawnIdempotencyFile(root, key, env)), false);
   }
+
   assert.equal(listJobs(root, env).length, 0);
   const spawnIdempotencyDirectory = path.dirname(
     spawnIdempotencyFile(root, "spawn-rejected-context-sentinel", env)
@@ -4107,6 +4077,31 @@ test("generation-1 immutable authority rejects corruption; verified target.txt w
     assertDurableSpawnRequestBinding(authorized.job, fixture.env)
   ));
 
+  const authorizedJobFile = path.join(
+    workspaceState(fixture.root, fixture.env),
+    "jobs",
+    `${fixture.workerId}.json`
+  );
+  const authorizedJobBytes = fs.readFileSync(authorizedJobFile);
+  const incompleteHook = installOversizeGitHook(
+    fixture.root,
+    "managed-launch"
+  );
+  try {
+    assert.throws(
+      () => assertWorkerProviderLaunchPreparation(
+        tryReadJob(fixture.root, fixture.workerId, fixture.env),
+        { providerGeneration: 1, env: fixture.env }
+      ),
+      (error) => error?.code === "E_CONTEXT_INCOMPLETE"
+        && error.details?.contextPhase === "execute"
+        && error.details?.metadataComponents?.includes("hooks")
+    );
+  } finally {
+    fs.unlinkSync(incompleteHook);
+  }
+  assert.equal(fs.readFileSync(authorizedJobFile).equals(authorizedJobBytes), true);
+
   for (const { name, mutate } of [
     {
       name: "executionBinding.scope",
@@ -6677,8 +6672,9 @@ test("pre-provider final observation fails closed for scope and unavailable cont
     },
     {
       name: "final capture unavailable",
-      expectedCode: "E_CONTEXT_DRIFT",
+      expectedCode: "E_CONTEXT_INCOMPLETE",
       unavailable: true,
+      expectedDetails: { contextPhase: "terminal", metadataComponents: ["contextCapture"] },
       prepare(fixture) {
         updateJob(fixture.root, fixture.workerId, (job) => (
           rebindWorkerLaunchAuthorization({
@@ -6732,8 +6728,10 @@ test("pre-provider final observation fails closed for scope and unavailable cont
       assert.notEqual(settled.result.stopReason, "cancelled");
       if (entry.unavailable) {
         assert.deepEqual(
-          settled.error.details.reasons,
-          ["[final-context-unavailable]"]
+          entry.expectedDetails
+            ? settled.error.details
+            : { reasons: settled.error.details.reasons },
+          entry.expectedDetails || { reasons: ["[final-context-unavailable]"] }
         );
         assert.equal(settled.completionContextManifest, null);
         assert.equal(settled.result.runtimeEvidence.postContext, null);

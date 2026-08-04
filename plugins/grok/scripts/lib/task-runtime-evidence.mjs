@@ -10,6 +10,10 @@ import {
   observeContextGitMetadataDrift
 } from "./task-git-identity.mjs";
 import {
+  inspectTaskRelevantMetadataObservation,
+  observeContextMetadataCompleteness
+} from "./task-context-metadata.mjs";
+import {
   MAX_IGNORED_ATTRIBUTABLE,
   MAX_IGNORED_PATHS,
   isVerificationCacheIgnoredPath
@@ -45,6 +49,13 @@ function projectRuntimeContextIdentity(context) {
       unrelatedRefIdentity: context.git.sharedRefIdentity.unrelatedRefIdentity
     };
   }
+  if (inspectTaskRelevantMetadataObservation(context.git) === "valid") {
+    identity.taskRelevantMetadataObservation = {
+      schemaVersion: context.git.taskRelevantMetadataObservation.schemaVersion,
+      complete: context.git.taskRelevantMetadataObservation.complete,
+      components: { ...context.git.taskRelevantMetadataObservation.components }
+    };
+  }
   return identity;
 }
 
@@ -57,6 +68,9 @@ export function buildRuntimeEvidence({
   scopeViolations = null,
   executionStatus = "completed"
 } = {}) {
+  const metadataObservation = preContext?.git && postContext?.git
+    ? observeContextMetadataCompleteness(preContext, postContext)
+    : null;
   const sharedRefObservation = preContext?.git && postContext?.git
     ? classifyContextGitMetadataObservation(preContext, postContext)
     : null;
@@ -78,7 +92,11 @@ export function buildRuntimeEvidence({
     hostVerification: "not_run",
     // Bounded public-safe classification distinguishing tolerated unrelated
     // shared-ref churn from task-relevant Git metadata/ref drift (issue #34).
-    ...(sharedRefObservation ? { sharedRefObservation } : {})
+    ...(sharedRefObservation && (metadataObservation?.complete !== false
+      || sharedRefObservation.taskRelevantMetadataDrift) ? { sharedRefObservation } : {}),
+    ...(metadataObservation ? {
+      metadataCompletenessObservation: metadataObservation
+    } : {})
   };
 }
 

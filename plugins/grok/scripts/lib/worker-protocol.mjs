@@ -25,6 +25,14 @@ import {
   MAX_LIFECYCLE_EVENTS,
   normalizeLifecycleEventSequences
 } from "./task-lifecycle.mjs";
+import {
+  appendContextIncompleteMessage,
+  projectContextIncompleteDetails,
+  projectMetadataCompletenessObservation,
+  projectSharedRefIdentitySummary,
+  projectSharedRefObservation,
+  projectTaskRelevantMetadataObservation
+} from "./worker-context-projection.mjs";
 
 /** Public protocol version for handle, snapshot, and cursor projections. */
 export const WORKER_PROTOCOL_VERSION = 1;
@@ -34,6 +42,7 @@ export const WORKER_EVENT_CURSOR_SCHEMA_VERSION = 1;
 export const WORKER_EVENT_SCHEMA_VERSION = 1;
 export const WORKER_RESULT_SCHEMA_VERSION = 1;
 export const WORKER_ERROR_SCHEMA_VERSION = 1;
+export const WORKER_CONTEXT_INCOMPLETE_ERROR_SCHEMA_VERSION = 2;
 
 /** Every persisted runtime error that may cross the public worker boundary. */
 export const PUBLIC_WORKER_ERROR_CODES = Object.freeze([
@@ -41,6 +50,7 @@ export const PUBLIC_WORKER_ERROR_CODES = Object.freeze([
   "E_CANCELLED",
   "E_CAPABILITY",
   "E_CONTEXT_DRIFT",
+  "E_CONTEXT_INCOMPLETE",
   "E_DELIVERY",
   "E_GIT_REQUIRED",
   "E_GROK_NOT_FOUND",
@@ -84,10 +94,11 @@ const PUBLIC_LIFECYCLE_EVENT_TYPES = new Set(LIFECYCLE_EVENT_TYPES);
 const PUBLIC_WORKER_ERROR_CODE_SET = new Set(PUBLIC_WORKER_ERROR_CODES);
 const FOREGROUND_PUBLIC_ERROR_CODE_SET = new Set([
   "E_STORAGE_READONLY",
-  "E_CONTEXT_INCOMPLETE",
   "E_INPUT_READ",
-  "E_INPUT_TIMEOUT"
+  "E_INPUT_TIMEOUT",
+  "E_CONTEXT_INCOMPLETE"
 ]);
+const SHA256_HEX_DIGEST = /^[a-f0-9]{64}$/;
 const WORKER_ID_PATTERN = /^(?:review|adversarial-review|task|stop-review|deep-research)-[a-f0-9]{16,64}$/;
 const MAX_PUBLIC_TEXT_BYTES = 2000;
 const MAX_PUBLIC_PLAN_ITEMS = 128;
@@ -103,6 +114,7 @@ const MAX_PRIVATE_PROCESS_DIAGNOSTIC_MESSAGE_LENGTH = 256;
 const PROCESS_IDENTITY_PUBLIC_MESSAGE = "Process ownership verification failed.";
 const SAFETY_PRIMARY_ERROR_CODES = new Set([
   "E_CONTEXT_DRIFT",
+  "E_CONTEXT_INCOMPLETE",
   "E_SCOPE_VIOLATION"
 ]);
 const PROCESS_OS_ERROR_CODES = new Set([
@@ -1126,7 +1138,9 @@ function projectNestedError(value) {
 }
 
 function projectPublicErrorDetails(code, value, { error = null } = {}) {
-  if (!isPlainObject(value)) return null;
+  if (!isPlainObject(value)) return code === "E_CONTEXT_INCOMPLETE"
+    ? projectContextIncompleteDetails(value)
+    : null;
   const projected = {};
   const warningCodes = new Set([
     "E_AUTH_REQUIRED",
@@ -1185,6 +1199,8 @@ function projectPublicErrorDetails(code, value, { error = null } = {}) {
     if (["complete", "task_scoped", "unknown"].includes(value.workspaceState)) {
       projected.workspaceState = value.workspaceState;
     }
+  } else if (code === "E_CONTEXT_INCOMPLETE") {
+    Object.assign(projected, projectContextIncompleteDetails(value));
   } else if (code === "E_JOB_ACTIVE") {
     if (typeof value.conflictingJobId === "string" && WORKER_ID_PATTERN.test(value.conflictingJobId)) {
       projected.conflictingJobId = value.conflictingJobId;
@@ -1227,91 +1243,6 @@ function projectProviderClaims(value) {
   };
 }
 
-/** Public inventory ceilings mirrored from private shared-ref capture bounds. */
-const MAX_PUBLIC_SHARED_REFS = 10_000;
-const SHA256_HEX_DIGEST = /^[a-f0-9]{64}$/;
-
-/**
- * Host-authoritative shared-ref identity summary.
- * Rejects non-digests, unsafe/inconsistent counts, and impossible completeness.
- * Malformed input must not project as a trusted claim.
- */
-function projectSharedRefIdentitySummary(value) {
-  if (!isPlainObject(value)) return null;
-  if (value.schemaVersion !== 1) return null;
-  if (typeof value.complete !== "boolean") return null;
-  if (!Number.isSafeInteger(value.refCount) || value.refCount < 0) return null;
-  if (!Number.isSafeInteger(value.taskRelevantRefCount) || value.taskRelevantRefCount < 0) {
-    return null;
-  }
-  if (!Number.isSafeInteger(value.unrelatedRefCount) || value.unrelatedRefCount < 0) return null;
-  if (value.refCount > MAX_PUBLIC_SHARED_REFS
-    || value.taskRelevantRefCount > MAX_PUBLIC_SHARED_REFS
-    || value.unrelatedRefCount > MAX_PUBLIC_SHARED_REFS) {
-    return null;
-  }
-  if (value.taskRelevantRefCount + value.unrelatedRefCount !== value.refCount) return null;
-  // complete ⇒ inventory within the hard shared-ref budget.
-  if (value.complete && value.refCount > MAX_PUBLIC_SHARED_REFS) return null;
-  if (typeof value.taskRelevantRefIdentity !== "string"
-    || !SHA256_HEX_DIGEST.test(value.taskRelevantRefIdentity)) {
-    return null;
-  }
-  if (typeof value.unrelatedRefIdentity !== "string"
-    || !SHA256_HEX_DIGEST.test(value.unrelatedRefIdentity)) {
-    return null;
-  }
-  return {
-    schemaVersion: 1,
-    complete: value.complete,
-    refCount: value.refCount,
-    taskRelevantRefCount: value.taskRelevantRefCount,
-    unrelatedRefCount: value.unrelatedRefCount,
-    taskRelevantRefIdentity: value.taskRelevantRefIdentity,
-    unrelatedRefIdentity: value.unrelatedRefIdentity
-  };
-}
-
-/**
- * Host-authoritative shared-ref observation.
- * Requires exact booleans and classification/flag tuples emitted by the
- * classifier; never Boolean-coerces malformed flags into trusted evidence.
- */
-function projectSharedRefObservation(value) {
-  if (!isPlainObject(value)) return null;
-  if (value.schemaVersion !== 1) return null;
-  if (typeof value.classification !== "string") return null;
-  if (typeof value.toleratedUnrelatedSharedRefChurn !== "boolean") return null;
-  if (typeof value.taskRelevantMetadataDrift !== "boolean") return null;
-  const classification = value.classification;
-  const tolerated = value.toleratedUnrelatedSharedRefChurn;
-  const drift = value.taskRelevantMetadataDrift;
-  const validTuple = (
-    (classification === "unchanged"
-      && tolerated === false
-      && drift === false)
-    || (classification === "tolerated_unrelated_shared_refs"
-      && tolerated === true
-      && drift === false)
-    || (classification === "task_relevant_metadata_drift"
-      && tolerated === false
-      && drift === true)
-    || (classification === "legacy_metadata_drift"
-      && tolerated === false
-      && drift === true)
-    || (classification === "fail_closed"
-      && tolerated === false
-      && drift === true)
-  );
-  if (!validTuple) return null;
-  return {
-    schemaVersion: 1,
-    classification,
-    toleratedUnrelatedSharedRefChurn: tolerated,
-    taskRelevantMetadataDrift: drift
-  };
-}
-
 function projectContextIdentity(value) {
   if (!isPlainObject(value)) return null;
   const projected = {
@@ -1330,7 +1261,16 @@ function projectContextIdentity(value) {
     projected.taskRelevantMetadataIdentity = value.taskRelevantMetadataIdentity;
   }
   const sharedRefIdentity = projectSharedRefIdentitySummary(value.sharedRefIdentity);
+  const metadataObservation = projectTaskRelevantMetadataObservation(
+    value.taskRelevantMetadataObservation
+  );
+  if (sharedRefIdentity
+    && metadataObservation
+    && sharedRefIdentity.complete !== metadataObservation.complete) {
+    return projected;
+  }
   if (sharedRefIdentity) projected.sharedRefIdentity = sharedRefIdentity;
+  if (metadataObservation) projected.taskRelevantMetadataObservation = metadataObservation;
   return projected;
 }
 
@@ -1357,6 +1297,9 @@ function projectRuntimeEvidence(value, { trustHostAuthority = true } = {}) {
     }
     : null;
   const sharedRefObservation = projectSharedRefObservation(value.sharedRefObservation);
+  const metadataCompleteness = projectMetadataCompletenessObservation(
+    value.metadataCompletenessObservation
+  );
   return {
     schemaVersion: nullableInteger(value.schemaVersion),
     preContext: projectContextIdentity(value.preContext),
@@ -1371,6 +1314,9 @@ function projectRuntimeEvidence(value, { trustHostAuthority = true } = {}) {
       ? value.hostVerification
       : "not_run",
     ...(sharedRefObservation ? { sharedRefObservation } : {}),
+    ...(metadataCompleteness ? {
+      metadataCompletenessObservation: metadataCompleteness
+    } : {}),
     ...(reconciler ? { reconciler } : {})
   };
 }
@@ -1891,7 +1837,9 @@ function projectPublicError(error) {
   const details = projectPublicErrorDetails(code, error.details, { error });
   return sanitizeCompleteWorkerProjection({
     workerProtocolVersion: WORKER_PROTOCOL_VERSION,
-    errorSchemaVersion: WORKER_ERROR_SCHEMA_VERSION,
+    errorSchemaVersion: code === "E_CONTEXT_INCOMPLETE"
+      ? WORKER_CONTEXT_INCOMPLETE_ERROR_SCHEMA_VERSION
+      : WORKER_ERROR_SCHEMA_VERSION,
     code,
     message,
     ...(details ? { details } : {})
@@ -1906,9 +1854,10 @@ function projectPublicError(error) {
 export function projectWorkerError(error) {
   if (isPlainObject(error) && FOREGROUND_PUBLIC_ERROR_CODE_SET.has(error.code)) {
     const messageText = typeof error.message === "string" ? error.message : "";
-    const message = scrubProcessDiagnosticText(messageText, error, {
-      selfDetect: true
-    });
+    const message = appendContextIncompleteMessage(
+      scrubProcessDiagnosticText(messageText, error, { selfDetect: true }),
+      error
+    );
     return sanitizePublicProjection({
       code: error.code,
       message: boundedText(message, {

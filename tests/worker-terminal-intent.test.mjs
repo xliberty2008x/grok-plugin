@@ -8,6 +8,7 @@ import { CompanionError } from "../plugins/grok/scripts/lib/errors.mjs";
 import { reconcileBrokerWorkers } from "../plugins/grok/scripts/lib/worker-recovery.mjs";
 import {
   cancelWorker,
+  persistCompletedWriteArtifact,
   settleStartedWorkerLoss,
   spawnReadOnlyWorker
 } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
@@ -19,6 +20,7 @@ import {
 } from "../plugins/grok/scripts/lib/task-contract.mjs";
 import {
   captureTerminalEvidence,
+  preferProvenTerminalSafetyPending,
   selectTaskTerminalError
 } from "../plugins/grok/scripts/lib/task-terminal-evidence.mjs";
 import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
@@ -230,6 +232,10 @@ test("terminal evidence requires valid pre- and post-context comparison authorit
     assert.equal(evidence.finalObservationUnavailable, true);
     assert.equal(evidence.postContext, null);
     assert.equal(evidence.runtimeEvidence.executionStatus, "failed");
+    assert.equal(
+      Object.hasOwn(evidence.runtimeEvidence, "metadataCompletenessObservation"),
+      false
+    );
     const selected = selectTaskTerminalError(evidence);
     assert.equal(selected.code, "E_CONTEXT_DRIFT");
     assert.deepEqual(
@@ -268,6 +274,100 @@ test("terminal evidence requires valid pre- and post-context comparison authorit
     }
   ));
 
+  const captureFailure = captureTerminalEvidence(
+    root,
+    job(context),
+    "completed",
+    {
+      captureContext() {
+        throw new Error("private terminal capture failure /Users/alice/secret");
+      }
+    }
+  );
+  const incomplete = selectTaskTerminalError(captureFailure, {
+    code: "E_PROCESS_IDENTITY",
+    message: "kill EPERM",
+    details: {
+      secondaryDiagnostic: { code: "EPERM", message: "kill EPERM" }
+    }
+  });
+  assert.equal(captureFailure.finalObservationUnavailable, true);
+  assert.equal(captureFailure.runtimeEvidence.executionStatus, "failed");
+  assert.deepEqual(captureFailure.runtimeEvidence.metadataCompletenessObservation, {
+    schemaVersion: 1,
+    complete: false,
+    metadataComponents: ["contextCapture"]
+  });
+  assert.equal(incomplete.code, "E_CONTEXT_INCOMPLETE");
+  assert.deepEqual(incomplete.details, {
+    contextPhase: "terminal",
+    metadataComponents: ["contextCapture"]
+  });
+  for (const priorCaptureSafety of [
+    {
+      code: "E_CONTEXT_DRIFT",
+      message: "Previously proven context drift.",
+      details: { reasons: ["[HEAD]"] }
+    },
+    {
+      code: "E_SCOPE_VIOLATION",
+      message: "Previously proven scope violation.",
+      details: { paths: ["outside.txt"] }
+    }
+  ]) {
+    assert.equal(
+      selectTaskTerminalError(captureFailure, priorCaptureSafety),
+      priorCaptureSafety
+    );
+  }
+  assert.equal(JSON.stringify(captureFailure).includes("/Users/alice"), false);
+
+  const typedCaptureFailure = captureTerminalEvidence(
+    root,
+    job(context),
+    "completed",
+    {
+      captureContext() {
+        throw new CompanionError(
+          "E_CONTEXT_DRIFT",
+          "typed private terminal capture failure /Users/alice/secret"
+        );
+      }
+    }
+  );
+  const typedIncomplete = selectTaskTerminalError(typedCaptureFailure);
+  assert.equal(typedCaptureFailure.finalObservationFailureKind, "contextCapture");
+  assert.equal(typedIncomplete.code, "E_CONTEXT_INCOMPLETE");
+  assert.deepEqual(typedIncomplete.details, {
+    contextPhase: "terminal",
+    metadataComponents: ["contextCapture"]
+  });
+  assert.equal(JSON.stringify(typedCaptureFailure).includes("/Users/alice"), false);
+
+  const incompleteHook = path.join(root, ".git", "hooks", "issue55-terminal-oversize");
+  fs.writeFileSync(incompleteHook, Buffer.alloc((4 * 1024 * 1024) + 1, 0x61));
+  try {
+    const incompleteEvidence = captureTerminalEvidence(
+      root,
+      job(context),
+      "completed"
+    );
+    assert.deepEqual(
+      incompleteEvidence.changedPaths,
+      ["[GIT_METADATA_INCOMPLETE]"]
+    );
+    assert.deepEqual(incompleteEvidence.scopeViolations, []);
+    assert.deepEqual(incompleteEvidence.runtimeEvidence.scopeViolations, []);
+    const componentError = selectTaskTerminalError(incompleteEvidence);
+    assert.equal(componentError.code, "E_CONTEXT_INCOMPLETE");
+    assert.deepEqual(componentError.details, {
+      contextPhase: "terminal",
+      metadataComponents: ["hooks"]
+    });
+  } finally {
+    fs.unlinkSync(incompleteHook);
+  }
+
   const stable = captureTerminalEvidence(
     root,
     job(context),
@@ -280,6 +380,154 @@ test("terminal evidence requires valid pre- and post-context comparison authorit
   assert.deepEqual(stable.scopeViolations, []);
   assert.equal(stable.runtimeEvidence.executionStatus, "completed");
   assert.equal(selectTaskTerminalError(stable), null);
+  const recoveredTransient = selectTaskTerminalError(stable, {
+    code: "E_CONTEXT_INCOMPLETE",
+    message: "Git execution context could not be observed completely.",
+    details: {
+      contextPhase: "terminal",
+      metadataComponents: ["hooks"]
+    }
+  });
+  assert.equal(recoveredTransient.code, "E_CONTEXT_INCOMPLETE");
+  assert.deepEqual(recoveredTransient.details, {
+    contextPhase: "terminal",
+    metadataComponents: ["hooks"]
+  });
+});
+
+test("legacy unavailable terminal evidence without a failure kind remains context drift", () => {
+  const selected = selectTaskTerminalError({
+    finalObservationUnavailable: true,
+    changedPaths: [],
+    scopeViolations: [],
+    runtimeEvidence: {
+      observedChangedPaths: [],
+      scopeViolations: []
+    }
+  });
+  assert.equal(selected.code, "E_CONTEXT_DRIFT");
+  assert.deepEqual(selected.details.reasons, ["[final-context-unavailable]"]);
+});
+
+test("terminal safety precedence preserves proven drift and scope over incompleteness", () => {
+  const processUncertainty = {
+    code: "E_PROCESS_IDENTITY",
+    message: "Verified owned process signalling could not be completed.",
+    details: {
+      secondaryDiagnostic: { code: "EPERM", message: "kill EPERM" }
+    }
+  };
+  const evidence = ({ changedPaths, scopeViolations, components = ["refs"] }) => ({
+    finalObservationUnavailable: false,
+    changedPaths,
+    scopeViolations,
+    runtimeEvidence: {
+      observedChangedPaths: changedPaths,
+      scopeViolations,
+      metadataCompletenessObservation: {
+        schemaVersion: 1,
+        complete: false,
+        metadataComponents: components
+      }
+    }
+  });
+
+  const drift = selectTaskTerminalError(evidence({
+    changedPaths: ["[HEAD]", "[GIT_METADATA_INCOMPLETE]"],
+    scopeViolations: ["outside.txt", "[GIT_METADATA_INCOMPLETE]"]
+  }), null, processUncertainty);
+  assert.equal(drift.code, "E_CONTEXT_DRIFT");
+  assert.deepEqual(drift.details.reasons, ["[HEAD]"]);
+  assert.equal(drift.details.secondaryDiagnostic.code, "EPERM");
+
+  const scope = selectTaskTerminalError(evidence({
+    changedPaths: ["outside.txt", "[GIT_METADATA_INCOMPLETE]"],
+    scopeViolations: ["outside.txt", "[GIT_METADATA_INCOMPLETE]"]
+  }), null, processUncertainty);
+  assert.equal(scope.code, "E_SCOPE_VIOLATION");
+  assert.deepEqual(scope.details.paths, ["outside.txt"]);
+  assert.equal(scope.details.secondaryDiagnostic.code, "EPERM");
+
+  const incomplete = selectTaskTerminalError(evidence({
+    changedPaths: ["[GIT_METADATA_INCOMPLETE]"],
+    scopeViolations: ["[GIT_METADATA_INCOMPLETE]"],
+    components: ["hooks", "refs"]
+  }), { code: "E_CANCELLED", message: "Cancelled." }, processUncertainty);
+  assert.equal(incomplete.code, "E_CONTEXT_INCOMPLETE");
+  assert.deepEqual(incomplete.details, {
+    contextPhase: "terminal",
+    metadataComponents: ["hooks", "refs"]
+  });
+  assert.equal(JSON.stringify(incomplete).includes("EPERM"), false);
+
+  for (const prior of [
+    {
+      code: "E_CONTEXT_DRIFT",
+      message: "Previously proven context drift.",
+      details: { reasons: ["[HEAD]"] }
+    },
+    {
+      code: "E_SCOPE_VIOLATION",
+      message: "Previously proven scope violation.",
+      details: { paths: ["outside.txt"] }
+    }
+  ]) {
+    const selected = selectTaskTerminalError(evidence({
+      changedPaths: ["[GIT_METADATA_INCOMPLETE]"],
+      scopeViolations: ["[GIT_METADATA_INCOMPLETE]"],
+      components: ["hooks"]
+    }), prior, processUncertainty);
+    assert.equal(selected, prior);
+    assert.equal(selected.code, prior.code);
+  }
+
+  const priorPending = {
+    status: "failed",
+    phase: "context-rejected",
+    completedAt: "2026-07-22T10:03:00.000Z",
+    error: { code: "E_CONTEXT_DRIFT", message: "Previously proven context drift." }
+  };
+  const incompletePending = {
+    status: "failed",
+    phase: "context-rejected",
+    completedAt: "2026-07-22T10:04:00.000Z",
+    error: { code: "E_CONTEXT_INCOMPLETE", message: "Incomplete terminal context." }
+  };
+  const preserved = preferProvenTerminalSafetyPending(
+    incompletePending,
+    {
+      ...priorPending,
+      status: "completed",
+      phase: "done",
+      summary: "Provider claimed completion"
+    }
+  );
+  assert.equal(preserved.status, "failed");
+  assert.equal(preserved.phase, "context-rejected");
+  assert.equal(preserved.completedAt, incompletePending.completedAt);
+  assert.equal(preserved.error, priorPending.error);
+  assert.equal(preserved.summary, priorPending.error.message);
+
+  // The write-artifact boundary independently rejects an incoherent completed
+  // envelope even if one reaches it from older durable state.
+  assert.equal(persistCompletedWriteArtifact(
+    { write: true },
+    {
+      status: "completed",
+      phase: "done",
+      completedAt: priorPending.completedAt,
+      error: priorPending.error,
+      summary: "Provider claimed completion"
+    }
+  ), null);
+  const freshDriftPending = {
+    ...incompletePending,
+    error: { code: "E_CONTEXT_DRIFT", message: "Fresh final drift." }
+  };
+  assert.equal(
+    preferProvenTerminalSafetyPending(freshDriftPending, priorPending),
+    freshDriftPending
+  );
 });
 
 test("provider-started recovery lets a cleanup signal failure outrank a completed intent", {

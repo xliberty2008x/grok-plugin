@@ -30,6 +30,7 @@
         "E_CAPABILITY",
         "E_CANCELLED",
         "E_CONTEXT_DRIFT",
+        "E_CONTEXT_INCOMPLETE",
         "E_DELIVERY",
         "E_GIT_REQUIRED",
         "E_GROK_NOT_FOUND",
@@ -325,6 +326,99 @@
         }
       ]
     },
+    "taskRelevantMetadataObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "complete", "components"],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "complete": { "type": "boolean" },
+        "components": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["nonRef", "operational", "hooks", "config", "indexFlags", "refs", "upstream"],
+          "properties": {
+            "nonRef": { "type": "string", "enum": ["complete", "incomplete"] },
+            "operational": { "type": "string", "enum": ["complete", "incomplete"] },
+            "hooks": { "type": "string", "enum": ["complete", "incomplete"] },
+            "config": { "type": "string", "enum": ["complete", "incomplete"] },
+            "indexFlags": { "type": "string", "enum": ["complete", "incomplete"] },
+            "refs": { "type": "string", "enum": ["complete", "incomplete"] },
+            "upstream": { "type": "string", "enum": ["not_configured", "resolved", "unresolved"] }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "complete": { "const": true } },
+            "required": ["complete"]
+          },
+          "then": {
+            "properties": {
+              "components": {
+                "properties": {
+                  "nonRef": { "const": "complete" },
+                  "operational": { "const": "complete" },
+                  "hooks": { "const": "complete" },
+                  "config": { "const": "complete" },
+                  "indexFlags": { "const": "complete" },
+                  "refs": { "const": "complete" },
+                  "upstream": { "enum": ["not_configured", "resolved"] }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "components": {
+                "anyOf": [
+                  { "properties": { "nonRef": { "const": "incomplete" } }, "required": ["nonRef"] },
+                  { "properties": { "operational": { "const": "incomplete" } }, "required": ["operational"] },
+                  { "properties": { "hooks": { "const": "incomplete" } }, "required": ["hooks"] },
+                  { "properties": { "config": { "const": "incomplete" } }, "required": ["config"] },
+                  { "properties": { "indexFlags": { "const": "incomplete" } }, "required": ["indexFlags"] },
+                  { "properties": { "refs": { "const": "incomplete" } }, "required": ["refs"] },
+                  { "properties": { "upstream": { "const": "unresolved" } }, "required": ["upstream"] }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "metadataCompletenessObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "complete", "metadataComponents"],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "complete": { "type": "boolean" },
+        "metadataComponents": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 9,
+          "items": {
+            "type": "string",
+            "enum": ["nonRef", "operational", "hooks", "config", "indexFlags", "refs", "upstream", "gitMetadata", "contextCapture"]
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "complete": { "const": true } },
+            "required": ["complete"]
+          },
+          "then": {
+            "properties": { "metadataComponents": { "maxItems": 0 } }
+          },
+          "else": {
+            "properties": { "metadataComponents": { "minItems": 1 } }
+          }
+        }
+      ]
+    },
     "contextIdentity": {
       "type": "object",
       "additionalProperties": false,
@@ -346,8 +440,44 @@
           "maxLength": 256,
           "pattern": "^[a-f0-9]{64}$"
         },
-        "sharedRefIdentity": { "$ref": "#/$defs/sharedRefIdentitySummary" }
-      }
+        "sharedRefIdentity": { "$ref": "#/$defs/sharedRefIdentitySummary" },
+        "taskRelevantMetadataObservation": { "$ref": "#/$defs/taskRelevantMetadataObservation" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["sharedRefIdentity", "taskRelevantMetadataObservation"]
+          },
+          "then": {
+            "oneOf": [
+              {
+                "properties": {
+                  "sharedRefIdentity": {
+                    "properties": { "complete": { "const": true } },
+                    "required": ["complete"]
+                  },
+                  "taskRelevantMetadataObservation": {
+                    "properties": { "complete": { "const": true } },
+                    "required": ["complete"]
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "sharedRefIdentity": {
+                    "properties": { "complete": { "const": false } },
+                    "required": ["complete"]
+                  },
+                  "taskRelevantMetadataObservation": {
+                    "properties": { "complete": { "const": false } },
+                    "required": ["complete"]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
     },
     "commandOutcome": {
       "type": "object",
@@ -388,6 +518,7 @@
         "executionStatus": { "type": ["string", "null"], "maxLength": 64 },
         "hostVerification": { "type": "string", "enum": ["not_run", "passed", "failed", "skipped"] },
         "sharedRefObservation": { "$ref": "#/$defs/sharedRefObservation" },
+        "metadataCompletenessObservation": { "$ref": "#/$defs/metadataCompletenessObservation" },
         "reconciler": { "$ref": "#/$defs/reconcilerEvidence" }
       }
     },
@@ -426,6 +557,17 @@
         "missingPaths": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicPath" } },
         "unsafePaths": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/publicPath" } },
         "workspaceState": { "type": "string", "enum": ["complete", "task_scoped", "unknown"] },
+        "contextPhase": { "type": "string", "enum": ["admission", "execute", "resume", "terminal"] },
+        "metadataComponents": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "maxItems": 9,
+          "items": {
+            "type": "string",
+            "enum": ["nonRef", "operational", "hooks", "config", "indexFlags", "refs", "upstream", "gitMetadata", "contextCapture"]
+          }
+        },
         "workerId": { "$ref": "#/$defs/workerId" },
         "conflictingJobId": { "$ref": "#/$defs/workerId" },
         "conflictingProviderHomeId": { "$ref": "#/$defs/workerId" },
@@ -433,15 +575,55 @@
       }
     },
     "WorkerError": {
+      "oneOf": [
+        { "$ref": "#/$defs/WorkerErrorV1" },
+        { "$ref": "#/$defs/WorkerContextIncompleteErrorV2" }
+      ]
+    },
+    "WorkerErrorV1": {
       "type": "object",
       "additionalProperties": false,
       "required": ["workerProtocolVersion", "errorSchemaVersion", "code", "message"],
       "properties": {
         "workerProtocolVersion": { "type": "integer", "const": 1 },
         "errorSchemaVersion": { "type": "integer", "const": 1 },
-        "code": { "$ref": "#/$defs/publicErrorCode" },
+        "code": {
+          "allOf": [
+            { "$ref": "#/$defs/publicErrorCode" },
+            { "not": { "const": "E_CONTEXT_INCOMPLETE" } }
+          ]
+        },
         "message": { "type": "string", "minLength": 1, "maxLength": 2000 },
         "details": { "$ref": "#/$defs/errorDetails" }
+      }
+    },
+    "WorkerContextIncompleteErrorV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workerProtocolVersion", "errorSchemaVersion", "code", "message", "details"],
+      "properties": {
+        "workerProtocolVersion": { "type": "integer", "const": 1 },
+        "errorSchemaVersion": { "type": "integer", "const": 2 },
+        "code": { "type": "string", "const": "E_CONTEXT_INCOMPLETE" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "details": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["contextPhase", "metadataComponents"],
+          "properties": {
+            "contextPhase": { "type": "string", "enum": ["admission", "execute", "resume", "terminal"] },
+            "metadataComponents": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 1,
+              "maxItems": 9,
+              "items": {
+                "type": "string",
+                "enum": ["nonRef", "operational", "hooks", "config", "indexFlags", "refs", "upstream", "gitMetadata", "contextCapture"]
+              }
+            }
+          }
+        }
       }
     },
     "WorkerEventCursor": {

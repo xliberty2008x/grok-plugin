@@ -2957,7 +2957,6 @@ test("stripped nested process errors sanitize reattached asynchronous signal res
 test("foreground public error projection preserves stable non-protocol codes", () => {
   for (const code of [
     "E_STORAGE_READONLY",
-    "E_CONTEXT_INCOMPLETE",
     "E_INPUT_READ",
     "E_INPUT_TIMEOUT"
   ]) {
@@ -4521,8 +4520,7 @@ test("published Worker Protocol schema has public roots, versions, and broker er
   );
   for (const [name, versionField] of [
     ["WorkerEvent", "eventSchemaVersion"],
-    ["WorkerResult", "resultSchemaVersion"],
-    ["WorkerError", "errorSchemaVersion"]
+    ["WorkerResult", "resultSchemaVersion"]
   ]) {
     assert.ok(schema.$defs[name].required.includes("workerProtocolVersion"));
     assert.ok(schema.$defs[name].required.includes(versionField));

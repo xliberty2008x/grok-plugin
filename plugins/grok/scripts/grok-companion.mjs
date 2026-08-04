@@ -84,6 +84,8 @@ import {
   parseTaskEnvelopeInput,
   scrubStoredJob
 } from "./lib/task-contract.mjs";
+import { bindContextMetadataCompleteness } from "./lib/task-context-metadata.mjs";
+import { assertResumeSourceContext } from "./lib/task-resume-context.mjs";
 import {
   projectWorkerDiagnosticText,
   projectWorkerHandle,
@@ -142,6 +144,7 @@ import {
   stableDigest as mailboxStableDigest
 } from "./lib/worker-mailbox.mjs";
 
+const { assertContextMetadataComplete, captureCompleteContextManifest } = bindContextMetadataCompleteness({ captureContextManifest, assertContextManifestIntegrity });
 const SCRIPT = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = path.resolve(path.dirname(SCRIPT), "..");
 const VALID_EFFORTS = new Set(["low", "medium", "high"]);
@@ -782,7 +785,7 @@ async function recoverActiveJobs(root) {
           ? (selectedError.code === "E_CANCELLED" ? "cancelled" : "failed")
           : current.status;
         current.status = finalStatus;
-        current.phase = selectedError?.code === "E_CONTEXT_DRIFT"
+        current.phase = ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(selectedError?.code)
           ? "context-rejected"
           : selectedError?.code === "E_SCOPE_VIOLATION"
             ? "scope-rejected"
@@ -939,7 +942,7 @@ async function recoverActiveJobs(root) {
       current.status = intendedStatus;
       current.phase = taskError
         ? (
-            taskError.code === "E_CONTEXT_DRIFT"
+            ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(taskError.code)
               ? "context-rejected"
               : taskError.code === "E_SCOPE_VIOLATION"
                 ? "scope-rejected"
@@ -1103,6 +1106,7 @@ function renderReview(job) {
 
 const HUMAN_PUBLIC_ONLY_ERROR_CODES = new Set([
   "E_CONTEXT_DRIFT",
+  "E_CONTEXT_INCOMPLETE",
   "E_SCOPE_VIOLATION",
   "E_PROCESS_IDENTITY"
 ]);
@@ -1519,7 +1523,7 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
 
   // Keep the accepted manifest available for failure evidence; exact validation happens
   // inside the terminal-state guard below so drift is persisted on the job.
-  let preContext = job.request?.contextManifest || captureContextManifest(root);
+  let preContext = job.request?.contextManifest || captureCompleteContextManifest(root, { contextPhase: "execute" });
   updateJob(root, id, (current) => {
     if (terminal(current)) {
       throw new CompanionError("E_STATE", "A terminal worker cannot be restarted.");
@@ -1636,7 +1640,7 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
   try {
     preContext = job.request?.contextManifest
       ? assertContextCompatible(root, job.request.contextManifest, { mode: "execute" })
-      : captureContextManifest(root);
+      : captureCompleteContextManifest(root, { contextPhase: "execute" });
     const workerNonce = process.env.GROK_COMPANION_WORKER_NONCE;
     if (isCancelRequested(root, id, workerNonce)) {
       throw new CompanionError("E_CANCELLED", "Grok job was cancelled before provider execution.");
@@ -2404,7 +2408,7 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
         }
       }
     }
-    const postContext = captureContextManifest(root);
+    const postContext = captureCompleteContextManifest(root, { contextPhase: "terminal" });
     if (job.jobClass === "review" && result.review) {
       const safeResult = redact({
         review: result.review,
@@ -2628,7 +2632,7 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
         providerProcess,
         error: redact(asErrorPayload(error)),
         summary: redactText(error.message),
-        progress: error.code === "E_CONTEXT_DRIFT" ? "Blocked: context drift" : "Finalizing failure",
+        progress: ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(error.code) ? "Blocked: context unavailable" : "Finalizing failure",
         ...terminalIntentPatch(current, intendedTerminal),
         result: {
           ...(current.result || {}),
@@ -2648,7 +2652,7 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
         completionContextManifest: postContext,
         lifecycleEvents: appendLifecycleEvent(
           current.lifecycleEvents,
-          error.code === "E_CONTEXT_DRIFT" || error.code === "E_CANCELLED" ? "blocked" : "checkpoint",
+          ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE", "E_CANCELLED"].includes(error.code) ? "blocked" : "checkpoint",
           redactText(error.message)
         )
       });
@@ -2826,7 +2830,7 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
             finalStatus = selectedError.code === "E_CANCELLED"
               ? "cancelled"
               : "failed";
-            finalPhase = selectedError.code === "E_CONTEXT_DRIFT"
+            finalPhase = ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(selectedError.code)
               ? "context-rejected"
               : selectedError.code === "E_SCOPE_VIOLATION"
                 ? "scope-rejected"
@@ -3210,30 +3214,12 @@ function resolveResumeSource(root, profile, { resume, jobId } = {}) {
       throw new CompanionError("E_NO_RESUME_CANDIDATE", `Job ${jobId} security profile does not match the requested task profile.`);
     }
     // Explicit resume path: refuse when the prior job's workspace identity drifted.
-    if (prior.verificationContextManifest || prior.completionContextManifest) {
-      // Host checks may legitimately create generated or tracked evidence. Once the same host
-      // task records bounded outcomes, resume binds to that post-verification manifest exactly.
-      assertContextCompatible(root, prior.verificationContextManifest || prior.completionContextManifest, { mode: "resume" });
-    } else if (prior.request?.contextManifest) {
-      if (Number(prior.schemaVersion || 0) >= 3) {
-        throw new CompanionError("E_CONTEXT_DRIFT", `Job ${jobId} is missing its completion context; refusing an unverifiable resume.`);
-      }
-      // Compatibility only for schema-v2 records. New jobs always resume from exact final state.
-      assertContextCompatible(root, prior.request.contextManifest, { mode: "legacy-resume" });
-    } else if (prior.workspaceRoot && fs.realpathSync(root) !== fs.realpathSync(prior.workspaceRoot)) {
-      throw new CompanionError("E_CONTEXT_DRIFT", "Workspace identity drifted; refusing to resume in a different checkout.", {
-        code: "E_CONTEXT_DRIFT",
-        reasons: ["workspaceRoot"],
-        expected: { workspaceRoot: prior.workspaceRoot },
-        current: { workspaceRoot: fs.realpathSync(root) }
-      });
-    }
-    return prior;
+    return assertResumeSourceContext(root, prior);
   }
   // Legacy compatibility path: implicit same-session candidate without --job-id.
   const candidate = resumeCandidate(root, profile);
   if (!candidate) throw new CompanionError("E_NO_RESUME_CANDIDATE", "No resumable Grok task with the same security profile exists in this host session.");
-  return candidate;
+  return assertResumeSourceContext(root, candidate);
 }
 
 async function handleRecordVerification(raw) {
@@ -3262,13 +3248,18 @@ async function handleRecordVerification(raw) {
       assertContextManifestIntegrity(job.verificationContextManifest);
       throw new CompanionError("E_STATE", `Job ${job.id} already has a host verification baseline; record verification once per job.`);
     }
+    assertContextMetadataComplete(completionContextManifest, {
+      contextPhase: "resume"
+    });
     const activeWriter = listJobs(root).find((candidate) => candidate.id !== job.id && !terminal(candidate) && candidate.write);
     if (activeWriter) throw new CompanionError("E_JOB_ACTIVE", `Cannot record verification while writer ${activeWriter.id} is active.`);
     const record = parseVerificationRecord(input, job.request?.envelope?.requiredVerification || []);
     // Store the full exact current snapshot for continuation binding, but compare
     // completion→current with the verification-only ignored observer so standard
     // pytest/Python cache drift from host checks is not treated as out-of-scope.
-    const verificationContextManifest = captureContextManifest(root);
+    const verificationContextManifest = captureCompleteContextManifest(root, {
+      contextPhase: "resume"
+    });
     const observedChangedPaths = observeChangedPaths(
       completionContextManifest,
       verificationContextManifest,
@@ -3371,7 +3362,9 @@ async function handleTask(raw) {
     throw new CompanionError("E_NO_RESUME_CANDIDATE", "No resumable Grok task with the same security profile exists in this host session.");
   }
 
-  const contextManifest = captureContextManifest(root);
+  const contextManifest = captureCompleteContextManifest(root, {
+    contextPhase: "admission"
+  });
   const envelope = buildTaskEnvelope({
     ...(envelopeInput || {}),
     userRequest: promptText,
@@ -4127,7 +4120,7 @@ async function handleCancel(raw) {
         ? "cancelled"
         : "failed";
       value.status = finalStatus;
-      value.phase = selectedError?.code === "E_CONTEXT_DRIFT"
+      value.phase = ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(selectedError?.code)
         ? "context-rejected"
         : selectedError?.code === "E_SCOPE_VIOLATION"
           ? "scope-rejected"
@@ -4884,7 +4877,7 @@ async function main() {
           const finalStatus = selectedError
             ? (selectedError.code === "E_CANCELLED" ? "cancelled" : "failed")
             : "cancelled";
-          const finalPhase = selectedError?.code === "E_CONTEXT_DRIFT"
+          const finalPhase = ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(selectedError?.code)
             ? "context-rejected"
             : selectedError?.code === "E_SCOPE_VIOLATION"
               ? "scope-rejected"
@@ -4912,7 +4905,7 @@ async function main() {
             ...base,
             status: finalStatus,
             phase: finalPhase,
-            completedAt: selectedError?.code === "E_CONTEXT_DRIFT"
+            completedAt: ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(selectedError?.code)
               || selectedError?.code === "E_SCOPE_VIOLATION"
               ? settledAt
               : intendedTerminal.completedAt,

@@ -98,6 +98,25 @@ function update(sessionId, value) {
   });
 }
 
+function scheduleSessionReady(config, emitSessionReady) {
+  if (typeof config.sessionResponseReleaseFile === "string"
+    && config.sessionResponseReleaseFile.length > 0) {
+    const waitForSessionRelease = () => {
+      if (fs.existsSync(config.sessionResponseReleaseFile)) {
+        emitSessionReady();
+        return;
+      }
+      setTimeout(waitForSessionRelease, 10);
+    };
+    waitForSessionRelease();
+  } else if (Number.isSafeInteger(config.sessionResponseDelayMs)
+    && config.sessionResponseDelayMs > 0) {
+    setTimeout(emitSessionReady, config.sessionResponseDelayMs);
+  } else {
+    emitSessionReady();
+  }
+}
+
 function capabilities(config) {
   const models = config.models ?? [
     {
@@ -224,12 +243,7 @@ async function serveAcp(binary, config) {
           emitCapabilityUpdates();
         }
       };
-      if (Number.isSafeInteger(config.sessionResponseDelayMs)
-        && config.sessionResponseDelayMs > 0) {
-        setTimeout(emitSessionReady, config.sessionResponseDelayMs);
-      } else {
-        emitSessionReady();
-      }
+      scheduleSessionReady(config, emitSessionReady);
       return;
     }
 
