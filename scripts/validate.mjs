@@ -277,10 +277,14 @@ function versionChecks() {
     problem(`Plugin NOTICE does not identify release ${version}.`, "plugins/grok/NOTICE");
   }
 
-  const provider = readText("plugins/grok/scripts/lib/grok-provider.mjs");
-  const clientVersion = provider?.match(/clientInfo\s*:\s*\{[\s\S]{0,300}?version\s*:\s*["']([^"']+)["']/)?.[1];
+  const providerRuntime = readText(
+    "plugins/grok/scripts/lib/provider-acp-runtime.mjs"
+  );
+  const clientVersion = providerRuntime?.match(
+    /clientInfo\s*:\s*\{[\s\S]{0,300}?version\s*:\s*["']([^"']+)["']/
+  )?.[1];
   if (clientVersion !== version) {
-    problem(`ACP clientInfo version (${clientVersion ?? "missing"}) does not match package version ${version}.`, "plugins/grok/scripts/lib/grok-provider.mjs");
+    problem(`ACP clientInfo version (${clientVersion ?? "missing"}) does not match package version ${version}.`, "plugins/grok/scripts/lib/provider-acp-runtime.mjs");
   }
 }
 

@@ -13,11 +13,9 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import {
-  discoverGrok,
-  runStructuredReview,
-  validateAppReview
-} from "../../../../plugins/grok/scripts/lib/grok-provider.mjs";
+import { discoverGrok } from "../../../../plugins/grok/scripts/lib/provider-core.mjs";
+import { runStructuredReview } from "../../../../plugins/grok/scripts/lib/provider-headless-runtime.mjs";
+import { validateAppReview } from "../../../../plugins/grok/scripts/lib/provider-review-contract.mjs";
 import {
   captureGrokExecutableIdentity,
   materializePinnedGrokExecutable,
