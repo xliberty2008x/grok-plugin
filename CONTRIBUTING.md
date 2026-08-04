@@ -22,7 +22,7 @@ merge gates for protected `main`.
 Run the executable structure policy directly when adding or moving JavaScript:
 
 ```text
-npm run structure:check
+npm run check:source-structure
 ```
 
 The checked-in policy scans handwritten `.js`, `.mjs`, and `.cjs` under the
@@ -41,11 +41,12 @@ input; it is not permission to compress ordinary declarations to preserve a
 legacy cap. Reviewers should require a named extraction when a cohesive data or
 behavior domain would otherwise make a capped file grow.
 
-The repository is initially in `observe` mode: existing debt is visible as
-warnings, while malformed policy, parser failure, unreadable source, or a
-symlink inside a source root fails closed. `ratchet` behavior is already tested
-but MUST NOT become the checked-in mode until the promotion conditions in
-`docs/issues/56-source-structure-policy.md` are satisfied.
+The checked-in policy runs in `ratchet` mode. Existing bounded debt remains
+visible as warnings, while new debt, cap growth, stale caps, new cycles, new
+ordinal fragments, and reverse facade imports fail the gate. Malformed policy,
+parser failure, unreadable source, or a symlink inside a source root also fails
+closed. The promotion conditions and digest history are recorded in
+`docs/issues/56-source-structure-policy.md`.
 
 Legacy allowances are exact paths, not patterns. Their original line count is
 immutable and protected by the repository-pinned baseline digest; the separate
