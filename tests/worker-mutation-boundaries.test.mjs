@@ -8,9 +8,12 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const LIB = path.join(ROOT, "plugins", "grok", "scripts", "lib");
 const FACADE = "worker-mutation.mjs";
 const LEAVES = Object.freeze([
+  "worker-mutation-cancellation.mjs",
   "worker-mutation-dispatch-admission.mjs",
   "worker-mutation-dispatch-contract.mjs",
+  "worker-mutation-dispatch-transition.mjs",
   "worker-mutation-followup-contract.mjs",
+  "worker-mutation-followup.mjs",
   "worker-mutation-idempotency.mjs",
   "worker-mutation-primitives.mjs",
   "worker-mutation-request-contract.mjs",
@@ -80,6 +83,11 @@ const PUBLIC_EXPORTS = Object.freeze([
   "verifyRecoveryCleanupFence"
 ].sort());
 const MOVED_PUBLIC_BINDINGS = Object.freeze({
+  "worker-mutation-cancellation.mjs": Object.freeze([
+    "CANCEL_METRIC_TIMESTAMPS",
+    "cancelWorker",
+    "projectCancellationReceipt"
+  ]),
   "worker-mutation-dispatch-admission.mjs": Object.freeze([
     "acquireRecoveryCleanupFence",
     "prepareDispatchProcessSpawn",
@@ -98,10 +106,21 @@ const MOVED_PUBLIC_BINDINGS = Object.freeze({
     "assertNoRecoveryCleanupFence",
     "providerLaunchState"
   ]),
+  "worker-mutation-dispatch-transition.mjs": Object.freeze([
+    "authorizeWorkerProviderRotation",
+    "claimWorkerDispatch",
+    "recordUnsettledProviderProcess",
+    "recordUnsettledWorkerProcess",
+    "recordWorkerProviderRotationNoChild",
+    "transitionWorkerDispatch"
+  ]),
   "worker-mutation-followup-contract.mjs": Object.freeze([
     "FOLLOWUP_ADMISSION_KIND",
     "FOLLOWUP_ADMISSION_WITNESS_SCHEMA_VERSION",
     "assertFollowupAdmissionBinding"
+  ]),
+  "worker-mutation-followup.mjs": Object.freeze([
+    "spawnGrantedFollowupWorker"
   ]),
   "worker-mutation-idempotency.mjs": Object.freeze([
     "getSpawnIdempotencyRecord"
@@ -150,8 +169,22 @@ const MOVED_PUBLIC_BINDINGS = Object.freeze({
   ])
 });
 const DIRECT_IMPORTS = Object.freeze([
+  ["plugins/grok/scripts/lib/companion-shared.mjs", "./worker-mutation-dispatch-contract.mjs", ["assertDispatchContract"]],
+  ["plugins/grok/scripts/lib/companion-shared.mjs", "./worker-mutation-dispatch-transition.mjs", ["recordWorkerProviderRotationNoChild", "recordUnsettledProviderProcess", "transitionWorkerDispatch"]],
+  ["plugins/grok/scripts/lib/companion-shared.mjs", "./worker-mutation-spawn-authority.mjs", ["assertWorkerProviderLaunchPreparation"]],
+  ["plugins/grok/scripts/lib/companion-status.mjs", "./worker-mutation-cancellation.mjs", ["cancelWorker"]],
+  ["plugins/grok/scripts/lib/companion-status.mjs", "./worker-mutation-primitives.mjs", ["cancellationNonce"]],
+  ["plugins/grok/scripts/lib/companion-task-executor.mjs", "./worker-mutation-dispatch-contract.mjs", ["assertDispatchContract"]],
+  ["plugins/grok/scripts/lib/companion-task-finalization.mjs", "./worker-mutation-terminal.mjs", ["settlePreProviderWorkerFinalization", "settleProviderStartedWorkerFinalization"]],
+  ["plugins/grok/scripts/lib/companion-task-result.mjs", "./worker-mutation-dispatch-transition.mjs", ["authorizeWorkerProviderRotation"]],
+  ["plugins/grok/scripts/lib/companion-task-turn.mjs", "./worker-mutation-dispatch-admission.mjs", ["prepareWorkerProviderSpawn", "recordWorkerProviderSpawnNoChild"]],
+  ["plugins/grok/scripts/lib/companion-task-turn.mjs", "./worker-mutation-dispatch-contract.mjs", ["assertDispatchContract"]],
+  ["plugins/grok/scripts/lib/companion-worker-launcher.mjs", "./worker-mutation-dispatch-admission.mjs", ["prepareDispatchProcessSpawn", "recordDispatchProcessNoChild"]],
+  ["plugins/grok/scripts/lib/companion-worker-launcher.mjs", "./worker-mutation-dispatch-contract.mjs", ["assertDispatchContract"]],
+  ["plugins/grok/scripts/lib/companion-worker-launcher.mjs", "./worker-mutation-dispatch-transition.mjs", ["recordUnsettledWorkerProcess", "transitionWorkerDispatch"]],
   ["plugins/grok/scripts/session-lifecycle-hook.mjs", "./lib/worker-mutation-primitives.mjs", ["cancellationNonce"]],
   ["plugins/grok/scripts/lib/worker-mailbox.mjs", "./worker-mutation-primitives.mjs", ["assertMutationOwnership", "cancellationNonce"]],
+  ["plugins/grok/scripts/lib/worker-mailbox.mjs", "./worker-mutation-followup.mjs", ["spawnGrantedFollowupWorker"]],
   ["plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs", "./worker-mutation-spawn-authority.mjs", ["assertDurableSpawnRequestBinding"]],
   ["plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs", "./worker-mutation-dispatch-contract.mjs", ["assertDispatchContract"]],
   ["plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs", "./worker-mutation-primitives.mjs", ["FOLLOWUP_SPAWN_OWNERSHIP_MODE", "SPAWN_OWNERSHIP_MODE", "SPAWN_SUCCESS_DEFINITION"]],
@@ -161,17 +194,38 @@ const DIRECT_IMPORTS = Object.freeze([
   ["plugins/grok/scripts/lib/worker-provisioner.mjs", "./worker-mutation-write-runtime-contract.mjs", ["assertWriteExecutionJob"]],
   ["plugins/grok/scripts/lib/worker-recovery.mjs", "./worker-mutation-dispatch-admission.mjs", ["acquireRecoveryCleanupFence", "recordWorkerProviderSpawnNoChild", "verifyRecoveryCleanupFence"]],
   ["plugins/grok/scripts/lib/worker-recovery.mjs", "./worker-mutation-dispatch-contract.mjs", ["assertDispatchContract"]],
+  ["plugins/grok/scripts/lib/worker-recovery.mjs", "./worker-mutation-dispatch-transition.mjs", ["transitionWorkerDispatch"]],
   ["plugins/grok/scripts/lib/worker-recovery.mjs", "./worker-mutation-primitives.mjs", ["cancellationNonce"]],
   ["plugins/grok/scripts/lib/worker-recovery.mjs", "./worker-mutation-terminal.mjs", ["settleFailedDispatchCleanup", "settleStartedWorkerLoss", "settleUnstartedDispatchLoss"]],
   ["plugins/grok/scripts/lib/worker-runtime.mjs", "./worker-mutation-dispatch-admission.mjs", ["prepareDispatchProcessSpawn", "recordDispatchProcessNoChild"]],
   ["plugins/grok/scripts/lib/worker-runtime.mjs", "./worker-mutation-dispatch-contract.mjs", ["providerLaunchState"]],
+  ["plugins/grok/scripts/lib/worker-runtime.mjs", "./worker-mutation-dispatch-transition.mjs", ["claimWorkerDispatch", "transitionWorkerDispatch"]],
   ["plugins/grok/scripts/lib/worker-runtime.mjs", "./worker-mutation-primitives.mjs", ["assertMutationOwnership"]],
   ["plugins/grok/scripts/lib/worker-service.mjs", "./worker-mutation-dispatch-contract.mjs", ["providerLaunchState"]],
+  ["plugins/grok/scripts/lib/worker-service.mjs", "./worker-mutation-cancellation.mjs", ["cancelWorker", "projectCancellationReceipt"]],
   ["plugins/grok/scripts/lib/worker-service.mjs", "./worker-mutation-spawn.mjs", ["spawnReadOnlyWorker"]],
   ["plugins/grok/scripts/lib/worker-service.mjs", "./worker-mutation-write-admission.mjs", ["authorizeReadyWriteWorkerDispatch"]],
   ["scripts/live-worker-provisioner-probe.mjs", "../plugins/grok/scripts/lib/worker-mutation-write-admission.mjs", ["admitWriteWorkerPlan"]],
   ["scripts/live-worker-provisioner-probe.mjs", "../plugins/grok/scripts/lib/worker-mutation-write-runtime-contract.mjs", ["assertWriteExecutionJob"]],
   ["scripts/test-natural-codex.mjs", "../plugins/grok/scripts/lib/worker-mutation-dispatch-contract.mjs", ["assertDispatchContract"]]
+]);
+const IMPLEMENTATION_CONSUMERS = Object.freeze([
+  "plugins/grok/scripts/lib/companion-shared.mjs",
+  "plugins/grok/scripts/lib/companion-status.mjs",
+  "plugins/grok/scripts/lib/companion-task-executor.mjs",
+  "plugins/grok/scripts/lib/companion-task-finalization.mjs",
+  "plugins/grok/scripts/lib/companion-task-result.mjs",
+  "plugins/grok/scripts/lib/companion-task-turn.mjs",
+  "plugins/grok/scripts/lib/companion-worker-launcher.mjs",
+  "plugins/grok/scripts/session-lifecycle-hook.mjs",
+  "plugins/grok/scripts/lib/worker-dispatch-supervisor.mjs",
+  "plugins/grok/scripts/lib/worker-mailbox.mjs",
+  "plugins/grok/scripts/lib/worker-provisioner.mjs",
+  "plugins/grok/scripts/lib/worker-recovery.mjs",
+  "plugins/grok/scripts/lib/worker-runtime.mjs",
+  "plugins/grok/scripts/lib/worker-service.mjs",
+  "scripts/live-worker-provisioner-probe.mjs",
+  "scripts/test-natural-codex.mjs"
 ]);
 
 function lineCount(file) {
@@ -201,10 +255,24 @@ test("worker mutation compatibility surface preserves all 54 exports and moved i
 });
 
 test("extracted mutation domains are bounded leaves and never import the mutation monolith", () => {
+  const facade = fs.readFileSync(path.join(LIB, FACADE), "utf8");
+  assert.ok(lineCount(path.join(LIB, FACADE)) <= 300, `${FACADE} exceeds 300 lines`);
+  assert.doesNotMatch(facade, /^(?:export\s+)?(?:async\s+)?function\b|^(?:export\s+)?const\b/mu);
   for (const leaf of LEAVES) {
     const source = fs.readFileSync(path.join(LIB, leaf), "utf8");
     assert.ok(lineCount(path.join(LIB, leaf)) <= 1500, `${leaf} exceeds 1500 lines`);
     assert.doesNotMatch(source, /from\s+["'][^"']*worker-mutation\.mjs["']/u);
+  }
+});
+
+test("implementation consumers bypass the compatibility facade", () => {
+  for (const relative of IMPLEMENTATION_CONSUMERS) {
+    const source = fs.readFileSync(path.join(ROOT, relative), "utf8");
+    assert.doesNotMatch(
+      source,
+      /from\s+["'][^"']*worker-mutation\.mjs["']/u,
+      `${relative} imports the compatibility facade`
+    );
   }
 });
 

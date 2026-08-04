@@ -11,7 +11,7 @@ import { buildRuntimeEvidence, observeChangedPaths } from "./task-runtime-eviden
 import { buildWorkerReport, buildWorkerReportOutputSchema, composeWorkerReportRepairPrompt } from "./worker-report-contract.mjs";
 import { captureContextManifest } from "./task-context-manifest.mjs";
 import { evaluateScope } from "./task-scope.mjs";
-import { authorizeWorkerProviderRotation } from "./worker-mutation.mjs";
+import { authorizeWorkerProviderRotation } from "./worker-mutation-dispatch-transition.mjs";
 import { isDispatchV2 } from "./worker-launch-contract.mjs";
 import { attachHostActionRequestToJob } from "./worker-host-actions.mjs";
 import { assertNoRetainedBodies, readAttemptMailbox } from "./worker-mailbox.mjs";

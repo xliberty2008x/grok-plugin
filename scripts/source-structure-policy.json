@@ -22,6 +22,7 @@
     "plugins/grok/scripts/grok-companion.mjs",
     "plugins/grok/scripts/lib/grok-provider.mjs",
     "plugins/grok/scripts/lib/task-contract.mjs",
+    "plugins/grok/scripts/lib/worker-mutation.mjs",
     "plugins/grok/scripts/session-lifecycle-hook.mjs",
     "plugins/grok/scripts/stop-review-gate-hook.mjs",
     "scripts/check-source-structure.mjs",
@@ -49,7 +50,7 @@
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
     "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b",
-    "policyDigest": "f6c96ff9b444fb11e4cb9ed13b2bd8d9a4781421ae004645219fa2699d081069"
+    "policyDigest": "d039e2b700be2f744918ad2df79688015379ff9e010b07ac5cf298971d6cd95a"
   },
   "dispositions": {
     "scripts/lib/worker-broker-evidence.mjs": {
@@ -702,41 +703,6 @@
           "key": "function:drainWorkerMailbox#1",
           "initialLines": 435,
           "capLines": 435
-        }
-      ]
-    },
-    "plugins/grok/scripts/lib/worker-mutation.mjs": {
-      "category": "product",
-      "initialLines": 11269,
-      "lineCap": 2217,
-      "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
-      "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
-      "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
-      "functions": [
-        {
-          "key": "function:cancelWorker#1",
-          "initialLines": 327,
-          "capLines": 327
-        },
-        {
-          "key": "function:cancelWorkerTransaction#1",
-          "initialLines": 309,
-          "capLines": 309
-        },
-        {
-          "key": "function:spawnGrantedFollowupWorker#1",
-          "initialLines": 299,
-          "capLines": 299
-        },
-        {
-          "key": "function:transitionDispatchTransaction#1",
-          "initialLines": 296,
-          "capLines": 296
-        },
-        {
-          "key": "function:transitionWorkerDispatch#1",
-          "initialLines": 359,
-          "capLines": 359
         }
       ]
     },
