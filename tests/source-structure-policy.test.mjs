@@ -887,14 +887,15 @@ test("checked-in observe baseline exactly covers all current file and function d
     "plugins/grok/mcp/server.mjs",
     "plugins/grok/scripts/grok-codex.mjs",
     "plugins/grok/scripts/grok-companion.mjs",
+    "plugins/grok/scripts/lib/task-contract.mjs",
     "plugins/grok/scripts/session-lifecycle-hook.mjs",
     "plugins/grok/scripts/stop-review-gate-hook.mjs",
     "scripts/check-source-structure.mjs"
   ]);
   const result = evaluateSourceStructure({ root: ROOT, config });
   assert.equal(result.ok, true);
-  assert.equal(result.files.length, 220);
-  assert.equal(result.warnings.length, 59);
+  assert.equal(result.files.length, 226);
+  assert.equal(result.warnings.length, 58);
   assert.equal(result.cycles.length, 0);
   assert.equal(result.fragments.length, 14);
   const debtPaths = result.files.filter((entry) => {
@@ -903,9 +904,8 @@ test("checked-in observe baseline exactly covers all current file and function d
     return entry.lines > budget.fileLines
       || entry.functions.some((span) => span.lines > budget.functionLines);
   }).map((entry) => entry.file).sort();
-  assert.equal(debtPaths.length, 45);
+  assert.equal(debtPaths.length, 44);
   assert.deepEqual(debtPaths, Object.keys(config.legacyDebt));
-  assert.deepEqual(debtPaths, Object.keys(config.initialDebt));
   for (const [file, entry] of Object.entries(config.legacyDebt)) {
     const measured = result.files.find((candidate) => candidate.file === file);
     const fileBudget = config.budgets[entry.category].fileLines;
@@ -915,6 +915,10 @@ test("checked-in observe baseline exactly covers all current file and function d
   }
   for (const [file, initial] of Object.entries(config.initialDebt)) {
     const cap = config.legacyDebt[file];
+    if (!cap) {
+      assert.equal(debtPaths.includes(file), false, `${file} must remain resolved`);
+      continue;
+    }
     assert.equal(initial.initialLines, cap.initialLines);
     assert.ok(initial.functions.every((span) => /#1$/u.test(span.key)));
     const initialFunctions = new Map(initial.functions.map((span) => [span.key, span]));

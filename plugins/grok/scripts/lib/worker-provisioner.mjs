@@ -29,7 +29,7 @@ import {
   readJob,
   withWorkspaceStateTransaction
 } from "./state.mjs";
-import { captureContextManifest } from "./task-contract.mjs";
+import { captureContextManifest } from "./task-context-manifest.mjs";
 import {
   activateWriteProvisioningAttempt,
   adoptWriteProvisioningEffect,

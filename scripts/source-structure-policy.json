@@ -20,6 +20,7 @@
     "plugins/grok/mcp/server.mjs",
     "plugins/grok/scripts/grok-codex.mjs",
     "plugins/grok/scripts/grok-companion.mjs",
+    "plugins/grok/scripts/lib/task-contract.mjs",
     "plugins/grok/scripts/session-lifecycle-hook.mjs",
     "plugins/grok/scripts/stop-review-gate-hook.mjs",
     "scripts/check-source-structure.mjs"
@@ -46,7 +47,7 @@
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
     "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b",
-    "policyDigest": "dcd1a6e7a176e85b438ff85675be97053a7b90b8eafb60888d0b052015c07399"
+    "policyDigest": "bd896fa859fdfb805f067f1bd67e0fbf95b29d8451df3985393dea601678faf6"
   },
   "dispositions": {
     "plugins/grok/scripts/grok-companion.mjs": {
@@ -753,26 +754,6 @@
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
       "functions": []
-    },
-    "plugins/grok/scripts/lib/task-contract.mjs": {
-      "category": "product",
-      "initialLines": 5494,
-      "lineCap": 2502,
-      "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
-      "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
-      "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
-      "functions": [
-        {
-          "key": "function:captureIndexFlagObservation#1",
-          "initialLines": 328,
-          "capLines": 328
-        },
-        {
-          "key": "function:validateLooseRefsInventory#1",
-          "initialLines": 295,
-          "capLines": 295
-        }
-      ]
     },
     "plugins/grok/scripts/lib/worker-mailbox-state.mjs": {
       "category": "product",

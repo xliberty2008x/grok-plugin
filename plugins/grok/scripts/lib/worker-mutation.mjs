@@ -37,18 +37,18 @@ import {
 import {
   assertContextCompatible,
   assertContextManifestIntegrity,
+  captureContextManifest
+} from "./task-context-manifest.mjs";
+import {
   assertTaskEnvelope,
   bindTaskEnvelopeContext,
-  boundPathEvidence,
-  buildRuntimeEvidence,
   buildTaskEnvelope,
-  captureContextManifest,
-  composeProviderPrompt,
-  CONTEXT_MANIFEST_VERSION,
-  CONTEXT_METADATA_POLICIES,
-  observeChangedPaths,
   scrubStoredJob
-} from "./task-contract.mjs";
+} from "./task-envelope.mjs";
+import { boundPathEvidence } from "./task-contract-primitives.mjs";
+import { CONTEXT_MANIFEST_VERSION, CONTEXT_METADATA_POLICIES } from "./task-context-policy.mjs";
+import { buildRuntimeEvidence, observeChangedPaths } from "./task-runtime-evidence.mjs";
+import { composeProviderPrompt } from "./task-provider-prompt.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import { evaluateScope } from "./task-scope.mjs";
 import {

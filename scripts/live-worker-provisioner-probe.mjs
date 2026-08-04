@@ -15,7 +15,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-contract.mjs";
+import { buildTaskEnvelope } from "../plugins/grok/scripts/lib/task-envelope.mjs";
 import {
   admitWriteWorkerPlan,
   assertWriteExecutionJob
