@@ -922,6 +922,99 @@ test("fake-ACP lifecycle: session-scoped capability, launch-ack nonterminal, rep
   assert.equal(interrupted.resume, false);
 });
 
+test("deep-research CLI rejects missing and pin-mismatched provider receipts before launch", (t) => {
+  if (process.platform === "win32") return;
+  const root = initRepo();
+  const pluginData = tempDir("deep-research-receipt-plugin-");
+  const fakeRoot = tempDir("deep-research-receipt-fake-");
+  const fake = installFakeGrok(fakeRoot, {
+    version: "0.2.99",
+    deepResearch: true,
+    authMethods: [{ id: "local", name: "Local test auth" }]
+  });
+  const env = testEnvironment({
+    fake,
+    pluginData,
+    sessionId: "deep-research-receipt-session",
+    extra: {
+      CODEX_THREAD_ID: "deep-research-receipt-session",
+      GROK_COMPANION_HOST: "codex",
+      GROK_COMPANION_HOST_SESSION_ID: "deep-research-receipt-session",
+      GROK_COMPANION_PLUGIN_DATA: pluginData
+    }
+  });
+  const pinned = installPinnedFakeCompanion(fake, env);
+  t.after(() => {
+    pinned.cleanup();
+    for (const directory of [root, pluginData, fakeRoot]) {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  const invoke = (query) => spawnSync(
+    process.execPath,
+    [
+      pinned.companionScript,
+      "deep-research",
+      "--wait",
+      "--web-only",
+      "--query-stdin",
+      "--json"
+    ],
+    {
+      cwd: root,
+      env: pinned.env,
+      input: query,
+      encoding: "utf8",
+      timeout: 30_000
+    }
+  );
+  const assertCapabilityFailure = (attempt) => {
+    assert.notEqual(attempt.status, 0, attempt.stdout);
+    const payload = JSON.parse(attempt.stdout);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.error.code, "E_CAPABILITY");
+    assert.notEqual(payload.error.code, "E_PROVIDER_EXIT");
+    assert.doesNotMatch(payload.error.message, /ReferenceError|is not defined/u);
+    assert.match(payload.error.message, /\$grok:setup/u);
+  };
+
+  assertCapabilityFailure(invoke("missing receipt must fail before launch"));
+  assert.deepEqual(readFakeLog(fake.logFile), []);
+
+  const setup = spawnSync(
+    process.execPath,
+    [pinned.companionScript, "setup", "--json"],
+    {
+      cwd: root,
+      env: pinned.env,
+      encoding: "utf8",
+      timeout: 30_000
+    }
+  );
+  assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+  const setupLog = readFakeLog(fake.logFile);
+  assert.ok(setupLog.length > 0);
+
+  const receiptFile = path.join(
+    pluginData,
+    "capabilities",
+    "provider-capability-v2.json"
+  );
+  const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8"));
+  fs.writeFileSync(
+    receiptFile,
+    `${JSON.stringify({
+      ...receipt,
+      providerLaunchBindingDigest: "0".repeat(64)
+    }, null, 2)}\n`,
+    { mode: 0o600 }
+  );
+
+  assertCapabilityFailure(invoke("pin mismatch must fail before launch"));
+  assert.deepEqual(readFakeLog(fake.logFile), setupLog);
+});
+
 test("detached deep-research uses the setup-pinned provider instead of ambient discovery", (t) => {
   if (process.platform === "win32") return;
   const root = initRepo();

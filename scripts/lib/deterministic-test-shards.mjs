@@ -34,6 +34,8 @@ export const DETERMINISTIC_SUPPORT_TEST_FILES = Object.freeze([
 export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
   Object.freeze([
     "tests/ci-post-grok-review.test.mjs",
+    "tests/companion-boundaries.test.mjs",
+    "tests/companion-recovery.test.mjs",
     "tests/control-plane_part1.mjs",
     "tests/deterministic-sharding.test.mjs",
     "tests/git-review.test.mjs",

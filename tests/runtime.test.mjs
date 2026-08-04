@@ -378,7 +378,7 @@ test("Codex task admission emits the canonical receipt E_CAPABILITY before durab
 }, (t) => {
   const canonical = canonicalReceiptAdmissionMessage();
   const companionSource = fs.readFileSync(
-    path.join(ROOT, "plugins/grok/scripts/grok-companion.mjs"),
+    path.join(ROOT, "plugins/grok/scripts/lib/companion-dispatch.mjs"),
     "utf8"
   );
   // Every gate emitter must use one local error factory and the single exported
@@ -1474,13 +1474,13 @@ function writeSeededJob(stateRoot, job) {
 }
 
 test("static human launch surfaces use public worker projections", () => {
-  const source = fs.readFileSync(COMPANION, "utf8");
-  const acceptedStart = source.indexOf(
+  const source = { companion: fs.readFileSync(COMPANION, "utf8"), dispatch: fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/companion-dispatch.mjs"), "utf8") };
+  const acceptedStart = source.dispatch.indexOf(
     "if (launcherCode === 0 && !background && announce)"
   );
-  const acceptedBlock = source.slice(
+  const acceptedBlock = source.dispatch.slice(
     acceptedStart,
-    source.indexOf("if (background) return readJob(root, job.id);", acceptedStart)
+    source.dispatch.indexOf("if (background) return readJob(root, job.id);", acceptedStart)
   );
   assert.match(
     acceptedBlock,
@@ -1491,10 +1491,10 @@ test("static human launch surfaces use public worker projections", () => {
     /accepted\.(?:id|status|phase|progress|summary)/
   );
 
-  const taskStart = source.indexOf("const finished = await startJob(root, job");
-  const taskBlock = source.slice(
+  const taskStart = source.companion.indexOf("const finished = await startJob(root, job");
+  const taskBlock = source.companion.slice(
     taskStart,
-    source.indexOf("async function handleDeepResearch", taskStart)
+    source.companion.indexOf("async function handleDeepResearch", taskStart)
   );
   assert.match(
     taskBlock,
@@ -1505,10 +1505,10 @@ test("static human launch surfaces use public worker projections", () => {
     /\$\{finished\.(?:id|phase|progress|summary)\}/
   );
 
-  const researchStart = source.indexOf("async function handleDeepResearch");
-  const researchBlock = source.slice(
+  const researchStart = source.companion.indexOf("async function handleDeepResearch");
+  const researchBlock = source.companion.slice(
     researchStart,
-    source.indexOf("async function startDeepResearchJob", researchStart)
+    source.companion.indexOf("async function startDeepResearchJob", researchStart)
   );
   assert.match(
     researchBlock,
@@ -1519,10 +1519,10 @@ test("static human launch surfaces use public worker projections", () => {
     /\$\{finished\.(?:id|phase|progress|summary)\}/
   );
 
-  const liveStart = source.indexOf("if (announce) {", researchStart);
-  const liveBlock = source.slice(
+  const liveStart = source.companion.indexOf("if (announce) {", researchStart);
+  const liveBlock = source.companion.slice(
     liveStart,
-    source.indexOf("if (finished.status ===", liveStart)
+    source.companion.indexOf("if (finished.status ===", liveStart)
   );
   assert.match(
     liveBlock,

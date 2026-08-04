@@ -48,13 +48,9 @@
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
     "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b",
-    "policyDigest": "147793a803edb0c2ae4a14cd24a2228c7834845da21f9b294ad03fbf4a9d1dd5"
+    "policyDigest": "f9b6a3a6c86ae8a83ee9cdf677f818eea85d2fd249fe838c141f56ff3e6a17da"
   },
   "dispositions": {
-    "plugins/grok/scripts/grok-companion.mjs": {
-      "stage": "4-provider-and-control-plane",
-      "target": "Keep a thin command facade and move command domains behind explicit service modules."
-    },
     "plugins/grok/scripts/lib/worker-mutation.mjs": {
       "stage": "5-worker-mutation",
       "target": "Split mutation admission, provisioning, dispatch, cancellation, and terminal transition domains."
@@ -647,7 +643,7 @@
     "plugins/grok/scripts/grok-companion.mjs": {
       "category": "facade",
       "initialLines": 5271,
-      "lineCap": 5271,
+      "lineCap": 3461,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
@@ -661,11 +657,6 @@
           "key": "function:main#1",
           "initialLines": 781,
           "capLines": 781
-        },
-        {
-          "key": "function:recoverActiveJobs#1",
-          "initialLines": 373,
-          "capLines": 373
         }
       ]
     },
