@@ -1703,7 +1703,7 @@ test("MCP cancellation in the commit-to-launch window starts no worker or provid
 });
 
 test("MCP primary-turn admission serializes session-boundary cancellation before prompt bytes", { skip: process.platform === "win32" }, async (t) => {
-  const sessionResponseReleaseFile = path.join(tempDir("grok-primary-admission-session-release-"), "release");
+  const sessionResponseReleaseFile = path.join(tempDir("grok-primary-admission-gen1-"), "session-release");
   const { root, fake, env } = fixture({ sessionResponseReleaseFile });
   const options = { env };
   let workerId = null;
