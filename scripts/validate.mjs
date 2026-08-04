@@ -505,7 +505,7 @@ if (!versionsOnly) {
     if (packageJson.type !== "module") problem("The package must use ESM (`type: module`).", "package.json");
     if (packageJson.license !== "Apache-2.0") problem("Package license must be Apache-2.0.", "package.json");
     if (packageJson.engines?.node !== ">=18.18") problem("Node engine must remain >=18.18.", "package.json");
-    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "test:protected-review", "test:installed-worker-mcp", "test:temp:cleanup", "codex:update-local", "structure:check", "validate", "version:check", "version:bump", "check"]) {
+    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "test:protected-review", "test:installed-worker-mcp", "test:temp:cleanup", "codex:update-local", "check:source-structure", "structure:check", "validate", "version:check", "version:bump", "check"]) {
       if (!packageJson.scripts?.[script]) problem(`Missing npm script: ${script}.`, "package.json");
     }
     if (packageJson.scripts?.["test:pty-ingress"] !== "node --test tests/pty-ingress.test.mjs") {
@@ -529,6 +529,9 @@ if (!versionsOnly) {
     }
     if (packageJson.scripts?.["structure:check"] !== "node scripts/check-source-structure.mjs") {
       problem("structure:check must execute the source-structure policy directly.", "package.json");
+    }
+    if (packageJson.scripts?.["check:source-structure"] !== "node scripts/check-source-structure.mjs") {
+      problem("check:source-structure must execute the source-structure policy directly.", "package.json");
     }
     if (packageJson.scripts?.check !== "npm run validate && npm run test:deterministic") {
       problem("check must run validation and the zero-skip deterministic suite.", "package.json");
