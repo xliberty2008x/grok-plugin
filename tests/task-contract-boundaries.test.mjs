@@ -2,12 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import * as taskContract from "../plugins/grok/scripts/lib/task-contract.mjs";
+import * as taskContextManifest from "../plugins/grok/scripts/lib/task-context-manifest.mjs";
 import * as taskContextPolicy from "../plugins/grok/scripts/lib/task-context-policy.mjs";
 import * as taskContextWorktree from "../plugins/grok/scripts/lib/task-context-worktree.mjs";
 import * as taskEnvelope from "../plugins/grok/scripts/lib/task-envelope.mjs";
 import * as taskLifecycle from "../plugins/grok/scripts/lib/task-lifecycle.mjs";
 import * as taskPrimitives from "../plugins/grok/scripts/lib/task-contract-primitives.mjs";
+import * as taskProviderPrompt from "../plugins/grok/scripts/lib/task-provider-prompt.mjs";
+import * as taskRuntimeEvidence from "../plugins/grok/scripts/lib/task-runtime-evidence.mjs";
 import * as taskScope from "../plugins/grok/scripts/lib/task-scope.mjs";
+import * as workerReportContract from "../plugins/grok/scripts/lib/worker-report-contract.mjs";
 
 const TASK_CONTRACT_EXPORTS = Object.freeze([
   "CONTEXT_MANIFEST_VERSION",
@@ -39,40 +43,54 @@ const TASK_CONTRACT_EXPORTS = Object.freeze([
   "scrubStoredRequest"
 ]);
 
-test("task-contract remains an exact explicit compatibility surface", () => {
+test("task-contract remains an exact explicit compatibility facade", () => {
   assert.deepEqual(Object.keys(taskContract).sort(), TASK_CONTRACT_EXPORTS);
-  assert.equal(taskContract.evaluateScope, taskScope.evaluateScope);
-  assert.equal(taskContract.LIFECYCLE_EVENT_TYPES, taskLifecycle.LIFECYCLE_EVENT_TYPES);
-  assert.equal(taskContract.MAX_LIFECYCLE_EVENTS, taskLifecycle.MAX_LIFECYCLE_EVENTS);
-  assert.equal(taskContract.appendLifecycleEvent, taskLifecycle.appendLifecycleEvent);
-  assert.equal(
-    taskContract.normalizeLifecycleEventSequences,
-    taskLifecycle.normalizeLifecycleEventSequences
-  );
-  for (const name of [
-    "TASK_ENVELOPE_VERSION",
-    "assertTaskEnvelope",
-    "bindTaskEnvelopeContext",
-    "buildTaskEnvelope",
-    "parseTaskEnvelopeInput",
-    "scrubStoredJob",
-    "scrubStoredRequest"
-  ]) {
-    assert.equal(taskContract[name], taskEnvelope[name], `${name} must be a direct leaf binding`);
+  const sources = [
+    [taskScope, ["evaluateScope"]],
+    [taskLifecycle, [
+      "LIFECYCLE_EVENT_TYPES",
+      "MAX_LIFECYCLE_EVENTS",
+      "appendLifecycleEvent",
+      "normalizeLifecycleEventSequences"
+    ]],
+    [taskEnvelope, [
+      "TASK_ENVELOPE_VERSION",
+      "assertTaskEnvelope",
+      "bindTaskEnvelopeContext",
+      "buildTaskEnvelope",
+      "parseTaskEnvelopeInput",
+      "scrubStoredJob",
+      "scrubStoredRequest"
+    ]],
+    [taskPrimitives, ["boundPathEvidence"]],
+    [workerReportContract, [
+      "WORKER_REPORT_VERSION",
+      "buildWorkerReport",
+      "buildWorkerReportOutputSchema",
+      "composeWorkerReportRepairPrompt"
+    ]],
+    [taskContextPolicy, [
+      "CONTEXT_MANIFEST_VERSION",
+      "CONTEXT_METADATA_POLICIES"
+    ]],
+    [taskContextManifest, [
+      "assertContextCompatible",
+      "assertContextManifestIntegrity",
+      "assertTaskContextReady",
+      "captureContextManifest"
+    ]],
+    [taskContextWorktree, ["isVerificationCacheIgnoredPath"]],
+    [taskRuntimeEvidence, ["buildRuntimeEvidence", "observeChangedPaths"]],
+    [taskProviderPrompt, ["composeProviderPrompt"]]
+  ];
+  const checked = [];
+  for (const [source, names] of sources) {
+    for (const name of names) {
+      assert.equal(taskContract[name], source[name], `${name} must be a direct leaf binding`);
+      checked.push(name);
+    }
   }
-  assert.equal(taskContract.boundPathEvidence, taskPrimitives.boundPathEvidence);
-  assert.equal(
-    taskContract.CONTEXT_MANIFEST_VERSION,
-    taskContextPolicy.CONTEXT_MANIFEST_VERSION
-  );
-  assert.equal(
-    taskContract.CONTEXT_METADATA_POLICIES,
-    taskContextPolicy.CONTEXT_METADATA_POLICIES
-  );
-  assert.equal(
-    taskContract.isVerificationCacheIgnoredPath,
-    taskContextWorktree.isVerificationCacheIgnoredPath
-  );
+  assert.deepEqual(checked.sort(), TASK_CONTRACT_EXPORTS);
   assert.equal(Object.hasOwn(taskContract, "default"), false);
 });
 

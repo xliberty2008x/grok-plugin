@@ -37,9 +37,9 @@ import {
 } from "./worker-host-actions.mjs";
 import {
   assertTaskEnvelope,
-  buildTaskEnvelope,
-  captureContextManifest
-} from "./task-contract.mjs";
+  buildTaskEnvelope
+} from "./task-envelope.mjs";
+import { captureContextManifest } from "./task-context-manifest.mjs";
 import {
   EXACT_WRITE_VERTICAL_SCOPE,
   assertExactWriteVerticalScope,
