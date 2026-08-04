@@ -44,11 +44,10 @@ const ACTIVE_PROGRESS = new RegExp(
 );
 const NEXT_STEP_PENDING = /^The\s+next\s+step\s+(?:is|will\s+be|is\s+to)\b/iu;
 const INCOMPLETE_STATE = /\b(?:(?:review|assessment|analysis)\s+(?:(?:is|remains)\s+(?:still\s+)?(?:ongoing|underway|unfinished|incomplete|in\s+progress|not\s+(?:yet\s+)?(?:finished|complete))|has\s+not\s+(?:finished|completed))|(?:this|it)\s+(?:is|remains)\s+(?:only\s+)?(?:a\s+)?preliminary\s+(?:review|assessment|analysis))\b/iu;
-const DEFERRED_CONCLUSION = /\b(?:final\s+)?(?:conclusion|assessment|review|analysis|findings?|report)\s+(?:will\s+(?:follow|be\s+(?:reported|completed|provided))\b|(?:comes?|follows?)\s+(?:only\s+)?(?:later|after|next)\b|awaits\s+(?:further|additional)\s+(?:review|analysis|investigation|inspection|assessment)\b|(?:is\s+)?not\s+(?:supplied|provided|reached|completed|available)\b)/iu;
 const GERUND_REVIEW_LEADING = /^(?:Inspecting|Reviewing|Searching|Locating|Checking|Analy[sz]ing|Assessing|Critiquing)\b/iu;
 const COMPLETED_RESULT_CUE = /\b(?:found|revealed|confirmed|showed|demonstrated|established|identified|exposed|surfaced|proved)\b/iu;
 const RESERVED_MARKER = /\b(?:Challenged|Assessment|Decision)\s*:/iu;
-const PLACEHOLDER_SEGMENT = /^(?:<[^>\r\n]{1,200}>$|(?:pending|todo|tbd|unknown|placeholder)\b)/iu;
+const PLACEHOLDER_SEGMENT = /^(?:<[^>\r\n]{1,200}>|(?:pending|todo|tbd|unknown|placeholder)(?:\s+(?:pending|todo|tbd|unknown|placeholder|\d+))*)$/iu;
 
 /** Minimum content in each explicit completed-assessment segment. */
 const MIN_ASSESSMENT_SEGMENT = 24;
@@ -103,8 +102,7 @@ function isPlanOrProgress(text) {
     || BARE_PENDING_ACTION.test(text)
     || ACTIVE_PROGRESS.test(text)
     || NEXT_STEP_PENDING.test(text)
-    || INCOMPLETE_STATE.test(text)
-    || DEFERRED_CONCLUSION.test(text)) return true;
+    || INCOMPLETE_STATE.test(text)) return true;
   return GERUND_REVIEW_LEADING.test(text) && !COMPLETED_RESULT_CUE.test(text);
 }
 

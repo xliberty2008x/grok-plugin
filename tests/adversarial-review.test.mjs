@@ -178,6 +178,28 @@ test("AC-04: empty-findings adversarial pass requires prefix plus substantive ra
   assert.equal(completedGerund.verdict, "pass");
 });
 
+test("PR #89: whole-segment placeholders reject without banning technical or operational prose", () => {
+  for (const summary of [
+    `${ADVERSARIAL_NO_FINDINGS_PREFIX} Challenged: Pending writes are drained before ownership release during shutdown. Assessment: Ownership checks remain exact because cleanup waits for the drain to finish. Decision: ship.`,
+    `${ADVERSARIAL_NO_FINDINGS_PREFIX} Challenged: Isolation boundaries across retry and cleanup ownership transitions. Assessment: Unknown residual risk remains non-blocking after isolation analysis. Decision: ship.`,
+    `${ADVERSARIAL_NO_FINDINGS_PREFIX} Challenged: Post-release monitoring across isolation and ownership boundaries. Assessment: A residual risk report will be provided via metrics and does not block release. Decision: ship.`
+  ]) {
+    assert.equal(validateAdversarialReview({ summary, findings: [] }).verdict, "pass");
+  }
+
+  for (const summary of [
+    `${ADVERSARIAL_NO_FINDINGS_PREFIX} Challenged: pending pending pending pending. Assessment: The approach holds after complete failure-path analysis of isolation. Decision: ship.`,
+    `${ADVERSARIAL_NO_FINDINGS_PREFIX} Challenged: Retry isolation boundaries under malformed provider output paths. Assessment: pending 1000 2000 3000 4000. Decision: ship.`,
+    `${ADVERSARIAL_NO_FINDINGS_PREFIX} Challenged: todo tbd pending unknown placeholder. Assessment: The approach holds after complete failure-path analysis of isolation. Decision: ship.`
+  ]) {
+    assert.throws(
+      () => validateAdversarialReview({ summary, findings: [] }),
+      (error) => error?.code === "E_SCHEMA"
+        && String(error?.details?.reason || "").startsWith("insubstantive-")
+    );
+  }
+});
+
 test("AC-05: findings-bearing adversarial payloads stay needs_changes without the prefix", () => {
   const result = validateAdversarialReview(FINDINGS_BEARING);
   assert.equal(result.verdict, "needs_changes");
