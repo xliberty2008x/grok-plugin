@@ -20,11 +20,11 @@ import {
 } from "./worker-authority.mjs";
 import {
   cancelWorker,
-  authorizeReadyWriteWorkerDispatch,
-  projectCancellationReceipt,
-  spawnReadOnlyWorker
+  projectCancellationReceipt
 } from "./worker-mutation.mjs";
 import { providerLaunchState } from "./worker-mutation-dispatch-contract.mjs";
+import { spawnReadOnlyWorker } from "./worker-mutation-spawn.mjs";
+import { authorizeReadyWriteWorkerDispatch } from "./worker-mutation-write-admission.mjs";
 import { launchCommittedWorker } from "./worker-runtime.mjs";
 import { provisionWriteWorkerWorktree } from "./worker-provisioner.mjs";
 import {
