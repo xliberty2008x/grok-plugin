@@ -30,7 +30,16 @@ application, plugin, script, and test roots. It measures physical lines and
 Acorn function spans, static ESM cycles, facade direction, and ordinal
 fragments. The budgets are 1,500/250 lines for product files/functions,
 2,000/350 for tooling, 2,000/400 for tests, and 300 lines for registered
-facades and entrypoints.
+facades and entrypoints with a 250-line function budget. Canonical roots and
+extensions are fixed; nested `build`, `coverage`, `dist`, and `vendor`
+directories do not create an exemption. Relative static imports into `.git`
+or `node_modules` fail the ratchet.
+
+Each source is capped at 2 MiB before parsing, and a handwritten physical line
+may not exceed 4 KiB. This rejects single-line source blobs and bounds parser
+input; it is not permission to compress ordinary declarations to preserve a
+legacy cap. Reviewers should require a named extraction when a cohesive data or
+behavior domain would otherwise make a capped file grow.
 
 The repository is initially in `observe` mode: existing debt is visible as
 warnings, while malformed policy, parser failure, unreadable source, or a
@@ -41,12 +50,21 @@ but MUST NOT become the checked-in mode until the promotion conditions in
 Legacy allowances are exact paths, not patterns. Their original line count is
 immutable and protected by the repository-pinned baseline digest; the separate
 current cap cannot grow, and a reduction must lower or resolve the cap in the
-same change. A resolved file cap is `null`; resolved function caps are removed
-from the active vector while their immutable history remains. Long-function
+same change. The complete current policy boundary has its own repository-pinned
+digest so active caps, facade registration, provenance, scan coverage, and
+resource limits cannot be silently weakened. A resolved file cap is `null`;
+resolved function caps are removed from the active vector while their
+immutable history remains. Long-function
 allowances are sorted per-function vectors. Every allowance needs an issue,
 rationale, and observable removal criterion.
 Do not add spare capacity, wildcard exceptions, fake `part1`/`part2` modules,
 empty facade indirection, or generated-file headers to evade the policy.
+
+Entrypoints and orchestrators own argument handling and sequencing only.
+Validation, protocol, identity, persistence, atomic mutation, and cleanup
+authority belong in named domain modules. A structural extraction MUST NOT
+create a second lifecycle authority, durable store, or hidden implementation
+dependency routed back through a public facade.
 
 ## Versioning convention and change taxonomy
 

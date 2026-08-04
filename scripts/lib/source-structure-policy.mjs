@@ -8,15 +8,16 @@ const { parse } = require("acorn");
 
 export const SOURCE_STRUCTURE_POLICY_PATH = "scripts/source-structure-policy.json";
 export const SOURCE_STRUCTURE_INITIAL_DIGEST = "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b";
+export const SOURCE_STRUCTURE_POLICY_DIGEST = "dcd1a6e7a176e85b438ff85675be97053a7b90b8eafb60888d0b052015c07399";
+export const SOURCE_STRUCTURE_EXTENSIONS = Object.freeze([".cjs", ".js", ".mjs"]);
+export const SOURCE_STRUCTURE_ROOTS = Object.freeze(["apps", "plugins", "scripts", "tests"]);
+export const SOURCE_STRUCTURE_MAX_PHYSICAL_LINE_BYTES = 4 * 1024;
+export const SOURCE_STRUCTURE_MAX_SOURCE_BYTES = 2 * 1024 * 1024;
 const POLICY_MODES = new Set(["observe", "ratchet"]);
 const CATEGORY_NAMES = Object.freeze(["product", "tooling", "tests", "facade"]);
 const DEFAULT_EXCLUDED_DIRECTORIES = new Set([
   ".git",
-  "build",
-  "coverage",
-  "dist",
-  "node_modules",
-  "vendor"
+  "node_modules"
 ]);
 const FUNCTION_TYPES = new Set([
   "ArrowFunctionExpression",
@@ -69,6 +70,14 @@ export function physicalLineCount(source) {
   const normalized = source.replace(/\r\n|\r|\u2028|\u2029/gu, "\n");
   const lines = normalized.split("\n");
   return normalized.endsWith("\n") ? lines.length - 1 : lines.length;
+}
+
+function maximumPhysicalLineBytes(source) {
+  if (source.length === 0) return 0;
+  return source
+    .replace(/\r\n|\r|\u2028|\u2029/gu, "\n")
+    .split("\n")
+    .reduce((largest, line) => Math.max(largest, Buffer.byteLength(line)), 0);
 }
 
 export function normalizePortableRelative(root, file, pathApi = path) {
@@ -439,25 +448,53 @@ export function sourceStructureInitialDigest(config) {
   return crypto.createHash("sha256").update(canonical).digest("hex");
 }
 
+function canonicalPolicyValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalPolicyValue);
+  if (!isPlainObject(value)) return value;
+  return Object.fromEntries(
+    Object.keys(value).sort().map((key) => [key, canonicalPolicyValue(value[key])])
+  );
+}
+
+function currentPolicyProjection(config) {
+  if (!isPlainObject(config)) return canonicalPolicyValue(config);
+  const baseline = isPlainObject(config.baseline)
+    ? Object.fromEntries(Object.entries(config.baseline).filter(([key]) => key !== "policyDigest"))
+    : config.baseline;
+  return canonicalPolicyValue({ ...config, baseline });
+}
+
+export function sourceStructurePolicyDigest(config) {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(currentPolicyProjection(config)))
+    .digest("hex");
+}
+
 export function validateSourceStructurePolicy(config, {
-  expectedInitialDigest = config?.baseline?.initialDigest
+  expectedInitialDigest = config?.baseline?.initialDigest,
+  expectedPolicyDigest = config?.baseline?.policyDigest
 } = {}) {
   const errors = [];
   if (!isPlainObject(config)) return ["Policy must be a JSON object."];
   validateExactKeys(config, [
     "baseline", "budgets", "capCycleComponents", "capOrdinalFragments", "dispositions",
     "extensions", "facadePaths", "initialCycles", "initialDebt", "initialOrdinalFragments", "legacyDebt",
-    "mode", "roots", "schemaVersion"
+    "maxPhysicalLineBytes", "maxSourceBytes", "mode", "roots", "schemaVersion"
   ], "Policy", errors);
   if (config.schemaVersion !== 1) errors.push("schemaVersion must be 1.");
   if (!POLICY_MODES.has(config.mode)) errors.push("mode must be observe or ratchet.");
   if (!sortedUniqueStrings(config.extensions)
     || config.extensions.some((entry) => !/^\.[a-z0-9]+$/u.test(entry))) {
     errors.push("extensions must be a sorted unique list of lowercase file extensions.");
+  } else if (JSON.stringify(config.extensions) !== JSON.stringify(SOURCE_STRUCTURE_EXTENSIONS)) {
+    errors.push(`extensions must remain the canonical set: ${SOURCE_STRUCTURE_EXTENSIONS.join(", ")}.`);
   }
   if (!sortedUniqueStrings(config.roots)
     || config.roots.some((entry) => !isPortableRelativePath(entry))) {
     errors.push("roots must be a sorted unique list of exact portable directories.");
+  } else if (JSON.stringify(config.roots) !== JSON.stringify(SOURCE_STRUCTURE_ROOTS)) {
+    errors.push(`roots must remain the canonical set: ${SOURCE_STRUCTURE_ROOTS.join(", ")}.`);
   }
   if (!sortedUniqueStrings(config.facadePaths)
     || config.facadePaths.some((entry) => !isPortableRelativePath(entry))) {
@@ -472,12 +509,19 @@ export function validateSourceStructurePolicy(config, {
     || config.budgets?.facade?.fileLines !== 300 || config.budgets?.facade?.functionLines !== 250) {
     errors.push("The canonical budgets are product 1500/250, tooling 2000/350, tests 2000/400, and facades 300/250 lines.");
   }
-  validateExactKeys(config.baseline, ["date", "initialDigest", "revision"], "baseline", errors);
+  if (config.maxPhysicalLineBytes !== SOURCE_STRUCTURE_MAX_PHYSICAL_LINE_BYTES) {
+    errors.push(`maxPhysicalLineBytes must remain ${SOURCE_STRUCTURE_MAX_PHYSICAL_LINE_BYTES}.`);
+  }
+  if (config.maxSourceBytes !== SOURCE_STRUCTURE_MAX_SOURCE_BYTES) {
+    errors.push(`maxSourceBytes must remain ${SOURCE_STRUCTURE_MAX_SOURCE_BYTES}.`);
+  }
+  validateExactKeys(config.baseline, ["date", "initialDigest", "policyDigest", "revision"], "baseline", errors);
   if (!isPlainObject(config.baseline)
     || !/^\d{4}-\d{2}-\d{2}$/u.test(config.baseline.date)
     || !/^[0-9a-f]{40}$/u.test(config.baseline.revision)
-    || !/^[0-9a-f]{64}$/u.test(config.baseline.initialDigest)) {
-    errors.push("baseline must contain an ISO date, full Git revision, and SHA-256 initialDigest.");
+    || !/^[0-9a-f]{64}$/u.test(config.baseline.initialDigest)
+    || !/^[0-9a-f]{64}$/u.test(config.baseline.policyDigest)) {
+    errors.push("baseline must contain an ISO date, full Git revision, and SHA-256 initialDigest and policyDigest values.");
   }
   validateDispositions(config, errors);
   validateInitialDebt(config, errors);
@@ -502,6 +546,15 @@ export function validateSourceStructurePolicy(config, {
     }
     if (typeof expectedInitialDigest === "string" && config.baseline.initialDigest !== expectedInitialDigest) {
       errors.push("baseline.initialDigest does not match the repository-pinned initial digest.");
+    }
+  }
+  if (/^[0-9a-f]{64}$/u.test(config.baseline?.policyDigest || "")) {
+    const calculated = sourceStructurePolicyDigest(config);
+    if (config.baseline.policyDigest !== calculated) {
+      errors.push("baseline.policyDigest does not match the current policy boundary.");
+    }
+    if (typeof expectedPolicyDigest === "string" && config.baseline.policyDigest !== expectedPolicyDigest) {
+      errors.push("baseline.policyDigest does not match the repository-pinned policy boundary.");
     }
   }
   return errors;
@@ -530,7 +583,8 @@ export function loadSourceStructurePolicy({
     throw new Error(`Could not parse source-structure policy JSON: ${error.message}`, { cause: error });
   }
   const errors = validateSourceStructurePolicy(config, {
-    expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST
+    expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST,
+    expectedPolicyDigest: SOURCE_STRUCTURE_POLICY_DIGEST
   });
   if (errors.length > 0) throw new Error(`Invalid source-structure policy:\n- ${errors.join("\n- ")}`);
   return config;
@@ -551,7 +605,7 @@ function finding(code, file, message, details = {}) {
 function walkSources({ root, config, fsApi }, hardFindings) {
   const files = [];
   const extensions = new Set(config.extensions);
-  const visit = (absolute) => {
+  const visit = (absolute, { scanRoot = false } = {}) => {
     let stat;
     try {
       stat = fsApi.lstatSync(absolute);
@@ -562,6 +616,10 @@ function walkSources({ root, config, fsApi }, hardFindings) {
     const relative = normalizePortableRelative(root, absolute);
     if (stat.isSymbolicLink()) {
       hardFindings.push(finding("symlinked-source-path", relative, "Source scan roots must not contain symlinks."));
+      return;
+    }
+    if (scanRoot && !stat.isDirectory()) {
+      hardFindings.push(finding("invalid-scan-root", relative, "Every canonical source scan root must be a real directory."));
       return;
     }
     if (stat.isDirectory()) {
@@ -584,7 +642,7 @@ function walkSources({ root, config, fsApi }, hardFindings) {
       hardFindings.push(finding("unsafe-scan-root", scanRoot, "Scan root escapes the repository."));
       continue;
     }
-    visit(absolute);
+    visit(absolute, { scanRoot: true });
   }
   return [...new Set(files)].sort((left, right) => (
     normalizePortableRelative(root, left).localeCompare(normalizePortableRelative(root, right))
@@ -595,11 +653,46 @@ function readAndParseFiles({ root, config, fsApi }, hardFindings) {
   const analyzed = [];
   for (const absolute of walkSources({ root, config, fsApi }, hardFindings)) {
     const file = normalizePortableRelative(root, absolute);
+    let stat;
+    try {
+      stat = fsApi.lstatSync(absolute);
+    } catch (error) {
+      hardFindings.push(finding("unreadable-source-metadata", file, error.message));
+      continue;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink() || !Number.isSafeInteger(stat.size) || stat.size < 0) {
+      hardFindings.push(finding("invalid-source-metadata", file, "Source metadata changed or is not a bounded regular file."));
+      continue;
+    }
+    if (stat.size > config.maxSourceBytes) {
+      hardFindings.push(finding(
+        "source-byte-limit",
+        file,
+        `Source exceeds the ${config.maxSourceBytes}-byte pre-parse limit.`
+      ));
+      continue;
+    }
     let source;
     try {
       source = fsApi.readFileSync(absolute, "utf8");
     } catch (error) {
       hardFindings.push(finding("unreadable-source", file, error.message));
+      continue;
+    }
+    if (Buffer.byteLength(source) > config.maxSourceBytes) {
+      hardFindings.push(finding(
+        "source-byte-limit",
+        file,
+        `Source exceeded the ${config.maxSourceBytes}-byte limit while being read.`
+      ));
+      continue;
+    }
+    if (maximumPhysicalLineBytes(source) > config.maxPhysicalLineBytes) {
+      hardFindings.push(finding(
+        "physical-line-byte-limit",
+        file,
+        `A physical source line exceeds the ${config.maxPhysicalLineBytes}-byte handwritten limit.`
+      ));
       continue;
     }
     let parsed;
@@ -623,9 +716,33 @@ function readAndParseFiles({ root, config, fsApi }, hardFindings) {
   return analyzed;
 }
 
-function resolveStaticEdge(importer, specifier, knownFiles) {
+const STATIC_FILE_URL_ROOT = "file:///__source_structure__/";
+
+function normalizeStaticSpecifier(importer, specifier) {
   if (typeof specifier !== "string" || !specifier.startsWith(".")) return null;
-  const base = path.posix.normalize(path.posix.join(path.posix.dirname(importer), specifier));
+  if (/%(?:2f|5c)/iu.test(specifier)) return null;
+  try {
+    const encodedImporter = importer.split("/").map(encodeURIComponent).join("/");
+    const resolved = new URL(specifier, new URL(encodedImporter, STATIC_FILE_URL_ROOT));
+    const decoded = decodeURIComponent(resolved.pathname);
+    const prefix = new URL(STATIC_FILE_URL_ROOT).pathname;
+    if (!decoded.startsWith(prefix)) {
+      return { excluded: false, outside: true, path: portable(decoded) };
+    }
+    const target = path.posix.normalize(decoded.slice(prefix.length));
+    const segments = target.split("/");
+    return {
+      excluded: segments.some((segment) => DEFAULT_EXCLUDED_DIRECTORIES.has(segment)),
+      outside: !SOURCE_STRUCTURE_ROOTS.some((root) => target === root || target.startsWith(`${root}/`)),
+      path: target
+    };
+  } catch {
+    return null;
+  }
+}
+
+function resolveStaticEdge(base, knownFiles) {
+  if (!base) return null;
   const candidates = path.posix.extname(base)
     ? [base]
     : [base, `${base}.mjs`, `${base}.js`, `${base}.cjs`, `${base}/index.mjs`, `${base}/index.js`];
@@ -674,10 +791,21 @@ function dependencyAnalysis(files) {
   const knownFiles = new Set(files.map((entry) => entry.file));
   const byPath = new Map(files.map((entry) => [entry.file, entry]));
   const edges = new Map(files.map((entry) => [entry.file, new Set()]));
+  const excludedSourceEdges = [];
+  const outsideSourceEdges = [];
   const reverseFacadeImports = [];
   for (const entry of files) {
     for (const specifier of entry.specifiers) {
-      const target = resolveStaticEdge(entry.file, specifier, knownFiles);
+      const normalized = normalizeStaticSpecifier(entry.file, specifier);
+      if (normalized?.excluded) {
+        excludedSourceEdges.push({ importer: entry.file, target: normalized.path });
+        continue;
+      }
+      if (normalized?.outside) {
+        outsideSourceEdges.push({ importer: entry.file, target: normalized.path });
+        continue;
+      }
+      const target = resolveStaticEdge(normalized?.path, knownFiles);
       if (!target) continue;
       edges.get(entry.file).add(target);
       if (!entry.facade && entry.category !== "tests" && byPath.get(target)?.facade) {
@@ -688,6 +816,12 @@ function dependencyAnalysis(files) {
   return {
     cycles: stronglyConnectedComponents(knownFiles, edges),
     edges,
+    excludedSourceEdges: excludedSourceEdges.sort((left, right) => (
+      left.importer.localeCompare(right.importer) || left.target.localeCompare(right.target)
+    )),
+    outsideSourceEdges: outsideSourceEdges.sort((left, right) => (
+      left.importer.localeCompare(right.importer) || left.target.localeCompare(right.target)
+    )),
     reverseFacadeImports: reverseFacadeImports.sort((left, right) => (
       left.importer.localeCompare(right.importer) || left.facade.localeCompare(right.facade)
     ))
@@ -904,10 +1038,14 @@ export function evaluateSourceStructure({
   config,
   mode = config?.mode,
   fsApi = fs,
-  expectedInitialDigest = config?.baseline?.initialDigest
+  expectedInitialDigest = config?.baseline?.initialDigest,
+  expectedPolicyDigest = config?.baseline?.policyDigest
 }) {
   const hardFindings = [];
-  const configErrors = validateSourceStructurePolicy(config, { expectedInitialDigest });
+  const configErrors = validateSourceStructurePolicy(config, {
+    expectedInitialDigest,
+    expectedPolicyDigest
+  });
   if (configErrors.length > 0) {
     return {
       errors: configErrors.map((message) => ({
@@ -941,6 +1079,26 @@ export function evaluateSourceStructure({
   for (const edge of dependency.reverseFacadeImports) {
     addPolicyFinding(findings, mode, "reverse-facade-import", edge.importer,
       `Implementation module imports facade ${edge.facade}; dependencies must point toward domain modules.`, edge);
+  }
+  for (const edge of dependency.excludedSourceEdges) {
+    addPolicyFinding(
+      findings,
+      mode,
+      "excluded-source-edge",
+      edge.importer,
+      `Relative static dependency enters excluded source directory: ${edge.target}.`,
+      edge
+    );
+  }
+  for (const edge of dependency.outsideSourceEdges) {
+    addPolicyFinding(
+      findings,
+      mode,
+      "outside-source-root-edge",
+      edge.importer,
+      "Relative static dependency escapes the canonical source roots.",
+      edge
+    );
   }
   const errors = [
     ...hardFindings.map((entry) => ({ ...entry, severity: "error" })),
