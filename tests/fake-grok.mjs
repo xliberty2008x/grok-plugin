@@ -56,18 +56,24 @@ function sessionsStoreFile(binary, config) {
   return `${binary}.sessions.json`;
 }
 
-function reviewValue(config) {
-  const value = config.review ?? {
-    summary: "No material findings in the fake review.",
-    findings: []
-  };
+function reviewValue(config, promptNumber = 1) {
+  let value;
+  if (Array.isArray(config.reviewSequence) && config.reviewSequence.length > 0) {
+    const index = Math.min(Math.max(promptNumber, 1), config.reviewSequence.length) - 1;
+    value = config.reviewSequence[index];
+  } else {
+    value = config.review ?? {
+      summary: "No material findings: Challenged: Fake review isolation and cleanup paths under provider completion. Assessment: The fixture found no material architecture defects or blocking residual risk. Decision: ship.",
+      findings: []
+    };
+  }
   if (config.preserveReviewVerdict) return value;
   const { verdict: _ignored, ...providerPayload } = value;
   return providerPayload;
 }
 
-function reviewJson(config) {
-  return JSON.stringify(reviewValue(config));
+function reviewJson(config, promptNumber = 1) {
+  return JSON.stringify(reviewValue(config, promptNumber));
 }
 
 function workerReportValue(text) {
@@ -488,7 +494,7 @@ async function serveAcp(binary, config) {
 
       let text;
       if (config.invalidReviewFirst && promptNumber === 1) text = "This is not JSON.";
-      else if (/review contract|review schema|required schema|valid review JSON/i.test(prompt)) text = reviewJson(config);
+      else if (/review contract|review schema|required schema|valid review JSON/i.test(prompt)) text = reviewJson(config, promptNumber);
       else if (Array.isArray(config.taskTexts) && config.taskTexts.length) {
         text = config.taskTexts[Math.min(promptNumber - 1, config.taskTexts.length - 1)];
       } else text = config.taskText ?? "Fake Grok task completed.";
@@ -668,7 +674,7 @@ async function serveHeadless(binary, config, args) {
       text = "This is not valid review JSON.";
       structuredOutput = { invalid: true };
     } else {
-      structuredOutput = reviewValue(config);
+      structuredOutput = reviewValue(config, promptNumber);
       text = config.reviewText ?? "Structured review complete.";
     }
   }

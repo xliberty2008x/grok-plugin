@@ -33,6 +33,7 @@ export const DETERMINISTIC_SUPPORT_TEST_FILES = Object.freeze([
 // inventory changes until the new file is deliberately assigned.
 export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
   Object.freeze([
+    "tests/adversarial-review.test.mjs",
     "tests/ci-post-grok-review.test.mjs",
     "tests/control-plane_part1.mjs",
     "tests/deterministic-sharding.test.mjs",

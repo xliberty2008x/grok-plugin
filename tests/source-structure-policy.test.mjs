@@ -894,7 +894,7 @@ test("checked-in observe baseline exactly covers all current file and function d
   ]);
   const result = evaluateSourceStructure({ root: ROOT, config });
   assert.equal(result.ok, true);
-  assert.equal(result.files.length, 236);
+  assert.equal(result.files.length, 238);
   assert.equal(result.warnings.length, 58);
   assert.equal(result.cycles.length, 0);
   assert.equal(result.fragments.length, 14);

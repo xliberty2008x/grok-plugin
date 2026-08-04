@@ -30,6 +30,7 @@ import {
   processStartToken,
   waitForImportedSession
 } from "./lib/grok-provider.mjs";
+import { structuredReviewOptionsFor } from "./lib/adversarial-review.mjs";
 import { profileFor, sameSecurityProfile } from "./lib/profiles.mjs";
 import {
   applyResearchPrivacy,
@@ -148,7 +149,6 @@ const { assertContextMetadataComplete, captureCompleteContextManifest } = bindCo
 const SCRIPT = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = path.resolve(path.dirname(SCRIPT), "..");
 const VALID_EFFORTS = new Set(["low", "medium", "high"]);
-
 function usage() {
   return ["Usage:", "  grok-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]", "  grok-companion.mjs review|adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]", "  grok-companion.mjs task [--wait|--background] [--write] [--resume|--fresh] [--job-id <id>] [--model <id>] [--effort low|medium|high] [--envelope-stdin [--stdin-ready] | --envelope-file <private-path> | -- <task>]", "  grok-companion.mjs deep-research [--wait|--background] [--web-only|--workspace] [--model <id>] [--effort low|medium|high] [--query-stdin [--stdin-ready]] [--json]", "  grok-companion.mjs transfer [--source <claude-or-codex-jsonl>] [--model <id>] [--effort low|medium|high] [--json]", "  grok-companion.mjs status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--readonly] [--json]", "  grok-companion.mjs result [job-id] [--json]", "  grok-companion.mjs cancel [job-id] [--json]"].join("\n");
 }
@@ -2261,7 +2261,7 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
       onEvent: eventUpdater(root, id, dispatchAttemptId, providerGeneration, dispatchFence)
     };
     let result = job.jobClass === "review" && job.kind !== "stop-review"
-      ? await runStructuredReview(common)
+      ? await runStructuredReview(structuredReviewOptionsFor(job.kind, common))
       : await runProvider(common);
     if (before) assertUnchanged(before, integritySnapshot(root));
     let workerReport = null;
