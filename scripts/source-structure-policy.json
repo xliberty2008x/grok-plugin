@@ -49,7 +49,7 @@
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
     "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b",
-    "policyDigest": "5f7db9ef06acfc2fff76bc6ecc6fd3449f6ca8d597581ba6a2ed507d21c7573e"
+    "policyDigest": "f6c96ff9b444fb11e4cb9ed13b2bd8d9a4781421ae004645219fa2699d081069"
   },
   "dispositions": {
     "scripts/lib/worker-broker-evidence.mjs": {
@@ -708,7 +708,7 @@
     "plugins/grok/scripts/lib/worker-mutation.mjs": {
       "category": "product",
       "initialLines": 11269,
-      "lineCap": 4840,
+      "lineCap": 2217,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
@@ -722,16 +722,6 @@
           "key": "function:cancelWorkerTransaction#1",
           "initialLines": 309,
           "capLines": 309
-        },
-        {
-          "key": "function:prepareProvisioningReissueTransaction#1",
-          "initialLines": 361,
-          "capLines": 361
-        },
-        {
-          "key": "function:prepareWriteProvisioningReissue#1",
-          "initialLines": 386,
-          "capLines": 386
         },
         {
           "key": "function:spawnGrantedFollowupWorker#1",

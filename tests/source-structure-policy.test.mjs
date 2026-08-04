@@ -972,7 +972,7 @@ test("checked-in ratchet baseline exactly covers all current file and function d
   ]);
   const result = evaluateSourceStructure({ root: ROOT, config });
   assert.equal(result.ok, true);
-  assert.equal(result.files.length, 278);
+  assert.equal(result.files.length, 280);
   assert.equal(result.warnings.length, 55);
   assert.equal(result.cycles.length, 0);
   assert.equal(result.fragments.length, 14);
