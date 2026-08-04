@@ -5596,7 +5596,6 @@ test("proof execution rejects clean tracked scope symlinks to mutable external c
   assert.equal(mutated.code, "E_PROOF_SOURCE");
   assert.equal(fs.existsSync(path.join(evidenceDir, "ledger.json")), false);
 });
-
 test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () => {
   assert.deepEqual(
     PHASE_PROOF_GATE_MANIFEST["1"].map((gate) => gate.gateId),
@@ -5658,6 +5657,7 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
     "tests/worker-runtime-teardown.test.mjs",
     "tests/worker-startup-crash-window.test.mjs",
     "tests/worker-launch-outbox.test.mjs",
+    "tests/worker-mutation-boundaries.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
     "tests/worker-cli-authority.test.mjs",
     "tests/worker-terminal-intent.test.mjs",
@@ -5679,6 +5679,7 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
     "tests/installed-worker-mcp-contract.test.mjs",
     "tests/installed-worker-mcp-runner.test.mjs",
     "tests/worker-launch-outbox.test.mjs",
+    "tests/worker-mutation-boundaries.test.mjs",
     "tests/provider-bootstrap-crash-window.test.mjs",
     "tests/provider-capability.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs"
@@ -5689,9 +5690,8 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
       `the Phase 1 focused gate must execute ${relative} exactly once`
     );
   }
-  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 30);
+  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 31);
 });
-
 test("Phase 2 protected manifest, scope, and serial inventory are exact", () => {
   assert.equal(PHASE_TWO_SLICE, "mailbox-context-roles");
   assert.equal(PROOF_PRODUCER_VERSION, 5);

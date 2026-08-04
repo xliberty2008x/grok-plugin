@@ -16,13 +16,15 @@ import {
   dispatchLeaseExpired,
   isDispatchV2
 } from "./worker-launch-contract.mjs";
+import { assertDurableSpawnRequestBinding } from "./worker-mutation.mjs";
 import {
-  assertDurableSpawnRequestBinding,
-  assertDispatchContract,
+  assertDispatchContract
+} from "./worker-mutation-dispatch-contract.mjs";
+import {
   FOLLOWUP_SPAWN_OWNERSHIP_MODE,
   SPAWN_OWNERSHIP_MODE,
   SPAWN_SUCCESS_DEFINITION
-} from "./worker-mutation.mjs";
+} from "./worker-mutation-primitives.mjs";
 import { launchCommittedWorker } from "./worker-runtime.mjs";
 import {
   controlStateSegment,

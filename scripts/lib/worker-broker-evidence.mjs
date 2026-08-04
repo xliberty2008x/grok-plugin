@@ -260,7 +260,6 @@ export const LIVE_RECEIPT_MANIFEST = Object.freeze({
   installedEntrypoint: "mcp/server.mjs",
   authorityModes: LIVE_RECEIPT_AUTHORITY_CONFIG
 });
-
 /** Explicit phase entrypoints; repository-local static imports are derived below. */
 const PHASE_SCOPE_SEEDS = freezeScopeMap({
   "0": [
@@ -371,6 +370,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "tests/worker-runtime-teardown.test.mjs",
     "tests/worker-startup-crash-window.test.mjs",
     "tests/worker-launch-outbox.test.mjs",
+    "tests/worker-mutation-boundaries.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
     "tests/worker-provider-rotation-intent.test.mjs",
     "tests/worker-recovery-fence.test.mjs",

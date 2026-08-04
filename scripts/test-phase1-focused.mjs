@@ -37,6 +37,7 @@ export const PHASE1_FOCUSED_TEST_FILES = Object.freeze([
   "tests/worker-recovery-fence.test.mjs",
   "tests/worker-cli-authority.test.mjs",
   "tests/worker-terminal-intent.test.mjs",
+  "tests/worker-mutation-boundaries.test.mjs",
   "tests/process-control-owned-identity.test.mjs",
   "tests/worker-mutation_part1.mjs",
   "tests/worker-mutation_part2.mjs",

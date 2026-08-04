@@ -21,10 +21,10 @@ import {
 import {
   cancelWorker,
   authorizeReadyWriteWorkerDispatch,
-  providerLaunchState,
   projectCancellationReceipt,
   spawnReadOnlyWorker
 } from "./worker-mutation.mjs";
+import { providerLaunchState } from "./worker-mutation-dispatch-contract.mjs";
 import { launchCommittedWorker } from "./worker-runtime.mjs";
 import { provisionWriteWorkerWorktree } from "./worker-provisioner.mjs";
 import {
