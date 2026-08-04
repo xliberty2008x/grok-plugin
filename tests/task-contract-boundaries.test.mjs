@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import * as taskContract from "../plugins/grok/scripts/lib/task-contract.mjs";
+import * as taskContextPolicy from "../plugins/grok/scripts/lib/task-context-policy.mjs";
+import * as taskContextWorktree from "../plugins/grok/scripts/lib/task-context-worktree.mjs";
+import * as taskEnvelope from "../plugins/grok/scripts/lib/task-envelope.mjs";
 import * as taskLifecycle from "../plugins/grok/scripts/lib/task-lifecycle.mjs";
+import * as taskPrimitives from "../plugins/grok/scripts/lib/task-contract-primitives.mjs";
 import * as taskScope from "../plugins/grok/scripts/lib/task-scope.mjs";
 
 const TASK_CONTRACT_EXPORTS = Object.freeze([
@@ -35,7 +39,7 @@ const TASK_CONTRACT_EXPORTS = Object.freeze([
   "scrubStoredRequest"
 ]);
 
-test("task-contract remains an exact explicit compatibility facade", () => {
+test("task-contract remains an exact explicit compatibility surface", () => {
   assert.deepEqual(Object.keys(taskContract).sort(), TASK_CONTRACT_EXPORTS);
   assert.equal(taskContract.evaluateScope, taskScope.evaluateScope);
   assert.equal(taskContract.LIFECYCLE_EVENT_TYPES, taskLifecycle.LIFECYCLE_EVENT_TYPES);
@@ -44,6 +48,30 @@ test("task-contract remains an exact explicit compatibility facade", () => {
   assert.equal(
     taskContract.normalizeLifecycleEventSequences,
     taskLifecycle.normalizeLifecycleEventSequences
+  );
+  for (const name of [
+    "TASK_ENVELOPE_VERSION",
+    "assertTaskEnvelope",
+    "bindTaskEnvelopeContext",
+    "buildTaskEnvelope",
+    "parseTaskEnvelopeInput",
+    "scrubStoredJob",
+    "scrubStoredRequest"
+  ]) {
+    assert.equal(taskContract[name], taskEnvelope[name], `${name} must be a direct leaf binding`);
+  }
+  assert.equal(taskContract.boundPathEvidence, taskPrimitives.boundPathEvidence);
+  assert.equal(
+    taskContract.CONTEXT_MANIFEST_VERSION,
+    taskContextPolicy.CONTEXT_MANIFEST_VERSION
+  );
+  assert.equal(
+    taskContract.CONTEXT_METADATA_POLICIES,
+    taskContextPolicy.CONTEXT_METADATA_POLICIES
+  );
+  assert.equal(
+    taskContract.isVerificationCacheIgnoredPath,
+    taskContextWorktree.isVerificationCacheIgnoredPath
   );
   assert.equal(Object.hasOwn(taskContract, "default"), false);
 });

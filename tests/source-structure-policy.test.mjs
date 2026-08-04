@@ -776,10 +776,21 @@ test("checked-in observe baseline exactly covers all current file and function d
     const cap = config.legacyDebt[file];
     assert.equal(initial.initialLines, cap.initialLines);
     assert.ok(initial.functions.every((span) => /#1$/u.test(span.key)));
-    assert.deepEqual(
-      initial.functions,
-      cap.functions.map((span) => ({ initialLines: span.initialLines, key: span.key }))
-    );
+    const initialFunctions = new Map(initial.functions.map((span) => [span.key, span]));
+    for (const span of cap.functions) {
+      assert.deepEqual(
+        { initialLines: span.initialLines, key: span.key },
+        initialFunctions.get(span.key),
+        `${file}:${span.key}`
+      );
+    }
+    const activeKeys = new Set(cap.functions.map((span) => span.key));
+    const measured = result.files.find((candidate) => candidate.file === file);
+    const functionBudget = config.budgets[cap.category].functionLines;
+    for (const span of initial.functions.filter((candidate) => !activeKeys.has(candidate.key))) {
+      const current = measured.functions.find((candidate) => candidate.key === span.key);
+      assert.ok(!current || current.lines <= functionBudget, `${file}:${span.key}`);
+    }
   }
   for (const entry of result.files) {
     if (!entry.category) continue;
@@ -787,7 +798,7 @@ test("checked-in observe baseline exactly covers all current file and function d
     assert.ok(entry.functions.filter((span) => span.lines > budget)
       .every((span) => span.stableIdentity && span.key.endsWith("#1")), entry.file);
   }
-  assert.equal(Object.keys(config.dispositions).length, 10);
+  assert.equal(Object.keys(config.dispositions).length, 9);
   assert.deepEqual(
     Object.keys(config.dispositions),
     result.files.filter((entry) => entry.lines > 5000).map((entry) => entry.file)
