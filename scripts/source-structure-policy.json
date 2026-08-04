@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "mode": "observe",
+  "mode": "ratchet",
   "extensions": [
     ".cjs",
     ".js",
@@ -47,7 +47,7 @@
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
     "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b",
-    "policyDigest": "bd896fa859fdfb805f067f1bd67e0fbf95b29d8451df3985393dea601678faf6"
+    "policyDigest": "9d743712335f82e91fc2d85d032326ec27b5fc34f603df01f07c869a5aec2d4a"
   },
   "dispositions": {
     "plugins/grok/scripts/grok-companion.mjs": {

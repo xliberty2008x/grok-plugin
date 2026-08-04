@@ -18,13 +18,15 @@ but their size obscures domain ownership, creates long functions, encourages
 reverse imports through public facades, and makes reviews and deterministic
 sharding harder.
 
-The first tranche adds an executable policy without pretending that the debt is
-already gone. `scripts/source-structure-policy.json` stays in `observe` mode.
-It records 45 exact files where either the file or a function is over budget,
-the existing six-module static ESM cycle, 14 ordinal test fragments, and a
-disposition for every handwritten file above 5,000 lines. Immutable initial
-debt/topology is separated from reducible caps and bound by a repository-pinned
-SHA-256 digest, so raising both an initial value and its cap cannot bless growth.
+The policy initially landed in `observe` mode without pretending that the debt
+was already gone. This prepared promotion will switch the checked-in policy to
+`ratchet` mode when the required host gates below are satisfied. Immutable
+history records 45 initially over-budget files, the former six-module static
+ESM cycle, and 14 initial ordinal test fragments. Active caps cover 44 files on
+the prepared task-contract pilot head because that pilot resolves its own debt.
+Initial debt/topology remains separate from reducible caps and bound by a
+repository-pinned SHA-256 digest, so raising both an initial value and its cap
+cannot bless growth.
 
 ## Enforced model
 
@@ -88,13 +90,13 @@ parser.
 
 ### Observe mode
 
-Current file/function debt, cap drift, cycles, ordinal fragments, and reverse
-facade imports are warnings. This makes the baseline visible on every normal
-`npm run validate` without making the first policy PR impossible to merge.
+Observe mode reports file/function debt, cap drift, cycles, ordinal fragments,
+and reverse facade imports as warnings. It remains available as an explicit
+diagnostic mode, but it is no longer the checked-in repository gate.
 
 ### Ratchet mode
 
-The tested ratchet engine fails:
+The checked-in ratchet engine fails:
 
 - a new over-budget file or function;
 - growth above an exact legacy file or per-function cap;
@@ -170,9 +172,21 @@ Final acceptance is: no handwritten JavaScript file above 5,000 lines, no
 ordinal aggregate wrappers, zero static ESM cycles, checked-in `ratchet` mode,
 and focused, full deterministic, and relevant installed lifecycle gates green.
 
-## Promotion from observe to ratchet
+## Ratchet promotion record
 
-Change the checked-in mode only after all of these are true:
+The promotion is based on task-context pilot head
+`2fef2e0513bce270bad0c747cfa011dbe5ba256d`. Within
+`scripts/source-structure-policy.json`, it changes only the checked-in mode and
+the current-policy digest. The immutable numeric baseline remains
+`ffa84d4ce22252777d887e8ab6616c7155b40da7`, and the initial digest remains
+`6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b`.
+The current-policy digest advances from
+`bd896fa859fdfb805f067f1bd67e0fbf95b29d8451df3985393dea601678faf6` to
+`9d743712335f82e91fc2d85d032326ec27b5fc34f603df01f07c869a5aec2d4a`.
+No cap, budget, source root, extension, or resource ceiling changes.
+
+Merge this prepared promotion only after all of these are true; attach the
+exact host run URLs to the Issue #56 closeout evidence:
 
 1. Every handwritten file above 5,000 lines has an explicit disposition and
    linked issue.

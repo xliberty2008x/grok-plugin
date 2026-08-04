@@ -871,9 +871,9 @@ test("portable paths normalize Windows separators", () => {
   );
 });
 
-test("checked-in observe baseline exactly covers all current file and function debt", () => {
+test("checked-in ratchet baseline exactly covers all current file and function debt", () => {
   const config = loadSourceStructurePolicy({ root: ROOT });
-  assert.equal(config.mode, "observe");
+  assert.equal(config.mode, "ratchet");
   assert.deepEqual(config.extensions, [...SOURCE_STRUCTURE_EXTENSIONS]);
   assert.deepEqual(config.roots, [...SOURCE_STRUCTURE_ROOTS]);
   assert.equal(config.maxPhysicalLineBytes, SOURCE_STRUCTURE_MAX_PHYSICAL_LINE_BYTES);
