@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import { CompanionError } from "./errors.mjs";
 import { assertExecutableAttestation } from "./executable-identity.mjs";
-import { grokVersion } from "./grok-provider.mjs";
+import { grokVersion } from "./provider-core.mjs";
 import { pluginDataRoot } from "./host.mjs";
 import { profileFor } from "./profiles.mjs";
 import {

@@ -134,12 +134,25 @@ export function installPinnedFakeCompanion(
     "grok-provider.mjs"
   );
   let providerSource = fs.readFileSync(providerFile, "utf8");
+  const providerCoreFile = path.join(
+    pluginRoot,
+    "scripts",
+    "lib",
+    "provider-core.mjs"
+  );
+  let providerCoreSource = fs.readFileSync(providerCoreFile, "utf8");
   const wrapperLiteral = JSON.stringify(wrapper);
+  const versionNeedle = 'spawnSync(binary, ["--version"],';
+  assert.equal(
+    providerCoreSource.split(versionNeedle).length - 1,
+    1,
+    `setup fixture provider command inventory drifted: provider-core.mjs:${versionNeedle}`
+  );
+  providerCoreSource = providerCoreSource.replace(
+    versionNeedle,
+    `spawnSync(binary, [${wrapperLiteral}, "--version"],`
+  );
   const replacements = [
-    [
-      'spawnSync(binary, ["--version"],',
-      `spawnSync(binary, [${wrapperLiteral}, "--version"],`
-    ],
     [
       'spawnSync(binary, ["inspect", "--json"],',
       `spawnSync(binary, [${wrapperLiteral}, "inspect", "--json"],`
@@ -172,6 +185,7 @@ export function installPinnedFakeCompanion(
     );
     providerSource = providerSource.replaceAll(needle, replacement);
   }
+  fs.writeFileSync(providerCoreFile, providerCoreSource, "utf8");
   fs.writeFileSync(providerFile, providerSource, "utf8");
 
   return Object.freeze({
