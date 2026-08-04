@@ -47,16 +47,12 @@
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
     "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b",
-    "policyDigest": "9d743712335f82e91fc2d85d032326ec27b5fc34f603df01f07c869a5aec2d4a"
+    "policyDigest": "c43468fd4beb1de15fae0e69b6452e0af037a71a466ed80a0241188a7f38f7aa"
   },
   "dispositions": {
     "plugins/grok/scripts/grok-companion.mjs": {
       "stage": "4-provider-and-control-plane",
       "target": "Keep a thin command facade and move command domains behind explicit service modules."
-    },
-    "plugins/grok/scripts/lib/grok-provider.mjs": {
-      "stage": "4-provider-and-control-plane",
-      "target": "Separate environment construction, transport lifecycle, and provider command execution."
     },
     "plugins/grok/scripts/lib/worker-mutation.mjs": {
       "stage": "5-worker-mutation",
@@ -690,7 +686,7 @@
     "plugins/grok/scripts/lib/grok-provider.mjs": {
       "category": "product",
       "initialLines": 5775,
-      "lineCap": 5775,
+      "lineCap": 3987,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
@@ -704,11 +700,6 @@
           "key": "function:runProvider#1",
           "initialLines": 499,
           "capLines": 499
-        },
-        {
-          "key": "function:taskEnvironment#1",
-          "initialLines": 324,
-          "capLines": 324
         },
         {
           "key": "function:workerOwnerControllerEnvironment#1",

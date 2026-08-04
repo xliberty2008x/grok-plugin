@@ -904,7 +904,7 @@ test("checked-in ratchet baseline exactly covers all current file and function d
   ]);
   const result = evaluateSourceStructure({ root: ROOT, config });
   assert.equal(result.ok, true);
-  assert.equal(result.files.length, 226);
+  assert.equal(result.files.length, 233);
   assert.equal(result.warnings.length, 58);
   assert.equal(result.cycles.length, 0);
   assert.equal(result.fragments.length, 14);
@@ -953,7 +953,7 @@ test("checked-in ratchet baseline exactly covers all current file and function d
     assert.ok(entry.functions.filter((span) => span.lines > budget)
       .every((span) => span.stableIdentity && span.key.endsWith("#1")), entry.file);
   }
-  assert.equal(Object.keys(config.dispositions).length, 9);
+  assert.equal(Object.keys(config.dispositions).length, 8);
   assert.deepEqual(
     Object.keys(config.dispositions),
     result.files.filter((entry) => entry.lines > 5000).map((entry) => entry.file)
