@@ -494,6 +494,12 @@ It shares the normal review target and execution rules but:
 - Remains read-only.
 - Reports only material, evidence-backed findings.
 - Uses the review JSON Schema as a hard output contract.
+- Requires a **completed** ship / no-ship / no-findings rationale, not a plan or progress note. Semantic completion is enforced above headless transport; `EndTurn` alone is not completion proof.
+- When `findings` is empty, `summary` MUST use exactly `No material findings: Challenged: <what was challenged>. Assessment: <why it holds or residual non-blocking risk>. Decision: ship.` Both marked segments require at least 24 characters, five distinct NFKC-normalized words of at least two letters (including one word of four letters), and a distinct-word ratio strictly above one half. Missing, reordered, duplicated, placeholder, or mechanically repetitive segments; reserved markers inside a segment; another decision; trailing text; and explicit plan/progress language in either segment are invalid. A no-ship decision must carry at least one finding.
+- Plan/progress-leading forms such as `I will`, `I'll`, `I need to`, `I am reviewing`, `Inspecting`, `Reviewing`, `Searching`, and `Locating` are not completed adversarial output for empty findings.
+- This is a deterministic completion/schema gate. It does not independently prove the meaning or truth of arbitrary provider paraphrases; stronger semantic qualification requires an evolved structured response or an independent evaluator, not unbounded prose heuristics.
+- Findings-bearing payloads still use the shared structural validator and derive `needs_changes` without requiring the no-findings prefix.
+- Ordinary review MUST keep the generic structural validator and MUST NOT require the adversarial no-findings prefix.
 
 ### 11.4 Review result schema
 
@@ -517,9 +523,11 @@ Both normal and adversarial review SHALL produce the same canonical structured p
 
 The root requires `verdict`, `summary`, and `findings`; each finding requires `severity`, `title`, and `body`. `file` and `line` are optional and MAY be `null`. Additional properties are forbidden. A non-null line MUST be a positive integer.
 
-The validator checks shape and positive line numbers. It does not independently prove that a returned path belongs to the selected target or that a line exists in the referenced revision. Paths and locations are provider claims and MUST be rendered without upgrading them into independently verified facts.
+The shared structural validator checks shape and positive line numbers and derives `pass` from zero findings and `needs_changes` from any finding. It does not independently prove that a returned path belongs to the selected target or that a line exists in the referenced revision. Paths and locations are provider claims and MUST be rendered without upgrading them into independently verified facts.
 
-Malformed structured output receives at most one same-session repair prompt. A second validation failure produces `E_SCHEMA` and MUST NOT be presented as a valid review. Human output for both review modes SHALL be rendered deterministically from the validated payload.
+Adversarial review additionally applies a specialization-only semantic completion check on top of that shared validator (empty-findings completed rationale contract above). Ordinary review does not.
+
+Malformed or semantically incomplete structured output receives at most one same-session repair prompt. A second validation failure produces `E_SCHEMA` and MUST NOT be presented as a valid review or terminal pass. Human output for both review modes SHALL be rendered deterministically from the validated payload.
 
 ### 11.5 `/grok:rescue`
 

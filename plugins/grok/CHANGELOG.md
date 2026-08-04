@@ -4,6 +4,18 @@
 
 Status: hardening candidate; not release-qualified.
 
+- Fixed adversarial review so plan/progress-only zero-finding provider payloads
+  cannot become terminal `pass`. Adversarial jobs wrap the shared structural
+  `validateReview` with a specialization-only semantic completion gate: empty
+  findings require the bounded `No material findings: Challenged: ...
+  Assessment: ... Decision: ship.` completion grammar, and bounded plan/progress
+  leading forms in either segment are rejected as `E_SCHEMA` without echoing
+  provider payload.
+  Exactly one same-session repair still uses existing `runStructuredReview`
+  behavior; a second semantic failure never publishes pass. Ordinary review,
+  schema, transport, App/stop review, profiles, and cleanup are unchanged.
+  Donor evidence records exact pins and rejected machinery under
+  `docs/issues/4-adversarial-review-donor-evidence.md`.
 - Fixed managed Codex setup so the installed `$grok:setup` skill requests
   approval before its one exact process. The approved action is explicitly a
   one-time, command-scoped unsandboxed setup execution because the host tool
