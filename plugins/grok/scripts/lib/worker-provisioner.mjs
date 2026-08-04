@@ -12,12 +12,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { CompanionError } from "./errors.mjs";
-import {
-  ensureChildExit,
-  openProvider,
-  providerCleanupIdentity,
-  taskEnvironment
-} from "./grok-provider.mjs";
+import { openProvider } from "./provider-acp-runtime.mjs";
+import { ensureChildExit, providerCleanupIdentity } from "./provider-process.mjs";
+import { taskEnvironment } from "./provider-task-environment.mjs";
 import { GrokWorktreeAcp } from "./grok-worktree-acp.mjs";
 import { processGroupGone } from "./process-control.mjs";
 import {

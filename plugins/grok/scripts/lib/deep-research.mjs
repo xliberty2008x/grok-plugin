@@ -16,20 +16,15 @@ import {
   isSuccessfulPromptStopReason
 } from "./acp-client.mjs";
 import { CompanionError } from "./errors.mjs";
-import {
-  assertProviderPlatform,
-  childEnvironment,
-  discoverGrok,
-  ensureChildExit,
-  inspectIsolation,
-  openProvider,
-  processStartToken
-} from "./grok-provider.mjs";
+import { assertProviderPlatform, childEnvironment, discoverGrok } from "./provider-core.mjs";
+import { ensureChildExit } from "./provider-process.mjs";
+import { inspectIsolation } from "./provider-profile.mjs";
+import { openProvider } from "./provider-acp-runtime.mjs";
 import { hostCommand } from "./host.mjs";
 import { integritySnapshot, assertUnchanged } from "./git-review.mjs";
 import { redactText } from "./redact.mjs";
 import { git } from "./workspace.mjs";
-import { processGroupGone } from "./process-control.mjs";
+import { processGroupGone, processStartToken } from "./process-control.mjs";
 import { captureExecutableFileIdentity } from "./executable-identity.mjs";
 import { resolveProviderExecutablePin } from "./provider-executable-pin.mjs";
 

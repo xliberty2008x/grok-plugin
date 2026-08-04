@@ -20,6 +20,7 @@
     "plugins/grok/mcp/server.mjs",
     "plugins/grok/scripts/grok-codex.mjs",
     "plugins/grok/scripts/grok-companion.mjs",
+    "plugins/grok/scripts/lib/grok-provider.mjs",
     "plugins/grok/scripts/lib/task-contract.mjs",
     "plugins/grok/scripts/session-lifecycle-hook.mjs",
     "plugins/grok/scripts/stop-review-gate-hook.mjs",
@@ -47,7 +48,7 @@
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
     "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b",
-    "policyDigest": "e902decdc0308ad0cfe36deb962983bf797c1144daa3da8e0fb4eb33738b0d86"
+    "policyDigest": "147793a803edb0c2ae4a14cd24a2228c7834845da21f9b294ad03fbf4a9d1dd5"
   },
   "dispositions": {
     "plugins/grok/scripts/grok-companion.mjs": {
@@ -671,7 +672,7 @@
     "plugins/grok/scripts/lib/deep-research.mjs": {
       "category": "product",
       "initialLines": 2094,
-      "lineCap": 2094,
+      "lineCap": 2089,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
@@ -680,26 +681,6 @@
           "key": "function:runDeepResearch#1",
           "initialLines": 654,
           "capLines": 654
-        }
-      ]
-    },
-    "plugins/grok/scripts/lib/grok-provider.mjs": {
-      "category": "product",
-      "initialLines": 5775,
-      "lineCap": 2153,
-      "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
-      "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
-      "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
-      "functions": [
-        {
-          "key": "function:openProvider#1",
-          "initialLines": 718,
-          "capLines": 718
-        },
-        {
-          "key": "function:runProvider#1",
-          "initialLines": 499,
-          "capLines": 499
         }
       ]
     },

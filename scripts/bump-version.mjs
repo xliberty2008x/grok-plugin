@@ -84,11 +84,11 @@ if (!/^Grok Companion for Claude Code and Codex \d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)
 }
 notice = notice.replace(/^Grok Companion for Claude Code and Codex \d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\./m, `Grok Companion for Claude Code and Codex ${nextVersion}.`);
 
-const providerPath = "plugins/grok/scripts/lib/grok-provider.mjs";
-let provider = fs.readFileSync(file(providerPath), "utf8");
+const providerRuntimePath = "plugins/grok/scripts/lib/provider-acp-runtime.mjs";
+let providerRuntime = fs.readFileSync(file(providerRuntimePath), "utf8");
 const clientVersionPattern = /(clientInfo\s*:\s*\{[\s\S]{0,300}?version\s*:\s*["'])[^"']+(["'])/;
-if (!clientVersionPattern.test(provider)) throw new Error("Could not find ACP clientInfo version.");
-provider = provider.replace(clientVersionPattern, `$1${nextVersion}$2`);
+if (!clientVersionPattern.test(providerRuntime)) throw new Error("Could not find ACP clientInfo version.");
+providerRuntime = providerRuntime.replace(clientVersionPattern, `$1${nextVersion}$2`);
 
 const updates = [
   ["package.json", serializeJson(packageJson)],
@@ -99,7 +99,7 @@ const updates = [
   ["plugins/grok/.codex-plugin/plugin.json", serializeJson(codexPluginManifest)],
   [changelogPath, changelog],
   [noticePath, notice],
-  [providerPath, provider]
+  [providerRuntimePath, providerRuntime]
 ];
 
 const changed = updates.filter(([relative, contents]) => atomicWrite(relative, contents)).map(([relative]) => relative);
