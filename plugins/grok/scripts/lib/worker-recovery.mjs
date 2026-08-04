@@ -24,13 +24,13 @@ import {
 } from "./state.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import {
-  acquireRecoveryCleanupFence,
-  recordWorkerProviderSpawnNoChild,
+  acquireRecoveryCleanupFence, recordWorkerProviderSpawnNoChild, verifyRecoveryCleanupFence
+} from "./worker-mutation-dispatch-admission.mjs";
+import {
   settleFailedDispatchCleanup,
   settleStartedWorkerLoss,
   settleUnstartedDispatchLoss,
-  transitionWorkerDispatch,
-  verifyRecoveryCleanupFence
+  transitionWorkerDispatch
 } from "./worker-mutation.mjs";
 import { assertDispatchContract } from "./worker-mutation-dispatch-contract.mjs";
 import { cancellationNonce } from "./worker-mutation-primitives.mjs";
