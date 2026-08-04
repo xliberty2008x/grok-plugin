@@ -3,7 +3,7 @@
  * an exact lost attempt, but it must never claim, launch, or replay work.
  */
 import { CompanionError } from "./errors.mjs";
-import { cleanupTaskRuntimeArtifacts } from "./grok-provider.mjs";
+import { cleanupTaskRuntimeArtifacts } from "./provider-controller-environments.mjs";
 import { sameHostSession } from "./host.mjs";
 import { processGroupGone, terminateOwnedProcess } from "./process-control.mjs";
 import {

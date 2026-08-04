@@ -71,6 +71,7 @@ import { workspaceState } from "../plugins/grok/scripts/lib/workspace.mjs";
 
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import { ROOT, git, initRepo, tempDir, waitFor } from "./helpers.mjs";
+import { patchPinnedFakeProviderCommands } from "./pinned-fake-grok.mjs";
 
 const THREAD_ID = "019f666a-6469-7cc1-9a8d-8c1adf61e103";
 const TURN_ID = "019f666e-4084-7902-8447-249f72043a37";
@@ -201,52 +202,7 @@ function installPinnedFakeControllerRuntime(fake, env) {
     ),
     "utf8"
   );
-  const providerFile = path.join(
-    pluginRoot,
-    "scripts",
-    "lib",
-    "grok-provider.mjs"
-  );
-  let providerSource = fs.readFileSync(providerFile, "utf8");
-  const fakeScript = JSON.stringify(wrapper);
-  const providerReplacements = [
-    [
-      'spawnSync(binary, ["--version"],',
-      `spawnSync(binary, [${fakeScript}, "--version"],`
-    ],
-    [
-      'spawnSync(binary, ["inspect", "--json"],',
-      `spawnSync(binary, [${fakeScript}, "inspect", "--json"],`
-    ],
-    [
-      'const args = ["--cwd", root,',
-      `const args = [${fakeScript}, "--cwd", root,`
-    ],
-    [
-      'spawnSync(binary, ["--help"],',
-      `spawnSync(binary, [${fakeScript}, "--help"],`
-    ],
-    [
-      'spawnSync(binary, ["agent", "--help"],',
-      `spawnSync(binary, [${fakeScript}, "agent", "--help"],`
-    ],
-    [
-      'spawnSync(binary, ["models"],',
-      `spawnSync(binary, [${fakeScript}, "models"],`
-    ]
-  ];
-  for (const [needle, replacement] of providerReplacements) {
-    const expectedOccurrences = needle === 'const args = ["--cwd", root,'
-      ? 2
-      : 1;
-    assert.equal(
-      providerSource.split(needle).length - 1,
-      expectedOccurrences,
-      `fixture must patch the exact provider command inventory: ${needle}`
-    );
-    providerSource = providerSource.replaceAll(needle, replacement);
-  }
-  fs.writeFileSync(providerFile, providerSource, "utf8");
+  patchPinnedFakeProviderCommands(pluginRoot, wrapper);
   const receipt = Object.freeze({
     ...TEST_PROVIDER_RECEIPT,
     providerLaunchBinding: pinned.binding,
