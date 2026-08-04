@@ -1474,7 +1474,7 @@ function writeSeededJob(stateRoot, job) {
 }
 
 test("static human launch surfaces use public worker projections", () => {
-  const source = { companion: fs.readFileSync(COMPANION, "utf8"), dispatch: fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/companion-dispatch.mjs"), "utf8"), handlers: fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/companion-handlers.mjs"), "utf8") };
+  const source = { research: fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/companion-research.mjs"), "utf8"), dispatch: fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/companion-dispatch.mjs"), "utf8"), handlers: fs.readFileSync(path.join(ROOT, "plugins/grok/scripts/lib/companion-handlers.mjs"), "utf8") };
   const acceptedStart = source.dispatch.indexOf(
     "if (launcherCode === 0 && !background && announce)"
   );
@@ -1505,10 +1505,10 @@ test("static human launch surfaces use public worker projections", () => {
     /\$\{finished\.(?:id|phase|progress|summary)\}/
   );
 
-  const researchStart = source.companion.indexOf("async function handleDeepResearch");
-  const researchBlock = source.companion.slice(
+  const researchStart = source.research.indexOf("async function handleDeepResearch");
+  const researchBlock = source.research.slice(
     researchStart,
-    source.companion.indexOf("async function startDeepResearchJob", researchStart)
+    source.research.indexOf("async function startDeepResearchJob", researchStart)
   );
   assert.match(
     researchBlock,
@@ -1519,10 +1519,10 @@ test("static human launch surfaces use public worker projections", () => {
     /\$\{finished\.(?:id|phase|progress|summary)\}/
   );
 
-  const liveStart = source.companion.indexOf("if (announce) {", researchStart);
-  const liveBlock = source.companion.slice(
+  const liveStart = source.research.indexOf("if (announce) {", researchStart);
+  const liveBlock = source.research.slice(
     liveStart,
-    source.companion.indexOf("if (finished.status ===", liveStart)
+    source.research.indexOf("if (finished.status ===", liveStart)
   );
   assert.match(
     liveBlock,
