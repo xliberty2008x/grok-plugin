@@ -871,9 +871,19 @@ test("portable paths normalize Windows separators", () => {
   );
 });
 
-test("checked-in observe baseline exactly covers all current file and function debt", () => {
+test("canonical source-structure command is pinned by project validation", () => {
+  const packageJson = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
+  assert.equal(
+    packageJson.scripts?.["check:source-structure"],
+    "node scripts/check-source-structure.mjs"
+  );
+  const validationSource = fs.readFileSync(path.join(ROOT, "scripts", "validate.mjs"), "utf8");
+  assert.match(validationSource, /\["check:source-structure"\] !== "node scripts\/check-source-structure\.mjs"/u);
+});
+
+test("checked-in ratchet baseline exactly covers all current file and function debt", () => {
   const config = loadSourceStructurePolicy({ root: ROOT });
-  assert.equal(config.mode, "observe");
+  assert.equal(config.mode, "ratchet");
   assert.deepEqual(config.extensions, [...SOURCE_STRUCTURE_EXTENSIONS]);
   assert.deepEqual(config.roots, [...SOURCE_STRUCTURE_ROOTS]);
   assert.equal(config.maxPhysicalLineBytes, SOURCE_STRUCTURE_MAX_PHYSICAL_LINE_BYTES);
