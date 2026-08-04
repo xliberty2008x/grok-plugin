@@ -41,6 +41,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/grok-review-app-target-collector.test.mjs",
     "tests/plugin-inventory.test.mjs",
     "tests/process-control-owned-identity.test.mjs",
+    "tests/provider-boundaries.test.mjs",
     "tests/provider-capability.test.mjs",
     "tests/source-structure-policy.test.mjs",
     "tests/task-contract-boundaries.test.mjs",

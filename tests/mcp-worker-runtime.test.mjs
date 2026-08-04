@@ -201,52 +201,48 @@ function installPinnedFakeControllerRuntime(fake, env) {
     ),
     "utf8"
   );
-  const providerFile = path.join(
-    pluginRoot,
-    "scripts",
-    "lib",
-    "grok-provider.mjs"
-  );
-  let providerSource = fs.readFileSync(providerFile, "utf8");
   const fakeScript = JSON.stringify(wrapper);
-  const providerReplacements = [
+  const providerPatches = [
     [
-      'spawnSync(binary, ["--version"],',
+      "provider-core.mjs", 1, 'spawnSync(binary, ["--version"],',
       `spawnSync(binary, [${fakeScript}, "--version"],`
     ],
     [
-      'spawnSync(binary, ["inspect", "--json"],',
+      "grok-provider.mjs", 1, 'spawnSync(binary, ["inspect", "--json"],',
       `spawnSync(binary, [${fakeScript}, "inspect", "--json"],`
     ],
     [
-      'const args = ["--cwd", root,',
+      "grok-provider.mjs", 2, 'const args = ["--cwd", root,',
       `const args = [${fakeScript}, "--cwd", root,`
     ],
     [
-      'spawnSync(binary, ["--help"],',
+      "grok-provider.mjs", 1, 'spawnSync(binary, ["--help"],',
       `spawnSync(binary, [${fakeScript}, "--help"],`
     ],
     [
-      'spawnSync(binary, ["agent", "--help"],',
+      "grok-provider.mjs", 1, 'spawnSync(binary, ["agent", "--help"],',
       `spawnSync(binary, [${fakeScript}, "agent", "--help"],`
     ],
     [
-      'spawnSync(binary, ["models"],',
+      "grok-provider.mjs", 1, 'spawnSync(binary, ["models"],',
       `spawnSync(binary, [${fakeScript}, "models"],`
     ]
   ];
-  for (const [needle, replacement] of providerReplacements) {
-    const expectedOccurrences = needle === 'const args = ["--cwd", root,'
-      ? 2
-      : 1;
+  const providerSources = new Map();
+  for (const [fileName, expectedOccurrences, needle, replacement] of providerPatches) {
+    const providerFile = path.join(pluginRoot, "scripts", "lib", fileName);
+    const providerSource = providerSources.get(providerFile)
+      ?? fs.readFileSync(providerFile, "utf8");
     assert.equal(
       providerSource.split(needle).length - 1,
       expectedOccurrences,
-      `fixture must patch the exact provider command inventory: ${needle}`
+      `fixture must patch the exact provider command inventory: ${fileName}:${needle}`
     );
-    providerSource = providerSource.replaceAll(needle, replacement);
+    providerSources.set(providerFile, providerSource.replaceAll(needle, replacement));
   }
-  fs.writeFileSync(providerFile, providerSource, "utf8");
+  for (const [providerFile, providerSource] of providerSources) {
+    fs.writeFileSync(providerFile, providerSource, "utf8");
+  }
   const receipt = Object.freeze({
     ...TEST_PROVIDER_RECEIPT,
     providerLaunchBinding: pinned.binding,
