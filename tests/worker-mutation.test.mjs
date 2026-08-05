@@ -788,45 +788,49 @@ async function cleanupPendingAbsentProvisioning(t, label) {
 }
 
 async function loadWorkerProvisionerWithProviderSeam(seam) {
-  const moduleFile = fileURLToPath(new URL(
-    "../plugins/grok/scripts/lib/worker-provisioner.mjs",
-    import.meta.url
-  ));
-  const seamKey = `__grokWorkerProvisionerSeam${
-    crypto.randomBytes(12).toString("hex")
-  }`;
-  globalThis[seamKey] = seam;
+  const moduleFile = fileURLToPath(new URL("../plugins/grok/scripts/lib/worker-provisioner.mjs", import.meta.url));
+  const seamImports = new Map([
+    ["./provider-acp-runtime.mjs", 'import { openProvider } from "./provider-acp-runtime.mjs";'],
+    ["./provider-process.mjs", 'import { ensureChildExit, providerCleanupIdentity } from "./provider-process.mjs";'],
+    ["./provider-task-environment.mjs", 'import { taskEnvironment } from "./provider-task-environment.mjs";']
+  ]);
+  const moduleSource = fs.readFileSync(moduleFile, "utf8");
+  for (const [specifier, declaration] of seamImports) {
+    assert.equal(
+      moduleSource.split(declaration).length - 1,
+      1,
+      `worker provisioner test seam import inventory drifted: ${specifier}`
+    );
+  }
+  assert.equal(
+    moduleSource.includes('from "./grok-provider.mjs"'),
+    false,
+    "worker provisioner must not regress through the provider facade"
+  );
+  const seamKey = `__grokWorkerProvisionerSeam${crypto.randomBytes(12).toString("hex")}`;
   const shimSource = `
     function seam() {
       const value = globalThis[${JSON.stringify(seamKey)}];
       if (!value) throw new Error("worker provisioner test seam was released");
       return value;
     }
-    export async function ensureChildExit(...args) {
-      return seam().ensureChildExit?.(...args);
-    }
-    export async function openProvider(...args) {
-      return seam().openProvider(...args);
-    }
-    export function providerCleanupIdentity(...args) {
-      return seam().providerCleanupIdentity?.(...args) ?? null;
-    }
-    export function taskEnvironment(...args) {
-      return seam().taskEnvironment(...args);
-    }
+    export async function ensureChildExit(...args) { return seam().ensureChildExit?.(...args); }
+    export async function openProvider(...args) { return seam().openProvider(...args); }
+    export function providerCleanupIdentity(...args) { return seam().providerCleanupIdentity?.(...args) ?? null; }
+    export function taskEnvironment(...args) { return seam().taskEnvironment(...args); }
   `;
-  const shimUrl = `data:text/javascript;base64,${
-    Buffer.from(shimSource).toString("base64")
-  }`;
+  const shimUrl = `data:text/javascript;base64,${Buffer.from(shimSource).toString("base64")}`;
   const moduleBase = pathToFileURL(moduleFile);
-  const source = fs.readFileSync(moduleFile, "utf8").replace(
+  const source = moduleSource.replace(
     /from "(\.\/[^"]+)"/g,
     (_match, specifier) => `from "${
-      specifier === "./grok-provider.mjs"
+      seamImports.has(specifier)
         ? shimUrl
         : new URL(specifier, moduleBase).href
     }"`
   );
+  assert.equal(source.split(`from "${shimUrl}"`).length - 1, 3);
+  globalThis[seamKey] = seam;
   try {
     const loaded = await import(`data:text/javascript;base64,${
       Buffer.from(source).toString("base64")
@@ -844,12 +848,7 @@ async function loadWorkerProvisionerWithProviderSeam(seam) {
 }
 
 function controllerEnvironmentSeam(counter) {
-  return function taskEnvironment(
-    stateDir,
-    _root,
-    _profile,
-    homeMarker
-  ) {
+  return function taskEnvironment(stateDir, _root, _profile, homeMarker) {
     counter.constructed += 1;
     const home = path.join(stateDir, "task-homes", homeMarker);
     const grokHome = path.join(home, ".grok");
@@ -2672,12 +2671,13 @@ test("reissue registration failure settles the exact preactivation planned diges
     intervalMs: 25
   });
 
-  const counter = { constructed: 0 };
+  const counter = { constructed: 0, opened: 0, cleanupInspected: 0 };
   let prepared = null;
   let reconciled = null;
   const loaded = await loadWorkerProvisionerWithProviderSeam({
     taskEnvironment: controllerEnvironmentSeam(counter),
     async openProvider({ providerLaunch }) {
+      counter.opened += 1;
       prepared = providerLaunch.prepare({
         executableIdentity: TEST_EXECUTABLE_IDENTITY
       });
@@ -2707,9 +2707,7 @@ test("reissue registration failure settles the exact preactivation planned diges
       error.code = "E_TEST_REGISTRATION";
       throw error;
     },
-    providerCleanupIdentity() {
-      return null;
-    }
+    providerCleanupIdentity() { counter.cleanupInspected += 1; return null; }
   });
   try {
     await assert.rejects(
@@ -2725,7 +2723,7 @@ test("reissue registration failure settles the exact preactivation planned diges
     loaded.release();
   }
 
-  assert.equal(counter.constructed, 1);
+  assert.deepEqual(counter, { constructed: 1, opened: 1, cleanupInspected: 1 });
   assert.equal(reconciled.reconciled, true);
   assert.equal(reconciled.settlement.settled, true);
   assert.equal(reconciled.settlement.replayed, false);
@@ -2758,13 +2756,14 @@ test("reissue registration failure settles the exact activated planned predecess
     `${fixture.workerId}-registration-activated`
   );
 
-  const counter = { constructed: 0 };
+  const counter = { constructed: 0, opened: 0, cleanupInspected: 0 };
   let prepared = null;
   let activation = null;
   let reconciled = null;
   const loaded = await loadWorkerProvisionerWithProviderSeam({
     taskEnvironment: controllerEnvironmentSeam(counter),
     async openProvider({ providerLaunch }) {
+      counter.opened += 1;
       prepared = providerLaunch.prepare({
         executableIdentity: TEST_EXECUTABLE_IDENTITY
       });
@@ -2812,9 +2811,7 @@ test("reissue registration failure settles the exact activated planned predecess
       error.code = "E_TEST_REGISTRATION";
       throw error;
     },
-    providerCleanupIdentity() {
-      return null;
-    }
+    providerCleanupIdentity() { counter.cleanupInspected += 1; return null; }
   });
   try {
     await assert.rejects(
@@ -2830,7 +2827,7 @@ test("reissue registration failure settles the exact activated planned predecess
     loaded.release();
   }
 
-  assert.equal(counter.constructed, 1);
+  assert.deepEqual(counter, { constructed: 1, opened: 1, cleanupInspected: 1 });
   assert.equal(reconciled.reconciled, true);
   assert.equal(reconciled.settlement.settled, true);
   assert.equal(reconciled.settlement.replayed, false);

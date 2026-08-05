@@ -5,7 +5,7 @@
  */
 
 import { CompanionError } from "./errors.mjs";
-import { validateReview } from "./grok-provider.mjs";
+import { validateReview } from "./provider-review-contract.mjs";
 
 /** Required prefix for empty-findings adversarial pass summaries. */
 export const ADVERSARIAL_NO_FINDINGS_PREFIX = "No material findings:";

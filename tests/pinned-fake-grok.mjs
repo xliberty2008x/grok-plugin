@@ -61,22 +61,22 @@ export function patchPinnedFakeProviderCommands(pluginRoot, wrapper) {
       `const args = [${wrapperLiteral}, "--cwd", root,`
     ],
     [
-      "grok-provider.mjs",
+      "provider-headless-runtime.mjs",
       'const args = ["--cwd", root,',
       `const args = [${wrapperLiteral}, "--cwd", root,`
     ],
     [
-      "grok-provider.mjs",
+      "provider-sessions.mjs",
       'spawnSync(binary, ["--help"],',
       `spawnSync(binary, [${wrapperLiteral}, "--help"],`
     ],
     [
-      "grok-provider.mjs",
+      "provider-sessions.mjs",
       'spawnSync(binary, ["agent", "--help"],',
       `spawnSync(binary, [${wrapperLiteral}, "agent", "--help"],`
     ],
     [
-      "grok-provider.mjs",
+      "provider-sessions.mjs",
       'spawnSync(binary, ["models"],',
       `spawnSync(binary, [${wrapperLiteral}, "models"],`
     ]
