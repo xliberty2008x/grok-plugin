@@ -5,11 +5,9 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { CompanionError } from "./errors.mjs";
+import { cleanupTaskRuntimeArtifacts } from "./provider-controller-environments.mjs";
 import {
-  cleanupTaskRuntimeArtifacts,
-  processStartToken
-} from "./grok-provider.mjs";
-import {
+  processStartToken,
   runSystemPs,
   signalOwnedProcess
 } from "./process-control.mjs";

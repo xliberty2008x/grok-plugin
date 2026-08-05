@@ -47,7 +47,7 @@
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
     "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b",
-    "policyDigest": "830f6e91a5d484754007baa6b14147f46ac8ca92cae548771cae66fa516dc66f"
+    "policyDigest": "608840ed4dcafa520e852570dfab6874e46e496a8cf1b2e5c5c6f0ffd41354b3"
   },
   "dispositions": {
     "plugins/grok/scripts/grok-companion.mjs": {
@@ -686,7 +686,7 @@
     "plugins/grok/scripts/lib/grok-provider.mjs": {
       "category": "product",
       "initialLines": 5775,
-      "lineCap": 3987,
+      "lineCap": 2153,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
@@ -700,16 +700,6 @@
           "key": "function:runProvider#1",
           "initialLines": 499,
           "capLines": 499
-        },
-        {
-          "key": "function:workerOwnerControllerEnvironment#1",
-          "initialLines": 344,
-          "capLines": 344
-        },
-        {
-          "key": "function:workerSessionCloseControllerEnvironment#1",
-          "initialLines": 320,
-          "capLines": 320
         }
       ]
     },
@@ -1156,7 +1146,7 @@
     "tests/mcp-worker-runtime.test.mjs": {
       "category": "tests",
       "initialLines": 3459,
-      "lineCap": 3455,
+      "lineCap": 3415,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",

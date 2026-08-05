@@ -22,7 +22,7 @@ import {
   assertProviderLaunchBinding,
   providerLaunchBindingDigest as digestProviderLaunchBinding
 } from "./provider-executable-pin.mjs";
-import { cleanupTaskRuntimeArtifacts } from "./grok-provider.mjs";
+import { cleanupTaskRuntimeArtifacts } from "./provider-controller-environments.mjs";
 import { sameHostSession } from "./host.mjs";
 import {
   generateId,
