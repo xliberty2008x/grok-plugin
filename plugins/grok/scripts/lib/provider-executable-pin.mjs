@@ -381,7 +381,9 @@ function donorArchitectureName(arch) {
   return arch;
 }
 
-function managedDirectoryIdentity(directory, label) {
+function managedDirectoryIdentity(directory, label, {
+  includeMtime = true
+} = {}) {
   try {
     const canonical = fs.realpathSync(directory);
     const stat = fs.lstatSync(canonical);
@@ -400,7 +402,7 @@ function managedDirectoryIdentity(directory, label) {
       inode: String(stat.ino),
       mode: stat.mode,
       uid: currentUid === null ? null : stat.uid,
-      mtimeMs: stat.mtimeMs
+      ...(includeMtime ? { mtimeMs: stat.mtimeMs } : {})
     });
   } catch {
     throw new CompanionError(
@@ -408,6 +410,18 @@ function managedDirectoryIdentity(directory, label) {
       `The active Grok ${label} has unsafe ownership, permissions, or indirection.`
     );
   }
+}
+
+function managedTargetSafeNumber(value) {
+  if (typeof value !== "bigint"
+    || value < 0n
+    || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new CompanionError(
+      "E_GROK_SOURCE",
+      "The active managed Grok target has unsupported filesystem metadata."
+    );
+  }
+  return Number(value);
 }
 
 function managedInstallation({
@@ -439,7 +453,8 @@ function managedInstallation({
   }
   const homeIdentity = managedDirectoryIdentity(
     canonicalHome,
-    "managed home"
+    "managed home",
+    { includeMtime: false }
   );
   const binIdentity = managedDirectoryIdentity(
     binDirectory,
@@ -534,7 +549,7 @@ function managedInstallation({
   }
   let targetStat;
   try {
-    targetStat = fs.lstatSync(target);
+    targetStat = fs.lstatSync(target, { bigint: true });
     fs.accessSync(target, fs.constants.X_OK);
   } catch {
     throw new CompanionError(
@@ -542,26 +557,38 @@ function managedInstallation({
       "The active managed Grok target is missing or unreadable."
     );
   }
+  const targetMode = managedTargetSafeNumber(targetStat.mode);
+  const targetSize = managedTargetSafeNumber(targetStat.size);
+  const targetMtimeMs = managedTargetSafeNumber(targetStat.mtimeMs);
   if (!targetStat.isFile()
     || targetStat.isSymbolicLink()
-    || (targetStat.mode & 0o111) === 0
-    || (targetStat.mode & 0o022) !== 0
-    || (currentUid !== null && targetStat.uid !== currentUid)) {
+    || (targetMode & 0o111) === 0
+    || (targetMode & 0o022) !== 0
+    || (currentUid !== null && targetStat.uid !== BigInt(currentUid))) {
     throw new CompanionError(
       "E_GROK_SOURCE",
       "The active managed Grok target has unsafe ownership or permissions."
     );
   }
   const targetIdentity = stableDigest({
-    device: String(targetStat.dev),
-    inode: String(targetStat.ino),
-    mode: targetStat.mode,
-    uid: currentUid === null ? null : targetStat.uid,
-    size: targetStat.size,
-    mtimeMs: targetStat.mtimeMs
+    device: targetStat.dev.toString(),
+    inode: targetStat.ino.toString(),
+    mode: targetMode,
+    uid: currentUid === null ? null : targetStat.uid.toString(),
+    size: targetSize,
+    mtimeMs: targetMtimeMs
+  });
+  const targetFileIdentity = Object.freeze({
+    canonicalPath: target,
+    device: targetStat.dev.toString(),
+    inode: targetStat.ino.toString(),
+    mode: targetMode,
+    size: targetSize,
+    mtimeMs: targetMtimeMs
   });
   return Object.freeze({
     canonicalPath: target,
+    targetFileIdentity,
     release: Object.freeze({
       releaseRecognition: "managed-observed",
       releaseSource: "managed-observed-v1",
@@ -591,6 +618,15 @@ function managedInstallation({
       target
     })
   });
+}
+
+function sameManagedTargetIdentity(captured, expected) {
+  return captured.canonicalPath === expected.canonicalPath
+    && captured.device === expected.device
+    && captured.inode === expected.inode
+    && captured.mode === expected.mode
+    && captured.size === expected.size
+    && captured.mtimeMs === expected.mtimeMs;
 }
 
 /**
@@ -635,6 +671,12 @@ export function discoverManagedRawGrokExecutable({
       releases,
       managedRelease: managed.release
     });
+    if (!sameManagedTargetIdentity(captured, managed.targetFileIdentity)) {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "The active managed Grok source changed while it was captured."
+      );
+    }
     let afterManaged;
     try {
       afterManaged = managedInstallation({ grokHome, platform, arch });
@@ -698,6 +740,7 @@ function removeNewPinArtifacts(layout, pinRef) {
 function managedVersionEnvironment(env) {
   const allowed = [
     "HOME",
+    "GROK_HOME",
     "USER",
     "LOGNAME",
     "TMPDIR",
@@ -727,9 +770,12 @@ function finalizeManagedPinnedAttestation(materialized, env) {
     maxBuffer: MAX_VERSION_OUTPUT_BYTES,
     env: managedVersionEnvironment(env)
   });
-  const output = `${run.stdout || ""} ${run.stderr || ""}`.trim();
+  const output = [run.stdout || "", run.stderr || ""]
+    .filter(Boolean)
+    .join("\n")
+    .replace(/\r?\n$/, "");
   const versionMatch = output.match(
-    /(?:^|\s)(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?=$|\s)/
+    /^grok ((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?)(?= |$)/
   );
   if (run.status !== 0
     || run.error
@@ -740,16 +786,29 @@ function finalizeManagedPinnedAttestation(materialized, env) {
       "The private managed Grok copy did not report its filename-bound stable version."
     );
   }
-  const buildMatch = output.match(/\(([a-zA-Z0-9._-]{1,128})\)/);
-  const channelMatch = output.match(/\[([a-zA-Z0-9._-]{1,64})\]/);
-  if (!buildMatch || channelMatch?.[1] !== "stable") {
+  const recordMatch = output.match(
+    /^grok ((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?)(?: \(([a-zA-Z0-9._-]{1,128})\))?(?: \[([a-zA-Z0-9._-]{1,64})\])?$/
+  );
+  if (!recordMatch) {
     throw new CompanionError(
       "E_GROK_VERSION",
-      "The private managed Grok copy did not report a build identity on the stable channel."
+      "The private managed Grok copy did not report its filename-bound stable version."
     );
   }
-  const channel = channelMatch[1];
+  if (!recordMatch[2]) {
+    throw new CompanionError(
+      "E_GROK_VERSION",
+      "The private managed Grok copy did not report a build identity."
+    );
+  }
+  if (recordMatch[3] && recordMatch[3] !== "stable") {
+    throw new CompanionError(
+      "E_GROK_VERSION",
+      "The private managed Grok copy explicitly reported a non-stable channel."
+    );
+  }
   const prior = materialized.attestation;
+  const channel = recordMatch[3] || prior.channel;
   const attestation = createManagedObservedAttestation(materialized, {
     releaseRecognition: prior.releaseRecognition,
     releaseSource: prior.releaseSource,
@@ -757,7 +816,7 @@ function finalizeManagedPinnedAttestation(materialized, env) {
     platform: prior.platform,
     arch: prior.arch,
     version: prior.version,
-    buildCommit: buildMatch[1],
+    buildCommit: recordMatch[2],
     channel,
     size: prior.size,
     executableDigest: prior.executableDigest
