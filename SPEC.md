@@ -145,6 +145,15 @@ Setup SHALL recognize two executable trust paths:
    are acceptable discovery inputs. Arbitrary unfamiliar `GROK_BIN` or `PATH`
    executables MUST fail with `E_GROK_SOURCE`.
 
+Unrelated top-level `$GROK_HOME` bookkeeping MAY change while the executable is
+captured without becoming managed-source drift. Setup MUST still bind the
+canonical managed home by device, inode, mode, and owner; retain the managed
+bin/target-directory identities; require the captured file's canonical path,
+device, inode, mode, size, and normalized modification time to equal the first
+validated target observation; and repeat the critical managed-source
+observation after capture. A transient active target, link, managed directory,
+config, or executable substitution MUST fail closed.
+
 Before any candidate is executed, setup MUST copy and hash it into the existing
 private immutable provider pin and re-attest the copied bytes. Every `--version`,
 authentication, isolation, ACP v1, session-loading, and capability probe MUST
@@ -153,6 +162,21 @@ mismatch or source/copy drift MUST fail with `E_PROCESS_IDENTITY`; absence of
 any candidate is `E_GROK_NOT_FOUND`; a malformed or below-floor version is
 `E_GROK_VERSION`; and missing runtime behavior remains `E_CAPABILITY`. Only
 `E_GROK_NOT_FOUND` may recommend installation.
+
+The private managed copy's `--version` output MUST be one complete,
+unambiguous `grok VERSION (BUILD)` record with an optional bracketed channel.
+The version MUST equal the stable SemVer version already bound from the active
+managed target filename and the build identity MUST be present. A printed
+channel MUST be exactly `stable`; an explicitly non-stable channel MUST fail
+with a distinct diagnostic. Because Grok Build derives the suffix from a
+best-effort display cache, an omitted suffix SHALL retain the already-bound
+`managed-observed` admission policy. That policy is Companion's bounded local
+trust rule for the active managed artifact; it is not proof of remote stable
+release membership or of the user's configured updater channel. Extra records,
+trailing output, or malformed fields MUST fail closed. Setup MUST keep the
+child-recursion marker, preserve the admitted `GROK_HOME`, and MUST NOT invoke
+the updater, mutate `version.json`, or require a network lookup to recover
+optional display text.
 
 Executable-attestation schema v2 SHALL persist `managed-observed` provenance,
 version, observed build, stable channel, platform, architecture,

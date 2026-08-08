@@ -4,6 +4,25 @@
 
 Status: hardening candidate; not release-qualified.
 
+- Fixed managed-observed setup for Grok Build 1.0.0, whose exact private
+  child process may omit the display-only `[stable]` suffix from `--version`.
+  Setup now requires one whole unambiguous `grok VERSION (BUILD)` record,
+  rejects an explicit non-stable suffix, and reports a missing build identity
+  separately. Missing display text retains the existing managed-observed
+  stable admission only after the managed layout, installer, ownership,
+  stable-filename, exact-byte copy, and source-stability checks; it does not
+  claim remote release membership or the user's configured updater channel.
+  The private observation also preserves a custom `GROK_HOME`. A real installed
+  setup exposed unrelated top-level Grok-home bookkeeping churn as a false
+  source-drift signal. Setup now ignores only that root-directory mtime while
+  retaining its canonical inode/ownership/mode identity, managed bin/target
+  directory identities, link/config checks, and the second source snapshot;
+  it additionally requires the captured file identity to equal the first
+  validated target identity so transient target substitution still fails
+  closed. No updater/network lookup was added; immutable pinning, launch
+  re-attestation, receipt invalidation, and capability probing are unchanged.
+  Donor and live-reproduction evidence is recorded in
+  `docs/issues/90-stable-version-output-donor-evidence.md`.
 - Fixed adversarial review so plan/progress-only zero-finding provider payloads
   cannot become terminal `pass`. Adversarial jobs wrap the shared structural
   `validateReview` with a specialization-only semantic completion gate: empty
