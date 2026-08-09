@@ -25,12 +25,10 @@ import {
   runStructuredReview,
   REVIEW_SCHEMA,
   DEFAULT_REVIEW_REPAIR_PROMPT,
-  MAX_SUGGESTION_REPLACEMENT_BYTES,
   resolveTrustedOutputSchema,
   selectAcpPermissionOption,
   taskCredentialEnvironment,
   taskEnvironment,
-  validateAppReview,
   validateReview
 } from "../plugins/grok/scripts/lib/grok-provider.mjs";
 import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
@@ -2060,137 +2058,56 @@ test("resolveTrustedOutputSchema defaults to REVIEW_SCHEMA and bounds explicit s
   );
 });
 
-test("validateAppReview accepts safe suggestions and degrades unsafe ones without mutation", () => {
-  const safe = validateAppReview({
-    summary: "One fixable defect.",
-    findings: [{
-      severity: "high",
-      title: "Missing guard",
-      body: "Add a null check.",
-      file: "src/a.js",
-      line: 2,
-      suggestion: { startLine: 2, endLine: 3, replacement: "if (!x) return;\nuse(x);\n" }
-    }]
-  });
-  assert.equal(safe.verdict, "needs_changes");
-  assert.deepEqual(safe.findings[0].suggestion, {
-    startLine: 2,
-    endLine: 3,
-    replacement: "if (!x) return;\nuse(x);\n"
-  });
-
-  const oversized = "y".repeat(MAX_SUGGESTION_REPLACEMENT_BYTES + 1);
-  const degraded = validateAppReview({
-    summary: "Unsafe suggestion degrades.",
-    findings: [{
-      severity: "medium",
-      title: "Too big",
-      body: "Replacement exceeds limit.",
-      file: "src/a.js",
-      line: 1,
-      suggestion: { startLine: 1, endLine: 1, replacement: oversized }
-    }]
-  });
-  assert.equal(degraded.findings[0].suggestion, undefined);
-  assert.equal(degraded.findings[0].title, "Too big");
-  // Original oversized text is not truncated into the result.
-  assert.equal(JSON.stringify(degraded).includes(oversized), false);
-
-  const zeroLine = validateAppReview({
-    summary: "Zero line degrades.",
-    findings: [{
-      severity: "low",
-      title: "Bad range",
-      body: "startLine zero is unsafe.",
-      file: "src/a.js",
-      line: 1,
-      suggestion: { startLine: 0, endLine: 1, replacement: "ok\n" }
-    }]
-  });
-  assert.equal(zeroLine.findings[0].suggestion, undefined);
-
-  const secretLike = validateAppReview({
-    summary: "Secret-like replacement degrades.",
-    findings: [{
-      severity: "critical",
-      title: "Credential exposure",
-      body: "Do not echo tokens into a suggestion.",
-      file: "src/a.js",
-      line: 1,
-      suggestion: {
-        startLine: 1,
-        endLine: 1,
-        replacement: "const token = \"ghp_abcdefghijklmnopqrstuvwxyz\";\n"
-      }
-    }]
-  });
-  assert.equal(secretLike.findings[0].suggestion, undefined);
-  assert.equal(
-    JSON.stringify(secretLike).includes("ghp_abcdefghijklmnopqrstuvwxyz"),
-    false
-  );
-
-  assert.throws(
-    () => validateAppReview({
-      summary: "Malformed suggestion structure.",
-      findings: [{
-        severity: "low",
-        title: "Bad",
-        body: "Extra key.",
-        suggestion: { startLine: 1, endLine: 1, replacement: "x", extra: true }
-      }]
-    }),
-    (error) => error?.code === "E_SCHEMA"
-  );
-
-  assert.throws(
-    () => validateAppReview({
-      verdict: "pass",
-      summary: "No model verdict.",
-      findings: []
-    }),
-    (error) => error?.code === "E_SCHEMA"
-  );
-
-  // Generic validator still rejects suggestions (Worker Protocol v1 wire shape).
-  assert.throws(
-    () => validateReview({
-      summary: "Generic path.",
-      findings: [{
-        severity: "low",
-        title: "No suggestion field",
-        body: "Generic schema only.",
-        suggestion: { startLine: 1, endLine: 1, replacement: "x" }
-      }]
-    }),
-    (error) => error?.code === "E_SCHEMA"
-  );
-
-  assert.throws(
-    () => validateAppReview({
-      summary: "Bad path.",
-      findings: [{
-        severity: "low",
-        title: "Traversal",
-        body: "Path must be repo-relative.",
-        file: "../secret",
-        line: 1
-      }]
-    }),
-    (error) => error?.code === "E_SCHEMA"
-  );
-});
-
 test("runStructuredReview accepts explicit trusted schema, validator, and repair prompt", async () => {
-  const appSchema = JSON.parse(fs.readFileSync(
-    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../apps/grok-review-app/schemas/review-output.schema.json"),
-    "utf8"
-  ));
-  const customRepair = "APP_REPAIR_PROMPT_UNIQUE_TOKEN: return only summary and findings with optional suggestion.";
+  const closedSchema = {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object",
+    additionalProperties: false,
+    required: ["summary", "findings"],
+    properties: {
+      summary: { type: "string" },
+      findings: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["severity", "title", "body"],
+          properties: {
+            severity: { enum: ["critical", "high", "medium", "low", "info"] },
+            title: { type: "string" },
+            body: { type: "string" },
+            file: { type: ["string", "null"] },
+            line: { type: ["integer", "null"] },
+            suggestion: {
+              type: "object",
+              additionalProperties: false,
+              required: ["startLine", "endLine", "replacement"],
+              properties: {
+                startLine: { type: "integer", minimum: 1 },
+                endLine: { type: "integer", minimum: 1 },
+                replacement: { type: "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+  const validateClosedReview = (value) => {
+    if (typeof value?.summary !== "string" || !Array.isArray(value?.findings)) {
+      throw new CompanionError("E_SCHEMA", "Custom review output did not match the test schema.");
+    }
+    return {
+      verdict: value.findings.length === 0 ? "pass" : "needs_changes",
+      summary: value.summary,
+      findings: value.findings
+    };
+  };
+  const customRepair = "CUSTOM_REPAIR_PROMPT_UNIQUE_TOKEN: return only summary and findings with optional suggestion.";
   await withFake({
     invalidReviewFirst: true,
     review: {
-      summary: "App suggestion path.",
+      summary: "Custom suggestion path.",
       findings: [{
         severity: "high",
         title: "Fix me",
@@ -2205,10 +2122,10 @@ test("runStructuredReview accepts explicit trusted schema, validator, and repair
     const result = await runStructuredReview({
       root,
       profile: profileFor("review"),
-      prompt: "App review",
+      prompt: "Custom review",
       stateDir: tempDir("provider-state-"),
-      outputSchema: appSchema,
-      validator: validateAppReview,
+      outputSchema: closedSchema,
+      validator: validateClosedReview,
       repairPrompt: customRepair
     });
     assert.equal(result.review.verdict, "needs_changes");
@@ -2220,10 +2137,10 @@ test("runStructuredReview accepts explicit trusted schema, validator, and repair
     const reviews = readFakeLog(fake.logFile).filter((entry) => entry.event === "headless");
     assert.equal(reviews.length, 2);
     const schemaArg = reviews[0].args[reviews[0].args.indexOf("--json-schema") + 1];
-    assert.equal(schemaArg, JSON.stringify(appSchema));
+    assert.equal(schemaArg, JSON.stringify(closedSchema));
     assert.notEqual(schemaArg, JSON.stringify(REVIEW_SCHEMA));
     // Repair attempt uses the same trusted schema and the explicit repair prompt.
-    assert.equal(reviews[1].args[reviews[1].args.indexOf("--json-schema") + 1], JSON.stringify(appSchema));
+    assert.equal(reviews[1].args[reviews[1].args.indexOf("--json-schema") + 1], JSON.stringify(closedSchema));
     assert.equal(reviews[1].prompt, customRepair);
   });
 });

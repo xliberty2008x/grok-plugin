@@ -17,10 +17,8 @@ export const REVIEW_SCHEMA = Object.freeze(JSON.parse(
 ));
 /** Default same-session repair prompt for generic structured reviews. */
 export const DEFAULT_REVIEW_REPAIR_PROMPT = "Your previous response was not valid review JSON. Return only one JSON object with exactly summary and findings. Omit verdict; the runtime derives pass from zero findings and needs_changes from one or more findings. Preserve substantive findings and use repository-relative paths.";
-/** App-only suggestion replacement ceiling (UTF-8 bytes). */
+/** Suggestion replacement ceiling shared with review publication (UTF-8 bytes). */
 export const MAX_SUGGESTION_REPLACEMENT_BYTES = 16 * 1024;
-/** Aggregate validated App review JSON ceiling (UTF-8 bytes). */
-export const MAX_APP_REVIEW_OUTPUT_BYTES = 512 * 1024;
 
 export function outputSchemaDigest(outputSchema) {
   if (outputSchema == null) return null;
@@ -130,136 +128,6 @@ export function validateReview(value) {
     summary: redactText(value.summary.trim()),
     findings
   };
-}
-
-/**
- * Whether a suggestion object has the exact App structural shape
- * `{ startLine, endLine, replacement }` with correct types.
- * Safety (bounds, safe integers range order) is checked separately so unsafe
- * but structured suggestions can degrade to ordinary findings.
- * @param {unknown} value
- * @returns {boolean}
- */
-function isAppSuggestionStructure(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const keys = Object.keys(value);
-  if (keys.length !== 3) return false;
-  if (!keys.includes("startLine") || !keys.includes("endLine") || !keys.includes("replacement")) {
-    return false;
-  }
-  return typeof value.startLine === "number"
-    && typeof value.endLine === "number"
-    && typeof value.replacement === "string";
-}
-
-/**
- * Safe suggestion: exact structure, safe positive integers, ordered range,
- * and replacement within the 16 KiB UTF-8 ceiling. Never mutates replacement.
- * @param {unknown} value
- * @returns {value is { startLine: number, endLine: number, replacement: string }}
- */
-function isSafeAppSuggestion(value) {
-  if (!isAppSuggestionStructure(value)) return false;
-  if (!Number.isSafeInteger(value.startLine) || !Number.isSafeInteger(value.endLine)) return false;
-  if (value.startLine < 1 || value.endLine < value.startLine) return false;
-  if (Buffer.byteLength(value.replacement, "utf8") > MAX_SUGGESTION_REPLACEMENT_BYTES) return false;
-  if (redactText(value.replacement) !== value.replacement) return false;
-  return true;
-}
-
-/**
- * App-only review validator: summary/findings plus optional exact suggestion.
- * Structurally valid but unsafe suggestions degrade to ordinary findings
- * without mutating or truncating replacement text. Aggregate output is bounded.
- * Suggestions never enter Worker Protocol v1 (this path is App-direct only).
- * @param {unknown} value
- * @returns {{ verdict: "pass"|"needs_changes", summary: string, findings: object[] }}
- */
-export function validateAppReview(value) {
-  const rootKeys = value && typeof value === "object" && !Array.isArray(value) ? Object.keys(value) : [];
-  const allowedKeys = new Set(["summary", "findings"]);
-  const findingKeys = new Set(["severity", "title", "body", "file", "line", "suggestion"]);
-
-  const findingsOk = Array.isArray(value?.findings) && value.findings.length <= 200 && value.findings.every((f) => {
-    if (!f || typeof f !== "object" || Array.isArray(f)) return false;
-    if (!Object.keys(f).every((key) => findingKeys.has(key))) return false;
-    if (!["critical", "high", "medium", "low", "info"].includes(f.severity)) return false;
-    if (typeof f.title !== "string" || !f.title.trim() || f.title.length > 240) return false;
-    if (typeof f.body !== "string" || !f.body.trim() || f.body.length > 6000) return false;
-    if (!reviewPathOk(f.file)) return false;
-    if (!(f.line === undefined || f.line === null || (Number.isInteger(f.line) && f.line >= 1))) return false;
-    if (f.suggestion === undefined) return true;
-    // Malformed structure fails validation; unsafe-but-structured degrades later.
-    return isAppSuggestionStructure(f.suggestion);
-  });
-
-  const ok = Boolean(
-    value
-    && typeof value === "object"
-    && !Array.isArray(value)
-    && rootKeys.every((key) => allowedKeys.has(key))
-    && typeof value.summary === "string"
-    && value.summary.trim()
-    && value.summary.length <= 2000
-    && findingsOk
-  );
-  if (!ok) {
-    const details = {
-      rootKeys: rootKeys.filter((key) => allowedKeys.has(key)).slice(0, 24),
-      hasUnknownRootKeys: rootKeys.some((key) => !allowedKeys.has(key)),
-      summaryType: typeof value?.summary,
-      findingsCount: Array.isArray(value?.findings) ? value.findings.length : null,
-      findingsShapeOk: findingsOk,
-      hint: "Return only summary and findings. Optional suggestion must be exactly {startLine,endLine,replacement}. Omit verdict."
-    };
-    try {
-      details.payloadDigest = crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
-    } catch {
-      details.payloadDigest = null;
-    }
-    throw new CompanionError("E_SCHEMA", "Grok App review output did not match the required schema.", details);
-  }
-
-  const findings = value.findings.map((f) => {
-    const finding = {
-      severity: f.severity,
-      title: redactText(f.title.trim()),
-      body: redactText(f.body.trim()),
-      ...(f.file === undefined ? {} : { file: f.file === null ? null : redactText(f.file.trim().replace(/\\/g, "/")) }),
-      ...(f.line === undefined ? {} : { line: f.line })
-    };
-    if (f.suggestion !== undefined && isSafeAppSuggestion(f.suggestion)) {
-      // Preserve replacement bytes exactly (no redact/truncate). Title/body already redacted.
-      finding.suggestion = {
-        startLine: f.suggestion.startLine,
-        endLine: f.suggestion.endLine,
-        replacement: f.suggestion.replacement
-      };
-    }
-    // Unsafe structured suggestion: degrade to ordinary finding (omit suggestion).
-    return finding;
-  });
-
-  const review = {
-    verdict: findings.length === 0 ? "pass" : "needs_changes",
-    summary: redactText(value.summary.trim()),
-    findings
-  };
-
-  let serialized;
-  try {
-    serialized = JSON.stringify(review);
-  } catch {
-    throw new CompanionError("E_SCHEMA", "Grok App review output is not JSON-serializable.");
-  }
-  if (Buffer.byteLength(serialized, "utf8") > MAX_APP_REVIEW_OUTPUT_BYTES) {
-    throw new CompanionError(
-      "E_SCHEMA",
-      `Grok App review output exceeds ${MAX_APP_REVIEW_OUTPUT_BYTES} bytes.`,
-      { bytes: Buffer.byteLength(serialized, "utf8") }
-    );
-  }
-  return review;
 }
 
 /**

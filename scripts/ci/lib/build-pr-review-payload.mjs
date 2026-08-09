@@ -1,5 +1,5 @@
 /**
- * Map companion / App review JSON + RIGHT-side diff targets to a GitHub
+ * Map structured review JSON + RIGHT-side diff targets to a GitHub
  * create-review body (always event COMMENT).
  *
  * @typedef {{ severity: string, title: string, body: string, file?: string|null, line?: number|null, suggestion?: { startLine: number, endLine: number, replacement: string }|null }} Finding

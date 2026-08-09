@@ -10,7 +10,7 @@ that structurally satisfied the shared review schema. `validateReview` derived
 `verdict: pass` from empty `findings`, so incomplete “I will review…” summaries
 became terminal pass after `EndTurn`. Ordinary reviews in the same campaign
 were substantive negative controls. Shared structural validation, schema,
-provider transport, App review, stop review, and security profiles must stay
+provider transport, structured review, stop review, and security profiles must stay
 unchanged.
 
 ## Decision

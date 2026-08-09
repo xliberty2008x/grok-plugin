@@ -114,7 +114,7 @@ export function requestDuringProviderStartup(client, method, params, timeoutMs, 
 }
 
 /**
- * Repository-relative path check shared by generic and App review validators.
+ * Repository-relative path check shared by review validators.
  * @param {unknown} file
  * @returns {boolean}
  */
