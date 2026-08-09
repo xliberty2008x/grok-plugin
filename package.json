@@ -30,11 +30,7 @@
     "worker:prove": "node scripts/worker-broker-evidence.mjs prove",
     "worker:phase3:evidence": "node scripts/worker-broker-phase3-evidence.mjs",
     "worker:verify": "node scripts/worker-broker-evidence.mjs verify",
-    "worker:qualify": "node scripts/worker-broker-evidence.mjs qualify",
-    "grok:ci-auth:sync": "node scripts/sync-grok-ci-auth.mjs",
-    "grok:ci-auth:install": "node scripts/install-grok-ci-auth-sync.mjs install",
-    "grok:ci-auth:status": "node scripts/install-grok-ci-auth-sync.mjs status",
-    "grok:ci-auth:uninstall": "node scripts/install-grok-ci-auth-sync.mjs uninstall"
+    "worker:qualify": "node scripts/worker-broker-evidence.mjs qualify"
   },
   "license": "Apache-2.0",
   "devDependencies": {

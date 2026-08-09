@@ -38,14 +38,6 @@ This metrics update is post-qualification documentation and is not part of the e
 
 > **External processing:** The CLI runs locally, but model requests are processed through Grok/xAI services. Task prompts, review context collected by the plugin, repository content selected by Grok task tools, command output, imported Claude context, and the user-visible subset of imported Codex context may be processed under your Grok account, organization policy, and applicable xAI terms. Do not delegate material that should not cross that boundary. See [Data boundary](#data-boundary) and [Security model](#execution-and-security-model).
 
-> **Private GitHub App review:** The central, install-only Grok PR review App
-> reviews installed repositories without a target-repository workflow, secret,
-> watcher, or integration file. `grok-plugin` uses the App-only path; the
-> central `.github/workflows/grok-review-app-worker.yml`, central
-> `GROK_AUTH_JSON`, and its single auth watcher remain required. See the
-> [App architecture](apps/grok-review-app/README.md) and
-> [deployment/migration runbook](docs/operations/private-grok-review-app.md).
-
 ---
 
 ## Table of contents
@@ -682,11 +674,6 @@ CI matrix:
 | windows-latest | 18.18.2, 22.x | `npm run validate` + `node --test tests/windows-neutral.test.mjs` only |
 
 A trusted, Codex-equipped self-hosted macOS runner may additionally run `npm run test:installed-codex` on `main` pushes or explicit workflow dispatch when `CODEX_PLUGIN_RUNNER_ENABLED=true`. With an authenticated Grok/Codex runner and `CODEX_GROK_NATURAL_E2E_ENABLED=true`, a separate protected job updates the installed snapshot and runs `npm run test:natural-codex`: a new natural Codex task must invoke the installed `$grok:rescue`, complete a real Grok job, persist a passed host check, preserve the worktree, and remove transient auth/profile artifacts. Neither trusted job executes pull-request code. CI validates commits; it does not deploy them into your desktop Codex cache. Run `npm run codex:update-local`, then start a **new Codex task** so the app loads the refreshed skill text and runtime snapshot.
-
-- **Grok Review App:** installed repositories receive informational reviews on
-  non-draft PRs without a target-repository workflow or `GROK_AUTH_JSON`. See
-  [CONTRIBUTING.md](CONTRIBUTING.md).
-
 
 Release promotion is fail-closed. `release-plan.json` declares the change class,
 target, stage, and both supported hosts. RC/stable validation requires one

@@ -32,7 +32,7 @@ Status: hardening candidate; not release-qualified.
   provider payload.
   Exactly one same-session repair still uses existing `runStructuredReview`
   behavior; a second semantic failure never publishes pass. Ordinary review,
-  schema, transport, App/stop review, profiles, and cleanup are unchanged.
+  schema, transport, structured/stop review, profiles, and cleanup are unchanged.
   Donor evidence records exact pins and rejected machinery under
   `docs/issues/4-adversarial-review-donor-evidence.md`.
 - Fixed managed Codex setup so the installed `$grok:setup` skill requests

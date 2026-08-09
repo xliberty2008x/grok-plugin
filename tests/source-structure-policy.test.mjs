@@ -699,8 +699,9 @@ test("excluded and outside source edges plus replaced roots fail closed", () => 
   assert.ok(codes(unsafeEdges, "error").has("excluded-source-edge"));
   assert.ok(codes(unsafeEdges, "error").has("outside-source-root-edge"));
 
-  fs.rmSync(path.join(root, "apps"), { recursive: true });
-  fs.writeFileSync(path.join(root, "apps"), "not a directory\n");
+  const replacedRootName = SOURCE_STRUCTURE_ROOTS[0];
+  fs.rmSync(path.join(root, replacedRootName), { recursive: true });
+  fs.writeFileSync(path.join(root, replacedRootName), "not a directory\n");
   const replacedRoot = evaluateSourceStructure({ root, config: policy() });
   assert.ok(codes(replacedRoot, "error").has("invalid-scan-root"));
 }));
@@ -881,6 +882,15 @@ test("canonical source-structure command is pinned by project validation", () =>
   assert.match(validationSource, /\["check:source-structure"\] !== "node scripts\/check-source-structure\.mjs"/u);
 });
 
+test("checked-in source inventory excludes the retired hosted review application", () => {
+  const config = loadSourceStructurePolicy({ root: ROOT });
+  const result = evaluateSourceStructure({ root: ROOT, config });
+  assert.deepEqual(
+    result.files.filter((entry) => entry.file.startsWith("apps/")),
+    []
+  );
+});
+
 test("checked-in ratchet baseline exactly covers all current file and function debt", () => {
   const config = loadSourceStructurePolicy({ root: ROOT });
   assert.equal(config.mode, "ratchet");
@@ -892,8 +902,6 @@ test("checked-in ratchet baseline exactly covers all current file and function d
   assert.equal(config.baseline.initialDigest, SOURCE_STRUCTURE_INITIAL_DIGEST);
   assert.equal(config.baseline.policyDigest, SOURCE_STRUCTURE_POLICY_DIGEST);
   assert.deepEqual(config.facadePaths, [
-    "apps/grok-review-app/src/actions/runner-cli.mjs",
-    "apps/grok-review-app/src/index.mjs",
     "plugins/grok/mcp/server.mjs",
     "plugins/grok/scripts/grok-codex.mjs",
     "plugins/grok/scripts/grok-companion.mjs",
@@ -905,8 +913,8 @@ test("checked-in ratchet baseline exactly covers all current file and function d
   ]);
   const result = evaluateSourceStructure({ root: ROOT, config });
   assert.equal(result.ok, true);
-  assert.equal(result.files.length, 253);
-  assert.equal(result.warnings.length, 57);
+  assert.equal(result.files.length, 218);
+  assert.equal(result.warnings.length, 53);
   assert.equal(result.cycles.length, 0);
   assert.equal(result.fragments.length, 14);
   const debtPaths = result.files.filter((entry) => {
@@ -915,7 +923,7 @@ test("checked-in ratchet baseline exactly covers all current file and function d
     return entry.lines > budget.fileLines
       || entry.functions.some((span) => span.lines > budget.functionLines);
   }).map((entry) => entry.file).sort();
-  assert.equal(debtPaths.length, 43);
+  assert.equal(debtPaths.length, 39);
   assert.deepEqual(debtPaths, Object.keys(config.legacyDebt));
   for (const [file, entry] of Object.entries(config.legacyDebt)) {
     const measured = result.files.find((candidate) => candidate.file === file);

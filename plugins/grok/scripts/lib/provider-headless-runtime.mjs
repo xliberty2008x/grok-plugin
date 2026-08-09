@@ -898,7 +898,7 @@ export async function runProvider({ root, profile, prompt, model, effort, stateD
 }
 
 /**
- * Run a structured review with optional App-specific trusted schema, validator,
+ * Run a structured review with an optional caller-specific trusted schema, validator,
  * and repair prompt. Defaults preserve the generic REVIEW_SCHEMA / validateReview
  * / DEFAULT_REVIEW_REPAIR_PROMPT contract for existing Worker Protocol consumers.
  *

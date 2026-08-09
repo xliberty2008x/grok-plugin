@@ -341,7 +341,7 @@ export function collectRightSideMap(diffText) {
  *
  * Compatibility wrapper over {@link collectRightSideMap}. Paths containing
  * colons can collide in this flat encoding; prefer the structured map for new
- * App publication paths.
+ * structured publication paths.
  * @param {string} diffText
  * @returns {Set<string>}
  */

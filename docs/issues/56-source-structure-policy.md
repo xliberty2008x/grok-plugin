@@ -19,11 +19,10 @@ reverse imports through public facades, and makes reviews and deterministic
 sharding harder.
 
 The policy initially landed in `observe` mode without pretending that the debt
-was already gone. This prepared promotion will switch the checked-in policy to
-`ratchet` mode when the required host gates below are satisfied. Immutable
-history records 45 initially over-budget files, the former six-module static
-ESM cycle, and 14 initial ordinal test fragments. Active caps cover 44 files on
-the prepared task-contract pilot head because that pilot resolves its own debt.
+was already gone. The checked-in policy now runs in `ratchet` mode. Its
+immutable history records 45 initially over-budget files, the former six-module
+static ESM cycle, and 14 initial ordinal test fragments. Active caps cover 39
+files; four retired hosted-review paths remain only as immutable history.
 Initial debt/topology remains separate from reducible caps and bound by a
 repository-pinned SHA-256 digest, so raising both an initial value and its cap
 cannot bless growth.
@@ -32,7 +31,7 @@ cannot bless growth.
 
 | Category | File budget | Function budget |
 | --- | ---: | ---: |
-| Product runtime and app source | 1,500 | 250 |
+| Product runtime | 1,500 | 250 |
 | Tooling scripts | 2,000 | 350 |
 | Tests | 2,000 | 400 |
 | Registered facade or entrypoint | 300 | 250 |
@@ -60,8 +59,6 @@ The baseline migration was:
 
 | File | Old key | Stable key |
 | --- | --- | --- |
-| `apps/grok-review-app/src/actions/exact-head-repository.mjs` | `arrow:anonymous#6` | `function:handleProxyRequest#1` |
-| `apps/grok-review-app/src/actions/exact-head-repository.mjs` | `arrow:anonymous#7` | `function:runProxyRequestTask#1` |
 | `plugins/grok/scripts/lib/worker-mutation.mjs` | `arrow:anonymous#32` | `function:transitionDispatchTransaction#1` |
 | `plugins/grok/scripts/lib/worker-mutation.mjs` | `arrow:anonymous#78` | `function:prepareProvisioningReissueTransaction#1` |
 | `plugins/grok/scripts/lib/worker-mutation.mjs` | `arrow:anonymous#95` | `function:admitWritePlanTransaction#1` |
@@ -80,7 +77,7 @@ untracked source cannot escape. Paths are sorted and rendered with `/` on every
 platform. A source-root symlink, unreadable path, parser failure, or malformed
 configuration is a hard error even in `observe` mode.
 
-The four scan roots and three JavaScript extensions are exact canonical sets.
+The three scan roots and three JavaScript extensions are exact canonical sets.
 Every root must remain a real directory. Nested `build`, `coverage`, `dist`,
 and `vendor` directories are scanned as project source; only `.git` and
 `node_modules` are skipped, and relative static edges into either are policy
@@ -172,7 +169,22 @@ Final acceptance is: no handwritten JavaScript file above 5,000 lines, no
 ordinal aggregate wrappers, zero static ESM cycles, checked-in `ratchet` mode,
 and focused, full deterministic, and relevant installed lifecycle gates green.
 
-## Ratchet promotion record
+## Current hosted review extraction record
+
+Removing the retired hosted-review source and test ownership preserves the
+45-file immutable debt projection while shrinking the active cap set from 43
+files to 39. The four retired paths remain under `initialDebt` only, so the
+initial digest remains
+`6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b`.
+The current-policy digest advances from
+`84cb994eb7724fcbf2f0f7386b2bb6d48edbe1cf8d55fa4906d5be537e318b6c` to
+`de6bae488b0bdc733947fcb7cf0e0855ae2e8a51ff16cc3182e17cf32805b995`.
+The canonical roots shrink to `plugins`, `scripts`, and `tests`; budgets,
+extensions, ordinal-fragment caps, and resource ceilings do not change. The
+`tests/provider.test.mjs` active file cap also lowers from 2,244 to 2,161 lines
+in the same change.
+
+## Historical ratchet promotion record
 
 The promotion is rebased on current `main` head
 `11e7eb0decc59c425035cc8431291e965f760137`. Within

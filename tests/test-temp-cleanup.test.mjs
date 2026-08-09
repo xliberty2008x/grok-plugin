@@ -482,10 +482,6 @@ test("process start tokens use a stable C locale", () => {
 
 test("legacy allowlist exactly covers checked-in literal system-temp allocation patterns", () => {
   const proven = new Set([
-    // These wrappers bind their literal prefix to os.tmpdir() or fixed /tmp
-    // through a local variable rather than in the same allocation expression.
-    "grok-ci-auth-installer-",
-    "grok-ci-auth-test-",
     // Historical prefix retained so legacy cleanup remains source-proven after
     // shortening the fixture path for macOS filename-component limits.
     "deep-research-pinned-plugin-",

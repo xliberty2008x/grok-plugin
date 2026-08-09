@@ -22,15 +22,10 @@ import { processStartToken } from "../plugins/grok/scripts/lib/process-control.m
 import { patchPinnedFakeProviderCommands } from "./pinned-fake-grok.mjs";
 
 const LIB = fileURLToPath(new URL("../plugins/grok/scripts/lib/", import.meta.url));
-const MODEL_REVIEW = fileURLToPath(new URL(
-  "../apps/grok-review-app/src/actions/model-review.mjs",
-  import.meta.url
-));
 const SOURCE_PLUGIN = path.resolve(LIB, "../..");
 
 const PROVIDER_EXPORTS = Object.freeze([
   "DEFAULT_REVIEW_REPAIR_PROMPT",
-  "MAX_APP_REVIEW_OUTPUT_BYTES",
   "MAX_SUGGESTION_REPLACEMENT_BYTES",
   "REVIEW_SCHEMA",
   "WORKTREE_CLEANUP_CONTROLLER_PROFILE_ID",
@@ -78,7 +73,6 @@ const PROVIDER_EXPORTS = Object.freeze([
   "settleWorktreeBootstrapRegistrationFailure",
   "taskCredentialEnvironment",
   "taskEnvironment",
-  "validateAppReview",
   "validateReview",
   "waitForImportedSession",
   "waitForProviderBootstrapReady",
@@ -104,12 +98,10 @@ const OWNER = Object.freeze({
     ]],
     [reviewContract, [
       "DEFAULT_REVIEW_REPAIR_PROMPT",
-      "MAX_APP_REVIEW_OUTPUT_BYTES",
       "MAX_SUGGESTION_REPLACEMENT_BYTES",
       "REVIEW_SCHEMA",
       "resolveTrustedOutputSchema",
       "selectAcpPermissionOption",
-      "validateAppReview",
       "validateReview"
     ]],
     [credentials, [
@@ -303,16 +295,4 @@ test("provider implementation consumers import owning domains instead of the fac
     assert.doesNotMatch(source, /\bfrom\s+"\.\/grok-provider\.mjs"/u);
   }
 
-  const modelReview = fs.readFileSync(MODEL_REVIEW, "utf8");
-  for (const domain of [
-    "provider-core.mjs",
-    "provider-headless-runtime.mjs",
-    "provider-review-contract.mjs"
-  ]) {
-    assert.match(modelReview, new RegExp(
-      `\\bfrom\\s+"[^"]*/${domain.replaceAll(".", "\\.")}"`,
-      "u"
-    ));
-  }
-  assert.doesNotMatch(modelReview, /grok-provider\.mjs/u);
 });

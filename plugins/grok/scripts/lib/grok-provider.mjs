@@ -22,12 +22,10 @@ export {
 
 export {
   DEFAULT_REVIEW_REPAIR_PROMPT,
-  MAX_APP_REVIEW_OUTPUT_BYTES,
   MAX_SUGGESTION_REPLACEMENT_BYTES,
   REVIEW_SCHEMA,
   resolveTrustedOutputSchema,
   selectAcpPermissionOption,
-  validateAppReview,
   validateReview
 } from "./provider-review-contract.mjs";
 
