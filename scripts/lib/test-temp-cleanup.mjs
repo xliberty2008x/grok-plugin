@@ -357,6 +357,23 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "worker-supervisor-terminal-data-",
   "zero-skip-reporter-",
 ]);
+const LSOF_CANDIDATES = Object.freeze(["/usr/sbin/lsof", "/usr/bin/lsof"]);
+const PS_CANDIDATES = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
+const GIT_CANDIDATES = Object.freeze(["/opt/homebrew/bin/git", "/usr/bin/git"]);
+const WORKTREE_PROOF_SCHEMA = "grok-worktree-registration-proof-v1";
+const WORKTREE_METADATA_FILE_MAX_BYTES = 1024 * 1024;
+const WORKTREE_METADATA_TOTAL_MAX_BYTES = 16 * 1024 * 1024;
+const WORKTREE_GIT_EXECUTABLE_MAX_BYTES = 128 * 1024 * 1024;
+const WORKTREE_GIT_EXECUTABLE_LINK_MAX_BYTES = 4 * 1024;
+const WORKTREE_REGISTRATION_MAX_ENTRIES = 4096;
+const WORKTREE_REGISTRATION_CONTROL_MAX_ENTRIES = 64;
+const WORKTREE_DESCENDANT_GIT_SCAN_MAX_ENTRIES = 10_000;
+const WORKTREE_REGISTRATION_RELEVANT_FILES = new Set([
+  "commondir",
+  "config.worktree",
+  "gitdir",
+  "locked"
+]);
 const WORKTREE_REGISTRATION_IGNORED_FILES = new Set([
   "AUTO_MERGE",
   "CHERRY_PICK_HEAD",
