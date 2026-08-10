@@ -13,6 +13,9 @@ import {
   tryBindProvisionalReviewWorker,
   reviewLaunchAuthorizationMatches
 } from "../plugins/grok/scripts/lib/review-preprovider-failure.mjs";
+import { terminalizeCleanLaunchFailure } from "../plugins/grok/scripts/lib/review-launch-failure.mjs";
+import { cleanupReviewEnvironment } from "../plugins/grok/scripts/lib/provider-credentials.mjs";
+import { processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
 import { initRepo, tempDir, testEnvironment } from "./helpers.mjs";
 import { installFakeGrok } from "./fake-grok.mjs";
 
@@ -249,4 +252,212 @@ test("tryBindProvisionalReviewWorker rejects foreign pid and missing auth", () =
     nonce: "h".repeat(32),
     env
   }), false);
+});
+
+test("terminalizeCleanLaunchFailure revokes auth under lock before home cleanup", () => {
+  const root = initRepo();
+  const env = envFixture();
+  const nonce = "i".repeat(32);
+  const { id } = reviewJobFixture(root, env, {
+    status: "running",
+    phase: "starting",
+    workerAuthorization: nonce
+  });
+  const state = workspaceState(root, env);
+  const home = path.join(state, "review-homes", id);
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(home, "marker"), "live", { mode: 0o600 });
+
+  let sawAuthAfterDecision = "unset";
+  let provisionalAfterRevoke = null;
+  const outcome = terminalizeCleanLaunchFailure({
+    root,
+    jobId: id,
+    diagnostic: "launcher exit 1",
+    env,
+    onAfterUnboundDecision(job) {
+      sawAuthAfterDecision = job.workerAuthorization;
+      // Authorized provisional bind must lose once auth is revoked under lock.
+      provisionalAfterRevoke = tryBindProvisionalReviewWorker({
+        root,
+        jobId: id,
+        nonce,
+        env
+      });
+    },
+    cleanupReviewHome: () => cleanupReviewEnvironment(state, id)
+  });
+
+  assert.equal(outcome.terminalized, true);
+  assert.equal(sawAuthAfterDecision, null);
+  assert.equal(provisionalAfterRevoke, false);
+  assert.equal(fs.existsSync(home), false);
+  const stored = readJob(root, id, env);
+  assert.equal(stored.status, "failed");
+  assert.equal(stored.workerAuthorization, null);
+  assert.equal(stored.error?.code, "E_WORKER_LOST");
+  assert.equal(stored.result?.providerSessionDeleted, true);
+});
+
+test("terminalizeCleanLaunchFailure skips cleanup when worker already bound", () => {
+  const root = initRepo();
+  const env = envFixture();
+  const nonce = "j".repeat(32);
+  const startToken = processStartToken(process.pid) || "bound-token";
+  const { id } = reviewJobFixture(root, env, {
+    status: "running",
+    phase: "starting",
+    workerAuthorization: null
+  });
+  // Attach a bound identity after create so commandMarker can use the job id.
+  writeJob(root, {
+    ...readJob(root, id, env),
+    workerProcess: {
+      pid: process.pid,
+      startToken,
+      nonce,
+      processGroupId: process.pid,
+      commandMarker: id
+    }
+  }, env);
+  const state = workspaceState(root, env);
+  const home = path.join(state, "review-homes", id);
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(home, "marker"), "bound", { mode: 0o600 });
+
+  let cleanupCalled = false;
+  const outcome = terminalizeCleanLaunchFailure({
+    root,
+    jobId: id,
+    diagnostic: "launcher exit 1 after bind",
+    env,
+    cleanupReviewHome: () => {
+      cleanupCalled = true;
+      return cleanupReviewEnvironment(state, id);
+    }
+  });
+
+  assert.equal(outcome.terminalized, false);
+  assert.equal(cleanupCalled, false);
+  assert.equal(fs.existsSync(home), true);
+  const stored = readJob(root, id, env);
+  assert.equal(stored.status, "running");
+  assert.equal(stored.workerProcess?.pid, process.pid);
+});
+
+test("terminalizeCleanLaunchFailure race: bind before lock leaves home intact", () => {
+  // Regression for the outer-read → cleanup → locked-recheck window: if a
+  // provisional worker binds before the locked decision, home must not be
+  // deleted and the job must not be terminalized as a clean launch failure.
+  const root = initRepo();
+  const env = envFixture();
+  const nonce = "k".repeat(32);
+  const { id } = reviewJobFixture(root, env, {
+    status: "running",
+    phase: "starting",
+    workerAuthorization: nonce
+  });
+  const state = workspaceState(root, env);
+  const home = path.join(state, "review-homes", id);
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(home, "marker"), "race", { mode: 0o600 });
+
+  // Simulate the provisional child winning the race before launcher cleanup.
+  assert.equal(tryBindProvisionalReviewWorker({ root, jobId: id, nonce, env }), true);
+  assert.ok(readJob(root, id, env).workerProcess?.pid);
+
+  let cleanupCalled = false;
+  const outcome = terminalizeCleanLaunchFailure({
+    root,
+    jobId: id,
+    diagnostic: "launcher exit after provisional bind",
+    env,
+    cleanupReviewHome: () => {
+      cleanupCalled = true;
+      return cleanupReviewEnvironment(state, id);
+    }
+  });
+
+  assert.equal(outcome.terminalized, false);
+  assert.equal(cleanupCalled, false);
+  assert.equal(fs.existsSync(home), true);
+  const stored = readJob(root, id, env);
+  assert.equal(stored.status, "running");
+  assert.ok(stored.workerProcess?.pid);
+});
+
+test("terminalizeCleanLaunchFailure does not cleanup when bind sneaks after outer observation", () => {
+  // Models the old bug order: observe unbound → (bind happens) → cleanup home.
+  // The helper must revoke under lock first so a concurrent bind either wins
+  // the lock (skip cleanup) or loses auth (cannot bind before cleanup).
+  const root = initRepo();
+  const env = envFixture();
+  const nonce = "l".repeat(32);
+  const { id } = reviewJobFixture(root, env, {
+    status: "running",
+    phase: "starting",
+    workerAuthorization: nonce
+  });
+  const state = workspaceState(root, env);
+  const home = path.join(state, "review-homes", id);
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(home, "marker"), "outer", { mode: 0o600 });
+
+  // Outer observation (legacy buggy path) sees no PID.
+  const outer = readJob(root, id, env);
+  assert.equal(outer.workerProcess?.pid, undefined);
+
+  // Concurrent provisional bind between observation and cleanup decision.
+  // Injected via a second writer that races the helper's phase-1 lock: if the
+  // helper acquires first, auth is revoked and bind fails; if bind wins, the
+  // helper skips cleanup. Either way home is not deleted under a live bind.
+  let bindWon = false;
+  const outcome = terminalizeCleanLaunchFailure({
+    root,
+    jobId: id,
+    diagnostic: "launcher exit race",
+    env,
+    onAfterUnboundDecision() {
+      // After helper revoked auth: attempt bind (must fail) then try forging
+      // a PID as a hostile mid-window mutation would — cleanup already deferred
+      // past revoke, so even a forged bind in this hook runs after revoke.
+      bindWon = tryBindProvisionalReviewWorker({ root, jobId: id, nonce, env });
+    },
+    cleanupReviewHome: () => cleanupReviewEnvironment(state, id)
+  });
+
+  // Helper won the unbound path (bind after revoke loses).
+  assert.equal(bindWon, false);
+  assert.equal(outcome.terminalized, true);
+  assert.equal(fs.existsSync(home), false);
+
+  // And when bind wins the lock before the helper:
+  const { id: id2 } = reviewJobFixture(root, env, {
+    status: "running",
+    phase: "starting",
+    workerAuthorization: "m".repeat(32)
+  });
+  const home2 = path.join(state, "review-homes", id2);
+  fs.mkdirSync(home2, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(home2, "marker"), "bound-first", { mode: 0o600 });
+  assert.equal(tryBindProvisionalReviewWorker({
+    root,
+    jobId: id2,
+    nonce: "m".repeat(32),
+    env
+  }), true);
+  let cleanup2 = false;
+  const outcome2 = terminalizeCleanLaunchFailure({
+    root,
+    jobId: id2,
+    diagnostic: "launcher exit after bind won",
+    env,
+    cleanupReviewHome: () => {
+      cleanup2 = true;
+      return cleanupReviewEnvironment(state, id2);
+    }
+  });
+  assert.equal(outcome2.terminalized, false);
+  assert.equal(cleanup2, false);
+  assert.equal(fs.existsSync(home2), true);
 });

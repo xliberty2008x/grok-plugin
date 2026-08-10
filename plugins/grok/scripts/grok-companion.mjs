@@ -3044,19 +3044,15 @@ async function startJob(root, job, background, { announce = false } = {}) {
       });
     } else {
       // Nonzero launcher exit is not proof the detached worker never bound.
-      const latestLaunch = readJob(root, job.id);
-      if (!terminal(latestLaunch) && !latestLaunch.workerProcess?.pid && !latestLaunch.providerProcess?.pid) {
-        const cleanup = job.jobClass === "review"
-          ? cleanupReviewEnvironment(stateDir(root), job.id)
-          : null;
-        terminalizeCleanLaunchFailure({
-          root,
-          jobId: job.id,
-          jobClass: job.jobClass,
-          diagnostic,
-          cleanup
-        });
-      }
+      // Revoke launch auth under the job lock before any review-home cleanup.
+      terminalizeCleanLaunchFailure({
+        root,
+        jobId: job.id,
+        diagnostic,
+        cleanupReviewHome: job.jobClass === "review"
+          ? () => cleanupReviewEnvironment(stateDir(root), job.id)
+          : null
+      });
     }
   }
   if (launcherCode === 0 && !background && announce) {
