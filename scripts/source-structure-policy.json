@@ -45,7 +45,7 @@
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
     "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b",
-    "policyDigest": "9916a4a5b3d111064d5c8e3a51d9fce4bdb6901ad6721bc69d5a7030a6cf9eda"
+    "policyDigest": "cb2fe3b26b04fd895840dddaf38badfb2b4a9ad427717a35357f094d55006213"
   },
   "dispositions": {
     "plugins/grok/scripts/grok-companion.mjs": {
@@ -584,7 +584,7 @@
     "plugins/grok/scripts/grok-companion.mjs": {
       "category": "facade",
       "initialLines": 5271,
-      "lineCap": 5260,
+      "lineCap": 5240,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",

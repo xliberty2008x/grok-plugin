@@ -62,7 +62,9 @@ export function reviewLostWorkerError(jobLike = {}, { unbound = false } = {}) {
       )
     };
   }
-  const preProvider = jobLike.startedAt == null && !jobLike.providerProcess;
+  // Provider-process evidence is the durable pre-provider boundary. Worker
+  // `startedAt` is set before provider launch and must not reclassify the stage.
+  const preProvider = !jobLike.providerProcess;
   if (preProvider) {
     return {
       code: "E_WORKER_LOST",

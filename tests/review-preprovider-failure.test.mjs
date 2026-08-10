@@ -181,8 +181,11 @@ test("recordReviewPreProviderFailure does not replace a different pendingTermina
   assert.equal(stored.pendingTerminal.error.code, "E_PROCESS_IDENTITY");
 });
 
-test("reviewLostWorkerError distinguishes pre-provider from mid-run", () => {
-  const pre = reviewLostWorkerError({ startedAt: null, providerProcess: null });
+test("reviewLostWorkerError uses providerProcess not worker startedAt", () => {
+  const pre = reviewLostWorkerError({
+    startedAt: "2026-08-10T00:00:00.000Z",
+    providerProcess: null
+  });
   assert.equal(pre.code, "E_WORKER_LOST");
   assert.match(pre.message, /before provider start/i);
   const mid = reviewLostWorkerError({

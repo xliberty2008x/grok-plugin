@@ -63,11 +63,12 @@ export async function runLegacyReviewWorker({
   } catch (error) {
     try {
       const record = readJob(root, id);
+      // Persist only while no provider process has been recorded. Do not use
+      // worker startedAt — execute sets that before provider launch.
       if (
         record.jobClass === "review"
         && !terminal(record)
         && !record.providerProcess
-        && record.startedAt == null
       ) {
         recordReviewPreProviderFailure({
           root,

@@ -97,6 +97,7 @@ import {
 import { CONTEXT_BINDING_MODE, verifyJobEffectivePrompt } from "./lib/worker-context.mjs";
 import { reviewLostWorkerError } from "./lib/review-preprovider-failure.mjs";
 import { runLegacyReviewWorker } from "./lib/review-worker-run.mjs";
+import { terminalizeCleanLaunchFailure } from "./lib/review-launch-failure.mjs";
 import {
   assertDispatchContract,
   assertWorkerProviderLaunchPreparation,
@@ -3042,41 +3043,20 @@ async function startJob(root, job, background, { announce = false } = {}) {
         return scrubStoredJob(current);
       });
     } else {
-      const cleanup = job.jobClass === "review"
-        ? cleanupReviewEnvironment(stateDir(root), job.id)
-        : null;
-      updateJob(root, job.id, (current) => {
-        Object.assign(current, scrubStoredJob(current));
-        current.workerAuthorization = null;
-        current.status = "failed";
-        current.phase = "failed";
-        current.completedAt = now();
-        current.error = {
-          code: "E_WORKER_LOST",
-          message: redactText(diagnostic)
-            || "Could not launch the isolated Grok worker."
-        };
-        current.summary = current.error.message;
-        current.result = {
-          ...(current.result || {}),
-          hostVerification: "not_run"
-        };
-        current.lifecycleEvents = appendLifecycleEvent(
-          current.lifecycleEvents,
-          "blocked",
-          current.error.message
-        );
-        if (cleanup) {
-          current.result = {
-            ...(current.result || {}),
-            providerSessionDeleted: cleanup.ok
-          };
-          if (cleanup.warning) {
-            current.result.privacyWarning = cleanup.warning;
-          }
-        }
-        return current;
-      });
+      // Nonzero launcher exit is not proof the detached worker never bound.
+      const latestLaunch = readJob(root, job.id);
+      if (!terminal(latestLaunch) && !latestLaunch.workerProcess?.pid && !latestLaunch.providerProcess?.pid) {
+        const cleanup = job.jobClass === "review"
+          ? cleanupReviewEnvironment(stateDir(root), job.id)
+          : null;
+        terminalizeCleanLaunchFailure({
+          root,
+          jobId: job.id,
+          jobClass: job.jobClass,
+          diagnostic,
+          cleanup
+        });
+      }
     }
   }
   if (launcherCode === 0 && !background && announce) {
