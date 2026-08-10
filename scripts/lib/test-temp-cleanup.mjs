@@ -48,6 +48,8 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "fake-grok-stop-codex-",
   "fake-grok-stop-crash-",
   "fake-grok-transfer-effort-",
+  "fake-preprovider-",
+  "fake-preprovider-rt-",
   "fake-ps-path-",
   "gated-cleanup-",
   "grok-artifact-readonly-",
@@ -182,6 +184,8 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "phase3-outside-",
   "phase3-receipt-",
   "phase3-symlink-",
+  "preprovider-data-",
+  "preprovider-rt-data-",
   "probe-gate-state-",
   "proof-ambient-authority-",
   "proof-external-target-",
@@ -309,7 +313,6 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "grok-unmanaged-provider-",
   "runner-failures-",
   // Finite template-literal expansions whose labels are checked in beside the
-  // allocating helper calls.
   "fake-grok-ready-duplicate-label-",
   "fake-grok-ready-empty-",
   "fake-grok-ready-empty-labeled-group-",
@@ -352,7 +355,6 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "worker-supervisor-scan-safety-data-",
   "worker-supervisor-terminal-data-"
 ].sort());
-
 const LSOF_CANDIDATES = Object.freeze(["/usr/sbin/lsof", "/usr/bin/lsof"]);
 const PS_CANDIDATES = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
 const GIT_CANDIDATES = Object.freeze(["/opt/homebrew/bin/git", "/usr/bin/git"]);
@@ -865,7 +867,6 @@ function selectGitExecutable(candidates, expectedUid) {
         }
       };
     } catch {
-      // Try the next fixed executable authority.
     }
   }
   throw new Error("A trusted Git executable is unavailable.");
@@ -1560,7 +1561,6 @@ export function removeInventoriedTestTempRoot(
           fs.renameSync(quarantine, root);
           restored = true;
         } catch {
-          // The quarantined tree is preserved and reported below.
         }
       }
     }
