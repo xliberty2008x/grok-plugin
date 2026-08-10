@@ -7,6 +7,18 @@ function isBoundWorkerOrProvider(job) {
   return Boolean(job?.workerProcess?.pid || job?.providerProcess?.pid);
 }
 
+/** Wait when a detached worker/provider already bound after launcher failure. */
+export function shouldWaitAfterFailedReviewLauncher(job) {
+  return Boolean(job && !terminal(job) && isBoundWorkerOrProvider(job));
+}
+
+/** Foreground startJob throw gate after nonzero review launcher exit. */
+export function failedReviewLauncherBlocksForeground(job, launcherCode) {
+  return launcherCode !== 0
+    && !terminal(job)
+    && !shouldWaitAfterFailedReviewLauncher(job);
+}
+
 /**
  * Terminalize a failed review/research-style launch only when the detached
  * worker never bound. Authorization is revoked under the job lock before any

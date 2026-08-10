@@ -97,7 +97,7 @@ import {
 import { CONTEXT_BINDING_MODE, verifyJobEffectivePrompt } from "./lib/worker-context.mjs";
 import { reviewLostWorkerError } from "./lib/review-preprovider-failure.mjs";
 import { runLegacyReviewWorker } from "./lib/review-worker-run.mjs";
-import { terminalizeCleanLaunchFailure } from "./lib/review-launch-failure.mjs";
+import { failedReviewLauncherBlocksForeground, terminalizeCleanLaunchFailure } from "./lib/review-launch-failure.mjs";
 import {
   assertDispatchContract,
   assertWorkerProviderLaunchPreparation,
@@ -3043,12 +3043,9 @@ async function startJob(root, job, background, { announce = false } = {}) {
         return scrubStoredJob(current);
       });
     } else {
-      // Nonzero launcher exit is not proof the detached worker never bound.
-      // Revoke launch auth under the job lock before any review-home cleanup.
+      // Nonzero exit ≠ unbound; revoke auth under lock before any review-home cleanup.
       terminalizeCleanLaunchFailure({
-        root,
-        jobId: job.id,
-        diagnostic,
+        root, jobId: job.id, diagnostic,
         cleanupReviewHome: job.jobClass === "review"
           ? () => cleanupReviewEnvironment(stateDir(root), job.id)
           : null
@@ -3067,15 +3064,12 @@ async function startJob(root, job, background, { announce = false } = {}) {
   }
   if (background) return readJob(root, job.id);
   let finished = readJob(root, job.id);
-  if (launcherCode !== 0 && !terminal(finished)) {
+  // Bound provisional workers wait; unbound nonterminal fails closed.
+  if (failedReviewLauncherBlocksForeground(finished, launcherCode)) {
     throw new CompanionError(
       finished.error?.code || "E_PROCESS_IDENTITY",
-      finished.error?.message
-        || "Worker launch cleanup remains unproven.",
-      {
-        ...(finished.error?.details || {}),
-        workerId: finished.id
-      }
+      finished.error?.message || "Worker launch cleanup remains unproven.",
+      { ...(finished.error?.details || {}), workerId: finished.id }
     );
   }
   let lastRecovery = 0;

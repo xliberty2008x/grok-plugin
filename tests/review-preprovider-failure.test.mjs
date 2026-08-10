@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { CompanionError } from "../plugins/grok/scripts/lib/errors.mjs";
 import { generateId, readJob, writeJob, now } from "../plugins/grok/scripts/lib/state.mjs";
@@ -13,9 +14,14 @@ import {
   tryBindProvisionalReviewWorker,
   reviewLaunchAuthorizationMatches
 } from "../plugins/grok/scripts/lib/review-preprovider-failure.mjs";
-import { terminalizeCleanLaunchFailure } from "../plugins/grok/scripts/lib/review-launch-failure.mjs";
+import {
+  failedReviewLauncherBlocksForeground,
+  shouldWaitAfterFailedReviewLauncher,
+  terminalizeCleanLaunchFailure
+} from "../plugins/grok/scripts/lib/review-launch-failure.mjs";
 import { cleanupReviewEnvironment } from "../plugins/grok/scripts/lib/provider-credentials.mjs";
 import { processStartToken } from "../plugins/grok/scripts/lib/process-control.mjs";
+import { terminal } from "../plugins/grok/scripts/lib/state.mjs";
 import { initRepo, tempDir, testEnvironment } from "./helpers.mjs";
 import { installFakeGrok } from "./fake-grok.mjs";
 
@@ -460,4 +466,73 @@ test("terminalizeCleanLaunchFailure does not cleanup when bind sneaks after oute
   assert.equal(outcome2.terminalized, false);
   assert.equal(cleanup2, false);
   assert.equal(fs.existsSync(home2), true);
+});
+
+test("shouldWaitAfterFailedReviewLauncher only for live bound identity", () => {
+  assert.equal(shouldWaitAfterFailedReviewLauncher({
+    status: "running",
+    workerProcess: { pid: 42 },
+    providerProcess: null
+  }), true);
+  assert.equal(shouldWaitAfterFailedReviewLauncher({
+    status: "running",
+    workerProcess: null,
+    providerProcess: { pid: 7 }
+  }), true);
+  assert.equal(shouldWaitAfterFailedReviewLauncher({
+    status: "running",
+    workerProcess: null,
+    providerProcess: null
+  }), false);
+  assert.equal(shouldWaitAfterFailedReviewLauncher({
+    status: "failed",
+    completedAt: new Date().toISOString(),
+    workerProcess: { pid: 42 }
+  }), false);
+});
+
+test("startJob foreground gate waits when launcher fails after provisional bind", () => {
+  // Mirrors startJob's post-launcher control flow: terminalize first, then the
+  // foreground throw gate. Bound workers must wait (not E_PROCESS_IDENTITY).
+  const root = initRepo();
+  const env = envFixture();
+  const nonce = "n".repeat(32);
+  const { id } = reviewJobFixture(root, env, {
+    status: "running",
+    phase: "starting",
+    workerAuthorization: nonce
+  });
+  assert.equal(tryBindProvisionalReviewWorker({ root, jobId: id, nonce, env }), true);
+
+  const launcherCode = 1;
+  const outcome = terminalizeCleanLaunchFailure({
+    root,
+    jobId: id,
+    diagnostic: "captureSpawnIdentity failed after bind",
+    env,
+    cleanupReviewHome: () => {
+      throw new Error("cleanup must not run for bound workers");
+    }
+  });
+  assert.equal(outcome.terminalized, false);
+
+  const finished = readJob(root, id, env);
+  assert.equal(terminal(finished), false);
+  assert.equal(shouldWaitAfterFailedReviewLauncher(finished), true);
+  assert.equal(failedReviewLauncherBlocksForeground(finished, launcherCode), false);
+  assert.equal(failedReviewLauncherBlocksForeground({
+    status: "running",
+    workerProcess: null,
+    providerProcess: null
+  }, 1), true);
+
+  // Companion startJob uses the shared foreground gate (not a local reimplementation).
+  const companion = fs.readFileSync(
+    path.join(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../plugins/grok/scripts/grok-companion.mjs"
+    ),
+    "utf8"
+  );
+  assert.match(companion, /failedReviewLauncherBlocksForeground\(finished, launcherCode\)/);
 });
