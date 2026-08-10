@@ -4428,11 +4428,134 @@ test("lost-worker recovery terminates headless review and removes its isolated h
       return job.status === "failed" ? job : false;
     }, { timeoutMs: 15000 });
     assert.equal(recovered.error.code, "E_WORKER_LOST");
+    // Mid-run loss may include a next-action suffix; must not look pre-provider.
+    assert.match(recovered.error.message, /prompt was not replayed/i);
+    assert.doesNotMatch(recovered.error.message, /before provider start/i);
     assert.equal(fs.existsSync(isolatedHome), false);
   } finally {
     try { process.kill(-running.providerProcess.processGroupId, "SIGKILL"); } catch {}
     fs.rmSync(path.join(pluginData, "state"), { recursive: true, force: true });
   }
+});
+
+test("review worker auth failure records typed pendingTerminal instead of opaque E_WORKER_LOST", {
+  skip: process.platform === "win32",
+  timeout: 20_000
+}, async () => {
+  const root = initRepo();
+  const { env, pluginData } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("review");
+  const isolatedHome = path.join(stateRoot, "review-homes", id);
+  fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  const stamped = new Date(Date.now() - 60_000).toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: pre-provider auth fixture",
+    summary: "Running",
+    write: false,
+    status: "running",
+    phase: "queued",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    workerAuthorization: null,
+    workerProcess: null,
+    providerProcess: null,
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: {
+      prompt: "PROMPT_MUST_BE_SCRUBBED_IF_PRESENT",
+      target: { mode: "working-tree", label: "fixture", base: null }
+    },
+    result: null,
+    error: null
+  });
+
+  const worker = runCompanion(["--worker", id, "--cwd", root], {
+    cwd: root,
+    env: { ...env, GROK_COMPANION_WORKER_NONCE: crypto.randomBytes(16).toString("hex") },
+    timeout: 15_000
+  });
+  assert.notEqual(worker.status, 0);
+
+  const afterWorker = persistedJob(pluginData, id);
+  assert.equal(afterWorker.pendingTerminal.error.code, "E_RECURSION");
+
+  const recovered = await waitFor(() => {
+    const result = runCompanion(["status", id, "--json"], { cwd: root, env });
+    if (result.status !== 0) return false;
+    const job = JSON.parse(result.stdout);
+    return job.status === "failed" ? job : false;
+  }, { timeoutMs: 15_000 });
+
+  assert.equal(recovered.error.code, "E_RECURSION");
+  assert.match(recovered.error.message, /re-run|status|replay|authenticate/i);
+  // Public status projection omits result.replay; durable job retains no-replay.
+  assert.equal(persistedJob(pluginData, id).result?.replay, false);
+  assert.equal(fs.existsSync(isolatedHome), false);
+  assert.equal(JSON.stringify(recovered).includes("PROMPT_MUST_BE_SCRUBBED_IF_PRESENT"), false);
+});
+
+test("review pre-provider silent loss uses stage-aware E_WORKER_LOST", {
+  skip: process.platform === "win32"
+}, () => {
+  const root = initRepo();
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("review");
+  const isolatedHome = path.join(stateRoot, "review-homes", id);
+  fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  const stamped = new Date(Date.now() - 60_000).toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: silent pre-provider loss",
+    summary: "Running",
+    write: false,
+    status: "running",
+    phase: "queued",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    workerProcess: {
+      pid: 999999991,
+      startToken: "dead-worker-token",
+      nonce: "n",
+      processGroupId: 999999991,
+      commandMarker: id
+    },
+    providerProcess: null,
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null, target: { mode: "working-tree", label: "fixture", base: null } },
+    result: null,
+    error: null
+  });
+  const recovered = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
+  assert.equal(recovered.status, "failed");
+  assert.equal(recovered.error.code, "E_WORKER_LOST");
+  assert.match(recovered.error.message, /before provider start/i);
+  assert.equal(fs.existsSync(isolatedHome), false);
 });
 
 test("lost-worker recovery retains privacy evidence when provider terminate cannot verify cleanup", { skip: process.platform === "win32" }, () => {
