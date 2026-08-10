@@ -526,13 +526,13 @@ test("startJob foreground gate waits when launcher fails after provisional bind"
     providerProcess: null
   }, 1), true);
 
-  // Companion startJob uses the shared foreground gate (not a local reimplementation).
-  const companion = fs.readFileSync(
+  // Companion startJob lives in the dispatch domain after issue #56 extraction.
+  const companionDispatch = fs.readFileSync(
     path.join(
       path.dirname(fileURLToPath(import.meta.url)),
-      "../plugins/grok/scripts/grok-companion.mjs"
+      "../plugins/grok/scripts/lib/companion-dispatch.mjs"
     ),
     "utf8"
   );
-  assert.match(companion, /failedReviewLauncherBlocksForeground\(finished, launcherCode\)/);
+  assert.match(companionDispatch, /failedReviewLauncherBlocksForeground\(finished, launcherCode\)/);
 });
