@@ -26,7 +26,9 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const REPORTER = path.join(ROOT, "scripts/lib/zero-skip-test-reporter.mjs");
 const SUPERVISOR = path.join(ROOT, "scripts/lib/test-temp-supervisor.mjs");
-export const DETERMINISTIC_TEST_FILE_TIMEOUT_MS = 10 * 60_000;
+// Hosted macOS Node 18 shard 4 has measured just over 10 minutes for the two
+// largest whole-file suites; keep a small headroom under the job budget.
+export const DETERMINISTIC_TEST_FILE_TIMEOUT_MS = 12 * 60_000;
 const DETERMINISTIC_SUPERVISOR_SHUTDOWN_ALLOWANCE_MS = 30_000;
 const OUTPUT_LIMIT_EXIT_CODE = 125;
 const CONTAINMENT_FAILURE_EXIT_CODE = 126;
