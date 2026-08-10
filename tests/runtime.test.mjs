@@ -51,7 +51,6 @@ import {
   pluginDataRoot,
   writeCodexSessionMetadata
 } from "../plugins/grok/scripts/lib/host.mjs";
-
 function parseJson(result) {
   assert.equal(result.status, 0, `command failed\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
   return JSON.parse(result.stdout);
@@ -64,7 +63,6 @@ function parseError(result, code) {
   assert.equal(payload.error.code, code);
   return payload.error;
 }
-
 function taskReport(summary = "Fake Grok task completed", acceptanceIds = ["AC-01", "AC-02"]) {
   return `GROK_WORKER_REPORT: ${JSON.stringify({
     outcome: "complete",
@@ -4428,6 +4426,8 @@ test("lost-worker recovery terminates headless review and removes its isolated h
       return job.status === "failed" ? job : false;
     }, { timeoutMs: 15000 });
     assert.equal(recovered.error.code, "E_WORKER_LOST");
+    assert.match(recovered.error.message, /prompt was not replayed/i);
+    assert.doesNotMatch(recovered.error.message, /before provider start/i);
     assert.equal(fs.existsSync(isolatedHome), false);
   } finally {
     try { process.kill(-running.providerProcess.processGroupId, "SIGKILL"); } catch {}
