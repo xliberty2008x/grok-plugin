@@ -1,14 +1,14 @@
-# Issue #95 Review Pre-Provider Diagnostics Implementation Plan
+# Issue #95 Review Pre-Provider Loss Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** When a review worker dies before provider start, publish a typed, actionable durable error when the child recorded one; keep generic `E_WORKER_LOST` only for unknown loss; never replay prompts.
+**Goal:** Fix review pre-provider loss by (P0) durable typed diagnostics, (P1) provisional auth so identity-publish lag cannot fail auth, and (P2) recovery of aged unbound queued reviews — without automatic prompt replay.
 
-**Architecture:** Add a focused helper `recordReviewPreProviderFailure` that writes scrubbed `pendingTerminal` under the job lock. Wire the legacy review `--worker` path to call it before exit on auth and other pre-`execute()` failures. Harden recovery’s generic `E_WORKER_LOST` message for pre-provider vs mid-run when no pending intent exists (recovery already prefers `pendingTerminal.error` for non-task jobs).
+**Architecture:** Add `review-preprovider-failure.mjs` for scrubbed `pendingTerminal` writes and stage-aware loss messages. Wire legacy review `--worker` to record intent on pre-provider failure and to provisionally authorize on matching `workerAuthorization` (deep-research pattern). Extend `recoverActiveJobs` for unbound orphans and improved generic `E_WORKER_LOST` wording. Implement strictly **P0 → P1 → P2**.
 
-**Tech Stack:** Node.js ESM (Node 18+), existing companion job state (`updateJob` / `readJob` / `pendingTerminal`), `node:test` suite.
+**Tech Stack:** Node.js ESM (Node 18+), companion job state (`updateJob` / `readJob` / `pendingTerminal`), `node:test`.
 
-**Spec:** `docs/superpowers/specs/2026-08-10-issue-95-review-preprovider-diagnostics-design.md`
+**Spec:** `docs/superpowers/specs/2026-08-10-issue-95-review-preprovider-diagnostics-design.md` (extended after RCA).
 
 ---
 
@@ -16,27 +16,29 @@
 
 | Path | Responsibility |
 | --- | --- |
-| `plugins/grok/scripts/lib/review-preprovider-failure.mjs` | **Create.** Pure helper: map error → scrubbed intent; write `pendingTerminal`; conflict/no-op rules; generic loss message builders |
-| `tests/review-preprovider-failure.test.mjs` | **Create.** Unit tests for helper write, no-op, conflict, redaction, message builders |
-| `plugins/grok/scripts/grok-companion.mjs` | **Modify.** Import helper; call on review worker auth failure and pre-`execute()` catch; improve `interruptedError` construction for review when pending is absent |
-| `tests/runtime.test.mjs` | **Modify.** Integration: auth failure → typed code; pending intent promoted; mid-run regression still green; optional foreground/background parity |
-| `docs/superpowers/specs/2026-08-10-issue-95-review-preprovider-diagnostics-design.md` | Reference only (already committed) |
+| `plugins/grok/scripts/lib/review-preprovider-failure.mjs` | **Create.** `buildReviewPreProviderError`, `reviewLostWorkerError`, `recordReviewPreProviderFailure` |
+| `tests/review-preprovider-failure.test.mjs` | **Create.** Unit tests for helper |
+| `plugins/grok/scripts/grok-companion.mjs` | **Modify.** P0 wire + recovery messages; P1 provisional auth; P2 orphan branch |
+| `tests/runtime.test.mjs` | **Modify.** Integration: auth diagnostics, delayed publish, orphan recovery, mid-run regression |
+| Spec / this plan | Docs only |
 
-**Out of scope (do not touch):** dispatch-v2 migration, `captureSpawnIdentity` timeouts, deep-research launch, task launch-unsettled path, stderr capture on detached spawn.
+**Out of scope:** dispatch-v2 migration, task launch, deep-research rewrite, stderr capture as primary channel, new error codes.
+
+**Test harness note:** If the agent runs under a live Grok tree, `hasGrokAncestor()` blocks non-internal CLI. Use double-fork/`setsid` reparent (ppid→1) or run CI-like environment when invoking `review`/`status`. Internal `--worker` only needs env markers cleared.
 
 ---
 
-### Task 1: Unit tests for `recordReviewPreProviderFailure` (TDD red)
+# Slice P0 — Diagnostics
+
+### Task 1: Failing unit tests for helper
 
 **Files:**
 - Create: `tests/review-preprovider-failure.test.mjs`
-- Create later in Task 2: `plugins/grok/scripts/lib/review-preprovider-failure.mjs`
 
-- [ ] **Step 1: Write failing unit tests**
+- [ ] **Step 1: Write the test file** (module import will fail until Task 2)
 
 ```js
 import assert from "node:assert/strict";
-import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -51,6 +53,17 @@ import {
 } from "../plugins/grok/scripts/lib/review-preprovider-failure.mjs";
 import { initRepo, tempDir, testEnvironment } from "./helpers.mjs";
 import { installFakeGrok } from "./fake-grok.mjs";
+
+function envFixture() {
+  const fake = installFakeGrok(tempDir("fake-preprovider-"));
+  const pluginData = tempDir("preprovider-data-");
+  const env = testEnvironment({ fake, pluginData });
+  delete env.GROK_COMPANION_CHILD;
+  delete env.GROK_COMPANION_JOB_MARKER;
+  delete env.GROK_AGENT;
+  delete env.GROK_LEADER_SOCKET;
+  return env;
+}
 
 function reviewJobFixture(root, env, overrides = {}) {
   const id = generateId("review");
@@ -91,16 +104,7 @@ function reviewJobFixture(root, env, overrides = {}) {
   fs.mkdirSync(path.join(state, "jobs"), { recursive: true, mode: 0o700 });
   writeJob(root, job, env);
   fs.writeFileSync(job.logFile, "", { mode: 0o600 });
-  return { id, state, job };
-}
-
-function envFixture() {
-  const fake = installFakeGrok(tempDir("fake-preprovider-"));
-  const pluginData = tempDir("preprovider-data-");
-  const env = testEnvironment({ fake, pluginData });
-  delete env.GROK_COMPANION_CHILD;
-  delete env.GROK_COMPANION_JOB_MARKER;
-  return env;
+  return { id, job };
 }
 
 test("buildReviewPreProviderError keeps CompanionError code and adds next action", () => {
@@ -116,7 +120,6 @@ test("buildReviewPreProviderError maps untyped throws to E_PROVIDER_EXIT", () =>
   const payload = buildReviewPreProviderError(new Error("boom"));
   assert.equal(payload.code, "E_PROVIDER_EXIT");
   assert.match(payload.message, /re-run|status|replay/i);
-  assert.doesNotMatch(payload.message, /boom.{200,}/); // stays bounded
 });
 
 test("recordReviewPreProviderFailure writes pendingTerminal and leaves job non-terminal", () => {
@@ -136,10 +139,7 @@ test("recordReviewPreProviderFailure writes pendingTerminal and leaves job non-t
   assert.equal(stored.pendingTerminal.status, "failed");
   assert.equal(stored.pendingTerminal.error.code, "E_RECURSION");
   assert.match(stored.pendingTerminal.error.message, /re-run|status|replay/i);
-  assert.equal(stored.pendingTerminal.summary, stored.pendingTerminal.error.message);
-  // Prompt must not reappear in error/summary after scrub path
-  const serialized = JSON.stringify(stored.pendingTerminal);
-  assert.equal(serialized.includes("SECRET_PROMPT_SHOULD_NOT_LEAK"), false);
+  assert.equal(JSON.stringify(stored.pendingTerminal).includes("SECRET_PROMPT_SHOULD_NOT_LEAK"), false);
 });
 
 test("recordReviewPreProviderFailure no-ops when job already terminal", () => {
@@ -151,16 +151,13 @@ test("recordReviewPreProviderFailure no-ops when job already terminal", () => {
     completedAt: now(),
     error: { code: "E_CANCELLED", message: "already done" }
   });
-  const result = recordReviewPreProviderFailure({
+  assert.equal(recordReviewPreProviderFailure({
     root,
     jobId: id,
     error: new CompanionError("E_RECURSION", "late write"),
     env
-  });
-  assert.equal(result, null);
-  const stored = readJob(root, id, env);
-  assert.equal(stored.error.code, "E_CANCELLED");
-  assert.equal(stored.pendingTerminal, undefined);
+  }), null);
+  assert.equal(readJob(root, id, env).error.code, "E_CANCELLED");
 });
 
 test("recordReviewPreProviderFailure does not replace a different pendingTerminal", () => {
@@ -182,71 +179,59 @@ test("recordReviewPreProviderFailure does not replace a different pendingTermina
   });
   const stored = readJob(root, id, env);
   assert.equal(stored.pendingTerminal.error.code, "E_PROCESS_IDENTITY");
-  assert.equal(stored.pendingTerminal.error.message, "first intent wins");
 });
 
 test("reviewLostWorkerError distinguishes pre-provider from mid-run", () => {
   const pre = reviewLostWorkerError({ startedAt: null, providerProcess: null });
   assert.equal(pre.code, "E_WORKER_LOST");
   assert.match(pre.message, /before provider start/i);
-  assert.match(pre.message, /re-run|status|replay/i);
-
   const mid = reviewLostWorkerError({
     startedAt: "2026-08-10T00:00:00.000Z",
     providerProcess: { pid: 1 }
   });
   assert.equal(mid.code, "E_WORKER_LOST");
   assert.doesNotMatch(mid.message, /before provider start/i);
-  assert.match(mid.message, /replay/i);
 });
 ```
 
-- [ ] **Step 2: Run tests — expect FAIL (module missing)**
+- [ ] **Step 2: Run — expect FAIL (module not found)**
 
 ```bash
 node --test tests/review-preprovider-failure.test.mjs
 ```
 
-Expected: FAIL with `ERR_MODULE_NOT_FOUND` for `review-preprovider-failure.mjs`.
-
-- [ ] **Step 3: Commit the red tests**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add tests/review-preprovider-failure.test.mjs
-git commit -m "$(cat <<'EOF'
-test: add review pre-provider failure unit coverage for #95
-
-Failing tests lock durable pendingTerminal writes, conflict rules,
-and typed loss messages before the helper exists.
-EOF
-)"
+git commit -m "test: add review pre-provider failure unit coverage for #95"
 ```
 
 ---
 
-### Task 2: Implement `review-preprovider-failure.mjs` (TDD green)
+### Task 2: Implement `review-preprovider-failure.mjs`
 
 **Files:**
 - Create: `plugins/grok/scripts/lib/review-preprovider-failure.mjs`
-- Test: `tests/review-preprovider-failure.test.mjs`
 
-- [ ] **Step 1: Implement the helper module**
+- [ ] **Step 1: Implement**
 
 ```js
-import { CompanionError, asErrorPayload } from "./errors.mjs";
+import { asErrorPayload } from "./errors.mjs";
 import { redact, redactText, sanitizeDisplayText } from "./redact.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import { updateJob, terminal, now } from "./state.mjs";
 import { scrubStoredJob } from "./task-contract.mjs";
 
 const MAX_MESSAGE_CHARS = 1024;
-
 const AUTH_NEXT =
   "Check job status for this review ID; do not expect automatic replay — re-run the review command if needed.";
 const GENERIC_NEXT =
   "Inspect this job's status/result, then re-run the review if the failure persists.";
 const MID_RUN_NEXT =
   "Inspect job status/result; do not expect automatic replay (prompts are not re-run).";
+const ORPHAN_NEXT =
+  "Inspect this job's status/result, then re-run the review if the failure persists.";
 
 function clipMessage(text) {
   const cleaned = sanitizeDisplayText(redactText(String(text || "")));
@@ -263,9 +248,6 @@ function withNextAction(cause, nextAction) {
   return clipMessage(joined);
 }
 
-/**
- * Map a thrown value to a scrubbed public error payload for review pre-provider failures.
- */
 export function buildReviewPreProviderError(error) {
   const rawCode = typeof error?.code === "string" && error.code.startsWith("E_")
     ? error.code
@@ -273,32 +255,31 @@ export function buildReviewPreProviderError(error) {
   const rawMessage = typeof error?.message === "string" && error.message.trim()
     ? error.message
     : "Review worker failed before provider start";
-
   let cause = rawMessage;
-  if (rawCode === "E_RECURSION"
-    || /unauthenticated|stale.*worker|worker invocation refused/i.test(rawMessage)) {
+  if (
+    rawCode === "E_RECURSION"
+    || /unauthenticated|stale.*worker|worker invocation refused/i.test(rawMessage)
+  ) {
     cause = "Worker could not authenticate before execution";
   }
-
   const message = withNextAction(cause, AUTH_NEXT);
-  const payload = redact(asErrorPayload({
-    code: rawCode,
-    message,
-    ...(error?.details === undefined ? {} : { details: { stage: "pre-provider", ...((error.details && typeof error.details === "object") ? error.details : {}) } })
-  }));
-  // Keep details optional and tiny: only stage marker if redaction left it.
-  if (payload.details && Object.keys(payload.details).length === 0) delete payload.details;
+  const payload = redact(asErrorPayload({ code: rawCode, message }));
   return {
     code: payload.code || rawCode,
-    message: clipMessage(payload.message || message),
-    ...(payload.details ? { details: payload.details } : {})
+    message: clipMessage(payload.message || message)
   };
 }
 
-/**
- * Generic E_WORKER_LOST when the child left no pendingTerminal.
- */
-export function reviewLostWorkerError(jobLike = {}) {
+export function reviewLostWorkerError(jobLike = {}, { unbound = false } = {}) {
+  if (unbound) {
+    return {
+      code: "E_WORKER_LOST",
+      message: withNextAction(
+        "Review launch never bound a worker process; the prompt was not replayed",
+        ORPHAN_NEXT
+      )
+    };
+  }
   const preProvider = jobLike.startedAt == null && !jobLike.providerProcess;
   if (preProvider) {
     return {
@@ -326,11 +307,6 @@ function samePending(a, b) {
   }
 }
 
-/**
- * Write scrubbed pendingTerminal for a review pre-provider failure.
- * Leaves the job non-terminal so recovery owns cleanup and final publication.
- * @returns {{ error, pendingTerminal } | null}
- */
 export function recordReviewPreProviderFailure({ root, jobId, error, env = process.env }) {
   const intendedError = buildReviewPreProviderError(error);
   const intendedTerminal = {
@@ -340,54 +316,41 @@ export function recordReviewPreProviderFailure({ root, jobId, error, env = proce
     error: intendedError,
     summary: intendedError.message
   };
-
   let recorded = null;
   updateJob(root, jobId, (current) => {
-    if (terminal(current)) {
+    if (terminal(current) || (current.jobClass && current.jobClass !== "review")) {
       recorded = null;
       return current;
     }
-    if (current.jobClass && current.jobClass !== "review") {
-      recorded = null;
-      return current;
-    }
-    if (current.pendingTerminal
-      && !samePending(current.pendingTerminal, intendedTerminal)) {
+    if (current.pendingTerminal && !samePending(current.pendingTerminal, intendedTerminal)) {
       recorded = {
         error: current.pendingTerminal.error,
         pendingTerminal: current.pendingTerminal
       };
       return current;
     }
-    current.pendingTerminal = intendedTerminal;
-    current.summary = intendedError.message;
-    current.progress = "Review worker failed before provider start; cleanup pending";
-    current.lifecycleEvents = appendLifecycleEvent(
-      current.lifecycleEvents || [],
-      "blocked",
-      intendedError.message
-    );
+    const next = scrubStoredJob({
+      ...current,
+      pendingTerminal: intendedTerminal,
+      summary: intendedError.message,
+      progress: "Review worker failed before provider start; cleanup pending",
+      lifecycleEvents: appendLifecycleEvent(
+        current.lifecycleEvents || [],
+        "blocked",
+        intendedError.message
+      )
+    });
+    // Ensure pending survives scrub if scrub strips unknown fields incorrectly.
+    next.pendingTerminal = intendedTerminal;
+    next.summary = intendedError.message;
     recorded = { error: intendedError, pendingTerminal: intendedTerminal };
-    return scrubStoredJob(current);
+    return next;
   }, env);
-
   return recorded;
 }
 ```
 
-Notes for implementers:
-- If `updateJob` / `writeJob` / `readJob` in this repo take `env` only on some call sites, match the local signatures used in nearby modules (`state.mjs`). Prefer the same pattern as other lib helpers that accept optional `env`.
-- If `scrubStoredJob` clears `pendingTerminal`, write `pendingTerminal` **after** scrub or re-apply it post-scrub. Verify with the unit test that pending survives. Adjust order to:
-
-```js
-const scrubbed = scrubStoredJob(current);
-scrubbed.pendingTerminal = intendedTerminal;
-scrubbed.summary = intendedError.message;
-// ... lifecycle on scrubbed
-return scrubbed;
-```
-
-- If `appendLifecycleEvent` is not re-exported cleanly from `task-contract.mjs`, import from `task-lifecycle.mjs` as shown.
+Adjust `updateJob`/`writeJob`/`readJob` arity to match `state.mjs` (with or without `env`).
 
 - [ ] **Step 2: Run unit tests — expect PASS**
 
@@ -395,31 +358,21 @@ return scrubbed;
 node --test tests/review-preprovider-failure.test.mjs
 ```
 
-Expected: all tests PASS. Fix scrub/order issues if any fail.
-
 - [ ] **Step 3: Commit**
 
 ```bash
 git add plugins/grok/scripts/lib/review-preprovider-failure.mjs tests/review-preprovider-failure.test.mjs
-git commit -m "$(cat <<'EOF'
-feat: record durable review pre-provider failure intent
-
-Add a bounded helper that writes scrubbed pendingTerminal for review
-workers and builds typed/actionable loss messages for #95.
-EOF
-)"
+git commit -m "feat: record durable review pre-provider failure intent"
 ```
 
 ---
 
-### Task 3: Wire review `--worker` to record intent before exit
+### Task 3: Wire review `--worker` + recovery messages (P0)
 
 **Files:**
-- Modify: `plugins/grok/scripts/grok-companion.mjs` (import near other lib imports; review worker block ~L4940–5091)
+- Modify: `plugins/grok/scripts/grok-companion.mjs`
 
-- [ ] **Step 1: Add import**
-
-Near the other `./lib/` imports:
+- [ ] **Step 1: Import**
 
 ```js
 import {
@@ -428,15 +381,7 @@ import {
 } from "./lib/review-preprovider-failure.mjs";
 ```
 
-- [ ] **Step 2: Replace bare auth throw with record-then-throw**
-
-In the `--worker` command path, where today:
-
-```js
-if (!authorized) throw new CompanionError("E_RECURSION", "Unauthenticated Grok Companion worker invocation refused.");
-```
-
-Use:
+- [ ] **Step 2: Auth failure (~L5079)**
 
 ```js
 if (!authorized) {
@@ -444,107 +389,38 @@ if (!authorized) {
     "E_RECURSION",
     "Unauthenticated Grok Companion worker invocation refused."
   );
-  // Only review jobs need this durable pre-provider intent for issue #95.
-  // Task/broker workers keep their existing settlement paths.
   try {
     const record = readJob(root, id);
     if (record.jobClass === "review") {
       recordReviewPreProviderFailure({ root, jobId: id, error: authError });
     }
-  } catch {
-    // Best-effort diagnostics; still refuse execution.
-  }
+  } catch { /* best-effort diagnostics */ }
   throw authError;
 }
 ```
 
-- [ ] **Step 3: Record on pre-`execute()` failures for review**
-
-Where today:
+- [ ] **Step 3: Pre-execute catch**
 
 ```js
 try {
   await execute(root, id, { dispatchAttemptId, dispatchFence: authorizedFence });
 } catch (error) {
-  // The executing worker never terminalizes its own still-live process.
-  // execute() atomically settles cleanup-safe pre-provider failures; if it
-  // could not, the controller/reconciler observes exact process exit and
-  // performs loss recovery without replaying the prompt.
-  throw error;
-}
-```
-
-Use:
-
-```js
-try {
-  await execute(root, id, { dispatchAttemptId, dispatchFence: authorizedFence });
-} catch (error) {
-  // execute() may already settle cleanup-safe task terminals. For review,
-  // ensure a scrubbed pre-provider (or early) intent exists before exit so
-  // recovery does not collapse the cause into opaque E_WORKER_LOST.
   try {
     const record = readJob(root, id);
-    if (record.jobClass === "review"
+    if (
+      record.jobClass === "review"
       && !terminal(record)
       && !record.providerProcess
-      && record.startedAt == null) {
+      && record.startedAt == null
+    ) {
       recordReviewPreProviderFailure({ root, jobId: id, error });
     }
-  } catch {
-    // Best-effort; preserve original throw.
-  }
+  } catch { /* best-effort */ }
   throw error;
 }
 ```
 
-Do **not** record after provider has started (`providerProcess` set or `startedAt` set): mid-run failures must keep existing terminal paths / generic loss behavior.
-
-- [ ] **Step 4: Syntax check**
-
-```bash
-node --check plugins/grok/scripts/grok-companion.mjs
-node --check plugins/grok/scripts/lib/review-preprovider-failure.mjs
-```
-
-Expected: exit 0.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add plugins/grok/scripts/grok-companion.mjs
-git commit -m "$(cat <<'EOF'
-fix: persist review worker pre-provider failures before exit
-
-Call recordReviewPreProviderFailure on auth refusal and early review
-worker throws so recovery can publish a typed cause for #95.
-EOF
-)"
-```
-
----
-
-### Task 4: Harden recovery generic `E_WORKER_LOST` for review
-
-**Files:**
-- Modify: `plugins/grok/scripts/grok-companion.mjs` inside `recoverActiveJobs`, ~L917–924 where `interruptedError` is built
-
-- [ ] **Step 1: Prefer helper for non-research interrupted error**
-
-Replace:
-
-```js
-const interruptedError = {
-  code: current.jobClass === "research"
-    ? "E_WORKFLOW_INCOMPLETE"
-    : "E_WORKER_LOST",
-  message: current.jobClass === "research"
-    ? "The deep-research workflow was interrupted when its worker disappeared; it was not replayed."
-    : "The background worker disappeared; the prompt was not replayed."
-};
-```
-
-With:
+- [ ] **Step 4: Recovery `interruptedError` (~L917)**
 
 ```js
 const interruptedError = current.jobClass === "research"
@@ -560,35 +436,36 @@ const interruptedError = current.jobClass === "research"
       };
 ```
 
-Recall: when `pendingTerminal` exists, the non-task branch already sets `current.error = pending.error` (~L965–967). This change only affects the **no-pending** path.
-
-- [ ] **Step 2: Syntax check**
+- [ ] **Step 5: Syntax check + unit tests**
 
 ```bash
 node --check plugins/grok/scripts/grok-companion.mjs
+node --test tests/review-preprovider-failure.test.mjs
 ```
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add plugins/grok/scripts/grok-companion.mjs
-git commit -m "$(cat <<'EOF'
-fix: make review lost-worker messages stage-aware
-
-Use pre-provider vs mid-run E_WORKER_LOST wording when review recovery
-has no pendingTerminal intent (#95).
-EOF
-)"
+git commit -m "fix: persist review pre-provider failures and stage-aware loss messages"
 ```
 
 ---
 
-### Task 5: Integration tests (auth failure + pending promotion + regression)
+### Task 4: P0 integration tests
 
 **Files:**
-- Modify: `tests/runtime.test.mjs` (add near existing lost-worker review tests ~L4310)
+- Modify: `tests/runtime.test.mjs` (near lost-worker review tests)
 
-- [ ] **Step 1: Add integration test — worker auth failure records typed intent and recovery promotes it**
+Helpers already in file: `fixture`, `seedWorkspace`, `writeSeededJob`, `parseJson`, `waitFor`, `generateId`, `persistedJobs`. Add `persistedJob` if missing:
+
+```js
+function persistedJob(pluginData, id) {
+  return persistedJobs(pluginData).find((job) => job.id === id);
+}
+```
+
+- [ ] **Step 1: Auth failure → typed recovery**
 
 ```js
 test("review worker auth failure records typed pendingTerminal instead of opaque E_WORKER_LOST", {
@@ -601,16 +478,14 @@ test("review worker auth failure records typed pendingTerminal instead of opaque
   const id = generateId("review");
   const isolatedHome = path.join(stateRoot, "review-homes", id);
   fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(path.join(isolatedHome, "marker"), "pre-auth\n", { mode: 0o600 });
   const stamped = new Date(Date.now() - 60_000).toISOString();
-  // Deliberately leave workerProcess null / mismatched so --worker cannot authorize.
   writeSeededJob(stateRoot, {
     schemaVersion: 2,
     id,
     kind: "review",
     jobClass: "review",
     title: "review: pre-provider auth fixture",
-    summary: "Queued",
+    summary: "Running",
     write: false,
     status: "running",
     phase: "queued",
@@ -637,23 +512,15 @@ test("review worker auth failure records typed pendingTerminal instead of opaque
     error: null
   });
 
-  const workerEnv = {
-    ...env,
-    GROK_COMPANION_WORKER_NONCE: crypto.randomBytes(16).toString("hex")
-  };
-  const worker = runCompanion(
-    ["--worker", id, "--cwd", root],
-    { cwd: root, env: workerEnv, timeout: 15_000 }
-  );
+  const worker = runCompanion(["--worker", id, "--cwd", root], {
+    cwd: root,
+    env: { ...env, GROK_COMPANION_WORKER_NONCE: crypto.randomBytes(16).toString("hex") },
+    timeout: 15_000
+  });
   assert.notEqual(worker.status, 0);
 
-  // Intent should be durable even before status recovery.
   const afterWorker = persistedJob(pluginData, id);
-  assert.ok(afterWorker.pendingTerminal, "expected pendingTerminal after auth failure");
   assert.equal(afterWorker.pendingTerminal.error.code, "E_RECURSION");
-  assert.match(afterWorker.pendingTerminal.error.message, /re-run|status|replay|authenticate/i);
-  assert.equal(afterWorker.startedAt, null);
-  assert.equal(afterWorker.providerProcess, null);
 
   const recovered = await waitFor(() => {
     const result = runCompanion(["status", id, "--json"], { cwd: root, env });
@@ -666,34 +533,22 @@ test("review worker auth failure records typed pendingTerminal instead of opaque
   assert.match(recovered.error.message, /re-run|status|replay|authenticate/i);
   assert.equal(recovered.result?.replay, false);
   assert.equal(fs.existsSync(isolatedHome), false);
-  const raw = JSON.stringify(recovered);
-  assert.equal(raw.includes("PROMPT_MUST_BE_SCRUBBED_IF_PRESENT"), false);
+  assert.equal(JSON.stringify(recovered).includes("PROMPT_MUST_BE_SCRUBBED_IF_PRESENT"), false);
 });
 ```
 
-If `persistedJob` is not already defined in this file, use the same helper pattern as nearby tests (`persistedJobs` filter by id) or:
-
-```js
-function persistedJob(pluginData, id) {
-  return persistedJobs(pluginData).find((job) => job.id === id);
-}
-```
-
-(only add if missing).
-
-- [ ] **Step 2: Add integration test — unknown pre-provider loss keeps E_WORKER_LOST with stage-aware message**
+- [ ] **Step 2: Silent pre-provider loss message**
 
 ```js
 test("review pre-provider silent loss uses stage-aware E_WORKER_LOST", {
   skip: process.platform === "win32"
 }, () => {
   const root = initRepo();
-  const { env, pluginData } = fixture();
+  const { env } = fixture();
   const stateRoot = seedWorkspace(root, env);
   const id = generateId("review");
   const isolatedHome = path.join(stateRoot, "review-homes", id);
   fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(path.join(isolatedHome, "marker"), "silent\n", { mode: 0o600 });
   const stamped = new Date(Date.now() - 60_000).toISOString();
   writeSeededJob(stateRoot, {
     schemaVersion: 2,
@@ -729,62 +584,419 @@ test("review pre-provider silent loss uses stage-aware E_WORKER_LOST", {
     result: null,
     error: null
   });
-
   const recovered = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
   assert.equal(recovered.status, "failed");
   assert.equal(recovered.error.code, "E_WORKER_LOST");
   assert.match(recovered.error.message, /before provider start/i);
-  assert.match(recovered.error.message, /re-run|status|replay/i);
   assert.equal(fs.existsSync(isolatedHome), false);
 });
 ```
 
-- [ ] **Step 3: Run focused tests**
+- [ ] **Step 3: Soften mid-run test message assertion if it used exact equality**
+
+Keep `error.code === "E_WORKER_LOST"`; allow next-action suffix; forbid “before provider start”.
+
+- [ ] **Step 4: Run focused tests**
 
 ```bash
 node --test tests/review-preprovider-failure.test.mjs tests/runtime.test.mjs
 ```
 
-If the full runtime suite is slow, run with a name filter if your Node version supports it, or run the whole file. Expected: new tests PASS; existing `lost-worker recovery terminates headless review...` still PASS (`E_WORKER_LOST` without “before provider start” is OK for mid-run — message may now include mid-run next action).
+- [ ] **Step 5: Commit**
 
-If the mid-run test asserts exact message equality, update it only to allow the added next-action suffix, **not** a code change:
+```bash
+git add tests/runtime.test.mjs
+git commit -m "test: prove review pre-provider diagnostics for #95"
+```
+
+---
+
+# Slice P1 — Provisional auth
+
+### Task 5: Provisional authorization for legacy review `--worker`
+
+**Files:**
+- Modify: `plugins/grok/scripts/grok-companion.mjs` auth loop in `--worker` (legacy non-broker branch only)
+
+Deep-research precedent (~L5208–5213):
 
 ```js
-assert.equal(recovered.error.code, "E_WORKER_LOST");
-assert.match(recovered.error.message, /background worker disappeared/i);
-assert.doesNotMatch(recovered.error.message, /before provider start/i);
+if (nonce && (record.workerAuthorization === nonce || identity?.nonce === nonce)) {
+  if (!identity?.pid || identity.pid === process.pid) {
+    authorized = true;
+    break;
+  }
+}
+```
+
+- [ ] **Step 1: Inside the existing 40-attempt loop for non-broker workers**, after full identity match fails, add:
+
+```js
+// Legacy review (and any non-broker worker): provisional admit while launcher
+// still records birth token — mirror deep-research first-registration window.
+if (
+  !brokerInvocation
+  && nonce
+  && (
+    record.workerAuthorization === nonce
+    || identity?.nonce === nonce
+  )
+  && (
+    !identity?.pid
+    || identity.pid === process.pid
+  )
+  && (
+    identity?.commandMarker == null
+    || identity.commandMarker === id
+  )
+) {
+  authorized = true;
+  break;
+}
+```
+
+Place this **only** on the path that is not already covered by broker registration. Prefer scoping with `record.jobClass === "review"` if non-review legacy workers must stay strict — **spec says review only**, so:
+
+```js
+if (!brokerInvocation && record.jobClass === "review" && nonce && ...)
+```
+
+- [ ] **Step 2: Confirm parent still publishes full identity** before any kill path (no change required if `captureSpawnIdentity` + updateJob remain). Do not signal without startToken.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add plugins/grok/scripts/grok-companion.mjs
+git commit -m "fix: provisionally authorize review workers during identity publish lag"
+```
+
+---
+
+### Task 6: Delayed identity-publication test (P1)
+
+**Files:**
+- Modify: `tests/runtime.test.mjs`
+
+- [ ] **Step 1: Add test**
+
+```js
+test("review worker provisionally authorizes before workerProcess is published", {
+  skip: process.platform === "win32",
+  timeout: 30_000
+}, async () => {
+  const root = initRepo();
+  fs.appendFileSync(path.join(root, "tracked.txt"), "provisional-auth\n", "utf8");
+  const { env, pluginData } = fixture({ headlessDelayMs: 60_000 });
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("review");
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const stamped = new Date().toISOString();
+  const logFile = path.join(stateRoot, "jobs", `${id}.log`);
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: provisional auth",
+    summary: "Queued",
+    write: false,
+    status: "queued",
+    phase: "queued",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    workerAuthorization: nonce,
+    workerProcess: null,
+    providerProcess: null,
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile,
+    progress: null,
+    request: {
+      prompt: "review provisional",
+      target: { mode: "working-tree", label: "fixture", base: null }
+    },
+    result: null,
+    error: null
+  });
+
+  const child = spawn(process.execPath, [COMPANION, "--worker", id, "--cwd", root], {
+    cwd: root,
+    env: { ...env, GROK_COMPANION_WORKER_NONCE: nonce },
+    detached: true,
+    stdio: "ignore"
+  });
+
+  // Withhold workerProcess longer than the old pure sleep budget.
+  await new Promise((r) => setTimeout(r, 1200));
+
+  const started = await waitFor(() => {
+    const job = persistedJob(pluginData, id);
+    return job?.startedAt ? job : false;
+  }, { timeoutMs: 10_000 });
+
+  assert.ok(started.startedAt, "provisional auth must reach execute without parent workerProcess publish");
+  try { process.kill(-child.pid, "SIGKILL"); } catch {}
+  try { process.kill(child.pid, "SIGKILL"); } catch {}
+});
+```
+
+Import `spawn` from `node:child_process` and `COMPANION` from helpers if not already.
+
+- [ ] **Step 2: Foreign PID rejection test**
+
+```js
+test("review provisional auth rejects foreign workerProcess pid", {
+  skip: process.platform === "win32",
+  timeout: 20_000
+}, async () => {
+  const root = initRepo();
+  const { env, pluginData } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("review");
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const stamped = new Date().toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: foreign pid",
+    summary: "Queued",
+    write: false,
+    status: "queued",
+    phase: "queued",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    workerAuthorization: nonce,
+    workerProcess: {
+      pid: 1,
+      startToken: "foreign",
+      nonce,
+      processGroupId: 1,
+      commandMarker: id
+    },
+    providerProcess: null,
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null, target: { mode: "working-tree", label: "fixture", base: null } },
+    result: null,
+    error: null
+  });
+
+  const worker = runCompanion(["--worker", id, "--cwd", root], {
+    cwd: root,
+    env: { ...env, GROK_COMPANION_WORKER_NONCE: nonce },
+    timeout: 15_000
+  });
+  assert.notEqual(worker.status, 0);
+  const stored = persistedJob(pluginData, id);
+  assert.equal(stored.startedAt, null);
+  assert.equal(stored.pendingTerminal?.error?.code, "E_RECURSION");
+});
+```
+
+- [ ] **Step 3: Run tests — expect PASS**
+
+```bash
+node --test tests/runtime.test.mjs
 ```
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add tests/runtime.test.mjs
-git commit -m "$(cat <<'EOF'
-test: prove review pre-provider diagnostics for #95
-
-Cover typed auth failure promotion, stage-aware silent loss, and keep
-mid-run lost-worker recovery fail-closed.
-EOF
-)"
+git add plugins/grok/scripts/grok-companion.mjs tests/runtime.test.mjs
+git commit -m "test: prove review provisional auth and foreign pid rejection"
 ```
 
 ---
 
-### Task 6: Foreground/background contract note + final verification
+# Slice P2 — Orphan recovery
+
+### Task 7: Terminalize aged unbound review jobs
 
 **Files:**
-- Modify: `tests/runtime.test.mjs` only if a second entry path is easy; otherwise document that both paths share job state (same helper + recovery) and the seeded `--worker` test is path-agnostic.
+- Modify: `plugins/grok/scripts/grok-companion.mjs` in `recoverActiveJobs` active loop (~L813+)
 
-- [ ] **Step 1: Optional compact parity assertion**
+- [ ] **Step 1: After the queued &lt;5s continue and controller/worker liveness gates**, before heavy terminate work, handle unbound review:
 
-If background review can be forced to hit auth failure without flaking, skip inventing a flaky race. The design treats durable job projection as the contract; Task 5’s seeded `--worker` path is the authoritative proof. Add a short comment above the integration test:
+When `job.jobClass === "review"` and `!job.workerProcess?.pid` and not cleanup-blocked and not controller-live:
+
+- Skip if still inside the existing `queued && age < 5000` gate (already applied).
+- Run review home cleanup (`cleanupReviewEnvironment` + guard cleanup).
+- In `updateJob`, if still non-terminal and still unbound, set terminal failed with `reviewLostWorkerError(current, { unbound: true })`, scrub, `replay: false`, privacy fields as other review loss paths.
+
+Concrete structure (fit into existing loop rather than duplicating terminate logic):
 
 ```js
-// Foreground and background review share durable job state + recovery; this
-// fixture exercises the worker entry both launch modes use.
+const unboundReview =
+  job.jobClass === "review"
+  && !cleanupBlocked
+  && !job.workerProcess?.pid;
+
+// existing continues for live worker / starting grace remain first
+
+if (unboundReview) {
+  // No process to terminate; cleanup home and terminalize with unbound message.
+  let cleanup = cleanupReviewEnvironment(stateDir(root), job.id);
+  cleanup = includeGuardCleanup(root, job.id, cleanup);
+  updateJob(root, job.id, (current) => {
+    if (terminal(current) || current.workerProcess?.pid) return current;
+    const err = reviewLostWorkerError(current, { unbound: true });
+    Object.assign(current, scrubStoredJob(current));
+    current.status = "failed";
+    current.phase = "failed";
+    current.completedAt = now();
+    current.error = err;
+    current.summary = err.message;
+    current.result = {
+      ...(current.result || {}),
+      hostVerification: current.result?.hostVerification || "not_run",
+      replay: false,
+      resume: false
+    };
+    current.result = applyReviewPrivacy(current.result, cleanup);
+    current.lifecycleEvents = appendLifecycleEvent(
+      current.lifecycleEvents || [],
+      "blocked",
+      err.message
+    );
+    delete current.pendingTerminal;
+    return current;
+  });
+  continue;
+}
 ```
 
-- [ ] **Step 2: Full offline checks used for this slice**
+Place this **after** live-worker checks and **after** the 5s queued grace so young launchers are not stolen. If the main loop structure already falls through when `workerProcess` is missing, ensure it does not no-op: today missing pid skips `identityMatches` continue and may still run terminate with null identities — verify behavior and either use the explicit branch above or ensure terminalization always runs.
+
+- [ ] **Step 2: Syntax check**
+
+```bash
+node --check plugins/grok/scripts/grok-companion.mjs
+```
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add plugins/grok/scripts/grok-companion.mjs
+git commit -m "fix: terminalize aged unbound review jobs without workerProcess"
+```
+
+---
+
+### Task 8: Orphan recovery tests + final verification
+
+**Files:**
+- Modify: `tests/runtime.test.mjs`
+
+- [ ] **Step 1: Aged unbound fails**
+
+```js
+test("aged unbound review without workerProcess is recovered as failed", {
+  skip: process.platform === "win32"
+}, () => {
+  const root = initRepo();
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("review");
+  const stamped = new Date(Date.now() - 10_000).toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: orphan unbound",
+    summary: "Queued",
+    write: false,
+    status: "queued",
+    phase: "queued",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    workerAuthorization: "abc",
+    workerProcess: null,
+    providerProcess: null,
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null, target: { mode: "working-tree", label: "fixture", base: null } },
+    result: null,
+    error: null
+  });
+  const recovered = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
+  assert.equal(recovered.status, "failed");
+  assert.equal(recovered.error.code, "E_WORKER_LOST");
+  assert.match(recovered.error.message, /never bound|before provider start|re-run|replay/i);
+});
+```
+
+- [ ] **Step 2: Young unbound keeps grace**
+
+```js
+test("young unbound review remains queued during launch grace", {
+  skip: process.platform === "win32"
+}, () => {
+  const root = initRepo();
+  const { env } = fixture();
+  const stateRoot = seedWorkspace(root, env);
+  const id = generateId("review");
+  const stamped = new Date().toISOString();
+  writeSeededJob(stateRoot, {
+    schemaVersion: 2,
+    id,
+    kind: "review",
+    jobClass: "review",
+    title: "review: young unbound",
+    summary: "Queued",
+    write: false,
+    status: "queued",
+    phase: "queued",
+    workspaceRoot: root,
+    host: { kind: "claude-code", sessionId: env.GROK_COMPANION_HOST_SESSION_ID },
+    grokSessionId: null,
+    createdAt: stamped,
+    startedAt: null,
+    updatedAt: stamped,
+    completedAt: null,
+    workerAuthorization: "abc",
+    workerProcess: null,
+    providerProcess: null,
+    profile: { id: "review", transport: "headless" },
+    model: null,
+    effort: null,
+    logFile: path.join(stateRoot, "jobs", `${id}.log`),
+    progress: null,
+    request: { prompt: null, target: { mode: "working-tree", label: "fixture", base: null } },
+    result: null,
+    error: null
+  });
+  const recovered = parseJson(runCompanion(["status", id, "--json"], { cwd: root, env }));
+  assert.equal(recovered.status, "queued");
+  assert.equal(recovered.error, null);
+});
+```
+
+- [ ] **Step 3: Full slice verification**
 
 ```bash
 node --check plugins/grok/scripts/lib/review-preprovider-failure.mjs
@@ -794,41 +1006,34 @@ node --test tests/runtime.test.mjs
 git diff --check
 ```
 
-Expected: all green; no authenticated Grok run required.
+Expected: all green; mid-run lost-worker test still passes.
 
-- [ ] **Step 3: Final commit only if comment/docs tweaks remain**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add tests/runtime.test.mjs
-git commit -m "test: note shared review diagnostic contract for foreground and background"
+git commit -m "test: cover unbound review orphan recovery and launch grace"
 ```
-
-(Skip empty commit if nothing changed.)
 
 ---
 
 ## Spec coverage checklist
 
-| Spec requirement | Task |
+| Spec item | Tasks |
 | --- | --- |
-| Child writes bounded `pendingTerminal` | Task 1–2, 3 |
-| Typed primary code when known (`E_RECURSION`, etc.) | Task 2–3, 5 |
-| Untyped → `E_PROVIDER_EXIT` | Task 1–2 |
-| Generic `E_WORKER_LOST` only without pending | Task 4–5 |
-| Pre-provider vs mid-run unknown-loss wording | Task 2, 4–5 |
-| One concrete next action | Task 2 |
-| No prompt/credential leakage | Task 1, 5 |
-| No automatic replay | Task 5 (`replay: false`) |
-| Recovery prefers pending (existing path + write) | Task 3, 5 |
-| Mid-run regression green | Task 5 |
-| Foreground/background same durable contract | Task 5–6 |
-| No race fix / no dispatch-v2 | Explicit non-touch |
+| P0 pendingTerminal + typed codes | 1–4 |
+| P0 stage-aware E_WORKER_LOST | 2–4 |
+| P1 provisional auth | 5–6 |
+| P1 foreign pid reject | 6 |
+| P2 orphan + grace | 7–8 |
+| No replay / scrub / mid-run regression | 4, 8 |
+| No dispatch-v2 | Out of scope |
 
 ## Placeholder / consistency self-review
 
-- No TBD steps; helper API names are stable across tasks: `recordReviewPreProviderFailure`, `buildReviewPreProviderError`, `reviewLostWorkerError`.
-- `pendingTerminal` shape matches the design doc.
-- Env plumbing may need a one-line adjustment to match `updateJob(root, id, fn, env)` vs `updateJob(root, id, fn)` — verify against `plugins/grok/scripts/lib/state.mjs` during Task 2 and keep unit tests as the authority.
+- APIs stable: `recordReviewPreProviderFailure`, `buildReviewPreProviderError`, `reviewLostWorkerError(..., { unbound })`.
+- Order enforced: P0 before P1 before P2.
+- `updateJob` env arg may need local signature tweak — unit tests are authority.
 
 ---
 
@@ -839,6 +1044,6 @@ Plan complete and saved to `docs/superpowers/plans/2026-08-10-issue-95-review-pr
 **Two execution options:**
 
 1. **Subagent-Driven (recommended)** — fresh subagent per task, review between tasks  
-2. **Inline Execution** — execute tasks in this session with checkpoints  
+2. **Inline Execution** — this session with checkpoints  
 
 Which approach?

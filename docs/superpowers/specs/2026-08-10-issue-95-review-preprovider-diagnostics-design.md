@@ -1,42 +1,38 @@
-# Issue #95: Review pre-provider diagnostics — Design
+# Issue #95: Review pre-provider loss — Design (extended)
 
-**Status:** Approved for implementation planning  
+**Status:** Draft for review (extended after RCA 2026-08-10)  
 **Date:** 2026-08-10  
 **Issue:** [#95](https://github.com/xliberty2008x/grok-plugin/issues/95)  
-**Type:** Bug fix (diagnostics / error attribution)  
-**Approach:** Shared review pre-provider intent helper (Approach 2)
+**Type:** Bug fix (root causes + diagnostics)  
+**Scope:** Legacy review launch only (not task dispatch-v2, not deep-research full rewrite)
 
 ---
 
-## 1. Problem
+## 0. RCA summary (evidence)
 
-A real installed `review` job can admit successfully, record a detached worker PID, then lose the worker **before** `startedAt`, provider process creation, or Grok launch. About five seconds later recovery publishes:
+Local reproduction (outside Grok ancestry) and code trace established three layers:
+
+| Layer | Status | Finding |
+| --- | --- | --- |
+| **P0 Diagnostic loss** | **Confirmed / always** | Child throws typed `E_RECURSION` (auth) with stderr; job stays non-terminal with **no** `pendingTerminal`; recovery publishes generic `E_WORKER_LOST`. |
+| **P1 Auth vs publish race** | **Credible / structural** | Parent: `spawn` → `captureSpawnIdentity` (≤750 ms) → first `workerProcess` write. Child starts at spawn and can only fully authorize on matching `workerProcess` (40×25 ms sleeps ≈1 s + overhead ≈1.8 s wall). Review lacks deep-research’s provisional `workerAuthorization` admit. Lock delay after capture can still lose the window. |
+| **P2 Orphan queued** | **Confirmed secondary** | Aged `queued` review with `workerProcess: null` is **never** terminalized by recovery (loop continues past gates without a dead-worker signal). |
+
+The original field incident (`workerProcess` set, `startedAt` null, fail ~5 s later) is consistent with P0 + either late publish of a dead PID or exit before `execute` sets `startedAt`. The incident alone cannot prove which exit reason; **P0 makes future incidents attributable**.
+
+No-automatic-replay remains correct and fail-closed.
+
+---
+
+## 1. Problem (operator-visible)
+
+A review job can fail before provider start and surface only:
 
 ```text
 E_WORKER_LOST: The background worker disappeared; the prompt was not replayed.
 ```
 
-No-automatic-replay is correct and must remain fail-closed. The defect is that the **pre-provider exit cause is discarded**, so operators cannot distinguish:
-
-- worker authorization / startup refusal;
-- early runtime failure before `execute()`;
-- external kill or silent death with no child write.
-
-The generic message also lacks a concrete next action, contrary to the project’s actionable-error expectations.
-
-### Confirmed mechanism (legacy review launch)
-
-1. Parent spawns the detached review worker with `stdio: "ignore"`.
-2. Parent may spend up to ~750 ms in `captureSpawnIdentity` before publishing `workerProcess`.
-3. Child polls durable state up to 40 × 25 ms, then throws `E_RECURSION` if it cannot authenticate.
-4. Pre-execute errors never reach durable state (ignored stdio; no `pendingTerminal` write).
-5. Recovery hardcodes generic `E_WORKER_LOST` when no usable pending intent exists.
-
-A startup race is a **credible** cause of some incidents; this design does **not** close that race. It ensures that when the child can observe a failure, the cause is durable and typed.
-
-### Existing recovery nuance
-
-For non-task jobs, recovery already prefers `pendingTerminal.error` when present. Review simply never writes that field on pre-provider failure. Mid-run loss after provider start correctly remains generic `E_WORKER_LOST` when no pre-provider intent was recorded.
+Operators cannot tell auth refusal, early crash, external kill, or launch never bound. Sometimes a job can also remain stuck `queued` with no worker identity at all.
 
 ---
 
@@ -44,205 +40,239 @@ For non-task jobs, recovery already prefers `pendingTerminal.error` when present
 
 ### Goals
 
-- Preserve a bounded, privacy-safe pre-provider launch diagnostic as durable job state.
-- Prefer a **typed primary error code** when the child recorded one.
-- Reserve generic `E_WORKER_LOST` for true unknown loss (no valid pending intent).
-- Always include **one concrete operator next action** in the published message.
-- Keep no-automatic-replay behavior.
-- Share one durable diagnostic contract for foreground and background review.
-- Prove behavior with deterministic tests matching issue #95 acceptance criteria.
+**P0 — Diagnostics**
 
-### Non-goals / out of scope
+- Durable, scrubbed pre-provider failure intent (`pendingTerminal`) from the review worker.
+- Typed primary code when known; generic `E_WORKER_LOST` only when unknown.
+- One concrete next action on published messages.
+- Foreground and background share the same durable contract.
+- No prompt/credential/unbounded-stderr leakage; no automatic replay.
 
-- Fixing the identity-publication vs authorization-window race (timeouts, reordering, handshake).
-- Migrating review onto dispatch-v2 / outbox controller launch.
-- Task, deep-research, or other non-review launch paths (except reuse of existing shared primitives).
-- Capturing parent/child stderr (`stdio: "ignore"` stays for the detached worker).
-- Inventing new public error codes (`E_WORKER_LAUNCH`, etc.) unless strictly required; prefer existing codes.
-- Changing process-identity kill rules, cleanup fences, or mid-run lost-worker semantics beyond message quality when no pending intent exists.
+**P1 — Race / handshake**
+
+- Legacy review worker can complete self-authorization without waiting for the parent’s post-`captureSpawnIdentity` `workerProcess` write, using the same **provisional authorization** pattern already used by deep-research workers.
+- Parent still records full owned identity (pid + startToken + nonce + commandMarker) before treating the worker as fully bound for signal/cleanup purposes.
+- Deterministic test: delay `workerProcess` publication past the old pure-poll window; worker still admits **or** leaves a typed durable failure (not silent opaque loss after a successful late publish of a dead PID).
+
+**P2 — Orphan recovery**
+
+- Aged non-terminal review with no live controller and **no** `workerProcess` (launch never bound) terminalizes with an actionable pre-provider loss error after the existing queued grace.
+- Does not steal jobs still inside the launch grace window.
+
+### Non-goals
+
+- Full migration of review onto dispatch-v2 / outbox controller (follow-up).
+- Changing task or deep-research launch beyond borrowing the provisional-auth **pattern**.
+- Capturing detached-worker stderr as the primary diagnostic channel (`stdio: "ignore"` may stay).
+- New public error codes unless unavoidable; prefer existing `E_RECURSION`, `E_WORKER_LOST`, `E_PROVIDER_EXIT`, `E_PROCESS_IDENTITY`.
+- Weakening process-identity checks before kill/signal of recorded groups.
+- Claiming the single production incident’s exact exit cause without durable evidence.
 
 ---
 
-## 3. Constraints (locked during brainstorming)
+## 3. Constraints
 
 | Decision | Choice |
 | --- | --- |
-| Fix priority | Diagnostics only |
-| Error shape | Typed primary code when known |
-| Durability mechanism | Child writes bounded terminal intent before exit |
-| Path scope | Review only |
-| Architecture | Shared helper + recovery preference (Approach 2) |
+| Job scope | **Review only** (legacy `--launch-worker` / `--worker`) |
+| Error shape | Typed primary when known |
+| Durability | Child writes `pendingTerminal` before exit (P0) |
+| Race strategy | **Provisional auth** (deep-research pattern), not dispatch-v2 |
+| Orphan strategy | Recovery terminalization after grace when unbound |
+| Delivery | One design; implement as ordered slices P0 → P1 → P2 |
 
 ---
 
 ## 4. Architecture
 
-### 4.1 Components
+### 4.1 P0 — `recordReviewPreProviderFailure`
 
-1. **`recordReviewPreProviderFailure({ root, jobId, error })`** (new helper)  
-   - Builds a scrubbed, bounded intended terminal from a thrown / `CompanionError`-like value.  
-   - Writes `pendingTerminal` (and matching summary / lifecycle event) under the job lock.  
-   - Does **not** kill processes, delete review homes, or publish final terminal status.  
-   - Location: leaf module already used by companion review lifecycle, or a small adjacent helper imported by `grok-companion.mjs`—prefer existing patterns over a new top-level facade.
+New leaf helper (e.g. `plugins/grok/scripts/lib/review-preprovider-failure.mjs`):
 
-2. **Review `--worker` entry** (existing)  
-   - On auth failure (`!authorized`) and on fail-before-successful-`execute()` paths that exit the worker, call the helper, then exit/rethrow as today.  
-   - Worker still does not “own” full recovery terminalization of a still-live process beyond leaving intent.
+- Input: `{ root, jobId, error, env? }`
+- Maps error → scrubbed `{ code, message }` (+ optional tiny `details.stage = "pre-provider"`).
+- Writes under `updateJob`:
+  - `pendingTerminal: { status: "failed", phase: "failed", completedAt, error, summary }`
+  - lifecycle `blocked` event
+  - non-terminal job (recovery owns cleanup + final publish)
+- No-op if already terminal; do not replace a **different** existing `pendingTerminal`.
+- Never stores prompt, credentials, or stderr blobs.
 
-3. **`recoverActiveJobs` review loss path** (existing)  
-   - After process-gone and cleanup proof (unchanged fences):  
-     - if valid `pendingTerminal.error` → publish it as primary;  
-     - else → `E_WORKER_LOST` with improved message + next action, wording chosen from whether provider/`startedAt` evidence shows pre-provider vs mid-run loss.  
-   - Progress/summary derive from the same selected error after cleanup.
+**Wire sites (review `--worker` only):**
 
-### 4.2 Data flow
+1. Auth failure (`!authorized`) before throw.  
+2. Catch around `execute` when still pre-provider (`startedAt == null` && `!providerProcess`).
 
-```
-parent: spawn review worker (stdio ignore) → publish workerProcess  [unchanged]
-child:  poll auth → fail or early throw
-child:  recordReviewPreProviderFailure → pendingTerminal
-child:  exit (no prompt replay)
-controller/status: recoverActiveJobs
-  → worker gone; cleanup review home per existing rules
-  → promote pendingTerminal.error if present
-  → else E_WORKER_LOST
-  → scrub; publish terminal failed; replay: false
+**Recovery:** already prefers `pendingTerminal.error` for non-task jobs; harden generic path with `reviewLostWorkerError(job)` (pre-provider vs mid-run wording + next action).
+
+### 4.2 P1 — Provisional authorization (race close)
+
+**Donor-in-tree pattern** (deep-research worker, current tree ~L5208–5213):
+
+```text
+if nonce matches workerAuthorization (or bound identity.nonce)
+  and (no workerProcess.pid OR workerProcess.pid === self)
+  → authorize provisionally
 ```
 
-### 4.3 Durable shape
+**Apply to legacy review `--worker` (non-broker only):**
 
-Reuse existing `pendingTerminal` (no new top-level job fields, no stderr buffer field):
+Provisional authorize when **all** hold:
+
+1. `GROK_COMPANION_WORKER_NONCE` is non-empty and equals `record.workerAuthorization`, **or** equals already-bound `workerProcess.nonce` for this job;  
+2. Job is review (or this branch is only reached for legacy non-broker review);  
+3. `workerProcess` is missing **or** `workerProcess.pid === process.pid` (never steal a foreign PID);  
+4. Job is not terminal;  
+5. Optional hardening: `commandMarker` absent or equals job id when present.
+
+After provisional auth, enter `execute` as today. The first durable bind inside `execute` / existing re-stamp path must still attach full identity (`startToken`, `processGroupId`, nonce, commandMarker) before provider launch.
+
+**Parent path (optional small harden, same slice):**
+
+- Keep `captureSpawnIdentity` + full `workerProcess` publish.  
+- Do **not** clear `workerAuthorization` until full identity is written (today parent nulls it in the same update as `workerProcess` — fine once provisional auth keys off either field).  
+- If capture fails and kills the child, existing launcher failure path terminalizes the job (keep); ensure message remains actionable (P0 helper or existing launcher diagnostic).
+
+**Why not only “widen poll to 5s”:** masks lock delay without fixing the handshake; provisional auth matches an already-shipped local pattern and removes ordering dependence.
+
+**Why not dispatch-v2 in this design:** larger surface; not required once provisional auth + diagnostics land.
+
+### 4.3 P2 — Orphan unbound review recovery
+
+In `recoverActiveJobs` active loop (after existing `queued` age &lt; 5 s skip):
+
+If job is review (legacy), non-terminal, not `providerLaunchCleanupBlocked`, controller not live, and **`workerProcess` is null/incomplete** (no pid), then:
+
+- Treat as launch-failed / unbound worker (not “still starting” — starting grace requires a matching live token).  
+- Cleanup review home if any.  
+- Terminalize with error from `reviewLostWorkerError` **or** a slightly more specific message: launch never bound a worker identity; re-run review; no replay.  
+- Code: `E_WORKER_LOST` is acceptable (unknown bound process); do not invent a new code unless docs already want one.
+
+Must **not** terminalize:
+
+- `queued` younger than 5 s (existing gate).  
+- Jobs with live matching `workerProcess`.  
+- Broker/dispatch-v1 candidates (already filtered).
+
+### 4.4 Data flow (combined)
+
+```
+parent: admit (workerAuthorization=nonce)
+     → spawn --worker (stdio ignore)
+     → captureSpawnIdentity → updateJob(workerProcess, clear auth)   [may lag]
+child:  provisional auth on workerAuthorization+self  OR full workerProcess match
+     → execute (startedAt, provider…)
+     → on pre-provider fail: recordReviewPreProviderFailure → pendingTerminal → exit
+recovery:
+     → prefer pendingTerminal.error
+     → else if unbound aged review: terminalize orphan
+     → else if dead worker: E_WORKER_LOST stage-aware
+     → cleanup home; replay: false
+```
+
+### 4.5 Durable shapes
+
+**pendingTerminal** (unchanged from prior approval):
 
 ```js
 pendingTerminal: {
   status: "failed",
   phase: "failed",
   completedAt: "<iso>",
-  error: { code: "<stable code>", message: "<cause + one next action>" },
+  error: { code, message },  // message includes one next action
   summary: "<same short text>"
 }
 ```
 
-Do not invent a new public phase unless an existing pre-provider phase is already required by local conventions; default `failed` is sufficient for this diagnostics fix.
+No new top-level fields required for P1/P2.
 
 ---
 
 ## 5. Error handling
 
-### 5.1 Code selection
-
-| Situation | Primary `error.code` |
-| --- | --- |
-| Auth never established after poll | `E_RECURSION` (existing throw code; improved message) |
-| Other `CompanionError` before successful `execute()` settlement | preserve `error.code` after scrub |
-| Non-`CompanionError` pre-provider throw | `E_PROVIDER_EXIT` (same default as `asErrorPayload` when `error.code` is absent; do not invent a new code) |
-| Worker gone, no valid `pendingTerminal`, provider never started | `E_WORKER_LOST` with pre-provider-oriented next-action message |
-| Mid-run loss after provider start, no pre-provider intent | `E_WORKER_LOST` with mid-run message (existing tests; may add next action without changing code) |
-
-### 5.2 Message contract
-
-Every published pre-provider or generic-loss message must be:
-
-1. **Redacted** via existing `redact` / `sanitizeDisplayText` / `scrubStoredJob` paths.  
-2. **Bounded** (same order as existing error message limits; no multi-KB blobs).  
-3. **Actionable**: short cause + **one** concrete next action.
-
-Illustrative wording (implementation may tighten; intent is fixed):
-
-- Auth:  
-  `Worker could not authenticate before execution. Check job status for this review ID; do not expect automatic replay — re-run the review command if needed.`
-- Unknown loss before provider start (`startedAt` null / `providerProcess` null):  
-  `The background worker disappeared before provider start; the prompt was not replayed. Inspect this job’s status/result, then re-run the review if the failure persists.`
-- Unknown mid-run loss (provider had started; no pending intent): keep code `E_WORKER_LOST`; message may add a next action but must not claim “before provider start.”
-
-Optional small `details` only if consistent with `asErrorPayload` (e.g. `stage: "pre-provider"`). Never store raw stderr dumps, credentials, full environment, or prompt text.
-
-### 5.3 Write rules for `recordReviewPreProviderFailure`
-
-- No-op if the job is already terminal.  
-- Do not overwrite a **different** existing `pendingTerminal` (first durable intent wins; identical payload may re-apply).  
-- Write under `updateJob` lock.  
-- Leave the job **non-terminal** so recovery owns review-home cleanup and final publication.  
-- Keep stored-job scrubbing consistent; never reintroduce a scrubbed prompt.
-
-### 5.4 Recovery precedence (review)
-
-1. Prefer valid `pendingTerminal.error` when present (already partially implemented for non-task jobs).  
-2. Else use improved generic `E_WORKER_LOST`.  
-3. After cleanup proven: progress/summary match final error; `replay: false`; scrub; apply review privacy/cleanup results as today.
+| Situation | Code | Notes |
+| --- | --- | --- |
+| Auth never established after full poll | `E_RECURSION` | Message: authenticate-before-execution + next action |
+| Other `CompanionError` pre-provider | keep code | Scrubbed |
+| Untyped pre-provider throw | `E_PROVIDER_EXIT` | Same default as `asErrorPayload` |
+| Dead worker, no pending, pre-provider | `E_WORKER_LOST` | “before provider start” + next action |
+| Mid-run loss, no pending | `E_WORKER_LOST` | Must **not** say “before provider start” |
+| Orphan unbound after grace | `E_WORKER_LOST` | Message: launch never bound worker / re-run |
 
 ---
 
 ## 6. Testing
 
-### 6.1 Required tests
+### P0
 
-1. **Auth / pre-authorization failure is typed**  
-   Deterministic fixture where the review worker cannot self-authorize (e.g. no matching `workerProcess` / blocked identity publication).  
-   Assert: typed code (`E_RECURSION` for auth), next action in message, no provider process / `startedAt` null, no replay, prompt scrubbed if present, review home cleaned when cleanup succeeds.
+1. Auth failure → durable `pendingTerminal` / recovered typed `E_RECURSION` + next action; no provider; no replay; home cleaned.  
+2. Pre-`execute` failure via helper → sanitized cause visible.  
+3. Mid-run lost-worker regression still green.  
+4. Helper unit: no-op terminal, no replace different pending, redaction.
 
-2. **Child fails before `execute()` with durable cause**  
-   Force a pre-execute failure that exercises the helper; after recovery, sanitized cause/code is visible; no provider launch; no replay.
+### P1
 
-3. **Regression: mid-run lost worker**  
-   Existing `lost-worker recovery terminates headless review...` remains green (`E_WORKER_LOST` after provider up; home removed).
+5. **Delayed identity publication:** spawn real `--worker` with valid `workerAuthorization`; withhold `workerProcess` write for &gt; old pure-poll window (≥1.2 s); assert worker reaches `execute` / `startedAt` **or** (if fixture stops provider) does not die with silent loss—prefer assert provisional auth succeeds and sets `startedAt` with fake provider.  
+6. **Foreign PID rejection:** job has `workerProcess.pid` for another process; provisional auth must **not** admit.  
+7. Full identity still required before any kill/cleanup of the worker group (existing identity tests stay green).
 
-4. **Foreground and background**  
-   Same durable error contract via job projection / `status --json` regardless of wait vs `--background` entry.
+### P2
 
-### 6.2 Optional unit coverage
+8. Seed review `queued`, `createdAt` aged &gt;5 s, `workerProcess: null` → `status` recovery → `failed` + actionable `E_WORKER_LOST`; no hang.  
+9. Seed review `queued`, age &lt;5 s, unbound → recovery leaves non-terminal (grace).
 
-- Helper no-ops when already terminal.  
-- Helper refuses to replace conflicting `pendingTerminal`.  
-- Message redaction/bounds hold for synthetic secret-like strings.
+### Verification
 
-### 6.3 Verification (implementation)
-
-- Focused Node test run for the files that receive new coverage.  
+- `node --check` on touched modules  
+- Focused `node --test` for new unit + runtime cases  
 - `git diff --check`  
-- No authenticated live Grok qualification required for this diagnostics-only change.
-
-### 6.4 Acceptance checklist
-
-- [ ] Known pre-provider failure → typed code + next action  
-- [ ] Unknown silent death → `E_WORKER_LOST` + next action  
-- [ ] No prompt/credential leakage  
-- [ ] No automatic replay  
-- [ ] Provider not started in pre-provider fixtures  
-- [ ] Existing provider-stage lost-worker test passes  
+- No authenticated live Grok run required for these slices  
 
 ---
 
-## 7. Implementation sketch (for writing-plans)
+## 7. Implementation order
 
-Order of work (not a full plan):
+1. **P0** — helper + wire + recovery messages + tests (unblocks attribution).  
+2. **P1** — provisional auth for legacy review + delayed-publish test.  
+3. **P2** — orphan unbound recovery + grace tests.  
+4. Update plan doc to match this extended design; implement slice-by-slice.
 
-1. Add `recordReviewPreProviderFailure` with scrubbing, conflict rules, and unit-level tests.  
-2. Wire review `--worker` auth failure and pre-`execute()` failure paths to the helper.  
-3. Harden generic review `E_WORKER_LOST` message when no pending intent.  
-4. Add deterministic runtime/integration tests from §6.  
-5. Confirm mid-run regression still green; no dispatch-v2 or race-timeout changes.
+Do not ship P1 without P0: a fixed race that still throws without durable intent re-creates opacity on other failures.
 
 ---
 
-## 8. Risks and follow-ups
+## 8. Risks
 
 | Risk | Mitigation |
 | --- | --- |
-| Child dies before any write (SIGKILL) | Still `E_WORKER_LOST`; message improved; race fix deferred |
-| Concurrent recovery vs child write | Job lock + “do not replace different pending”; recovery re-reads under lock |
-| Operators confuse auth `E_RECURSION` with nested-Grok recursion | Message explicitly says authentication-before-execution; docs/README can note review pre-provider sense later if needed |
-| Scope creep into race fix or dispatch-v2 | Explicit non-goals; separate issues |
-
-**Deferred follow-ups (not this design):** close identity-publication race; prefer dispatch-v2 for review; unify deep-research diagnostics.
+| Provisional auth too loose | Require nonce match; reject foreign pid; review/legacy-only branch |
+| Provisional auth without startToken | Do not signal/kill until full identity recorded; execute bind path unchanged for provider |
+| P2 races live launcher | Keep 5 s queued grace; only unbound (null workerProcess) |
+| `E_RECURSION` confusion with nested Grok | Message text names authentication-before-execution |
+| Scope creep to dispatch-v2 | Explicit non-goal |
 
 ---
 
-## 9. Donor / local mapping note
+## 9. Local pattern mapping
 
-Issue #95 is local lifecycle diagnostics. No donor code is required to invent a new cache or protocol. Local invariants to preserve:
+| Need | Local precedent |
+| --- | --- |
+| Provisional worker admit | Deep-research `--deep-research-worker` auth window |
+| `pendingTerminal` + recovery prefer | Task/research unsettled paths; non-task recovery already reads pending |
+| No-replay lost worker | `SPEC.md` §12 |
+| Fail-closed identity before signal | `process-control` / `captureSpawnIdentity` |
 
-- Fail-closed no-replay for lost workers (`SPEC.md` §12).  
-- Scrubbed durable job records.  
-- Recovery as the owner of final terminalization when the worker cannot prove cleanup.  
-- Reuse of `pendingTerminal` already used by task/research unsettled paths.
+No new donor pin required beyond patterns already in this repository. Prior diagnostics-only design is **superseded** by this extended document for implementation planning.
+
+---
+
+## 10. Acceptance checklist
+
+- [ ] Known pre-provider failure → typed code + next action (P0)  
+- [ ] Unknown silent death → stage-aware `E_WORKER_LOST` (P0)  
+- [ ] Delayed `workerProcess` publish still allows healthy auth (P1)  
+- [ ] Foreign `workerProcess` cannot be stolen (P1)  
+- [ ] Aged unbound queued review terminalizes (P2)  
+- [ ] Young unbound queued review keeps grace (P2)  
+- [ ] No prompt/credential leakage; no automatic replay  
+- [ ] Mid-run lost-worker test green  
