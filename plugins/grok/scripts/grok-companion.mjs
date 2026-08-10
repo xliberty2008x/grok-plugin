@@ -827,6 +827,44 @@ async function recoverActiveJobs(root) {
     const workerTokenMatches = Boolean(job.workerProcess?.pid && job.workerProcess.startToken && processStartToken(job.workerProcess.pid) === job.workerProcess.startToken);
     const workerMayStillBeStarting = workerTokenMatches && !processIsZombie(job.workerProcess.pid);
     if (!cleanupBlocked && workerMayStillBeStarting && Date.now() - Date.parse(job.updatedAt || job.startedAt || job.createdAt) < 1500) continue;
+    // Aged unbound review: launch never bound a workerProcess after the queued grace.
+    // Terminalize explicitly so recovery does not leave a permanent queued hang.
+    // Prefer any durable pre-provider pendingTerminal over the generic unbound message.
+    if (
+      !cleanupBlocked
+      && job.jobClass === "review"
+      && !job.workerProcess?.pid
+    ) {
+      let cleanup = cleanupReviewEnvironment(stateDir(root), job.id);
+      cleanup = includeGuardCleanup(root, job.id, cleanup);
+      updateJob(root, job.id, (current) => {
+        if (terminal(current) || current.workerProcess?.pid) return current;
+        if (providerLaunchCleanupBlocked(current)) return current;
+        Object.assign(current, scrubStoredJob(current));
+        const pending = current.pendingTerminal || null;
+        const err = pending?.error || reviewLostWorkerError(current, { unbound: true });
+        current.status = pending?.status || "failed";
+        current.phase = pending?.phase || "failed";
+        current.completedAt = pending?.completedAt || now();
+        current.error = err;
+        current.summary = pending?.summary || err.message;
+        current.result = {
+          ...(current.result || {}),
+          hostVerification: current.result?.hostVerification || "not_run",
+          replay: false,
+          resume: false
+        };
+        current.result = applyReviewPrivacy(current.result, cleanup);
+        current.lifecycleEvents = appendLifecycleEvent(
+          current.lifecycleEvents || [],
+          "blocked",
+          current.summary || err.message
+        );
+        delete current.pendingTerminal;
+        return current;
+      });
+      continue;
+    }
     let cleanupError = null;
     let providerIdentity = null;
     let taskCleanup = null;
