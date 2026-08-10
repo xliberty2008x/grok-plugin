@@ -95,10 +95,8 @@ import {
   projectWorkerSnapshot
 } from "./lib/worker-protocol.mjs";
 import { CONTEXT_BINDING_MODE, verifyJobEffectivePrompt } from "./lib/worker-context.mjs";
-import {
-  recordReviewPreProviderFailure,
-  reviewLostWorkerError
-} from "./lib/review-preprovider-failure.mjs";
+import { reviewLostWorkerError } from "./lib/review-preprovider-failure.mjs";
+import { runLegacyReviewWorker } from "./lib/review-worker-run.mjs";
 import {
   assertDispatchContract,
   assertWorkerProviderLaunchPreparation,
@@ -648,18 +646,14 @@ async function recoverActiveJobs(root) {
   );
   const host = currentHost();
   if (host.kind === "codex" && host.sessionId) {
-    // Worker Dispatch v1 has one owner-scoped, generation-aware recovery
-    // authority. The legacy CLI sweeper must never inspect or mutate foreign
-    // dispatch records and must never select a stale provider generation.
+    // Legacy CLI sweeper must not mutate foreign dispatch-v1 records.
     await reconcileBrokerWorkers({
       root,
       principal: { hostKind: "codex", threadId: host.sessionId }
     });
   }
   for (const job of listJobs(root).filter((candidate) => !dispatchV1(candidate) && terminal(candidate) && candidate.jobClass === "review" && candidate.result?.providerSessionDeleted === false && candidate.result?.skipReason !== "empty-target")) {
-    // Fail closed: require the complete owned provider process group to be gone
-    // (not merely a dead leader). Mirrors SessionEnd processGroupGone semantics.
-    // Use guard identity when providerProcess was never recorded on the job.
+    // Require the complete owned provider group gone (guard when unrecorded).
     const { identity: providerIdentity } = resolveProviderCleanupTarget(root, job);
     if (!processGroupGone(providerIdentity) || !processGroupGone(job.workerProcess)) continue;
     let cleanup = cleanupReviewEnvironment(stateDir(root), job.id);
@@ -815,9 +809,7 @@ async function recoverActiveJobs(root) {
     });
   }
   for (const job of listJobs(root).filter((candidate) => !dispatchV1(candidate) && !terminal(candidate))) {
-    // Broker-owned spawns deliberately commit before provider launch. Missing
-    // process identity is not evidence of loss while that launch boundary is
-    // pending, in flight, or explicitly ambiguous.
+    // Missing process identity is not loss while a launch boundary is unsettled.
     if (providerLaunchCleanupBlocked(job)) continue;
     const cleanupBlocked = job.phase === "cleanup-blocked" && Boolean(job.pendingTerminal);
     if (job.status === "queued" && Date.now() - Date.parse(job.createdAt) < 5000) continue;
@@ -827,44 +819,6 @@ async function recoverActiveJobs(root) {
     const workerTokenMatches = Boolean(job.workerProcess?.pid && job.workerProcess.startToken && processStartToken(job.workerProcess.pid) === job.workerProcess.startToken);
     const workerMayStillBeStarting = workerTokenMatches && !processIsZombie(job.workerProcess.pid);
     if (!cleanupBlocked && workerMayStillBeStarting && Date.now() - Date.parse(job.updatedAt || job.startedAt || job.createdAt) < 1500) continue;
-    // Aged unbound review: launch never bound a workerProcess after the queued grace.
-    // Terminalize explicitly so recovery does not leave a permanent queued hang.
-    // Prefer any durable pre-provider pendingTerminal over the generic unbound message.
-    if (
-      !cleanupBlocked
-      && job.jobClass === "review"
-      && !job.workerProcess?.pid
-    ) {
-      let cleanup = cleanupReviewEnvironment(stateDir(root), job.id);
-      cleanup = includeGuardCleanup(root, job.id, cleanup);
-      updateJob(root, job.id, (current) => {
-        if (terminal(current) || current.workerProcess?.pid) return current;
-        if (providerLaunchCleanupBlocked(current)) return current;
-        Object.assign(current, scrubStoredJob(current));
-        const pending = current.pendingTerminal || null;
-        const err = pending?.error || reviewLostWorkerError(current, { unbound: true });
-        current.status = pending?.status || "failed";
-        current.phase = pending?.phase || "failed";
-        current.completedAt = pending?.completedAt || now();
-        current.error = err;
-        current.summary = pending?.summary || err.message;
-        current.result = {
-          ...(current.result || {}),
-          hostVerification: current.result?.hostVerification || "not_run",
-          replay: false,
-          resume: false
-        };
-        current.result = applyReviewPrivacy(current.result, cleanup);
-        current.lifecycleEvents = appendLifecycleEvent(
-          current.lifecycleEvents || [],
-          "blocked",
-          current.summary || err.message
-        );
-        delete current.pendingTerminal;
-        return current;
-      });
-      continue;
-    }
     let cleanupError = null;
     let providerIdentity = null;
     let taskCleanup = null;
@@ -953,9 +907,7 @@ async function recoverActiveJobs(root) {
         : pending?.status === "cancelled"
           ? "cancelled"
           : "failed";
-      // Research jobs never use TaskEnvelope evidence paths. Task evidence is
-      // captured from the authoritative locked record only after cleanup was
-      // proven, so a stale outer snapshot cannot mask final workspace drift.
+      // Research skips TaskEnvelope evidence; capture after cleanup only.
       const evidence = current.jobClass === "research"
         ? { postContext: null, runtimeEvidence: null }
         : captureTerminalEvidence(root, current, pendingExecutionStatus);
@@ -3095,6 +3047,7 @@ async function startJob(root, job, background, { announce = false } = {}) {
         : null;
       updateJob(root, job.id, (current) => {
         Object.assign(current, scrubStoredJob(current));
+        current.workerAuthorization = null;
         current.status = "failed";
         current.phase = "failed";
         current.completedAt = now();
@@ -4504,10 +4457,7 @@ async function handleTransfer(raw) {
 
 async function main() {
   const [command, ...raw] = process.argv.slice(2);
-  const internal = command === "--launch-worker"
-    || command === "--worker"
-    || command === "--launch-deep-research"
-    || command === "--deep-research-worker";
+  const internal = ["--launch-worker", "--worker", "--launch-deep-research", "--deep-research-worker"].includes(command);
   const grokEnvironment = process.env.GROK_COMPANION_CHILD === "1" || process.env.GROK_COMPANION_JOB_MARKER || process.env.GROK_AGENT || process.env.GROK_LEADER_SOCKET;
   let guardedWorkspace = false;
   if (!internal && ["setup", "review", "adversarial-review", "task", "deep-research", "transfer"].includes(command)) {
@@ -5001,6 +4951,10 @@ async function main() {
       throw new CompanionError("E_USAGE", "Invalid worker invocation.");
     }
     const root = workspaceRoot(cwd), nonce = process.env.GROK_COMPANION_WORKER_NONCE;
+    if (!brokerInvocation && readJob(root, id).jobClass === "review") {
+      await runLegacyReviewWorker({ root, id, nonce, readJob, execute });
+      return;
+    }
     let authorized = false;
     let authorizedFence = null;
     for (let attempt = 0; attempt < 40; attempt++) {
@@ -5119,59 +5073,15 @@ async function main() {
           : null;
         break;
       }
-      // Provisional auth for legacy review --worker during identity publish lag
-      // (mirrors deep-research first-registration window; review-only, non-broker).
-      if (
-        !brokerInvocation
-        && record.jobClass === "review"
-        && nonce
-        && (
-          record.workerAuthorization === nonce
-          || identity?.nonce === nonce
-        )
-        && (
-          !identity?.pid
-          || identity.pid === process.pid
-        )
-        && (
-          identity?.commandMarker == null
-          || identity.commandMarker === id
-        )
-      ) {
-        authorized = true;
-        break;
-      }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     if (!authorized) {
-      const authError = new CompanionError(
+      throw new CompanionError(
         "E_RECURSION",
         "Unauthenticated Grok Companion worker invocation refused."
       );
-      try {
-        const record = readJob(root, id);
-        if (record.jobClass === "review") {
-          recordReviewPreProviderFailure({ root, jobId: id, error: authError });
-        }
-      } catch { /* best-effort diagnostics */ }
-      throw authError;
     }
-    try {
-      await execute(root, id, { dispatchAttemptId, dispatchFence: authorizedFence });
-    } catch (error) {
-      try {
-        const record = readJob(root, id);
-        if (
-          record.jobClass === "review"
-          && !terminal(record)
-          && !record.providerProcess
-          && record.startedAt == null
-        ) {
-          recordReviewPreProviderFailure({ root, jobId: id, error });
-        }
-      } catch { /* best-effort */ }
-      throw error;
-    }
+    await execute(root, id, { dispatchAttemptId, dispatchFence: authorizedFence });
     return;
   }
   if (command === "--launch-deep-research") {

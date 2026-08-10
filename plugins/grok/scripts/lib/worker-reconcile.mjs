@@ -32,15 +32,9 @@ export function providerLaunchUnsettled(job) {
  * settlement. Authorization is published before process identity, so an
  * authorization-only record is still launch-capable unless the launcher has
  * durably committed the explicit `not-launched` outcome.
- *
- * Spawn-contract jobs only: legacy review/research without `request.spawn`
- * rely on recoverActiveJobs' queued age grace. Leftover workerAuthorization
- * alone must not block forever after a failed or abandoned launch.
  */
 export function providerLaunchCleanupBlocked(job) {
   if (providerLaunchUnsettled(job)) return true;
-  const spawn = job?.request?.spawn;
-  if (!spawn || typeof spawn !== "object") return false;
   const hasAuthorization = job?.workerAuthorization !== null
     && job?.workerAuthorization !== undefined;
   const hasRecordedProcess = Boolean(
@@ -48,7 +42,7 @@ export function providerLaunchCleanupBlocked(job) {
   );
   return hasAuthorization
     && !hasRecordedProcess
-    && spawn.providerLaunchOutcome !== "not-launched";
+    && job?.request?.spawn?.providerLaunchOutcome !== "not-launched";
 }
 
 /**

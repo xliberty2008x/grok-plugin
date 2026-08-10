@@ -1043,7 +1043,7 @@ Plan complete and saved to `docs/superpowers/plans/2026-08-10-issue-95-review-pr
 
 **Two execution options:**
 
-1. **Subagent-Driven (recommended)** — fresh subagent per task, review between tasks  
-2. **Inline Execution** — this session with checkpoints  
+1. **Subagent-Driven (recommended)** — fresh subagent per task, review between tasks
+2. **Inline Execution** — this session with checkpoints
 
 Which approach?

@@ -100,6 +100,8 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/provider-startup-cancel.test.mjs",
     "tests/recursion-guard.test.mjs",
     "tests/redact.test.mjs",
+    "tests/review-preprovider-failure.test.mjs",
+    "tests/review-preprovider-runtime.test.mjs",
     "tests/runtime-context-incomplete.test.mjs",
     "tests/test-temp-cleanup.test.mjs",
     "tests/windows-neutral.test.mjs",

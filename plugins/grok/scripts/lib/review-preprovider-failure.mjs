@@ -2,7 +2,8 @@ import { asErrorPayload } from "./errors.mjs";
 import { redact, redactText, sanitizeDisplayText } from "./redact.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import { updateJob, terminal, now } from "./state.mjs";
-import { scrubStoredJob } from "./task-contract.mjs";
+import { scrubStoredJob } from "./task-envelope.mjs";
+import { processStartToken } from "./process-control.mjs";
 
 const MAX_MESSAGE_CHARS = 1024;
 const AUTH_NEXT =
@@ -89,11 +90,45 @@ function samePending(a, b) {
 }
 
 /**
- * Persist scrubbed pre-provider failure intent as pendingTerminal without
- * terminalizing the job. Recovery later promotes the intent once safe.
- * Never embeds request.prompt into pendingTerminal.
+ * True when the caller still holds an exact, live launch authorization for this
+ * review job. Unauthenticated or wrong-nonce callers must not mutate state.
  */
-export function recordReviewPreProviderFailure({ root, jobId, error, env = process.env }) {
+export function reviewLaunchAuthorizationMatches(job, authorization) {
+  if (!job || job.jobClass !== "review" || !authorization) return false;
+  const nonce = typeof authorization.nonce === "string" ? authorization.nonce : "";
+  if (!nonce) return false;
+  if (job.workerAuthorization === nonce && !job.workerProcess?.pid) return true;
+  const identity = job.workerProcess;
+  const pid = Number(authorization.pid);
+  const startToken = typeof authorization.startToken === "string"
+    ? authorization.startToken
+    : "";
+  const commandMarker = authorization.commandMarker;
+  if (!identity?.pid || !Number.isInteger(pid) || pid <= 0) return false;
+  return identity.nonce === nonce
+    && identity.pid === pid
+    && identity.startToken === startToken
+    && identity.startToken
+    && identity.commandMarker === commandMarker
+    && (
+      process.platform === "win32"
+        ? identity.processGroupId === null
+        : identity.processGroupId === pid
+    );
+}
+
+/**
+ * Persist scrubbed pre-provider failure intent only for an exact still-current
+ * review launch authorization/identity. Unauthenticated callers no-op.
+ */
+export function recordReviewPreProviderFailure({
+  root,
+  jobId,
+  error,
+  authorization = null,
+  env = process.env
+}) {
+  if (!authorization) return null;
   const intendedError = buildReviewPreProviderError(error);
   const intendedTerminal = {
     status: "failed",
@@ -104,7 +139,11 @@ export function recordReviewPreProviderFailure({ root, jobId, error, env = proce
   };
   let recorded = null;
   updateJob(root, jobId, (current) => {
-    if (terminal(current) || (current.jobClass && current.jobClass !== "review")) {
+    if (terminal(current) || current.jobClass !== "review") {
+      recorded = null;
+      return current;
+    }
+    if (!reviewLaunchAuthorizationMatches(current, authorization)) {
       recorded = null;
       return current;
     }
@@ -126,11 +165,56 @@ export function recordReviewPreProviderFailure({ root, jobId, error, env = proce
         intendedError.message
       )
     });
-    // Ensure pending survives scrub if scrub strips unknown fields incorrectly.
     next.pendingTerminal = intendedTerminal;
     next.summary = intendedError.message;
     recorded = { error: intendedError, pendingTerminal: intendedTerminal };
     return next;
   }, env);
   return recorded;
+}
+
+/**
+ * Provisional review admission during identity-publish lag: only when no PID is
+ * recorded and workerAuthorization still matches. Atomically consumes the
+ * authorization while binding the full self identity (pid, startToken, pgid).
+ */
+export function tryBindProvisionalReviewWorker({
+  root,
+  jobId,
+  nonce,
+  env = process.env
+}) {
+  if (typeof nonce !== "string" || !nonce) return false;
+  const pid = process.pid;
+  const startToken = processStartToken(pid);
+  if (!startToken) return false;
+  const processGroupId = process.platform === "win32" ? null : pid;
+  let bound = false;
+  updateJob(root, jobId, (current) => {
+    if (terminal(current) || current.jobClass !== "review") return current;
+    if (current.workerAuthorization !== nonce) return current;
+    if (current.workerProcess?.pid) return current;
+    current.workerAuthorization = null;
+    current.workerProcess = {
+      pid,
+      startToken,
+      processGroupId,
+      nonce,
+      commandMarker: jobId
+    };
+    current.summary = "Worker started";
+    bound = true;
+    return current;
+  }, env);
+  return bound;
+}
+
+export function selfReviewWorkerAuthorization(jobId, nonce) {
+  const pid = process.pid;
+  return {
+    nonce,
+    pid,
+    startToken: processStartToken(pid),
+    commandMarker: jobId
+  };
 }

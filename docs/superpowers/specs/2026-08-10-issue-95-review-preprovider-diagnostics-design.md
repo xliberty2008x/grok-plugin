@@ -1,9 +1,9 @@
 # Issue #95: Review pre-provider loss — Design (extended)
 
-**Status:** Draft for review (extended after RCA 2026-08-10)  
-**Date:** 2026-08-10  
-**Issue:** [#95](https://github.com/xliberty2008x/grok-plugin/issues/95)  
-**Type:** Bug fix (root causes + diagnostics)  
+**Status:** Draft for review (extended after RCA 2026-08-10)
+**Date:** 2026-08-10
+**Issue:** [#95](https://github.com/xliberty2008x/grok-plugin/issues/95)
+**Type:** Bug fix (root causes + diagnostics)
 **Scope:** Legacy review launch only (not task dispatch-v2, not deep-research full rewrite)
 
 ---
@@ -100,7 +100,7 @@ New leaf helper (e.g. `plugins/grok/scripts/lib/review-preprovider-failure.mjs`)
 
 **Wire sites (review `--worker` only):**
 
-1. Auth failure (`!authorized`) before throw.  
+1. Auth failure (`!authorized`) before throw.
 2. Catch around `execute` when still pre-provider (`startedAt == null` && `!providerProcess`).
 
 **Recovery:** already prefers `pendingTerminal.error` for non-task jobs; harden generic path with `reviewLostWorkerError(job)` (pre-provider vs mid-run wording + next action).
@@ -119,18 +119,18 @@ if nonce matches workerAuthorization (or bound identity.nonce)
 
 Provisional authorize when **all** hold:
 
-1. `GROK_COMPANION_WORKER_NONCE` is non-empty and equals `record.workerAuthorization`, **or** equals already-bound `workerProcess.nonce` for this job;  
-2. Job is review (or this branch is only reached for legacy non-broker review);  
-3. `workerProcess` is missing **or** `workerProcess.pid === process.pid` (never steal a foreign PID);  
-4. Job is not terminal;  
+1. `GROK_COMPANION_WORKER_NONCE` is non-empty and equals `record.workerAuthorization`, **or** equals already-bound `workerProcess.nonce` for this job;
+2. Job is review (or this branch is only reached for legacy non-broker review);
+3. `workerProcess` is missing **or** `workerProcess.pid === process.pid` (never steal a foreign PID);
+4. Job is not terminal;
 5. Optional hardening: `commandMarker` absent or equals job id when present.
 
 After provisional auth, enter `execute` as today. The first durable bind inside `execute` / existing re-stamp path must still attach full identity (`startToken`, `processGroupId`, nonce, commandMarker) before provider launch.
 
 **Parent path (optional small harden, same slice):**
 
-- Keep `captureSpawnIdentity` + full `workerProcess` publish.  
-- Do **not** clear `workerAuthorization` until full identity is written (today parent nulls it in the same update as `workerProcess` — fine once provisional auth keys off either field).  
+- Keep `captureSpawnIdentity` + full `workerProcess` publish.
+- Do **not** clear `workerAuthorization` until full identity is written (today parent nulls it in the same update as `workerProcess` — fine once provisional auth keys off either field).
 - If capture fails and kills the child, existing launcher failure path terminalizes the job (keep); ensure message remains actionable (P0 helper or existing launcher diagnostic).
 
 **Why not only “widen poll to 5s”:** masks lock delay without fixing the handshake; provisional auth matches an already-shipped local pattern and removes ordering dependence.
@@ -143,15 +143,15 @@ In `recoverActiveJobs` active loop (after existing `queued` age &lt; 5 s skip)
 
 If job is review (legacy), non-terminal, not `providerLaunchCleanupBlocked`, controller not live, and **`workerProcess` is null/incomplete** (no pid), then:
 
-- Treat as launch-failed / unbound worker (not “still starting” — starting grace requires a matching live token).  
-- Cleanup review home if any.  
-- Terminalize with error from `reviewLostWorkerError` **or** a slightly more specific message: launch never bound a worker identity; re-run review; no replay.  
+- Treat as launch-failed / unbound worker (not “still starting” — starting grace requires a matching live token).
+- Cleanup review home if any.
+- Terminalize with error from `reviewLostWorkerError` **or** a slightly more specific message: launch never bound a worker identity; re-run review; no replay.
 - Code: `E_WORKER_LOST` is acceptable (unknown bound process); do not invent a new code unless docs already want one.
 
 Must **not** terminalize:
 
-- `queued` younger than 5 s (existing gate).  
-- Jobs with live matching `workerProcess`.  
+- `queued` younger than 5 s (existing gate).
+- Jobs with live matching `workerProcess`.
 - Broker/dispatch-v1 candidates (already filtered).
 
 ### 4.4 Data flow (combined)
@@ -205,36 +205,36 @@ No new top-level fields required for P1/P2.
 
 ### P0
 
-1. Auth failure → durable `pendingTerminal` / recovered typed `E_RECURSION` + next action; no provider; no replay; home cleaned.  
-2. Pre-`execute` failure via helper → sanitized cause visible.  
-3. Mid-run lost-worker regression still green.  
+1. Auth failure → durable `pendingTerminal` / recovered typed `E_RECURSION` + next action; no provider; no replay; home cleaned.
+2. Pre-`execute` failure via helper → sanitized cause visible.
+3. Mid-run lost-worker regression still green.
 4. Helper unit: no-op terminal, no replace different pending, redaction.
 
 ### P1
 
-5. **Delayed identity publication:** spawn real `--worker` with valid `workerAuthorization`; withhold `workerProcess` write for &gt; old pure-poll window (≥1.2 s); assert worker reaches `execute` / `startedAt` **or** (if fixture stops provider) does not die with silent loss—prefer assert provisional auth succeeds and sets `startedAt` with fake provider.  
-6. **Foreign PID rejection:** job has `workerProcess.pid` for another process; provisional auth must **not** admit.  
+5. **Delayed identity publication:** spawn real `--worker` with valid `workerAuthorization`; withhold `workerProcess` write for &gt; old pure-poll window (≥1.2 s); assert worker reaches `execute` / `startedAt` **or** (if fixture stops provider) does not die with silent loss—prefer assert provisional auth succeeds and sets `startedAt` with fake provider.
+6. **Foreign PID rejection:** job has `workerProcess.pid` for another process; provisional auth must **not** admit.
 7. Full identity still required before any kill/cleanup of the worker group (existing identity tests stay green).
 
 ### P2
 
-8. Seed review `queued`, `createdAt` aged &gt;5 s, `workerProcess: null` → `status` recovery → `failed` + actionable `E_WORKER_LOST`; no hang.  
+8. Seed review `queued`, `createdAt` aged &gt;5 s, `workerProcess: null` → `status` recovery → `failed` + actionable `E_WORKER_LOST`; no hang.
 9. Seed review `queued`, age &lt;5 s, unbound → recovery leaves non-terminal (grace).
 
 ### Verification
 
-- `node --check` on touched modules  
-- Focused `node --test` for new unit + runtime cases  
-- `git diff --check`  
-- No authenticated live Grok run required for these slices  
+- `node --check` on touched modules
+- Focused `node --test` for new unit + runtime cases
+- `git diff --check`
+- No authenticated live Grok run required for these slices
 
 ---
 
 ## 7. Implementation order
 
-1. **P0** — helper + wire + recovery messages + tests (unblocks attribution).  
-2. **P1** — provisional auth for legacy review + delayed-publish test.  
-3. **P2** — orphan unbound recovery + grace tests.  
+1. **P0** — helper + wire + recovery messages + tests (unblocks attribution).
+2. **P1** — provisional auth for legacy review + delayed-publish test.
+3. **P2** — orphan unbound recovery + grace tests.
 4. Update plan doc to match this extended design; implement slice-by-slice.
 
 Do not ship P1 without P0: a fixed race that still throws without durable intent re-creates opacity on other failures.
@@ -268,11 +268,22 @@ No new donor pin required beyond patterns already in this repository. Prior diag
 
 ## 10. Acceptance checklist
 
-- [ ] Known pre-provider failure → typed code + next action (P0)  
-- [ ] Unknown silent death → stage-aware `E_WORKER_LOST` (P0)  
-- [ ] Delayed `workerProcess` publish still allows healthy auth (P1)  
-- [ ] Foreign `workerProcess` cannot be stolen (P1)  
-- [ ] Aged unbound queued review terminalizes (P2)  
-- [ ] Young unbound queued review keeps grace (P2)  
-- [ ] No prompt/credential leakage; no automatic replay  
-- [ ] Mid-run lost-worker test green  
+- [ ] Known pre-provider failure → typed code + next action (P0)
+- [ ] Unknown silent death → stage-aware `E_WORKER_LOST` (P0)
+- [ ] Delayed `workerProcess` publish still allows healthy auth (P1)
+- [ ] Foreign `workerProcess` cannot be stolen (P1)
+- [ ] Aged unbound queued review terminalizes (P2)
+- [ ] Young unbound queued review keeps grace (P2)
+- [ ] No prompt/credential leakage; no automatic replay
+- [ ] Mid-run lost-worker test green
+
+## 11. Donor pins (lifecycle / process)
+
+Repository policy requires recording both donors for lifecycle and process-control changes:
+
+| Donor | Pin / path | Useful invariant | Rejected pattern |
+| --- | --- | --- | --- |
+| `openai/codex-plugin-cc` | `db52e28` — session lifecycle cleanup | Terminate recorded process tree before deleting job/session state | Unconditional record removal while processes may still be live |
+| `xai-org/grok-build` | audit pin in `WORKER_BROKER_PLAN.md` / current cancel+terminal sources | Attach children to an owned process group; terminate and reap before cleanup/finalization | Cleaning homes/guards before proving owned group absence |
+
+Local adaptation: review recovery reuses `terminateProviderCleanupTarget` / guard resolution before `cleanupReviewEnvironment`, and provisional worker bind consumes `workerAuthorization` only with no recorded PID while attaching full self identity.
