@@ -5081,6 +5081,28 @@ async function main() {
           : null;
         break;
       }
+      // Provisional auth for legacy review --worker during identity publish lag
+      // (mirrors deep-research first-registration window; review-only, non-broker).
+      if (
+        !brokerInvocation
+        && record.jobClass === "review"
+        && nonce
+        && (
+          record.workerAuthorization === nonce
+          || identity?.nonce === nonce
+        )
+        && (
+          !identity?.pid
+          || identity.pid === process.pid
+        )
+        && (
+          identity?.commandMarker == null
+          || identity.commandMarker === id
+        )
+      ) {
+        authorized = true;
+        break;
+      }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     if (!authorized) {
