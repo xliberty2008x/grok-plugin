@@ -45,7 +45,11 @@
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
     "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b",
+<<<<<<< Updated upstream
     "policyDigest": "70c74fda0ca49f9a9e80ebc068f91906361238467c538b7c410f5d916176b86b"
+=======
+    "policyDigest": "7475d1542447c1843ae6823146bc2a004e46eb9ae4150bc033efc7d0b651e448"
+>>>>>>> Stashed changes
   },
   "dispositions": {
     "plugins/grok/scripts/lib/worker-mutation.mjs": {
@@ -577,6 +581,7 @@
     }
   },
   "legacyDebt": {
+<<<<<<< Updated upstream
     "plugins/grok/scripts/grok-companion.mjs": {
       "category": "facade",
       "initialLines": 5271,
@@ -597,6 +602,8 @@
         }
       ]
     },
+=======
+>>>>>>> Stashed changes
     "plugins/grok/scripts/lib/deep-research.mjs": {
       "category": "product",
       "initialLines": 2094,
@@ -669,6 +676,7 @@
         }
       ]
     },
+<<<<<<< Updated upstream
     "plugins/grok/scripts/lib/worker-mutation.mjs": {
       "category": "product",
       "initialLines": 11269,
@@ -749,6 +757,8 @@
         }
       ]
     },
+=======
+>>>>>>> Stashed changes
     "plugins/grok/scripts/lib/worker-owner-controller.mjs": {
       "category": "product",
       "initialLines": 934,
@@ -893,7 +903,7 @@
     "scripts/lib/test-temp-cleanup.mjs": {
       "category": "tooling",
       "initialLines": 2631,
-      "lineCap": 2621,
+      "lineCap": 2606,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
@@ -955,6 +965,7 @@
         }
       ]
     },
+<<<<<<< Updated upstream
     "scripts/test-installed-worker-mcp.mjs": {
       "category": "tooling",
       "initialLines": 9698,
@@ -990,6 +1001,8 @@
         }
       ]
     },
+=======
+>>>>>>> Stashed changes
     "tests/control-plane.test.mjs": {
       "category": "tests",
       "initialLines": 6564,

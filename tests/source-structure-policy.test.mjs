@@ -557,19 +557,19 @@ test("immutable and active digests pin history and the shrink-only policy bounda
   assert.equal(sourceStructurePolicyDigest(selfReference), SOURCE_STRUCTURE_POLICY_DIGEST);
 
   const changedHistoryBoundary = structuredClone(config);
-  changedHistoryBoundary.initialDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].initialLines += 1;
+  changedHistoryBoundary.initialDebt["scripts/lib/worker-broker-evidence.mjs"].initialLines += 1;
   assert.notEqual(sourceStructurePolicyDigest(changedHistoryBoundary), SOURCE_STRUCTURE_POLICY_DIGEST);
 
   const raised = structuredClone(config);
-  raised.initialDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].initialLines += 1;
-  raised.legacyDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].initialLines += 1;
-  raised.legacyDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].lineCap += 1;
+  raised.initialDebt["scripts/lib/worker-broker-evidence.mjs"].initialLines += 1;
+  raised.legacyDebt["scripts/lib/worker-broker-evidence.mjs"].initialLines += 1;
+  raised.legacyDebt["scripts/lib/worker-broker-evidence.mjs"].lineCap += 1;
   assert.ok(validateSourceStructurePolicy(raised, {
     expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST
   }).some((message) => /initialDigest/u.test(message)));
 
   const lowerCap = structuredClone(config);
-  lowerCap.legacyDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].lineCap -= 1;
+  lowerCap.legacyDebt["scripts/lib/worker-broker-evidence.mjs"].lineCap -= 1;
   refreshPolicyDigest(lowerCap);
   assert.deepEqual(validateSourceStructurePolicy(lowerCap, {
     expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST,
@@ -577,7 +577,7 @@ test("immutable and active digests pin history and the shrink-only policy bounda
   }), []);
 
   const removedCap = structuredClone(config);
-  delete removedCap.legacyDebt["plugins/grok/scripts/lib/worker-mutation.mjs"];
+  delete removedCap.legacyDebt["scripts/lib/worker-broker-evidence.mjs"];
   refreshPolicyDigest(removedCap);
   assert.deepEqual(validateSourceStructurePolicy(removedCap, {
     expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST,
@@ -596,7 +596,7 @@ test("immutable and active digests pin history and the shrink-only policy bounda
   }), []);
 
   const reopenedCap = structuredClone(lowerCap);
-  reopenedCap.legacyDebt["plugins/grok/scripts/lib/worker-mutation.mjs"].lineCap += 1;
+  reopenedCap.legacyDebt["scripts/lib/worker-broker-evidence.mjs"].lineCap += 1;
   refreshPolicyDigest(reopenedCap);
   assert.ok(validateSourceStructurePolicy(reopenedCap, {
     expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST,
@@ -614,7 +614,7 @@ test("immutable and active digests pin history and the shrink-only policy bounda
   const invalidCycleCap = structuredClone(config);
   invalidCycleCap.capCycleComponents = [[
     "plugins/grok/scripts/lib/state.mjs",
-    "plugins/grok/scripts/lib/worker-mutation.mjs"
+    "scripts/lib/worker-broker-evidence.mjs"
   ]];
   assert.ok(validateSourceStructurePolicy(invalidCycleCap, {
     expectedInitialDigest: SOURCE_STRUCTURE_INITIAL_DIGEST
@@ -923,7 +923,7 @@ test("checked-in ratchet baseline exactly covers all current file and function d
     return entry.lines > budget.fileLines
       || entry.functions.some((span) => span.lines > budget.functionLines);
   }).map((entry) => entry.file).sort();
-  assert.equal(debtPaths.length, 39);
+  assert.equal(debtPaths.length, 36);
   assert.deepEqual(debtPaths, Object.keys(config.legacyDebt));
   for (const [file, entry] of Object.entries(config.legacyDebt)) {
     const measured = result.files.find((candidate) => candidate.file === file);
