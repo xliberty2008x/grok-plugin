@@ -96,6 +96,10 @@ import {
 } from "./lib/worker-protocol.mjs";
 import { CONTEXT_BINDING_MODE, verifyJobEffectivePrompt } from "./lib/worker-context.mjs";
 import {
+  recordReviewPreProviderFailure,
+  reviewLostWorkerError
+} from "./lib/review-preprovider-failure.mjs";
+import {
   assertDispatchContract,
   assertWorkerProviderLaunchPreparation,
   authorizeWorkerProviderRotation,
@@ -917,14 +921,17 @@ async function recoverActiveJobs(root) {
       const evidence = current.jobClass === "research"
         ? { postContext: null, runtimeEvidence: null }
         : captureTerminalEvidence(root, current, pendingExecutionStatus);
-      const interruptedError = {
-        code: current.jobClass === "research"
-          ? "E_WORKFLOW_INCOMPLETE"
-          : "E_WORKER_LOST",
-        message: current.jobClass === "research"
-          ? "The deep-research workflow was interrupted when its worker disappeared; it was not replayed."
-          : "The background worker disappeared; the prompt was not replayed."
-      };
+      const interruptedError = current.jobClass === "research"
+        ? {
+            code: "E_WORKFLOW_INCOMPLETE",
+            message: "The deep-research workflow was interrupted when its worker disappeared; it was not replayed."
+          }
+        : current.jobClass === "review"
+          ? reviewLostWorkerError(current)
+          : {
+              code: "E_WORKER_LOST",
+              message: "The background worker disappeared; the prompt was not replayed."
+            };
       const taskError = current.jobClass === "task"
         ? selectTaskTerminalError(
             evidence,
@@ -5076,14 +5083,33 @@ async function main() {
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    if (!authorized) throw new CompanionError("E_RECURSION", "Unauthenticated Grok Companion worker invocation refused.");
+    if (!authorized) {
+      const authError = new CompanionError(
+        "E_RECURSION",
+        "Unauthenticated Grok Companion worker invocation refused."
+      );
+      try {
+        const record = readJob(root, id);
+        if (record.jobClass === "review") {
+          recordReviewPreProviderFailure({ root, jobId: id, error: authError });
+        }
+      } catch { /* best-effort diagnostics */ }
+      throw authError;
+    }
     try {
       await execute(root, id, { dispatchAttemptId, dispatchFence: authorizedFence });
     } catch (error) {
-      // The executing worker never terminalizes its own still-live process.
-      // execute() atomically settles cleanup-safe pre-provider failures; if it
-      // could not, the controller/reconciler observes exact process exit and
-      // performs loss recovery without replaying the prompt.
+      try {
+        const record = readJob(root, id);
+        if (
+          record.jobClass === "review"
+          && !terminal(record)
+          && !record.providerProcess
+          && record.startedAt == null
+        ) {
+          recordReviewPreProviderFailure({ root, jobId: id, error });
+        }
+      } catch { /* best-effort */ }
       throw error;
     }
     return;
