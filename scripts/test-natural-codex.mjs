@@ -283,8 +283,11 @@ function main() {
   }
 }
 
-try { main(); }
-catch (error) {
-  process.stderr.write(`Natural Codex/Grok E2E failed: ${error.message}\n`);
-  process.exitCode = 1;
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try { main(); }
+  catch (error) {
+    process.stderr.write(`Natural Codex/Grok E2E failed: ${error.message}
+`);
+    process.exitCode = 1;
+  }
 }
