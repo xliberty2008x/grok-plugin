@@ -45,7 +45,8 @@ import {
   captureTerminalEvidence,
   normalizeTerminalProcessSignalError,
   selectTaskTerminalError,
-  terminalTaskProgress
+  terminalTaskProgress,
+  preferProvenTerminalSafetyPending
 } from "./task-terminal-evidence.mjs";
 import { knownManagedWriteSafetyTerminalObservation } from "./worker-terminal-safety.mjs";
 import {
@@ -500,7 +501,7 @@ export function settlePreProviderWorkerFinalization({
 }
 
 export function persistCompletedWriteArtifact(job, pending, env) {
-  if (job?.write !== true || pending?.status !== "completed") return null;
+  if (job?.write !== true || pending?.status !== "completed" || pending?.error != null) return null;
   assertDispatchContract(job);
   assertExactWriteVerticalScope(job.request?.envelope?.scope);
   const binding = job.executionBinding;
@@ -784,7 +785,15 @@ export function reconcileProviderStartedWriteCompletion(job, pending, env) {
   } catch (error) {
     const safetyObservation =
       knownManagedWriteSafetyTerminalObservation(job, error);
-    if (safetyObservation) return safetyObservation;
+    if (safetyObservation) {
+      return Object.freeze({
+        ...safetyObservation,
+        pending: preferProvenTerminalSafetyPending(
+          safetyObservation.pending,
+          pending
+        )
+      });
+    }
     return unavailableManagedWriteTerminalObservation(job);
   }
   const contextDrift = observed.coreReasons.length > 0
@@ -795,7 +804,7 @@ export function reconcileProviderStartedWriteCompletion(job, pending, env) {
     ...(observed.controlContextMarkers || []),
     ...observed.metadataMarkers
   ])].slice(0, 8);
-  const reconciledPending = rejected
+  const observedPending = rejected
     ? Object.freeze({
         status: "failed",
         phase: contextDrift ? "context-rejected" : "scope-rejected",
@@ -818,6 +827,10 @@ export function reconcileProviderStartedWriteCompletion(job, pending, env) {
           : "Worker output changed paths outside the delegated scope."
       })
     : pending;
+  const reconciledPending = preferProvenTerminalSafetyPending(
+    observedPending,
+    pending
+  );
   const runtimeEvidence = buildRuntimeEvidence({
     preContext: observed.requestContextManifest,
     postContext: observed.currentContextManifest,

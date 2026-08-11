@@ -25,6 +25,7 @@ import {
   CONTEXT_MANIFEST_VERSION,
   CONTEXT_METADATA_POLICIES
 } from "./task-context-policy.mjs";
+import { contextIncompleteError } from "./task-context-metadata.mjs";
 import {
   buildRuntimeEvidence,
   observeChangedPaths
