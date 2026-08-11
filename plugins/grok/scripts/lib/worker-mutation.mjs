@@ -39,26 +39,6 @@ import {
   assertContextManifestIntegrity,
   captureContextManifest
 } from "./task-context-manifest.mjs";
-
-const {
-  assertContextMetadataComplete,
-  captureCompleteContextManifest
-} = bindContextMetadataCompleteness({
-  captureContextManifest,
-  assertContextManifestIntegrity
-});
-
-function resolveAdmissionContext(root, manifest, metadataPolicy = null) {
-  const options = {
-    mode: "execute",
-    contextPhase: "admission",
-    ...(metadataPolicy ? { metadataPolicy } : {})
-  };
-  const accepted = manifest
-    ? assertContextCompatible(root, manifest, options)
-    : captureCompleteContextManifest(root, { contextPhase: "admission" });
-  return assertContextMetadataComplete(accepted, { contextPhase: "admission" });
-}
 import {
   assertTaskEnvelope,
   bindTaskEnvelopeContext,
@@ -67,7 +47,6 @@ import {
 } from "./task-envelope.mjs";
 import { boundPathEvidence } from "./task-contract-primitives.mjs";
 import { CONTEXT_MANIFEST_VERSION, CONTEXT_METADATA_POLICIES } from "./task-context-policy.mjs";
-import { contextIncompleteError } from "./task-context-metadata.mjs";
 import { buildRuntimeEvidence, observeChangedPaths } from "./task-runtime-evidence.mjs";
 import { composeProviderPrompt } from "./task-provider-prompt.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
@@ -275,6 +254,27 @@ import {
   hasManagedWritePostBinding,
   storedSpawnReplayRequestDigest
 } from "./worker-mutation-spawn-authority.mjs";
+
+
+const {
+  assertContextMetadataComplete,
+  captureCompleteContextManifest
+} = bindContextMetadataCompleteness({
+  captureContextManifest,
+  assertContextManifestIntegrity
+});
+
+function resolveAdmissionContext(root, manifest, metadataPolicy = null) {
+  const options = {
+    mode: "execute",
+    contextPhase: "admission",
+    ...(metadataPolicy ? { metadataPolicy } : {})
+  };
+  const accepted = manifest
+    ? assertContextCompatible(root, manifest, options)
+    : captureCompleteContextManifest(root, { contextPhase: "admission" });
+  return assertContextMetadataComplete(accepted, { contextPhase: "admission" });
+}
 
 export {
   SPAWN_OWNERSHIP_MODE,
