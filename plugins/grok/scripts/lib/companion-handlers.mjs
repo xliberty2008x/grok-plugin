@@ -184,14 +184,18 @@ async function handleRecordVerification(raw) {
       assertContextManifestIntegrity(job.verificationContextManifest);
       throw new CompanionError("E_STATE", `Job ${job.id} already has a host verification baseline; record verification once per job.`);
     }
+    assertContextMetadataComplete(completionContextManifest, {
+      contextPhase: "resume"
+    });
     const activeWriter = listJobs(root).find((candidate) => candidate.id !== job.id && !terminal(candidate) && candidate.write);
     if (activeWriter) throw new CompanionError("E_JOB_ACTIVE", `Cannot record verification while writer ${activeWriter.id} is active.`);
     const record = parseVerificationRecord(input, job.request?.envelope?.requiredVerification || []);
     // Store the full exact current snapshot for continuation binding, but compare
     // completion→current with the verification-only ignored observer so standard
     // pytest/Python cache drift from host checks is not treated as out-of-scope.
-    const verificationContextManifest = captureCompleteContextManifest(root, { contextPhase: "terminal" });
-    assertContextMetadataComplete(verificationContextManifest, { contextPhase: "terminal" });
+    const verificationContextManifest = captureCompleteContextManifest(root, {
+      contextPhase: "resume"
+    });
     const observedChangedPaths = observeChangedPaths(
       completionContextManifest,
       verificationContextManifest,
