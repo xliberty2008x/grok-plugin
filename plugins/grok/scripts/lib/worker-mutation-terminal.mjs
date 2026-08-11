@@ -125,7 +125,7 @@ export function reconcileTerminalCleanupSignal(
   if (!signalError) return terminalIntent;
   const secondaryDiagnostic =
     cleanupSignalSecondaryDiagnostic(signalError);
-  if (["E_CONTEXT_DRIFT", "E_SCOPE_VIOLATION"].includes(
+  if (["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE", "E_SCOPE_VIOLATION"].includes(
     terminalIntent?.error?.code
   )) {
     const priorDetails = isPlainRecord(terminalIntent.error.details)
