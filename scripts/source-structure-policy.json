@@ -45,7 +45,7 @@
     "date": "2026-08-03",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
     "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b",
-    "policyDigest": "ad35836230b792a581fe08ac3f8457ea7e927a2bcc0a3f0493026786a24e78fd"
+    "policyDigest": "bb8c992cd1af1cdfb2cb7668c1c7a279a78ea8ddc07114e8815e9b1971d801cf"
   },
   "dispositions": {
     "plugins/grok/scripts/lib/worker-mutation.mjs": {
@@ -55,10 +55,6 @@
     "scripts/lib/worker-broker-evidence.mjs": {
       "stage": "6-evidence-last",
       "target": "Separate evidence validation, signing, promotion, and qualification without changing canonical digests."
-    },
-    "scripts/test-installed-worker-mcp.mjs": {
-      "stage": "3-installed-runner",
-      "target": "Move fixtures, lifecycle helpers, scenarios, and cleanup into named modules behind one runner."
     },
     "tests/control-plane.test.mjs": {
       "stage": "4-provider-and-control-plane",
@@ -938,7 +934,7 @@
     "scripts/test-installed-worker-mcp.mjs": {
       "category": "tooling",
       "initialLines": 9698,
-      "lineCap": 5746,
+      "lineCap": 4545,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
