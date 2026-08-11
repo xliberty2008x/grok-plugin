@@ -1,3 +1,4 @@
+import { contextIncompleteError } from "./task-context-metadata.mjs";
 /** Issue #56 worker-mutation spawn-authority domain. */
 import path from "node:path";
 import { CompanionError, asErrorPayload } from "./errors.mjs";
@@ -501,9 +502,17 @@ export function captureManagedWritePostBindingContext(
     env,
     { allowFinalControlContextDrift: true }
   );
-  const currentContextManifest = observedContextManifest == null
-    ? captureContextManifest(binding.expectedExecutionRoot)
-    : assertContextManifestIntegrity(observedContextManifest);
+  let currentContextManifest;
+  if (observedContextManifest == null) {
+    try {
+      currentContextManifest = captureContextManifest(binding.expectedExecutionRoot);
+    } catch {
+      throw contextIncompleteError("terminal", ["contextCapture"]);
+    }
+    currentContextManifest = assertContextManifestIntegrity(currentContextManifest);
+  } else {
+    currentContextManifest = assertContextManifestIntegrity(observedContextManifest);
+  }
   const controlReasons = Array.isArray(controlContextError?.details?.reasons)
     ? [...controlContextError.details.reasons]
     : controlContextError
