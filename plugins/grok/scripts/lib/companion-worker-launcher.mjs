@@ -25,6 +25,7 @@ import { applyTaskPrivacy, currentHost, stateDir, touchJob, workerEnvironment } 
 
 import { execute } from "./companion-task-executor.mjs";
 import { executeDeepResearch } from "./companion-research.mjs";
+import { runLegacyReviewWorker } from "./review-worker-run.mjs";
 
 function parseLaunchWorkerArguments(raw) {
   const brokerInvocation = raw[1] === "--attempt";
@@ -542,6 +543,10 @@ async function handleWorker(raw) {
     throw new CompanionError("E_USAGE", "Invalid worker invocation.");
   }
   const root = workspaceRoot(cwd), nonce = process.env.GROK_COMPANION_WORKER_NONCE;
+  if (!brokerInvocation && readJob(root, id).jobClass === "review") {
+    await runLegacyReviewWorker({ root, id, nonce, readJob, execute });
+    return;
+  }
   let authorized = false;
   let authorizedFence = null;
   for (let attempt = 0; attempt < 40; attempt++) {
