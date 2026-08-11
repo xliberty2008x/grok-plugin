@@ -3550,11 +3550,11 @@ test("final task evidence fails closed when post-cleanup context is unavailable"
   assert.deepEqual(evidence.changedPaths, []);
   assert.deepEqual(evidence.scopeViolations, []);
   assert.equal(evidence.runtimeEvidence.postContext, null);
-  assert.equal(selected.code, "E_CONTEXT_DRIFT");
-  assert.deepEqual(selected.details.reasons, [
-    "[final-context-unavailable]"
-  ]);
-  assert.equal(selected.details.secondaryDiagnostic.code, "EPERM");
+  assert.equal(selected.code, "E_CONTEXT_INCOMPLETE");
+  assert.deepEqual(selected.details.metadataComponents, ["contextCapture"]);
+  assert.equal(selected.details.contextPhase, "terminal");
+  // Capture failure is incompleteness and outranks process-signal uncertainty;
+  // do not require secondaryDiagnostic to be preserved on this path.
   assert.equal(
     JSON.stringify(evidence).includes("private capture failure"),
     false
