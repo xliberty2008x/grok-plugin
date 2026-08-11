@@ -8,7 +8,7 @@ const { parse } = require("acorn");
 
 export const SOURCE_STRUCTURE_POLICY_PATH = "scripts/source-structure-policy.json";
 export const SOURCE_STRUCTURE_INITIAL_DIGEST = "bc76d24b5d3f2c2d88fedb02029fdf8ee1a7b8c92342b28def60307f4fdb18f8";
-export const SOURCE_STRUCTURE_POLICY_DIGEST = "df93aab8903e73d55006538cdb4f324925cd4e41dbb208c47c8e4f88c26a9560";
+export const SOURCE_STRUCTURE_POLICY_DIGEST = "edca925ab0ffce9611f79d564cfff461233b63aaedccd576ead643b78c4e6f9d";
 export const SOURCE_STRUCTURE_EXTENSIONS = Object.freeze([".cjs", ".js", ".mjs"]);
 export const SOURCE_STRUCTURE_ROOTS = Object.freeze(["plugins", "scripts", "tests"]);
 export const SOURCE_STRUCTURE_MAX_PHYSICAL_LINE_BYTES = 4 * 1024;

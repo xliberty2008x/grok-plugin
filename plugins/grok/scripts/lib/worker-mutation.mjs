@@ -2740,7 +2740,7 @@ function reconcileTerminalCleanupSignal(
   if (!signalError) return terminalIntent;
   const secondaryDiagnostic =
     cleanupSignalSecondaryDiagnostic(signalError);
-  if (["E_CONTEXT_DRIFT", "E_SCOPE_VIOLATION"].includes(
+  if (["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE", "E_SCOPE_VIOLATION"].includes(
     terminalIntent?.error?.code
   )) {
     const priorDetails = isPlainRecord(terminalIntent.error.details)
@@ -6580,8 +6580,8 @@ export function adoptWriteProvisioningEffect({
     }
 
     const verification = managedWorktreeVerification(verified.binding, env);
-    const executionContextManifest = captureContextManifest(
-      verified.binding.expectedExecutionRoot
+    const executionContextManifest = captureCompleteContextManifest(
+      verified.binding.expectedExecutionRoot, { contextPhase: "execute" }
     );
     const currentManifest = assertContextCompatible(
       verified.binding.expectedExecutionRoot,
@@ -8574,7 +8574,9 @@ function assertManagedWriteReplayContext(job, env = process.env) {
   return completionObservation;
 }
 
-export function assertDurableSpawnRequestBinding(job, env = process.env) {
+export function assertDurableSpawnRequestBinding(job, env = process.env, {
+  contextPhase = null
+} = {}) {
   const spawn = job?.request?.spawn;
   const executionRoot = spawn?.executionRoot;
   const isGrantedFollowup = job?.request?.followup !== undefined;
@@ -8620,7 +8622,10 @@ export function assertDurableSpawnRequestBinding(job, env = process.env) {
       acceptedContext = assertContextCompatible(
         executionRoot,
         job.request?.contextManifest,
-        { mode: isGrantedFollowup ? "resume" : "execute" }
+        {
+          mode: isGrantedFollowup ? "resume" : "execute",
+          ...(contextPhase ? { contextPhase } : {})
+        }
       );
     }
   } catch (error) {
