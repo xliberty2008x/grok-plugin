@@ -67,6 +67,7 @@ import {
 } from "./task-envelope.mjs";
 import { boundPathEvidence } from "./task-contract-primitives.mjs";
 import { CONTEXT_MANIFEST_VERSION, CONTEXT_METADATA_POLICIES } from "./task-context-policy.mjs";
+import { contextIncompleteError } from "./task-context-metadata.mjs";
 import { buildRuntimeEvidence, observeChangedPaths } from "./task-runtime-evidence.mjs";
 import { composeProviderPrompt } from "./task-provider-prompt.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
@@ -122,6 +123,7 @@ import {
 import {
   captureTerminalEvidence,
   normalizeTerminalProcessSignalError,
+  preferProvenTerminalSafetyPending,
   selectTaskTerminalError,
   terminalTaskProgress
 } from "./task-terminal-evidence.mjs";
@@ -2065,7 +2067,7 @@ export function settlePreProviderWorkerFinalization({
  * credential/profile deletion.
  */
 export function persistCompletedWriteArtifact(job, pending, env) {
-  if (job?.write !== true || pending?.status !== "completed") return null;
+  if (job?.write !== true || pending?.status !== "completed" || pending?.error != null) return null;
   assertDispatchContract(job);
   assertExactWriteVerticalScope(job.request?.envelope?.scope);
   const binding = job.executionBinding;
@@ -2356,7 +2358,15 @@ function reconcileProviderStartedWriteCompletion(job, pending, env) {
   } catch (error) {
     const safetyObservation =
       knownManagedWriteSafetyTerminalObservation(job, error);
-    if (safetyObservation) return safetyObservation;
+    if (safetyObservation) {
+      return Object.freeze({
+        ...safetyObservation,
+        pending: preferProvenTerminalSafetyPending(
+          safetyObservation.pending,
+          pending
+        )
+      });
+    }
     return unavailableManagedWriteTerminalObservation(job);
   }
   const contextDrift = observed.coreReasons.length > 0
@@ -2371,7 +2381,7 @@ function reconcileProviderStartedWriteCompletion(job, pending, env) {
     ...(observed.controlContextMarkers || []),
     ...observed.metadataMarkers
   ])].slice(0, 8);
-  const reconciledPending = rejected
+  const observedPending = rejected
     ? Object.freeze({
         status: "failed",
         phase: contextDrift
@@ -2415,6 +2425,10 @@ function reconcileProviderStartedWriteCompletion(job, pending, env) {
             : "Worker execution context could not be observed completely."
       })
     : pending;
+  const reconciledPending = preferProvenTerminalSafetyPending(
+    observedPending,
+    pending
+  );
   const runtimeEvidence = buildRuntimeEvidence({
     preContext: observed.requestContextManifest,
     postContext: observed.currentContextManifest,
