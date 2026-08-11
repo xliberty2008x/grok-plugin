@@ -680,6 +680,7 @@ export function reconcileCleanupSafeTerminalObservation(
     : null;
   const safetyFailure = [
     "E_CONTEXT_DRIFT",
+    "E_CONTEXT_INCOMPLETE",
     "E_SCOPE_VIOLATION"
   ].includes(selectedError?.code);
   const selectedStatus = selectedError
@@ -697,7 +698,7 @@ export function reconcileCleanupSafeTerminalObservation(
   const reconciledPending = selectedError
     ? Object.freeze({
         status: selectedStatus,
-        phase: selectedError.code === "E_CONTEXT_DRIFT"
+        phase: ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(selectedError.code)
           ? "context-rejected"
           : selectedError.code === "E_SCOPE_VIOLATION"
             ? "scope-rejected"
@@ -798,8 +799,12 @@ export function reconcileProviderStartedWriteCompletion(job, pending, env) {
   }
   const contextDrift = observed.coreReasons.length > 0
     || observed.metadataMarkers.length > 0;
-  const scopeDrift = observed.scopeViolations.length > 0;
-  const rejected = contextDrift || scopeDrift;
+  const concreteScopeViolations = observed.scopeViolations.filter(
+    (item) => item !== "[GIT_METADATA_INCOMPLETE]"
+  );
+  const scopeDrift = concreteScopeViolations.length > 0;
+  const contextIncomplete = observed.incompleteComponents.length > 0;
+  const rejected = contextDrift || scopeDrift || contextIncomplete;
   const contextReasons = [...new Set([
     ...(observed.controlContextMarkers || []),
     ...observed.metadataMarkers
@@ -807,24 +812,45 @@ export function reconcileProviderStartedWriteCompletion(job, pending, env) {
   const observedPending = rejected
     ? Object.freeze({
         status: "failed",
-        phase: contextDrift ? "context-rejected" : "scope-rejected",
+        phase: contextDrift
+          ? "context-rejected"
+          : scopeDrift
+            ? "scope-rejected"
+            : "context-rejected",
         completedAt: now(),
         error: Object.freeze({
-          code: contextDrift ? "E_CONTEXT_DRIFT" : "E_SCOPE_VIOLATION",
+          code: contextDrift
+            ? "E_CONTEXT_DRIFT"
+            : scopeDrift
+              ? "E_SCOPE_VIOLATION"
+              : "E_CONTEXT_INCOMPLETE",
           message: contextDrift
             ? "Worker output failed final execution-context reconciliation."
-            : "Worker output changed paths outside the delegated scope.",
+            : scopeDrift
+              ? "Worker output changed paths outside the delegated scope."
+              : "Worker execution context could not be observed completely.",
           ...(contextDrift && contextReasons.length
             ? {
                 details: Object.freeze({
                   reasons: Object.freeze(contextReasons)
                 })
               }
-            : {})
+            : contextIncomplete && !scopeDrift
+              ? {
+                  details: Object.freeze({
+                    contextPhase: "terminal",
+                    metadataComponents: Object.freeze(
+                      [...observed.incompleteComponents]
+                    )
+                  })
+                }
+              : {})
         }),
         summary: contextDrift
           ? "Worker output failed final execution-context reconciliation."
-          : "Worker output changed paths outside the delegated scope."
+          : scopeDrift
+            ? "Worker output changed paths outside the delegated scope."
+            : "Worker execution context could not be observed completely."
       })
     : pending;
   const reconciledPending = preferProvenTerminalSafetyPending(
@@ -839,7 +865,7 @@ export function reconcileProviderStartedWriteCompletion(job, pending, env) {
       ? observed.observedChangedPaths.join("\n")
       : "No workspace changes observed.",
     commandOutcomes: job.commandOutcomes || [],
-    scopeViolations: observed.scopeViolations,
+    scopeViolations: concreteScopeViolations,
     executionStatus: rejected
       ? "failed"
       : pending?.status === "cancelled"
