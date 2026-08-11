@@ -6,6 +6,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { runLegacyReviewWorker } from "./lib/review-worker-run.mjs";
 import { splitArgs, parseArgs } from "./lib/args.mjs";
 import { CompanionError, asErrorPayload, attachTransferCleanupEvidence, exitCodeFor } from "./lib/errors.mjs";
 import { collectContext, resolveTarget, integritySnapshot, assertUnchanged } from "./lib/git-review.mjs";
@@ -1413,6 +1414,10 @@ async function main() {
       throw new CompanionError("E_USAGE", "Invalid worker invocation.");
     }
     const root = workspaceRoot(cwd), nonce = process.env.GROK_COMPANION_WORKER_NONCE;
+    if (!brokerInvocation && readJob(root, id).jobClass === "review") {
+      await runLegacyReviewWorker({ root, id, nonce, readJob, execute });
+      return;
+    }
     let authorized = false;
     let authorizedFence = null;
     for (let attempt = 0; attempt < 40; attempt++) {
