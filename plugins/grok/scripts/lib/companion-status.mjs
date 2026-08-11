@@ -290,7 +290,7 @@ async function handleCancel(raw) {
         ? "cancelled"
         : "failed";
       value.status = finalStatus;
-      value.phase = selectedError?.code === "E_CONTEXT_DRIFT"
+      value.phase = ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(selectedError?.code)
         ? "context-rejected"
         : selectedError?.code === "E_SCOPE_VIOLATION"
           ? "scope-rejected"
