@@ -356,7 +356,7 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "worker-supervisor-server-data-",
   "worker-supervisor-terminal-data-",
   "zero-skip-reporter-",
-]);
+].sort());
 const LSOF_CANDIDATES = Object.freeze(["/usr/sbin/lsof", "/usr/bin/lsof"]);
 const PS_CANDIDATES = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
 const GIT_CANDIDATES = Object.freeze(["/opt/homebrew/bin/git", "/usr/bin/git"]);
