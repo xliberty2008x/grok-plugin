@@ -266,7 +266,12 @@ function main() {
     }
 
     const jobFile = findJobFile(DATA_ROOT, `${reported.jobId}.json`);
-    if (!jobFile) fail(`Persisted Grok job ${reported.jobId} was not found beneath ${DATA_ROOT}.`);
+    if (!jobFile) {
+      fail(
+        `Persisted Grok job ${reported.jobId} was not found beneath ${DATA_ROOT}.`,
+        codexRunMetadata(codexRun)
+      );
+    }
     const job = JSON.parse(fs.readFileSync(jobFile, "utf8"));
     if (job.id !== reported.jobId || job.status !== "completed" || job.phase !== "done") fail("Persisted Grok job did not complete successfully.", JSON.stringify({ id: job.id, status: job.status, phase: job.phase, error: job.error }));
     if (job.profile?.id !== "rescue-read-v3") fail(`Natural task used unexpected profile ${job.profile?.id || "missing"}.`);
@@ -328,7 +333,8 @@ function main() {
       providerLaunchBindingDigest: spawn.providerLaunchBindingDigest,
       codexVersion,
       grokVersion: job.profile.grokVersion || null,
-      model: MODEL
+      model: MODEL,
+      reasoningEffort: REASONING_EFFORT
     }, null, 2)}\n`);
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
