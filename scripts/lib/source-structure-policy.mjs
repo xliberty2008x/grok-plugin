@@ -8,7 +8,11 @@ const { parse } = require("acorn");
 
 export const SOURCE_STRUCTURE_POLICY_PATH = "scripts/source-structure-policy.json";
 export const SOURCE_STRUCTURE_INITIAL_DIGEST = "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b";
+<<<<<<< HEAD
 export const SOURCE_STRUCTURE_POLICY_DIGEST = "70c74fda0ca49f9a9e80ebc068f91906361238467c538b7c410f5d916176b86b";
+=======
+export const SOURCE_STRUCTURE_POLICY_DIGEST = "58bad7575abac6efbbccd31f646b32b214770410732a1b4073021e94c65e2024";
+>>>>>>> e483f53 (fix: ratchet companion structure caps after task extraction)
 export const SOURCE_STRUCTURE_EXTENSIONS = Object.freeze([".cjs", ".js", ".mjs"]);
 export const SOURCE_STRUCTURE_ROOTS = Object.freeze(["plugins", "scripts", "tests"]);
 export const SOURCE_STRUCTURE_MAX_PHYSICAL_LINE_BYTES = 4 * 1024;
