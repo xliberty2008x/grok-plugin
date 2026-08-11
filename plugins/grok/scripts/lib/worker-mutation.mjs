@@ -102,9 +102,11 @@ import {
 import {
   captureTerminalEvidence,
   normalizeTerminalProcessSignalError,
+  preferProvenTerminalSafetyPending,
   selectTaskTerminalError,
   terminalTaskProgress
 } from "./task-terminal-evidence.mjs";
+import { contextIncompleteError } from "./task-context-metadata.mjs";
 import {
   DEFAULT_DISPATCH_LEASE_MS,
   WORKER_DISPATCH_OUTBOX_SCHEMA_VERSION,
@@ -3105,7 +3107,7 @@ export function settlePreProviderWorkerFinalization({
  * credential/profile deletion.
  */
 export function persistCompletedWriteArtifact(job, pending, env) {
-  if (job?.write !== true || pending?.status !== "completed") return null;
+  if (job?.write !== true || pending?.status !== "completed" || pending?.error != null) return null;
   assertDispatchContract(job);
   assertExactWriteVerticalScope(job.request?.envelope?.scope);
   const binding = job.executionBinding;
@@ -3505,7 +3507,15 @@ function reconcileProviderStartedWriteCompletion(job, pending, env) {
   } catch (error) {
     const safetyObservation =
       knownManagedWriteSafetyTerminalObservation(job, error);
-    if (safetyObservation) return safetyObservation;
+    if (safetyObservation) {
+      return Object.freeze({
+        ...safetyObservation,
+        pending: preferProvenTerminalSafetyPending(
+          safetyObservation.pending,
+          pending
+        )
+      });
+    }
     return unavailableManagedWriteTerminalObservation(job);
   }
   const contextDrift = observed.coreReasons.length > 0
@@ -3516,7 +3526,7 @@ function reconcileProviderStartedWriteCompletion(job, pending, env) {
     ...(observed.controlContextMarkers || []),
     ...observed.metadataMarkers
   ])].slice(0, 8);
-  const reconciledPending = rejected
+  const observedPending = rejected
     ? Object.freeze({
         status: "failed",
         phase: contextDrift ? "context-rejected" : "scope-rejected",
@@ -3539,6 +3549,10 @@ function reconcileProviderStartedWriteCompletion(job, pending, env) {
           : "Worker output changed paths outside the delegated scope."
       })
     : pending;
+  const reconciledPending = preferProvenTerminalSafetyPending(
+    observedPending,
+    pending
+  );
   const runtimeEvidence = buildRuntimeEvidence({
     preContext: observed.requestContextManifest,
     postContext: observed.currentContextManifest,
@@ -8387,9 +8401,17 @@ function captureManagedWritePostBindingContext(
     env,
     { allowFinalControlContextDrift: true }
   );
-  const currentContextManifest = observedContextManifest == null
-    ? captureContextManifest(binding.expectedExecutionRoot)
-    : assertContextManifestIntegrity(observedContextManifest);
+  let currentContextManifest;
+  if (observedContextManifest == null) {
+    try {
+      currentContextManifest = captureContextManifest(binding.expectedExecutionRoot);
+    } catch {
+      throw contextIncompleteError("terminal", ["contextCapture"]);
+    }
+    currentContextManifest = assertContextManifestIntegrity(currentContextManifest);
+  } else {
+    currentContextManifest = assertContextManifestIntegrity(observedContextManifest);
+  }
   const controlReasons = Array.isArray(controlContextError?.details?.reasons)
     ? [...controlContextError.details.reasons]
     : controlContextError
