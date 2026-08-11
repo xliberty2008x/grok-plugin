@@ -1335,7 +1335,7 @@ async function main() {
           const finalStatus = selectedError
             ? (selectedError.code === "E_CANCELLED" ? "cancelled" : "failed")
             : "cancelled";
-          const finalPhase = selectedError?.code === "E_CONTEXT_DRIFT"
+          const finalPhase = ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(selectedError?.code)
             ? "context-rejected"
             : selectedError?.code === "E_SCOPE_VIOLATION"
               ? "scope-rejected"
@@ -1363,8 +1363,7 @@ async function main() {
             ...base,
             status: finalStatus,
             phase: finalPhase,
-            completedAt: selectedError?.code === "E_CONTEXT_DRIFT"
-              || selectedError?.code === "E_SCOPE_VIOLATION"
+            completedAt: ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE", "E_SCOPE_VIOLATION"].includes(selectedError?.code)
               ? settledAt
               : intendedTerminal.completedAt,
             completionContextManifest: evidence.postContext,
