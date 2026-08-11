@@ -14,6 +14,12 @@ import { readBoundedStdin } from "./stdin.mjs";
 import { hostCommand, sameHostSession } from "./host.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import { assertContextCompatible, assertContextManifestIntegrity, assertTaskContextReady, captureContextManifest } from "./task-context-manifest.mjs";
+import { bindContextMetadataCompleteness } from "./task-context-metadata.mjs";
+
+const { assertContextMetadataComplete, captureCompleteContextManifest } = bindContextMetadataCompleteness({
+  captureContextManifest,
+  assertContextManifestIntegrity
+});
 import { boundPathEvidence } from "./task-contract-primitives.mjs";
 import { buildTaskEnvelope, parseTaskEnvelopeInput } from "./task-envelope.mjs";
 import { composeProviderPrompt } from "./task-provider-prompt.mjs";
@@ -184,7 +190,8 @@ async function handleRecordVerification(raw) {
     // Store the full exact current snapshot for continuation binding, but compare
     // completion→current with the verification-only ignored observer so standard
     // pytest/Python cache drift from host checks is not treated as out-of-scope.
-    const verificationContextManifest = captureContextManifest(root);
+    const verificationContextManifest = captureCompleteContextManifest(root, { contextPhase: "terminal" });
+    assertContextMetadataComplete(verificationContextManifest, { contextPhase: "terminal" });
     const observedChangedPaths = observeChangedPaths(
       completionContextManifest,
       verificationContextManifest,
@@ -287,7 +294,7 @@ async function handleTask(raw) {
     throw new CompanionError("E_NO_RESUME_CANDIDATE", "No resumable Grok task with the same security profile exists in this host session.");
   }
 
-  const contextManifest = captureContextManifest(root);
+  const contextManifest = captureCompleteContextManifest(root, { contextPhase: "admission" });
   const envelope = buildTaskEnvelope({
     ...(envelopeInput || {}),
     userRequest: promptText,

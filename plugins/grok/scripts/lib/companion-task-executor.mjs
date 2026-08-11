@@ -7,7 +7,13 @@ import { assertProviderLaunchBinding as assertExecutableProviderLaunchBinding, p
 import { updateJob, readJob, isCancelRequested, terminal, now } from "./state.mjs";
 import { redact } from "./redact.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
-import { assertContextCompatible, captureContextManifest } from "./task-context-manifest.mjs";
+import { assertContextCompatible, assertContextManifestIntegrity, captureContextManifest } from "./task-context-manifest.mjs";
+import { bindContextMetadataCompleteness } from "./task-context-metadata.mjs";
+
+const { captureCompleteContextManifest } = bindContextMetadataCompleteness({
+  captureContextManifest,
+  assertContextManifestIntegrity
+});
 import { composeProviderPrompt } from "./task-provider-prompt.mjs";
 import { scrubStoredJob } from "./task-envelope.mjs";
 import { CONTEXT_BINDING_MODE, verifyJobEffectivePrompt } from "./worker-context.mjs";
@@ -93,7 +99,7 @@ if (dispatchAttemptId && isDispatchV2(job.request?.spawn?.dispatch)) {
 
 // Keep the accepted manifest available for failure evidence; exact validation happens
 // inside the terminal-state guard below so drift is persisted on the job.
-let preContext = job.request?.contextManifest || captureContextManifest(root);
+let preContext = job.request?.contextManifest || captureCompleteContextManifest(root, { contextPhase: "execute" });
 updateJob(root, id, (current) => {
   if (terminal(current)) {
     throw new CompanionError("E_STATE", "A terminal worker cannot be restarted.");
@@ -230,7 +236,7 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
   try {
     execution.preContext = execution.job.request?.contextManifest
       ? assertContextCompatible(root, execution.job.request.contextManifest, { mode: "execute" })
-      : captureContextManifest(root);
+      : captureCompleteContextManifest(root, { contextPhase: "execute" });
     const workerNonce = process.env.GROK_COMPANION_WORKER_NONCE;
     if (isCancelRequested(root, id, workerNonce)) {
       throw new CompanionError("E_CANCELLED", "Grok job was cancelled before provider execution.");

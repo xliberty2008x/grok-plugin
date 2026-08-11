@@ -10,7 +10,13 @@ import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import { boundPathEvidence } from "./task-contract-primitives.mjs";
 import { buildRuntimeEvidence, observeChangedPaths } from "./task-runtime-evidence.mjs";
 import { buildWorkerReport, buildWorkerReportOutputSchema, composeWorkerReportRepairPrompt } from "./worker-report-contract.mjs";
-import { captureContextManifest } from "./task-context-manifest.mjs";
+import { assertContextManifestIntegrity, captureContextManifest } from "./task-context-manifest.mjs";
+import { bindContextMetadataCompleteness } from "./task-context-metadata.mjs";
+
+const { captureCompleteContextManifest } = bindContextMetadataCompleteness({
+  captureContextManifest,
+  assertContextManifestIntegrity
+});
 import { evaluateScope } from "./task-scope.mjs";
 import { authorizeWorkerProviderRotation } from "./worker-mutation.mjs";
 import { isDispatchV2 } from "./worker-launch-contract.mjs";
@@ -212,7 +218,7 @@ function persistExecutionResult(execution, state, providerResult) {
     root, id, job, preContext, dispatchAttemptId, dispatchFence
   } = execution;
   const { result, workerReport, reportRepair, reportRepairError } = providerResult;
-  const postContext = captureContextManifest(root);
+  const postContext = captureCompleteContextManifest(root, { contextPhase: "terminal" });
   if (job.jobClass === "review" && result.review) {
     const safeResult = redact({
       review: result.review,
@@ -427,7 +433,7 @@ function recordExecutionFailure(execution, error) {
     }
   })();
   const postContext = (() => {
-    try { return captureContextManifest(root); } catch { return null; }
+    try { return captureCompleteContextManifest(root, { contextPhase: "terminal" }); } catch { return null; }
   })();
   updateJob(root, id, (current) => {
     if (terminal(current)) return current;
@@ -441,7 +447,7 @@ function recordExecutionFailure(execution, error) {
       providerProcess,
       error: redact(asErrorPayload(error)),
       summary: redactText(error.message),
-      progress: error.code === "E_CONTEXT_DRIFT" ? "Blocked: context drift" : "Finalizing failure",
+      progress: ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(error.code) ? "Blocked: context unavailable" : "Finalizing failure",
       ...execution.terminalIntentPatch(current, intendedTerminal),
       result: {
         ...(current.result || {}),
@@ -461,7 +467,7 @@ function recordExecutionFailure(execution, error) {
       completionContextManifest: postContext,
       lifecycleEvents: appendLifecycleEvent(
         current.lifecycleEvents,
-        error.code === "E_CONTEXT_DRIFT" || error.code === "E_CANCELLED" ? "blocked" : "checkpoint",
+        ["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE", "E_CANCELLED"].includes(error.code) ? "blocked" : "checkpoint",
         redactText(error.message)
       )
     });
