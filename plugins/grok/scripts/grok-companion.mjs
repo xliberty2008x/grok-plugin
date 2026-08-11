@@ -1414,10 +1414,7 @@ async function main() {
       throw new CompanionError("E_USAGE", "Invalid worker invocation.");
     }
     const root = workspaceRoot(cwd), nonce = process.env.GROK_COMPANION_WORKER_NONCE;
-    if (!brokerInvocation && readJob(root, id).jobClass === "review") {
-      await runLegacyReviewWorker({ root, id, nonce, readJob, execute });
-      return;
-    }
+    if (!brokerInvocation && readJob(root, id).jobClass === "review") return void await runLegacyReviewWorker({ root, id, nonce, readJob, execute });
     let authorized = false;
     let authorizedFence = null;
     for (let attempt = 0; attempt < 40; attempt++) {
