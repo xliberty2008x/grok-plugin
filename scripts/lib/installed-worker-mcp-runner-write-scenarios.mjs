@@ -958,10 +958,17 @@ export async function runWriteSmokeScenario(baseContext, fixtureRoot) {
     context, fixtureRoot, workerId, parentBefore, metadata, expectedContent,
     expectedContentDigest, result, patch
   });
+  const {
+    providerGeneration,
+    workerReport,
+    nativeStructuredReportProof,
+    expectedExecutionRoot
+  } = privateEvidence;
   const replayBoundary = await validateWriteSmokePrivateEvidence({
     context, fixtureRoot, workerId, parentBefore, metadata, spawned,
     spawnArguments, ...privateEvidence
   });
+  const { retainedProviderIdentities } = replayBoundary;
 
   const replay = await replayWriteSmokeSpawn({
     context, fixtureRoot, client, workerId, spawnArguments, parentBefore,
