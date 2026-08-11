@@ -40,6 +40,7 @@ import {
   buildTaskEnvelope
 } from "./task-envelope.mjs";
 import { captureContextManifest } from "./task-context-manifest.mjs";
+import { contextIncompleteError } from "./task-context-metadata.mjs";
 import {
   EXACT_WRITE_VERTICAL_SCOPE,
   assertExactWriteVerticalScope,
@@ -619,7 +620,18 @@ export function createWorkerService({
       if (!idempotencyKey) {
         throw new CompanionError("E_USAGE", "idempotencyKey is required for spawn.");
       }
-      const boundContextManifest = contextManifest || captureContext(root);
+      let boundContextManifest;
+      if (contextManifest) {
+        boundContextManifest = contextManifest;
+      } else {
+        try {
+          boundContextManifest = captureContext(root);
+        } catch {
+          // Fresh capture failures are incomplete (not drift); never leak private
+          // capture diagnostics through the public error surface.
+          throw contextIncompleteError("admission", ["contextCapture"]);
+        }
+      }
       const taskEnvelope = envelope ? assertTaskEnvelope(envelope) : buildTaskEnvelope({
         userRequest: userRequest || objective || "worker task",
         objective,

@@ -18,6 +18,29 @@ const SCHEMA = path.join(ROOT, "tests", "natural-codex-output.schema.json");
 const CODEX_HOME = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
 const DATA_ROOT = path.join(CODEX_HOME, "plugins", "data", "grok-grok-companion");
 const SHA256_HEX = /^[a-f0-9]{64}$/;
+const CODEX_REASONING_EFFORTS = new Set([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra"
+]);
+
+export function resolveNaturalCodexReasoningEffort(value) {
+  const effort = value || "xhigh";
+  if (!CODEX_REASONING_EFFORTS.has(effort)) {
+    throw new Error(`Natural Codex reasoning effort ${effort} is unsupported.`);
+  }
+  return effort;
+}
+
+const REASONING_EFFORT = resolveNaturalCodexReasoningEffort(
+  process.env.CODEX_E2E_REASONING_EFFORT
+);
+
 
 function fail(message, details = "") {
   throw new Error(`${message}${details.trim() ? `\n${details.trim()}` : ""}`);
@@ -161,6 +184,39 @@ function checked(command, args, options) {
   return result;
 }
 
+function codexRunMetadata(result) {
+  return JSON.stringify({
+    status: result?.status ?? null,
+    signal: result?.signal ?? null,
+    stdoutBytes: Buffer.byteLength(result?.stdout || "", "utf8"),
+    stderrBytes: Buffer.byteLength(result?.stderr || "", "utf8")
+  });
+}
+
+export function naturalCodexExecArgs({
+  model,
+  reasoningEffort,
+  root,
+  schema,
+  outputFile,
+  prompt
+}) {
+  const resolvedReasoningEffort = resolveNaturalCodexReasoningEffort(reasoningEffort);
+  return [
+    "exec",
+    "--ephemeral",
+    "--dangerously-bypass-hook-trust",
+    "--model", model,
+    "--config", `model_reasoning_effort="${resolvedReasoningEffort}"`,
+    "--sandbox", "danger-full-access",
+    "--cd", root,
+    "--color", "never",
+    "--output-schema", schema,
+    "--output-last-message", outputFile,
+    prompt
+  ];
+}
+
 function findJobFile(directory, name) {
   if (!fs.existsSync(directory)) return null;
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
@@ -191,18 +247,14 @@ function main() {
   ].join("\n");
 
   try {
-    checked(CODEX_BIN, [
-      "exec",
-      "--ephemeral",
-      "--dangerously-bypass-hook-trust",
-      "--model", MODEL,
-      "--sandbox", "danger-full-access",
-      "--cd", ROOT,
-      "--color", "never",
-      "--output-schema", SCHEMA,
-      "--output-last-message", outputFile,
+    const codexRun = checked(CODEX_BIN, naturalCodexExecArgs({
+      model: MODEL,
+      reasoningEffort: REASONING_EFFORT,
+      root: ROOT,
+      schema: SCHEMA,
+      outputFile,
       prompt
-    ], { timeout: 20 * 60_000 });
+    }), { timeout: 20 * 60_000 });
 
     if (!fs.existsSync(outputFile)) fail("Codex did not write its schema-constrained final result.");
     let reported;
