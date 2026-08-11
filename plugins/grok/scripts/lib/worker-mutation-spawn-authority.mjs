@@ -1,10 +1,3 @@
-<<<<<<< HEAD
-import {
-  contextIncompleteError,
-  observeContextMetadataCompleteness
-} from "./task-context-metadata.mjs";
-=======
->>>>>>> b85c3e5 (fix: drop duplicate contextIncompleteError import after restack)
 /** Issue #56 worker-mutation spawn-authority domain. */
 import path from "node:path";
 import { CompanionError, asErrorPayload } from "./errors.mjs";
@@ -18,6 +11,10 @@ import {
   captureContextManifest
 } from "./task-context-manifest.mjs";
 import {
+  contextIncompleteError,
+  observeContextMetadataCompleteness
+} from "./task-context-metadata.mjs";
+import {
   assertTaskEnvelope,
   bindTaskEnvelopeContext,
   buildTaskEnvelope,
@@ -28,7 +25,6 @@ import {
   CONTEXT_MANIFEST_VERSION,
   CONTEXT_METADATA_POLICIES
 } from "./task-context-policy.mjs";
-import { contextIncompleteError } from "./task-context-metadata.mjs";
 import {
   buildRuntimeEvidence,
   observeChangedPaths
