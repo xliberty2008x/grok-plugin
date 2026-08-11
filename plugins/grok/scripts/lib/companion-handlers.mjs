@@ -146,9 +146,10 @@ function resolveResumeSource(root, profile, { resume, jobId } = {}) {
     return prior;
   }
   // Legacy compatibility path: implicit same-session candidate without --job-id.
+  // Still enforce the same resume context integrity checks as explicit --job-id.
   const candidate = resumeCandidate(root, profile);
   if (!candidate) throw new CompanionError("E_NO_RESUME_CANDIDATE", "No resumable Grok task with the same security profile exists in this host session.");
-  return candidate;
+  return resolveResumeSource(root, profile, { resume: true, jobId: candidate.id });
 }
 
 async function handleRecordVerification(raw) {

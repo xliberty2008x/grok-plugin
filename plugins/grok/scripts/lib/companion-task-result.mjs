@@ -2,6 +2,7 @@ import { CompanionError, asErrorPayload } from "./errors.mjs";
 import { integritySnapshot, assertUnchanged } from "./git-review.mjs";
 import { providerCleanupIdentity } from "./provider-process.mjs";
 import { runProvider, runStructuredReview } from "./provider-headless-runtime.mjs";
+import { structuredReviewOptionsFor } from "./adversarial-review.mjs";
 import { profileFor } from "./profiles.mjs";
 import { updateJob, readJob, terminal } from "./state.mjs";
 import { redact, redactText } from "./redact.mjs";
@@ -56,7 +57,7 @@ function createProviderState(execution) {
 async function runProviderAndRepairReport(execution, state, common) {
   const { root, id, job, before, dispatchAttemptId, dispatchFence } = execution;
   let result = job.jobClass === "review" && job.kind !== "stop-review"
-    ? await runStructuredReview(common)
+    ? await runStructuredReview(structuredReviewOptionsFor(job.kind, common))
     : await runProvider(common);
   if (before) assertUnchanged(before, integritySnapshot(root));
   let workerReport = null;
