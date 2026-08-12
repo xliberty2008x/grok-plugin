@@ -259,7 +259,7 @@ test("provider domains stay bounded, acyclic, and independent of the facade", ()
 test("provider implementation consumers import owning domains instead of the facade", () => {
   const consumers = new Map([
     ["adversarial-review.mjs", ["provider-review-contract.mjs"]],
-    ["worker-mutation.mjs", ["provider-controller-environments.mjs"]],
+    ["worker-mutation-cancellation.mjs", ["provider-controller-environments.mjs"]],
     ["worker-recovery.mjs", ["provider-controller-environments.mjs"]],
     ["worker-runtime.mjs", ["provider-controller-environments.mjs"]],
     ["worker-owner-controller.mjs", [

@@ -913,13 +913,8 @@ test("checked-in ratchet baseline exactly covers all current file and function d
   ]);
   const result = evaluateSourceStructure({ root: ROOT, config });
   assert.equal(result.ok, true);
-<<<<<<< HEAD
-  assert.equal(result.files.length, 264);
-  assert.equal(result.warnings.length, 51);
-=======
-  assert.equal(result.files.length, 266);
+  assert.equal(result.files.length, 267);
   assert.equal(result.warnings.length, 50);
->>>>>>> 7537e85 (fix: preserve write-completion authority and structure caps)
   assert.equal(result.cycles.length, 0);
   assert.equal(result.fragments.length, 14);
   const debtPaths = result.files.filter((entry) => {
