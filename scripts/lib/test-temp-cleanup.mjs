@@ -26,8 +26,7 @@ export const TEST_TEMP_SIZE_SCAN_ENTRY_BUDGET = 10_000;
 export const TEST_TEMP_SNAPSHOT_REFRESH_MS = 10_000;
 const TEST_TEMP_WORKTREE_SCAN_TIMEOUT_MS = 120_000;
 export const LEGACY_REPOSITORY_PREFIX = "grok-plugin-repo-";
-// Every entry is an exact literal prefix used by tests in this repository.
-// Legacy cleanup is opt-in and accepts only prefix + mkdtemp's six-character suffix.
+// Exact literal prefixes used by this repo's tests; cleanup matches prefix + mkdtemp's six-character suffix.
 export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "controller-startup-crash-",
   "deep-research-cancel-fake-",
@@ -355,8 +354,7 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "worker-supervisor-scan-safety-data-",
   "worker-supervisor-server-data-",
   "worker-supervisor-terminal-data-",
-  "zero-skip-reporter-",
-].sort());
+  "zero-skip-reporter-"].sort());
 const LSOF_CANDIDATES = Object.freeze(["/usr/sbin/lsof", "/usr/bin/lsof"]);
 const PS_CANDIDATES = Object.freeze(["/bin/ps", "/usr/bin/ps"]);
 const GIT_CANDIDATES = Object.freeze(["/opt/homebrew/bin/git", "/usr/bin/git"]);
