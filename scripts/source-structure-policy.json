@@ -45,7 +45,7 @@
     "date": "2026-08-11",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
     "initialDigest": "bc76d24b5d3f2c2d88fedb02029fdf8ee1a7b8c92342b28def60307f4fdb18f8",
-    "policyDigest": "f6aaef2a42b2b6b968cf0821a61db2346d01b9391df04ac8bbda9c6d713b5cc0"
+    "policyDigest": "64897e48f5bc6674c5d1e5a9e6d9ede94acd51372e0b43845d02dad525c0012a"
   },
   "dispositions": {
     "scripts/lib/worker-broker-evidence.mjs": {
@@ -649,16 +649,6 @@
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
       "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
       "functions": [
-        {
-          "key": "function:cancelWorker#1",
-          "initialLines": 327,
-          "capLines": 327
-        },
-        {
-          "key": "function:cancelWorkerTransaction#1",
-          "initialLines": 309,
-          "capLines": 309
-        },
         {
           "key": "function:prepareProvisioningReissueTransaction#1",
           "initialLines": 361,
