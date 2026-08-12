@@ -41,3 +41,25 @@ test("assertDurableSpawnRequestBinding accepts admission contextPhase option", (
   const arity = assertDurableSpawnRequestBinding.length;
   assert.ok(arity >= 0 && arity <= 2, "optional trailing options must not break arity");
 });
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const RECOVERY = path.join(
+  HERE,
+  "../plugins/grok/scripts/lib/worker-mutation-write-recovery.mjs"
+);
+
+test("host adoption captures complete execute-phase context", () => {
+  const source = fs.readFileSync(RECOVERY, "utf8");
+  assert.match(
+    source,
+    /captureCompleteContextManifest\(\s*verified\.binding\.expectedExecutionRoot\s*,\s*\{\s*contextPhase:\s*"execute"\s*\}/
+  );
+  assert.doesNotMatch(
+    source,
+    /const executionContextManifest = captureContextManifest\(\s*verified\.binding\.expectedExecutionRoot\s*\)/
+  );
+});
