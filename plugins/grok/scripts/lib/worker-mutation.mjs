@@ -3295,6 +3295,7 @@ function reconcileCleanupSafeTerminalObservation(
     executionStatus,
     managedAuthorityUnavailable
       ? {
+          captureFailureKind: "evidenceAssembly",
           captureContext() {
             throw new CompanionError(
               "E_CONTEXT_DRIFT",
