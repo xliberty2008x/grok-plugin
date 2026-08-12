@@ -411,7 +411,7 @@ test("deterministic runner executes files sequentially and aggregates exact zero
   assert.deepEqual(calls.map((call) => call.args), files.map((file) => [
     TEST_TEMP_SUPERVISOR,
     "--timeout-ms",
-    "600000",
+    "720000",
     "--",
     "/exact/node",
     "--test",
@@ -421,7 +421,7 @@ test("deterministic runner executes files sequentially and aggregates exact zero
   assert.ok(calls.every((call) => call.binary === "/exact/node"));
   assert.ok(calls.every((call) => call.options.cwd === "/exact/root"));
   assert.ok(calls.every((call) => call.options.shell === false));
-  assert.ok(calls.every((call) => call.options.timeout === 630000));
+  assert.ok(calls.every((call) => call.options.timeout === 750000));
   assert.ok(calls.every((call) => call.options.killSignal === "SIGKILL"));
   assert.ok(calls.every((call) => call.options.maxBuffer === 1024 * 1024));
   assert.ok(calls.every((call) => call.options.env.TMPDIR === call.options.env.TMP));
