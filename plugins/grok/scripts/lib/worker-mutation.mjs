@@ -12,12 +12,9 @@
  */
 import crypto from "node:crypto";
 import path from "node:path";
-
 import { CompanionError } from "./errors.mjs";
-
 import { providerLaunchBindingDigest as digestProviderLaunchBinding } from "./provider-executable-pin.mjs";
 import { cleanupTaskRuntimeArtifacts } from "./provider-controller-environments.mjs";
-
 import {
   generateId,
   isCancelRequested,
@@ -36,7 +33,6 @@ import {
   buildTaskEnvelope,
   scrubStoredJob
 } from "./task-envelope.mjs";
-
 import { composeProviderPrompt } from "./task-provider-prompt.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 
@@ -155,7 +151,6 @@ import {
   recordWriteProvisionerNoChild,
   retainWriteProvisioningCleanupPending
 } from "./worker-mutation-write-recovery.mjs";
-
 
 const {
   assertContextMetadataComplete,
