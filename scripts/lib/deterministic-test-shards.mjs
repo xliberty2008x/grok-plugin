@@ -56,6 +56,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/worker-host-actions.test.mjs",
     "tests/worker-launch-outbox.test.mjs",
     "tests/worker-mutation-boundaries.test.mjs",
+    "tests/worker-mutation-review-failclosed.test.mjs",
     "tests/worker-owner-controller.test.mjs",
     "tests/worker-protocol.test.mjs",
     "tests/worker-recovery-fence.test.mjs",
