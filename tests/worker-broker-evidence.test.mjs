@@ -202,7 +202,6 @@ for (const method of ["only", "skip", "todo"]) {
     args
   );
 }
-
 const STARTED_AT = "2026-07-16T10:00:00.000Z";
 const ENDED_AT = "2026-07-16T10:00:01.000Z";
 const PRE_V5_PROOF_MANIFEST_DIGESTS = Object.freeze({
@@ -260,7 +259,6 @@ function installZeroSkipReporter(root) {
     fs.copyFileSync(source, destination);
   }
 }
-
 function installPhaseOneFocusedRunner(root) {
   for (const source of [
     DETERMINISTIC_TEST_LIBRARY,
@@ -327,7 +325,6 @@ function zeroSkipViolation(overrides = {}) {
     ...overrides
   };
 }
-
 function zeroSkipSummary(overrides = {}) {
   return `${JSON.stringify({
     reporter: ZERO_SKIP_REPORTER_ID,
@@ -1308,7 +1305,6 @@ function installProofRepositoryGate(root, command) {
     ].join("\n")
   );
 }
-
 function rawEvidenceFixturePath(root, record) {
   const phaseDirectory = record.phase === "aggregate" ? "aggregate" : `phase-${record.phase}`;
   const sourceDigest = record.source?.sourceInventoryDigest ?? record.recordDigest;
@@ -1322,7 +1318,6 @@ function rawEvidenceFixturePath(root, record) {
   fs.writeFileSync(absolute, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
   return relative.split(path.sep).join("/");
 }
-
 function seedLedgerFixtureEntry(root, entry) {
   const ledgerPath = path.join(root, "tests/e2e-results/worker-broker/ledger.json");
   fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
@@ -1357,7 +1352,6 @@ function seedLedgerFixtureEntry(root, entry) {
   fs.writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`, { mode: 0o600 });
   return ledger;
 }
-
 function syntheticLedgerEntry(phase, slice, overrides = {}) {
   const recordDigest = sha256Text(`${phase}:${slice}:record`);
   const directory = phase === "aggregate" ? "aggregate" : `phase-${phase}`;

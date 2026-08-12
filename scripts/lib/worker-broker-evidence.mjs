@@ -610,7 +610,6 @@ function freezeScopeMap(scope) {
     Object.entries(scope).map(([phase, paths]) => [phase, Object.freeze([...paths])])
   ));
 }
-
 function repositoryRelativePath(root, absolute) {
   const relative = path.relative(root, absolute);
   if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
@@ -618,7 +617,6 @@ function repositoryRelativePath(root, absolute) {
   }
   return relative.split(path.sep).join("/");
 }
-
 function exactParserObject(value, keys) {
   return Boolean(
     value
@@ -628,7 +626,6 @@ function exactParserObject(value, keys) {
     && keys.every((key) => Object.hasOwn(value, key))
   );
 }
-
 function staticImportParserEnvironment() {
   const environment = {};
   if (process.platform === "win32") {
@@ -638,7 +635,6 @@ function staticImportParserEnvironment() {
   }
   return environment;
 }
-
 function rememberStaticImportSpecifiers(id, specifiers) {
   if (STATIC_IMPORT_CACHE.has(id)) STATIC_IMPORT_CACHE.delete(id);
   STATIC_IMPORT_CACHE.set(id, Object.freeze([...specifiers]));
@@ -646,7 +642,6 @@ function rememberStaticImportSpecifiers(id, specifiers) {
     STATIC_IMPORT_CACHE.delete(STATIC_IMPORT_CACHE.keys().next().value);
   }
 }
-
 function parseStaticImportBatch(entries) {
   const input = JSON.stringify({ schemaVersion: 1, sources: entries });
   if (Buffer.byteLength(input, "utf8") > MAX_STATIC_IMPORT_BATCH_BYTES) {
@@ -710,7 +705,6 @@ function parseStaticImportBatch(entries) {
     throw new Error("Static ESM dependency parser returned malformed output.");
   }
 }
-
 function parseStaticImportSources(sources) {
   if (!Array.isArray(sources)) throw new TypeError("Static ESM sources must be an array.");
   const normalized = sources.map((source) => {
