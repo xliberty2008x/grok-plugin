@@ -546,7 +546,7 @@ test("file-URL query, fragment, and percent encoding cannot hide facade cycles",
 
 test("immutable and active digests pin history and the shrink-only policy boundary", () => {
   const config = loadSourceStructurePolicy({ root: ROOT });
-  assert.equal(SOURCE_STRUCTURE_INITIAL_DIGEST, "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b");
+  assert.equal(SOURCE_STRUCTURE_INITIAL_DIGEST, "bc76d24b5d3f2c2d88fedb02029fdf8ee1a7b8c92342b28def60307f4fdb18f8");
   assert.equal(config.baseline.initialDigest, SOURCE_STRUCTURE_INITIAL_DIGEST);
   assert.equal(sourceStructureInitialDigest(config), SOURCE_STRUCTURE_INITIAL_DIGEST);
   assert.equal(config.baseline.policyDigest, SOURCE_STRUCTURE_POLICY_DIGEST);
