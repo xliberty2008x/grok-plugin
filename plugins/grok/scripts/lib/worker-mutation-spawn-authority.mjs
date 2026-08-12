@@ -1,4 +1,7 @@
-import { contextIncompleteError } from "./task-context-metadata.mjs";
+import {
+  contextIncompleteError,
+  observeContextMetadataCompleteness
+} from "./task-context-metadata.mjs";
 /** Issue #56 worker-mutation spawn-authority domain. */
 import path from "node:path";
 import { CompanionError, asErrorPayload } from "./errors.mjs";
@@ -451,7 +454,8 @@ export function assertManagedWriteImmutableAuthority(
       }
     );
   } catch (error) {
-    if (!allowFinalControlContextDrift || error?.code !== "E_CONTEXT_DRIFT") {
+    if (!allowFinalControlContextDrift
+      || !["E_CONTEXT_DRIFT", "E_CONTEXT_INCOMPLETE"].includes(error?.code)) {
       throw error;
     }
     controlContextError = error;
@@ -513,9 +517,13 @@ export function captureManagedWritePostBindingContext(
   } else {
     currentContextManifest = assertContextManifestIntegrity(observedContextManifest);
   }
+  const controlIncompleteComponents = controlContextError?.code === "E_CONTEXT_INCOMPLETE"
+    && Array.isArray(controlContextError?.details?.metadataComponents)
+    ? [...controlContextError.details.metadataComponents]
+    : [];
   const controlReasons = Array.isArray(controlContextError?.details?.reasons)
     ? [...controlContextError.details.reasons]
-    : controlContextError
+    : controlContextError && controlContextError.code !== "E_CONTEXT_INCOMPLETE"
       ? ["controlContext"]
       : [];
   const coreReasons = [
@@ -597,7 +605,16 @@ export function captureManagedWritePostBindingContext(
   );
   const metadataMarkers = scopeViolations.filter(
     (item) => String(item).startsWith("[")
+      && item !== "[GIT_METADATA_INCOMPLETE]"
   );
+  const completeness = observeContextMetadataCompleteness(
+    requestContextManifest,
+    currentContextManifest
+  );
+  const incompleteComponents = [...new Set([
+    ...controlIncompleteComponents,
+    ...(completeness.metadataComponents || [])
+  ])];
   return Object.freeze({
     binding,
     journal,
@@ -611,7 +628,8 @@ export function captureManagedWritePostBindingContext(
     scopeViolations,
     coreReasons,
     controlContextMarkers,
-    metadataMarkers
+    metadataMarkers,
+    incompleteComponents
   });
 }
 
