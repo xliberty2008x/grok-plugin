@@ -4372,43 +4372,383 @@ export function promoteWriteWorkerReady({
   }, env);
 }
 
-/**
- * Retain an activated provisioner in cleanup-pending after its exact
- * controller process and guard are gone, without claiming whether the
- * official worktree effect occurred. A verified receipt is preserved when
- * available; null remains an explicit unknown-effect state.
- */
+function cancelRequestDigest({ principal, workerId }) {
+  return stableDigest({
+    ownerThreadId: principal?.threadId || null,
+    workerId
+  });
+}
+
+function recoveryRecordFromIdempotency(existing, keyDigest) {
+  return normalizeCancellationRecoveryRecord({
+    schemaVersion: 1,
+    workerId: existing.workerId,
+    ownerThreadId: existing.ownerThreadId,
+    requestDigest: existing.requestDigest,
+    idempotencyKeyDigest: keyDigest,
+    receipt: existing.receipt,
+    committedAt: existing.committedAt
+  }, { jobId: existing.workerId, keyDigest });
+}
+
+function findCancellationRecovery(transaction, keyDigest) {
+  const matches = [];
+  for (const job of transaction.listJobs()) {
+    const record = cancellationRecoveryRecordForKey(job, keyDigest);
+    if (record) matches.push({ job, record });
+  }
+  if (matches.length > 1) {
+    cancellationStateError("Cancellation recovery identity is ambiguous across durable jobs.");
+  }
+  return matches[0] || null;
+}
 
 /**
- * Adopt one exact, clean worktree whose official create response was lost
- * after the broker had durably retained the unknown effect. This records
- * host-observed evidence, never fabricates an official Grok receipt, and
- * grants no provider-dispatch authority.
+ * Idempotent cancel: immutable receipt, exactly one cancellation-request lifecycle event.
  */
+export function cancelWorker({
+  root,
+  principal,
+  workerId,
+  idempotencyKey,
+  env = process.env
+} = {}) {
+  assertIdempotencyKey(idempotencyKey);
+  if (!principal?.threadId) {
+    throw new CompanionError("E_AUTH_REQUIRED", "Trusted Codex task identity is unavailable.");
+  }
+  if (!workerId) {
+    throw new CompanionError("E_USAGE", "workerId is required.");
+  }
 
-/**
- * Settle an exact provisioning intent when no usable child survives. A
- * prepared/no-process intent may fail directly; an activated intent requires
- * exact cleanup proof and a verified absent guard before terminal publication.
- */
+  const keyDigest = digestKey(idempotencyKey);
+  const mutationDigest = cancelRequestDigest({ principal, workerId });
+  return withWorkspaceStateTransaction(root, function cancelWorkerTransaction(transaction) {
+    const existing = readIdempotency(root, "cancel", idempotencyKey, env);
+    if (existing) {
+      if (
+        existing.ownerThreadId !== principal.threadId
+        || existing.requestDigest !== mutationDigest
+        || existing.workerId !== workerId
+      ) {
+        idempotencyConflict("idempotencyKey was reused with a different cancellation owner or request.");
+      }
+      const recovered = recoveryRecordFromIdempotency(existing, keyDigest);
+      return { receipt: recovered.receipt, replayed: true };
+    }
 
+    // Recovery records are searched workspace-wide so reuse of a key against a
+    // different worker still conflicts after loss of the adjacent idempotency
+    // file. The error intentionally discloses no worker or owner identity.
+    const durableRecovery = findCancellationRecovery(transaction, keyDigest);
+    if (durableRecovery) {
+      const { job, record } = durableRecovery;
+      if (
+        record.ownerThreadId !== principal.threadId
+        || record.requestDigest !== mutationDigest
+        || record.workerId !== workerId
+      ) {
+        idempotencyConflict("idempotencyKey was reused with a different cancellation owner or request.");
+      }
+      assertMutationOwnership(job, principal);
+      writeIdempotency(root, "cancel", idempotencyKey, {
+        workerId,
+        ownerThreadId: record.ownerThreadId,
+        requestDigest: record.requestDigest,
+        receipt: record.receipt,
+        committedAt: record.committedAt
+      }, env);
+      return { receipt: record.receipt, replayed: true };
+    }
 
-/**
- * Validate one durable write job for exact spawn-admission replay.
- *
- * Pre-dispatch/provisioning jobs keep assertWriteExecutionJob. Once a
- * dispatch-v2 outbox exists (including terminal provider outcomes), the
- * immutable executionBinding and dispatch contract are fail-closed without
- * recomputing dirty execution-worktree acceptance context.
- */
+    const initial = transaction.tryReadJob(workerId);
+    if (!initial) {
+      // Foreign and nonexistent are observationally equivalent.
+      throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+    }
+    assertMutationOwnership(initial, principal);
 
-/**
- * Persist only a write-worker plan. This is an internal Phase 3 admission
- * boundary: it creates no worktree and grants no dispatch or provider
- * authority. A later fenced provisioner must promote the journal to ready.
- */
+    const requestAcceptedAt = now();
+    const receiptId = `cancel-${digestKey(`${principal.threadId}:${workerId}:${keyDigest}`).slice(0, 24)}`;
+    let cancellationRequestSequence = null;
+    let status = "accepted";
+    const processGroupGoneAt = null;
+    let terminalRecordCommittedAt = null;
+    let wasActive = false;
 
-/**
- * Commit a durable read-only worker job. Provider launch is intentionally not performed.
- * write:true routes only to the internal admission-only Phase 3 plan.
- */
+    const cancellationRecord = () => ({
+      receiptId,
+      status,
+      requestAcceptedAt,
+      processGroupGoneAt,
+      terminalRecordCommittedAt,
+      idempotencyKeyDigest: keyDigest,
+      ownerThreadId: principal.threadId,
+      requestDigest: mutationDigest,
+      cancellationRequestSequence
+    });
+
+    const cancellationReceipt = () => Object.freeze({
+      receiptId,
+      workerId,
+      status,
+      requestAcceptedAt,
+      processGroupGoneAt,
+      terminalRecordCommittedAt,
+      idempotencyKeyDigest: keyDigest,
+      cancellationRequestSequence
+    });
+
+    const cancellationRecoveryRecord = () => ({
+      schemaVersion: 1,
+      workerId,
+      ownerThreadId: principal.threadId,
+      requestDigest: mutationDigest,
+      idempotencyKeyDigest: keyDigest,
+      receipt: cancellationReceipt(),
+      committedAt: requestAcceptedAt
+    });
+
+    const persistCancellation = (current, extra = {}) => ({
+      ...(current.result || {}),
+      hostVerification: current.result?.hostVerification || "not_run",
+      ...extra,
+      cancellation: cancellationRecord(),
+      cancellationReceiptsByKey: appendCancellationRecoveryRecord(
+        current,
+        cancellationRecoveryRecord()
+      )
+    });
+
+    const updated = transaction.updateJob(workerId, (current) => {
+      assertMutationOwnership(current, principal);
+      if (current.status !== "queued" && current.status !== "running") {
+        status = "already_terminal";
+        terminalRecordCommittedAt = current.completedAt || requestAcceptedAt;
+        return {
+          ...current,
+          // Persist immutable per-key recovery next to the terminal job. If the
+          // adjacent idempotency-file publication is interrupted, later keys
+          // cannot overwrite this receipt's recovery identity.
+          result: persistCancellation(current)
+        };
+      }
+      wasActive = true;
+
+      const events = Array.isArray(current.lifecycleEvents) ? current.lifecycleEvents : [];
+      const existingEvent = events.find((event) => event.type === "cancellation.requested");
+      let nextEvents = events;
+      if (existingEvent) {
+        status = "already_cancelled";
+        cancellationRequestSequence = existingEvent.sequence ?? null;
+      } else {
+        nextEvents = appendLifecycleEvent(
+          events,
+          "cancellation.requested",
+          "Cancellation request accepted by worker broker.",
+          { requestAcceptedAt }
+        );
+        cancellationRequestSequence = nextEvents.at(-1)?.sequence ?? null;
+      }
+
+      const spawn = current.request?.spawn || {};
+      const dispatch = spawn.dispatch;
+      let dispatchContractValid = false;
+      let dispatchContractWarning = null;
+      try {
+        assertDispatchContract(current);
+        dispatchContractValid = true;
+      } catch {
+        dispatchContractWarning = "Queued worker dispatch metadata is malformed or no longer launch-safe.";
+      }
+      const providerLaunchSafelyAbsent = Boolean(
+        (
+          spawn.providerLaunchPending === true
+          && spawn.providerLaunchInFlight === false
+          && (spawn.providerLaunchOutcome === null || spawn.providerLaunchOutcome === "pending")
+        )
+        || (
+          spawn.providerLaunchPending === false
+          && spawn.providerLaunchInFlight === false
+          && spawn.providerLaunchOutcome === "not-launched"
+        )
+      );
+      const brokerOnlyQueuedCandidate = Boolean(
+        dispatchContractValid
+        && providerLaunchSafelyAbsent
+        && current.status === "queued"
+        && isDispatchV2(dispatch)
+        && dispatch.state === "pending"
+        && dispatch.attemptId === null
+        && dispatch.fence === 0
+        && dispatch.lease === null
+        && dispatch.providerGeneration === 0
+        && dispatch.nextProviderGeneration === null
+        && spawn.controllerSpawnIntent == null
+        && spawn.workerSpawnIntent == null
+        && spawn.unsettledWorkerProcess == null
+        && spawn.controllerCleanupProcess == null
+        && spawn.controllerCleanupPending !== true
+        && current.controllerProcess == null
+        && current.workerProcess == null
+        && current.providerProcess == null
+        && current.pendingTerminal == null
+      );
+      let providerGuardAbsent = false;
+      let providerGuardWarning = null;
+      if (brokerOnlyQueuedCandidate) {
+        try {
+          providerGuardAbsent = loadProviderGuard(root, current.id, env) === null;
+          if (!providerGuardAbsent) {
+            providerGuardWarning = "Provider ownership metadata exists for this queued worker.";
+          }
+        } catch {
+          providerGuardWarning = "Provider ownership metadata is malformed or unreadable.";
+        }
+      }
+      const brokerOnlyQueued = brokerOnlyQueuedCandidate && providerGuardAbsent;
+      // Fail closed for every active state, including the commit-before-launch
+      // window. The provider launch hook observes this same nonce-bound marker.
+      transaction.requestCancel(workerId, cancellationNonce(current));
+      // A broker-only queued job has no process to stop, but stale credentials
+      // or profiles may still exist after a prior interrupted cleanup. Verify
+      // their removal inside this workspace/job transaction before claiming a
+      // cleanup-safe terminal state. Active cancellation remains nonterminal
+      // until the controller, worker, or trusted recovery path publishes the
+      // same proof. Caller callbacks are never cancellation authority.
+      const brokerOnlyCleanup = brokerOnlyQueued
+        ? cleanupTaskRuntimeArtifacts(
+            workspaceState(root, env),
+            current.request?.providerHomeId || current.id,
+            []
+          )
+        : null;
+      const mayCommitTerminal = brokerOnlyQueued && brokerOnlyCleanup?.ok === true;
+      if (mayCommitTerminal) terminalRecordCommittedAt = now();
+
+      if (mayCommitTerminal) {
+        const settledRequest = {
+            ...current.request,
+            spawn: {
+              ...current.request?.spawn,
+              providerLaunchPending: false,
+              providerLaunchInFlight: false,
+              providerLaunchOutcome: "not-launched",
+              providerLaunchCompletedAt: terminalRecordCommittedAt,
+              dispatch: {
+                ...dispatch,
+                state: "failed",
+                // Dispatch-v2 requires a fenced attempt identity for every
+                // non-pending state. Cancellation owns this synthetic fence
+                // only to atomically revoke the never-consumed launch grant.
+                attemptId: digestKey(`${receiptId}:cancel-dispatch`).slice(0, 32),
+                fence: 1,
+                lease: null,
+                nextProviderGeneration: null,
+                claimedAt: terminalRecordCommittedAt,
+                failedAt: terminalRecordCommittedAt,
+                updatedAt: terminalRecordCommittedAt
+              }
+            }
+          };
+        const observed = reconcileCleanupSafeTerminalObservation(
+          {
+            ...current,
+            request: settledRequest,
+            workerAuthorization: null,
+            lifecycleEvents: nextEvents,
+            result: persistCancellation(current, {
+              taskRuntimeCleaned: true
+            })
+          },
+          {
+            status: "cancelled",
+            phase: "cancelled",
+            completedAt: terminalRecordCommittedAt,
+            error: null,
+            summary: "Cancelled"
+          }
+        );
+        const pending = observed.pending;
+        const terminal = scrubStoredJob({
+          ...observed.job,
+          status: pending.status,
+          phase: pending.phase,
+          summary: pending.summary || pending.error?.message || "Cancelled",
+          progress: terminalTaskProgress(pending.status, pending.error),
+          completedAt: pending.completedAt || terminalRecordCommittedAt,
+          error: pending.error || null,
+          workerAuthorization: null,
+          lifecycleEvents: nextEvents,
+          result: {
+            ...(observed.job.result || {}),
+            ...(pending.status === "cancelled"
+              ? { stopReason: "cancelled" }
+              : {})
+          }
+        });
+        assertDispatchContract(terminal);
+        return terminal;
+      }
+
+      return {
+        ...current,
+        phase: "cancellation-requested",
+        summary: "Cancellation requested",
+        progress: brokerOnlyCleanup?.warning
+          ? "Cancellation accepted; runtime artifact cleanup remains incomplete."
+          : providerGuardWarning || dispatchContractWarning
+            ? "Cancellation accepted; provider cleanup identity remains ambiguous."
+          : "Cancellation accepted; waiting for cleanup-safe runtime finalization.",
+        lifecycleEvents: nextEvents,
+        result: persistCancellation(current, brokerOnlyCleanup?.warning || providerGuardWarning || dispatchContractWarning
+          ? {
+              taskRuntimeCleaned: false,
+              privacyWarning: brokerOnlyCleanup?.warning || providerGuardWarning || dispatchContractWarning
+            }
+          : {})
+      };
+    });
+
+    if (wasActive) {
+      const count = (updated.lifecycleEvents || [])
+        .filter((event) => event.type === "cancellation.requested").length;
+      if (count !== 1) {
+        throw new CompanionError(
+          "E_STATE",
+          `Expected exactly one cancellation-request event, found ${count}.`
+        );
+      }
+    }
+
+    const receipt = cancellationReceipt();
+    writeIdempotency(root, "cancel", idempotencyKey, {
+      workerId,
+      ownerThreadId: principal.threadId,
+      requestDigest: mutationDigest,
+      receipt,
+      committedAt: requestAcceptedAt
+    }, env);
+
+    return { receipt, replayed: false };
+  }, env);
+}
+
+export function projectCancellationReceipt(receipt) {
+  if (!receipt) return null;
+  const projectedTimestamp = (value) => (
+    validIsoTimestamp(value) ? value : null
+  );
+  return {
+    receiptId: receipt.receiptId,
+    workerId: receipt.workerId,
+    status: receipt.status,
+    requestAcceptedAt: projectedTimestamp(receipt.requestAcceptedAt),
+    processGroupGoneAt: projectedTimestamp(receipt.processGroupGoneAt),
+    terminalRecordCommittedAt: projectedTimestamp(
+      receipt.terminalRecordCommittedAt
+    ),
+    idempotencyKeyDigest: receipt.idempotencyKeyDigest || null,
+    cancellationRequestSequence: receipt.cancellationRequestSequence ?? null
+  };
+}
