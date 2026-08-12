@@ -25,7 +25,12 @@ import {
   tryReadJob,
   withWorkspaceStateTransaction
 } from "./state.mjs";
-import { assertContextCompatible } from "./task-context-manifest.mjs";
+import {
+  assertContextCompatible,
+  assertContextManifestIntegrity,
+  captureContextManifest
+} from "./task-context-manifest.mjs";
+import { bindContextMetadataCompleteness } from "./task-context-metadata.mjs";
 import {
   bindTaskEnvelopeContext,
   buildTaskEnvelope,
