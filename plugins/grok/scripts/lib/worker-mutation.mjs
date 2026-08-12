@@ -6319,7 +6319,9 @@ export function spawnReadOnlyWorker({
       }
       assertSpawnIdempotencyJobBinding(record, committed, { keyDigest });
       assertDispatchContract(committed);
-      assertDurableSpawnRequestBinding(committed, env);
+      assertDurableSpawnRequestBinding(committed, env, {
+        contextPhase: "admission"
+      });
       assertMutationOwnership(committed, principal);
       const replayRequestDigest = storedSpawnReplayRequestDigest({
         job: committed,
@@ -6385,7 +6387,9 @@ export function spawnReadOnlyWorker({
         idempotencyConflict("idempotencyKey was reused with a different spawn owner or request.");
       }
       assertDispatchContract(orphan);
-      assertDurableSpawnRequestBinding(orphan, env);
+      assertDurableSpawnRequestBinding(orphan, env, {
+        contextPhase: "admission"
+      });
       assertMutationOwnership(orphan, principal);
       const replayRequestDigest = storedSpawnReplayRequestDigest({
         job: orphan,

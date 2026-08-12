@@ -647,9 +647,12 @@ export function assertManagedWritePostBindingObservation(observed) {
       }
     );
   }
-  if (observed.scopeViolations.length) {
+  const concreteScopeViolations = observed.scopeViolations.filter(
+    (item) => item !== "[GIT_METADATA_INCOMPLETE]"
+  );
+  if (concreteScopeViolations.length) {
     const paths = boundPathEvidence(
-      observed.scopeViolations,
+      concreteScopeViolations,
       { marker: "[SCOPE_VIOLATIONS_OVERFLOW]" }
     );
     throw new CompanionError(
@@ -657,6 +660,9 @@ export function assertManagedWritePostBindingObservation(observed) {
       "Managed write execution produced changes outside its exact delegated scope.",
       { paths }
     );
+  }
+  if (observed.incompleteComponents?.length) {
+    throw contextIncompleteError("terminal", observed.incompleteComponents);
   }
   return observed;
 }
@@ -737,7 +743,9 @@ export function assertManagedWriteReplayContext(job, env = process.env) {
   return completionObservation;
 }
 
-export function assertDurableSpawnRequestBinding(job, env = process.env) {
+export function assertDurableSpawnRequestBinding(job, env = process.env, {
+  contextPhase = null
+} = {}) {
   const spawn = job?.request?.spawn;
   const executionRoot = spawn?.executionRoot;
   const isGrantedFollowup = job?.request?.followup !== undefined;
@@ -783,7 +791,10 @@ export function assertDurableSpawnRequestBinding(job, env = process.env) {
       acceptedContext = assertContextCompatible(
         executionRoot,
         job.request?.contextManifest,
-        { mode: isGrantedFollowup ? "resume" : "execute" }
+        {
+          mode: isGrantedFollowup ? "resume" : "execute",
+          ...(contextPhase ? { contextPhase } : {})
+        }
       );
     }
   } catch (error) {
