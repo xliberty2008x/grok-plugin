@@ -6,10 +6,14 @@ import test from "node:test";
 
 import {
   assertContextCompatible,
+  assertTaskContextReady,
   buildRuntimeEvidence,
+  buildTaskEnvelope,
   captureContextManifest,
   observeChangedPaths
 } from "../plugins/grok/scripts/lib/task-contract.mjs";
+import { captureEffectiveGitConfigIdentity } from "../plugins/grok/scripts/lib/task-git-controls.mjs";
+import { spawnReadOnlyWorker } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import { CompanionError } from "../plugins/grok/scripts/lib/errors.mjs";
 import { recordExecutionFailure } from "../plugins/grok/scripts/lib/companion-task-result.mjs";
 import { generateId, readJob, updateJob, writeJob } from "../plugins/grok/scripts/lib/state.mjs";
@@ -89,6 +93,73 @@ function persistedJob(pluginData, id) {
   const value = persistedJobs(pluginData).find((job) => job.id === id);
   assert.ok(value, `missing persisted job ${id}`);
   return value;
+}
+
+const { captureCompleteContextManifest } = bindContextMetadataCompleteness({
+  captureContextManifest,
+  assertContextManifestIntegrity
+});
+
+function linkedWorktreeWithoutConfig() {
+  const root = initRepo();
+  git(root, "config", "extensions.worktreeConfig", "true");
+  const linked = `${root}-linked`;
+  git(root, "worktree", "add", "-q", linked, "-b", `issue97-${path.basename(root)}`);
+  const relative = git(linked, "rev-parse", "--git-path", "config.worktree");
+  const configWorktree = path.resolve(linked, relative);
+  assert.equal(fs.existsSync(configWorktree), false);
+  return { root, linked, configWorktree };
+}
+
+function disposeLinkedWorktree({ root, linked, configWorktree }) {
+  try {
+    if (configWorktree && fs.existsSync(configWorktree)) {
+      try { fs.chmodSync(configWorktree, 0o644); } catch {}
+      const includeTarget = path.join(path.dirname(configWorktree), "issue97-include.inc");
+      try { fs.unlinkSync(includeTarget); } catch {}
+      fs.unlinkSync(configWorktree);
+    }
+  } catch {}
+  try {
+    git(root, "worktree", "remove", "--force", linked);
+  } catch {
+    try { fs.rmSync(linked, { recursive: true, force: true }); } catch {}
+  }
+}
+
+function boundedReadEnvelope() {
+  return buildTaskEnvelope({
+    userRequest: "inspect only tracked.txt",
+    mode: "read",
+    scope: { include: ["tracked.txt"], exclude: [] },
+    context: {
+      facts: [],
+      constraints: [],
+      expectedProjectMarkers: [],
+      requiredPaths: ["tracked.txt"],
+      workspaceState: "task_scoped",
+      upstreamFreshness: "not_checked"
+    }
+  });
+}
+
+function mutationEnv() {
+  const pluginData = tempDir("grok-mutation-data-");
+  return {
+    HOME: path.dirname(pluginData),
+    GROK_COMPANION_HOST: "codex",
+    GROK_COMPANION_PLUGIN_DATA: pluginData
+  };
+}
+
+function assertPublicConfigIncomplete(error) {
+  assert.equal(error?.code, "E_CONTEXT_INCOMPLETE");
+  assert.match(error.message, /could not be observed completely/);
+  assert.equal(error.details?.metadataComponents?.includes("config"), true);
+  const serialized = JSON.stringify(error);
+  assert.equal(/\/(?:private\/)?(?:Users|var|tmp)\//.test(serialized), false);
+  assert.equal(serialized.includes("config.worktree"), false);
+  return true;
 }
 
 function writeEnvelope(userRequest) {
@@ -339,4 +410,139 @@ test("failure finalization records ordinary context when complete terminal captu
     else process.env.CLAUDE_PLUGIN_DATA = previous;
     fs.unlinkSync(hook);
   }
+});
+
+test("linked worktree without config.worktree is a complete empty config scope", (t) => {
+  const fixture = linkedWorktreeWithoutConfig();
+  t.after(() => disposeLinkedWorktree(fixture));
+  const { root, linked } = fixture;
+  const first = captureEffectiveGitConfigIdentity(linked);
+  const second = captureEffectiveGitConfigIdentity(linked);
+  assert.equal(first.observable, true);
+  assert.equal(first.truncated, false);
+  assert.equal(first.identity, second.identity);
+  assert.equal(first.identity, captureEffectiveGitConfigIdentity(root).identity);
+
+  const manifest = captureCompleteContextManifest(linked, { contextPhase: "admission" });
+  assert.equal(manifest.git.taskRelevantMetadataObservation.complete, true);
+  assert.equal(manifest.git.taskRelevantMetadataObservation.components.config, "complete");
+  assert.doesNotThrow(() => assertTaskContextReady(boundedReadEnvelope(), manifest, {
+    structuredInput: true
+  }));
+
+  const admitted = spawnReadOnlyWorker({
+    root: linked,
+    principal: {
+      hostKind: "codex",
+      threadId: "019f666a-6469-7cc1-9a8d-8c1adf61e103",
+      turnId: "019f666e-4084-7902-8447-249f72043a37",
+      source: "codex-mcp-stdio",
+      pluginId: "grok@grok-companion",
+      root: linked,
+      mutationCapable: true
+    },
+    envelope: boundedReadEnvelope(),
+    idempotencyKey: `issue97-admit-${path.basename(linked)}`,
+    env: mutationEnv()
+  });
+  assert.equal(typeof admitted.handle?.id, "string");
+  assert.equal(admitted.handle.id.length > 0, true);
+
+  git(root, "config", "--unset", "extensions.worktreeConfig");
+  const featureOff = captureEffectiveGitConfigIdentity(linked);
+  assert.notEqual(first.identity, featureOff.identity);
+
+  git(root, "config", "extensions.worktreeConfig", "true");
+  git(linked, "config", "--worktree", "user.issue97", "present");
+  const present = captureEffectiveGitConfigIdentity(linked);
+  assert.equal(present.observable, true);
+  assert.notEqual(first.identity, present.identity);
+});
+
+test("creating deleting or changing config.worktree is task-relevant drift", (t) => {
+  const fixture = linkedWorktreeWithoutConfig();
+  t.after(() => disposeLinkedWorktree(fixture));
+  const { linked, configWorktree } = fixture;
+  const empty = captureContextManifest(linked);
+  git(linked, "config", "--worktree", "user.issue97", "created");
+  const created = captureContextManifest(linked);
+  assert.throws(
+    () => assertContextCompatible(linked, empty),
+    (error) => error?.code === "E_CONTEXT_DRIFT"
+      && error.details?.reasons?.includes("taskRelevantMetadataIdentity")
+  );
+  const createdChanged = observeChangedPaths(empty, created);
+  assert.equal(createdChanged.includes("[GIT_METADATA]"), true);
+
+  git(linked, "config", "--worktree", "user.issue97", "changed");
+  const changed = captureContextManifest(linked);
+  assert.throws(
+    () => assertContextCompatible(linked, created),
+    (error) => error?.code === "E_CONTEXT_DRIFT"
+  );
+  assert.notEqual(
+    created.git.taskRelevantMetadataIdentity,
+    changed.git.taskRelevantMetadataIdentity
+  );
+
+  fs.unlinkSync(configWorktree);
+  const deleted = captureContextManifest(linked);
+  assert.equal(deleted.git.taskRelevantMetadataObservation.components.config, "complete");
+  assert.throws(
+    () => assertContextCompatible(linked, changed),
+    (error) => error?.code === "E_CONTEXT_DRIFT"
+  );
+  assert.equal(
+    deleted.git.taskRelevantMetadataIdentity,
+    empty.git.taskRelevantMetadataIdentity
+  );
+});
+
+test("present unreadable malformed include and oversize worktree config stay incomplete", (t) => {
+  const fixture = linkedWorktreeWithoutConfig();
+  t.after(() => disposeLinkedWorktree(fixture));
+  const { linked, configWorktree } = fixture;
+
+  fs.writeFileSync(configWorktree, "[issue97]\n\tvalue = malformed\n");
+  fs.chmodSync(configWorktree, 0);
+  try {
+    const unreadable = captureContextManifest(linked);
+    assert.equal(unreadable.git.taskRelevantMetadataObservation.components.config, "incomplete");
+    assert.throws(
+      () => captureCompleteContextManifest(linked, { contextPhase: "admission" }),
+      assertPublicConfigIncomplete
+    );
+  } finally {
+    fs.chmodSync(configWorktree, 0o644);
+  }
+
+  fs.writeFileSync(configWorktree, "[issue97\nthis is not git config\n");
+  const malformed = captureContextManifest(linked);
+  assert.equal(malformed.git.taskRelevantMetadataObservation.components.config, "incomplete");
+  assert.throws(
+    () => captureCompleteContextManifest(linked, { contextPhase: "admission" }),
+    assertPublicConfigIncomplete
+  );
+
+  const includeTarget = path.join(path.dirname(configWorktree), "issue97-include.inc");
+  fs.writeFileSync(includeTarget, "[[[[\n");
+  fs.writeFileSync(configWorktree, "[include]\n\tpath = issue97-include.inc\n");
+  const includeFailed = captureContextManifest(linked);
+  assert.equal(includeFailed.git.taskRelevantMetadataObservation.components.config, "incomplete");
+  assert.throws(
+    () => captureCompleteContextManifest(linked, { contextPhase: "admission" }),
+    (error) => {
+      assertPublicConfigIncomplete(error);
+      assert.equal(JSON.stringify(error).includes("issue97-include.inc"), false);
+      return true;
+    }
+  );
+
+  fs.writeFileSync(configWorktree, `[issue97]\n\tblob = ${"x".repeat((4 * 1024 * 1024) + 1)}\n`);
+  const oversized = captureContextManifest(linked);
+  assert.equal(oversized.git.taskRelevantMetadataObservation.components.config, "incomplete");
+  assert.throws(
+    () => captureCompleteContextManifest(linked, { contextPhase: "admission" }),
+    assertPublicConfigIncomplete
+  );
 });
