@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import { describe, test } from "node:test";
 
 import {
   assertContextCompatible,
@@ -71,6 +71,12 @@ function nodeWorkspace() {
   return root;
 }
 
+function disposeNodeWorkspace(root) {
+  for (const relative of ["node_modules", "dist", "dist-backup", "secret-output.txt"]) {
+    fs.rmSync(path.join(root, relative), { recursive: true, force: true });
+  }
+}
+
 function verificationEnvelope(overrides = {}) {
   return {
     schemaVersion: 1,
@@ -102,8 +108,10 @@ test("buildTaskEnvelope defaults verificationGeneratedPaths to an empty list", (
   assert.deepEqual(envelope.verificationGeneratedPaths, []);
 });
 
-test("declared dist is excluded from verification identity when ignored inventory exceeds 2000", () => {
+describe("issue 94 large ignored fixtures", { concurrency: 1 }, () => {
+test("declared dist is excluded from verification identity when ignored inventory exceeds 2000", (t) => {
   const root = nodeWorkspace();
+  t.after(() => disposeNodeWorkspace(root));
   const before = captureContextManifest(root, { verificationGeneratedPaths: ["dist"] });
   assert.equal(before.git.ignoredEntryCount >= IGNORED_DEPENDENCY_COUNT, true);
   assert.equal(before.git.ignoredEntriesAttributable, false);
@@ -118,8 +126,9 @@ test("declared dist is excluded from verification identity when ignored inventor
   );
 });
 
-test("undeclared dist and unexpected ignored files stay visible to verification", () => {
+test("undeclared dist and unexpected ignored files stay visible to verification", (t) => {
   const root = nodeWorkspace();
+  t.after(() => disposeNodeWorkspace(root));
   const undeclaredBefore = captureContextManifest(root);
   writeDist(root, "undeclared\n");
   assert.deepEqual(
@@ -139,8 +148,9 @@ test("undeclared dist and unexpected ignored files stay visible to verification"
   assert.equal(mixed.includes("dist/app.js"), false);
 });
 
-test("declared dist does not match similarly prefixed ignored paths", () => {
+test("declared dist does not match similarly prefixed ignored paths", (t) => {
   const root = nodeWorkspace();
+  t.after(() => disposeNodeWorkspace(root));
   fs.writeFileSync(path.join(root, ".gitignore"), "node_modules/\ndist/\ndist-backup/\n");
   git(root, "add", ".gitignore");
   git(root, "commit", "-m", "also ignore dist-backup");
@@ -157,8 +167,9 @@ test("declared dist does not match similarly prefixed ignored paths", () => {
 
 test("record-verification accepts declared dist drift and continues the same job", {
   skip: !PROVIDER_LIFECYCLE_AVAILABLE && "process start tokens unavailable (ps denied in this environment)"
-}, () => {
+}, (t) => {
   const root = nodeWorkspace();
+  t.after(() => disposeNodeWorkspace(root));
   const { env } = fixture();
   const job = parseJson(runCompanion(
     ["task", "--wait", "--envelope-stdin", "--json"],
@@ -190,8 +201,9 @@ test("record-verification accepts declared dist drift and continues the same job
 
 test("record-verification rejects unexpected ignored drift beside declared dist", {
   skip: !PROVIDER_LIFECYCLE_AVAILABLE && "process start tokens unavailable (ps denied in this environment)"
-}, () => {
+}, (t) => {
   const root = nodeWorkspace();
+  t.after(() => disposeNodeWorkspace(root));
   const { env } = fixture();
   const job = parseJson(runCompanion(
     ["task", "--wait", "--envelope-stdin", "--json"],
@@ -219,8 +231,9 @@ test("record-verification rejects unexpected ignored drift beside declared dist"
 
 test("ordinary resume still fails closed on undeclared ignored dist drift", {
   skip: !PROVIDER_LIFECYCLE_AVAILABLE && "process start tokens unavailable (ps denied in this environment)"
-}, () => {
+}, (t) => {
   const root = nodeWorkspace();
+  t.after(() => disposeNodeWorkspace(root));
   const { env } = fixture();
   const job = parseJson(runCompanion(
     ["task", "--wait", "--envelope-stdin", "--json"],
@@ -236,4 +249,5 @@ test("ordinary resume still fails closed on undeclared ignored dist drift", {
   assert.equal(error.code, "E_CONTEXT_DRIFT");
   assert.match(error.message, /ignoredDigest/);
   assert.equal(JSON.stringify(error).includes(root), false);
+});
 });
