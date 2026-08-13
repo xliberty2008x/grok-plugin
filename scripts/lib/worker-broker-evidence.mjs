@@ -260,7 +260,6 @@ export const LIVE_RECEIPT_MANIFEST = Object.freeze({
   installedEntrypoint: "mcp/server.mjs",
   authorityModes: LIVE_RECEIPT_AUTHORITY_CONFIG
 });
-
 /** Explicit phase entrypoints; repository-local static imports are derived below. */
 const PHASE_SCOPE_SEEDS = freezeScopeMap({
   "0": [
@@ -290,7 +289,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "tests/worker-broker-evidence_part6.mjs",
     "tests/worker-broker-evidence_part7.mjs",
     "tests/worker-broker-evidence_part8.mjs",
-    "tests/worker-mutation.test.mjs", "tests/worker-admission-context-incomplete.test.mjs",
+    "tests/worker-mutation.test.mjs",
     "tests/worker-mutation_part1.mjs",
     "tests/worker-mutation_part2.mjs",
     "tests/worker-broker-phase3-evidence.test.mjs",
@@ -358,11 +357,11 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "tests/recursion-guard.test.mjs",
     "tests/runtime.test.mjs", "tests/runtime-context-incomplete.test.mjs",
     "tests/worker-mailbox.test.mjs",
-    "tests/worker-protocol.test.mjs", "tests/worker-context-incomplete-protocol.test.mjs",
+    "tests/worker-protocol.test.mjs",
     "tests/worker-service.test.mjs",
     "tests/mcp-worker-broker.test.mjs",
     "tests/mcp-worker-runtime.test.mjs",
-    "tests/installed-worker-mcp-contract.test.mjs", "tests/installed-context-incomplete-contract.test.mjs",
+    "tests/installed-worker-mcp-contract.test.mjs",
     "tests/installed-worker-mcp-runner.test.mjs",
     "tests/provider-bootstrap-crash-window.test.mjs",
     "tests/provider-capability.test.mjs",
@@ -371,6 +370,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "tests/worker-runtime-teardown.test.mjs",
     "tests/worker-startup-crash-window.test.mjs",
     "tests/worker-launch-outbox.test.mjs",
+    "tests/worker-mutation-boundaries.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
     "tests/worker-provider-rotation-intent.test.mjs",
     "tests/worker-recovery-fence.test.mjs",
@@ -387,7 +387,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "tests/worker-broker-evidence_part8.mjs",
     "tests/worker-broker-protected-review.test.mjs",
     "tests/process-control-owned-identity.test.mjs",
-    "tests/worker-mutation.test.mjs", "tests/worker-admission-context-incomplete.test.mjs",
+    "tests/worker-mutation.test.mjs",
     "tests/worker-mutation_part1.mjs",
     "tests/worker-mutation_part2.mjs",
     "tests/worker-safety-proofs.test.mjs",
@@ -438,7 +438,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "scripts/validate.mjs",
     "package.json",
     "tests/acp-client.test.mjs",
-    "tests/installed-worker-mcp-contract.test.mjs", "tests/installed-context-incomplete-contract.test.mjs",
+    "tests/installed-worker-mcp-contract.test.mjs",
     "tests/installed-worker-mcp-runner.test.mjs",
     "tests/mcp-worker-broker.test.mjs",
     "tests/mcp-worker-runtime.test.mjs",
@@ -449,10 +449,13 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "tests/worker-dispatch-supervisor.test.mjs",
     "tests/worker-host-actions.test.mjs",
     "tests/worker-mailbox.test.mjs",
-    "tests/worker-mutation.test.mjs", "tests/worker-admission-context-incomplete.test.mjs",
+    "tests/worker-mutation.test.mjs",
     "tests/worker-mutation_part1.mjs",
     "tests/worker-mutation_part2.mjs",
-    "tests/worker-protocol.test.mjs", "tests/worker-context-incomplete-protocol.test.mjs",
+    "tests/worker-admission-context-incomplete.test.mjs",
+    "tests/worker-context-incomplete-protocol.test.mjs",
+    "tests/installed-context-incomplete-contract.test.mjs",
+    "tests/worker-protocol.test.mjs",
     "tests/worker-provider-rotation-intent.test.mjs",
     "tests/worker-recovery-fence.test.mjs",
     "tests/worker-service.test.mjs",
@@ -508,7 +511,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "scripts/worker-broker-phase3-evidence.mjs",
     "tests/acp-client.test.mjs",
     "tests/grok-worktree-acp.test.mjs",
-    "tests/installed-worker-mcp-contract.test.mjs", "tests/installed-context-incomplete-contract.test.mjs",
+    "tests/installed-worker-mcp-contract.test.mjs",
     "tests/installed-worker-mcp-runner.test.mjs",
     "tests/mcp-worker-broker.test.mjs",
     "tests/mcp-worker-runtime.test.mjs",
@@ -531,12 +534,15 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "tests/worker-dispatch-supervisor.test.mjs",
     "tests/worker-execution-binding.test.mjs",
     "tests/worker-launch-outbox.test.mjs",
-    "tests/worker-mutation.test.mjs", "tests/worker-admission-context-incomplete.test.mjs",
+    "tests/worker-mutation.test.mjs",
     "tests/worker-mutation_part1.mjs",
     "tests/worker-mutation_part2.mjs",
+    "tests/worker-admission-context-incomplete.test.mjs",
+    "tests/worker-context-incomplete-protocol.test.mjs",
+    "tests/installed-context-incomplete-contract.test.mjs",
     "tests/worker-owner-controller.test.mjs",
     "tests/worker-owner-lifecycle.test.mjs",
-    "tests/worker-protocol.test.mjs", "tests/worker-context-incomplete-protocol.test.mjs",
+    "tests/worker-protocol.test.mjs",
     "tests/worker-service.test.mjs",
     "tests/worker-session-close-environment.test.mjs",
     "tests/worker-worktree.test.mjs",
@@ -557,7 +563,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "plugins/grok/schemas/worker-protocol.schema.json",
     "scripts/lib/worker-broker-evidence.mjs",
     "tests/worker-presentation.test.mjs",
-    "tests/worker-protocol.test.mjs", "tests/worker-context-incomplete-protocol.test.mjs",
+    "tests/worker-protocol.test.mjs",
     "tests/mcp-worker-broker.test.mjs",
     "tests/worker-broker-evidence.test.mjs",
     "tests/worker-broker-evidence_part1.mjs",
@@ -586,7 +592,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "plugins/grok/scripts/lib/state.mjs",
     "plugins/grok/scripts/lib/task-contract.mjs",
     "plugins/grok/scripts/lib/workspace.mjs",
-    "tests/worker-mutation.test.mjs", "tests/worker-admission-context-incomplete.test.mjs",
+    "tests/worker-mutation.test.mjs",
     "tests/worker-mutation_part1.mjs",
     "tests/worker-mutation_part2.mjs",
     "tests/worker-mailbox.test.mjs",
@@ -604,7 +610,6 @@ function freezeScopeMap(scope) {
     Object.entries(scope).map(([phase, paths]) => [phase, Object.freeze([...paths])])
   ));
 }
-
 function repositoryRelativePath(root, absolute) {
   const relative = path.relative(root, absolute);
   if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
@@ -612,7 +617,6 @@ function repositoryRelativePath(root, absolute) {
   }
   return relative.split(path.sep).join("/");
 }
-
 function exactParserObject(value, keys) {
   return Boolean(
     value
@@ -622,7 +626,6 @@ function exactParserObject(value, keys) {
     && keys.every((key) => Object.hasOwn(value, key))
   );
 }
-
 function staticImportParserEnvironment() {
   const environment = {};
   if (process.platform === "win32") {
@@ -632,7 +635,6 @@ function staticImportParserEnvironment() {
   }
   return environment;
 }
-
 function rememberStaticImportSpecifiers(id, specifiers) {
   if (STATIC_IMPORT_CACHE.has(id)) STATIC_IMPORT_CACHE.delete(id);
   STATIC_IMPORT_CACHE.set(id, Object.freeze([...specifiers]));
@@ -640,7 +642,6 @@ function rememberStaticImportSpecifiers(id, specifiers) {
     STATIC_IMPORT_CACHE.delete(STATIC_IMPORT_CACHE.keys().next().value);
   }
 }
-
 function parseStaticImportBatch(entries) {
   const input = JSON.stringify({ schemaVersion: 1, sources: entries });
   if (Buffer.byteLength(input, "utf8") > MAX_STATIC_IMPORT_BATCH_BYTES) {
@@ -704,7 +705,6 @@ function parseStaticImportBatch(entries) {
     throw new Error("Static ESM dependency parser returned malformed output.");
   }
 }
-
 function parseStaticImportSources(sources) {
   if (!Array.isArray(sources)) throw new TypeError("Static ESM sources must be an array.");
   const normalized = sources.map((source) => {
@@ -1045,7 +1045,7 @@ export const PHASE_PROOF_GATE_MANIFEST = freezeGateManifest({
         "--test-reporter=./scripts/lib/zero-skip-test-reporter.mjs",
         "tests/worker-safety-proofs.test.mjs",
         "tests/worker-mutation_part1.mjs",
-        "tests/worker-mutation_part2.mjs", "tests/worker-admission-context-incomplete.test.mjs"
+        "tests/worker-mutation_part2.mjs"
       ],
       boundary: "focused-source-provider-neutral",
       timeoutMs: 10 * 60_000

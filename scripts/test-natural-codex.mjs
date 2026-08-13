@@ -9,10 +9,9 @@ import { fileURLToPath } from "node:url";
 
 import { readValidProviderCapabilityReceipt } from "../plugins/grok/scripts/lib/provider-capability.mjs";
 import { providerLaunchBindingDigest } from "../plugins/grok/scripts/lib/provider-executable-pin.mjs";
-import { assertDispatchContract } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
+import { assertDispatchContract } from "../plugins/grok/scripts/lib/worker-mutation-dispatch-contract.mjs";
 
-const SCRIPT = fileURLToPath(import.meta.url);
-const ROOT = path.resolve(path.dirname(SCRIPT), "..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CODEX_BIN = process.env.CODEX_BIN || "codex";
 const MODEL = process.env.CODEX_E2E_MODEL || "gpt-5.5";
 const SCHEMA = path.join(ROOT, "tests", "natural-codex-output.schema.json");
@@ -41,6 +40,7 @@ export function resolveNaturalCodexReasoningEffort(value) {
 const REASONING_EFFORT = resolveNaturalCodexReasoningEffort(
   process.env.CODEX_E2E_REASONING_EFFORT
 );
+
 
 function fail(message, details = "") {
   throw new Error(`${message}${details.trim() ? `\n${details.trim()}` : ""}`);
@@ -341,10 +341,11 @@ function main() {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === SCRIPT) {
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try { main(); }
   catch (error) {
-    process.stderr.write(`Natural Codex/Grok E2E failed: ${error.message}\n`);
+    process.stderr.write(`Natural Codex/Grok E2E failed: ${error.message}
+`);
     process.exitCode = 1;
   }
 }

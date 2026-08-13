@@ -10,7 +10,11 @@ import {
   captureContextManifest,
   observeChangedPaths
 } from "../plugins/grok/scripts/lib/task-contract.mjs";
-import { updateJob } from "../plugins/grok/scripts/lib/state.mjs";
+import { CompanionError } from "../plugins/grok/scripts/lib/errors.mjs";
+import { recordExecutionFailure } from "../plugins/grok/scripts/lib/companion-task-result.mjs";
+import { generateId, readJob, updateJob, writeJob } from "../plugins/grok/scripts/lib/state.mjs";
+import { bindContextMetadataCompleteness } from "../plugins/grok/scripts/lib/task-context-metadata.mjs";
+import { assertContextManifestIntegrity } from "../plugins/grok/scripts/lib/task-context-manifest.mjs";
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import {
   git,
@@ -286,4 +290,53 @@ test("implicit resume rejects an incomplete old-v2 completion context before pro
   assert.match(error.message, /gitMetadata/);
   assert.equal(agentStdioCount(fake.logFile), providerStarts);
   assert.equal(persistedJobs(pluginData).length, jobCount);
+});
+
+test("failure finalization records ordinary context when complete terminal capture cannot", () => {
+  const root = fs.realpathSync(initRepo());
+  const pluginData = tempDir("grok-runtime-data-");
+  const env = { ...process.env, CLAUDE_PLUGIN_DATA: pluginData };
+  const id = generateId("task");
+  const preContext = captureContextManifest(root);
+  writeJob(root, {
+    schemaVersion: 1,
+    id,
+    kind: "task",
+    status: "running",
+    createdAt: "2026-08-13T00:00:00.000Z",
+    updatedAt: "2026-08-13T00:00:00.000Z"
+  }, env);
+  const hook = installOversizeGitHook(root, "failure-ordinary-capture");
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginData;
+  try {
+    const { captureCompleteContextManifest } = bindContextMetadataCompleteness({
+      captureContextManifest,
+      assertContextManifestIntegrity
+    });
+    assert.throws(
+      () => captureCompleteContextManifest(root, { contextPhase: "terminal" }),
+      (error) => error?.code === "E_CONTEXT_INCOMPLETE"
+    );
+    recordExecutionFailure({
+      root,
+      id,
+      preContext,
+      dispatchAttemptId: null,
+      exactBrokerWorkerIdentity: () => false,
+      terminalIntentFor: () => null,
+      terminalIntentPatch: () => ({})
+    }, new CompanionError("E_PROVIDER", "provider failed after admission"));
+    const job = readJob(root, id, env);
+    assert.equal(job.error.code, "E_PROVIDER");
+    assert.ok(job.completionContextManifest);
+    assert.equal(
+      job.completionContextManifest.git?.taskRelevantMetadataObservation?.components?.hooks,
+      "incomplete"
+    );
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_PLUGIN_DATA;
+    else process.env.CLAUDE_PLUGIN_DATA = previous;
+    fs.unlinkSync(hook);
+  }
 });

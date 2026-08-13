@@ -20,11 +20,11 @@ import {
 } from "./worker-authority.mjs";
 import {
   cancelWorker,
-  authorizeReadyWriteWorkerDispatch,
-  providerLaunchState,
-  projectCancellationReceipt,
-  spawnReadOnlyWorker
-} from "./worker-mutation.mjs";
+  projectCancellationReceipt
+} from "./worker-mutation-cancellation.mjs";
+import { providerLaunchState } from "./worker-mutation-dispatch-contract.mjs";
+import { spawnReadOnlyWorker } from "./worker-mutation-spawn.mjs";
+import { authorizeReadyWriteWorkerDispatch } from "./worker-mutation-write-admission.mjs";
 import { launchCommittedWorker } from "./worker-runtime.mjs";
 import { provisionWriteWorkerWorktree } from "./worker-provisioner.mjs";
 import {
@@ -85,14 +85,6 @@ function assertWaitMs(value) {
     throw new CompanionError("E_USAGE", `Worker wait must be an integer from 0 to ${MAX_WORKER_WAIT_MS} milliseconds.`);
   }
   return timeoutMs;
-}
-
-function captureAdmissionContext(root, captureContext) {
-  try {
-    return captureContext(root);
-  } catch {
-    throw contextIncompleteError("admission", ["contextCapture"]);
-  }
 }
 
 export function createWorkerService({
@@ -628,7 +620,18 @@ export function createWorkerService({
       if (!idempotencyKey) {
         throw new CompanionError("E_USAGE", "idempotencyKey is required for spawn.");
       }
-      const boundContextManifest = contextManifest || captureAdmissionContext(root, captureContext);
+      let boundContextManifest;
+      if (contextManifest) {
+        boundContextManifest = contextManifest;
+      } else {
+        try {
+          boundContextManifest = captureContext(root);
+        } catch {
+          // Fresh capture failures are incomplete (not drift); never leak private
+          // capture diagnostics through the public error surface.
+          throw contextIncompleteError("admission", ["contextCapture"]);
+        }
+      }
       const taskEnvelope = envelope ? assertTaskEnvelope(envelope) : buildTaskEnvelope({
         userRequest: userRequest || objective || "worker task",
         objective,

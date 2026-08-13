@@ -24,16 +24,16 @@ import {
 } from "./state.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import {
-  assertDispatchContract,
-  acquireRecoveryCleanupFence,
-  cancellationNonce,
-  recordWorkerProviderSpawnNoChild,
+  acquireRecoveryCleanupFence, recordWorkerProviderSpawnNoChild, verifyRecoveryCleanupFence
+} from "./worker-mutation-dispatch-admission.mjs";
+import { transitionWorkerDispatch } from "./worker-mutation-dispatch-transition.mjs";
+import {
   settleFailedDispatchCleanup,
   settleStartedWorkerLoss,
-  settleUnstartedDispatchLoss,
-  transitionWorkerDispatch,
-  verifyRecoveryCleanupFence
-} from "./worker-mutation.mjs";
+  settleUnstartedDispatchLoss
+} from "./worker-mutation-terminal.mjs";
+import { assertDispatchContract } from "./worker-mutation-dispatch-contract.mjs";
+import { cancellationNonce } from "./worker-mutation-primitives.mjs";
 import { workspaceState } from "./workspace.mjs";
 import {
   dispatchLeaseExpired,

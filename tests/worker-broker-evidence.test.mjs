@@ -202,7 +202,6 @@ for (const method of ["only", "skip", "todo"]) {
     args
   );
 }
-
 const STARTED_AT = "2026-07-16T10:00:00.000Z";
 const ENDED_AT = "2026-07-16T10:00:01.000Z";
 const PRE_V5_PROOF_MANIFEST_DIGESTS = Object.freeze({
@@ -260,7 +259,6 @@ function installZeroSkipReporter(root) {
     fs.copyFileSync(source, destination);
   }
 }
-
 function installPhaseOneFocusedRunner(root) {
   for (const source of [
     DETERMINISTIC_TEST_LIBRARY,
@@ -327,7 +325,6 @@ function zeroSkipViolation(overrides = {}) {
     ...overrides
   };
 }
-
 function zeroSkipSummary(overrides = {}) {
   return `${JSON.stringify({
     reporter: ZERO_SKIP_REPORTER_ID,
@@ -1308,7 +1305,6 @@ function installProofRepositoryGate(root, command) {
     ].join("\n")
   );
 }
-
 function rawEvidenceFixturePath(root, record) {
   const phaseDirectory = record.phase === "aggregate" ? "aggregate" : `phase-${record.phase}`;
   const sourceDigest = record.source?.sourceInventoryDigest ?? record.recordDigest;
@@ -1322,7 +1318,6 @@ function rawEvidenceFixturePath(root, record) {
   fs.writeFileSync(absolute, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
   return relative.split(path.sep).join("/");
 }
-
 function seedLedgerFixtureEntry(root, entry) {
   const ledgerPath = path.join(root, "tests/e2e-results/worker-broker/ledger.json");
   fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
@@ -1357,7 +1352,6 @@ function seedLedgerFixtureEntry(root, entry) {
   fs.writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`, { mode: 0o600 });
   return ledger;
 }
-
 function syntheticLedgerEntry(phase, slice, overrides = {}) {
   const recordDigest = sha256Text(`${phase}:${slice}:record`);
   const directory = phase === "aggregate" ? "aggregate" : `phase-${phase}`;
@@ -5596,7 +5590,6 @@ test("proof execution rejects clean tracked scope symlinks to mutable external c
   assert.equal(mutated.code, "E_PROOF_SOURCE");
   assert.equal(fs.existsSync(path.join(evidenceDir, "ledger.json")), false);
 });
-
 test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () => {
   assert.deepEqual(
     PHASE_PROOF_GATE_MANIFEST["1"].map((gate) => gate.gateId),
@@ -5641,7 +5634,7 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
     "tests/control-plane_part1.mjs",
     "tests/control-plane_part2.mjs",
     "tests/control-plane_part3.mjs",
-    "tests/installed-context-incomplete-contract.test.mjs", "tests/installed-worker-mcp-contract.test.mjs",
+    "tests/installed-worker-mcp-contract.test.mjs",
     "tests/installed-worker-mcp-runner.test.mjs",
     "tests/mcp-worker-runtime.test.mjs",
     "tests/process-control.test.mjs",
@@ -5651,18 +5644,19 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
     "tests/provider-startup-cancel.test.mjs",
     "tests/recursion-guard.test.mjs",
     "tests/runtime.test.mjs", "tests/runtime-context-incomplete.test.mjs",
-    "tests/worker-mailbox.test.mjs", "tests/worker-context-incomplete-protocol.test.mjs",
+    "tests/worker-mailbox.test.mjs",
     "tests/worker-provider-rotation-intent.test.mjs",
     "tests/worker-reconcile-safety.test.mjs",
     "tests/worker-recovery-fence.test.mjs",
     "tests/worker-runtime-teardown.test.mjs",
     "tests/worker-startup-crash-window.test.mjs",
     "tests/worker-launch-outbox.test.mjs",
+    "tests/worker-mutation-boundaries.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
     "tests/worker-cli-authority.test.mjs",
     "tests/worker-terminal-intent.test.mjs",
     "tests/process-control-owned-identity.test.mjs",
-    "tests/worker-safety-proofs.test.mjs", "tests/worker-admission-context-incomplete.test.mjs"
+    "tests/worker-safety-proofs.test.mjs"
   ]) {
     assert.equal(
       PHASE_SCOPE["1"].filter((candidate) => candidate === relative).length,
@@ -5676,12 +5670,13 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
     "the Phase 1 focused gate must use only the fixed serial runner"
   );
   for (const relative of [
-    "tests/installed-context-incomplete-contract.test.mjs", "tests/installed-worker-mcp-contract.test.mjs",
+    "tests/installed-worker-mcp-contract.test.mjs",
     "tests/installed-worker-mcp-runner.test.mjs",
     "tests/worker-launch-outbox.test.mjs", "tests/runtime-context-incomplete.test.mjs",
+    "tests/worker-mutation-boundaries.test.mjs",
     "tests/provider-bootstrap-crash-window.test.mjs",
     "tests/provider-capability.test.mjs",
-    "tests/worker-dispatch-supervisor.test.mjs", "tests/worker-context-incomplete-protocol.test.mjs", "tests/worker-admission-context-incomplete.test.mjs"
+    "tests/worker-dispatch-supervisor.test.mjs"
   ]) {
     assert.equal(
       PHASE1_FOCUSED_TEST_FILES.filter((candidate) => candidate === relative).length,
@@ -5689,9 +5684,8 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
       `the Phase 1 focused gate must execute ${relative} exactly once`
     );
   }
-  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 34);
+  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 32);
 });
-
 test("Phase 2 protected manifest, scope, and serial inventory are exact", () => {
   assert.equal(PHASE_TWO_SLICE, "mailbox-context-roles");
   assert.equal(PROOF_PRODUCER_VERSION, 5);
@@ -5726,10 +5720,12 @@ test("Phase 2 protected manifest, scope, and serial inventory are exact", () => 
     "tests/state.test.mjs",
     "tests/worker-context-roles.test.mjs",
     "tests/worker-host-actions.test.mjs",
-    "tests/worker-mailbox.test.mjs", "tests/worker-admission-context-incomplete.test.mjs",
+    "tests/worker-mailbox.test.mjs",
+    "tests/worker-admission-context-incomplete.test.mjs",
     "tests/worker-mutation_part1.mjs",
     "tests/worker-mutation_part2.mjs",
-    "tests/worker-protocol.test.mjs", "tests/worker-context-incomplete-protocol.test.mjs",
+    "tests/worker-protocol.test.mjs",
+    "tests/worker-context-incomplete-protocol.test.mjs",
     "tests/worker-service.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
     "tests/worker-terminal-intent.test.mjs",
@@ -5737,7 +5733,8 @@ test("Phase 2 protected manifest, scope, and serial inventory are exact", () => 
     "tests/worker-provider-rotation-intent.test.mjs",
     "tests/mcp-worker-broker.test.mjs",
     "tests/mcp-worker-runtime.test.mjs",
-    "tests/installed-context-incomplete-contract.test.mjs", "tests/installed-worker-mcp-contract.test.mjs",
+    "tests/installed-context-incomplete-contract.test.mjs",
+    "tests/installed-worker-mcp-contract.test.mjs",
     "tests/installed-worker-mcp-runner.test.mjs"
   ]);
   assert.equal(typeof runPhaseTwoFocusedTests, "function");
@@ -5810,18 +5807,21 @@ test("Phase 3 protected manifest, scope, and zero-skip inventory are exact", () 
     "tests/state.test.mjs",
     "tests/worker-dispatch-supervisor.test.mjs",
     "tests/worker-execution-binding.test.mjs",
-    "tests/worker-launch-outbox.test.mjs", "tests/worker-admission-context-incomplete.test.mjs",
+    "tests/worker-launch-outbox.test.mjs",
+    "tests/worker-admission-context-incomplete.test.mjs",
     "tests/worker-mutation_part1.mjs",
     "tests/worker-mutation_part2.mjs",
     "tests/worker-owner-controller.test.mjs",
     "tests/worker-owner-lifecycle.test.mjs",
-    "tests/worker-protocol.test.mjs", "tests/worker-context-incomplete-protocol.test.mjs",
+    "tests/worker-protocol.test.mjs",
+    "tests/worker-context-incomplete-protocol.test.mjs",
     "tests/worker-service.test.mjs",
     "tests/worker-session-close-environment.test.mjs",
     "tests/worker-worktree.test.mjs",
     "tests/mcp-worker-broker.test.mjs",
     "tests/mcp-worker-runtime.test.mjs",
-    "tests/installed-context-incomplete-contract.test.mjs", "tests/installed-worker-mcp-contract.test.mjs",
+    "tests/installed-context-incomplete-contract.test.mjs",
+    "tests/installed-worker-mcp-contract.test.mjs",
     "tests/installed-worker-mcp-runner.test.mjs",
     "tests/worker-broker-phase3-evidence.test.mjs"
   ]);

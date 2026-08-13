@@ -35,6 +35,8 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
   Object.freeze([
     "tests/adversarial-review.test.mjs",
     "tests/ci-post-grok-review.test.mjs",
+    "tests/companion-boundaries.test.mjs",
+    "tests/companion-recovery.test.mjs",
     "tests/control-plane_part1.mjs",
     "tests/deterministic-sharding.test.mjs",
     "tests/git-review.test.mjs",
@@ -53,6 +55,8 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/worker-execution-binding.test.mjs",
     "tests/worker-host-actions.test.mjs",
     "tests/worker-launch-outbox.test.mjs",
+    "tests/worker-mutation-boundaries.test.mjs",
+    "tests/worker-mutation-review-failclosed.test.mjs",
     "tests/worker-owner-controller.test.mjs",
     "tests/worker-protocol.test.mjs",
     "tests/worker-recovery-fence.test.mjs",

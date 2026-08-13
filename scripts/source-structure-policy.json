@@ -42,27 +42,15 @@
     }
   },
   "baseline": {
-    "date": "2026-08-03",
+    "date": "2026-08-11",
     "revision": "ffa84d4ce22252777d887e8ab6616c7155b40da7",
-    "initialDigest": "6cd632e75601aad00a3872546281f1794960eb86f278fa0d7f5340898315396b",
-    "policyDigest": "e77e1ca70891633884aea2ec8762230b42af4724f832b7331f91ee4b7c704eed"
+    "initialDigest": "bc76d24b5d3f2c2d88fedb02029fdf8ee1a7b8c92342b28def60307f4fdb18f8",
+    "policyDigest": "ee84e44d38d4d08d01581954d584551c52e2779a7b79ed58551bed5253845895"
   },
   "dispositions": {
-    "plugins/grok/scripts/grok-companion.mjs": {
-      "stage": "4-provider-and-control-plane",
-      "target": "Keep a thin command facade and move command domains behind explicit service modules."
-    },
-    "plugins/grok/scripts/lib/worker-mutation.mjs": {
-      "stage": "5-worker-mutation",
-      "target": "Split mutation admission, provisioning, dispatch, cancellation, and terminal transition domains."
-    },
     "scripts/lib/worker-broker-evidence.mjs": {
       "stage": "6-evidence-last",
       "target": "Separate evidence validation, signing, promotion, and qualification without changing canonical digests."
-    },
-    "scripts/test-installed-worker-mcp.mjs": {
-      "stage": "3-installed-runner",
-      "target": "Move fixtures, lifecycle helpers, scenarios, and cleanup into named modules behind one runner."
     },
     "tests/control-plane.test.mjs": {
       "stage": "4-provider-and-control-plane",
@@ -352,11 +340,11 @@
       "category": "product",
       "functions": [
         {
-          "initialLines": 740,
+          "initialLines": 751,
           "key": "function:createWorkerService#1"
         }
       ],
-      "initialLines": 828
+      "initialLines": 840
     },
     "plugins/grok/scripts/lib/worker-worktree.mjs": {
       "category": "product",
@@ -581,31 +569,6 @@
     }
   },
   "legacyDebt": {
-    "plugins/grok/scripts/grok-companion.mjs": {
-      "category": "facade",
-      "initialLines": 5271,
-      "lineCap": 5230,
-      "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
-      "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
-      "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
-      "functions": [
-        {
-          "key": "function:execute#1",
-          "initialLines": 1421,
-          "capLines": 1421
-        },
-        {
-          "key": "function:main#1",
-          "initialLines": 781,
-          "capLines": 779
-        },
-        {
-          "key": "function:recoverActiveJobs#1",
-          "initialLines": 373,
-          "capLines": 368
-        }
-      ]
-    },
     "plugins/grok/scripts/lib/deep-research.mjs": {
       "category": "product",
       "initialLines": 2094,
@@ -675,86 +638,6 @@
           "key": "function:drainWorkerMailbox#1",
           "initialLines": 435,
           "capLines": 435
-        }
-      ]
-    },
-    "plugins/grok/scripts/lib/worker-mutation.mjs": {
-      "category": "product",
-      "initialLines": 11269,
-      "lineCap": 11254,
-      "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
-      "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
-      "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
-      "functions": [
-        {
-          "key": "function:admitWritePlanTransaction#1",
-          "initialLines": 256,
-          "capLines": 251
-        },
-        {
-          "key": "function:admitWriteWorkerPlan#1",
-          "initialLines": 378,
-          "capLines": 370
-        },
-        {
-          "key": "function:adoptWriteProvisioningEffect#1",
-          "initialLines": 284,
-          "capLines": 284
-        },
-        {
-          "key": "function:assertWriteProvisioningRuntime#1",
-          "initialLines": 256,
-          "capLines": 256
-        },
-        {
-          "key": "function:authorizeReadyWriteWorkerDispatch#1",
-          "initialLines": 282,
-          "capLines": 282
-        },
-        {
-          "key": "function:cancelWorker#1",
-          "initialLines": 327,
-          "capLines": 327
-        },
-        {
-          "key": "function:cancelWorkerTransaction#1",
-          "initialLines": 309,
-          "capLines": 309
-        },
-        {
-          "key": "function:prepareProvisioningReissueTransaction#1",
-          "initialLines": 361,
-          "capLines": 361
-        },
-        {
-          "key": "function:prepareWriteProvisioningReissue#1",
-          "initialLines": 386,
-          "capLines": 386
-        },
-        {
-          "key": "function:recordWriteProvisionerNoChild#1",
-          "initialLines": 289,
-          "capLines": 289
-        },
-        {
-          "key": "function:spawnGrantedFollowupWorker#1",
-          "initialLines": 299,
-          "capLines": 299
-        },
-        {
-          "key": "function:spawnReadOnlyWorker#1",
-          "initialLines": 380,
-          "capLines": 378
-        },
-        {
-          "key": "function:transitionDispatchTransaction#1",
-          "initialLines": 296,
-          "capLines": 296
-        },
-        {
-          "key": "function:transitionWorkerDispatch#1",
-          "initialLines": 359,
-          "capLines": 359
         }
       ]
     },
@@ -844,7 +727,7 @@
     },
     "plugins/grok/scripts/lib/worker-service.mjs": {
       "category": "product",
-      "initialLines": 828,
+      "initialLines": 840,
       "lineCap": null,
       "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
       "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
@@ -852,8 +735,8 @@
       "functions": [
         {
           "key": "function:createWorkerService#1",
-          "initialLines": 740,
-          "capLines": 740
+          "initialLines": 751,
+          "capLines": 751
         }
       ]
     },
@@ -961,41 +844,6 @@
           "key": "function:runFreshProbe#1",
           "initialLines": 1004,
           "capLines": 1004
-        }
-      ]
-    },
-    "scripts/test-installed-worker-mcp.mjs": {
-      "category": "tooling",
-      "initialLines": 9698,
-      "lineCap": 9698,
-      "issue": "https://github.com/xliberty2008x/grok-plugin/issues/56",
-      "rationale": "Existing handwritten debt captured by the issue #56 observe baseline; growth is not permitted in ratchet mode.",
-      "removalCriterion": "Remove this entry when the file and every function are within its category budgets.",
-      "functions": [
-        {
-          "key": "function:cleanupExactWorkerBoundary#1",
-          "initialLines": 467,
-          "capLines": 467
-        },
-        {
-          "key": "function:qualify#1",
-          "initialLines": 493,
-          "capLines": 493
-        },
-        {
-          "key": "function:runTwoWriterScenario#1",
-          "initialLines": 504,
-          "capLines": 504
-        },
-        {
-          "key": "function:runWriteCancellationScenario#1",
-          "initialLines": 445,
-          "capLines": 445
-        },
-        {
-          "key": "function:runWriteSmokeScenario#1",
-          "initialLines": 959,
-          "capLines": 959
         }
       ]
     },

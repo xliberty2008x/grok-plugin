@@ -33,16 +33,16 @@ import {
 import { bindContextMetadataCompleteness } from "./task-context-metadata.mjs";
 import {
   activateWriteProvisioningAttempt,
-  adoptWriteProvisioningEffect,
-  assertMutationOwnership,
-  assertWriteExecutionJob,
   prepareWriteProvisionerIntent,
   prepareWriteProvisioningReissue,
   promoteWriteWorkerReady,
-  recordOfficialWorktreeReceipt,
-  recordWriteProvisionerNoChild,
-  retainWriteProvisioningCleanupPending
-} from "./worker-mutation.mjs";
+  recordOfficialWorktreeReceipt
+} from "./worker-mutation-write-provisioning.mjs";
+import {
+  adoptWriteProvisioningEffect, recordWriteProvisionerNoChild, retainWriteProvisioningCleanupPending
+} from "./worker-mutation-write-recovery.mjs";
+import { assertMutationOwnership } from "./worker-mutation-primitives.mjs";
+import { assertWriteExecutionJob } from "./worker-mutation-write-runtime-contract.mjs";
 import {
   assertManagedWorkerWorktree,
   classifyWorkerWorktreeEffect
