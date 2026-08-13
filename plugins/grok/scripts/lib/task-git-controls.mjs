@@ -437,6 +437,60 @@ function captureWorktreeOperationalIdentity(gitDir, workspaceRoot = null) {
   };
 }
 
+function failClosedConfigIdentity(token) {
+  return {
+    identity: sha(`config-v1:${token}`),
+    observable: false,
+    truncated: true
+  };
+}
+
+/**
+ * Locate the optional worktree config file. Enabling
+ * `extensions.worktreeConfig` does not create `config.worktree`; absence is a
+ * complete empty scope. Any other path/stat failure stays fail-closed.
+ */
+function observeWorktreeConfigFile(workspaceRoot) {
+  const pathRun = git(
+    workspaceRoot,
+    ["rev-parse", "--path-format=absolute", "--git-path", "config.worktree"],
+    { allowFailure: true }
+  );
+  if (pathRun.error || pathRun.status !== 0) {
+    return { ok: false, token: "worktree-path-unreadable" };
+  }
+  const absolute = String(pathRun.stdout || "").trim();
+  if (!absolute || !path.isAbsolute(absolute)) {
+    return { ok: false, token: "worktree-path-unreadable" };
+  }
+  try {
+    fs.lstatSync(absolute);
+    return { ok: true, present: true, absolute };
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return { ok: true, present: false, absolute };
+    }
+    return { ok: false, token: "worktree-unreadable" };
+  }
+}
+
+function revalidateWorktreeConfigPresence(absolute, expectedPresent) {
+  const state = { unreadable: false };
+  if (expectedPresent) {
+    try {
+      fs.lstatSync(absolute);
+      return { ok: true };
+    } catch {
+      return { ok: false, token: "worktree-disappeared" };
+    }
+  }
+  revalidateOptionalRootWitnesses([{ kind: "absent", absolute }], state);
+  if (state.unreadable) {
+    return { ok: false, token: "worktree-appeared" };
+  }
+  return { ok: true };
+}
+
 /**
  * Private digest of effective repository/worktree Git config with includes
  * resolved by Git (`--includes`). Only key/value digests are retained — never
@@ -526,22 +580,38 @@ function captureEffectiveGitConfigIdentity(workspaceRoot) {
   }
 
   if (worktreeEnabled) {
-    const worktreeRun = git(
-      workspaceRoot,
-      ["config", "--worktree", "--includes", "--list", "--null"],
-      { allowFailure: true, maxBuffer: 16 * 1024 * 1024 }
-    );
-    if (worktreeRun.error || worktreeRun.status !== 0) {
-      return {
-        identity: sha("config-v1:worktree-resolution-failed"),
-        observable: false,
-        truncated: true
-      };
+    const file = observeWorktreeConfigFile(workspaceRoot);
+    if (!file.ok) return failClosedConfigIdentity(file.token);
+    if (!file.present) {
+      const recheck = revalidateWorktreeConfigPresence(file.absolute, false);
+      if (!recheck.ok) return failClosedConfigIdentity(recheck.token);
+      // Feature enabled, file absent: complete empty worktree-config scope.
+      // Distinct from disabled (`enabled: false`) and from a present file.
+      scopes.push({
+        scope: "worktree",
+        pairs: [],
+        enabled: true,
+        present: false
+      });
+    } else {
+      const worktreeRun = git(
+        workspaceRoot,
+        ["config", "--worktree", "--includes", "--list", "--null"],
+        { allowFailure: true, maxBuffer: 16 * 1024 * 1024 }
+      );
+      // Present file: never treat a git-config failure as empty absence.
+      if (worktreeRun.error || worktreeRun.status !== 0) {
+        return failClosedConfigIdentity("worktree-resolution-failed");
+      }
+      const recheck = revalidateWorktreeConfigPresence(file.absolute, true);
+      if (!recheck.ok) return failClosedConfigIdentity(recheck.token);
+      scopes.push({
+        scope: "worktree",
+        pairs: parseNullConfigList(worktreeRun.stdout),
+        enabled: true,
+        present: true
+      });
     }
-    scopes.push({
-      scope: "worktree",
-      pairs: parseNullConfigList(worktreeRun.stdout)
-    });
   } else {
     scopes.push({ scope: "worktree", pairs: [], enabled: false });
   }
