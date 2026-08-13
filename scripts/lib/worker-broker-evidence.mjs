@@ -355,7 +355,7 @@ const PHASE_SCOPE_SEEDS = freezeScopeMap({
     "tests/process-control.test.mjs",
     "tests/provider.test.mjs",
     "tests/recursion-guard.test.mjs",
-    "tests/runtime.test.mjs",
+    "tests/runtime.test.mjs", "tests/runtime-context-incomplete.test.mjs",
     "tests/worker-mailbox.test.mjs",
     "tests/worker-protocol.test.mjs",
     "tests/worker-service.test.mjs",

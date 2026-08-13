@@ -5643,7 +5643,7 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
     "tests/provider-capability.test.mjs",
     "tests/provider-startup-cancel.test.mjs",
     "tests/recursion-guard.test.mjs",
-    "tests/runtime.test.mjs",
+    "tests/runtime.test.mjs", "tests/runtime-context-incomplete.test.mjs",
     "tests/worker-mailbox.test.mjs",
     "tests/worker-provider-rotation-intent.test.mjs",
     "tests/worker-reconcile-safety.test.mjs",
@@ -5672,7 +5672,7 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
   for (const relative of [
     "tests/installed-worker-mcp-contract.test.mjs",
     "tests/installed-worker-mcp-runner.test.mjs",
-    "tests/worker-launch-outbox.test.mjs",
+    "tests/worker-launch-outbox.test.mjs", "tests/runtime-context-incomplete.test.mjs",
     "tests/worker-mutation-boundaries.test.mjs",
     "tests/provider-bootstrap-crash-window.test.mjs",
     "tests/provider-capability.test.mjs",
@@ -5684,7 +5684,7 @@ test("Phase 1 proof scope and code-owned worker-api manifest are explicit", () =
       `the Phase 1 focused gate must execute ${relative} exactly once`
     );
   }
-  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 31);
+  assert.equal(PHASE1_FOCUSED_TEST_FILES.length, 32);
 });
 test("Phase 2 protected manifest, scope, and serial inventory are exact", () => {
   assert.equal(PHASE_TWO_SLICE, "mailbox-context-roles");
