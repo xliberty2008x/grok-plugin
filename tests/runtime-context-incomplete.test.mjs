@@ -111,6 +111,22 @@ function linkedWorktreeWithoutConfig() {
   return { root, linked, configWorktree };
 }
 
+function disposeLinkedWorktree({ root, linked, configWorktree }) {
+  try {
+    if (configWorktree && fs.existsSync(configWorktree)) {
+      try { fs.chmodSync(configWorktree, 0o644); } catch {}
+      const includeTarget = path.join(path.dirname(configWorktree), "issue97-include.inc");
+      try { fs.unlinkSync(includeTarget); } catch {}
+      fs.unlinkSync(configWorktree);
+    }
+  } catch {}
+  try {
+    git(root, "worktree", "remove", "--force", linked);
+  } catch {
+    try { fs.rmSync(linked, { recursive: true, force: true }); } catch {}
+  }
+}
+
 function boundedReadEnvelope() {
   return buildTaskEnvelope({
     userRequest: "inspect only tracked.txt",
@@ -396,8 +412,10 @@ test("failure finalization records ordinary context when complete terminal captu
   }
 });
 
-test("linked worktree without config.worktree is a complete empty config scope", () => {
-  const { root, linked } = linkedWorktreeWithoutConfig();
+test("linked worktree without config.worktree is a complete empty config scope", (t) => {
+  const fixture = linkedWorktreeWithoutConfig();
+  t.after(() => disposeLinkedWorktree(fixture));
+  const { root, linked } = fixture;
   const first = captureEffectiveGitConfigIdentity(linked);
   const second = captureEffectiveGitConfigIdentity(linked);
   assert.equal(first.observable, true);
@@ -441,8 +459,10 @@ test("linked worktree without config.worktree is a complete empty config scope",
   assert.notEqual(first.identity, present.identity);
 });
 
-test("creating deleting or changing config.worktree is task-relevant drift", () => {
-  const { linked, configWorktree } = linkedWorktreeWithoutConfig();
+test("creating deleting or changing config.worktree is task-relevant drift", (t) => {
+  const fixture = linkedWorktreeWithoutConfig();
+  t.after(() => disposeLinkedWorktree(fixture));
+  const { linked, configWorktree } = fixture;
   const empty = captureContextManifest(linked);
   git(linked, "config", "--worktree", "user.issue97", "created");
   const created = captureContextManifest(linked);
@@ -478,8 +498,10 @@ test("creating deleting or changing config.worktree is task-relevant drift", () 
   );
 });
 
-test("present unreadable malformed include and oversize worktree config stay incomplete", () => {
-  const { linked, configWorktree } = linkedWorktreeWithoutConfig();
+test("present unreadable malformed include and oversize worktree config stay incomplete", (t) => {
+  const fixture = linkedWorktreeWithoutConfig();
+  t.after(() => disposeLinkedWorktree(fixture));
+  const { linked, configWorktree } = fixture;
 
   fs.writeFileSync(configWorktree, "[issue97]\n\tvalue = malformed\n");
   fs.chmodSync(configWorktree, 0);
