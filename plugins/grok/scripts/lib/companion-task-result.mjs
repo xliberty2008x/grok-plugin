@@ -433,7 +433,9 @@ function recordExecutionFailure(execution, error) {
     }
   })();
   const postContext = (() => {
-    try { return captureCompleteContextManifest(root, { contextPhase: "terminal" }); } catch { return null; }
+    // Parent #77 failure finalization used ordinary capture. Complete
+    // capture is fail-closed and belongs on success/admission paths.
+    try { return captureContextManifest(root); } catch { return null; }
   })();
   updateJob(root, id, (current) => {
     if (terminal(current)) return current;
