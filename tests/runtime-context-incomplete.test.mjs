@@ -294,7 +294,7 @@ test("implicit resume rejects an incomplete old-v2 completion context before pro
 
 test("failure finalization records ordinary context when complete terminal capture cannot", () => {
   const root = fs.realpathSync(initRepo());
-  const pluginData = tempDir("grok-failure-capture-data-");
+  const pluginData = tempDir("grok-runtime-data-");
   const env = { ...process.env, CLAUDE_PLUGIN_DATA: pluginData };
   const id = generateId("task");
   const preContext = captureContextManifest(root);
