@@ -33,6 +33,7 @@ const TASK_ENVELOPE_INPUT_KEYS = new Set([
   "nonGoals",
   "acceptanceCriteria",
   "requiredVerification",
+  "verificationGeneratedPaths",
   "expectedReturnFormat"
 ]);
 const TASK_ENVELOPE_KEYS = new Set([
@@ -45,11 +46,15 @@ const TASK_ENVELOPE_KEYS = new Set([
   "nonGoals",
   "acceptanceCriteria",
   "requiredVerification",
+  "verificationGeneratedPaths",
   "expectedReturnFormat",
   "contextManifestId",
   "envelopeId",
   "digest"
 ]);
+const TASK_ENVELOPE_LEGACY_KEYS = new Set(
+  [...TASK_ENVELOPE_KEYS].filter((key) => key !== "verificationGeneratedPaths")
+);
 
 
 /**
@@ -123,6 +128,7 @@ export function buildTaskEnvelope({
   nonGoals = [],
   acceptanceCriteria = null,
   requiredVerification = [],
+  verificationGeneratedPaths,
   expectedReturnFormat = null,
   contextManifestId = null
 } = {}) {
@@ -196,6 +202,13 @@ export function buildTaskEnvelope({
     nonGoals: asStringList(nonGoals),
     acceptanceCriteria: criteria,
     requiredVerification: asStringList(requiredVerification),
+    ...(verificationGeneratedPaths !== undefined ? {
+      verificationGeneratedPaths: asRepositoryPathList(
+        verificationGeneratedPaths,
+        "verificationGeneratedPaths",
+        { max: 64 }
+      )
+    } : {}),
     expectedReturnFormat: clip(
       expectedReturnFormat
         || "Return one Worker Report JSON object containing outcome, summary, changedFiles, checksClaimed, acceptanceResults, risks, questions, and hostActionRequest. The runtime requests native structured output; only when that channel is unavailable, prefix the fallback object with GROK_WORKER_REPORT:."
@@ -227,6 +240,9 @@ function taskEnvelopeBuilderInput(envelope, contextManifestId = envelope?.contex
     nonGoals: envelope.nonGoals,
     acceptanceCriteria: envelope.acceptanceCriteria,
     requiredVerification: envelope.requiredVerification,
+    ...(Object.hasOwn(envelope, "verificationGeneratedPaths")
+      ? { verificationGeneratedPaths: envelope.verificationGeneratedPaths }
+      : {}),
     expectedReturnFormat: envelope.expectedReturnFormat,
     contextManifestId
   };
@@ -246,8 +262,10 @@ export function assertTaskEnvelope(envelope) {
       throw taskEnvelopeSchemaError();
     }
     const keys = Object.keys(envelope);
-    if (keys.length !== TASK_ENVELOPE_KEYS.size
-      || keys.some((key) => !TASK_ENVELOPE_KEYS.has(key))
+    const hasGeneratedPaths = Object.hasOwn(envelope, "verificationGeneratedPaths");
+    const allowedKeys = hasGeneratedPaths ? TASK_ENVELOPE_KEYS : TASK_ENVELOPE_LEGACY_KEYS;
+    if (keys.length !== allowedKeys.size
+      || keys.some((key) => !allowedKeys.has(key))
       || envelope.schemaVersion !== TASK_ENVELOPE_VERSION
       || typeof envelope.userRequest !== "string"
       || typeof envelope.objective !== "string"

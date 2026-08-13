@@ -15,13 +15,14 @@ import { hostCommand, sameHostSession } from "./host.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import { assertContextCompatible, assertContextManifestIntegrity, assertTaskContextReady, captureContextManifest } from "./task-context-manifest.mjs";
 import { bindContextMetadataCompleteness } from "./task-context-metadata.mjs";
+import { contextCaptureOptions } from "./task-context-worktree.mjs";
 
 const { assertContextMetadataComplete, captureCompleteContextManifest } = bindContextMetadataCompleteness({
   captureContextManifest,
   assertContextManifestIntegrity
 });
 import { boundPathEvidence } from "./task-contract-primitives.mjs";
-import { buildTaskEnvelope, parseTaskEnvelopeInput } from "./task-envelope.mjs";
+import { bindTaskEnvelopeContext, buildTaskEnvelope, parseTaskEnvelopeInput } from "./task-envelope.mjs";
 import { composeProviderPrompt } from "./task-provider-prompt.mjs";
 import { evaluateScope } from "./task-scope.mjs";
 import { observeChangedPaths } from "./task-runtime-evidence.mjs";
@@ -193,9 +194,7 @@ async function handleRecordVerification(raw) {
     // Store the full exact current snapshot for continuation binding, but compare
     // completion→current with the verification-only ignored observer so standard
     // pytest/Python cache drift from host checks is not treated as out-of-scope.
-    const verificationContextManifest = captureCompleteContextManifest(root, {
-      contextPhase: "resume"
-    });
+    const verificationContextManifest = captureCompleteContextManifest(root, contextCaptureOptions("resume", job));
     const observedChangedPaths = observeChangedPaths(
       completionContextManifest,
       verificationContextManifest,
@@ -298,14 +297,17 @@ async function handleTask(raw) {
     throw new CompanionError("E_NO_RESUME_CANDIDATE", "No resumable Grok task with the same security profile exists in this host session.");
   }
 
-  const contextManifest = captureCompleteContextManifest(root, { contextPhase: "admission" });
-  const envelope = buildTaskEnvelope({
+  const envelopeDraft = buildTaskEnvelope({
     ...(envelopeInput || {}),
     userRequest: promptText,
     objective: envelopeInput?.objective || promptText,
-    mode: options.write ? "write" : "read",
-    contextManifestId: contextManifest.manifestId
+    mode: options.write ? "write" : "read"
   });
+  const contextManifest = captureCompleteContextManifest(
+    root,
+    contextCaptureOptions("admission", envelopeDraft)
+  );
+  const envelope = bindTaskEnvelopeContext(envelopeDraft, contextManifest.manifestId);
   if (options.write && envelope.scope.include.length === 0) {
     throw new CompanionError("E_USAGE", "Write TaskEnvelope scope.include must contain at least one bounded repository path or glob.");
   }

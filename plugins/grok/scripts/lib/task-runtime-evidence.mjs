@@ -107,7 +107,8 @@ export function buildRuntimeEvidence({
  * - "full" (default): compare the complete ignored-worktree identity. Used for
  *   task completion scope checks and ordinary resume compatibility.
  * - "verification": compare the verification-only ignored identity that excludes
- *   exact `.pytest_cache` / `__pycache__` path components. Used only by
+ *   exact `.pytest_cache` / `__pycache__` path components and any
+ *   `verificationGeneratedPaths` declared on the TaskEnvelope. Used only by
  *   record-verification. Older manifests without verification fields fall back
  *   fail-closed to the full ignored comparison.
  */

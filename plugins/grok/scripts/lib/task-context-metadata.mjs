@@ -299,10 +299,13 @@ export function bindContextMetadataCompleteness({
     if (incomplete.length) throw contextIncompleteError(contextPhase, incomplete);
     return stored;
   }
-  function captureCompleteContextManifest(root, { contextPhase = "admission" } = {}) {
+  function captureCompleteContextManifest(root, {
+    contextPhase = "admission",
+    verificationGeneratedPaths = []
+  } = {}) {
     let captured;
     try {
-      captured = captureContextManifest(root);
+      captured = captureContextManifest(root, { verificationGeneratedPaths });
     } catch {
       throw contextIncompleteError(contextPhase, ["contextCapture"]);
     }

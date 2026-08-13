@@ -26,7 +26,7 @@ node <resolved-grok-codex.mjs> status --all --readonly --json
 
 Use this surface only for pure read preflight observability. It returns `{ "jobs": [...public projections...], "migrationRequired": boolean }` when the control store is readable, keeps existing control jobs visible, and reports whether valid legacy state still requires migration—without migrating, recovering workers, creating directories, chmod, locking, cleaning, or publishing markers. It does **not** prove plugin-data writability and must not be treated as a storage-capability check. Do not use default `status` (recovery/migration) for this preflight step. If pure preflight fails with `E_STATE`, treat authoritative state as unsafe and stop. Write capability is enforced later at job admission (`admitJob` / durable lock and atomic state write) **before** worker/provider launch; unwritable storage surfaces there as sanitized `E_STORAGE_READONLY` (prerequisite)—stop and remediate plugin-data permissions/media, then retry dispatch.
 
-Build one JSON object with exactly these TaskEnvelope v1 input fields:
+Build one JSON object with these TaskEnvelope v1 input fields. Omit `verificationGeneratedPaths` unless declaring ignored outputs that host verification is expected to rewrite; stored schemaVersion 1 envelopes without the key remain valid and keep their original digest and envelope id.
 
 ```json
 {
@@ -46,11 +46,14 @@ Build one JSON object with exactly these TaskEnvelope v1 input fields:
   "nonGoals": ["explicit exclusions"],
   "acceptanceCriteria": [{ "id": "AC-1", "text": "observable criterion" }],
   "requiredVerification": ["commands/evidence the host must run after the worker returns"],
+  "verificationGeneratedPaths": ["optional ignored files or directories the declared host checks are expected to rewrite"],
   "expectedReturnFormat": "GROK_WORKER_REPORT JSON plus concise human summary"
 }
 ```
 
 `requiredPaths` contains exact repository-relative files or directories that must already exist; use it to prove that a task-scoped checkout contains the implementation slice, not only documentation. Do not use globs or paths the task is expected to create. Do not include credentials, raw transcripts, unrelated conversation history, or guessed repository facts.
+
+`verificationGeneratedPaths` names the ignored files or directories a declared host verification command is expected to rewrite (for example `apps/web/dist` after a Node/Vite build). The runtime excludes only those exact paths and their descendants, plus `.pytest_cache` / `__pycache__`, from the `record-verification` ignored identity. It does not infer outputs from command strings and does not ignore `dist/**` or `node_modules/**` on ordinary completion or resume. If the build can write outside the workspace or into a dedicated declared directory, isolate it there instead of leaving undeclared ignored drift.
 
 ## Native-like job workflow
 
