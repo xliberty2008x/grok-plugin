@@ -15,6 +15,7 @@ import { hostCommand, sameHostSession } from "./host.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import { assertContextCompatible, assertContextManifestIntegrity, assertTaskContextReady, captureContextManifest } from "./task-context-manifest.mjs";
 import { bindContextMetadataCompleteness } from "./task-context-metadata.mjs";
+import { contextCaptureOptions } from "./task-context-worktree.mjs";
 
 const { assertContextMetadataComplete, captureCompleteContextManifest } = bindContextMetadataCompleteness({
   captureContextManifest,
@@ -193,9 +194,7 @@ async function handleRecordVerification(raw) {
     // Store the full exact current snapshot for continuation binding, but compare
     // completion→current with the verification-only ignored observer so standard
     // pytest/Python cache drift from host checks is not treated as out-of-scope.
-    const verificationContextManifest = captureCompleteContextManifest(root, {
-      contextPhase: "resume"
-    });
+    const verificationContextManifest = captureCompleteContextManifest(root, contextCaptureOptions("resume", job));
     const observedChangedPaths = observeChangedPaths(
       completionContextManifest,
       verificationContextManifest,
@@ -298,7 +297,7 @@ async function handleTask(raw) {
     throw new CompanionError("E_NO_RESUME_CANDIDATE", "No resumable Grok task with the same security profile exists in this host session.");
   }
 
-  const contextManifest = captureCompleteContextManifest(root, { contextPhase: "admission" });
+  const contextManifest = captureCompleteContextManifest(root, contextCaptureOptions("admission", envelopeInput || {}));
   const envelope = buildTaskEnvelope({
     ...(envelopeInput || {}),
     userRequest: promptText,

@@ -36,7 +36,7 @@ const timestamp = () => new Date().toISOString();
  * Capture a ContextManifest for the workspace. Used for job identity and drift checks.
  * Never stores task text or credentials.
  */
-export function captureContextManifest(root) {
+export function captureContextManifest(root, { verificationGeneratedPaths = [] } = {}) {
   const workspaceRoot = fs.realpathSync(root);
   const headRun = git(workspaceRoot, ["rev-parse", "HEAD"], { allowFailure: true });
   const head = headRun.status === 0 ? String(headRun.stdout || "").trim() : null;
@@ -48,7 +48,9 @@ export function captureContextManifest(root) {
   const dirtyPaths = dirtyEntries.flatMap((entry) => [entry.path, entry.sourcePath]).filter(Boolean);
   const dirtyDigest = dirtySnapshot.digest;
   const trackedTree = sha(String(git(workspaceRoot, ["ls-files", "--stage", "-z"], { allowFailure: true }).stdout || ""));
-  const ignoredSnapshot = ignoredWorktreeSnapshot(workspaceRoot);
+  const ignoredSnapshot = ignoredWorktreeSnapshot(workspaceRoot, {
+    verificationGeneratedPaths
+  });
   const worktreeRun = git(workspaceRoot, ["rev-parse", "--is-inside-work-tree"], { allowFailure: true });
   const insideWorktree = worktreeRun.status === 0 && String(worktreeRun.stdout || "").trim() === "true";
   const gitDirRun = git(workspaceRoot, ["rev-parse", "--git-dir"], { allowFailure: true });
@@ -138,9 +140,9 @@ export function captureContextManifest(root) {
       ignoredEntries: ignoredSnapshot.entries,
       ignoredEntriesAttributable: ignoredSnapshot.attributable,
       ignoredInventoryComplete: ignoredSnapshot.complete,
-      // Verification-only identity excludes pytest/Python cache path components so
-      // record-verification can tolerate host-check cache drift without weakening
-      // ordinary resume or task-scope ignored-write protection.
+      // Verification-only identity excludes pytest/Python cache path components
+      // and author-declared verification-generated paths so record-verification
+      // can tolerate those host-check outputs without weakening ordinary resume.
       verificationIgnoredDigest: ignoredSnapshot.verificationDigest,
       verificationIgnoredEntryCount: ignoredSnapshot.verificationCount,
       verificationIgnoredEntries: ignoredSnapshot.verificationEntries,

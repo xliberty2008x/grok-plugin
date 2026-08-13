@@ -9,6 +9,7 @@ import { redact } from "./redact.mjs";
 import { appendLifecycleEvent } from "./task-lifecycle.mjs";
 import { assertContextCompatible, assertContextManifestIntegrity, captureContextManifest } from "./task-context-manifest.mjs";
 import { bindContextMetadataCompleteness } from "./task-context-metadata.mjs";
+import { contextCaptureOptions } from "./task-context-worktree.mjs";
 
 const { captureCompleteContextManifest } = bindContextMetadataCompleteness({
   captureContextManifest,
@@ -99,7 +100,7 @@ if (dispatchAttemptId && isDispatchV2(job.request?.spawn?.dispatch)) {
 
 // Keep the accepted manifest available for failure evidence; exact validation happens
 // inside the terminal-state guard below so drift is persisted on the job.
-let preContext = job.request?.contextManifest || captureCompleteContextManifest(root, { contextPhase: "execute" });
+let preContext = job.request?.contextManifest || captureCompleteContextManifest(root, contextCaptureOptions("execute", job));
 updateJob(root, id, (current) => {
   if (terminal(current)) {
     throw new CompanionError("E_STATE", "A terminal worker cannot be restarted.");
@@ -236,7 +237,7 @@ async function execute(root, id, { dispatchAttemptId = null, dispatchFence = nul
   try {
     execution.preContext = execution.job.request?.contextManifest
       ? assertContextCompatible(root, execution.job.request.contextManifest, { mode: "execute" })
-      : captureCompleteContextManifest(root, { contextPhase: "execute" });
+      : captureCompleteContextManifest(root, contextCaptureOptions("execute", execution.job));
     const workerNonce = process.env.GROK_COMPANION_WORKER_NONCE;
     if (isCancelRequested(root, id, workerNonce)) {
       throw new CompanionError("E_CANCELLED", "Grok job was cancelled before provider execution.");

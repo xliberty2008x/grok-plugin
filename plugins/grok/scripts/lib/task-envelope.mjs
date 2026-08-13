@@ -33,6 +33,7 @@ const TASK_ENVELOPE_INPUT_KEYS = new Set([
   "nonGoals",
   "acceptanceCriteria",
   "requiredVerification",
+  "verificationGeneratedPaths",
   "expectedReturnFormat"
 ]);
 const TASK_ENVELOPE_KEYS = new Set([
@@ -45,6 +46,7 @@ const TASK_ENVELOPE_KEYS = new Set([
   "nonGoals",
   "acceptanceCriteria",
   "requiredVerification",
+  "verificationGeneratedPaths",
   "expectedReturnFormat",
   "contextManifestId",
   "envelopeId",
@@ -123,6 +125,7 @@ export function buildTaskEnvelope({
   nonGoals = [],
   acceptanceCriteria = null,
   requiredVerification = [],
+  verificationGeneratedPaths = [],
   expectedReturnFormat = null,
   contextManifestId = null
 } = {}) {
@@ -196,6 +199,11 @@ export function buildTaskEnvelope({
     nonGoals: asStringList(nonGoals),
     acceptanceCriteria: criteria,
     requiredVerification: asStringList(requiredVerification),
+    verificationGeneratedPaths: asRepositoryPathList(
+      verificationGeneratedPaths,
+      "verificationGeneratedPaths",
+      { max: 64 }
+    ),
     expectedReturnFormat: clip(
       expectedReturnFormat
         || "Return one Worker Report JSON object containing outcome, summary, changedFiles, checksClaimed, acceptanceResults, risks, questions, and hostActionRequest. The runtime requests native structured output; only when that channel is unavailable, prefix the fallback object with GROK_WORKER_REPORT:."
@@ -227,6 +235,7 @@ function taskEnvelopeBuilderInput(envelope, contextManifestId = envelope?.contex
     nonGoals: envelope.nonGoals,
     acceptanceCriteria: envelope.acceptanceCriteria,
     requiredVerification: envelope.requiredVerification,
+    verificationGeneratedPaths: envelope.verificationGeneratedPaths,
     expectedReturnFormat: envelope.expectedReturnFormat,
     contextManifestId
   };

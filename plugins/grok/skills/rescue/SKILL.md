@@ -46,11 +46,14 @@ Build one JSON object with exactly these TaskEnvelope v1 input fields:
   "nonGoals": ["explicit exclusions"],
   "acceptanceCriteria": [{ "id": "AC-1", "text": "observable criterion" }],
   "requiredVerification": ["commands/evidence the host must run after the worker returns"],
+  "verificationGeneratedPaths": ["optional ignored files or directories the declared host checks are expected to rewrite"],
   "expectedReturnFormat": "GROK_WORKER_REPORT JSON plus concise human summary"
 }
 ```
 
 `requiredPaths` contains exact repository-relative files or directories that must already exist; use it to prove that a task-scoped checkout contains the implementation slice, not only documentation. Do not use globs or paths the task is expected to create. Do not include credentials, raw transcripts, unrelated conversation history, or guessed repository facts.
+
+`verificationGeneratedPaths` names the ignored files or directories a declared host verification command is expected to rewrite (for example `apps/web/dist` after a Node/Vite build). The runtime excludes only those exact paths and their descendants, plus `.pytest_cache` / `__pycache__`, from the `record-verification` ignored identity. It does not infer outputs from command strings and does not ignore `dist/**` or `node_modules/**` on ordinary completion or resume. If the build can write outside the workspace or into a dedicated declared directory, isolate it there instead of leaving undeclared ignored drift.
 
 ## Native-like job workflow
 

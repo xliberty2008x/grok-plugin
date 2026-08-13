@@ -12,6 +12,7 @@ import { buildRuntimeEvidence, observeChangedPaths } from "./task-runtime-eviden
 import { buildWorkerReport, buildWorkerReportOutputSchema, composeWorkerReportRepairPrompt } from "./worker-report-contract.mjs";
 import { assertContextManifestIntegrity, captureContextManifest } from "./task-context-manifest.mjs";
 import { bindContextMetadataCompleteness } from "./task-context-metadata.mjs";
+import { contextCaptureOptions } from "./task-context-worktree.mjs";
 
 const { captureCompleteContextManifest } = bindContextMetadataCompleteness({
   captureContextManifest,
@@ -218,7 +219,7 @@ function persistExecutionResult(execution, state, providerResult) {
     root, id, job, preContext, dispatchAttemptId, dispatchFence
   } = execution;
   const { result, workerReport, reportRepair, reportRepairError } = providerResult;
-  const postContext = captureCompleteContextManifest(root, { contextPhase: "terminal" });
+  const postContext = captureCompleteContextManifest(root, contextCaptureOptions("terminal", job));
   if (job.jobClass === "review" && result.review) {
     const safeResult = redact({
       review: result.review,
@@ -435,7 +436,7 @@ function recordExecutionFailure(execution, error) {
   const postContext = (() => {
     // Parent #77 failure finalization used ordinary capture. Complete
     // capture is fail-closed and belongs on success/admission paths.
-    try { return captureContextManifest(root); } catch { return null; }
+    try { return captureContextManifest(root, contextCaptureOptions(null, execution.job)); } catch { return null; }
   })();
   updateJob(root, id, (current) => {
     if (terminal(current)) return current;

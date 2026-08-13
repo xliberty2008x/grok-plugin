@@ -66,16 +66,53 @@ export function isVerificationCacheIgnoredPath(relativePath) {
 }
 
 /**
+ * True when `relativePath` is exactly a declared verification-generated path
+ * or a descendant. Prefix matching uses a path-component boundary so `dist`
+ * does not match `dist-backup`.
+ */
+export function isDeclaredVerificationGeneratedPath(relativePath, generatedPaths = []) {
+  const normalized = String(relativePath || "").replace(/\\/g, "/");
+  if (!normalized) return false;
+  for (const raw of Array.isArray(generatedPaths) ? generatedPaths : []) {
+    const prefix = String(raw || "").replace(/\\/g, "/").replace(/\/+$/, "");
+    if (!prefix) continue;
+    if (normalized === prefix || normalized.startsWith(`${prefix}/`)) return true;
+  }
+  return false;
+}
+
+export function isVerificationExcludedIgnoredPath(relativePath, generatedPaths = []) {
+  return isVerificationCacheIgnoredPath(relativePath)
+    || isDeclaredVerificationGeneratedPath(relativePath, generatedPaths);
+}
+
+export function verificationGeneratedPathsFrom(source) {
+  const value = source?.request?.envelope?.verificationGeneratedPaths
+    ?? source?.verificationGeneratedPaths
+    ?? [];
+  return Array.isArray(value) ? value : [];
+}
+
+export function contextCaptureOptions(contextPhase, source) {
+  return {
+    ...(contextPhase ? { contextPhase } : {}),
+    verificationGeneratedPaths: verificationGeneratedPathsFrom(source)
+  };
+}
+
+/**
  * Fingerprint ignored worktree paths that `git status --untracked-files=all` omits.
  * Small files receive content hashes up to a global budget; every path also carries
  * high-resolution metadata so ordinary search/replace writes remain observable.
  * Large inventories retain only a digest and fail closed to an unattributed marker.
  *
  * From the same inventory, also compute a verification-only identity that drops
- * only standard pytest/Python cache path components so host checks can leave
- * cache drift without triggering out-of-scope write detection.
+ * standard pytest/Python cache path components and any author-declared
+ * verification-generated paths so host checks can leave those outputs without
+ * triggering out-of-scope write detection. Ordinary ignored identity is
+ * unchanged.
  */
-function ignoredWorktreeSnapshot(root) {
+function ignoredWorktreeSnapshot(root, { verificationGeneratedPaths = [] } = {}) {
   const run = git(root, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], {
     allowFailure: true,
     maxBuffer: 64 * 1024 * 1024
@@ -98,7 +135,9 @@ function ignoredWorktreeSnapshot(root) {
   const complete = allPaths.length <= MAX_IGNORED_PATHS;
   const paths = allPaths.slice(0, MAX_IGNORED_PATHS);
   const attributable = complete && paths.length <= MAX_IGNORED_ATTRIBUTABLE;
-  const allVerificationPaths = allPaths.filter((relativePath) => !isVerificationCacheIgnoredPath(relativePath));
+  const allVerificationPaths = allPaths.filter((relativePath) => (
+    !isVerificationExcludedIgnoredPath(relativePath, verificationGeneratedPaths)
+  ));
   const verificationCount = allVerificationPaths.length;
   const verificationComplete = verificationCount <= MAX_IGNORED_PATHS;
   const verificationPaths = allVerificationPaths.slice(0, MAX_IGNORED_PATHS);
