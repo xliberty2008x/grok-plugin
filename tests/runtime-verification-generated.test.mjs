@@ -5,6 +5,7 @@ import { describe, test } from "node:test";
 
 import {
   assertContextCompatible,
+  assertTaskEnvelope,
   buildTaskEnvelope,
   captureContextManifest,
   observeChangedPaths
@@ -104,8 +105,34 @@ function writeDist(root, body = "console.log('built');\n") {
 }
 
 test("buildTaskEnvelope defaults verificationGeneratedPaths to an empty list", () => {
-  const envelope = buildTaskEnvelope({ userRequest: "inspect verification defaults" });
+  const envelope = buildTaskEnvelope({
+    userRequest: "inspect verification defaults",
+    verificationGeneratedPaths: []
+  });
   assert.deepEqual(envelope.verificationGeneratedPaths, []);
+});
+
+test("legacy v1 envelopes without verificationGeneratedPaths keep their identity", () => {
+  const legacy = buildTaskEnvelope({ userRequest: "legacy envelope without generated paths" });
+  assert.equal(Object.hasOwn(legacy, "verificationGeneratedPaths"), false);
+  const accepted = assertTaskEnvelope(structuredClone(legacy));
+  assert.equal(accepted.digest, legacy.digest);
+  assert.equal(accepted.envelopeId, legacy.envelopeId);
+  const declared = buildTaskEnvelope({
+    userRequest: "legacy envelope without generated paths",
+    verificationGeneratedPaths: ["dist"]
+  });
+  assert.notEqual(declared.digest, legacy.digest);
+});
+
+test("verificationGeneratedPaths are bounded before context capture", () => {
+  const many = Array.from({ length: 200 }, (_, index) => `generated-${index}`);
+  const envelope = buildTaskEnvelope({
+    userRequest: "bound oversized generated-path lists",
+    verificationGeneratedPaths: many
+  });
+  assert.equal(envelope.verificationGeneratedPaths.length, 64);
+  assert.deepEqual(envelope.verificationGeneratedPaths, many.slice(0, 64));
 });
 
 describe("issue 94 large ignored fixtures", { concurrency: 1 }, () => {

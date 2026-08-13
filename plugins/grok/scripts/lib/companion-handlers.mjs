@@ -22,7 +22,7 @@ const { assertContextMetadataComplete, captureCompleteContextManifest } = bindCo
   assertContextManifestIntegrity
 });
 import { boundPathEvidence } from "./task-contract-primitives.mjs";
-import { buildTaskEnvelope, parseTaskEnvelopeInput } from "./task-envelope.mjs";
+import { bindTaskEnvelopeContext, buildTaskEnvelope, parseTaskEnvelopeInput } from "./task-envelope.mjs";
 import { composeProviderPrompt } from "./task-provider-prompt.mjs";
 import { evaluateScope } from "./task-scope.mjs";
 import { observeChangedPaths } from "./task-runtime-evidence.mjs";
@@ -297,14 +297,17 @@ async function handleTask(raw) {
     throw new CompanionError("E_NO_RESUME_CANDIDATE", "No resumable Grok task with the same security profile exists in this host session.");
   }
 
-  const contextManifest = captureCompleteContextManifest(root, contextCaptureOptions("admission", envelopeInput || {}));
-  const envelope = buildTaskEnvelope({
+  const envelopeDraft = buildTaskEnvelope({
     ...(envelopeInput || {}),
     userRequest: promptText,
     objective: envelopeInput?.objective || promptText,
-    mode: options.write ? "write" : "read",
-    contextManifestId: contextManifest.manifestId
+    mode: options.write ? "write" : "read"
   });
+  const contextManifest = captureCompleteContextManifest(
+    root,
+    contextCaptureOptions("admission", envelopeDraft)
+  );
+  const envelope = bindTaskEnvelopeContext(envelopeDraft, contextManifest.manifestId);
   if (options.write && envelope.scope.include.length === 0) {
     throw new CompanionError("E_USAGE", "Write TaskEnvelope scope.include must contain at least one bounded repository path or glob.");
   }
