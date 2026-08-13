@@ -26,7 +26,7 @@ node <resolved-grok-codex.mjs> status --all --readonly --json
 
 Use this surface only for pure read preflight observability. It returns `{ "jobs": [...public projections...], "migrationRequired": boolean }` when the control store is readable, keeps existing control jobs visible, and reports whether valid legacy state still requires migration—without migrating, recovering workers, creating directories, chmod, locking, cleaning, or publishing markers. It does **not** prove plugin-data writability and must not be treated as a storage-capability check. Do not use default `status` (recovery/migration) for this preflight step. If pure preflight fails with `E_STATE`, treat authoritative state as unsafe and stop. Write capability is enforced later at job admission (`admitJob` / durable lock and atomic state write) **before** worker/provider launch; unwritable storage surfaces there as sanitized `E_STORAGE_READONLY` (prerequisite)—stop and remediate plugin-data permissions/media, then retry dispatch.
 
-Build one JSON object with exactly these TaskEnvelope v1 input fields:
+Build one JSON object with these TaskEnvelope v1 input fields. Omit `verificationGeneratedPaths` unless declaring ignored outputs that host verification is expected to rewrite; stored schemaVersion 1 envelopes without the key remain valid and keep their original digest and envelope id.
 
 ```json
 {

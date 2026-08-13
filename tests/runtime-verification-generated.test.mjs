@@ -116,13 +116,21 @@ test("legacy v1 envelopes without verificationGeneratedPaths keep their identity
   const legacy = buildTaskEnvelope({ userRequest: "legacy envelope without generated paths" });
   assert.equal(Object.hasOwn(legacy, "verificationGeneratedPaths"), false);
   const accepted = assertTaskEnvelope(structuredClone(legacy));
+  assert.equal(Object.hasOwn(accepted, "verificationGeneratedPaths"), false);
   assert.equal(accepted.digest, legacy.digest);
   assert.equal(accepted.envelopeId, legacy.envelopeId);
+  const emptyDeclared = buildTaskEnvelope({
+    userRequest: "legacy envelope without generated paths",
+    verificationGeneratedPaths: []
+  });
+  assert.deepEqual(emptyDeclared.verificationGeneratedPaths, []);
+  assert.notEqual(emptyDeclared.digest, legacy.digest);
   const declared = buildTaskEnvelope({
     userRequest: "legacy envelope without generated paths",
     verificationGeneratedPaths: ["dist"]
   });
   assert.notEqual(declared.digest, legacy.digest);
+  assert.notEqual(declared.digest, emptyDeclared.digest);
 });
 
 test("verificationGeneratedPaths are bounded before context capture", () => {

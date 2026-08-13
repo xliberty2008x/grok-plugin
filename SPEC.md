@@ -595,11 +595,13 @@ context.facts, constraints, expectedProjectMarkers, requiredPaths, workspaceStat
 nonGoals
 acceptanceCriteria[{id, text}]
 requiredVerification[]
-verificationGeneratedPaths[]
+verificationGeneratedPaths[]   (optional on schemaVersion 1)
 expectedReturnFormat
 contextManifestId
 envelopeId, digest
 ```
+
+`verificationGeneratedPaths` is optional on schemaVersion 1. A previously valid canonical v1 envelope that omits the key remains valid and keeps its original `digest` / `envelopeId`. New envelopes include the key only when the author declares ignored outputs that host verification is expected to rewrite. When present, the list is at most 64 repository-relative files or directories. Omitting the key is not the same digest identity as declaring `[]`.
 
 `context.requiredPaths` MUST contain exact, pre-existing repository-relative files or directories needed for task-scoped work; a `task_scoped` envelope with no required path fails closed. It MUST NOT contain globs or paths the task is expected to create. The runtime verifies that each path exists and resolves inside the canonical workspace. Credentials, raw transcripts, and guessed repository facts MUST NOT appear in the envelope. Structured stdin/file input is bounded during descriptor reads (256 KiB). Whole-project context requires host preflight that marks a complete workspace and verified upstream freshness; missing markers/required paths or an unverified whole-project checkout fail with `E_CONTEXT_INCOMPLETE`.
 
