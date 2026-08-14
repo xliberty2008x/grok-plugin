@@ -323,5 +323,8 @@ export function parseTaskEnvelopeInput(text) {
   if (value.mode != null && !["read", "write"].includes(value.mode)) {
     throw new CompanionError("E_USAGE", "TaskEnvelope mode must be read or write.");
   }
+  if (typeof value.userRequest !== "string" || !value.userRequest.trim()) {
+    throw new CompanionError("E_USAGE", "TaskEnvelope userRequest must be a non-empty string.");
+  }
   return value;
 }

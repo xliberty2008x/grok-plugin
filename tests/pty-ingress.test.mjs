@@ -5,6 +5,7 @@ import process from "node:process";
 import test from "node:test";
 
 import { STDIN_READY_MARKER } from "../plugins/grok/scripts/lib/stdin.mjs";
+import { parseTaskEnvelopeInput } from "../plugins/grok/scripts/lib/task-envelope.mjs";
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import { installPinnedFakeCompanion } from "./pinned-fake-grok.mjs";
 import {
@@ -16,6 +17,24 @@ import {
   tempDir,
   testEnvironment
 } from "./helpers.mjs";
+
+test("TaskEnvelope stdin requires a non-empty userRequest after --envelope-stdin", () => {
+  assert.throws(
+    () => parseTaskEnvelopeInput(JSON.stringify({ schemaVersion: 1, objective: "no userRequest field" })),
+    (error) => error?.code === "E_USAGE"
+      && /userRequest must be a non-empty string/.test(error.message)
+      && !/pass --envelope-stdin/.test(error.message)
+  );
+  assert.throws(
+    () => parseTaskEnvelopeInput(JSON.stringify({ schemaVersion: 1, userRequest: "   " })),
+    (error) => error?.code === "E_USAGE" && /userRequest must be a non-empty string/.test(error.message)
+  );
+  const parsed = parseTaskEnvelopeInput(JSON.stringify({
+    schemaVersion: 1,
+    userRequest: "implement the handshake fixture"
+  }));
+  assert.equal(parsed.userRequest, "implement the handshake fixture");
+});
 
 const PYTHON_AVAILABLE = ptyPythonAvailable();
 const PYTHON_BINDING = (() => {
@@ -386,7 +405,12 @@ test("task envelope stdin keeps empty, malformed, and oversized failures as publ
   const cases = [
     ["empty", "", /requires one TaskEnvelope JSON object/],
     ["malformed", "{not-json", /TaskEnvelope stdin is not valid JSON/],
-    ["oversized", "x".repeat(256 * 1024 + 1), /exceeds the 256 KiB input limit/]
+    ["oversized", "x".repeat(256 * 1024 + 1), /exceeds the 256 KiB input limit/],
+    [
+      "missing-userRequest",
+      JSON.stringify({ schemaVersion: 1, objective: "no userRequest field", mode: "read" }),
+      /TaskEnvelope userRequest must be a non-empty string/
+    ]
   ];
   for (const [label, input, message] of cases) {
     const result = runCodexCompanion(
@@ -398,10 +422,100 @@ test("task envelope stdin keeps empty, malformed, and oversized failures as publ
     assert.equal(payload.ok, false, label);
     assert.equal(payload.error?.code, "E_USAGE", label);
     assert.match(payload.error?.message || "", message, label);
+    assert.doesNotMatch(
+      payload.error?.message || "",
+      /pass --envelope-stdin/,
+      `${label}: must not claim --envelope-stdin was absent after that flag was supplied`
+    );
     assert.deepEqual(jobRecordFiles(pluginData), [], `${label}: invalid stdin created a job record`);
   }
   const providerStarts = readFakeLog(fake.logFile).filter(
     (entry) => entry.event === "argv" && entry.args.includes("agent") && entry.args.includes("stdio")
   );
   assert.equal(providerStarts.length, 0, "invalid stdin launched the provider");
+});
+
+test("write PTY --envelope-stdin --stdin-ready admits one delayed envelope after STDIN_READY", {
+  skip: process.platform === "win32"
+    ? "PTY harness is POSIX-only"
+    : (!(PYTHON_AVAILABLE && PYTHON_BINDING) ? "Python 3 PTY harness is unavailable" : false)
+}, (t) => {
+  const root = initRepo();
+  const pluginData = tempDir("grok-source-pty-data-");
+  const fakeRoot = tempDir("grok-source-pty-fake-");
+  t.after(() => removeFixtureDirectories([root, pluginData, fakeRoot]));
+  const fake = installFakeGrok(fakeRoot, {
+    taskText: `GROK_WORKER_REPORT: ${JSON.stringify({
+      outcome: "complete",
+      summary: "Issue 104 write handshake completed",
+      changedFiles: [],
+      checksClaimed: [],
+      acceptanceResults: [{ id: "AC-01", status: "met" }],
+      risks: [],
+      questions: []
+    })}`
+  });
+  const env = testEnvironment({
+    fake,
+    pluginData,
+    sessionId: "issue-104-write-pty",
+    extra: {
+      CODEX_THREAD_ID: "issue-104-write-pty",
+      GROK_COMPANION_HOST: "codex",
+      GROK_COMPANION_HOST_SESSION_ID: "issue-104-write-pty",
+      GROK_COMPANION_PLUGIN_DATA: pluginData,
+      GROK_TEST_PTY_OBSERVE_LOG: fake.logFile
+    }
+  });
+  for (const key of [
+    "CLAUDE_PLUGIN_DATA",
+    "CLAUDE_PROJECT_DIR",
+    "CLAUDE_SESSION_ID",
+    "GROK_COMPANION_CLAUDE_SESSION_ID",
+    "GROK_COMPANION_CHILD",
+    "GROK_COMPANION_JOB_MARKER",
+    "GROK_AGENT",
+    "GROK_LEADER_SOCKET"
+  ]) delete env[key];
+  const pinned = installPinnedFakeCompanion(fake, env);
+  t.after(pinned.cleanup);
+  const setup = run(
+    process.execPath,
+    [pinned.codexCompanionScript, "setup", "--json"],
+    { cwd: root, env: pinned.env, timeout: 30_000 }
+  );
+  assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+  const envelope = JSON.stringify({
+    schemaVersion: 1,
+    userRequest: "implement the issue 104 write handshake fixture",
+    objective: "Admit one delayed write envelope after STDIN_READY",
+    mode: "write",
+    scope: { include: ["tracked.txt"], exclude: [] },
+    context: {
+      facts: ["The host writes the envelope only after readiness."],
+      constraints: ["Do not edit the fixture."],
+      expectedProjectMarkers: [],
+      requiredPaths: ["tracked.txt"],
+      workspaceState: "task_scoped",
+      upstreamFreshness: "not_checked"
+    },
+    nonGoals: [],
+    acceptanceCriteria: [{ id: "AC-01", text: "Create exactly one durable write job." }],
+    requiredVerification: ["git status --short"],
+    expectedReturnFormat: "GROK_WORKER_REPORT JSON plus concise human summary"
+  });
+  const dispatch = runPtyStdin(
+    pinned.codexCompanionScript,
+    ["task", "--background", "--envelope-stdin", "--stdin-ready", "--write", "--fresh", "--json"],
+    { cwd: root, env: pinned.env, input: envelope, timeout: 45_000 }
+  );
+  assert.equal(dispatch.driver.status, 0, dispatch.driver.stderr || dispatch.driver.stdout);
+  assert.equal(dispatch.result?.ready, true, dispatch.result?.stderr);
+  assert.equal(dispatch.result?.code, 0, dispatch.result?.stderr || dispatch.result?.stdout);
+  assert.match(dispatch.result?.stderr || "", new RegExp(STDIN_READY_MARKER));
+  assert.doesNotMatch(dispatch.result?.stderr || "", /Provide a task for Grok or pass --envelope-stdin/);
+  const job = JSON.parse(dispatch.result.stdout);
+  assert.ok(job.id);
+  assert.equal(job.write, true);
+  assert.equal(jobRecordFiles(pluginData).length, 1);
 });
