@@ -441,8 +441,8 @@ test("write PTY --envelope-stdin --stdin-ready admits one delayed envelope after
     : (!(PYTHON_AVAILABLE && PYTHON_BINDING) ? "Python 3 PTY harness is unavailable" : false)
 }, (t) => {
   const root = initRepo();
-  const pluginData = tempDir("grok-issue-104-write-pty-data-");
-  const fakeRoot = tempDir("grok-issue-104-write-pty-fake-");
+  const pluginData = tempDir("grok-source-pty-data-");
+  const fakeRoot = tempDir("grok-source-pty-fake-");
   t.after(() => removeFixtureDirectories([root, pluginData, fakeRoot]));
   const fake = installFakeGrok(fakeRoot, {
     taskText: `GROK_WORKER_REPORT: ${JSON.stringify({
