@@ -32,6 +32,16 @@ import {
 
 const timestamp = () => new Date().toISOString();
 
+function resolveAbsoluteGitPath(workspaceRoot, reported, fallback) {
+  if (!reported) return fallback;
+  const candidate = path.isAbsolute(reported) ? reported : path.resolve(workspaceRoot, reported);
+  try {
+    return fs.realpathSync(candidate);
+  } catch {
+    return candidate;
+  }
+}
+
 /**
  * Capture a ContextManifest for the workspace. Used for job identity and drift checks.
  * Never stores task text or credentials.
@@ -53,14 +63,14 @@ export function captureContextManifest(root, { verificationGeneratedPaths = [] }
   });
   const worktreeRun = git(workspaceRoot, ["rev-parse", "--is-inside-work-tree"], { allowFailure: true });
   const insideWorktree = worktreeRun.status === 0 && String(worktreeRun.stdout || "").trim() === "true";
-  const gitDirRun = git(workspaceRoot, ["rev-parse", "--git-dir"], { allowFailure: true });
+  const gitDirRun = git(workspaceRoot, ["rev-parse", "--path-format=absolute", "--git-dir"], { allowFailure: true });
   const gitDir = gitDirRun.status === 0 ? String(gitDirRun.stdout || "").trim() : "";
-  const commonDirRun = git(workspaceRoot, ["rev-parse", "--git-common-dir"], { allowFailure: true });
+  const commonDirRun = git(workspaceRoot, ["rev-parse", "--path-format=absolute", "--git-common-dir"], { allowFailure: true });
   const commonDir = commonDirRun.status === 0 ? String(commonDirRun.stdout || "").trim() : "";
-  const absoluteGitDir = gitDir ? path.resolve(workspaceRoot, gitDir) : path.join(workspaceRoot, ".git");
-  const absoluteCommonDir = commonDir ? path.resolve(workspaceRoot, commonDir) : absoluteGitDir;
+  const absoluteGitDir = resolveAbsoluteGitPath(workspaceRoot, gitDir, path.join(workspaceRoot, ".git"));
+  const absoluteCommonDir = resolveAbsoluteGitPath(workspaceRoot, commonDir, absoluteGitDir);
   const metadataIdentity = gitMetadataIdentity(absoluteGitDir, absoluteCommonDir);
-  const isLinkedWorktree = Boolean(gitDir && commonDir && path.resolve(workspaceRoot, gitDir) !== path.resolve(workspaceRoot, commonDir));
+  const isLinkedWorktree = Boolean(gitDir && commonDir && absoluteGitDir !== absoluteCommonDir);
   const sparseRun = git(workspaceRoot, ["sparse-checkout", "list"], { allowFailure: true });
   const sparse = sparseRun.status === 0 && String(sparseRun.stdout || "").trim().length > 0;
   const shallowRun = git(workspaceRoot, ["rev-parse", "--is-shallow-repository"], { allowFailure: true });
