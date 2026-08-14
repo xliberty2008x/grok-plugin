@@ -13,6 +13,12 @@ import {
   observeChangedPaths
 } from "../plugins/grok/scripts/lib/task-contract.mjs";
 import { captureEffectiveGitConfigIdentity } from "../plugins/grok/scripts/lib/task-git-controls.mjs";
+import { captureSemanticSharedRefs } from "../plugins/grok/scripts/lib/task-git-refs.mjs";
+import { gitSubprocessEnv } from "../plugins/grok/scripts/lib/workspace.mjs";
+import {
+  resolveWorkspaceGitDirectories,
+  selectRevParseGitReport
+} from "../plugins/grok/scripts/lib/task-context-manifest.mjs";
 import { spawnReadOnlyWorker } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import { CompanionError } from "../plugins/grok/scripts/lib/errors.mjs";
 import { recordExecutionFailure } from "../plugins/grok/scripts/lib/companion-task-result.mjs";
@@ -141,6 +147,65 @@ function boundedReadEnvelope() {
       upstreamFreshness: "not_checked"
     }
   });
+}
+
+function completeReadEnvelope() {
+  return buildTaskEnvelope({
+    userRequest: "inspect the fully materialized checkout",
+    mode: "read",
+    scope: { include: ["tracked.txt"], exclude: [] },
+    context: {
+      facts: [],
+      constraints: [],
+      expectedProjectMarkers: [],
+      requiredPaths: ["tracked.txt"],
+      workspaceState: "complete",
+      upstreamFreshness: "verified"
+    }
+  });
+}
+
+function completeWriteEnvelope() {
+  return buildTaskEnvelope({
+    userRequest: "edit only tracked.txt in a complete checkout",
+    mode: "write",
+    scope: { include: ["tracked.txt"], exclude: [] },
+    context: {
+      facts: [],
+      constraints: [],
+      expectedProjectMarkers: [],
+      requiredPaths: ["tracked.txt"],
+      workspaceState: "complete",
+      upstreamFreshness: "verified"
+    }
+  });
+}
+
+function admitReadWorker(root, envelope, idempotencyKey) {
+  return spawnReadOnlyWorker({
+    root,
+    principal: {
+      hostKind: "codex",
+      threadId: "019f666a-6469-7cc1-9a8d-8c1adf61e103",
+      turnId: "019f666e-4084-7902-8447-249f72043a37",
+      source: "codex-mcp-stdio",
+      pluginId: "grok@grok-companion",
+      root,
+      mutationCapable: true
+    },
+    envelope,
+    idempotencyKey,
+    env: mutationEnv()
+  });
+}
+
+function assertLinkedAdmissionComplete(manifest) {
+  const observation = manifest.git.taskRelevantMetadataObservation;
+  assert.equal(manifest.git.linkedWorktree, true);
+  assert.equal(observation.components.config, "complete");
+  assert.equal(observation.components.refs, "complete");
+  assert.equal(observation.complete, true);
+  return observation;
 }
 
 function mutationEnv() {
@@ -545,4 +610,142 @@ test("present unreadable malformed include and oversize worktree config stay inc
     () => captureCompleteContextManifest(linked, { contextPhase: "admission" }),
     assertPublicConfigIncomplete
   );
+});
+
+test("git subprocess env drops inherited repository location overrides", () => {
+  const env = gitSubprocessEnv({
+    PATH: "/bin",
+    HOME: "/tmp",
+    GIT_DIR: ".git",
+    GIT_COMMON_DIR: ".git",
+    GIT_WORK_TREE: "/elsewhere",
+    GIT_INDEX_FILE: "/tmp/index",
+    GIT_OBJECT_DIRECTORY: "/tmp/objects",
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: "/tmp/alt",
+    GIT_NAMESPACE: "ns",
+    GIT_PREFIX: "prefix/"
+  });
+  assert.equal(env.PATH, "/bin");
+  assert.equal(env.HOME, "/tmp");
+  assert.equal(Object.hasOwn(env, "GIT_DIR"), false);
+  assert.equal(Object.hasOwn(env, "GIT_COMMON_DIR"), false);
+  assert.equal(Object.hasOwn(env, "GIT_WORK_TREE"), false);
+  assert.equal(Object.hasOwn(env, "GIT_INDEX_FILE"), false);
+});
+
+test("linked worktree admits task_scoped and complete envelopes despite inherited GIT_COMMON_DIR", (t) => {
+  const withConfig = linkedWorktreeWithoutConfig();
+  t.after(() => disposeLinkedWorktree(withConfig));
+  const plainRoot = initRepo();
+  const plainLinked = `${plainRoot}-linked`;
+  git(plainRoot, "worktree", "add", "-q", plainLinked, "-b", `issue101-${path.basename(plainRoot)}`);
+  t.after(() => disposeLinkedWorktree({ root: plainRoot, linked: plainLinked }));
+
+  const previous = process.env.GIT_COMMON_DIR;
+  process.env.GIT_COMMON_DIR = ".git";
+  t.after(() => {
+    if (previous === undefined) delete process.env.GIT_COMMON_DIR;
+    else process.env.GIT_COMMON_DIR = previous;
+  });
+
+  for (const linked of [withConfig.linked, plainLinked]) {
+    const first = captureCompleteContextManifest(linked, { contextPhase: "admission" });
+    const second = captureCompleteContextManifest(linked, { contextPhase: "admission" });
+    assertLinkedAdmissionComplete(first);
+    assertLinkedAdmissionComplete(second);
+    assert.equal(
+      first.git.taskRelevantMetadataObservation.components.config,
+      second.git.taskRelevantMetadataObservation.components.config
+    );
+    assert.equal(
+      first.git.taskRelevantMetadataObservation.components.refs,
+      second.git.taskRelevantMetadataObservation.components.refs
+    );
+    assert.equal(captureEffectiveGitConfigIdentity(linked).observable, true);
+    assert.equal(captureSemanticSharedRefs(linked).complete, true);
+
+    const scoped = admitReadWorker(
+      linked,
+      boundedReadEnvelope(),
+      `issue101-scoped-${path.basename(linked)}`
+    );
+    assert.equal(typeof scoped.handle?.id, "string");
+    assert.equal(scoped.handle.id.length > 0, true);
+
+    const complete = admitReadWorker(
+      linked,
+      completeReadEnvelope(),
+      `issue101-complete-${path.basename(linked)}`
+    );
+    assert.equal(typeof complete.handle?.id, "string");
+    assert.equal(complete.handle.id.length > 0, true);
+
+    const writeReady = captureCompleteContextManifest(linked, { contextPhase: "admission" });
+    assert.doesNotThrow(() => assertTaskContextReady(completeWriteEnvelope(), writeReady, {
+      structuredInput: true
+    }));
+  }
+
+  const primary = captureCompleteContextManifest(withConfig.root, { contextPhase: "admission" });
+  assert.equal(primary.git.linkedWorktree, false);
+  assert.equal(primary.git.taskRelevantMetadataObservation.complete, true);
+  const primaryAdmitted = admitReadWorker(
+    withConfig.root,
+    boundedReadEnvelope(),
+    `issue101-primary-${path.basename(withConfig.root)}`
+  );
+  assert.equal(typeof primaryAdmitted.handle?.id, "string");
+  assert.equal(primaryAdmitted.handle.id.length > 0, true);
+});
+
+test("inherited GIT_COMMON_DIR does not weaken present-file worktree-config fail-closed", (t) => {
+  const fixture = linkedWorktreeWithoutConfig();
+  t.after(() => disposeLinkedWorktree(fixture));
+  const { linked, configWorktree } = fixture;
+  const previous = process.env.GIT_COMMON_DIR;
+  process.env.GIT_COMMON_DIR = ".git";
+  t.after(() => {
+    if (previous === undefined) delete process.env.GIT_COMMON_DIR;
+    else process.env.GIT_COMMON_DIR = previous;
+  });
+
+  fs.writeFileSync(configWorktree, "[issue101\nthis is not git config\n");
+  const malformed = captureContextManifest(linked);
+  assert.equal(malformed.git.taskRelevantMetadataObservation.components.config, "incomplete");
+  assert.throws(
+    () => captureCompleteContextManifest(linked, { contextPhase: "admission" }),
+    assertPublicConfigIncomplete
+  );
+});
+
+test("path-format absolute failure falls back to plain rev-parse so linked worktrees stay linked", (t) => {
+  assert.equal(selectRevParseGitReport(
+    { status: 0, stdout: "/abs/repo/.git/worktrees/wt\n" },
+    { status: 0, stdout: ".git\n" }
+  ), "/abs/repo/.git/worktrees/wt");
+  assert.equal(selectRevParseGitReport(
+    { status: 128, stdout: "", stderr: "unknown option `path-format=absolute'" },
+    { status: 0, stdout: "/abs/repo/.git/worktrees/wt\n" }
+  ), "/abs/repo/.git/worktrees/wt");
+  assert.equal(selectRevParseGitReport(
+    { status: 128, stdout: "" },
+    { status: 0, stdout: "../.git\n" }
+  ), "../.git");
+  assert.equal(selectRevParseGitReport(
+    { status: 128, stdout: "" },
+    { status: 128, stdout: "" }
+  ), "");
+
+  const fixture = linkedWorktreeWithoutConfig();
+  t.after(() => disposeLinkedWorktree(fixture));
+  const { root, linked } = fixture;
+  const observed = resolveWorkspaceGitDirectories(linked);
+  assert.equal(observed.linkedWorktree, true);
+  assert.notEqual(observed.absoluteGitDir, observed.absoluteCommonDir);
+  assert.equal(resolveWorkspaceGitDirectories(root).linkedWorktree, false);
+
+  const manifest = captureCompleteContextManifest(linked, { contextPhase: "admission" });
+  assert.equal(manifest.git.linkedWorktree, true);
+  assert.equal(manifest.git.taskRelevantMetadataObservation.components.config, "complete");
+  assert.equal(manifest.git.taskRelevantMetadataObservation.components.refs, "complete");
 });

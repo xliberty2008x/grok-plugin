@@ -10,8 +10,38 @@ import {
 } from "./errors.mjs";
 import { pluginDataRoot } from "./host.mjs";
 
+/**
+ * Host GIT_* location overrides (Codex/Grok worktrees often inherit
+ * `GIT_COMMON_DIR=.git`) must not replace cwd discovery. A linked worktree's
+ * `.git` is a gitfile; a relative common-dir then fails config and refs.
+ */
+const GIT_REPOSITORY_LOCATION_KEYS = Object.freeze([
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_COMMON_DIR",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_NAMESPACE",
+  "GIT_PREFIX"
+]);
+
+export function gitSubprocessEnv(baseEnv = process.env) {
+  const env = { ...baseEnv };
+  for (const key of GIT_REPOSITORY_LOCATION_KEYS) {
+    delete env[key];
+  }
+  return env;
+}
+
 export function git(cwd, args, { allowFailure = false, encoding = "utf8", maxBuffer = 8 * 1024 * 1024 } = {}) {
-  const run = spawnSync("git", args, { cwd, encoding, maxBuffer, shell: false });
+  const run = spawnSync("git", args, {
+    cwd,
+    encoding,
+    maxBuffer,
+    shell: false,
+    env: gitSubprocessEnv()
+  });
   if (run.error || (!allowFailure && run.status !== 0)) throw new CompanionError("E_GIT_REQUIRED", `Git command failed: git ${args.join(" ")}`, { stderr: String(run.stderr ?? "").trim() });
   return run;
 }
