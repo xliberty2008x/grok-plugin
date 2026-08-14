@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { STDIN_READY_MARKER } from "../plugins/grok/scripts/lib/stdin.mjs";
 import { parseTaskEnvelopeInput } from "../plugins/grok/scripts/lib/task-envelope.mjs";
+import { buildWorkerReport } from "../plugins/grok/scripts/lib/task-contract.mjs";
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import { installPinnedFakeCompanion } from "./pinned-fake-grok.mjs";
 import {
@@ -518,4 +519,99 @@ test("write PTY --envelope-stdin --stdin-ready admits one delayed envelope after
   assert.ok(job.id);
   assert.equal(job.write, true);
   assert.equal(jobRecordFiles(pluginData).length, 1);
+});
+
+test("buildWorkerReport refuses complete when required acceptance stays unknown", () => {
+  const report = buildWorkerReport({
+    providerText: `GROK_WORKER_REPORT: ${JSON.stringify({
+      outcome: "complete",
+      summary: "Pending source review",
+      changedFiles: [],
+      checksClaimed: [],
+      acceptanceResults: [
+        { id: "AC-01", status: "unknown", note: "Pending source review" },
+        { id: "AC-02", status: "unknown", note: "Pending source review" }
+      ],
+      risks: [],
+      questions: []
+    })}`,
+    acceptanceCriteria: [
+      { id: "AC-01", text: "First" },
+      { id: "AC-02", text: "Second" }
+    ]
+  });
+  assert.equal(report.valid, true);
+  assert.notEqual(report.outcome, "complete");
+  assert.match(report.classificationReason || "", /unknown/i);
+  assert.match(report.summary, /unknown/i);
+});
+
+test("task cannot publish outcome complete when required acceptance criteria stay unknown", (t) => {
+  const root = initRepo();
+  const pluginData = tempDir("grok-source-stdin-negative-data-");
+  const fakeRoot = tempDir("grok-source-stdin-negative-fake-");
+  t.after(() => removeFixtureDirectories([root, pluginData, fakeRoot]));
+  const fake = installFakeGrok(fakeRoot, {
+    taskText: `GROK_WORKER_REPORT: ${JSON.stringify({
+      outcome: "complete",
+      summary: "Pending source review",
+      changedFiles: [],
+      checksClaimed: [],
+      acceptanceResults: [
+        { id: "AC-01", status: "unknown", note: "Pending source review" },
+        { id: "AC-02", status: "unknown", note: "Pending source review" },
+        { id: "AC-03", status: "unknown", note: "Pending source review" },
+        { id: "AC-04", status: "unknown", note: "Pending source review" }
+      ],
+      risks: [],
+      questions: []
+    })}`
+  });
+  const env = testEnvironment({ fake, pluginData, sessionId: "issue-105-unknown-complete" });
+  delete env.GROK_COMPANION_CHILD;
+  delete env.GROK_COMPANION_JOB_MARKER;
+  delete env.GROK_AGENT;
+  delete env.GROK_LEADER_SOCKET;
+  delete env.CODEX_THREAD_ID;
+  const envelope = JSON.stringify({
+    schemaVersion: 1,
+    userRequest: "review the payment service contract against source",
+    objective: "Diagnose incomplete implementation",
+    mode: "read",
+    scope: { include: [], exclude: [] },
+    context: {
+      facts: [],
+      constraints: [],
+      expectedProjectMarkers: [],
+      requiredPaths: ["tracked.txt"],
+      workspaceState: "task_scoped",
+      upstreamFreshness: "not_checked"
+    },
+    nonGoals: [],
+    acceptanceCriteria: [
+      { id: "AC-01", text: "Contract identified" },
+      { id: "AC-02", text: "Implementation gap stated" },
+      { id: "AC-03", text: "Risks listed" },
+      { id: "AC-04", text: "Next action listed" }
+    ],
+    requiredVerification: ["git diff --exit-code"],
+    expectedReturnFormat: "GROK_WORKER_REPORT JSON plus concise human summary"
+  });
+  const result = runCodexCompanion(
+    ["task", "--wait", "--envelope-stdin", "--json"],
+    { cwd: root, env, input: envelope }
+  );
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const job = JSON.parse(result.stdout);
+  assert.equal(job.status, "completed");
+  assert.notEqual(job.result.workerReport.outcome, "complete");
+  assert.equal(job.result.providerClaims.success, false);
+  assert.equal(
+    job.result.workerReport.acceptanceResults.every((entry) => entry.status === "unknown"),
+    true
+  );
+  assert.match(`${job.summary || ""} ${job.result.workerReport.summary || ""}`, /unknown|incomplete|not complete/i);
+  const human = runCodexCompanion(["result", job.id], { cwd: root, env });
+  assert.equal(human.status, 0, human.stderr);
+  assert.doesNotMatch(human.stdout, /Outcome: complete/);
 });
