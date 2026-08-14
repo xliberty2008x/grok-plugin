@@ -69,6 +69,12 @@ jobs:
       - name: Install locked dependencies
         run: npm ci --ignore-scripts
 
+      - name: Fetch PR base for the plugin-byte version gate
+        if: github.event_name == 'pull_request' && matrix.shard == 1
+        run: |
+          git fetch --unshallow || true
+          git fetch --no-tags origin ${{ github.base_ref }}
+
       - name: Validate release structure
         if: matrix.shard == 1
         run: npm run validate
@@ -101,6 +107,12 @@ jobs:
 
       - name: Install locked dependencies
         run: npm ci --ignore-scripts
+
+      - name: Fetch PR base for the plugin-byte version gate
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --unshallow || true
+          git fetch --no-tags origin ${{ github.base_ref }}
 
       - name: Validate release structure
         run: npm run validate

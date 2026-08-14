@@ -81,8 +81,11 @@ Classify the complete change set by its highest-impact product change:
 | `feature` | New backward-compatible user-facing capability | Increment minor |
 | `breaking` | Public command, manifest, state schema, execution profile, security boundary, or compatibility contract changes | Increment minor while the base major is `0`; increment major from `1.0.0` onward |
 
-Documentation, tests, and internal refactors do not independently require a
-version bump unless they alter shipped behavior, packaging, or compatibility.
+Any change under `plugins/grok/` is a plugin-byte change and MUST bump the
+synchronized active development version. Documentation, tests, and tooling
+outside that tree do not independently require a version bump.
+`0.3.0-dev.2` is burned and MUST NOT be reused; the next plugin-byte ship is
+`0.3.0-dev.3`.
 When a tranche contains multiple classes, the highest-impact class wins.
 
 Each release-bearing branch MUST update `release-plan.json` before product
@@ -119,6 +122,12 @@ Commit prefixes follow the same taxonomy: `fix:` normally maps to `patch`,
 `feat:` maps to `feature`, and `!` or a `BREAKING CHANGE` footer maps to
 `breaking`. The release plan, not the prefix alone, is authoritative for a
 mixed tranche.
+
+## Branch hygiene
+
+After GitHub reports a feature-branch pull request as MERGED, any agent may
+delete the remote and local feature branch. Do not leave merged topic branches
+as repository clutter. Protected branches such as `main` are never deleted.
 
 ## Verification boundary taxonomy and conviction rules
 

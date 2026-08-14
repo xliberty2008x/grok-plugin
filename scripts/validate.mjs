@@ -14,7 +14,17 @@ import {
   DETERMINISTIC_TEST_SHARDS,
   validateDeterministicTestShards
 } from "./lib/deterministic-test-shards.mjs";
-import { activeVersionForPlan, qualificationEvidencePath, qualificationSourceDigest, validateQualificationEvidence, validateReadmeReleaseStatus, validateReleasePlan } from "./lib/version-policy.mjs";
+import {
+  activeVersionForPlan,
+  collectChangedPathsFromGitReports,
+  inspectPluginByteShip,
+  pluginByteShipBaseErrors,
+  qualificationEvidencePath,
+  qualificationSourceDigest,
+  validateQualificationEvidence,
+  validateReadmeReleaseStatus,
+  validateReleasePlan
+} from "./lib/version-policy.mjs";
 import {
   EXTERNAL_BOUNDARY_TESTS,
   listDeterministicTestFiles
@@ -152,6 +162,72 @@ function relative(file) {
   return path.relative(ROOT, file).split(path.sep).join("/");
 }
 
+function gitText(args) {
+  try {
+    return execFileSync("git", args, {
+      cwd: ROOT,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+  } catch {
+    return null;
+  }
+}
+
+function pluginByteShipChecks(version) {
+  const githubBaseRef = process.env.GITHUB_BASE_REF || "";
+  const baseRef = process.env.GROK_VERSION_BASE_REF
+    || (githubBaseRef ? `origin/${githubBaseRef}` : "origin/main");
+  if (gitText(["rev-parse", "--verify", `${baseRef}^{commit}`]) == null && githubBaseRef) {
+    gitText(["fetch", "--unshallow"]);
+    gitText(["fetch", "--no-tags", "origin", githubBaseRef]);
+  }
+  if (githubBaseRef && gitText(["merge-base", baseRef, "HEAD"]) == null) {
+    gitText(["fetch", "--unshallow"]);
+    gitText(["fetch", "--no-tags", "origin", githubBaseRef]);
+  }
+  const baseResolved = gitText(["rev-parse", "--verify", `${baseRef}^{commit}`]) != null
+    && gitText(["merge-base", baseRef, "HEAD"]) != null;
+  for (const message of pluginByteShipBaseErrors({
+    githubBaseRefSet: Boolean(githubBaseRef || process.env.GROK_VERSION_BASE_REF),
+    baseResolved
+  })) {
+    problem(message, "release-plan.json");
+  }
+  if (!baseResolved) return;
+  const mergeBaseDiff = gitText(["diff", "--name-only", `${baseRef}...HEAD`]);
+  if (mergeBaseDiff == null) {
+    if (githubBaseRef || process.env.GROK_VERSION_BASE_REF) {
+      problem(`Could not diff plugin-byte changes against ${baseRef}.`, "release-plan.json");
+    }
+    return;
+  }
+  const changedPaths = collectChangedPathsFromGitReports({
+    mergeBaseDiff,
+    worktreeDiff: gitText(["diff", "--name-only", "HEAD"]) || "",
+    untracked: gitText(["ls-files", "--others", "--exclude-standard"]) || ""
+  });
+  let baseActiveVersion = version;
+  const basePackageText = gitText(["show", `${baseRef}:package.json`]);
+  if (basePackageText) {
+    try {
+      const basePackage = JSON.parse(basePackageText);
+      if (typeof basePackage.version === "string" && basePackage.version) {
+        baseActiveVersion = basePackage.version;
+      }
+    } catch {
+      baseActiveVersion = version;
+    }
+  }
+  for (const message of inspectPluginByteShip({
+    changedPaths,
+    baseActiveVersion,
+    nextActiveVersion: version
+  })) {
+    problem(message, "release-plan.json");
+  }
+}
+
 function versionChecks() {
   const packageJson = readJson("package.json");
   const packageLock = readJson("package-lock.json");
@@ -207,6 +283,7 @@ function versionChecks() {
   if (plannedVersion !== version) {
     problem(`Active release-plan version (${plannedVersion ?? "invalid"}) does not match package version ${version}.`, "release-plan.json");
   }
+  pluginByteShipChecks(version);
 
   const changelog = readText("plugins/grok/CHANGELOG.md");
   const firstChangelogVersion = changelog?.match(/^##\s+([^\s]+)\s*$/m)?.[1] || null;
@@ -297,6 +374,7 @@ if (!versionsOnly) {
     "LICENSE",
     "NOTICE",
     "CONTRIBUTING.md",
+    "AGENTS.md",
     "README.md",
     "SPEC.md",
     "PLAN.md",
@@ -491,6 +569,16 @@ if (!versionsOnly) {
     || !/npm run codex:update-local/.test(contributing)
     || !/CODEX_PLUGIN_RUNNER_ENABLED/.test(contributing))) {
     problem("CONTRIBUTING.md must define version governance, boundary-scoped evidence, and the installed-Codex gate.", "CONTRIBUTING.md");
+  }
+
+  const agents = readText("AGENTS.md", { required: false });
+  if (agents != null && (!/plugins\/grok/.test(agents)
+    || !/0\.3\.0-dev\.2/.test(agents)
+    || !/burned/i.test(agents)
+    || !/codex:update-local/.test(agents)
+    || !/after MERGED/i.test(agents)
+    || !/feature branch/i.test(agents))) {
+    problem("AGENTS.md must define the plugin-byte ship contract, burned 0.3.0-dev.2, and post-merge branch deletion.", "AGENTS.md");
   }
 
   const specification = readText("SPEC.md", { required: false });
