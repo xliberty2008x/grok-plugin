@@ -179,9 +179,15 @@ function pluginByteShipChecks(version) {
   const baseRef = process.env.GROK_VERSION_BASE_REF
     || (githubBaseRef ? `origin/${githubBaseRef}` : "origin/main");
   if (gitText(["rev-parse", "--verify", `${baseRef}^{commit}`]) == null && githubBaseRef) {
-    gitText(["fetch", "--no-tags", "--depth=1", "origin", githubBaseRef]);
+    gitText(["fetch", "--unshallow"]);
+    gitText(["fetch", "--no-tags", "origin", githubBaseRef]);
   }
-  const baseResolved = gitText(["rev-parse", "--verify", `${baseRef}^{commit}`]) != null;
+  if (githubBaseRef && gitText(["merge-base", baseRef, "HEAD"]) == null) {
+    gitText(["fetch", "--unshallow"]);
+    gitText(["fetch", "--no-tags", "origin", githubBaseRef]);
+  }
+  const baseResolved = gitText(["rev-parse", "--verify", `${baseRef}^{commit}`]) != null
+    && gitText(["merge-base", baseRef, "HEAD"]) != null;
   for (const message of pluginByteShipBaseErrors({
     githubBaseRefSet: Boolean(githubBaseRef || process.env.GROK_VERSION_BASE_REF),
     baseResolved
