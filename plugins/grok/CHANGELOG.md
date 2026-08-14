@@ -7,11 +7,13 @@ Status: hardening candidate; not release-qualified.
 - Fixed linked-worktree task admission so inherited Git location overrides
   (`GIT_COMMON_DIR=.git`, `GIT_DIR`, index/object overrides) cannot make a
   valid checkout look like incomplete `config` and `refs`. Companion Git
-  discovery now uses the caller's worktree cwd only. Absent optional
-  `config.worktree` remains a complete empty scope; present unreadable,
-  malformed, include-failed, or oversized worktree config still fails closed.
-  Shared and worktree-private ref inventories stay fail-closed when they
-  disagree or cannot be observed.
+  discovery now uses the caller's worktree cwd only. `--path-format=absolute`
+  is preferred, but Git < 2.31 falls back to plain `rev-parse --git-dir` /
+  `--git-common-dir` so linked worktrees are not misclassified as primary.
+  Absent optional `config.worktree` remains a complete empty scope; present
+  unreadable, malformed, include-failed, or oversized worktree config still
+  fails closed. Shared and worktree-private ref inventories stay fail-closed
+  when they disagree or cannot be observed.
 - Fixed managed-observed setup for Grok Build 1.0.0, whose exact private
   child process may omit the display-only `[stable]` suffix from `--version`.
   Setup now requires one whole unambiguous `grok VERSION (BUILD)` record,

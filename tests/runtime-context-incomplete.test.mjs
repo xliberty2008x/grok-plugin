@@ -15,6 +15,10 @@ import {
 import { captureEffectiveGitConfigIdentity } from "../plugins/grok/scripts/lib/task-git-controls.mjs";
 import { captureSemanticSharedRefs } from "../plugins/grok/scripts/lib/task-git-refs.mjs";
 import { gitSubprocessEnv } from "../plugins/grok/scripts/lib/workspace.mjs";
+import {
+  resolveWorkspaceGitDirectories,
+  selectRevParseGitReport
+} from "../plugins/grok/scripts/lib/task-context-manifest.mjs";
 import { spawnReadOnlyWorker } from "../plugins/grok/scripts/lib/worker-mutation.mjs";
 import { CompanionError } from "../plugins/grok/scripts/lib/errors.mjs";
 import { recordExecutionFailure } from "../plugins/grok/scripts/lib/companion-task-result.mjs";
@@ -712,4 +716,36 @@ test("inherited GIT_COMMON_DIR does not weaken present-file worktree-config fail
     () => captureCompleteContextManifest(linked, { contextPhase: "admission" }),
     assertPublicConfigIncomplete
   );
+});
+
+test("path-format absolute failure falls back to plain rev-parse so linked worktrees stay linked", (t) => {
+  assert.equal(selectRevParseGitReport(
+    { status: 0, stdout: "/abs/repo/.git/worktrees/wt\n" },
+    { status: 0, stdout: ".git\n" }
+  ), "/abs/repo/.git/worktrees/wt");
+  assert.equal(selectRevParseGitReport(
+    { status: 128, stdout: "", stderr: "unknown option `path-format=absolute'" },
+    { status: 0, stdout: "/abs/repo/.git/worktrees/wt\n" }
+  ), "/abs/repo/.git/worktrees/wt");
+  assert.equal(selectRevParseGitReport(
+    { status: 128, stdout: "" },
+    { status: 0, stdout: "../.git\n" }
+  ), "../.git");
+  assert.equal(selectRevParseGitReport(
+    { status: 128, stdout: "" },
+    { status: 128, stdout: "" }
+  ), "");
+
+  const fixture = linkedWorktreeWithoutConfig();
+  t.after(() => disposeLinkedWorktree(fixture));
+  const { root, linked } = fixture;
+  const observed = resolveWorkspaceGitDirectories(linked);
+  assert.equal(observed.linkedWorktree, true);
+  assert.notEqual(observed.absoluteGitDir, observed.absoluteCommonDir);
+  assert.equal(resolveWorkspaceGitDirectories(root).linkedWorktree, false);
+
+  const manifest = captureCompleteContextManifest(linked, { contextPhase: "admission" });
+  assert.equal(manifest.git.linkedWorktree, true);
+  assert.equal(manifest.git.taskRelevantMetadataObservation.components.config, "complete");
+  assert.equal(manifest.git.taskRelevantMetadataObservation.components.refs, "complete");
 });
