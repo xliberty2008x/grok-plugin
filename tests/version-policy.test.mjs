@@ -5,9 +5,13 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  BURNED_ACTIVE_VERSIONS,
   activeVersionForPlan,
   expectedReadmeStatusForStage,
   expectedTargetVersion,
+  inspectPluginByteShip,
+  isPluginBytePath,
+  nextDevelopmentPreRelease,
   qualificationEvidencePath,
   qualificationSourceDigest,
   validateQualificationEvidence,
@@ -127,4 +131,66 @@ test("qualification source digest survives its evidence commit but detects later
 
   fs.writeFileSync(path.join(root, "source.mjs"), "export const value = 2;\n");
   assert.notEqual(qualificationSourceDigest(root), qualified);
+});
+
+const validDevelopmentPlan = {
+  schemaVersion: 1,
+  baseVersion: "0.2.0",
+  changeClass: "breaking",
+  targetVersion: "0.3.0",
+  stage: "development",
+  preRelease: "dev.1",
+  supportedHosts: ["codex", "claude-code"],
+  reasons: ["Contract changed."]
+};
+
+test("plugin-byte paths are the installable plugins/grok tree only", () => {
+  assert.equal(isPluginBytePath("plugins/grok/scripts/lib/workspace.mjs"), true);
+  assert.equal(isPluginBytePath("plugins/grok"), true);
+  assert.equal(isPluginBytePath("plugins/grok/.codex-plugin/plugin.json"), true);
+  assert.equal(isPluginBytePath("./plugins/grok/CHANGELOG.md"), true);
+  assert.equal(isPluginBytePath("plugins\\grok\\NOTICE"), true);
+  assert.equal(isPluginBytePath("AGENTS.md"), false);
+  assert.equal(isPluginBytePath("scripts/validate.mjs"), false);
+  assert.equal(isPluginBytePath("tests/version-policy.test.mjs"), false);
+  assert.equal(isPluginBytePath("docs/superpowers/specs/example.md"), false);
+  assert.equal(isPluginBytePath("package.json"), false);
+  assert.equal(isPluginBytePath("plugins/other/file.mjs"), false);
+});
+
+test("plugin-byte PRs must bump; docs-only PRs must not", () => {
+  assert.deepEqual(inspectPluginByteShip({
+    changedPaths: ["docs/superpowers/specs/example.md", "AGENTS.md", "scripts/validate.mjs"],
+    baseActiveVersion: "0.3.0-dev.1",
+    nextActiveVersion: "0.3.0-dev.1"
+  }), []);
+  assert.match(inspectPluginByteShip({
+    changedPaths: ["plugins/grok/scripts/lib/workspace.mjs"],
+    baseActiveVersion: "0.3.0-dev.1",
+    nextActiveVersion: "0.3.0-dev.1"
+  }).join(" "), /Plugin-byte changes under plugins\/grok require a synchronized version bump from 0\.3\.0-dev\.1/);
+  assert.deepEqual(inspectPluginByteShip({
+    changedPaths: ["plugins/grok/scripts/lib/workspace.mjs"],
+    baseActiveVersion: "0.3.0-dev.1",
+    nextActiveVersion: "0.3.0-dev.3"
+  }), []);
+});
+
+test("0.3.0-dev.2 is burned and the next development label skips it", () => {
+  assert.deepEqual(BURNED_ACTIVE_VERSIONS, ["0.3.0-dev.2"]);
+  assert.equal(nextDevelopmentPreRelease("dev.1", { targetVersion: "0.3.0" }), "dev.3");
+  assert.equal(nextDevelopmentPreRelease("dev.3", { targetVersion: "0.3.0" }), "dev.4");
+  assert.match(
+    inspectPluginByteShip({
+      changedPaths: ["plugins/grok/scripts/lib/workspace.mjs"],
+      baseActiveVersion: "0.3.0-dev.1",
+      nextActiveVersion: "0.3.0-dev.2"
+    }).join(" "),
+    /burned and MUST NOT be reused/
+  );
+  assert.match(
+    validateReleasePlan({ ...validDevelopmentPlan, preRelease: "dev.2" }).join(" "),
+    /burned and MUST NOT be reused/
+  );
+  assert.deepEqual(validateReleasePlan(validDevelopmentPlan), []);
 });

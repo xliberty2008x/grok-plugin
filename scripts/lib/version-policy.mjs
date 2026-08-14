@@ -6,6 +6,58 @@ import { execFileSync } from "node:child_process";
 const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*))?$/;
 const CHANGE_CLASSES = new Set(["patch", "feature", "breaking"]);
 const STAGES = new Set(["development", "release_candidate", "release"]);
+const PLUGIN_BYTE_ROOT = "plugins/grok";
+
+export const BURNED_ACTIVE_VERSIONS = Object.freeze(["0.3.0-dev.2"]);
+
+export function isPluginBytePath(relativePath) {
+  const normalized = String(relativePath || "").replaceAll("\\", "/").replace(/^\.\//, "");
+  return normalized === PLUGIN_BYTE_ROOT || normalized.startsWith(`${PLUGIN_BYTE_ROOT}/`);
+}
+
+export function nextDevelopmentPreRelease(currentPreRelease, {
+  targetVersion,
+  burnedActiveVersions = BURNED_ACTIVE_VERSIONS
+} = {}) {
+  const match = String(currentPreRelease || "").match(/^dev\.(\d+)$/);
+  if (!match) throw new Error("currentPreRelease must be dev.N");
+  let next = Number(match[1]) + 1;
+  while (burnedActiveVersions.includes(`${targetVersion}-dev.${next}`)) next += 1;
+  return `dev.${next}`;
+}
+
+export function collectChangedPathsFromGitReports({
+  mergeBaseDiff = "",
+  worktreeDiff = "",
+  untracked = ""
+} = {}) {
+  return [...new Set(
+    [mergeBaseDiff, worktreeDiff, untracked]
+      .join("\n")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+  )];
+}
+
+export function inspectPluginByteShip({
+  changedPaths = [],
+  baseActiveVersion,
+  nextActiveVersion,
+  burnedActiveVersions = BURNED_ACTIVE_VERSIONS
+} = {}) {
+  const errors = [];
+  if (nextActiveVersion && burnedActiveVersions.includes(nextActiveVersion)) {
+    errors.push(`Active version ${nextActiveVersion} is burned and MUST NOT be reused.`);
+  }
+  const pluginByteChanged = changedPaths.some((relativePath) => isPluginBytePath(relativePath));
+  if (pluginByteChanged && baseActiveVersion && nextActiveVersion === baseActiveVersion) {
+    errors.push(
+      `Plugin-byte changes under plugins/grok require a synchronized version bump from ${baseActiveVersion}.`
+    );
+  }
+  return errors;
+}
 
 export function parseSemver(value) {
   const match = String(value || "").match(SEMVER);
@@ -153,6 +205,12 @@ export function validateReleasePlan(plan) {
   if (!STAGES.has(plan.stage)) errors.push("stage must be development, release_candidate, or release.");
   if (plan.stage === "development" && !/^dev\.\d+$/.test(String(plan.preRelease || ""))) {
     errors.push("development stage requires preRelease dev.N.");
+  }
+  if (plan.stage === "development" && /^dev\.\d+$/.test(String(plan.preRelease || ""))) {
+    const active = activeVersionForPlan(plan);
+    if (BURNED_ACTIVE_VERSIONS.includes(active)) {
+      errors.push(`Active version ${active} is burned and MUST NOT be reused.`);
+    }
   }
   if (plan.stage === "release_candidate" && !/^rc\.\d+$/.test(String(plan.preRelease || ""))) {
     errors.push("release_candidate stage requires preRelease rc.N.");
