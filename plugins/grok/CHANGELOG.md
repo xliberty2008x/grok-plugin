@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0-dev.3
+
+Status: hardening candidate; not release-qualified.
+
+- Fixed the `--envelope-stdin --stdin-ready` handshake so a TaskEnvelope
+  without `userRequest` reports a field-level `E_USAGE` instead of claiming
+  `--envelope-stdin` was absent after readiness was emitted. Empty stdin and
+  invalid JSON stay distinct controlled errors. A delayed write envelope after
+  `GROK_COMPANION_STDIN_READY` still creates exactly one durable job.
+
 ## 0.3.0-dev.1
 
 Status: hardening candidate; not release-qualified.

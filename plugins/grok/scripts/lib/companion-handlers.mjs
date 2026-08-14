@@ -274,7 +274,14 @@ async function handleTask(raw) {
       ? parseTaskEnvelopeInput(readPrivateEnvelopeFile(options["envelope-file"]))
       : null;
   const promptText = envelopeInput?.userRequest ?? positionals.join(" ").trim();
-  if (!promptText) throw new CompanionError("E_USAGE", "Provide a task for Grok or pass --envelope-stdin.");
+  if (!promptText) {
+    throw new CompanionError(
+      "E_USAGE",
+      options["envelope-stdin"] || options["envelope-file"]
+        ? "TaskEnvelope userRequest must be a non-empty string."
+        : "Provide a task for Grok or pass --envelope-stdin."
+    );
+  }
   if (options.write && !envelopeInput) {
     throw new CompanionError("E_USAGE", "Write tasks require a structured TaskEnvelope via --envelope-stdin or --envelope-file.");
   }
