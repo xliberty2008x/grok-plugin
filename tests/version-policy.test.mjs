@@ -12,6 +12,7 @@ import {
   inspectPluginByteShip,
   isPluginBytePath,
   nextDevelopmentPreRelease,
+  pluginByteShipBaseErrors,
   qualificationEvidencePath,
   qualificationSourceDigest,
   validateQualificationEvidence,
@@ -193,4 +194,13 @@ test("0.3.0-dev.2 is burned and the next development label skips it", () => {
     /burned and MUST NOT be reused/
   );
   assert.deepEqual(validateReleasePlan(validDevelopmentPlan), []);
+});
+
+test("hosted PR validation fails closed when the version base cannot be resolved", () => {
+  assert.deepEqual(pluginByteShipBaseErrors({ githubBaseRefSet: false, baseResolved: false }), []);
+  assert.deepEqual(pluginByteShipBaseErrors({ githubBaseRefSet: true, baseResolved: true }), []);
+  assert.match(
+    pluginByteShipBaseErrors({ githubBaseRefSet: true, baseResolved: false }).join(" "),
+    /Could not resolve version base/
+  );
 });

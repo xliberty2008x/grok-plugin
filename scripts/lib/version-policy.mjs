@@ -40,6 +40,13 @@ export function collectChangedPathsFromGitReports({
   )];
 }
 
+export function pluginByteShipBaseErrors({ githubBaseRefSet = false, baseResolved = false } = {}) {
+  if (githubBaseRefSet && !baseResolved) {
+    return ["Could not resolve version base for the plugin-byte ship check."];
+  }
+  return [];
+}
+
 export function inspectPluginByteShip({
   changedPaths = [],
   baseActiveVersion,

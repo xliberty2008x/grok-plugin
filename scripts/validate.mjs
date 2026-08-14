@@ -18,6 +18,7 @@ import {
   activeVersionForPlan,
   collectChangedPathsFromGitReports,
   inspectPluginByteShip,
+  pluginByteShipBaseErrors,
   qualificationEvidencePath,
   qualificationSourceDigest,
   validateQualificationEvidence,
@@ -174,11 +175,27 @@ function gitText(args) {
 }
 
 function pluginByteShipChecks(version) {
+  const githubBaseRef = process.env.GITHUB_BASE_REF || "";
   const baseRef = process.env.GROK_VERSION_BASE_REF
-    || (process.env.GITHUB_BASE_REF ? `origin/${process.env.GITHUB_BASE_REF}` : "origin/main");
-  if (gitText(["rev-parse", "--verify", `${baseRef}^{commit}`]) == null) return;
+    || (githubBaseRef ? `origin/${githubBaseRef}` : "origin/main");
+  if (gitText(["rev-parse", "--verify", `${baseRef}^{commit}`]) == null && githubBaseRef) {
+    gitText(["fetch", "--no-tags", "--depth=1", "origin", githubBaseRef]);
+  }
+  const baseResolved = gitText(["rev-parse", "--verify", `${baseRef}^{commit}`]) != null;
+  for (const message of pluginByteShipBaseErrors({
+    githubBaseRefSet: Boolean(githubBaseRef || process.env.GROK_VERSION_BASE_REF),
+    baseResolved
+  })) {
+    problem(message, "release-plan.json");
+  }
+  if (!baseResolved) return;
   const mergeBaseDiff = gitText(["diff", "--name-only", `${baseRef}...HEAD`]);
-  if (mergeBaseDiff == null) return;
+  if (mergeBaseDiff == null) {
+    if (githubBaseRef || process.env.GROK_VERSION_BASE_REF) {
+      problem(`Could not diff plugin-byte changes against ${baseRef}.`, "release-plan.json");
+    }
+    return;
+  }
   const changedPaths = collectChangedPathsFromGitReports({
     mergeBaseDiff,
     worktreeDiff: gitText(["diff", "--name-only", "HEAD"]) || "",

@@ -131,7 +131,9 @@ burned cache directory, reinstall `0.3.0-dev.1` from that clean tree.
 | Any tree using `0.3.0-dev.2` | `validate` fails: burned |
 | Docs-only PR at `0.3.0-dev.1` | Pass |
 | Plugin-byte PR at `0.3.0-dev.3` | Pass (subject to existing synchronized-manifest checks) |
-| Base ref missing | Skip bump-required; still reject burned |
+| Base ref missing locally | Skip bump-required; still reject burned |
+| Hosted PR (`GITHUB_BASE_REF` or `GROK_VERSION_BASE_REF` set) and base missing after fetch | Fail closed |
+| Hosted PR checkout | CI fetches `origin/${{ github.base_ref }}` before `validate` |
 | Merged feature branch still on origin | Any agent deletes it |
 
 ## 7. Testing
