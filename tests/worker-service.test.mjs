@@ -1304,3 +1304,63 @@ test("WorkerService rejects mailbox admission when provider capability expires a
     (error) => error?.code === "E_CAPABILITY"
   );
 });
+
+test("waitAny returns early when any owned worker is terminal and does not require a launch", async () => {
+  const root = initRepo();
+  const running = record("task-aaaaaaaaaaaaaaaa", THREAD_A);
+  const finished = record("task-bbbbbbbbbbbbbbbb", THREAD_A, {
+    status: "completed",
+    phase: "done",
+    completedAt: "2026-07-15T00:01:00.000Z"
+  });
+  let dispatched = 0;
+  const service = createWorkerService({
+    root,
+    principal: { hostKind: "codex", threadId: THREAD_A },
+    readJob: (cwd, id) => [running, finished].find((job) => job.id === id) || null,
+    listJobs: () => [running, finished],
+    dispatchWorker: async () => {
+      dispatched += 1;
+      throw new Error("waitAny must not launch a provider");
+    }
+  });
+  const observed = await service.waitAny(
+    [running.id, finished.id],
+    { timeoutMs: 0 }
+  );
+  assert.equal(observed.timedOut, false);
+  assert.equal(dispatched, 0);
+  const changed = observed.streams.filter((stream) => stream.events.length || stream.terminal);
+  assert.equal(changed.length >= 1, true);
+  assert.equal(changed.some((stream) => stream.workerId === finished.id && stream.terminal), true);
+  assert.equal(
+    new Set(observed.streams.map((stream) => stream.workerId)).size,
+    2
+  );
+});
+
+test("waitAny times out with empty streams and rejects a foreign worker", async () => {
+  const root = initRepo();
+  const first = record("task-aaaaaaaaaaaaaaaa", THREAD_A);
+  const second = record("task-bbbbbbbbbbbbbbbb", THREAD_A);
+  const foreign = record("task-cccccccccccccccc", THREAD_B);
+  const service = createWorkerService({
+    root,
+    principal: { hostKind: "codex", threadId: THREAD_A },
+    readJob: (cwd, id) => [first, second, foreign].find((job) => job.id === id) || null,
+    listJobs: () => [first, second, foreign]
+  });
+  const timeout = await service.waitAny([first.id, second.id], {
+    cursors: [
+      { schemaVersion: 1, workerId: first.id, sequence: 1 },
+      { schemaVersion: 1, workerId: second.id, sequence: 1 }
+    ],
+    timeoutMs: 0
+  });
+  assert.equal(timeout.timedOut, true);
+  assert.equal(timeout.streams.every((stream) => stream.events.length === 0), true);
+  await assert.rejects(
+    () => service.waitAny([first.id, foreign.id], { timeoutMs: 0 }),
+    (error) => error?.code === "E_JOB_NOT_FOUND"
+  );
+});

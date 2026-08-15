@@ -113,14 +113,26 @@ export const BASE_WORKER_TOOLS = deepFreeze([
   {
     name: "worker_wait",
     title: "Wait for Grok worker progress",
-    description: "Wait up to 30 seconds for new lifecycle events or terminal state, draining this owned worker's durable launch outbox before authority-bound recovery maintenance.",
+    description: "Wait up to 30 seconds for new lifecycle events or terminal state, draining this owned worker's durable launch outbox before authority-bound recovery maintenance. Two or more ids wait for any owned worker to change and never launch a provider.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
-      required: ["id"],
       properties: {
         id: WORKER_ID_SCHEMA,
+        ids: {
+          type: "array",
+          minItems: 2,
+          maxItems: 16,
+          uniqueItems: true,
+          items: WORKER_ID_SCHEMA
+        },
         cursor: CURSOR_SCHEMA,
+        cursors: {
+          type: "array",
+          minItems: 2,
+          maxItems: 16,
+          items: CURSOR_SCHEMA
+        },
         timeoutMs: { type: "integer", minimum: 0, maximum: MAX_WORKER_WAIT_MS }
       }
     },
@@ -567,6 +579,15 @@ function schemaAccepts(value, schema) {
     const length = Array.from(value).length;
     if (Number.isInteger(schema.minLength) && length < schema.minLength) return false;
     if (Number.isInteger(schema.maxLength) && length > schema.maxLength) return false;
+  } else if (schema.type === "array") {
+    if (!Array.isArray(value)) return false;
+    if (Number.isInteger(schema.minItems) && value.length < schema.minItems) return false;
+    if (Number.isInteger(schema.maxItems) && value.length > schema.maxItems) return false;
+    if (schema.uniqueItems) {
+      const seen = new Set(value.map((item) => JSON.stringify(item)));
+      if (seen.size !== value.length) return false;
+    }
+    return value.every((item) => schemaAccepts(item, schema.items || {}));
   } else if (schema.type === "integer") {
     if (!Number.isSafeInteger(value)) return false;
     if (Number.isFinite(schema.minimum) && value < schema.minimum) return false;
@@ -669,6 +690,28 @@ export function negotiateMcpProtocolVersion(requested) {
   return requested;
 }
 
+async function handleWorkerWait(service, args) {
+  if (Array.isArray(args.ids) === Boolean(args.id)) {
+    throw new CompanionError("E_USAGE", "Use exactly one of id or ids.");
+  }
+  if (Array.isArray(args.ids)) {
+    if (args.cursor !== undefined) {
+      throw new CompanionError("E_USAGE", "ids uses cursors, not cursor.");
+    }
+    return toolResult(await service.waitAny(args.ids, {
+      cursors: args.cursors ?? null,
+      timeoutMs: args.timeoutMs
+    }));
+  }
+  if (args.cursors !== undefined) {
+    throw new CompanionError("E_USAGE", "cursors is not valid for a single-worker wait.");
+  }
+  return toolResult({ stream: await service.wait(args.id, {
+    cursor: args.cursor ?? null,
+    timeoutMs: args.timeoutMs
+  }) });
+}
+
 export async function callWorkerTool(params, options = {}) {
   const name = params?.name;
   const runtime = brokerRuntime(options);
@@ -742,12 +785,7 @@ export async function callWorkerTool(params, options = {}) {
     if (name === "worker_events_after") {
       return toolResult({ stream: service.eventsAfter(args.id, args.cursor ?? null) });
     }
-    if (name === "worker_wait") {
-      return toolResult({ stream: await service.wait(args.id, {
-        cursor: args.cursor ?? null,
-        timeoutMs: args.timeoutMs
-      }) });
-    }
+    if (name === "worker_wait") return await handleWorkerWait(service, args);
     if (name === "worker_result") {
       const worker = service.result(args.id);
       const artifact = service.artifactMetadata(args.id);
