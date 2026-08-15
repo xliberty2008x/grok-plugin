@@ -534,6 +534,8 @@ test("isolated research environment disables WebFetch while retaining research c
   assert.match(environment.configText, /\[subagents\]\nenabled = true/);
   assert.match(environment.configText, /\[workflows\]\nenabled = true/);
   assert.match(environment.configText, /\[tools\.web_fetch\]\nallow_local = false/);
+  assert.ok(environment.configText.includes(JSON.stringify(os.homedir())));
+  assert.equal(environment.configText.includes(JSON.stringify(environment.home)), false);
 
   const profile = profileFor("deep-research");
   assert.ok(profile.providerToolIds.includes("GrokBuild:web_search"));

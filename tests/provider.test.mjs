@@ -1474,7 +1474,7 @@ test("isolated ACP homes reject external discovery and redact opaque copied cred
   await withFake({ inspectValue: { hooks: [{ event: "SessionStart" }], skills: [], plugins: [], mcpServers: [], agents: [] } }, async () => {
     await assert.rejects(
       () => runProvider({ root: initRepo(), profile: profileFor("task", false), prompt: "inspect", stateDir: tempDir("provider-state-") }),
-      (error) => error.code === "E_CAPABILITY" && /external hooks/.test(error.message)
+      (error) => error.code === "E_CAPABILITY" && /external hooks/.test(error.message) && error.details?.contamination?.includes("hooks")
     );
   });
 
@@ -1486,7 +1486,7 @@ test("isolated ACP homes reject external discovery and redact opaque copied cred
   await withFake({ inspectValue: { hooks: [], skills: [{ name: "external", source: { type: "user", path: "/tmp/external/SKILL.md" } }], plugins: [], mcpServers: [], agents: [] } }, async () => {
     await assert.rejects(
       () => runProvider({ root: initRepo(), profile: profileFor("task", false), prompt: "inspect", stateDir: tempDir("provider-state-") }),
-      (error) => error.code === "E_CAPABILITY" && /external hooks/.test(error.message)
+      (error) => error.code === "E_CAPABILITY" && /external skills/.test(error.message) && error.details?.contamination?.includes("skills") && !/\/tmp\/external/.test(JSON.stringify(error))
     );
   });
 });

@@ -46,8 +46,19 @@ export function inspectIsolation(binary, root, environment) {
       });
     } catch { return true; }
   });
-  if ((value.hooks || []).length || externalSkills.length || (value.plugins || []).length || (value.mcpServers || []).length || nonBuiltinAgents.length) {
-    throw new CompanionError("E_CAPABILITY", "The isolated provider environment loaded external hooks, skills, plugins, MCP servers, or agents.");
+  const contamination = [
+    (value.hooks || []).length ? "hooks" : null,
+    externalSkills.length ? "skills" : null,
+    (value.plugins || []).length ? "plugins" : null,
+    (value.mcpServers || []).length ? "mcpServers" : null,
+    nonBuiltinAgents.length ? "agents" : null
+  ].filter(Boolean);
+  if (contamination.length) {
+    throw new CompanionError(
+      "E_CAPABILITY",
+      `The isolated provider environment loaded external ${contamination.join(", ")}.`,
+      { contamination }
+    );
   }
   return value;
 }
