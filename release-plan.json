@@ -4,7 +4,11 @@
   "changeClass": "breaking",
   "targetVersion": "0.3.0",
   "stage": "development",
+<<<<<<< HEAD
   "preRelease": "dev.7",
+=======
+  "preRelease": "dev.8",
+>>>>>>> 8e2260a (fix: keep record-verification paths from the write job)
   "supportedHosts": [
     "codex",
     "claude-code"
