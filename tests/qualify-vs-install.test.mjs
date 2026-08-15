@@ -8,7 +8,11 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { runLocalCodexInstall } from "../scripts/lib/local-codex-install.mjs";
-import { runLocalQualify } from "../scripts/lib/local-qualify.mjs";
+import {
+  acquireQualifyLock,
+  releaseQualifyLock,
+  runLocalQualify
+} from "../scripts/lib/local-qualify.mjs";
 import {
   assertReceiptMatchesIdentity,
   buildQualificationReceipt,
@@ -218,4 +222,70 @@ test("qualify timeout kills the child and writes no receipt", async () => {
   }
   assert.equal(fs.existsSync(receiptPath), false);
   assert.ok(killed.some((entry) => entry.signal === "SIGTERM"));
+});
+
+test("successful check after timeout still writes a receipt", async () => {
+  const receiptPath = path.join(tempDir(), "receipt.json");
+  const child = mockSpawn({ hangMs: 60_000 })("node", ["-e", "1"]);
+  const originalKill = process.kill;
+  process.kill = (pid, signal) => {
+    if (signal === "SIGTERM") {
+      queueMicrotask(() => child.emit("close", 0, null));
+    }
+  };
+  try {
+    const result = await runLocalQualify({
+      root: ROOT,
+      receiptPath,
+      timeoutMs: 20,
+      killGraceMs: 20,
+      spawn() {
+        return child;
+      },
+      write() {}
+    });
+    assert.equal(result.receipt.source_digest, collectInstallIdentity(ROOT).sourceDigest);
+    assert.equal(fs.existsSync(receiptPath), true);
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("package or marketplace drift during qualify writes no receipt", async () => {
+  const receiptPath = path.join(tempDir(), "receipt.json");
+  const first = collectInstallIdentity(ROOT);
+  let calls = 0;
+  await assert.rejects(
+    () => runLocalQualify({
+      root: ROOT,
+      receiptPath,
+      timeoutMs: 5_000,
+      spawn: mockSpawn({ stdout: "ok\n" }),
+      write() {},
+      collectIdentity() {
+        calls += 1;
+        if (calls === 1) return first;
+        return { ...first, packageDigest: "cd".repeat(32) };
+      }
+    }),
+    /package metadata, or marketplace digest changed/
+  );
+  assert.equal(fs.existsSync(receiptPath), false);
+});
+
+test("a second qualify fails while the exclusive lock is held", async () => {
+  const lockPath = acquireQualifyLock(ROOT);
+  try {
+    await assert.rejects(
+      () => runLocalQualify({
+        root: ROOT,
+        receiptPath: path.join(tempDir(), "receipt.json"),
+        spawn: mockSpawn(),
+        write() {}
+      }),
+      /already running/
+    );
+  } finally {
+    releaseQualifyLock(lockPath);
+  }
 });

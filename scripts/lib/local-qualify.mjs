@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
 import {
@@ -10,23 +12,92 @@ import {
 } from "./qualification-receipt.mjs";
 
 export const DEFAULT_QUALIFY_TIMEOUT_MS = 45 * 60_000;
+export const QUALIFY_KILL_GRACE_MS = 1_000;
 
 function fail(message, details = "") {
   const suffix = details.trim() ? `\n${details.trim()}` : "";
   throw new Error(`${message}${suffix}`);
 }
 
-function killProcessTree(pid, signal) {
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+export function qualificationLockPath(root) {
+  return path.join(root, ".qualification", "qualify.lock");
+}
+
+function killProcessTree(pid, signal, killer) {
   if (!Number.isInteger(pid) || pid < 1) return;
+  const send = killer ?? process.kill.bind(process);
   try {
-    process.kill(-pid, signal);
+    send(-pid, signal);
   } catch {
     try {
-      process.kill(pid, signal);
+      send(pid, signal);
     } catch {
       // Already gone.
     }
   }
+}
+
+function processIsAlive(pid, killer) {
+  if (!Number.isInteger(pid) || pid < 1) return false;
+  const send = killer ?? process.kill.bind(process);
+  try {
+    send(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function acquireQualifyLock(root, options = {}) {
+  const lockPath = qualificationLockPath(root);
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  const openExclusive = () => {
+    const fd = fs.openSync(lockPath, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, `${process.pid}\n`);
+    } finally {
+      fs.closeSync(fd);
+    }
+    return lockPath;
+  };
+  try {
+    return openExclusive();
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    let owner = 0;
+    try {
+      owner = Number(fs.readFileSync(lockPath, "utf8").trim());
+    } catch {
+      owner = 0;
+    }
+    if (processIsAlive(owner, options.kill)) {
+      fail(`Qualification already running (pid ${owner}).`);
+    }
+    fs.rmSync(lockPath, { force: true });
+    return openExclusive();
+  }
+}
+
+export function releaseQualifyLock(lockPath) {
+  if (typeof lockPath === "string" && lockPath.length > 0) {
+    fs.rmSync(lockPath, { force: true });
+  }
+}
+
+function identityDrifted(before, after) {
+  return (
+    after.sourceDigest !== before.sourceDigest
+    || after.packageDigest !== before.packageDigest
+    || after.marketplaceDigest !== before.marketplaceDigest
+    || after.version !== before.version
+    || after.fileCount !== before.fileCount
+  );
 }
 
 /**
@@ -47,80 +118,103 @@ export async function runLocalQualify(options = {}) {
   const spawnImpl = options.spawn ?? spawn;
   const write = options.write ?? ((text) => process.stdout.write(text));
   const now = options.now ?? (() => new Date());
+  const host = options.process ?? process;
+  const killer = options.kill ?? process.kill.bind(process);
+  const graceMs = options.killGraceMs ?? QUALIFY_KILL_GRACE_MS;
 
-  const identity = collectInstallIdentity(root);
-  write(`Qualifying ${identity.version} (${identity.fileCount} plugin files)...\n`);
-  write(`phase: repository-check\n`);
+  const lockPath = acquireQualifyLock(root, { kill: killer });
+  let child = null;
+  const forward = (signal) => {
+    write(`phase: forwarding ${signal}\n`);
+    if (child?.pid) killProcessTree(child.pid, signal, killer);
+  };
+  host.on("SIGINT", forward);
+  host.on("SIGTERM", forward);
+  try {
+    const collectIdentity = options.collectIdentity ?? collectInstallIdentity;
+    const identity = collectIdentity(root);
+    write(`Qualifying ${identity.version} (${identity.fileCount} plugin files)...\n`);
+    write(`phase: repository-check\n`);
 
-  const child = spawnImpl(npmBin, checkArgs, {
-    cwd: root,
-    env: options.env ?? process.env,
-    stdio: ["ignore", "pipe", "pipe"],
-    shell: false,
-    detached: process.platform !== "win32"
-  });
-  if (!Number.isInteger(child.pid) || child.pid < 1) {
-    fail("Could not start npm run check.");
-  }
+    child = spawnImpl(npmBin, checkArgs, {
+      cwd: root,
+      env: options.env ?? process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: false,
+      detached: process.platform !== "win32"
+    });
+    if (!Number.isInteger(child.pid) || child.pid < 1) {
+      fail("Could not start npm run check.");
+    }
 
-  let stdout = "";
-  let stderr = "";
-  child.stdout?.on("data", (chunk) => {
-    const text = String(chunk);
-    stdout += text;
-    write(text);
-  });
-  child.stderr?.on("data", (chunk) => {
-    const text = String(chunk);
-    stderr += text;
-    write(text);
-  });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => {
+      const text = String(chunk);
+      stdout += text;
+      write(text);
+    });
+    child.stderr?.on("data", (chunk) => {
+      const text = String(chunk);
+      stderr += text;
+      write(text);
+    });
 
-  let timedOut = false;
-  let timer;
-  const exit = await new Promise((resolve, reject) => {
-    timer = setTimeout(() => {
+    const closed = new Promise((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", (status, signal) => {
+        resolve({ status, signal });
+      });
+    });
+
+    let timedOut = false;
+    const timeoutWait = sleep(timeoutMs).then(() => {
       timedOut = true;
+    });
+    let exit = await Promise.race([closed, timeoutWait.then(() => null)]);
+    if (exit == null) {
       write(`phase: repository-check timeout after ${timeoutMs}ms; stopping children\n`);
-      killProcessTree(child.pid, "SIGTERM");
-      setTimeout(() => killProcessTree(child.pid, "SIGKILL"), 1_000).unref?.();
-    }, timeoutMs);
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on("close", (status, signal) => {
-      clearTimeout(timer);
-      resolve({ status, signal });
-    });
-  });
+      killProcessTree(child.pid, "SIGTERM", killer);
+      exit = await Promise.race([closed, sleep(graceMs).then(() => null)]);
+      if (exit == null) {
+        killProcessTree(child.pid, "SIGKILL", killer);
+        exit = await closed;
+      }
+    }
 
-  if (timedOut) {
-    fail(
-      "Qualification timed out during phase repository-check.",
-      "Timed-out children were signaled. Retry only after this command exits."
-    );
-  }
-  if (exit.status !== 0) {
-    fail(
-      `npm run check exited with status ${exit.status}.`,
-      [stdout, stderr].filter(Boolean).join("\n")
-    );
-  }
+    if (timedOut && exit.status !== 0) {
+      fail(
+        "Qualification timed out during phase repository-check.",
+        "Timed-out children were signaled. Retry only after this command exits."
+      );
+    }
+    if (exit.status !== 0) {
+      fail(
+        `npm run check exited with status ${exit.status}.`,
+        [stdout, stderr].filter(Boolean).join("\n")
+      );
+    }
 
-  const current = collectInstallIdentity(root);
-  if (current.sourceDigest !== identity.sourceDigest) {
-    fail("Source plugin changed while qualification was running; no receipt written.");
+    const current = collectIdentity(root);
+    if (identityDrifted(identity, current)) {
+      fail(
+        "Source plugin, package metadata, or marketplace digest changed while qualification was running; no receipt written."
+      );
+    }
+    const receipt = buildQualificationReceipt(current, {
+      createdAt: now().toISOString(),
+      checkCommand: "npm run check"
+    });
+    assertReceiptMatchesIdentity(receipt, current);
+    const receiptPath = options.receiptPath ?? qualificationReceiptPath(root);
+    writeQualificationReceiptAtomic(receiptPath, receipt);
+    write(`Qualification receipt written: ${receiptPath}\n`);
+    write(`  version: ${receipt.version}\n`);
+    write(`  digest:  ${receipt.source_digest}\n`);
+    return { receipt, receiptPath, identity: current };
+  } finally {
+    host.off("SIGINT", forward);
+    host.off("SIGTERM", forward);
+    releaseQualifyLock(lockPath);
   }
-  const receipt = buildQualificationReceipt(current, {
-    createdAt: now().toISOString(),
-    checkCommand: "npm run check"
-  });
-  assertReceiptMatchesIdentity(receipt, current);
-  const receiptPath = options.receiptPath ?? qualificationReceiptPath(root);
-  writeQualificationReceiptAtomic(receiptPath, receipt);
-  write(`Qualification receipt written: ${receiptPath}\n`);
-  write(`  version: ${receipt.version}\n`);
-  write(`  digest:  ${receipt.source_digest}\n`);
-  return { receipt, receiptPath, identity: current };
 }
