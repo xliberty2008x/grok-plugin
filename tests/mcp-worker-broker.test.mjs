@@ -289,6 +289,48 @@ test("write-smoke owner lifecycle exposes bounded preview, integrate, verify, ab
   );
 });
 
+test("worker_wait ids waits for any owned worker without creating a service launch", async () => {
+  let waited = null;
+  const result = await callWorkerTool({
+    name: "worker_wait",
+    arguments: {
+      ids: ["task-aaaaaaaaaaaaaaaa", "task-bbbbbbbbbbbbbbbb"],
+      timeoutMs: 0
+    },
+    _meta: {
+      threadId: PRINCIPAL.threadId,
+      "x-codex-turn-metadata": {
+        thread_id: PRINCIPAL.threadId,
+        turn_id: PRINCIPAL.turnId
+      },
+      plugin_id: "grok@grok-companion",
+      [MCP_SANDBOX_STATE_META_CAPABILITY]: {
+        sandboxCwd: pathToFileURL(ROOT).href
+      }
+    }
+  }, {
+    runtime: SPAWN_RUNTIME,
+    readProviderCapabilityReceipt: () => SPAWN_RECEIPT,
+    createService() {
+      return {
+        async wait() {
+          throw new Error("single-id wait must not run");
+        },
+        async waitAny(ids, options) {
+          waited = { ids, options };
+          return {
+            streams: ids.map((id) => ({ workerId: id, events: [], terminal: false, timedOut: true })),
+            timedOut: true
+          };
+        }
+      };
+    }
+  });
+  assert.equal(result.structuredContent?.ok, true, JSON.stringify(result));
+  assert.equal(result.structuredContent.timedOut, true);
+  assert.deepEqual(waited.ids, ["task-aaaaaaaaaaaaaaaa", "task-bbbbbbbbbbbbbbbb"]);
+});
+
 test("worker_wait requires mutation authority before recovery-capable service creation", async () => {
   let serviceCreated = false;
   const withoutPluginId = {

@@ -293,6 +293,46 @@ export function createWorkerService({
       }
     },
 
+    async waitAny(ids, { cursors = null, timeoutMs: requestedTimeoutMs } = {}) {
+      const uniqueIds = [...new Set((Array.isArray(ids) ? ids : []).map((id) => String(id)))];
+      if (uniqueIds.length < 2) {
+        throw new CompanionError("E_USAGE", "worker_wait ids must contain at least two owned worker identities.");
+      }
+      if (uniqueIds.length > 16) {
+        throw new CompanionError("E_USAGE", "worker_wait ids cannot exceed 16 workers.");
+      }
+      const timeoutMs = assertWaitMs(requestedTimeoutMs);
+      const cursorById = new Map();
+      if (cursors != null) {
+        if (!Array.isArray(cursors) || cursors.length !== uniqueIds.length) {
+          throw new CompanionError("E_USAGE", "worker_wait cursors must align 1:1 with ids.");
+        }
+        uniqueIds.forEach((id, index) => cursorById.set(id, cursors[index] ?? null));
+      }
+      for (const id of uniqueIds) ownedJob(id);
+      const deadline = clock() + timeoutMs;
+      for (;;) {
+        await maintainIfDue();
+        const streams = uniqueIds.map((id) => {
+          const job = ownedJob(id);
+          const stream = projectWorkerLifecycleCursor(job, cursorById.get(id) ?? null, {
+            trustHostAuthority: false
+          });
+          return { ...stream, workerId: id, timedOut: false };
+        });
+        const changed = streams.some((stream) => stream.events.length || stream.terminal);
+        if (changed) return { streams, timedOut: false };
+        const remaining = deadline - clock();
+        if (remaining <= 0) {
+          return {
+            streams: streams.map((stream) => ({ ...stream, timedOut: true })),
+            timedOut: true
+          };
+        }
+        await sleep(Math.min(WAIT_POLL_MS, remaining));
+      }
+    },
+
     result(id) {
       const job = ownedJob(id);
       if (!isWorkerTerminal(job)) {
