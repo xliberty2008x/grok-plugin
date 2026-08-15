@@ -13,8 +13,9 @@ qualify a live complex-diff review.
 - Local adaptation: one same-session repair remains. If the second
   payload is still invalid, the job stays `E_SCHEMA` with no `verdict:
   pass`, and public error details keep the validation `reason` plus a
-  sanitized findings partial. Raw plan/progress summaries are not
-  echoed.
+  sanitized findings partial. The projector lives in
+  `public-schema-error.mjs` so `worker-protocol.mjs` stays at its exact
+  2097-line cap. Raw plan/progress summaries are not echoed.
 - Rejected or missing pattern: loosening empty-findings ship grammar
   so a placeholder can become pass.
 
