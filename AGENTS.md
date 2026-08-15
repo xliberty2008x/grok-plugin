@@ -45,8 +45,8 @@ reach Codex until someone refreshes that snapshot.
 - **Docs, tests, and tooling outside `plugins/grok/` do not bump.** This
   governance change stays on `0.3.0-dev.1`.
 - **`0.3.0-dev.2` is burned** and MUST NOT be reused. It was a local Codex
-  cache of old bytes, not a GitHub release. While `main` is `0.3.0-dev.4`, the
-  next plugin-byte ship is `0.3.0-dev.5` (use `nextDevelopmentPreRelease` in
+  cache of old bytes, not a GitHub release. While `main` is `0.3.0-dev.5`, the
+  next plugin-byte ship is `0.3.0-dev.6` (use `nextDevelopmentPreRelease` in
   `scripts/lib/version-policy.mjs` so later burned labels are skipped).
 - **Do not leave a dirty version label** in
   `~/.codex/local-marketplaces/grok-companion-src`. That checkout must match

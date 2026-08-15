@@ -519,6 +519,20 @@ test("write PTY --envelope-stdin --stdin-ready admits one delayed envelope after
   assert.ok(job.id);
   assert.equal(job.write, true);
   assert.equal(jobRecordFiles(pluginData).length, 1);
+  const terminalStatus = run(
+    process.execPath,
+    [
+      pinned.codexCompanionScript,
+      "status",
+      job.id,
+      "--wait",
+      "--timeout-ms",
+      "30000",
+      "--json"
+    ],
+    { cwd: root, env: pinned.env, timeout: 45_000 }
+  );
+  assert.equal(terminalStatus.status, 0, terminalStatus.stderr || terminalStatus.stdout);
 });
 
 test("buildWorkerReport refuses complete when required acceptance stays unknown", () => {

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0-dev.5
+
+Status: hardening candidate; not release-qualified.
+
+- Working-tree review now records the dirty target paths in runtime evidence
+  instead of the empty read-only mutation set. A dirty repository that binds
+  zero changed paths fails closed with `E_REVIEW_TARGET` and cannot emit
+  `Verdict: pass`.
+
 ## 0.3.0-dev.4
 
 Status: hardening candidate; not release-qualified.
