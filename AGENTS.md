@@ -54,8 +54,10 @@ reach Codex until someone refreshes that snapshot.
 - **Refresh Codex from clean `main`:** restore the marketplace source, delete
   any burned or wrong version directory under
   `~/.codex/plugins/cache/grok-companion/grok/`, then from that source run
-  `npm run codex:update-local` (or `codex plugin add grok@grok-companion`).
-  Start a new Codex task after the refresh.
+  `npm run qualify` once for the exact bytes and `npm run codex:update-local`
+  (or `npm run codex:install`) to verify the receipt and refresh the cache.
+  Start a new Codex task after the refresh. Do not use `codex:update-local`
+  as a 45-minute repository test wrapper.
 
 ## Branch hygiene
 

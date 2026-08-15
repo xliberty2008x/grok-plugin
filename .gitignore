@@ -8,6 +8,7 @@ plugins/grok/.generated/
 # Runtime and local state
 *.log
 *.pid
+.qualification/
 .env
 .env.*
 !.env.example

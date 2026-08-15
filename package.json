@@ -19,6 +19,8 @@
     "test:installed-worker-mcp:two-writer": "node scripts/test-installed-worker-mcp.mjs --two-writer",
     "test:phase3-focused": "node scripts/test-phase3-focused.mjs",
     "test:natural-codex": "node scripts/test-natural-codex.mjs",
+    "qualify": "node scripts/qualify-local.mjs",
+    "codex:install": "node scripts/update-local-codex.mjs",
     "codex:update-local": "node scripts/update-local-codex.mjs",
     "check:source-structure": "node scripts/check-source-structure.mjs",
     "structure:check": "node scripts/check-source-structure.mjs",

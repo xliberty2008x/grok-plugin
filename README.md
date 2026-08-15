@@ -653,7 +653,8 @@ npm run test:temp:cleanup # dry-run manifest-backed temp cleanup; add -- --legac
 npm run test:temp:cleanup -- --apply --older-than 1h # remove only revalidated inactive candidates
 npm run test:pty-ingress  # issue #2 real nonblocking PTY + negative-input gate
 npm run test:installed-codex # clean CODEX_HOME install and cached-wrapper gate
-npm run codex:update-local # verify, reinstall into this Codex home, compare source/cache
+npm run qualify            # stream npm run check and write a byte-bound receipt
+npm run codex:update-local # verify that receipt, reinstall, compare source/cache
 npm run test:natural-codex # quota-using installed Codex -> real Grok -> host-check gate
 npm run version:check     # versions only
 npm run version:bump      # coordinated version bump helper
