@@ -21,7 +21,7 @@ import { assertExecutionBinding } from "./worker-execution-binding.mjs";
 import { expectedWorkerWorktreeRoot } from "./worker-worktree.mjs";
 
 const JOB_ID_PATTERN = /^(review|adversarial-review|task|stop-review|deep-research)-[a-f0-9]{16,64}$/;
-const JOB_STATUSES = new Set(["queued", "running", "completed", "failed", "cancelled"]);
+const JOB_STATUSES = new Set(["queued", "running", "interrupted", "completed", "failed", "cancelled"]);
 const JOB_CLASS_BY_KIND = new Map([
   ["task", "task"],
   ["review", "review"],
@@ -30,7 +30,7 @@ const JOB_CLASS_BY_KIND = new Map([
   ["deep-research", "research"]
 ]);
 const JOB_CLASSES = new Set(JOB_CLASS_BY_KIND.values());
-const ACTIVE = new Set(["queued", "running"]);
+const ACTIVE = new Set(["queued", "running", "interrupted"]);
 const LOCK_OWNER_START_TOKEN = processStartToken(process.pid);
 const LOCK_CONSTRUCTION_GRACE_MS = 30_000;
 const LOCK_TRANSITION_FILE = "transition.json";

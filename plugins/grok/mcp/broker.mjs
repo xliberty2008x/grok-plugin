@@ -153,14 +153,15 @@ export const BASE_WORKER_TOOLS = deepFreeze([
   {
     name: "worker_cancel",
     title: "Cancel a Grok worker",
-    description: "Idempotently request cancellation. Returns an immutable receipt; exactly one cancellation-request event is recorded.",
+    description: "Idempotently request cancellation or a resumable interrupt. mode=interrupt stops the current attempt and keeps the worker available for follow-up when the provider session can be preserved; otherwise it falls back to terminal cancel. Exactly one receipt is recorded per idempotency key.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       required: ["id", "idempotencyKey"],
       properties: {
         id: WORKER_ID_SCHEMA,
-        idempotencyKey: { type: "string", minLength: 8, maxLength: 256 }
+        idempotencyKey: { type: "string", minLength: 8, maxLength: 256 },
+        mode: { type: "string", enum: ["cancel", "interrupt"] }
       }
     },
     annotations: CANCEL_ANNOTATIONS
@@ -920,7 +921,8 @@ export async function callWorkerTool(params, options = {}) {
         replayed: followed.replayed,
         spawnSuccessDefinition: followed.spawnSuccessDefinition,
         providerLaunchState: followed.providerLaunchState,
-        providerLaunched: followed.providerLaunched
+        providerLaunched: followed.providerLaunched,
+        sessionReused: followed.sessionReused === true
       });
     }
     if (name === "worker_send") {
@@ -937,9 +939,17 @@ export async function callWorkerTool(params, options = {}) {
     if (name === "worker_cancel") {
       const cancelled = service.cancel({
         id: args.id,
-        idempotencyKey: args.idempotencyKey
+        idempotencyKey: args.idempotencyKey,
+        mode: args.mode
       });
-      return toolResult({ receipt: cancelled.receipt, replayed: cancelled.replayed });
+      return toolResult({
+        receipt: cancelled.receipt,
+        replayed: cancelled.replayed,
+        ...(cancelled.fallback ? { fallback: cancelled.fallback } : {}),
+        ...(typeof cancelled.receipt?.sessionPreserved === "boolean"
+          ? { sessionPreserved: cancelled.receipt.sessionPreserved }
+          : {})
+      });
     }
     return toolResult({ code: "E_USAGE", message: "Invalid worker broker request." }, true);
   } catch (error) {

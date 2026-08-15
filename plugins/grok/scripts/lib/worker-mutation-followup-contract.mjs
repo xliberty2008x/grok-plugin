@@ -179,6 +179,18 @@ export function terminalFollowupParent(parent) {
   );
 }
 
+export function interruptedFollowupParent(parent) {
+  return Boolean(
+    parent
+    && parent.status === "interrupted"
+    && typeof parent.grokSessionId === "string"
+    && parent.grokSessionId.length > 0
+    && parent.grokSessionId.length <= 256
+    && !/[\r\n\0]/.test(parent.grokSessionId)
+    && parent.result?.interrupt?.sessionPreserved === true
+  );
+}
+
 export function resolveParentAdmission(parent, {
   root,
   principal = null,
@@ -192,7 +204,7 @@ export function resolveParentAdmission(parent, {
       exactThreadId: parent?.host?.sessionId ?? null
     });
   }
-  if (!terminalFollowupParent(parent)) {
+  if (!terminalFollowupParent(parent) && !interruptedFollowupParent(parent)) {
     throw new CompanionError(
       "E_CAPABILITY",
       "Follow-up requires a terminal parent with an exact provider session and completed task-runtime cleanup."

@@ -53,6 +53,7 @@ const PUBLIC_EXPORTS = Object.freeze([
   "authorizeWorkerProviderRotation",
   "cancelWorker",
   "cancellationNonce",
+  "interruptWorker",
   "claimWorkerDispatch",
   "getSpawnIdempotencyRecord",
   "persistCompletedWriteArtifact",
@@ -61,6 +62,7 @@ const PUBLIC_EXPORTS = Object.freeze([
   "prepareWriteProvisionerIntent",
   "prepareWriteProvisioningReissue",
   "projectCancellationReceipt",
+  "projectInterruptReceipt",
   "promoteWriteWorkerReady",
   "providerLaunchState",
   "recordDispatchProcessNoChild",
@@ -86,7 +88,9 @@ const MOVED_PUBLIC_BINDINGS = Object.freeze({
   "worker-mutation-cancellation.mjs": Object.freeze([
     "CANCEL_METRIC_TIMESTAMPS",
     "cancelWorker",
-    "projectCancellationReceipt"
+    "interruptWorker",
+    "projectCancellationReceipt",
+    "projectInterruptReceipt"
   ]),
   "worker-mutation-dispatch-admission.mjs": Object.freeze([
     "acquireRecoveryCleanupFence",
@@ -202,7 +206,7 @@ const DIRECT_IMPORTS = Object.freeze([
   ["plugins/grok/scripts/lib/worker-runtime.mjs", "./worker-mutation-dispatch-transition.mjs", ["claimWorkerDispatch", "transitionWorkerDispatch"]],
   ["plugins/grok/scripts/lib/worker-runtime.mjs", "./worker-mutation-primitives.mjs", ["assertMutationOwnership"]],
   ["plugins/grok/scripts/lib/worker-service.mjs", "./worker-mutation-dispatch-contract.mjs", ["providerLaunchState"]],
-  ["plugins/grok/scripts/lib/worker-service.mjs", "./worker-mutation-cancellation.mjs", ["cancelWorker", "projectCancellationReceipt"]],
+  ["plugins/grok/scripts/lib/worker-service.mjs", "./worker-mutation-cancellation.mjs", ["cancelWorker", "interruptWorker", "projectCancellationReceipt", "projectInterruptReceipt"]],
   ["plugins/grok/scripts/lib/worker-service.mjs", "./worker-mutation-spawn.mjs", ["spawnReadOnlyWorker"]],
   ["plugins/grok/scripts/lib/worker-service.mjs", "./worker-mutation-write-admission.mjs", ["authorizeReadyWriteWorkerDispatch"]],
   ["scripts/live-worker-provisioner-probe.mjs", "../plugins/grok/scripts/lib/worker-mutation-write-admission.mjs", ["admitWriteWorkerPlan"]],

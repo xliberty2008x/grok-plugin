@@ -465,7 +465,7 @@ export function cancelWorker({ root, principal, workerId, idempotencyKey, env = 
 
     const updated = transaction.updateJob(workerId, (current) => {
       assertMutationOwnership(current, principal);
-      if (current.status !== "queued" && current.status !== "running") {
+      if (current.status !== "queued" && current.status !== "running" && current.status !== "interrupted") {
         cancellation.status = "already_terminal";
         cancellation.terminalRecordCommittedAt = current.completedAt || cancellation.requestAcceptedAt;
         return {
@@ -674,4 +674,129 @@ export function projectCancellationReceipt(receipt) {
     idempotencyKeyDigest: receipt.idempotencyKeyDigest || null,
     cancellationRequestSequence: receipt.cancellationRequestSequence ?? null
   };
+}
+
+export function interruptRequestDigest({ principal, workerId }) {
+  return stableDigest({
+    kind: "interrupt",
+    ownerThreadId: principal?.threadId || null,
+    workerId
+  });
+}
+
+function canPreserveProviderSession(job) {
+  const session = job?.grokSessionId;
+  return typeof session === "string"
+    && session.length > 0
+    && session.length <= 256
+    && !/[\r\n\0]/.test(session)
+    && ["queued", "running", "interrupted"].includes(job.status);
+}
+
+export function projectInterruptReceipt(receipt) {
+  if (!receipt) return null;
+  return {
+    receiptId: receipt.receiptId,
+    workerId: receipt.workerId,
+    status: receipt.status,
+    sessionPreserved: receipt.sessionPreserved === true,
+    requestAcceptedAt: validIsoTimestamp(receipt.requestAcceptedAt) ? receipt.requestAcceptedAt : null,
+    idempotencyKeyDigest: receipt.idempotencyKeyDigest || null,
+    interruptRequestSequence: receipt.interruptRequestSequence ?? null
+  };
+}
+
+export function interruptWorker({ root, principal, workerId, idempotencyKey, env = process.env } = {}) {
+  const existingJob = tryReadJob(root, workerId, env);
+  if (!existingJob) {
+    throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+  }
+  assertMutationOwnership(existingJob, principal);
+  if (!canPreserveProviderSession(existingJob)) {
+    return { ...cancelWorker({ root, principal, workerId, idempotencyKey, env }), fallback: "cancel" };
+  }
+  assertIdempotencyKey(idempotencyKey);
+  if (!principal?.threadId) {
+    throw new CompanionError("E_AUTH_REQUIRED", "Trusted Codex task identity is unavailable.");
+  }
+  const keyDigest = digestKey(idempotencyKey);
+  const mutationDigest = interruptRequestDigest({ principal, workerId });
+  return withWorkspaceStateTransaction(root, function interruptWorkerTransaction(transaction) {
+    const existing = readIdempotency(root, "interrupt", idempotencyKey, env);
+    if (existing) {
+      if (
+        existing.ownerThreadId !== principal.threadId
+        || existing.requestDigest !== mutationDigest
+        || existing.workerId !== workerId
+      ) {
+        idempotencyConflict("idempotencyKey was reused with a different interrupt owner or request.");
+      }
+      return { receipt: existing.receipt, replayed: true, fallback: null };
+    }
+    const current = transaction.tryReadJob(workerId);
+    if (!current) {
+      throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+    }
+    assertMutationOwnership(current, principal);
+    if (!canPreserveProviderSession(current)) {
+      throw new CompanionError("E_STATE", "Provider session was lost before interrupt settlement.");
+    }
+    if (current.workerProcess || current.controllerProcess) {
+      transaction.requestCancel(workerId, cancellationNonce(current) || "");
+    }
+    const acceptedAt = now();
+    const updated = transaction.updateJob(workerId, (job) => {
+      assertMutationOwnership(job, principal);
+      const events = Array.isArray(job.lifecycleEvents) ? job.lifecycleEvents : [];
+      const already = events.some((event) => event.type === "interruption.requested");
+      const nextEvents = already
+        ? events
+        : appendLifecycleEvent(
+          events,
+          "interruption.requested",
+          "Interrupt request accepted by worker broker.",
+          { requestAcceptedAt: acceptedAt }
+        );
+      const receipt = {
+        receiptId: `interrupt-${keyDigest.slice(0, 24)}`,
+        workerId,
+        status: "accepted",
+        sessionPreserved: true,
+        requestAcceptedAt: acceptedAt,
+        idempotencyKeyDigest: keyDigest,
+        interruptRequestSequence: nextEvents.at(-1)?.sequence ?? null
+      };
+      return {
+        ...job,
+        status: "interrupted",
+        phase: "interrupted",
+        progress: "Provider attempt interrupted; worker remains available for follow-up.",
+        lifecycleEvents: nextEvents,
+        result: {
+          ...(job.result || {}),
+          interrupt: {
+            sessionPreserved: true,
+            receipt
+          }
+        }
+      };
+    });
+    const receipt = updated.result?.interrupt?.receipt;
+    const count = (updated.lifecycleEvents || [])
+      .filter((event) => event.type === "interruption.requested").length;
+    if (count !== 1) {
+      throw new CompanionError(
+        "E_STATE",
+        `Expected exactly one interrupt-request event, found ${count}.`
+      );
+    }
+    writeIdempotency(root, "interrupt", idempotencyKey, {
+      workerId,
+      ownerThreadId: principal.threadId,
+      requestDigest: mutationDigest,
+      receipt,
+      committedAt: acceptedAt
+    }, env);
+    return { receipt, replayed: false, fallback: null };
+  }, env);
 }

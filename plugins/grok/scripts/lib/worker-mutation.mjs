@@ -2,7 +2,9 @@
 export {
   CANCEL_METRIC_TIMESTAMPS,
   cancelWorker,
-  projectCancellationReceipt
+  interruptWorker,
+  projectCancellationReceipt,
+  projectInterruptReceipt
 } from "./worker-mutation-cancellation.mjs";
 export {
   acquireRecoveryCleanupFence,
