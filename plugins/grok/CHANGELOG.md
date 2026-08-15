@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0-dev.9
+
+Status: hardening candidate; not release-qualified.
+
+- `record-verification` publishes the terminal runtime observed paths on
+  `result.verification` and the host-verification checkpoint. A clean host
+  check no longer replaces those paths with `[]`.
+
 ## 0.3.0-dev.8
 
 Status: hardening candidate; not release-qualified.
