@@ -3,7 +3,7 @@ import path from "node:path";
 import process from "node:process";
 import { parseArgs } from "./args.mjs";
 import { CompanionError, asErrorPayload } from "./errors.mjs";
-import { collectContext, resolveTarget } from "./git-review.mjs";
+import { assertWorkingTreeTargetBound, collectContext, resolveTarget } from "./git-review.mjs";
 import { probe } from "./provider-sessions.mjs";
 import { profileFor, sameSecurityProfile } from "./profiles.mjs";
 import { clearProviderCapabilityReceipt, writeProviderCapabilityReceipt } from "./provider-capability.mjs";
@@ -91,10 +91,19 @@ async function handleReview(command, raw) {
   if (options.wait && options.background) throw new CompanionError("E_USAGE", "Choose --wait or --background.");
   const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd());
   const target = resolveTarget(root, { scope: options.scope || "auto", base: options.base || null });
-  const context = collectContext(root, target), kind = command;
+  const context = assertWorkingTreeTargetBound(collectContext(root, target));
+  const kind = command;
   const prompt = loadTemplate(command === "review" ? "review" : "adversarial-review", { TARGET_LABEL: context.target.label, REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance, REVIEW_INPUT: context.content, USER_FOCUS: positionals.join(" ") || "No extra focus provided." });
   const id = generateId(kind), profile = profileFor(kind);
-  const job = baseRecord({ id, kind, root, profile, title: `${kind}: ${target.label}`, request: { prompt, target }, write: false });
+  const job = baseRecord({
+    id,
+    kind,
+    root,
+    profile,
+    title: `${kind}: ${target.label}`,
+    request: { prompt, target: { ...target, changedPaths: context.changedPaths || [] } },
+    write: false
+  });
   if (context.empty) {
     job.status = "completed"; job.phase = "done"; job.startedAt = job.createdAt; job.completedAt = now(); job.summary = "pass: no changes in the selected review target"; job.request = { target, prompt: null };
     // Empty targets never invoke Grok; do not claim a provider session was deleted.

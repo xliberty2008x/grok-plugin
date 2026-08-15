@@ -17,6 +17,34 @@ function hashFile(file) {
   return hash.digest("hex");
 }
 
+export function listWorkingTreeChangedPaths(root) {
+  const raw = stdout(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  const paths = [];
+  for (const entry of raw.split("\0").filter(Boolean)) {
+    if (entry.length < 4) continue;
+    const body = entry.slice(3);
+    if (body.includes(" -> ")) {
+      const renamed = body.split(" -> ").pop();
+      if (renamed) paths.push(renamed);
+      continue;
+    }
+    paths.push(body);
+  }
+  return [...new Set(paths)];
+}
+
+export function assertWorkingTreeTargetBound(context) {
+  if (context?.target?.mode !== "working-tree" || context.empty) return context;
+  const paths = Array.isArray(context.changedPaths) ? context.changedPaths : [];
+  if (paths.length === 0) {
+    throw new CompanionError(
+      "E_REVIEW_TARGET",
+      "Working-tree review found a dirty repository but bound zero changed paths."
+    );
+  }
+  return context;
+}
+
 export function resolveTarget(root, { scope = "auto", base = null } = {}) {
   if (!["auto", "working-tree", "branch"].includes(scope)) throw new CompanionError("E_USAGE", "--scope must be auto, working-tree, or branch.");
   const status = stdout(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
@@ -50,7 +78,7 @@ export function collectContext(root, target) {
   if (target.mode === "branch") {
     const diff = stdout(root, ["diff", "--binary", `${target.base}...HEAD`], { maxBuffer: 32 * 1024 * 1024 });
     if (Buffer.byteLength(diff) > MAX_REVIEW_BYTES) throw new CompanionError("E_REVIEW_TOO_LARGE", `Branch diff exceeds the ${MAX_REVIEW_BYTES / (1024 * 1024)} MiB tool-free review limit. Review a smaller scope.`);
-    return { target, empty: diff.length === 0, collectionGuidance: "Branch diff collected by the plugin.", content: diff || "[empty branch diff]" };
+    return { target, empty: diff.length === 0, changedPaths: [], collectionGuidance: "Branch diff collected by the plugin.", content: diff || "[empty branch diff]" };
   }
   const status = stdout(root, ["status", "--short", "--untracked-files=all"]);
   const staged = stdout(root, ["diff", "--binary", "--cached"], { maxBuffer: 32 * 1024 * 1024 });
@@ -58,7 +86,14 @@ export function collectContext(root, target) {
   const extras = untracked(root);
   const content = [`STATUS\n${status || "[clean]"}`, `STAGED DIFF\n${staged || "[empty]"}\nUNSTAGED DIFF\n${unstaged || "[empty]"}`, ...extras.map((x) => `UNTRACKED ${x.kind}: ${x.path}\n${x.content}`)].join("\n\n");
   if (Buffer.byteLength(content) > MAX_REVIEW_BYTES) throw new CompanionError("E_REVIEW_TOO_LARGE", `Working-tree context exceeds the ${MAX_REVIEW_BYTES / (1024 * 1024)} MiB tool-free review limit. Review a smaller scope.`);
-  return { target, empty: status.trim().length === 0, collectionGuidance: "Complete tool-free working-tree context is embedded by the plugin.", content };
+  const changedPaths = listWorkingTreeChangedPaths(root);
+  return {
+    target,
+    empty: status.trim().length === 0,
+    changedPaths,
+    collectionGuidance: "Complete tool-free working-tree context is embedded by the plugin.",
+    content
+  };
 }
 
 export function integritySnapshot(root) {

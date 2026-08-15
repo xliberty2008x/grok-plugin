@@ -5,11 +5,14 @@ import test from "node:test";
 
 import {
   assertUnchanged,
+  assertWorkingTreeTargetBound,
   collectContext,
   integritySnapshot,
+  listWorkingTreeChangedPaths,
   resolveTarget
 } from "../plugins/grok/scripts/lib/git-review.mjs";
-import { git, initRepo } from "./helpers.mjs";
+import { git, initRepo, runCodexCompanion, tempDir, testEnvironment } from "./helpers.mjs";
+import { installFakeGrok } from "./fake-grok.mjs";
 
 test("auto review chooses the default branch when clean and working tree when dirty", () => {
   const root = initRepo();
@@ -109,6 +112,71 @@ test("integrity snapshots hash complete large and binary untracked contents", ()
   fs.writeFileSync(file, second);
   const after = integritySnapshot(root);
   assert.notEqual(after.untracked, before.untracked);
+});
+
+test("working-tree collection records dirty paths and refuses dirty-empty binding", () => {
+  const root = initRepo();
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.mkdirSync(path.join(root, "test"), { recursive: true });
+  fs.writeFileSync(path.join(root, "src/payment-service.mjs"), "export const charge = () => {};\n");
+  fs.writeFileSync(path.join(root, "test/payment-service.test.mjs"), "import test from 'node:test';\n");
+  git(root, "add", "src/payment-service.mjs", "test/payment-service.test.mjs");
+  git(root, "commit", "-m", "payment fixture");
+  fs.appendFileSync(path.join(root, "src/payment-service.mjs"), "export const retry = () => {};\n");
+  fs.appendFileSync(path.join(root, "test/payment-service.test.mjs"), "test('retry', () => {});\n");
+
+  const paths = listWorkingTreeChangedPaths(root);
+  assert.deepEqual(paths.sort(), [
+    "src/payment-service.mjs",
+    "test/payment-service.test.mjs"
+  ]);
+  const context = collectContext(root, resolveTarget(root, { scope: "working-tree" }));
+  assert.equal(context.empty, false);
+  assert.deepEqual([...context.changedPaths].sort(), paths.sort());
+  assert.doesNotThrow(() => assertWorkingTreeTargetBound(context));
+  assert.throws(
+    () => assertWorkingTreeTargetBound({
+      target: { mode: "working-tree" },
+      empty: false,
+      changedPaths: []
+    }),
+    (error) => error.code === "E_REVIEW_TARGET"
+      && /dirty/.test(error.message)
+      && /zero changed paths/.test(error.message)
+  );
+});
+
+test("dirty working-tree review records bound paths and cannot pass with an empty observation", (t) => {
+  const root = initRepo();
+  const pluginData = tempDir("grok-plugin-test-");
+  const fakeRoot = tempDir("grok-plugin-test-");
+  t.after(() => {
+    fs.rmSync(pluginData, { recursive: true, force: true });
+    fs.rmSync(fakeRoot, { recursive: true, force: true });
+  });
+  fs.appendFileSync(path.join(root, "tracked.txt"), "dirty review target\n");
+  fs.writeFileSync(path.join(root, "second.txt"), "second dirty file\n");
+  git(root, "add", "second.txt");
+  const fake = installFakeGrok(fakeRoot);
+  const env = testEnvironment({ fake, pluginData });
+  delete env.GROK_COMPANION_CHILD;
+  delete env.GROK_COMPANION_JOB_MARKER;
+  delete env.GROK_AGENT;
+  delete env.GROK_LEADER_SOCKET;
+  delete env.CODEX_THREAD_ID;
+  const result = runCodexCompanion(
+    ["review", "--wait", "--scope", "working-tree", "--json"],
+    { cwd: root, env }
+  );
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const job = JSON.parse(result.stdout);
+  const observed = job.result?.runtimeEvidence?.observedChangedPaths || [];
+  assert.ok(observed.includes("tracked.txt"), JSON.stringify(observed));
+  assert.ok(observed.includes("second.txt"), JSON.stringify(observed));
+  assert.notEqual(observed.length, 0);
+  if (job.result?.review?.verdict === "pass") {
+    assert.notEqual(observed.length, 0);
+  }
 });
 
 test("invalid scopes and non-commit base refs fail deterministically", () => {

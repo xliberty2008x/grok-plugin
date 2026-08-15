@@ -697,7 +697,7 @@ export async function openWorkerOwnerController({
         },
         clientInfo: {
           name: "grok-companion-owner-controller",
-          version: "0.3.0-dev.4"
+          version: "0.3.0-dev.5"
         }
       },
       30_000

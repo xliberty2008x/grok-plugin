@@ -221,6 +221,17 @@ function persistExecutionResult(execution, state, providerResult) {
   const { result, workerReport, reportRepair, reportRepairError } = providerResult;
   const postContext = captureCompleteContextManifest(root, contextCaptureOptions("terminal", job));
   if (job.jobClass === "review" && result.review) {
+    const targetPaths = Array.isArray(job.request?.target?.changedPaths)
+      ? job.request.target.changedPaths
+      : [];
+    const workingTree = job.request?.target?.mode === "working-tree";
+    const reviewPaths = workingTree ? targetPaths : observeChangedPaths(preContext, postContext);
+    if (workingTree && reviewPaths.length === 0 && result.review.verdict === "pass") {
+      throw new CompanionError(
+        "E_REVIEW_TARGET",
+        "Working-tree review found a dirty repository but bound zero changed paths."
+      );
+    }
     const safeResult = redact({
       review: result.review,
       stopReason: result.stopReason,
@@ -228,7 +239,8 @@ function persistExecutionResult(execution, state, providerResult) {
       runtimeEvidence: buildRuntimeEvidence({
         preContext,
         postContext,
-        changedPaths: observeChangedPaths(preContext, postContext),
+        changedPaths: reviewPaths,
+        diffSummary: reviewPaths.length ? reviewPaths.join("\n") : "No workspace changes observed.",
         executionStatus: "completed"
       })
     });
