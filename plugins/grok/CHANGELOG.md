@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0-dev.6
+
+Status: hardening candidate; not release-qualified.
+
+- Persist no longer crashes when `buildWorkerReport` leaves `outcome: complete`
+  but host success is false (unmet acceptance or claimed/observed file
+  mismatch). The job publishes `partial` with `providerClaims.success: false`
+  and a `classificationReason` instead of `Assignment to constant variable`.
+
 ## 0.3.0-dev.5
 
 Status: hardening candidate; not release-qualified.

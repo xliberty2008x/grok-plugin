@@ -629,3 +629,73 @@ test("task cannot publish outcome complete when required acceptance criteria sta
   assert.equal(human.status, 0, human.stderr);
   assert.doesNotMatch(human.stdout, /Outcome: complete/);
 });
+
+test("persist demotes complete to partial when acceptance is unmet without crashing", (t) => {
+  const providerText = `GROK_WORKER_REPORT: ${JSON.stringify({
+    outcome: "complete",
+    summary: "Charge path implemented",
+    changedFiles: [],
+    checksClaimed: [],
+    acceptanceResults: [
+      { id: "AC-01", status: "met", note: "Contract identified" },
+      { id: "AC-02", status: "unmet", note: "Retry path missing" }
+    ],
+    risks: [],
+    questions: []
+  })}`;
+  const acceptanceCriteria = [
+    { id: "AC-01", text: "Contract identified" },
+    { id: "AC-02", text: "Retry path implemented" }
+  ];
+  const parsed = buildWorkerReport({ providerText, acceptanceCriteria });
+  assert.equal(parsed.valid, true);
+  assert.equal(parsed.outcome, "complete", "unmet criteria must stay complete through buildWorkerReport so persist reclassifies");
+  assert.equal(parsed.acceptanceResults.some((entry) => entry.status === "unmet"), true);
+
+  const root = initRepo();
+  const pluginData = tempDir("grok-source-stdin-negative-data-");
+  const fakeRoot = tempDir("grok-source-stdin-negative-fake-");
+  t.after(() => removeFixtureDirectories([root, pluginData, fakeRoot]));
+  const fake = installFakeGrok(fakeRoot, { taskText: providerText });
+  const env = testEnvironment({ fake, pluginData, sessionId: "issue-105-unmet-complete" });
+  delete env.GROK_COMPANION_CHILD;
+  delete env.GROK_COMPANION_JOB_MARKER;
+  delete env.GROK_AGENT;
+  delete env.GROK_LEADER_SOCKET;
+  delete env.CODEX_THREAD_ID;
+  const envelope = JSON.stringify({
+    schemaVersion: 1,
+    userRequest: "review the payment retry path against source",
+    objective: "Diagnose incomplete implementation",
+    mode: "read",
+    scope: { include: [], exclude: [] },
+    context: {
+      facts: [],
+      constraints: [],
+      expectedProjectMarkers: [],
+      requiredPaths: ["tracked.txt"],
+      workspaceState: "task_scoped",
+      upstreamFreshness: "not_checked"
+    },
+    nonGoals: [],
+    acceptanceCriteria,
+    requiredVerification: ["git diff --exit-code"],
+    expectedReturnFormat: "GROK_WORKER_REPORT JSON plus concise human summary"
+  });
+  const result = runCodexCompanion(
+    ["task", "--wait", "--envelope-stdin", "--json"],
+    { cwd: root, env, input: envelope }
+  );
+  const combined = `${result.stdout || ""}\n${result.stderr || ""}`;
+  assert.doesNotMatch(combined, /Assignment to constant variable/);
+  assert.equal(result.status, 0, combined);
+  const job = JSON.parse(result.stdout);
+  assert.equal(job.status, "completed");
+  assert.equal(job.result.workerReport.outcome, "partial");
+  assert.equal(job.result.providerClaims.success, false);
+  assert.equal(job.result.providerClaims.outcome, "partial");
+  assert.match(
+    `${job.result.workerReport.classificationReason || ""} ${job.result.workerReport.summary || ""}`,
+    /success conditions were not met/i
+  );
+});
