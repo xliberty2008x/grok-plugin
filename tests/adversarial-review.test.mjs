@@ -7,8 +7,10 @@ import { fileURLToPath } from "node:url";
 import {
   ADVERSARIAL_NO_FINDINGS_PREFIX,
   ADVERSARIAL_REVIEW_REPAIR_PROMPT,
+  ORDINARY_REVIEW_REPAIR_PROMPT,
   structuredReviewOptionsFor,
-  validateAdversarialReview
+  validateAdversarialReview,
+  validateOrdinaryReview
 } from "../plugins/grok/scripts/lib/adversarial-review.mjs";
 import {
   cleanupReviewEnvironment,
@@ -219,14 +221,16 @@ test("AC-05: findings-bearing adversarial payloads stay needs_changes without th
   );
 });
 
-test("AC-06: ordinary review options stay generic and accept legacy zero-finding summaries", async () => {
+test("AC-06: ordinary review rejects provisional terminals and keeps stop-review generic", async () => {
   const common = Object.freeze({
     root: "/tmp/example",
     profile: profileFor("review"),
     prompt: "review",
     stateDir: "/tmp/state"
   });
-  assert.equal(structuredReviewOptionsFor("review", common), common);
+  const ordinary = structuredReviewOptionsFor("review", common);
+  assert.notEqual(ordinary, common);
+  assert.equal(ordinary.repairPrompt, ORDINARY_REVIEW_REPAIR_PROMPT);
   assert.equal(structuredReviewOptionsFor("stop-review", common), common);
   const adversarial = structuredReviewOptionsFor("adversarial-review", common);
   assert.notEqual(adversarial, common);
@@ -235,11 +239,35 @@ test("AC-06: ordinary review options stay generic and accept legacy zero-finding
   assert.equal(adversarial.root, common.root);
   assert.match(DEFAULT_REVIEW_REPAIR_PROMPT, /summary and findings/);
 
-  const ordinaryZero = validateReview({
+  const ordinaryZero = validateOrdinaryReview({
     summary: "No defects found in the selected target.",
     findings: []
   });
   assert.equal(ordinaryZero.verdict, "pass");
+  assert.throws(
+    () => validateOrdinaryReview(PLAN_ONLY),
+    (error) => error?.code === "E_SCHEMA" && error?.details?.reason === "plan-progress-only"
+  );
+  assert.throws(
+    () => validateOrdinaryReview({
+      summary: "No defects found in the selected target.",
+      findings: []
+    }, { observedChangedPaths: ["src/payment-service.mjs"] }),
+    (error) => error?.code === "E_SCHEMA" && error?.details?.reason === "missing-changed-paths"
+  );
+  assert.equal(
+    validateOrdinaryReview({
+      summary: "No defects found in src/payment-service.mjs after checking the retry map.",
+      findings: []
+    }, { observedChangedPaths: ["src/payment-service.mjs"] }).verdict,
+    "pass"
+  );
+
+  const structuralZero = validateReview({
+    summary: "No defects found in the selected target.",
+    findings: []
+  });
+  assert.equal(structuralZero.verdict, "pass");
 
   await withFake({
     review: { summary: "No defects found in the selected target.", findings: [] }
@@ -261,7 +289,10 @@ test("AC-06: ordinary review options stay generic and accept legacy zero-finding
   });
 
   await withFake({
-    review: { summary: "No defects found in the selected target.", findings: [] }
+    review: {
+      summary: "No defects found in tracked.txt; the working-tree comment is a fixture-only change.",
+      findings: []
+    }
   }, async (fake) => {
     const root = initRepo();
     fs.appendFileSync(path.join(root, "tracked.txt"), "ordinary review control\n");
@@ -281,7 +312,7 @@ test("AC-06: ordinary review options stay generic and accept legacy zero-finding
     assert.equal(job.kind, "review");
     assert.equal(job.status, "completed");
     assert.equal(job.result.review.verdict, "pass");
-    assert.equal(job.result.review.summary, "No defects found in the selected target.");
+    assert.match(job.result.review.summary, /No defects found/);
     const reviews = readFakeLog(fake.logFile).filter((entry) => entry.event === "headless");
     assert.equal(reviews.length, 1);
   });
@@ -446,9 +477,84 @@ test("selector does not mutate ordinary common options object", () => {
   const common = { root: "r", prompt: "p", stateDir: "s" };
   const copy = { ...common };
   const out = structuredReviewOptionsFor("review", common);
-  assert.equal(out, common);
+  assert.notEqual(out, common);
   assert.deepEqual(common, copy);
+  assert.equal(out.repairPrompt, ORDINARY_REVIEW_REPAIR_PROMPT);
   const adv = structuredReviewOptionsFor("adversarial-review", common);
   assert.equal(common.validator, undefined);
   assert.equal(adv.validator, validateAdversarialReview);
+});
+
+test("ordinary review plan-only first response repairs once then fails closed", async () => {
+  const completed = {
+    summary: "No defects found in tracked.txt after inspecting the working-tree comment.",
+    findings: []
+  };
+  await withFake({ reviewSequence: [PLAN_ONLY, completed] }, async (fake) => {
+    const root = initRepo();
+    const stateDir = tempDir("provider-state-");
+    const result = await runStructuredReview(structuredReviewOptionsFor("review", {
+      root,
+      profile: profileFor("review"),
+      prompt: "Grok Companion review contract v1: return review schema JSON",
+      stateDir,
+      jobMarker: "ordinary-repair-once",
+      observedChangedPaths: ["tracked.txt"]
+    }));
+    assert.equal(result.review.verdict, "pass");
+    assert.match(result.review.summary, /tracked\.txt/);
+    const reviews = readFakeLog(fake.logFile).filter((entry) => entry.event === "headless");
+    assert.equal(reviews.length, 2);
+    assert.equal(reviews[1].prompt, ORDINARY_REVIEW_REPAIR_PROMPT);
+    assert.equal(cleanupReviewEnvironment(stateDir, "ordinary-repair-once").ok, true);
+  });
+
+  await withFake({ reviewSequence: [PLAN_ONLY, PLAN_ONLY] }, async (fake) => {
+    const root = initRepo();
+    const stateDir = tempDir("provider-state-");
+    await assert.rejects(
+      () => runStructuredReview(structuredReviewOptionsFor("review", {
+        root,
+        profile: profileFor("review"),
+        prompt: "Grok Companion review contract v1: return review schema JSON",
+        stateDir,
+        jobMarker: "ordinary-double-fail"
+      })),
+      (error) => error?.code === "E_SCHEMA"
+        && error?.details?.repairAttempted === true
+        && error?.details?.reason === "plan-progress-only"
+    );
+    assert.equal(cleanupReviewEnvironment(stateDir, "ordinary-double-fail").ok, true);
+  });
+});
+
+test("ordinary companion review does not publish a provisional pass", async () => {
+  await withFake({
+    reviewSequence: [PLAN_ONLY, PLAN_ONLY]
+  }, async (fake) => {
+    const root = initRepo();
+    fs.appendFileSync(path.join(root, "tracked.txt"), "review me\n");
+    const pluginData = tempDir("grok-plugin-data-");
+    const env = testEnvironment({ fake, pluginData, sessionId: "ordinary-provisional" });
+    delete env.GROK_COMPANION_CHILD;
+    delete env.GROK_COMPANION_JOB_MARKER;
+    delete env.GROK_AGENT;
+    delete env.GROK_LEADER_SOCKET;
+    const started = runCompanion(["review", "--background", "--json", "--scope", "working-tree"], {
+      cwd: root,
+      env
+    });
+    assert.equal(started.status, 0, started.stderr || started.stdout);
+    const handle = JSON.parse(started.stdout);
+    const status = runCompanion(
+      ["status", handle.id, "--wait", "--timeout-ms", "30000", "--json"],
+      { cwd: root, env, timeout: 45_000 }
+    );
+    assert.equal(status.status, 0, status.stderr || status.stdout);
+    const terminal = JSON.parse(status.stdout);
+    assert.equal(terminal.status, "failed");
+    assert.equal(terminal.error?.code, "E_SCHEMA");
+    assert.equal(terminal.result?.review, undefined);
+    assert.doesNotMatch(JSON.stringify(terminal), /"verdict"\s*:\s*"pass"/);
+  });
 });

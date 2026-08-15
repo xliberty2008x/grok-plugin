@@ -157,7 +157,12 @@ test("dirty working-tree review records bound paths and cannot pass with an empt
   fs.appendFileSync(path.join(root, "tracked.txt"), "dirty review target\n");
   fs.writeFileSync(path.join(root, "second.txt"), "second dirty file\n");
   git(root, "add", "second.txt");
-  const fake = installFakeGrok(fakeRoot);
+  const fake = installFakeGrok(fakeRoot, {
+    review: {
+      summary: "No defects found in tracked.txt and second.txt; the dirty working-tree comments are fixture-only.",
+      findings: []
+    }
+  });
   const env = testEnvironment({ fake, pluginData });
   delete env.GROK_COMPANION_CHILD;
   delete env.GROK_COMPANION_JOB_MARKER;
