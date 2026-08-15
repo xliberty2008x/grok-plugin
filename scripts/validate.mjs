@@ -397,6 +397,10 @@ if (!versionsOnly) {
     "scripts/lib/deterministic-test-shards.mjs",
     "scripts/bump-version.mjs",
     "scripts/update-local-codex.mjs",
+    "scripts/qualify-local.mjs",
+    "scripts/lib/qualification-receipt.mjs",
+    "scripts/lib/local-qualify.mjs",
+    "scripts/lib/local-codex-install.mjs",
     "scripts/test-natural-codex.mjs",
     "scripts/test-installed-worker-mcp.mjs",
     "scripts/lib/installed-worker-mcp-failure.mjs",
@@ -515,7 +519,7 @@ if (!versionsOnly) {
     if (packageJson.type !== "module") problem("The package must use ESM (`type: module`).", "package.json");
     if (packageJson.license !== "Apache-2.0") problem("Package license must be Apache-2.0.", "package.json");
     if (packageJson.engines?.node !== ">=18.18") problem("Node engine must remain >=18.18.", "package.json");
-    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "test:protected-review", "test:installed-worker-mcp", "test:temp:cleanup", "codex:update-local", "check:source-structure", "structure:check", "validate", "version:check", "version:bump", "check"]) {
+    for (const script of ["test", "test:e2e", "test:pty-ingress", "test:installed-codex", "test:protected-review", "test:installed-worker-mcp", "test:temp:cleanup", "qualify", "codex:install", "codex:update-local", "check:source-structure", "structure:check", "validate", "version:check", "version:bump", "check"]) {
       if (!packageJson.scripts?.[script]) problem(`Missing npm script: ${script}.`, "package.json");
     }
     if (packageJson.scripts?.["test:pty-ingress"] !== "node --test tests/pty-ingress.test.mjs") {
@@ -548,6 +552,12 @@ if (!versionsOnly) {
     }
     if (packageJson.scripts?.["codex:update-local"] !== "node scripts/update-local-codex.mjs") {
       problem("codex:update-local must execute the verified local-cache updater directly.", "package.json");
+    }
+    if (packageJson.scripts?.["codex:install"] !== "node scripts/update-local-codex.mjs") {
+      problem("codex:install must execute the same receipt-gated installer as codex:update-local.", "package.json");
+    }
+    if (packageJson.scripts?.qualify !== "node scripts/qualify-local.mjs") {
+      problem("qualify must execute the streamed repository qualification command directly.", "package.json");
     }
   }
 

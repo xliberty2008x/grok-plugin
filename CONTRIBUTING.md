@@ -172,17 +172,21 @@ state must not be used to test or qualify a build.
 Use the repository-owned update command from the repository root:
 
 ```text
+npm run qualify
 npm run codex:update-local
 ```
 
-The command runs the complete repository check, requires the clean-profile
-installed-Codex PTY regression, verifies that the configured
-`grok-companion` marketplace resolves to this checkout, refreshes
-`grok@grok-companion`, and compares every installed file with the source plugin
-by path, size, and SHA-256. It fails instead of claiming success if Codex is
-missing, the marketplace points elsewhere, the version differs, or the cached
-snapshot is stale. Start a new Codex task after it passes; the current task does
-not provide trustworthy evidence for the refreshed build.
+`npm run qualify` is the expensive developer/release command. It streams
+`npm run check`, then writes a receipt bound to the exact plugin inventory,
+package metadata, and marketplace digest.
+
+`npm run codex:update-local` (alias `npm run codex:install`) does not run the
+repository suite. It verifies that receipt, refreshes `grok@grok-companion`,
+and compares every installed file with the source plugin by path, size, and
+SHA-256. Missing, stale, or mismatched receipts fail in seconds with guidance
+to requalify. It also fails if Codex is missing, the marketplace points
+elsewhere, or the version differs. Start a new Codex task after it passes; the
+current task does not provide trustworthy evidence for the refreshed build.
 
 Default GitHub CI exposes three different claims:
 
