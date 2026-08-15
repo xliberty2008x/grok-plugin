@@ -33,6 +33,7 @@ import {
   projectSharedRefObservation,
   projectTaskRelevantMetadataObservation
 } from "./worker-context-projection.mjs";
+import { projectPublicSchemaErrorDetails } from "./public-schema-error.mjs";
 
 /** Public protocol version for handle, snapshot, and cursor projections. */
 export const WORKER_PROTOCOL_VERSION = 1;
@@ -1176,15 +1177,7 @@ function projectPublicErrorDetails(code, value, { error = null } = {}) {
       projected.signal = value.signal;
     }
   } else if (code === "E_SCHEMA") {
-    if (typeof value.hint === "string") projected.hint = boundedText(value.hint);
-    if (Array.isArray(value.rootKeys)) projected.rootKeys = publicStringList(value.rootKeys, { maxItems: 24, maxBytes: 128 });
-    if (typeof value.hasUnknownRootKeys === "boolean") projected.hasUnknownRootKeys = value.hasUnknownRootKeys;
-    if (typeof value.summaryType === "string") projected.summaryType = boundedText(value.summaryType, { max: 64 });
-    if (Number.isSafeInteger(value.findingsCount) && value.findingsCount >= 0) {
-      projected.findingsCount = value.findingsCount;
-    }
-    if (typeof value.findingsShapeOk === "boolean") projected.findingsShapeOk = value.findingsShapeOk;
-    if (typeof value.payloadDigest === "string") projected.payloadDigest = boundedText(value.payloadDigest, { max: 256 });
+    Object.assign(projected, projectPublicSchemaErrorDetails(value, boundedText));
   } else if (code === "E_SCOPE_VIOLATION") {
     const paths = publicPathList(value.paths);
     if (paths.length) projected.paths = paths;
