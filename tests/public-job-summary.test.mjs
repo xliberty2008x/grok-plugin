@@ -184,6 +184,9 @@ test("integration: report-repair result keeps a complete worker summary and a bo
 
   const rendered = runCompanion(["result", json.id], { cwd: root, env });
   assert.equal(rendered.status, 0, rendered.stderr);
-  assert.match(rendered.stdout, new RegExp(`Summary: ${ISSUE_114_FIRST_SENTENCE}\\u2026`));
-  assert.match(rendered.stdout, /Only src\/payment-service\.mjs/);
+  assert.equal(
+    rendered.stdout.includes(`Summary: ${ISSUE_114_FIRST_SENTENCE}${PUBLIC_JOB_SUMMARY_ELLIPSIS}`),
+    true
+  );
+  assert.equal(rendered.stdout.includes("Only src/payment-service.mjs"), true);
 });
