@@ -78,8 +78,8 @@ test("issue #115: passing record-verification keeps two write-job paths", {
   git(root, "add", "src/job-runner.mjs", "test/job-runner.test.mjs");
   git(root, "commit", "-m", "job-runner fixture");
 
-  const pluginData = tempDir("grok-verify-data-");
-  const fake = installFakeGrok(tempDir("grok-verify-fake-"), {
+  const pluginData = tempDir("grok-plugin-data-");
+  const fake = installFakeGrok(tempDir("fake-grok-runtime-"), {
     taskText: workerReport(),
     taskMutatePaths: [
       {
