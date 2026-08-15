@@ -1228,7 +1228,7 @@ export function researchEnvironment(stateDir, jobMarker, {
     path.join(grokHome, "config.toml"),
     [
       "[skills]",
-      `ignore = [${JSON.stringify(home)}]`,
+      `ignore = ${JSON.stringify([os.homedir(), path.join(os.homedir(), ".grok"), path.join(os.homedir(), ".codex"), path.join(os.homedir(), ".claude"), path.join(os.homedir(), ".cursor")])}`,
       "",
       "[subagents]",
       "enabled = true",
