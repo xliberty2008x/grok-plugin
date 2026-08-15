@@ -1177,6 +1177,36 @@ function projectPublicErrorDetails(code, value, { error = null } = {}) {
     }
   } else if (code === "E_SCHEMA") {
     if (typeof value.hint === "string") projected.hint = boundedText(value.hint);
+    if (typeof value.reason === "string") projected.reason = boundedText(value.reason, { max: 128 });
+    if (typeof value.repairAttempted === "boolean") projected.repairAttempted = value.repairAttempted;
+    if (Number.isSafeInteger(value.attempts) && value.attempts >= 0) {
+      projected.attempts = value.attempts;
+    }
+    if (typeof value.firstError === "string") projected.firstError = boundedText(value.firstError, { max: 64 });
+    if (isPlainObject(value.partial)) {
+      const findings = Array.isArray(value.partial.findings)
+        ? value.partial.findings.slice(0, 32).map((item) => {
+          if (!isPlainObject(item)) return null;
+          const finding = {};
+          if (typeof item.severity === "string") {
+            finding.severity = boundedText(item.severity, { max: 32 });
+          }
+          if (typeof item.title === "string") {
+            finding.title = boundedText(item.title, { max: 300 });
+          }
+          if (typeof item.body === "string") {
+            finding.body = boundedText(item.body, { max: 4000 });
+          }
+          return Object.keys(finding).length ? finding : null;
+        }).filter(Boolean)
+        : [];
+      projected.partial = {
+        findings,
+        ...(typeof value.partial.summaryPresent === "boolean"
+          ? { summaryPresent: value.partial.summaryPresent }
+          : {})
+      };
+    }
     if (Array.isArray(value.rootKeys)) projected.rootKeys = publicStringList(value.rootKeys, { maxItems: 24, maxBytes: 128 });
     if (typeof value.hasUnknownRootKeys === "boolean") projected.hasUnknownRootKeys = value.hasUnknownRootKeys;
     if (typeof value.summaryType === "string") projected.summaryType = boundedText(value.summaryType, { max: 64 });

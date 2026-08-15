@@ -942,7 +942,8 @@ export async function runStructuredReview(options) {
         firstError: firstError?.code || null,
         repairAttempted: true,
         attempts: 2,
-        jobId: rest.jobMarker || null
+        jobId: rest.jobMarker || null,
+        partial: sanitizeStructuredReviewPartial(parsed)
       };
       throw new CompanionError(
         repairError?.code || "E_SCHEMA",
@@ -951,4 +952,24 @@ export async function runStructuredReview(options) {
       );
     }
   }
+}
+
+function sanitizeStructuredReviewPartial(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { findings: [], summaryPresent: false };
+  }
+  const findings = Array.isArray(value.findings)
+    ? value.findings.slice(0, 32).map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+      const projected = {};
+      if (typeof item.severity === "string") projected.severity = redactText(item.severity).slice(0, 32);
+      if (typeof item.title === "string") projected.title = redactText(item.title).slice(0, 300);
+      if (typeof item.body === "string") projected.body = redactText(item.body).slice(0, 4000);
+      return Object.keys(projected).length ? projected : null;
+    }).filter(Boolean)
+    : [];
+  return {
+    findings,
+    summaryPresent: typeof value.summary === "string" && value.summary.trim().length > 0
+  };
 }
