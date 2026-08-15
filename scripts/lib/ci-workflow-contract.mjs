@@ -89,11 +89,71 @@ function isShardOneValidationStep(step) {
   ].join("\n");
 }
 
-const HOSTED_MACOS_PULL_REQUEST_SKIP =
-  "    if: ${{ github.event_name != 'pull_request' || matrix.os != 'macos-latest' }}";
+const HOSTED_MACOS_POST_MERGE_GATE =
+  "    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}";
 
-function skipsHostedMacosOnPullRequest(job) {
-  return job.split("\n").includes(HOSTED_MACOS_PULL_REQUEST_SKIP);
+function isHostedMacosPostMergeJob(job) {
+  return job.split("\n").includes(HOSTED_MACOS_POST_MERGE_GATE);
+}
+
+function shardList(shardCount) {
+  return `[${Array.from({ length: shardCount }, (_, index) => index + 1).join(", ")}]`;
+}
+
+function isHostedPtyJob(job, os) {
+  const matrix = job == null ? "" : workflowMatrix(job);
+  const run = job == null
+    ? null
+    : workflowStep(job, "Run source PTY ingress regression");
+  const expectedFields = [
+    "    name: PTY ingress / ${{ matrix.os }}",
+    ...(os === "macos-latest" ? [HOSTED_MACOS_POST_MERGE_GATE] : []),
+    "    runs-on: ${{ matrix.os }}",
+    "    timeout-minutes: 10",
+    "    strategy:",
+    "    steps:"
+  ];
+  return job != null
+    && !containsContinueOnError(job)
+    && hasExactJobLevelFields(job, expectedFields)
+    && (os !== "macos-latest" || isHostedMacosPostMergeJob(job))
+    && /^    runs-on:\s*\$\{\{\s*matrix\.os\s*\}\}\s*$/mu.test(job)
+    && /^    timeout-minutes:\s*10\s*$/mu.test(job)
+    && /^      fail-fast:\s*false\s*$/mu.test(job)
+    && isExactMatrix(matrix, [`        os: [${os}]`])
+    && isUnconditionalRunStep(run, "npm run test:pty-ingress");
+}
+
+function isUnixDeterministicJob(job, { os, shardCount, postMerge = false } = {}) {
+  if (job == null) return false;
+  const matrix = workflowMatrix(job);
+  const validationRun = workflowStep(job, "Validate release structure");
+  const deterministicRun = workflowStep(job, "Run deterministic zero-skip shard");
+  const expectedFields = [
+    `    name: \${{ matrix.os }} / Node \${{ matrix.node }} / shard \${{ matrix.shard }}/${shardCount}`,
+    ...(postMerge ? [HOSTED_MACOS_POST_MERGE_GATE] : []),
+    "    runs-on: ${{ matrix.os }}",
+    "    timeout-minutes: 30",
+    "    strategy:",
+    "    steps:"
+  ];
+  return hasExactJobLevelFields(job, expectedFields)
+    && (!postMerge || isHostedMacosPostMergeJob(job))
+    && /^    runs-on:\s*\$\{\{\s*matrix\.os\s*\}\}\s*$/mu.test(job)
+    && /^    timeout-minutes:\s*30\s*$/mu.test(job)
+    && /^      fail-fast:\s*false\s*$/mu.test(job)
+    && !containsContinueOnError(job)
+    && !/windows-latest/u.test(matrix)
+    && isExactMatrix(matrix, [
+      `        os: [${os}]`,
+      "        node: [18.18.2, 22.x]",
+      `        shard: ${shardList(shardCount)}`
+    ])
+    && isShardOneValidationStep(validationRun)
+    && isUnconditionalRunStep(
+      deterministicRun,
+      `npm run test:deterministic -- --shard=\\$\\{\\{\\s*matrix\\.shard\\s*\\}\\}/${shardCount}`
+    );
 }
 
 export function validateHostedCiWorkflow(source, { shardCount = 4 } = {}) {
@@ -110,72 +170,25 @@ export function validateHostedCiWorkflow(source, { shardCount = 4 } = {}) {
     errors.push("CI must run on pull requests, main pushes, and manual dispatch.");
   }
 
-  const ptyJob = workflowJob(source, "pty-ingress");
-  const ptyMatrix = ptyJob == null ? "" : workflowMatrix(ptyJob);
-  const ptyRun = ptyJob == null
-    ? null
-    : workflowStep(ptyJob, "Run source PTY ingress regression");
-  if (ptyJob == null
-    || containsContinueOnError(ptyJob)
-    || !hasExactJobLevelFields(ptyJob, [
-      "    name: PTY ingress / ${{ matrix.os }}",
-      HOSTED_MACOS_PULL_REQUEST_SKIP,
-      "    runs-on: ${{ matrix.os }}",
-      "    timeout-minutes: 10",
-      "    strategy:",
-      "    steps:"
-    ])
-    || !skipsHostedMacosOnPullRequest(ptyJob)
-    || !/^    runs-on:\s*\$\{\{\s*matrix\.os\s*\}\}\s*$/mu.test(ptyJob)
-    || !/^    timeout-minutes:\s*10\s*$/mu.test(ptyJob)
-    || !/^      fail-fast:\s*false\s*$/mu.test(ptyJob)
-    || !isExactMatrix(ptyMatrix, [
-      "        os: [ubuntu-latest, macos-latest]"
-    ])
-    || !isUnconditionalRunStep(ptyRun, "npm run test:pty-ingress")) {
-    errors.push("CI must preserve both fail-closed hosted PTY ingress gates and skip hosted macOS on pull_request.");
+  if (!isHostedPtyJob(workflowJob(source, "pty-ingress"), "ubuntu-latest")) {
+    errors.push("CI must preserve the fail-closed Ubuntu PTY ingress gate.");
+  }
+  if (!isHostedPtyJob(workflowJob(source, "pty-ingress-macos"), "macos-latest")) {
+    errors.push("CI must preserve the hosted macOS PTY ingress suite for main and workflow_dispatch.");
   }
 
-  const unixJob = workflowJob(source, "validate-and-test");
-  if (unixJob == null) {
-    errors.push("CI must define the sharded Unix deterministic matrix.");
-  } else {
-    const matrix = workflowMatrix(unixJob);
-    const validationRun = workflowStep(unixJob, "Validate release structure");
-    const deterministicRun = workflowStep(unixJob, "Run deterministic zero-skip shard");
-    if (!hasExactJobLevelFields(unixJob, [
-      `    name: \${{ matrix.os }} / Node \${{ matrix.node }} / shard \${{ matrix.shard }}/${shardCount}`,
-      HOSTED_MACOS_PULL_REQUEST_SKIP,
-      "    runs-on: ${{ matrix.os }}",
-      "    timeout-minutes: 30",
-      "    strategy:",
-      "    steps:"
-    ])
-      || !skipsHostedMacosOnPullRequest(unixJob)
-      || !/^    runs-on:\s*\$\{\{\s*matrix\.os\s*\}\}\s*$/mu.test(unixJob)
-      || !/^    timeout-minutes:\s*30\s*$/mu.test(unixJob)
-      || !/^      fail-fast:\s*false\s*$/mu.test(unixJob)
-      || containsContinueOnError(unixJob)
-      || /windows-latest/u.test(matrix)
-      || !isExactMatrix(matrix, [
-        "        os: [ubuntu-latest, macos-latest]",
-        "        node: [18.18.2, 22.x]",
-        `        shard: [${Array.from(
-          { length: shardCount },
-          (_, index) => index + 1
-        ).join(", ")}]`
-      ])) {
-      errors.push(`The Unix deterministic matrix must remain OS x Node x ${shardCount} exact shards with a 30-minute budget, fail-fast disabled, and hosted macOS skipped on pull_request.`);
-    }
-    if (!isShardOneValidationStep(validationRun)) {
-      errors.push("Each Unix OS/Node combination must run structural validation only on shard 1.");
-    }
-    if (!isUnconditionalRunStep(
-      deterministicRun,
-      `npm run test:deterministic -- --shard=\\$\\{\\{\\s*matrix\\.shard\\s*\\}\\}/${shardCount}`
-    )) {
-      errors.push("Each Unix matrix cell must run its exact deterministic shard.");
-    }
+  if (!isUnixDeterministicJob(workflowJob(source, "validate-and-test"), {
+    os: "ubuntu-latest",
+    shardCount
+  })) {
+    errors.push(`The required Unix deterministic matrix must remain Ubuntu x Node x ${shardCount} exact shards with a 30-minute budget and fail-fast disabled.`);
+  }
+  if (!isUnixDeterministicJob(workflowJob(source, "validate-and-test-macos"), {
+    os: "macos-latest",
+    shardCount,
+    postMerge: true
+  })) {
+    errors.push(`CI must preserve the hosted macOS deterministic matrix for main and workflow_dispatch as Node x ${shardCount} exact shards.`);
   }
 
   const windowsJob = workflowJob(source, "windows-neutral");
@@ -218,9 +231,10 @@ export function validateHostedCiWorkflow(source, { shardCount = 4 } = {}) {
     || !/name:\s*CI required\b/u.test(prGate)
     || !/always\(\)/u.test(prGate)
     || !/needs:\s*\[pty-ingress,\s*validate-and-test,\s*windows-neutral\]/u.test(prGate)
+    || /pty-ingress-macos|validate-and-test-macos/u.test(prGate)
     || !exactGateEnvironment.every((assignment) => assignment.test(prGate))
     || !exactGate.test(prGate)) {
-    errors.push("CI must preserve the stable CI required gate and directly fail on every unsuccessful hosted dependency.");
+    errors.push("CI must preserve the stable CI required gate over Ubuntu and Windows only, and directly fail on every unsuccessful hosted dependency.");
   }
 
   return errors;

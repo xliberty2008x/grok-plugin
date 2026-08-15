@@ -216,13 +216,23 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
     ),
     mutateJob(
       "pty-ingress",
-      "    if: ${{ github.event_name != 'pull_request' || matrix.os != 'macos-latest' }}",
+      "        os: [ubuntu-latest]",
+      "        os: [ubuntu-latest, macos-latest]"
+    ),
+    mutateJob(
+      "pty-ingress-macos",
+      "    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}",
       "    if: true"
     ),
     mutateJob(
-      "pty-ingress",
-      "    if: ${{ github.event_name != 'pull_request' || matrix.os != 'macos-latest' }}\n",
+      "pty-ingress-macos",
+      "    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}\n",
       ""
+    ),
+    mutateJob(
+      "pty-ingress-macos",
+      "        os: [macos-latest]",
+      "        os: [macos-latest]\n        exclude:\n          - os: macos-latest"
     ),
     mutateJob(
       "pty-ingress",
@@ -241,18 +251,23 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
     ),
     mutateJob(
       "validate-and-test",
-      "    if: ${{ github.event_name != 'pull_request' || matrix.os != 'macos-latest' }}",
+      "        os: [ubuntu-latest]",
+      "        os: [ubuntu-latest, macos-latest]"
+    ),
+    mutateJob(
+      "validate-and-test-macos",
+      "    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}",
       "    if: true"
     ),
     mutateJob(
-      "validate-and-test",
-      "    if: ${{ github.event_name != 'pull_request' || matrix.os != 'macos-latest' }}\n",
+      "validate-and-test-macos",
+      "    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}\n",
       ""
     ),
     mutateJob(
-      "validate-and-test",
-      "    if: ${{ github.event_name != 'pull_request' || matrix.os != 'macos-latest' }}",
-      "    if: ${{ github.event_name != 'pull_request' || matrix.os != 'ubuntu-latest' }}"
+      "validate-and-test-macos",
+      "        os: [macos-latest]",
+      "        os: [macos-latest]\n        exclude:\n          - node: 18.18.2"
     ),
     mutateJob(
       "validate-and-test",
@@ -289,7 +304,7 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
         "    strategy:",
         "      fail-fast: false",
         "      matrix:",
-        "        os: [ubuntu-latest, macos-latest]",
+        "        os: [ubuntu-latest]",
         "        node: [18.18.2, 22.x]",
         "        shard: [1, 2, 3, 4]"
       ].join("\n");
@@ -298,7 +313,7 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
         "      strategy:",
         "      fail-fast: false",
         "      matrix:",
-        "        os: [ubuntu-latest, macos-latest]",
+        "        os: [ubuntu-latest]",
         "        node: [18.18.2, 22.x]",
         "        shard: [1, 2, 3, 4]"
       ].join("\n");
@@ -357,9 +372,15 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
       "        continue-on-error: true\n        run: npm run test:pty-ingress"
     ),
     workflow.replace(
-      "      matrix:\n        os: [ubuntu-latest, macos-latest]",
-      "      matrix:\n        os: [ubuntu-latest, macos-latest]\n        exclude:\n          - os: macos-latest"
+      "      matrix:\n        os: [ubuntu-latest]",
+      "      matrix:\n        os: [ubuntu-latest]\n        exclude:\n          - os: ubuntu-latest"
     ),
+    workflow.replace(
+      "needs: [pty-ingress, validate-and-test, windows-neutral]",
+      "needs: [pty-ingress, pty-ingress-macos, validate-and-test, validate-and-test-macos, windows-neutral]"
+    ),
+    workflow.replace("  pty-ingress-macos:\n", "  pty-ingress-darwin:\n"),
+    workflow.replace("  validate-and-test-macos:\n", "  validate-and-test-darwin:\n"),
     workflow.replace(
       [
         "  windows-neutral:",
