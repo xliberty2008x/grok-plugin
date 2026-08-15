@@ -20,7 +20,7 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function tempDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "grok-qualify-"));
+  return fs.mkdtempSync(path.join(os.tmpdir(), "grok-plugin-test-"));
 }
 
 function mockSpawn({ status = 0, stdout = "ok\n", hangMs = 0 } = {}) {
