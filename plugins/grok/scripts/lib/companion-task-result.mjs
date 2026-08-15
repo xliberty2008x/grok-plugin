@@ -218,7 +218,8 @@ function persistExecutionResult(execution, state, providerResult) {
   const {
     root, id, job, preContext, dispatchAttemptId, dispatchFence
   } = execution;
-  const { result, workerReport, reportRepair, reportRepairError } = providerResult;
+  const { result, reportRepair, reportRepairError } = providerResult;
+  let workerReport = providerResult.workerReport;
   const postContext = captureCompleteContextManifest(root, contextCaptureOptions("terminal", job));
   if (job.jobClass === "review" && result.review) {
     const targetPaths = Array.isArray(job.request?.target?.changedPaths)
@@ -302,11 +303,15 @@ function persistExecutionResult(execution, state, providerResult) {
       && mailboxLifecycleValid
       && mailboxFinalReportBound;
     if (workerReport.outcome === "complete" && !providerSuccess) {
+      const classificationReason = workerReport.classificationReason
+        || "Provider claimed complete but host success conditions were not met.";
       workerReport = {
         ...workerReport,
         outcome: "partial",
-        classificationReason: workerReport.classificationReason
-          || "Provider claimed complete but host success conditions were not met."
+        classificationReason,
+        summary: workerReport.classificationReason
+          ? workerReport.summary
+          : `${classificationReason} ${workerReport.summary}`
       };
     }
     const safeResult = redact({
