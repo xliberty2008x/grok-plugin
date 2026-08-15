@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0-dev.12
+
+Status: hardening candidate; not release-qualified.
+
+- A second failed adversarial-review repair still fail-closes with `E_SCHEMA`
+  and no pass verdict. Public error details now keep the validation reason
+  and any sanitized findings so `status`/`result` are not a dead-end.
+
 ## 0.3.0-dev.11
 
 Status: hardening candidate; not release-qualified.
