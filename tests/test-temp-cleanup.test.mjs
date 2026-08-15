@@ -3342,10 +3342,10 @@ test("supervisor fails closed when its signed PID registry is replaced, truncate
       "child.unref();",
       `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
       tamper === "replace"
-        ? "fs.unlinkSync(registry); fs.writeFileSync(registry, \"\", { mode: 0o600 });"
+        ? "const d=Date.now()+2000; while (Date.now()<d && fs.readFileSync(registry,\"utf8\")===initialRegistry); fs.unlinkSync(registry); fs.writeFileSync(registry, \"\", { mode: 0o600 }); setInterval(() => {}, 1000);"
         : tamper === "truncate"
-          ? "fs.truncateSync(registry, 0);"
-          : "fs.writeFileSync(registry, initialRegistry);",
+          ? "const d=Date.now()+2000; while (Date.now()<d && fs.readFileSync(registry,\"utf8\")===initialRegistry); fs.truncateSync(registry, 0); setInterval(() => {}, 1000);"
+          : "const d=Date.now()+2000; while (Date.now()<d && fs.readFileSync(registry,\"utf8\")===initialRegistry); fs.writeFileSync(registry, initialRegistry); setInterval(() => {}, 1000);",
       ""
     ].join("\n"));
     let descendantPid = null;
