@@ -34,8 +34,11 @@ informs the split; it does not qualify a live Codex cache refresh.
   children instead of leaving them overlapping a retry.
 - Local adaptation: `qualify` streams the repository check, records the
   active phase, and signals the child process group on timeout so a later
-  retry cannot overlap a live suite. Install refuses to mutate the cache
-  until the receipt matches the exact source inventory.
+  retry cannot overlap a live suite. The bound wait is cleared when the
+  owner-scoped check ends so leftover timeout cannot keep the CLI alive;
+  unref is rejected because it lets the wait vanish when the child has no
+  OS handles. Install refuses to mutate the cache until the receipt
+  matches the exact source inventory.
 - Rejected or missing pattern: embedded ACP cancel and leader flock are not
   a Codex marketplace installer. Do not keep `spawnSync npm run check` on
   the consumer install path.

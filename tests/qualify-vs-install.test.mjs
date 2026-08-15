@@ -27,6 +27,10 @@ function tempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "grok-plugin-test-"));
 }
 
+function fakeHost() {
+  return new EventEmitter();
+}
+
 function mockSpawn({ status = 0, stdout = "ok\n", hangMs = 0 } = {}) {
   return (command, args) => {
     const child = new EventEmitter();
@@ -184,6 +188,7 @@ test("qualify writes a receipt bound to the current inventory after a streamed c
     npmBin: "npm",
     checkArgs: ["run", "check"],
     spawn: mockSpawn({ stdout: "validation ok\n" }),
+    process: fakeHost(),
     write(text) {
       seen.push(text);
     }
@@ -209,6 +214,7 @@ test("qualify timeout kills the child and writes no receipt", async () => {
       spawn() {
         return child;
       },
+      process: fakeHost(),
       kill(pid, signal) {
         killed.push({ pid, signal });
         if (signal === "SIGTERM") {
@@ -237,6 +243,7 @@ test("timeout never writes a receipt even if the child later exits 0", async () 
       spawn() {
         return child;
       },
+      process: fakeHost(),
       kill(_pid, signal) {
         if (signal === "SIGTERM") {
           queueMicrotask(() => child.emit("close", 0, null));
@@ -261,6 +268,7 @@ test("package or marketplace drift during qualify writes no receipt", async () =
       receiptPath,
       timeoutMs: 5_000,
       spawn: mockSpawn({ stdout: "ok\n" }),
+      process: fakeHost(),
       write() {},
       collectIdentity() {
         calls += 1;
@@ -283,6 +291,7 @@ test("a second qualify fails while the exclusive lock is held", async () => {
         lockRoot: workspace,
         receiptPath: path.join(workspace, "receipt.json"),
         spawn: mockSpawn(),
+        process: fakeHost(),
         write() {}
       }),
       /already running/
@@ -290,4 +299,21 @@ test("a second qualify fails while the exclusive lock is held", async () => {
   } finally {
     releaseQualifyLock(lockPath);
   }
+});
+
+test("successful qualify does not wait for the leftover timeout", async () => {
+  const workspace = tempDir();
+  const receiptPath = path.join(workspace, "receipt.json");
+  const started = Date.now();
+  await runLocalQualify({
+    root: ROOT,
+    lockRoot: workspace,
+    receiptPath,
+    timeoutMs: 30_000,
+    spawn: mockSpawn({ stdout: "ok\n" }),
+    process: fakeHost(),
+    write() {}
+  });
+  assert.ok(Date.now() - started < 5_000);
+  assert.equal(fs.existsSync(receiptPath), true);
 });

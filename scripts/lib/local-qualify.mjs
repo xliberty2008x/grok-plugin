@@ -19,11 +19,19 @@ function fail(message, details = "") {
   throw new Error(`${message}${suffix}`);
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    if (typeof timer.unref === "function") timer.unref();
+function delay(ms) {
+  let timer = null;
+  const promise = new Promise((resolve) => {
+    timer = setTimeout(resolve, ms);
   });
+  return {
+    promise,
+    clear() {
+      if (timer == null) return;
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
 }
 
 export function qualificationLockPath(root) {
@@ -132,6 +140,8 @@ export async function runLocalQualify(options = {}) {
 
   const lockPath = acquireQualifyLock(options.lockRoot ?? root, { kill: killer });
   let child = null;
+  let timeout = null;
+  let grace = null;
   const forward = (signal) => {
     write(`phase: forwarding ${signal}\n`);
     if (child?.pid) killProcessTree(child.pid, signal, killer);
@@ -176,14 +186,14 @@ export async function runLocalQualify(options = {}) {
     });
 
     let timedOut = false;
-    const timeoutWait = sleep(timeoutMs).then(() => {
-      timedOut = true;
-    });
-    let exit = await Promise.race([closed, timeoutWait.then(() => null)]);
+    timeout = delay(timeoutMs);
+    let exit = await Promise.race([closed, timeout.promise.then(() => null)]);
     if (exit == null) {
+      timedOut = true;
       write(`phase: repository-check timeout after ${timeoutMs}ms; stopping children\n`);
       killProcessTree(child.pid, "SIGTERM", killer);
-      exit = await Promise.race([closed, sleep(graceMs).then(() => null)]);
+      grace = delay(graceMs);
+      exit = await Promise.race([closed, grace.promise.then(() => null)]);
       if (exit == null) {
         killProcessTree(child.pid, "SIGKILL", killer);
         exit = await closed;
@@ -221,6 +231,8 @@ export async function runLocalQualify(options = {}) {
     write(`  digest:  ${receipt.source_digest}\n`);
     return { receipt, receiptPath, identity: current };
   } finally {
+    timeout?.clear();
+    grace?.clear();
     host.off("SIGINT", forward);
     host.off("SIGTERM", forward);
     releaseQualifyLock(lockPath);
