@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { runLocalCodexInstall } from "../scripts/lib/local-codex-install.mjs";
 import {
   acquireQualifyLock,
+  qualificationLockPath,
   releaseQualifyLock,
   runLocalQualify
 } from "../scripts/lib/local-qualify.mjs";
@@ -316,4 +317,90 @@ test("successful qualify does not wait for the leftover timeout", async () => {
   });
   assert.ok(Date.now() - started < 5_000);
   assert.equal(fs.existsSync(receiptPath), true);
+});
+
+test("EPERM on a lock owner is treated as already running", () => {
+  const workspace = tempDir();
+  const lockPath = qualificationLockPath(workspace);
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  fs.writeFileSync(lockPath, "4242\n");
+  assert.throws(
+    () => acquireQualifyLock(workspace, {
+      kill() {
+        const error = new Error("denied");
+        error.code = "EPERM";
+        throw error;
+      }
+    }),
+    /already running/
+  );
+});
+
+test("a live child pid in a stale parent lock blocks retry", () => {
+  const workspace = tempDir();
+  const lockPath = qualificationLockPath(workspace);
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  fs.writeFileSync(lockPath, `999999999\n${process.pid}\n`);
+  assert.throws(
+    () => acquireQualifyLock(workspace),
+    /already running/
+  );
+});
+
+test("releaseQualifyLock does not delete a lock owned by another pid", () => {
+  const workspace = tempDir();
+  const lockPath = qualificationLockPath(workspace);
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  fs.writeFileSync(lockPath, "999999999\n");
+  releaseQualifyLock(lockPath);
+  assert.equal(fs.existsSync(lockPath), true);
+});
+
+test("SIGINT during qualify writes no receipt even if the child exits 0", async () => {
+  const workspace = tempDir();
+  const receiptPath = path.join(workspace, "receipt.json");
+  const host = fakeHost();
+  const child = mockSpawn({ hangMs: 60_000 })("node", ["-e", "1"]);
+  const pending = runLocalQualify({
+    root: ROOT,
+    lockRoot: workspace,
+    receiptPath,
+    timeoutMs: 2_000,
+    process: host,
+    spawn() {
+      return child;
+    },
+    kill(_pid, signal) {
+      if (signal === "SIGINT" || signal === "SIGTERM" || signal === "SIGKILL") {
+        queueMicrotask(() => child.emit("close", signal === "SIGINT" ? 0 : 1, signal));
+      }
+    },
+    write() {}
+  });
+  setImmediate(() => host.emit("SIGINT"));
+  await assert.rejects(() => pending, /interrupted/);
+  assert.equal(fs.existsSync(receiptPath), false);
+});
+
+test("qualify failure keeps only a bounded log tail", async () => {
+  const workspace = tempDir();
+  const receiptPath = path.join(workspace, "receipt.json");
+  const huge = `${"x".repeat(80 * 1024)}\n`;
+  await assert.rejects(
+    () => runLocalQualify({
+      root: ROOT,
+      lockRoot: workspace,
+      receiptPath,
+      timeoutMs: 5_000,
+      spawn: mockSpawn({ status: 1, stdout: huge }),
+      process: fakeHost(),
+      write() {}
+    }),
+    (error) => {
+      assert.match(error.message, /exited with status 1/);
+      assert.ok(error.message.length < 70 * 1024);
+      return true;
+    }
+  );
+  assert.equal(fs.existsSync(receiptPath), false);
 });

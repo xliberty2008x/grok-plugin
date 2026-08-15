@@ -13,6 +13,7 @@ import {
 
 export const DEFAULT_QUALIFY_TIMEOUT_MS = 45 * 60_000;
 export const QUALIFY_KILL_GRACE_MS = 1_000;
+export const QUALIFY_LOG_TAIL_CHARS = 64 * 1024;
 
 function fail(message, details = "") {
   const suffix = details.trim() ? `\n${details.trim()}` : "";
@@ -58,9 +59,35 @@ function processIsAlive(pid, killer) {
   try {
     send(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return error?.code === "EPERM";
   }
+}
+
+function readLockPids(lockPath) {
+  try {
+    return fs.readFileSync(lockPath, "utf8")
+      .split(/\s+/u)
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0);
+  } catch {
+    return [];
+  }
+}
+
+function writeLockPids(lockPath, pids) {
+  const text = pids
+    .filter((value) => Number.isInteger(value) && value > 0)
+    .map((value) => `${value}\n`)
+    .join("");
+  fs.writeFileSync(lockPath, text, { mode: 0o600 });
+}
+
+function appendCapture(buffer, text) {
+  const next = buffer + text;
+  return next.length > QUALIFY_LOG_TAIL_CHARS
+    ? next.slice(-QUALIFY_LOG_TAIL_CHARS)
+    : next;
 }
 
 export function acquireQualifyLock(root, options = {}) {
@@ -79,16 +106,21 @@ export function acquireQualifyLock(root, options = {}) {
     return openExclusive();
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
-    let owner = 0;
+    const live = readLockPids(lockPath)
+      .filter((owner) => processIsAlive(owner, options.kill));
+    if (live.length > 0) {
+      fail(`Qualification already running (pid ${live.join(", ")}).`);
+    }
+    const stalePath = `${lockPath}.${process.pid}.stale`;
     try {
-      owner = Number(fs.readFileSync(lockPath, "utf8").trim());
-    } catch {
-      owner = 0;
+      fs.renameSync(lockPath, stalePath);
+    } catch (renameError) {
+      if (renameError.code === "ENOENT") {
+        fail("Qualification already running.");
+      }
+      throw renameError;
     }
-    if (processIsAlive(owner, options.kill)) {
-      fail(`Qualification already running (pid ${owner}).`);
-    }
-    fs.rmSync(lockPath, { force: true });
+    fs.rmSync(stalePath, { force: true });
     try {
       return openExclusive();
     } catch (retryError) {
@@ -101,9 +133,13 @@ export function acquireQualifyLock(root, options = {}) {
 }
 
 export function releaseQualifyLock(lockPath) {
-  if (typeof lockPath === "string" && lockPath.length > 0) {
-    fs.rmSync(lockPath, { force: true });
+  if (typeof lockPath !== "string" || lockPath.length < 1) return;
+  try {
+    if (!readLockPids(lockPath).includes(process.pid)) return;
+  } catch {
+    return;
   }
+  fs.rmSync(lockPath, { force: true });
 }
 
 function identityDrifted(before, after) {
@@ -142,12 +178,16 @@ export async function runLocalQualify(options = {}) {
   let child = null;
   let timeout = null;
   let grace = null;
+  let interrupted = false;
   const forward = (signal) => {
+    interrupted = true;
     write(`phase: forwarding ${signal}\n`);
     if (child?.pid) killProcessTree(child.pid, signal, killer);
   };
-  host.on("SIGINT", forward);
-  host.on("SIGTERM", forward);
+  const onSigint = () => forward("SIGINT");
+  const onSigterm = () => forward("SIGTERM");
+  host.on("SIGINT", onSigint);
+  host.on("SIGTERM", onSigterm);
   try {
     const collectIdentity = options.collectIdentity ?? collectInstallIdentity;
     const identity = collectIdentity(root);
@@ -164,25 +204,25 @@ export async function runLocalQualify(options = {}) {
     if (!Number.isInteger(child.pid) || child.pid < 1) {
       fail("Could not start npm run check.");
     }
-
-    let stdout = "";
-    let stderr = "";
-    child.stdout?.on("data", (chunk) => {
-      const text = String(chunk);
-      stdout += text;
-      write(text);
-    });
-    child.stderr?.on("data", (chunk) => {
-      const text = String(chunk);
-      stderr += text;
-      write(text);
-    });
-
     const closed = new Promise((resolve, reject) => {
       child.on("error", reject);
       child.on("close", (status, signal) => {
         resolve({ status, signal });
       });
+    });
+    writeLockPids(lockPath, [process.pid, child.pid]);
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => {
+      const text = String(chunk);
+      stdout = appendCapture(stdout, text);
+      write(text);
+    });
+    child.stderr?.on("data", (chunk) => {
+      const text = String(chunk);
+      stderr = appendCapture(stderr, text);
+      write(text);
     });
 
     let timedOut = false;
@@ -206,6 +246,9 @@ export async function runLocalQualify(options = {}) {
         "Timed-out children were signaled. Retry only after this command exits."
       );
     }
+    if (interrupted) {
+      fail("Qualification interrupted; no receipt written.");
+    }
     if (exit.status !== 0) {
       fail(
         `npm run check exited with status ${exit.status}.`,
@@ -218,6 +261,9 @@ export async function runLocalQualify(options = {}) {
       fail(
         "Source plugin, package metadata, or marketplace digest changed while qualification was running; no receipt written."
       );
+    }
+    if (interrupted) {
+      fail("Qualification interrupted; no receipt written.");
     }
     const receipt = buildQualificationReceipt(current, {
       createdAt: now().toISOString(),
@@ -233,8 +279,8 @@ export async function runLocalQualify(options = {}) {
   } finally {
     timeout?.clear();
     grace?.clear();
-    host.off("SIGINT", forward);
-    host.off("SIGTERM", forward);
+    host.off("SIGINT", onSigint);
+    host.off("SIGTERM", onSigterm);
     releaseQualifyLock(lockPath);
   }
 }
