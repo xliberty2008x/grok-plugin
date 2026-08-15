@@ -13,7 +13,9 @@ session.
 - Local adaptation: existing `worker_wait` keeps the single-`id` launch
   drain. `ids` (2–16 owned workers) waits for any new event or terminal
   transition, preserves per-worker cursors, and never dispatches a
-  provider. Timeout is an empty no-change result.
+  provider. Timeout is an empty no-change result. `waitAny` lives
+  outside `createWorkerService` so that function stays at its 751-line
+  cap.
 - Rejected or missing pattern: adding a second tool name that would
   change the frozen 10-tool live-receipt inventory.
 
