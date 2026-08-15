@@ -331,6 +331,46 @@ test("worker_wait ids waits for any owned worker without creating a service laun
   assert.deepEqual(waited.ids, ["task-aaaaaaaaaaaaaaaa", "task-bbbbbbbbbbbbbbbb"]);
 });
 
+test("worker_wait rejects mixed id/ids cursor fields", async () => {
+  const meta = {
+    threadId: PRINCIPAL.threadId,
+    "x-codex-turn-metadata": {
+      thread_id: PRINCIPAL.threadId,
+      turn_id: PRINCIPAL.turnId
+    },
+    plugin_id: "grok@grok-companion",
+    [MCP_SANDBOX_STATE_META_CAPABILITY]: {
+      sandboxCwd: pathToFileURL(ROOT).href
+    }
+  };
+  const mixed = await callWorkerTool({
+    name: "worker_wait",
+    arguments: {
+      id: "task-aaaaaaaaaaaaaaaa",
+      cursors: [
+        { schemaVersion: 1, workerId: "task-aaaaaaaaaaaaaaaa", sequence: 0 },
+        { schemaVersion: 1, workerId: "task-bbbbbbbbbbbbbbbb", sequence: 0 }
+      ]
+    },
+    _meta: meta
+  }, {
+    runtime: SPAWN_RUNTIME,
+    readProviderCapabilityReceipt: () => SPAWN_RECEIPT,
+    createService() {
+      return {
+        async wait() {
+          throw new Error("single-id wait must not run");
+        },
+        async waitAny() {
+          throw new Error("waitAny must not run");
+        }
+      };
+    }
+  });
+  assert.equal(mixed.structuredContent?.ok, false, JSON.stringify(mixed));
+  assert.equal(mixed.structuredContent.error.code, "E_USAGE");
+});
+
 test("worker_wait requires mutation authority before recovery-capable service creation", async () => {
   let serviceCreated = false;
   const withoutPluginId = {

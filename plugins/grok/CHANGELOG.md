@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0-dev.13
+
+Status: hardening candidate; not release-qualified.
+
+- `worker_wait` can wait for any of 2–16 owned workers via `ids` without a
+  new tool name or provider launch. Timeout is an empty no-change result.
+  Single-worker `id` wait stays compatible.
+
 ## 0.3.0-dev.12
 
 Status: hardening candidate; not release-qualified.

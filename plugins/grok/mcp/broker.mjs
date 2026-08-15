@@ -777,7 +777,7 @@ export async function callWorkerTool(params, options = {}) {
         }));
       }
       if (args.cursors !== undefined) {
-        throw new CompanionError("E_USAGE", "cursor is required for a single-worker wait.");
+        throw new CompanionError("E_USAGE", "cursors is not valid for a single-worker wait.");
       }
       return toolResult({ stream: await service.wait(args.id, {
         cursor: args.cursor ?? null,
