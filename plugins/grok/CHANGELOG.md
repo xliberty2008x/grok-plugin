@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0-dev.11
+
+Status: hardening candidate; not release-qualified.
+
+- Deep-research isolation now ignores the real user home and host extension
+  roots, and contamination failures name the loaded capability class without
+  private paths.
+
 ## 0.3.0-dev.10
 
 Status: hardening candidate; not release-qualified.
