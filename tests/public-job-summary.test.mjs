@@ -39,8 +39,8 @@ function workerReport(overrides = {}) {
 }
 
 function fixture(config = {}) {
-  const data = tempDir("grok-pjs-data-");
-  const fake = installFakeGrok(tempDir("grok-pjs-fake-"), config);
+  const data = tempDir();
+  const fake = installFakeGrok(tempDir(), config);
   const env = testEnvironment({ fake, pluginData: data });
   delete env.GROK_COMPANION_CHILD;
   delete env.GROK_COMPANION_JOB_MARKER;
