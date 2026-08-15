@@ -4,7 +4,7 @@ Grok Companion is a dual-host marketplace plugin that delegates code review, inv
 
 | | |
 |---|---|
-| **Version** | `0.3.0-dev.3` |
+| **Version** | `0.3.0-dev.4` |
 | **Status** | Development hardening prerelease; unqualified and not release-ready or stable |
 | **Repository** | `xliberty2008x/grok-plugin` |
 | **Marketplace name** | `grok-companion` |

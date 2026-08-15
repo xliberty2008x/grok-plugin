@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0-dev.4
+
+Status: hardening candidate; not release-qualified.
+
+- A structured task report that claims `outcome: complete` while any required
+  acceptance criterion is `unknown` is reclassified as `partial` with an
+  explicit `classificationReason`. `providerClaims.success: false` cannot
+  coexist with a published complete outcome. Host command verification stays
+  separate from that semantic classification.
+
 ## 0.3.0-dev.3
 
 Status: hardening candidate; not release-qualified.

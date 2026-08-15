@@ -207,7 +207,16 @@ export function buildWorkerReport(options = {}) {
   } else if (parsed && parsedReport.source !== "acp-structured" && !parsedReport.markerPresent) {
     validationIssues.push("Provider returned JSON without the required GROK_WORKER_REPORT marker.");
   }
-  const resolvedOutcome = requestedOutcome || "partial";
+  let resolvedOutcome = requestedOutcome || "partial";
+  let classificationReason = null;
+  const declaredRequired = Array.isArray(acceptanceCriteria) && acceptanceCriteria.length > 0;
+  if (resolvedOutcome === "complete" && declaredRequired) {
+    const unknownRequired = normalizedAcceptance.results.filter((entry) => entry.status === "unknown");
+    if (unknownRequired.length) {
+      resolvedOutcome = "partial";
+      classificationReason = "Required acceptance criteria remain unknown.";
+    }
+  }
   const reportSource = parsedReport?.source === "acp-structured"
     ? "acp-structured"
     : nativeErrorPresent
@@ -224,7 +233,7 @@ export function buildWorkerReport(options = {}) {
       || Boolean(parsedReport?.markerPresent)
     ) && validationIssues.length === 0,
     outcome: resolvedOutcome,
-    summary: resolvedSummary,
+    summary: classificationReason ? `${classificationReason} ${resolvedSummary}` : resolvedSummary,
     changedFiles: files,
     checksClaimed: checks,
     acceptanceResults: normalizedAcceptance.results,
@@ -235,7 +244,8 @@ export function buildWorkerReport(options = {}) {
       : {}),
     validationIssues,
     reportSource,
-    reportDigest: null
+    reportDigest: null,
+    ...(classificationReason ? { classificationReason } : {})
   };
   if (report.valid) {
     report.reportDigest = sha(canonicalJson({

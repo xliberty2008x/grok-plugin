@@ -283,6 +283,20 @@ function persistExecutionResult(execution, state, providerResult) {
       && result.mailboxEvidence.finalReportDigest === selectedReportDigest
     );
     // Provider success is a claim only; hostVerification stays not_run.
+    const providerSuccess = workerReport.valid
+      && workerReport.outcome === "complete"
+      && workerReport.acceptanceResults.every((entry) => entry.status === "met")
+      && observedFileAgreement
+      && mailboxLifecycleValid
+      && mailboxFinalReportBound;
+    if (workerReport.outcome === "complete" && !providerSuccess) {
+      workerReport = {
+        ...workerReport,
+        outcome: "partial",
+        classificationReason: workerReport.classificationReason
+          || "Provider claimed complete but host success conditions were not met."
+      };
+    }
     const safeResult = redact({
       ...storedText,
       interim: textEvidence(result.interimText || ""),
@@ -293,12 +307,7 @@ function persistExecutionResult(execution, state, providerResult) {
       stopReason: result.stopReason,
       workerReport,
       providerClaims: {
-        success: workerReport.valid
-          && workerReport.outcome === "complete"
-          && workerReport.acceptanceResults.every((entry) => entry.status === "met")
-          && observedFileAgreement
-          && mailboxLifecycleValid
-          && mailboxFinalReportBound,
+        success: providerSuccess,
         outcome: workerReport.outcome,
         summary: workerReport.summary,
         changedFiles: workerReport.changedFiles,
