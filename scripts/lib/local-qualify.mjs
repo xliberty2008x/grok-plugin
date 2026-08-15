@@ -21,7 +21,8 @@ function fail(message, details = "") {
 
 function sleep(ms) {
   return new Promise((resolve) => {
-    setTimeout(resolve, ms);
+    const timer = setTimeout(resolve, ms);
+    if (typeof timer.unref === "function") timer.unref();
   });
 }
 
@@ -80,7 +81,14 @@ export function acquireQualifyLock(root, options = {}) {
       fail(`Qualification already running (pid ${owner}).`);
     }
     fs.rmSync(lockPath, { force: true });
-    return openExclusive();
+    try {
+      return openExclusive();
+    } catch (retryError) {
+      if (retryError.code === "EEXIST") {
+        fail("Qualification already running.");
+      }
+      throw retryError;
+    }
   }
 }
 
@@ -122,7 +130,7 @@ export async function runLocalQualify(options = {}) {
   const killer = options.kill ?? process.kill.bind(process);
   const graceMs = options.killGraceMs ?? QUALIFY_KILL_GRACE_MS;
 
-  const lockPath = acquireQualifyLock(root, { kill: killer });
+  const lockPath = acquireQualifyLock(options.lockRoot ?? root, { kill: killer });
   let child = null;
   const forward = (signal) => {
     write(`phase: forwarding ${signal}\n`);
@@ -182,7 +190,7 @@ export async function runLocalQualify(options = {}) {
       }
     }
 
-    if (timedOut && exit.status !== 0) {
+    if (timedOut) {
       fail(
         "Qualification timed out during phase repository-check.",
         "Timed-out children were signaled. Retry only after this command exits."

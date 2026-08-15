@@ -173,10 +173,12 @@ test("matching receipt installs without running the repository suite", () => {
 });
 
 test("qualify writes a receipt bound to the current inventory after a streamed check", async () => {
-  const receiptPath = path.join(tempDir(), "receipt.json");
+  const workspace = tempDir();
+  const receiptPath = path.join(workspace, "receipt.json");
   const seen = [];
   const result = await runLocalQualify({
     root: ROOT,
+    lockRoot: workspace,
     receiptPath,
     timeoutMs: 5_000,
     npmBin: "npm",
@@ -194,70 +196,68 @@ test("qualify writes a receipt bound to the current inventory after a streamed c
 });
 
 test("qualify timeout kills the child and writes no receipt", async () => {
-  const receiptPath = path.join(tempDir(), "receipt.json");
+  const workspace = tempDir();
+  const receiptPath = path.join(workspace, "receipt.json");
   const child = mockSpawn({ hangMs: 60_000 })("node", ["-e", "1"]);
-  let killed = [];
-  const originalKill = process.kill;
-  process.kill = (pid, signal) => {
-    killed.push({ pid, signal });
-    if (signal === "SIGTERM") {
-      queueMicrotask(() => child.emit("close", null, "SIGTERM"));
-    }
-  };
-  try {
-    await assert.rejects(
-      () => runLocalQualify({
-        root: ROOT,
-        receiptPath,
-        timeoutMs: 20,
-        spawn() {
-          return child;
-        },
-        write() {}
-      }),
-      /timed out during phase repository-check/
-    );
-  } finally {
-    process.kill = originalKill;
-  }
+  const killed = [];
+  await assert.rejects(
+    () => runLocalQualify({
+      root: ROOT,
+      lockRoot: workspace,
+      receiptPath,
+      timeoutMs: 20,
+      spawn() {
+        return child;
+      },
+      kill(pid, signal) {
+        killed.push({ pid, signal });
+        if (signal === "SIGTERM") {
+          queueMicrotask(() => child.emit("close", null, "SIGTERM"));
+        }
+      },
+      write() {}
+    }),
+    /timed out during phase repository-check/
+  );
   assert.equal(fs.existsSync(receiptPath), false);
   assert.ok(killed.some((entry) => entry.signal === "SIGTERM"));
 });
 
-test("successful check after timeout still writes a receipt", async () => {
-  const receiptPath = path.join(tempDir(), "receipt.json");
+test("timeout never writes a receipt even if the child later exits 0", async () => {
+  const workspace = tempDir();
+  const receiptPath = path.join(workspace, "receipt.json");
   const child = mockSpawn({ hangMs: 60_000 })("node", ["-e", "1"]);
-  const originalKill = process.kill;
-  process.kill = (pid, signal) => {
-    if (signal === "SIGTERM") {
-      queueMicrotask(() => child.emit("close", 0, null));
-    }
-  };
-  try {
-    const result = await runLocalQualify({
+  await assert.rejects(
+    () => runLocalQualify({
       root: ROOT,
+      lockRoot: workspace,
       receiptPath,
       timeoutMs: 20,
       killGraceMs: 20,
       spawn() {
         return child;
       },
+      kill(_pid, signal) {
+        if (signal === "SIGTERM") {
+          queueMicrotask(() => child.emit("close", 0, null));
+        }
+      },
       write() {}
-    });
-    assert.equal(result.receipt.source_digest, collectInstallIdentity(ROOT).sourceDigest);
-    assert.equal(fs.existsSync(receiptPath), true);
-  } finally {
-    process.kill = originalKill;
-  }
+    }),
+    /timed out during phase repository-check/
+  );
+  assert.equal(fs.existsSync(receiptPath), false);
 });
 
 test("package or marketplace drift during qualify writes no receipt", async () => {
-  const receiptPath = path.join(tempDir(), "receipt.json");
+  const workspace = tempDir();
+  const receiptPath = path.join(workspace, "receipt.json");
   const first = collectInstallIdentity(ROOT);
   let calls = 0;
   await assert.rejects(
     () => runLocalQualify({
       root: ROOT,
+      lockRoot: workspace,
       receiptPath,
       timeoutMs: 5_000,
       spawn: mockSpawn({ stdout: "ok\n" }),
@@ -274,12 +274,14 @@ test("package or marketplace drift during qualify writes no receipt", async () =
 });
 
 test("a second qualify fails while the exclusive lock is held", async () => {
-  const lockPath = acquireQualifyLock(ROOT);
+  const workspace = tempDir();
+  const lockPath = acquireQualifyLock(workspace);
   try {
     await assert.rejects(
       () => runLocalQualify({
         root: ROOT,
-        receiptPath: path.join(tempDir(), "receipt.json"),
+        lockRoot: workspace,
+        receiptPath: path.join(workspace, "receipt.json"),
         spawn: mockSpawn(),
         write() {}
       }),
