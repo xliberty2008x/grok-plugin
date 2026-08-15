@@ -98,8 +98,20 @@ test("public job summary helper never splits a unicode scalar or escape", () => 
 
   const escaped = `${"z".repeat(PUBLIC_JOB_SUMMARY_LIMIT - 2)}\\n more`;
   const escapedProjected = projectPublicJobSummary(escaped);
-  assert.equal(escapedProjected.summary.endsWith("\\"), false);
-  assert.equal(escapedProjected.summary.endsWith(PUBLIC_JOB_SUMMARY_ELLIPSIS), true);
+  assert.equal(escapedProjected.truncated, true);
+  assert.equal(escapedProjected.summary.includes("\\"), false);
+  assert.equal(escapedProjected.summary.endsWith(`\\${PUBLIC_JOB_SUMMARY_ELLIPSIS}`), false);
+  assert.equal(escapedProjected.summary, PUBLIC_JOB_SUMMARY_ELLIPSIS);
+});
+
+test("public job summary helper does not hard-cut a leading path that fills the budget", () => {
+  const path = `src/${"payment-service-".repeat(12)}cache.mjs`;
+  assert.equal(path.length > PUBLIC_JOB_SUMMARY_LIMIT, true);
+  assert.equal(/\s/u.test(path.slice(0, PUBLIC_JOB_SUMMARY_LIMIT)), false);
+  const projected = projectPublicJobSummary(`${path} leftover`);
+  assert.equal(projected.truncated, true);
+  assert.equal(projected.summary.includes("src/payment-service-"), false);
+  assert.equal(projected.summary, PUBLIC_JOB_SUMMARY_ELLIPSIS);
 });
 
 test("status, result, and JSON share one truncated public summary", () => {

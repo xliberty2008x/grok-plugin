@@ -12,9 +12,11 @@ evidence informs the bound; it does not qualify a live job.
   present a corrupted or mid-token completion message as the product.
 - Local adaptation: `projectPublicJobSummary` bounds the stored public
   `job.summary` at 160 characters on a sentence or identifier boundary
-  and appends `…`. `result.workerReport.summary` remains the full
-  durable text. No new Worker Protocol snapshot field is added because
-  `WORKER_SNAPSHOT_KEYS` is an exact-key set.
+  and appends `…`. If retreat from a mid-token cut reaches 0, the public
+  summary is only `…` rather than a last-resort hard slice. 
+  `result.workerReport.summary` remains the full durable text. No new
+  Worker Protocol snapshot field is added because `WORKER_SNAPSHOT_KEYS`
+  is an exact-key set.
 - Rejected or missing pattern: Codex command docs do not define a
   160-character public-summary budget or an ellipsis contract to copy.
 

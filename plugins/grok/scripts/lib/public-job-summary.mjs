@@ -74,7 +74,7 @@ function choosePublicSummaryCut(text, budget) {
   const safeBudget = retreatFromUnsafeCut(text, Math.min(budget, text.length));
   const sentence = lastSentenceBoundary(text, safeBudget);
   if (sentence > 0) return sentence;
-  return safeBudget > 0 ? safeBudget : lastCompleteScalarIndex(text, Math.min(budget, text.length));
+  return safeBudget;
 }
 
 /**
