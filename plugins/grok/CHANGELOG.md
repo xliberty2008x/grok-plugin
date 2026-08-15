@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0-dev.9
+
+Status: hardening candidate; not release-qualified.
+
+- Advertised MCP `worker_spawn` returns an actionable stale-receipt or
+  invalid-receipt error instead of generic `E_CAPABILITY` when the frozen
+  broker snapshot no longer matches the live setup receipt.
+
 ## 0.3.0-dev.8
 
 Status: hardening candidate; not release-qualified.
