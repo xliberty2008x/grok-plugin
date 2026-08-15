@@ -72,12 +72,15 @@ function jobRecordFiles(root) {
 
 function removeFixtureDirectories(directories) {
   for (const directory of directories) {
-    fs.rmSync(directory, {
-      recursive: true,
-      force: true,
-      maxRetries: 100,
-      retryDelay: 25
-    });
+    const deadline = Date.now() + 15_000;
+    while (fs.existsSync(directory)) {
+      try {
+        fs.rmSync(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      } catch (error) {
+        if (error?.code !== "ENOTEMPTY" || Date.now() >= deadline) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+      }
+    }
   }
 }
 
