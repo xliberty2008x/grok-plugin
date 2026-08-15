@@ -7,8 +7,10 @@ import { fileURLToPath } from "node:url";
 import {
   ADVERSARIAL_NO_FINDINGS_PREFIX,
   ADVERSARIAL_REVIEW_REPAIR_PROMPT,
+  ORDINARY_REVIEW_REPAIR_PROMPT,
   structuredReviewOptionsFor,
-  validateAdversarialReview
+  validateAdversarialReview,
+  validateOrdinaryReview
 } from "../plugins/grok/scripts/lib/adversarial-review.mjs";
 import {
   cleanupReviewEnvironment,
@@ -88,6 +90,20 @@ test("AC-01: plan/progress-only zero findings is adversarial E_SCHEMA and never 
   assert.throws(
     () => validateAdversarialReview(PLAN_ONLY),
     (error) => error?.code === "E_SCHEMA" && error?.details?.reason === "plan-progress-only"
+  );
+  assert.throws(
+    () => validateOrdinaryReview({
+      summary: "I will inspect the payment-service changes, tests, and surrounding intent so the review is based on the actual working tree.",
+      findings: []
+    }),
+    (error) => error?.code === "E_SCHEMA" && error?.details?.reason === "plan-progress-only"
+  );
+  assert.equal(
+    validateOrdinaryReview({
+      summary: "No defects found in the selected target.",
+      findings: []
+    }).verdict,
+    "pass"
   );
 });
 
@@ -226,14 +242,19 @@ test("AC-06: ordinary review options stay generic and accept legacy zero-finding
     prompt: "review",
     stateDir: "/tmp/state"
   });
-  assert.equal(structuredReviewOptionsFor("review", common), common);
   assert.equal(structuredReviewOptionsFor("stop-review", common), common);
+  const ordinary = structuredReviewOptionsFor("review", common);
+  assert.notEqual(ordinary, common);
+  assert.equal(ordinary.validator, validateOrdinaryReview);
+  assert.equal(ordinary.repairPrompt, ORDINARY_REVIEW_REPAIR_PROMPT);
+  assert.equal(ordinary.root, common.root);
   const adversarial = structuredReviewOptionsFor("adversarial-review", common);
   assert.notEqual(adversarial, common);
   assert.equal(adversarial.validator, validateAdversarialReview);
   assert.equal(adversarial.repairPrompt, ADVERSARIAL_REVIEW_REPAIR_PROMPT);
   assert.equal(adversarial.root, common.root);
   assert.match(DEFAULT_REVIEW_REPAIR_PROMPT, /summary and findings/);
+  assert.match(ORDINARY_REVIEW_REPAIR_PROMPT, /completed, evidence-based rationale/);
 
   const ordinaryZero = validateReview({
     summary: "No defects found in the selected target.",
@@ -401,6 +422,9 @@ test("AC-07 background/status-result: double plan-only never publishes pass and 
     assert.equal(terminal.status, "failed");
     assert.equal(terminal.error?.code, "E_SCHEMA");
     assert.equal(terminal.result?.review, undefined);
+    assert.equal(terminal.result?.reportRepair?.attempted, true);
+    assert.equal(terminal.result?.reportRepair?.valid, false);
+    assert.ok(terminal.result?.reportRepair?.initialResponse?.bytes > 0);
     assert.doesNotMatch(JSON.stringify(terminal), /"verdict"\s*:\s*"pass"/);
     assert.doesNotMatch(JSON.stringify(terminal), new RegExp(PRIVATE_SENTINEL));
     assert.doesNotMatch(String(terminal.progress || ""), /Review finalized/i);
@@ -446,9 +470,80 @@ test("selector does not mutate ordinary common options object", () => {
   const common = { root: "r", prompt: "p", stateDir: "s" };
   const copy = { ...common };
   const out = structuredReviewOptionsFor("review", common);
-  assert.equal(out, common);
+  assert.notEqual(out, common);
   assert.deepEqual(common, copy);
+  assert.equal(out.validator, validateOrdinaryReview);
   const adv = structuredReviewOptionsFor("adversarial-review", common);
   assert.equal(common.validator, undefined);
   assert.equal(adv.validator, validateAdversarialReview);
+});
+
+test("issue #113: ordinary review rejects provisional intent and repairs once", async () => {
+  const provisional = {
+    summary: "I will inspect the payment-service changes, tests, and surrounding intent so the review is based on the actual working tree.",
+    findings: []
+  };
+  const completed = {
+    summary: "The payment-service retry map poisons failed in-flight charges and the added test uses timers. Not ready.",
+    findings: [{
+      severity: "high",
+      title: "Rejected in-flight promise poisons retries",
+      body: "The #inFlight map keeps the rejected promise, so later retries return the same failure."
+    }]
+  };
+  await withFake({
+    reviewSequence: [provisional, completed]
+  }, async (fake) => {
+    const root = initRepo();
+    fs.mkdirSync(path.join(root, "src"), { recursive: true });
+    fs.writeFileSync(path.join(root, "src/payment-service.mjs"), "export const charge = () => {};\n");
+    const pluginData = tempDir("grok-plugin-data-");
+    const env = testEnvironment({ fake, pluginData, sessionId: "ordinary-provisional" });
+    delete env.GROK_COMPANION_CHILD;
+    delete env.GROK_COMPANION_JOB_MARKER;
+    delete env.GROK_AGENT;
+    delete env.GROK_LEADER_SOCKET;
+    const finished = runCompanion(["review", "--wait", "--json", "--scope", "working-tree"], {
+      cwd: root,
+      env,
+      timeout: 60_000
+    });
+    assert.equal(finished.status, 0, finished.stderr || finished.stdout);
+    const job = JSON.parse(finished.stdout);
+    assert.equal(job.kind, "review");
+    assert.equal(job.status, "completed");
+    assert.equal(job.result.review.verdict, "needs_changes");
+    assert.equal(job.result.review.findings.length, 1);
+    assert.doesNotMatch(job.result.review.summary, /I will inspect/);
+    const reviews = readFakeLog(fake.logFile).filter((entry) => entry.event === "headless");
+    assert.equal(reviews.length, 2);
+    assert.equal(reviews[1].prompt, ORDINARY_REVIEW_REPAIR_PROMPT);
+  });
+});
+
+test("issue #116: findings-bearing complex adversarial review stays needs_changes", () => {
+  const complex = {
+    summary: "The payment-service coalescing map poisons retries, aliases tenant keys, and the new test uses timers. Do not ship.",
+    findings: [
+      {
+        severity: "high",
+        title: "Rejected in-flight promise poisons retries",
+        body: "A failed charge stays in #inFlight, so the next identical request returns the same rejection."
+      },
+      {
+        severity: "high",
+        title: "Delimiter-based composite keys collide",
+        body: "tenantId:idempotencyKey aliases distinct pairs when either side contains a colon."
+      },
+      {
+        severity: "medium",
+        title: "Visible test uses a timer",
+        body: "AGENTS.md forbids setTimeout in this repository's contract tests."
+      }
+    ]
+  };
+  const result = validateAdversarialReview(complex);
+  assert.equal(result.verdict, "needs_changes");
+  assert.equal(result.findings.length, 3);
+  assert.equal(result.summary.startsWith(ADVERSARIAL_NO_FINDINGS_PREFIX), false);
 });

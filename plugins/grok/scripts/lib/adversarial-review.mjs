@@ -1,7 +1,8 @@
 /**
- * Adversarial-review specialization: wraps the shared structural validateReview
- * with a zero-findings semantic completion gate. Ordinary review keeps the
- * generic validator; only job.kind === "adversarial-review" selects this path.
+ * Review specialization: wraps the shared structural validateReview.
+ * Ordinary review rejects plan/progress-only zero-finding summaries.
+ * Adversarial review additionally requires the ship/no-ship grammar.
+ * stop-review keeps the generic validator.
  */
 
 import { CompanionError } from "./errors.mjs";
@@ -23,10 +24,21 @@ export const ADVERSARIAL_REVIEW_REPAIR_PROMPT = [
   "Your previous response was not a completed adversarial review.",
   "Return only one JSON object with exactly summary and findings.",
   "Omit verdict; the runtime derives pass from zero findings and needs_changes from one or more findings.",
+  "If you already identified concrete risks, put them in findings and write a completed ship/no-ship summary. Do not rerun the review or launch another session.",
   "For empty findings, summary MUST use exactly: `No material findings: Challenged: <what was challenged>. Assessment: <why it holds or residual non-blocking risk>. Decision: ship.`",
   "Both marked segments must be substantive completed assessment text with at least five distinct letter-bearing words and bounded repetition, not placeholders, plans, or progress notes.",
   "Do not return plan or progress-only text such as I will, I'll, I need to, I am reviewing, I have begun, I plan to, The next step, Still reviewing, Currently reviewing, Inspecting, Reviewing, Searching, or Locating.",
   "Preserve substantive findings and use repository-relative paths."
+].join(" ");
+
+/** Same-session repair text for ordinary review provisional or incomplete output. */
+export const ORDINARY_REVIEW_REPAIR_PROMPT = [
+  "Your previous response was not a completed review.",
+  "Return only one JSON object with exactly summary and findings.",
+  "Omit verdict; the runtime derives pass from zero findings and needs_changes from one or more findings.",
+  "Do not return plan or progress-only text such as I will, I'll, I need to, I am reviewing, Inspecting, Reviewing, Searching, or Locating.",
+  "A zero-finding pass requires a completed, evidence-based rationale for the actual changed files and applicable repository instructions.",
+  "If you found defects, put them in findings. Preserve substantive findings and use repository-relative paths."
 ].join(" ");
 
 /** Bounded future/incomplete forms observed in issue #4 and close variants. */
@@ -147,20 +159,58 @@ export function validateAdversarialReview(value) {
   return validated;
 }
 
+const ORDINARY_COMPLETED_CUE = /\b(?:found|revealed|confirmed|showed|demonstrated|established|identified|exposed|surfaced|proved|no\s+(?:defects?|findings?|issues?|risks?)|ready(?:\s+with\s+fixes)?|not\s+ready|holds)\b/iu;
+
 /**
- * Select runStructuredReview options. Ordinary review receives `common`
- * unchanged (generic validator, repair prompt, one-call success path).
- * Adversarial review adds the semantic validator and specialized repair text.
+ * Ordinary-review semantic gate: keep the shared structural validator and
+ * never require the adversarial no-findings prefix. Zero-finding pass still
+ * rejects plan/progress-only summaries that are not a completed assessment.
+ *
+ * @param {unknown} value provider structured output
+ * @returns {{ verdict: "pass"|"needs_changes", summary: string, findings: object[] }}
+ */
+export function validateOrdinaryReview(value) {
+  const validated = validateReview(value);
+  if (validated.findings.length > 0) return validated;
+  const summary = validated.summary.trim();
+  if (isPlanOrProgress(summary) || !ORDINARY_COMPLETED_CUE.test(summary)) {
+    throw new CompanionError(
+      "E_SCHEMA",
+      "Review output is only a plan or progress note, not a completed assessment.",
+      {
+        reason: isPlanOrProgress(summary) ? "plan-progress-only" : "missing-evidence-rationale",
+        hint: "Return a completed summary tied to the reviewed files, or put concrete findings in findings. Plan or progress-only text is not a completed review.",
+        findingsCount: 0
+      }
+    );
+  }
+  return validated;
+}
+
+/**
+ * Select runStructuredReview options. Ordinary review adds a provisional-intent
+ * gate on top of the generic structural validator and MUST NOT require the
+ * adversarial no-findings prefix. Adversarial review keeps the ship/no-ship
+ * grammar. stop-review stays on the generic one-call path.
  *
  * @param {string} kind job kind
  * @param {object} common shared provider options
  * @returns {object}
  */
 export function structuredReviewOptionsFor(kind, common) {
-  if (kind !== "adversarial-review") return common;
-  return {
-    ...common,
-    validator: validateAdversarialReview,
-    repairPrompt: ADVERSARIAL_REVIEW_REPAIR_PROMPT
-  };
+  if (kind === "adversarial-review") {
+    return {
+      ...common,
+      validator: validateAdversarialReview,
+      repairPrompt: ADVERSARIAL_REVIEW_REPAIR_PROMPT
+    };
+  }
+  if (kind === "review") {
+    return {
+      ...common,
+      validator: validateOrdinaryReview,
+      repairPrompt: ORDINARY_REVIEW_REPAIR_PROMPT
+    };
+  }
+  return common;
 }

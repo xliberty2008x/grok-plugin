@@ -488,8 +488,8 @@ async function serveAcp(binary, config) {
         status: "completed"
       });
 
-      if (config.taskMutatePath && (!config.taskMutateOnPrompt || config.taskMutateOnPrompt === promptNumber)) {
-        fs.writeFileSync(config.taskMutatePath, config.taskMutation || "mutated by fake Grok task\n");
+      if (!config.taskMutateOnPrompt || config.taskMutateOnPrompt === promptNumber) {
+        for (const mutation of [{ path: config.taskMutatePath, contents: config.taskMutation }, ...(config.taskMutatePaths || [])]) if (mutation?.path) fs.writeFileSync(mutation.path, mutation.contents || "mutated by fake Grok task\n");
       }
 
       let text;

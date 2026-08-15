@@ -409,6 +409,19 @@ test("every admission tool revalidates the live receipt before authority or serv
       assert.equal(result.structuredContent.error.code, "E_CAPABILITY", `${label}:${name}`);
       assert.equal(authorityResolved, false, `${label}:${name}`);
       assert.equal(serviceCreated, false, `${label}:${name}`);
+      if (label === "digest-drift") {
+        assert.match(
+          result.structuredContent.error.message,
+          /frozen provider capability receipt is stale/
+        );
+        assert.equal(result.structuredContent.error.details?.reason, "stale_frozen_receipt");
+      } else {
+        assert.match(
+          result.structuredContent.error.message,
+          /no longer valid|Reconnect or restart/
+        );
+        assert.equal(result.structuredContent.error.details?.reason, "receipt_unavailable");
+      }
     }
   }
 });

@@ -112,6 +112,29 @@ export function buildRuntimeEvidence({
  *   record-verification. Older manifests without verification fields fall back
  *   fail-closed to the full ignored comparison.
  */
+/**
+ * Public verification changed-path evidence.
+ *
+ * `record-verification` still scopes the completion→verification window so
+ * host-only mutations can fail closed. The published field must not replace
+ * the terminal runtime's observed paths with that often-empty window, which
+ * reads as "the host verified no changes" for a successful write job.
+ */
+export function publishedVerificationChangedPaths({
+  runtimeObservedPaths = [],
+  verificationWindowPaths = []
+} = {}) {
+  const seen = new Set();
+  const merged = [];
+  for (const value of [...runtimeObservedPaths, ...verificationWindowPaths]) {
+    const relativePath = typeof value === "string" ? value.trim() : "";
+    if (!relativePath || seen.has(relativePath)) continue;
+    seen.add(relativePath);
+    merged.push(relativePath);
+  }
+  return boundPathEvidence(merged);
+}
+
 export function observeChangedPaths(preContext, postContext, { observer = "full" } = {}) {
   if (!preContext?.git || !postContext?.git) return [];
   const fingerprint = (entry) => canonicalJson({

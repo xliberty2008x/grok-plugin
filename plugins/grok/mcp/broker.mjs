@@ -479,22 +479,50 @@ function brokerRuntime(options) {
   return options?.runtime || DEFAULT_BROKER_RUNTIME;
 }
 
-function currentProviderCapabilityDigest(runtime, options) {
-  if (!SHA256_HEX.test(runtime?.providerCapabilityDigest || "")) return null;
+function readLiveProviderCapabilityReceipt(options) {
+  const readReceipt = options?.readProviderCapabilityReceipt
+    || readValidProviderCapabilityReceipt;
   try {
-    const readReceipt = options?.readProviderCapabilityReceipt
-      || readValidProviderCapabilityReceipt;
-    const receipt = readReceipt({ env: options?.env || process.env });
-    return validProviderCapabilityReceipt(receipt)
-      && receipt.capabilityDigest === runtime.providerCapabilityDigest
-      && receipt.providerLaunchBindingDigest === runtime.providerLaunchBindingDigest
-      && providerLaunchBindingDigest(receipt.providerLaunchBinding)
-        === providerLaunchBindingDigest(runtime.providerLaunchBinding)
-      ? receipt.capabilityDigest
-      : null;
+    return readReceipt({ env: options?.env || process.env });
   } catch {
     return null;
   }
+}
+
+function currentProviderCapabilityDigest(runtime, options) {
+  if (!SHA256_HEX.test(runtime?.providerCapabilityDigest || "")) return null;
+  const receipt = readLiveProviderCapabilityReceipt(options);
+  return validProviderCapabilityReceipt(receipt)
+    && receipt.capabilityDigest === runtime.providerCapabilityDigest
+    && receipt.providerLaunchBindingDigest === runtime.providerLaunchBindingDigest
+    && providerLaunchBindingDigest(receipt.providerLaunchBinding)
+      === providerLaunchBindingDigest(runtime.providerLaunchBinding)
+    ? receipt.capabilityDigest
+    : null;
+}
+
+function providerCapabilityAdmissionError(runtime, options) {
+  const frozen = SHA256_HEX.test(runtime?.providerCapabilityDigest || "");
+  const receipt = readLiveProviderCapabilityReceipt(options);
+  const liveValid = validProviderCapabilityReceipt(receipt);
+  if (frozen && liveValid && receipt.capabilityDigest !== runtime.providerCapabilityDigest) {
+    return {
+      code: "E_CAPABILITY",
+      message: "The MCP broker's frozen provider capability receipt is stale. Reconnect or restart the MCP server after setup so advertised worker tools can use the current receipt.",
+      details: { reason: "stale_frozen_receipt" }
+    };
+  }
+  if (frozen && !liveValid) {
+    return {
+      code: "E_CAPABILITY",
+      message: "The MCP broker advertised worker tools from a setup receipt that is no longer valid. Run setup, then reconnect or restart the MCP server.",
+      details: { reason: "receipt_unavailable" }
+    };
+  }
+  return {
+    code: "E_CAPABILITY",
+    message: "Required worker broker capability is unavailable."
+  };
 }
 
 function currentWriteLifecycleCapabilityDigest(runtime, options) {
@@ -666,10 +694,7 @@ export async function callWorkerTool(params, options = {}) {
   // the service so expiry, setup revocation, or binary/profile drift fail closed.
   if (["worker_spawn", "worker_decide_host_action", "worker_followup", "worker_send"].includes(name)
     && currentProviderCapabilityDigest(runtime, options) === null) {
-    return toolResult({
-      code: "E_CAPABILITY",
-      message: "Required worker broker capability is unavailable."
-    }, true);
+    return toolResult(providerCapabilityAdmissionError(runtime, options), true);
   }
   if ([
     "worker_spawn_write",

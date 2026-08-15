@@ -937,12 +937,25 @@ export async function runStructuredReview(options) {
     try {
       return { ...repair, review: validate(parsed) };
     } catch (repairError) {
+      const initialText = String(run?.text || "");
       const details = {
         ...(repairError?.details && typeof repairError.details === "object" ? repairError.details : {}),
         firstError: firstError?.code || null,
         repairAttempted: true,
         attempts: 2,
-        jobId: rest.jobMarker || null
+        jobId: rest.jobMarker || null,
+        reportRepair: {
+          attempted: true,
+          valid: false,
+          initialResponse: {
+            bytes: Buffer.byteLength(initialText, "utf8"),
+            digest: crypto.createHash("sha256").update(initialText).digest("hex")
+          },
+          validationIssues: [
+            firstError?.details?.reason || firstError?.code || "E_SCHEMA",
+            repairError?.details?.reason || repairError?.code || "E_SCHEMA"
+          ].filter(Boolean)
+        }
       };
       throw new CompanionError(
         repairError?.code || "E_SCHEMA",

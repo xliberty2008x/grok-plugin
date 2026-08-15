@@ -523,7 +523,7 @@ It shares the normal review target and execution rules but:
 - Plan/progress-leading forms such as `I will`, `I'll`, `I need to`, `I am reviewing`, `Inspecting`, `Reviewing`, `Searching`, and `Locating` are not completed adversarial output for empty findings.
 - This is a deterministic completion/schema gate. It does not independently prove the meaning or truth of arbitrary provider paraphrases; stronger semantic qualification requires an evolved structured response or an independent evaluator, not unbounded prose heuristics.
 - Findings-bearing payloads still use the shared structural validator and derive `needs_changes` without requiring the no-findings prefix.
-- Ordinary review MUST keep the generic structural validator and MUST NOT require the adversarial no-findings prefix.
+- Ordinary review MUST keep the generic structural validator and MUST NOT require the adversarial no-findings prefix. Ordinary review additionally rejects zero-finding summaries that are only plan or progress notes (`I will inspect`, `I need to review`, and equivalent provisional language) and requires a completed, evidence-based rationale before deriving `pass`.
 
 ### 11.4 Review result schema
 
@@ -549,9 +549,9 @@ The root requires `verdict`, `summary`, and `findings`; each finding requires `s
 
 The shared structural validator checks shape and positive line numbers and derives `pass` from zero findings and `needs_changes` from any finding. It does not independently prove that a returned path belongs to the selected target or that a line exists in the referenced revision. Paths and locations are provider claims and MUST be rendered without upgrading them into independently verified facts.
 
-Adversarial review additionally applies a specialization-only semantic completion check on top of that shared validator (empty-findings completed rationale contract above). Ordinary review does not.
+Adversarial review additionally applies a specialization-only semantic completion check on top of that shared validator (empty-findings completed rationale contract above). Ordinary review applies a distinct provisional-intent gate only: it MUST NOT require the adversarial prefix or ship/no-ship grammar, and it MUST NOT derive `pass` from plan or progress-only zero-finding summaries.
 
-Malformed or semantically incomplete structured output receives at most one same-session repair prompt. A second validation failure produces `E_SCHEMA` and MUST NOT be presented as a valid review or terminal pass. Human output for both review modes SHALL be rendered deterministically from the validated payload.
+Malformed or semantically incomplete structured output receives at most one same-session repair prompt. A second validation failure produces `E_SCHEMA` and MUST NOT be presented as a valid review or terminal pass. Failed review repair MUST retain sanitized bounded repair evidence (`reportRepair`) without publishing `verdict: pass`. Human output for both review modes SHALL be rendered deterministically from the validated payload.
 
 ### 11.5 `/grok:rescue`
 

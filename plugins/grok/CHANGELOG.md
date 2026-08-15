@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.0-dev.7
+
+Status: hardening candidate; not release-qualified.
+
+- Ordinary `review` no longer publishes `Verdict: pass` from a plan or
+  progress-only summary such as `I will inspect…`. Zero-finding pass now
+  requires a completed, evidence-based rationale. One same-session repair is
+  allowed; an unresolved repair fails closed.
+- Adversarial review still rejects placeholder intent, but a failed repair now
+  keeps sanitized `reportRepair` evidence instead of a bare `E_SCHEMA`
+  dead-end. Findings-bearing complex diffs stay `needs_changes` without the
+  no-findings prefix.
+- `record-verification` publishes the terminal runtime's observed changed
+  paths. An empty completion→verification window no longer looks like the host
+  verified no write-job changes.
+- Advertised MCP `worker_spawn` returns an actionable stale-receipt or
+  invalid-receipt error instead of generic `E_CAPABILITY` when the frozen
+  broker snapshot no longer matches the live setup receipt.
+- Deep-research isolation now ignores the real user home and host extension
+  roots, and contamination failures name the loaded capability class without
+  private paths.
+
 ## 0.3.0-dev.6
 
 Status: hardening candidate; not release-qualified.

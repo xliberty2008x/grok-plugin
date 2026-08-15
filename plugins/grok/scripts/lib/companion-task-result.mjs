@@ -483,6 +483,9 @@ function recordExecutionFailure(execution, error) {
         ...(mailboxFailureEvidence
           ? { mailboxEvidence: mailboxFailureEvidence }
           : {}),
+        ...(error?.details?.reportRepair
+          ? { reportRepair: error.details.reportRepair }
+          : {}),
         hostVerification: current.result?.hostVerification || "not_run",
         runtimeEvidence: buildRuntimeEvidence({
           preContext,

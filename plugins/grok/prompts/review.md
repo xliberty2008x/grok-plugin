@@ -56,10 +56,12 @@ helps authors trust the rest of the feedback.
 Return exactly one JSON object matching this shape:
 `{"summary":"...","findings":[{"severity":"critical|high|medium|low|info","title":"...","body":"...","file":"path or null","line":1}]}`
 
-**summary** (required, non-empty): 2–5 sentences covering (1) what the change does,
+**summary** (required, non-empty): 2–5 completed sentences covering (1) what the change does,
 (2) strengths / what is well done, (3) dominant risk areas, (4) readiness assessment
 in plain language (e.g. ready / ready with fixes / not ready) — without inventing a
-`verdict` field.
+`verdict` field. Do not return future-tense or in-progress notes such as
+`I will inspect`, `I need to review`, `Inspecting`, or `Reviewing`. A zero-finding
+pass must be a completed, evidence-based rationale for the actual changed files.
 
 **findings**: Leave `findings` empty when there are no actionable defects. For each finding:
 - `title`: short specific issue name
