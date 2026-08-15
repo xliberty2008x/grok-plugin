@@ -149,6 +149,24 @@ export function observeChangedPaths(preContext, postContext, { observer = "full"
   return [...changed];
 }
 
+/**
+ * Public verification path evidence keeps the terminal runtime's observed
+ * paths and appends any additional completion→verification delta. The delta
+ * remains the scope-check input; this projection is what status/result show.
+ */
+export function projectVerificationObservedPaths(runtimePaths, verificationDelta) {
+  const runtime = Array.isArray(runtimePaths) ? runtimePaths : [];
+  const delta = Array.isArray(verificationDelta) ? verificationDelta : [];
+  const seen = new Set();
+  const merged = [];
+  for (const item of [...runtime, ...delta]) {
+    if (typeof item !== "string" || seen.has(item)) continue;
+    seen.add(item);
+    merged.push(item);
+  }
+  return boundPathEvidence(merged);
+}
+
 function observeFullIgnoredDrift(preGit, postGit, changed) {
   if ((preGit.ignoredDigest || null) !== (postGit.ignoredDigest || null)) {
     if (preGit.ignoredEntriesAttributable && postGit.ignoredEntriesAttributable) {

@@ -34,6 +34,7 @@ export {
 export { isVerificationCacheIgnoredPath } from "./task-context-worktree.mjs";
 export {
   buildRuntimeEvidence,
-  observeChangedPaths
+  observeChangedPaths,
+  projectVerificationObservedPaths
 } from "./task-runtime-evidence.mjs";
 export { composeProviderPrompt } from "./task-provider-prompt.mjs";

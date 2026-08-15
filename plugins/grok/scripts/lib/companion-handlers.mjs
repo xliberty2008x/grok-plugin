@@ -25,7 +25,7 @@ import { boundPathEvidence } from "./task-contract-primitives.mjs";
 import { bindTaskEnvelopeContext, buildTaskEnvelope, parseTaskEnvelopeInput } from "./task-envelope.mjs";
 import { composeProviderPrompt } from "./task-provider-prompt.mjs";
 import { evaluateScope } from "./task-scope.mjs";
-import { observeChangedPaths } from "./task-runtime-evidence.mjs";
+import { observeChangedPaths, projectVerificationObservedPaths } from "./task-runtime-evidence.mjs";
 import { projectWorkerHandle } from "./worker-protocol.mjs";
 import { argvFrom, assertHostJobAccess, baseRecord, currentHost, loadTemplate, out, parseVerificationRecord, publicJson, readPrivateEnvelopeFile, renderJob, renderReview, stateDir, stdinReadySignal, touchJob, validateModelEffort } from "./companion-shared.mjs";
 
@@ -221,7 +221,10 @@ async function handleRecordVerification(raw) {
         { paths: scopeViolationEvidence }
       );
     }
-    const observedChangedEvidence = boundPathEvidence(observedChangedPaths);
+    const observedChangedEvidence = projectVerificationObservedPaths(
+      job.result?.runtimeEvidence?.observedChangedPaths,
+      observedChangedPaths
+    );
     return updateJob(root, job.id, (current) => {
       current.verificationContextManifest = verificationContextManifest;
       current.commandOutcomes = record.commandOutcomes;
