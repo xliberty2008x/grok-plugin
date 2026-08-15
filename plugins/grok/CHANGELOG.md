@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0-dev.8
+
+Status: hardening candidate; not release-qualified.
+
+- `record-verification` publishes the terminal runtime's observed changed
+  paths. An empty completion→verification window no longer looks like the host
+  verified no write-job changes.
+
 ## 0.3.0-dev.7
 
 Status: hardening candidate; not release-qualified.

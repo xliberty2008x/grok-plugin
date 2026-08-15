@@ -25,7 +25,7 @@ import { boundPathEvidence } from "./task-contract-primitives.mjs";
 import { bindTaskEnvelopeContext, buildTaskEnvelope, parseTaskEnvelopeInput } from "./task-envelope.mjs";
 import { composeProviderPrompt } from "./task-provider-prompt.mjs";
 import { evaluateScope } from "./task-scope.mjs";
-import { observeChangedPaths } from "./task-runtime-evidence.mjs";
+import { observeChangedPaths, publishedVerificationChangedPaths } from "./task-runtime-evidence.mjs";
 import { projectWorkerHandle } from "./worker-protocol.mjs";
 import { argvFrom, assertHostJobAccess, baseRecord, currentHost, loadTemplate, out, parseVerificationRecord, publicJson, readPrivateEnvelopeFile, renderJob, renderReview, stateDir, stdinReadySignal, touchJob, validateModelEffort } from "./companion-shared.mjs";
 
@@ -203,6 +203,8 @@ async function handleRecordVerification(raw) {
     // Store the full exact current snapshot for continuation binding, but compare
     // completion→current with the verification-only ignored observer so standard
     // pytest/Python cache drift from host checks is not treated as out-of-scope.
+    // Scope checks use that window; the published path list keeps the terminal
+    // runtime's observed paths so an empty window cannot look like "no changes".
     const verificationContextManifest = captureCompleteContextManifest(root, contextCaptureOptions("resume", job));
     const observedChangedPaths = observeChangedPaths(
       completionContextManifest,
@@ -221,7 +223,10 @@ async function handleRecordVerification(raw) {
         { paths: scopeViolationEvidence }
       );
     }
-    const observedChangedEvidence = boundPathEvidence(observedChangedPaths);
+    const observedChangedEvidence = publishedVerificationChangedPaths({
+      runtimeObservedPaths: job.result?.runtimeEvidence?.observedChangedPaths,
+      verificationWindowPaths: observedChangedPaths
+    });
     return updateJob(root, job.id, (current) => {
       current.verificationContextManifest = verificationContextManifest;
       current.commandOutcomes = record.commandOutcomes;
