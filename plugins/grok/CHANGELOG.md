@@ -1,6 +1,13 @@
 # Changelog
 
-<<<<<<< HEAD
+## 0.3.0-dev.8
+
+Status: hardening candidate; not release-qualified.
+
+- `record-verification` publishes the terminal runtime's observed changed
+  paths. An empty completion→verification window no longer looks like the host
+  verified no write-job changes.
+
 ## 0.3.0-dev.7
 
 Status: hardening candidate; not release-qualified.
@@ -10,15 +17,6 @@ Status: hardening candidate; not release-qualified.
   requires a completed rationale that names the observed changed paths.
   One same-session repair is allowed; a second provisional payload fails
   closed with `E_SCHEMA`.
-=======
-## 0.3.0-dev.8
-
-Status: hardening candidate; not release-qualified.
-
-- `record-verification` publishes the terminal runtime's observed changed
-  paths. An empty completion→verification window no longer looks like the host
-  verified no write-job changes.
->>>>>>> 8e2260a (fix: keep record-verification paths from the write job)
 
 ## 0.3.0-dev.6
 
