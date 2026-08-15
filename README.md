@@ -670,9 +670,11 @@ CI matrix:
 
 | OS | Node | Tests |
 |---|---|---|
-| ubuntu-latest, macos-latest | 18.18.2, 22.x | `npm run validate` + full `npm test` |
-| ubuntu-latest, macos-latest | 22.x | Dedicated `npm run test:pty-ingress` gate |
-| windows-latest | 18.18.2, 22.x | `npm run validate` + `node --test tests/windows-neutral.test.mjs` only |
+| ubuntu-latest | 18.18.2, 22.x | PR required: `npm run validate` + full `npm test` |
+| macos-latest | 18.18.2, 22.x | main/dispatch only: same suite (does not block PRs) |
+| ubuntu-latest | 22.x | PR required: dedicated `npm run test:pty-ingress` gate |
+| macos-latest | 22.x | main/dispatch only: PTY ingress (does not block PRs) |
+| windows-latest | 18.18.2, 22.x | PR required: `npm run validate` + `node --test tests/windows-neutral.test.mjs` only |
 
 A trusted, Codex-equipped self-hosted macOS runner may additionally run `npm run test:installed-codex` on `main` pushes or explicit workflow dispatch when `CODEX_PLUGIN_RUNNER_ENABLED=true`. With an authenticated Grok/Codex runner and `CODEX_GROK_NATURAL_E2E_ENABLED=true`, a separate protected job updates the installed snapshot and runs `npm run test:natural-codex`: a new natural Codex task must invoke the installed `$grok:rescue`, complete a real Grok job, persist a passed host check, preserve the worktree, and remove transient auth/profile artifacts. Neither trusted job executes pull-request code. CI validates commits; it does not deploy them into your desktop Codex cache. Run `npm run codex:update-local`, then start a **new Codex task** so the app loads the refreshed skill text and runtime snapshot.
 

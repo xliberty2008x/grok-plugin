@@ -191,10 +191,11 @@ current task does not provide trustworthy evidence for the refreshed build.
 Default GitHub CI exposes three different claims:
 
 - `PTY ingress` recreates the production EAGAIN ordering on a genuinely
-  nonblocking PTY on hosted Linux and macOS runners, without claiming install
-  coverage.
+  nonblocking PTY on hosted Linux (pull-request required) and hosted macOS
+  (main/dispatch only), without claiming install coverage.
 - The operating-system/Node matrix validates the full provider-neutral source
-  suite.
+  suite. Ubuntu cells are pull-request required; hosted macOS cells run on
+  `main` and `workflow_dispatch` only.
 - `Installed Codex snapshot` uses a self-hosted macOS runner with the
   `codex-plugin` label when the repository Actions variable
   `CODEX_PLUGIN_RUNNER_ENABLED` is `true`. It runs only for trusted `main`

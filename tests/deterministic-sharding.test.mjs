@@ -216,6 +216,16 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
     ),
     mutateJob(
       "pty-ingress",
+      "    if: ${{ github.event_name != 'pull_request' || matrix.os != 'macos-latest' }}",
+      "    if: true"
+    ),
+    mutateJob(
+      "pty-ingress",
+      "    if: ${{ github.event_name != 'pull_request' || matrix.os != 'macos-latest' }}\n",
+      ""
+    ),
+    mutateJob(
+      "pty-ingress",
       "    runs-on: ${{ matrix.os }}",
       "    runs-on: self-hosted\n    # runs-on: ${{ matrix.os }}"
     ),
@@ -228,6 +238,21 @@ test("hosted CI contract rejects matrix and gate mutations that could hide cover
       "pty-ingress",
       "      fail-fast: false",
       "      fail-fast: true\n      # fail-fast: false"
+    ),
+    mutateJob(
+      "validate-and-test",
+      "    if: ${{ github.event_name != 'pull_request' || matrix.os != 'macos-latest' }}",
+      "    if: true"
+    ),
+    mutateJob(
+      "validate-and-test",
+      "    if: ${{ github.event_name != 'pull_request' || matrix.os != 'macos-latest' }}\n",
+      ""
+    ),
+    mutateJob(
+      "validate-and-test",
+      "    if: ${{ github.event_name != 'pull_request' || matrix.os != 'macos-latest' }}",
+      "    if: ${{ github.event_name != 'pull_request' || matrix.os != 'ubuntu-latest' }}"
     ),
     mutateJob(
       "validate-and-test",

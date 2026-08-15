@@ -16,6 +16,10 @@ concurrency:
 jobs:
   pty-ingress:
     name: PTY ingress / ${{ matrix.os }}
+    # Hosted macOS stays in the matrix for main/dispatch. Pull requests must
+    # not wait on it; skipped cells finish immediately and do not block
+    # `CI required`.
+    if: ${{ github.event_name != 'pull_request' || matrix.os != 'macos-latest' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
@@ -44,6 +48,10 @@ jobs:
 
   validate-and-test:
     name: ${{ matrix.os }} / Node ${{ matrix.node }} / shard ${{ matrix.shard }}/4
+    # Hosted macOS stays in the matrix for main/dispatch. Pull requests must
+    # not wait on it; skipped cells finish immediately and do not block
+    # `CI required`.
+    if: ${{ github.event_name != 'pull_request' || matrix.os != 'macos-latest' }}
     runs-on: ${{ matrix.os }}
     # Each file remains independently bounded by DETERMINISTIC_TEST_FILE_TIMEOUT_MS.
     # Cleanup-heavy hosted macOS shards have measured near 26–30 minutes; preserve
@@ -194,7 +202,9 @@ jobs:
 
   # Stable public branch-protection check. Always runs so a failed hosted job
   # still produces this named result. Self-hosted jobs are intentionally out of
-  # scope (skipped on pull requests; not merge gates for fork PRs).
+  # scope (skipped on pull requests; not merge gates for fork PRs). Hosted
+  # macOS matrix cells are also skipped on pull_request so this gate does not
+  # wait on Darwin; they still run on main and workflow_dispatch.
   ci-required:
     name: CI required
     if: always()

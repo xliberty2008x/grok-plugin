@@ -89,6 +89,13 @@ function isShardOneValidationStep(step) {
   ].join("\n");
 }
 
+const HOSTED_MACOS_PULL_REQUEST_SKIP =
+  "    if: ${{ github.event_name != 'pull_request' || matrix.os != 'macos-latest' }}";
+
+function skipsHostedMacosOnPullRequest(job) {
+  return job.split("\n").includes(HOSTED_MACOS_PULL_REQUEST_SKIP);
+}
+
 export function validateHostedCiWorkflow(source, { shardCount = 4 } = {}) {
   source = source.replace(/\r\n?/gu, "\n");
   const errors = [];
@@ -112,11 +119,13 @@ export function validateHostedCiWorkflow(source, { shardCount = 4 } = {}) {
     || containsContinueOnError(ptyJob)
     || !hasExactJobLevelFields(ptyJob, [
       "    name: PTY ingress / ${{ matrix.os }}",
+      HOSTED_MACOS_PULL_REQUEST_SKIP,
       "    runs-on: ${{ matrix.os }}",
       "    timeout-minutes: 10",
       "    strategy:",
       "    steps:"
     ])
+    || !skipsHostedMacosOnPullRequest(ptyJob)
     || !/^    runs-on:\s*\$\{\{\s*matrix\.os\s*\}\}\s*$/mu.test(ptyJob)
     || !/^    timeout-minutes:\s*10\s*$/mu.test(ptyJob)
     || !/^      fail-fast:\s*false\s*$/mu.test(ptyJob)
@@ -124,7 +133,7 @@ export function validateHostedCiWorkflow(source, { shardCount = 4 } = {}) {
       "        os: [ubuntu-latest, macos-latest]"
     ])
     || !isUnconditionalRunStep(ptyRun, "npm run test:pty-ingress")) {
-    errors.push("CI must preserve both fail-closed hosted PTY ingress gates.");
+    errors.push("CI must preserve both fail-closed hosted PTY ingress gates and skip hosted macOS on pull_request.");
   }
 
   const unixJob = workflowJob(source, "validate-and-test");
@@ -136,11 +145,13 @@ export function validateHostedCiWorkflow(source, { shardCount = 4 } = {}) {
     const deterministicRun = workflowStep(unixJob, "Run deterministic zero-skip shard");
     if (!hasExactJobLevelFields(unixJob, [
       `    name: \${{ matrix.os }} / Node \${{ matrix.node }} / shard \${{ matrix.shard }}/${shardCount}`,
+      HOSTED_MACOS_PULL_REQUEST_SKIP,
       "    runs-on: ${{ matrix.os }}",
       "    timeout-minutes: 30",
       "    strategy:",
       "    steps:"
     ])
+      || !skipsHostedMacosOnPullRequest(unixJob)
       || !/^    runs-on:\s*\$\{\{\s*matrix\.os\s*\}\}\s*$/mu.test(unixJob)
       || !/^    timeout-minutes:\s*30\s*$/mu.test(unixJob)
       || !/^      fail-fast:\s*false\s*$/mu.test(unixJob)
@@ -154,7 +165,7 @@ export function validateHostedCiWorkflow(source, { shardCount = 4 } = {}) {
           (_, index) => index + 1
         ).join(", ")}]`
       ])) {
-      errors.push(`The Unix deterministic matrix must remain OS x Node x ${shardCount} exact shards with a 30-minute budget and fail-fast disabled.`);
+      errors.push(`The Unix deterministic matrix must remain OS x Node x ${shardCount} exact shards with a 30-minute budget, fail-fast disabled, and hosted macOS skipped on pull_request.`);
     }
     if (!isShardOneValidationStep(validationRun)) {
       errors.push("Each Unix OS/Node combination must run structural validation only on shard 1.");
