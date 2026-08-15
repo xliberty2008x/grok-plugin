@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0-dev.8
+
+Status: hardening candidate; not release-qualified.
+
+- Public job summaries no longer stop mid-path. When the 160-character budget
+  is exceeded, the host keeps the last complete sentence or identifier
+  boundary and appends an ellipsis. The durable worker-report summary is
+  unchanged.
+
 ## 0.3.0-dev.7
 
 Status: hardening candidate; not release-qualified.
