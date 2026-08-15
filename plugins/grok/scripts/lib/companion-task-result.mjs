@@ -64,7 +64,12 @@ function createProviderState(execution) {
 async function runProviderAndRepairReport(execution, state, common) {
   const { root, id, job, before, dispatchAttemptId, dispatchFence } = execution;
   let result = job.jobClass === "review" && job.kind !== "stop-review"
-    ? await runStructuredReview(structuredReviewOptionsFor(job.kind, common))
+    ? await runStructuredReview(structuredReviewOptionsFor(job.kind, {
+      ...common,
+      observedChangedPaths: Array.isArray(job.request?.target?.changedPaths)
+        ? job.request.target.changedPaths
+        : []
+    }))
     : await runProvider(common);
   if (before) assertUnchanged(before, integritySnapshot(root));
   let workerReport = null;

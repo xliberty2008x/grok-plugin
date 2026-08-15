@@ -69,7 +69,9 @@ in plain language (e.g. ready / ready with fixes / not ready) — without invent
 - `severity`: only the enum values above
 
 Do not rely on a model-controlled `verdict`; the runtime derives pass from zero findings
-and needs_changes from any finding. Do not include a `verdict` field.
+and needs_changes from any finding. Do not include a `verdict` field. Do not terminate
+with plan or progress-only text such as `I will inspect` or `I am reviewing`. An empty
+`findings` pass must be a completed rationale that names the observed changed paths.
 
 ## Critical rules
 

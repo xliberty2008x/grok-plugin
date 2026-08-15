@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0-dev.7
+
+Status: hardening candidate; not release-qualified.
+
+- Ordinary `review-v1` no longer publishes `Verdict: pass` from a
+  plan/progress-only summary such as `I will inspect…`. Zero-finding pass
+  requires a completed rationale that names the observed changed paths.
+  One same-session repair is allowed; a second provisional payload fails
+  closed with `E_SCHEMA`.
+
 ## 0.3.0-dev.6
 
 Status: hardening candidate; not release-qualified.

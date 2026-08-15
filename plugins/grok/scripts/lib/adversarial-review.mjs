@@ -1,7 +1,8 @@
 /**
- * Adversarial-review specialization: wraps the shared structural validateReview
- * with a zero-findings semantic completion gate. Ordinary review keeps the
- * generic validator; only job.kind === "adversarial-review" selects this path.
+ * Review completion gates on top of shared structural validateReview.
+ * Adversarial review keeps the ship/no-ship grammar. Ordinary review-v1
+ * rejects plan/progress-only terminals and requires a completed zero-finding
+ * rationale; it does not reuse the adversarial ship prefix.
  */
 
 import { CompanionError } from "./errors.mjs";
@@ -19,6 +20,15 @@ const SHIP_DECISION = "Decision: ship.";
  * Same-session repair text for adversarial semantic (and structural) failures.
  * Kept short; does not echo provider payload or repository content.
  */
+export const ORDINARY_REVIEW_REPAIR_PROMPT = [
+  "Your previous response was not a completed review.",
+  "Return only one JSON object with exactly summary and findings.",
+  "Omit verdict; the runtime derives pass from zero findings and needs_changes from one or more findings.",
+  "Do not return plan or progress-only text such as I will, I'll, I need to, I am reviewing, I have begun, I plan to, The next step, Still reviewing, Currently reviewing, Inspecting, Reviewing, Searching, or Locating.",
+  "For empty findings, summary MUST be a completed evidence-based rationale that names each observed changed path.",
+  "Preserve substantive findings and use repository-relative paths."
+].join(" ");
+
 export const ADVERSARIAL_REVIEW_REPAIR_PROMPT = [
   "Your previous response was not a completed adversarial review.",
   "Return only one JSON object with exactly summary and findings.",
@@ -46,6 +56,7 @@ const NEXT_STEP_PENDING = /^The\s+next\s+step\s+(?:is|will\s+be|is\s+to)\b/iu;
 const INCOMPLETE_STATE = /\b(?:(?:review|assessment|analysis)\s+(?:(?:is|remains)\s+(?:still\s+)?(?:ongoing|underway|unfinished|incomplete|in\s+progress|not\s+(?:yet\s+)?(?:finished|complete))|has\s+not\s+(?:finished|completed))|(?:this|it)\s+(?:is|remains)\s+(?:only\s+)?(?:a\s+)?preliminary\s+(?:review|assessment|analysis))\b/iu;
 const GERUND_REVIEW_LEADING = /^(?:Inspecting|Reviewing|Searching|Locating|Checking|Analy[sz]ing|Assessing|Critiquing)\b/iu;
 const COMPLETED_RESULT_CUE = /\b(?:found|revealed|confirmed|showed|demonstrated|established|identified|exposed|surfaced|proved)\b/iu;
+const ORDINARY_NO_FINDINGS_CUE = /\bno(?:\s+\w+){0,4}\s+(?:defects?|findings?|issues?|risks?)\b/iu;
 const RESERVED_MARKER = /\b(?:Challenged|Assessment|Decision)\s*:/iu;
 const PLACEHOLDER_SEGMENT = /^(?:<[^>\r\n]{1,200}>|(?:pending|todo|tbd|unknown|placeholder)(?:\s+(?:pending|todo|tbd|unknown|placeholder|\d+))*)$/iu;
 
@@ -114,6 +125,51 @@ function isPlanOrProgress(text) {
  * @param {unknown} value provider structured output
  * @returns {{ verdict: "pass"|"needs_changes", summary: string, findings: object[] }}
  */
+function rejectOrdinaryIncomplete(reason) {
+  throw new CompanionError(
+    "E_SCHEMA",
+    "Review output did not complete the assessment.",
+    {
+      reason,
+      hint: "A review cannot terminate on future-intent or progress-only text. A zero-finding pass must be a completed rationale that names the observed changed paths.",
+      findingsCount: 0
+    }
+  );
+}
+
+/**
+ * Ordinary review-v1 validator: structural validateReview first, then reject
+ * plan/progress terminals. Zero-finding pass must look completed and, when
+ * observed paths are supplied, name each path.
+ *
+ * @param {unknown} value provider structured output
+ * @param {{ observedChangedPaths?: string[] }} [options]
+ */
+export function validateOrdinaryReview(value, options = {}) {
+  const validated = validateReview(value);
+  const trimmed = validated.summary.trim();
+  if (isPlanOrProgress(trimmed)) {
+    rejectOrdinaryIncomplete("plan-progress-only");
+  }
+  if (validated.findings.length > 0) return validated;
+  if (!COMPLETED_RESULT_CUE.test(trimmed) && !ORDINARY_NO_FINDINGS_CUE.test(trimmed)) {
+    rejectOrdinaryIncomplete("missing-completed-rationale");
+  }
+  const paths = (options.observedChangedPaths || [])
+    .map((entry) => String(entry || "").trim())
+    .filter((entry) => entry.length > 0 && !entry.startsWith("["));
+  const haystack = trimmed.toLowerCase();
+  const missing = paths.filter((entry) => !haystack.includes(entry.toLowerCase()));
+  if (missing.length > 0) {
+    rejectOrdinaryIncomplete("missing-changed-paths");
+  }
+  return validated;
+}
+
+export function createOrdinaryReviewValidator(observedChangedPaths) {
+  return (value) => validateOrdinaryReview(value, { observedChangedPaths });
+}
+
 export function validateAdversarialReview(value) {
   const validated = validateReview(value);
   if (validated.findings.length > 0) return validated;
@@ -148,19 +204,28 @@ export function validateAdversarialReview(value) {
 }
 
 /**
- * Select runStructuredReview options. Ordinary review receives `common`
- * unchanged (generic validator, repair prompt, one-call success path).
- * Adversarial review adds the semantic validator and specialized repair text.
+ * Select runStructuredReview options. Ordinary review-v1 gets the
+ * plan/progress completion gate. Adversarial review keeps the ship/no-ship
+ * grammar. stop-review stays on the generic validator.
  *
  * @param {string} kind job kind
  * @param {object} common shared provider options
  * @returns {object}
  */
 export function structuredReviewOptionsFor(kind, common) {
-  if (kind !== "adversarial-review") return common;
-  return {
-    ...common,
-    validator: validateAdversarialReview,
-    repairPrompt: ADVERSARIAL_REVIEW_REPAIR_PROMPT
-  };
+  if (kind === "adversarial-review") {
+    return {
+      ...common,
+      validator: validateAdversarialReview,
+      repairPrompt: ADVERSARIAL_REVIEW_REPAIR_PROMPT
+    };
+  }
+  if (kind === "review") {
+    return {
+      ...common,
+      validator: createOrdinaryReviewValidator(common.observedChangedPaths),
+      repairPrompt: ORDINARY_REVIEW_REPAIR_PROMPT
+    };
+  }
+  return common;
 }
