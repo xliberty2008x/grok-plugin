@@ -26,6 +26,7 @@ import {
 } from "./worker-mutation-cancellation.mjs";
 import { providerLaunchState } from "./worker-mutation-dispatch-contract.mjs";
 import { spawnReadOnlyWorker } from "./worker-mutation-spawn.mjs";
+import { assertPublicSpawnOptions } from "./worker-spawn-options.mjs";
 import { authorizeReadyWriteWorkerDispatch } from "./worker-mutation-write-admission.mjs";
 import { launchCommittedWorker } from "./worker-runtime.mjs";
 import { provisionWriteWorkerWorktree } from "./worker-provisioner.mjs";
@@ -334,7 +335,6 @@ export function createWorkerService({
     nextMaintenanceAt = observedAt + maintenanceIntervalMs;
     await maintain();
   };
-
   const ownedJob = (id) => {
     const job = readJob(root, id, env);
     if (!job || !sameHostSession(job, host)) throw notFound();
@@ -342,7 +342,6 @@ export function createWorkerService({
     // equivalent so foreign/nonexistent remain observationally identical.
     return job;
   };
-
   return Object.freeze({
     listOwned() {
       return listJobs(root, env)
@@ -714,8 +713,10 @@ export function createWorkerService({
       contextManifest = null,
       idempotencyKey,
       roleId = "explorer",
-      write = false
+      write = false,
+      ...spawnFields
     } = {}) {
+      const publicSpawn = assertPublicSpawnOptions(spawnFields);
       if (!idempotencyKey) {
         throw new CompanionError("E_USAGE", "idempotencyKey is required for spawn.");
       }
@@ -765,7 +766,8 @@ export function createWorkerService({
         writeLifecycleCapabilityDigest,
         providerCapabilityDigest,
         providerLaunchBinding,
-        providerLaunchBindingDigest
+        providerLaunchBindingDigest,
+        publicSpawn
       });
       if (write) {
         return {
@@ -830,7 +832,6 @@ export function createWorkerService({
         write: true
       });
     },
-
     cancel(args) {
       return cancelOrInterruptOwned({ ...args, root, principal, env });
     },

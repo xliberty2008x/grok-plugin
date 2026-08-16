@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0-dev.15
+
+Status: hardening candidate; not release-qualified.
+
+- `worker_spawn` can select isolated, full, or recent-turn context by digest,
+  name the worker, and attach a parent id. Explicit model/effort fail closed
+  until the installed receipt advertises them. Default explorer spawn is
+  unchanged.
+
 ## 0.3.0-dev.14
 
 Status: hardening candidate; not release-qualified.

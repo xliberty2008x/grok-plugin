@@ -1661,7 +1661,6 @@ function parseWorkerEventCursor(job, cursor) {
   }
   return cursor.sequence;
 }
-
 function projectWorkerIdentityMetadata(job) {
   const envelope = job.request?.envelope || null;
   const manifest = job.request?.contextManifest || null;
@@ -1669,7 +1668,10 @@ function projectWorkerIdentityMetadata(job) {
     Array.isArray(job.lifecycleEvents) ? job.lifecycleEvents : []
   );
   return {
+    name: nullableText(job.request?.displayName, 64),
     parentWorkerId: nullableText(job.request?.resumeJobId, 256),
+    contextMode: nullableText(job.request?.contextInheritance?.mode, 16),
+    contextInheritanceDigest: nullableText(job.request?.contextInheritance?.digest, 64),
     lineageWorkerId: nullableText(job.request?.providerHomeId || job.id, 256),
     eventCursor: workerEventCursor(
       job.id,
@@ -1688,7 +1690,6 @@ function projectWorkerIdentityMetadata(job) {
     }
   };
 }
-
 /**
  * Cursor projection bound to a job record (includes terminal state).
  * Public broker callers use structured tokens so an in-range cursor from another
@@ -1717,7 +1718,6 @@ export function projectWorkerLifecycleCursor(
     latestAvailableCursor: workerEventCursor(job.id, projected.latestAvailableSequence)
   };
 }
-
 /**
  * Lightweight public worker handle — identity and liveness without detail payload.
  * Omits prompts, raw host identity, provider session IDs, process identity, and credentials.
@@ -1757,7 +1757,6 @@ export function projectWorkerHandle(job, { trustHostAuthority = true } = {}) {
     terminal: isWorkerTerminal(job)
   }, sanitizationError);
 }
-
 /**
  * Build the public result object shared by CLI status/result JSON and future brokers.
  * Never includes raw provider text, prompts, or private process fields.

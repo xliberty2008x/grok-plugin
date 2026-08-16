@@ -183,7 +183,14 @@ export const WORKER_SPAWN_TOOL = deepFreeze({
       roleId: {
         type: "string",
         enum: ["explorer"]
-      }
+      },
+      contextMode: { type: "string", enum: ["none", "all", "recent"] },
+      inheritTurns: { type: "integer", minimum: 1, maximum: 32 },
+      contextDigest: { type: "string", minLength: 64, maxLength: 64 },
+      name: { type: "string", minLength: 1, maxLength: 64 },
+      parentId: WORKER_ID_SCHEMA,
+      model: { type: "string", minLength: 1, maxLength: 128 },
+      effort: { type: "string", minLength: 1, maxLength: 32 }
     }
   },
   annotations: MUTATION_ANNOTATIONS
@@ -856,7 +863,14 @@ export async function callWorkerTool(params, options = {}) {
         objective: args.objective,
         idempotencyKey: args.idempotencyKey,
         roleId: args.roleId || "explorer",
-        write: false
+        write: false,
+        contextMode: args.contextMode,
+        inheritTurns: args.inheritTurns,
+        contextDigest: args.contextDigest,
+        name: args.name,
+        parentId: args.parentId,
+        model: args.model,
+        effort: args.effort
       });
       return toolResult({
         worker: spawned.handle,
