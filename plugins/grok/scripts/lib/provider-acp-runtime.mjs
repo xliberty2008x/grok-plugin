@@ -963,7 +963,7 @@ async function initializeProviderClient(context, eventRuntime) {
     initialized = await requestDuringProviderStartup(
       client,
       "initialize",
-      { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } }, clientInfo: { name: "grok-companion", version: "0.3.0-dev.14" } },
+      { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } }, clientInfo: { name: "grok-companion", version: "0.3.0-dev.15" } },
       30000,
       cancelRequested
     );

@@ -65,6 +65,7 @@ export const DETERMINISTIC_TEST_SHARDS = Object.freeze([
     "tests/worker-runtime-teardown.test.mjs",
     "tests/worker-safety-proofs.test.mjs",
     "tests/worker-service.test.mjs",
+    "tests/worker-spawn-options.test.mjs",
     "tests/worker-terminal-intent.test.mjs",
     "tests/worker-worktree.test.mjs"
   ]),
