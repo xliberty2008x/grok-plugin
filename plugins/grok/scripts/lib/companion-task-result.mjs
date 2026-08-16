@@ -26,6 +26,7 @@ import { assertNoRetainedBodies, readAttemptMailbox } from "./worker-mailbox.mjs
 import { boundedProviderText, eventUpdater, providerLaunchBinding, recordLifecycle, settlePendingProviderRotationNoChild, textEvidence, touchJob } from "./companion-shared.mjs";
 
 import { createMailboxAuthorities, createMailboxController, createPrimaryTurnController, createProviderRunOptions } from "./companion-task-turn.mjs";
+import { projectPublicJobSummary } from "./public-job-summary.mjs";
 
 function createProviderState(execution) {
   const { job, prompt, receiptBacked, dispatchAttemptId, providerGeneration } = execution;
@@ -257,7 +258,7 @@ function persistExecutionResult(execution, state, providerResult) {
       providerProcess: current.providerProcess || result.provider?.process || null,
       profile: { ...current.profile, grokVersion: result.provider?.version || null },
       result: safeResult,
-      summary: `${safeResult.review.verdict}: ${safeResult.review.summary}`.slice(0, 160),
+      summary: projectPublicJobSummary(`${safeResult.review.verdict}: ${safeResult.review.summary}`).summary,
       progress: "Review finalized",
       lifecycleEvents: appendLifecycleEvent(current.lifecycleEvents, "final.report", "Review report ready", {
         verdict: safeResult.review.verdict,
@@ -405,7 +406,7 @@ function persistExecutionResult(execution, state, providerResult) {
           providerProcess: withHostAction.providerProcess || result.provider?.process || null,
           profile: { ...withHostAction.profile, grokVersion: result.provider?.version || null },
           result: safeResult,
-          summary: workerReport.summary.slice(0, 160),
+          summary: projectPublicJobSummary(workerReport.summary).summary,
           progress: "Final report ready",
           ...execution.terminalIntentPatch(withHostAction, intendedTerminal),
           lifecycleEvents: appendLifecycleEvent(

@@ -20,10 +20,13 @@ import {
 } from "./worker-authority.mjs";
 import {
   cancelWorker,
-  projectCancellationReceipt
+  interruptWorker,
+  projectCancellationReceipt,
+  projectInterruptReceipt
 } from "./worker-mutation-cancellation.mjs";
 import { providerLaunchState } from "./worker-mutation-dispatch-contract.mjs";
 import { spawnReadOnlyWorker } from "./worker-mutation-spawn.mjs";
+import { assertPublicSpawnOptions } from "./worker-spawn-options.mjs";
 import { authorizeReadyWriteWorkerDispatch } from "./worker-mutation-write-admission.mjs";
 import { launchCommittedWorker } from "./worker-runtime.mjs";
 import { provisionWriteWorkerWorktree } from "./worker-provisioner.mjs";
@@ -79,12 +82,109 @@ function assertServicePrincipal(principal) {
   }
 }
 
+async function waitAnyOwnedWorkers({
+  ids,
+  cursors = null,
+  timeoutMs: requestedTimeoutMs,
+  ownedJob,
+  maintainIfDue,
+  clock,
+  sleep
+}) {
+  const uniqueIds = [...new Set((Array.isArray(ids) ? ids : []).map((id) => String(id)))];
+  if (uniqueIds.length < 2) {
+    throw new CompanionError("E_USAGE", "worker_wait ids must contain at least two owned worker identities.");
+  }
+  if (uniqueIds.length > 16) {
+    throw new CompanionError("E_USAGE", "worker_wait ids cannot exceed 16 workers.");
+  }
+  const timeoutMs = assertWaitMs(requestedTimeoutMs);
+  const cursorById = new Map();
+  if (cursors != null) {
+    if (!Array.isArray(cursors) || cursors.length !== uniqueIds.length) {
+      throw new CompanionError("E_USAGE", "worker_wait cursors must align 1:1 with ids.");
+    }
+    uniqueIds.forEach((id, index) => cursorById.set(id, cursors[index] ?? null));
+  }
+  for (const id of uniqueIds) ownedJob(id);
+  const deadline = clock() + timeoutMs;
+  for (;;) {
+    await maintainIfDue();
+    const streams = uniqueIds.map((id) => {
+      const job = ownedJob(id);
+      const stream = projectWorkerLifecycleCursor(job, cursorById.get(id) ?? null, {
+        trustHostAuthority: false
+      });
+      return { ...stream, workerId: id, timedOut: false };
+    });
+    const changed = streams.some((stream) => stream.events.length || stream.terminal);
+    if (changed) return { streams, timedOut: false };
+    const remaining = deadline - clock();
+    if (remaining <= 0) {
+      return {
+        streams: streams.map((stream) => ({ ...stream, timedOut: true })),
+        timedOut: true
+      };
+    }
+    await sleep(Math.min(WAIT_POLL_MS, remaining));
+  }
+}
+
 function assertWaitMs(value) {
   const timeoutMs = value == null ? DEFAULT_WORKER_WAIT_MS : value;
   if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > MAX_WORKER_WAIT_MS) {
     throw new CompanionError("E_USAGE", `Worker wait must be an integer from 0 to ${MAX_WORKER_WAIT_MS} milliseconds.`);
   }
   return timeoutMs;
+}
+
+function cancelOrInterruptOwned({
+  id,
+  idempotencyKey,
+  mode = "cancel",
+  root,
+  principal,
+  env
+}) {
+  if (!id) throw new CompanionError("E_USAGE", "id is required for cancel.");
+  if (!idempotencyKey) {
+    throw new CompanionError("E_USAGE", "idempotencyKey is required for cancel.");
+  }
+  if (mode === "interrupt") {
+    const result = interruptWorker({
+      root,
+      principal,
+      workerId: id,
+      idempotencyKey,
+      env
+    });
+    if (result.fallback === "cancel") {
+      return {
+        receipt: {
+          ...projectCancellationReceipt(result.receipt),
+          sessionPreserved: false
+        },
+        replayed: result.replayed,
+        fallback: "cancel"
+      };
+    }
+    return {
+      receipt: projectInterruptReceipt(result.receipt),
+      replayed: result.replayed,
+      fallback: null
+    };
+  }
+  if (mode != null && mode !== "cancel") {
+    throw new CompanionError("E_USAGE", "mode must be cancel or interrupt.");
+  }
+  const { receipt, replayed } = cancelWorker({
+    root,
+    principal,
+    workerId: id,
+    idempotencyKey,
+    env
+  });
+  return { receipt: projectCancellationReceipt(receipt), replayed };
 }
 
 export function createWorkerService({
@@ -235,7 +335,6 @@ export function createWorkerService({
     nextMaintenanceAt = observedAt + maintenanceIntervalMs;
     await maintain();
   };
-
   const ownedJob = (id) => {
     const job = readJob(root, id, env);
     if (!job || !sameHostSession(job, host)) throw notFound();
@@ -243,23 +342,19 @@ export function createWorkerService({
     // equivalent so foreign/nonexistent remain observationally identical.
     return job;
   };
-
   return Object.freeze({
     listOwned() {
       return listJobs(root, env)
         .filter((job) => sameHostSession(job, host))
         .map((job) => projectWorkerHandle(job, { trustHostAuthority: false }));
     },
-
     get(id) {
       return projectWorkerSnapshot(ownedJob(id), { trustHostAuthority: false });
     },
-
     eventsAfter(id, cursor = null) {
       const job = ownedJob(id);
       return projectWorkerLifecycleCursor(job, cursor, { trustHostAuthority: false });
     },
-
     async wait(id, { cursor = null, timeoutMs: requestedTimeoutMs } = {}) {
       const timeoutMs = assertWaitMs(requestedTimeoutMs);
       const deadline = clock() + timeoutMs;
@@ -293,6 +388,9 @@ export function createWorkerService({
       }
     },
 
+    waitAny(ids, options) {
+      return waitAnyOwnedWorkers({ ids, ...options, ownedJob, maintainIfDue, clock, sleep });
+    },
     result(id) {
       const job = ownedJob(id);
       if (!isWorkerTerminal(job)) {
@@ -615,8 +713,10 @@ export function createWorkerService({
       contextManifest = null,
       idempotencyKey,
       roleId = "explorer",
-      write = false
+      write = false,
+      ...spawnFields
     } = {}) {
+      const publicSpawn = assertPublicSpawnOptions(spawnFields);
       if (!idempotencyKey) {
         throw new CompanionError("E_USAGE", "idempotencyKey is required for spawn.");
       }
@@ -666,7 +766,8 @@ export function createWorkerService({
         writeLifecycleCapabilityDigest,
         providerCapabilityDigest,
         providerLaunchBinding,
-        providerLaunchBindingDigest
+        providerLaunchBindingDigest,
+        publicSpawn
       });
       if (write) {
         return {
@@ -731,20 +832,8 @@ export function createWorkerService({
         write: true
       });
     },
-
-    cancel({ id, idempotencyKey } = {}) {
-      if (!id) throw new CompanionError("E_USAGE", "id is required for cancel.");
-      if (!idempotencyKey) {
-        throw new CompanionError("E_USAGE", "idempotencyKey is required for cancel.");
-      }
-      const { receipt, replayed } = cancelWorker({
-        root,
-        principal,
-        workerId: id,
-        idempotencyKey,
-        env
-      });
-      return { receipt: projectCancellationReceipt(receipt), replayed };
+    cancel(args) {
+      return cancelOrInterruptOwned({ ...args, root, principal, env });
     },
 
     send({ id, message, idempotencyKey } = {}) {
@@ -805,6 +894,9 @@ export function createWorkerService({
           "The installed provider capability changed before follow-up admission."
         );
       }
+      const parent = ownedJob(id);
+      const sessionReused = parent.status === "interrupted"
+        && parent.result?.interrupt?.sessionPreserved === true;
       const admitted = followupWorker({
         root,
         principal,
@@ -833,7 +925,8 @@ export function createWorkerService({
         ...admitted,
         handle: admitted.handle,
         providerLaunchState: launchState,
-        providerLaunched: launch?.providerLaunched === true
+        providerLaunched: launch?.providerLaunched === true,
+        sessionReused
       };
     }
   });

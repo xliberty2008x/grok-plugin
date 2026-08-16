@@ -266,9 +266,31 @@ export function prepareReadOnlyWorkerAdmission({ root, principal, envelope, cont
   };
 }
 
-export function spawnReadOnlyWorker({ root, principal, envelope, contextManifest = null, idempotencyKey, roleId = "explorer", write = false, env = process.env, allowWriteSpawn = false, writeLifecycleCapabilityDigest = null, providerCapabilityDigest = null, providerLaunchBinding = null, providerLaunchBindingDigest = null, providerLaunch = undefined } = {}) {
+function assertOwnedSpawnParent(root, principal, publicSpawn, env) {
+  if (!publicSpawn?.parentId) return;
+  const parent = tryReadJob(root, publicSpawn.parentId, env);
+  if (!parent) throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+  assertMutationOwnership(parent, principal);
+}
+
+function publicSpawnRequestFields(publicSpawn) {
+  return {
+    displayName: publicSpawn?.name || null,
+    resumeJobId: publicSpawn?.parentId || null,
+    contextInheritance: publicSpawn?.contextMode
+      ? {
+        mode: publicSpawn.contextMode,
+        digest: publicSpawn.contextDigest,
+        inheritTurns: publicSpawn.inheritTurns
+      }
+      : null
+  };
+}
+
+export function spawnReadOnlyWorker({ root, principal, envelope, contextManifest = null, idempotencyKey, roleId = "explorer", write = false, env = process.env, allowWriteSpawn = false, writeLifecycleCapabilityDigest = null, providerCapabilityDigest = null, providerLaunchBinding = null, providerLaunchBindingDigest = null, providerLaunch = undefined, publicSpawn = null } = {}) {
   const prepared = prepareReadOnlyWorkerAdmission({ root, principal, envelope, contextManifest, idempotencyKey, roleId, write, env, allowWriteSpawn, writeLifecycleCapabilityDigest, providerCapabilityDigest, providerLaunchBinding, providerLaunchBindingDigest, providerLaunch });
   if (prepared.writeAdmission) return prepared.writeAdmission;
+  assertOwnedSpawnParent(root, principal, publicSpawn, env);
   const { validatedEnvelope, role, controlWorkspaceId, executionRoot, acceptedContextManifest, boundEnvelope, profile, contextPacket, runtimeRolePolicy, providerPromptDigest, contextBindingDigest, keyDigest, requestOwner, spawnDigest, admittedProviderBinding } = prepared;
   const admitted = withWorkspaceStateTransaction(root, (transaction) => {
     const digestOwners = transaction.listJobs().filter((candidate) => (
@@ -445,6 +467,7 @@ export function spawnReadOnlyWorker({ root, principal, envelope, contextManifest
           ? boundEnvelope.objective
           : null,
         roleId: role.id,
+        ...publicSpawnRequestFields(publicSpawn),
         spawn: {
           executionRoot,
           idempotencyKeyDigest: keyDigest,

@@ -33,6 +33,7 @@ import {
   projectSharedRefObservation,
   projectTaskRelevantMetadataObservation
 } from "./worker-context-projection.mjs";
+import { projectPublicSchemaErrorDetails } from "./public-schema-error.mjs";
 
 /** Public protocol version for handle, snapshot, and cursor projections. */
 export const WORKER_PROTOCOL_VERSION = 1;
@@ -88,7 +89,7 @@ export const PUBLIC_WORKER_ERROR_CODES = Object.freeze([
 /** Re-export retention bound so adapters share one constant with append paths. */
 export { MAX_LIFECYCLE_EVENTS };
 
-const ACTIVE_WORKER_STATUSES = new Set(["queued", "running"]);
+const ACTIVE_WORKER_STATUSES = new Set(["queued", "running", "interrupted"]);
 const PUBLIC_WORKER_STATUSES = new Set(["queued", "running", "completed", "failed", "cancelled", "unknown"]);
 const PUBLIC_LIFECYCLE_EVENT_TYPES = new Set(LIFECYCLE_EVENT_TYPES);
 const PUBLIC_WORKER_ERROR_CODE_SET = new Set(PUBLIC_WORKER_ERROR_CODES);
@@ -1176,15 +1177,7 @@ function projectPublicErrorDetails(code, value, { error = null } = {}) {
       projected.signal = value.signal;
     }
   } else if (code === "E_SCHEMA") {
-    if (typeof value.hint === "string") projected.hint = boundedText(value.hint);
-    if (Array.isArray(value.rootKeys)) projected.rootKeys = publicStringList(value.rootKeys, { maxItems: 24, maxBytes: 128 });
-    if (typeof value.hasUnknownRootKeys === "boolean") projected.hasUnknownRootKeys = value.hasUnknownRootKeys;
-    if (typeof value.summaryType === "string") projected.summaryType = boundedText(value.summaryType, { max: 64 });
-    if (Number.isSafeInteger(value.findingsCount) && value.findingsCount >= 0) {
-      projected.findingsCount = value.findingsCount;
-    }
-    if (typeof value.findingsShapeOk === "boolean") projected.findingsShapeOk = value.findingsShapeOk;
-    if (typeof value.payloadDigest === "string") projected.payloadDigest = boundedText(value.payloadDigest, { max: 256 });
+    Object.assign(projected, projectPublicSchemaErrorDetails(value, boundedText));
   } else if (code === "E_SCOPE_VIOLATION") {
     const paths = publicPathList(value.paths);
     if (paths.length) projected.paths = paths;
@@ -1668,7 +1661,6 @@ function parseWorkerEventCursor(job, cursor) {
   }
   return cursor.sequence;
 }
-
 function projectWorkerIdentityMetadata(job) {
   const envelope = job.request?.envelope || null;
   const manifest = job.request?.contextManifest || null;
@@ -1676,7 +1668,10 @@ function projectWorkerIdentityMetadata(job) {
     Array.isArray(job.lifecycleEvents) ? job.lifecycleEvents : []
   );
   return {
+    name: nullableText(job.request?.displayName, 64),
     parentWorkerId: nullableText(job.request?.resumeJobId, 256),
+    contextMode: nullableText(job.request?.contextInheritance?.mode, 16),
+    contextInheritanceDigest: nullableText(job.request?.contextInheritance?.digest, 64),
     lineageWorkerId: nullableText(job.request?.providerHomeId || job.id, 256),
     eventCursor: workerEventCursor(
       job.id,
@@ -1695,7 +1690,6 @@ function projectWorkerIdentityMetadata(job) {
     }
   };
 }
-
 /**
  * Cursor projection bound to a job record (includes terminal state).
  * Public broker callers use structured tokens so an in-range cursor from another
@@ -1724,7 +1718,6 @@ export function projectWorkerLifecycleCursor(
     latestAvailableCursor: workerEventCursor(job.id, projected.latestAvailableSequence)
   };
 }
-
 /**
  * Lightweight public worker handle — identity and liveness without detail payload.
  * Omits prompts, raw host identity, provider session IDs, process identity, and credentials.
@@ -1764,7 +1757,6 @@ export function projectWorkerHandle(job, { trustHostAuthority = true } = {}) {
     terminal: isWorkerTerminal(job)
   }, sanitizationError);
 }
-
 /**
  * Build the public result object shared by CLI status/result JSON and future brokers.
  * Never includes raw provider text, prompts, or private process fields.

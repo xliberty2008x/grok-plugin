@@ -19,6 +19,7 @@ import {
   validateReview
 } from "../plugins/grok/scripts/lib/grok-provider.mjs";
 import { profileFor } from "../plugins/grok/scripts/lib/profiles.mjs";
+import { projectWorkerError } from "../plugins/grok/scripts/lib/worker-protocol.mjs";
 import { installFakeGrok, readFakeLog } from "./fake-grok.mjs";
 import { initRepo, runCompanion, tempDir, testEnvironment } from "./helpers.mjs";
 
@@ -363,11 +364,73 @@ test("AC-03: plan-only first and repair fail E_SCHEMA without terminal pass and 
         && error?.details?.repairAttempted === true
         && error?.details?.attempts === 2
         && error?.details?.reason === "plan-progress-only"
+        && Array.isArray(error?.details?.partial?.findings)
+        && error.details.partial.findings.length === 0
+        && Object.hasOwn(error.details.partial, "verdict") === false
         && !JSON.stringify(error).includes(PRIVATE_SENTINEL)
     );
     const reviews = readFakeLog(fake.logFile).filter((entry) => entry.event === "headless");
     assert.equal(reviews.length, 2);
     assert.equal(cleanupReviewEnvironment(stateDir, marker).ok, true);
+  });
+});
+
+test("public E_SCHEMA details expose reason and sanitized partial findings", () => {
+  const projected = projectWorkerError({
+    code: "E_SCHEMA",
+    message: "Adversarial review output did not complete the ship/no-ship rationale contract.",
+    details: {
+      reason: "plan-progress-only",
+      repairAttempted: true,
+      attempts: 2,
+      firstError: "E_SCHEMA",
+      partial: {
+        findings: [{
+          severity: "high",
+          title: "Retry poisoning",
+          body: "A failed charge can be replayed against a different tenant."
+        }],
+        summaryPresent: true
+      }
+    }
+  });
+  assert.equal(projected.details.reason, "plan-progress-only");
+  assert.equal(projected.details.repairAttempted, true);
+  assert.equal(projected.details.attempts, 2);
+  assert.equal(projected.details.partial.findings[0].title, "Retry poisoning");
+  assert.equal(Object.hasOwn(projected.details.partial, "verdict"), false);
+});
+
+test("failed adversarial repair preserves sanitized findings without a pass verdict", async () => {
+  const incompleteFinding = {
+    summary: "Dominant risk is retry poisoning on the payment path.",
+    findings: [{
+      severity: "high",
+      title: "Retry poisoning",
+      body: "A failed charge can be replayed against a different tenant."
+    }, {
+      title: "Incomplete second finding"
+    }]
+  };
+  await withFake({
+    reviewSequence: [incompleteFinding, incompleteFinding]
+  }, async () => {
+    const root = initRepo();
+    const stateDir = tempDir("provider-state-");
+    await assert.rejects(
+      () => runStructuredReview(structuredReviewOptionsFor("adversarial-review", {
+        root,
+        profile: profileFor("adversarial-review"),
+        prompt: "Grok Companion adversarial review contract v1: return review schema JSON",
+        stateDir,
+        jobMarker: "adversarial-partial-findings"
+      })),
+      (error) => error?.code === "E_SCHEMA"
+        && error?.details?.repairAttempted === true
+        && error.details.partial.findings.some((item) => item.title === "Retry poisoning")
+        && Object.hasOwn(error.details.partial, "verdict") === false
+    );
+    assert.equal(cleanupReviewEnvironment(stateDir, "adversarial-partial-findings").ok, true);
   });
 });
 
@@ -431,6 +494,10 @@ test("AC-07 background/status-result: double plan-only never publishes pass and 
     const terminal = JSON.parse(status.stdout);
     assert.equal(terminal.status, "failed");
     assert.equal(terminal.error?.code, "E_SCHEMA");
+    assert.equal(terminal.error?.details?.reason, "plan-progress-only");
+    assert.equal(terminal.error?.details?.repairAttempted, true);
+    assert.deepEqual(terminal.error?.details?.partial?.findings, []);
+    assert.equal(Object.hasOwn(terminal.error.details.partial, "verdict"), false);
     assert.equal(terminal.result?.review, undefined);
     assert.doesNotMatch(JSON.stringify(terminal), /"verdict"\s*:\s*"pass"/);
     assert.doesNotMatch(JSON.stringify(terminal), new RegExp(PRIVATE_SENTINEL));
@@ -443,6 +510,8 @@ test("AC-07 background/status-result: double plan-only never publishes pass and 
     const payload = JSON.parse(result.stdout);
     assert.equal(payload.status, "failed");
     assert.equal(payload.error?.code, "E_SCHEMA");
+    assert.equal(payload.error?.details?.reason, "plan-progress-only");
+    assert.deepEqual(payload.error?.details?.partial?.findings, []);
     assert.equal(payload.result?.review, undefined);
     assert.doesNotMatch(JSON.stringify(payload), /"verdict"\s*:\s*"pass"/);
     assert.doesNotMatch(JSON.stringify(payload), new RegExp(PRIVATE_SENTINEL));

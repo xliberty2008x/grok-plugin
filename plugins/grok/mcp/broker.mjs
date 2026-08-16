@@ -113,14 +113,26 @@ export const BASE_WORKER_TOOLS = deepFreeze([
   {
     name: "worker_wait",
     title: "Wait for Grok worker progress",
-    description: "Wait up to 30 seconds for new lifecycle events or terminal state, draining this owned worker's durable launch outbox before authority-bound recovery maintenance.",
+    description: "Wait up to 30 seconds for new lifecycle events or terminal state, draining this owned worker's durable launch outbox before authority-bound recovery maintenance. Two or more ids wait for any owned worker to change and never launch a provider.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
-      required: ["id"],
       properties: {
         id: WORKER_ID_SCHEMA,
+        ids: {
+          type: "array",
+          minItems: 2,
+          maxItems: 16,
+          uniqueItems: true,
+          items: WORKER_ID_SCHEMA
+        },
         cursor: CURSOR_SCHEMA,
+        cursors: {
+          type: "array",
+          minItems: 2,
+          maxItems: 16,
+          items: CURSOR_SCHEMA
+        },
         timeoutMs: { type: "integer", minimum: 0, maximum: MAX_WORKER_WAIT_MS }
       }
     },
@@ -141,14 +153,15 @@ export const BASE_WORKER_TOOLS = deepFreeze([
   {
     name: "worker_cancel",
     title: "Cancel a Grok worker",
-    description: "Idempotently request cancellation. Returns an immutable receipt; exactly one cancellation-request event is recorded.",
+    description: "Idempotently request cancellation or a resumable interrupt. mode=interrupt stops the current attempt and keeps the worker available for follow-up when the provider session can be preserved; otherwise it falls back to terminal cancel. Exactly one receipt is recorded per idempotency key.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       required: ["id", "idempotencyKey"],
       properties: {
         id: WORKER_ID_SCHEMA,
-        idempotencyKey: { type: "string", minLength: 8, maxLength: 256 }
+        idempotencyKey: { type: "string", minLength: 8, maxLength: 256 },
+        mode: { type: "string", enum: ["cancel", "interrupt"] }
       }
     },
     annotations: CANCEL_ANNOTATIONS
@@ -170,7 +183,14 @@ export const WORKER_SPAWN_TOOL = deepFreeze({
       roleId: {
         type: "string",
         enum: ["explorer"]
-      }
+      },
+      contextMode: { type: "string", enum: ["none", "all", "recent"] },
+      inheritTurns: { type: "integer", minimum: 1, maximum: 32 },
+      contextDigest: { type: "string", minLength: 64, maxLength: 64 },
+      name: { type: "string", minLength: 1, maxLength: 64 },
+      parentId: WORKER_ID_SCHEMA,
+      model: { type: "string", minLength: 1, maxLength: 128 },
+      effort: { type: "string", minLength: 1, maxLength: 32 }
     }
   },
   annotations: MUTATION_ANNOTATIONS
@@ -567,6 +587,15 @@ function schemaAccepts(value, schema) {
     const length = Array.from(value).length;
     if (Number.isInteger(schema.minLength) && length < schema.minLength) return false;
     if (Number.isInteger(schema.maxLength) && length > schema.maxLength) return false;
+  } else if (schema.type === "array") {
+    if (!Array.isArray(value)) return false;
+    if (Number.isInteger(schema.minItems) && value.length < schema.minItems) return false;
+    if (Number.isInteger(schema.maxItems) && value.length > schema.maxItems) return false;
+    if (schema.uniqueItems) {
+      const seen = new Set(value.map((item) => JSON.stringify(item)));
+      if (seen.size !== value.length) return false;
+    }
+    return value.every((item) => schemaAccepts(item, schema.items || {}));
   } else if (schema.type === "integer") {
     if (!Number.isSafeInteger(value)) return false;
     if (Number.isFinite(schema.minimum) && value < schema.minimum) return false;
@@ -669,6 +698,28 @@ export function negotiateMcpProtocolVersion(requested) {
   return requested;
 }
 
+async function handleWorkerWait(service, args) {
+  if (Array.isArray(args.ids) === Boolean(args.id)) {
+    throw new CompanionError("E_USAGE", "Use exactly one of id or ids.");
+  }
+  if (Array.isArray(args.ids)) {
+    if (args.cursor !== undefined) {
+      throw new CompanionError("E_USAGE", "ids uses cursors, not cursor.");
+    }
+    return toolResult(await service.waitAny(args.ids, {
+      cursors: args.cursors ?? null,
+      timeoutMs: args.timeoutMs
+    }));
+  }
+  if (args.cursors !== undefined) {
+    throw new CompanionError("E_USAGE", "cursors is not valid for a single-worker wait.");
+  }
+  return toolResult({ stream: await service.wait(args.id, {
+    cursor: args.cursor ?? null,
+    timeoutMs: args.timeoutMs
+  }) });
+}
+
 export async function callWorkerTool(params, options = {}) {
   const name = params?.name;
   const runtime = brokerRuntime(options);
@@ -742,12 +793,7 @@ export async function callWorkerTool(params, options = {}) {
     if (name === "worker_events_after") {
       return toolResult({ stream: service.eventsAfter(args.id, args.cursor ?? null) });
     }
-    if (name === "worker_wait") {
-      return toolResult({ stream: await service.wait(args.id, {
-        cursor: args.cursor ?? null,
-        timeoutMs: args.timeoutMs
-      }) });
-    }
+    if (name === "worker_wait") return await handleWorkerWait(service, args);
     if (name === "worker_result") {
       const worker = service.result(args.id);
       const artifact = service.artifactMetadata(args.id);
@@ -817,7 +863,14 @@ export async function callWorkerTool(params, options = {}) {
         objective: args.objective,
         idempotencyKey: args.idempotencyKey,
         roleId: args.roleId || "explorer",
-        write: false
+        write: false,
+        contextMode: args.contextMode,
+        inheritTurns: args.inheritTurns,
+        contextDigest: args.contextDigest,
+        name: args.name,
+        parentId: args.parentId,
+        model: args.model,
+        effort: args.effort
       });
       return toolResult({
         worker: spawned.handle,
@@ -882,7 +935,8 @@ export async function callWorkerTool(params, options = {}) {
         replayed: followed.replayed,
         spawnSuccessDefinition: followed.spawnSuccessDefinition,
         providerLaunchState: followed.providerLaunchState,
-        providerLaunched: followed.providerLaunched
+        providerLaunched: followed.providerLaunched,
+        sessionReused: followed.sessionReused === true
       });
     }
     if (name === "worker_send") {
@@ -899,9 +953,17 @@ export async function callWorkerTool(params, options = {}) {
     if (name === "worker_cancel") {
       const cancelled = service.cancel({
         id: args.id,
-        idempotencyKey: args.idempotencyKey
+        idempotencyKey: args.idempotencyKey,
+        mode: args.mode
       });
-      return toolResult({ receipt: cancelled.receipt, replayed: cancelled.replayed });
+      return toolResult({
+        receipt: cancelled.receipt,
+        replayed: cancelled.replayed,
+        ...(cancelled.fallback ? { fallback: cancelled.fallback } : {}),
+        ...(typeof cancelled.receipt?.sessionPreserved === "boolean"
+          ? { sessionPreserved: cancelled.receipt.sessionPreserved }
+          : {})
+      });
     }
     return toolResult({ code: "E_USAGE", message: "Invalid worker broker request." }, true);
   } catch (error) {

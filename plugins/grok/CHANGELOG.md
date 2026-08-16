@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.3.0-dev.15
+
+Status: hardening candidate; not release-qualified.
+
+- `worker_spawn` can select isolated, full, or recent-turn context by digest,
+  name the worker, and attach a parent id. Explicit model/effort fail closed
+  until the installed receipt advertises them. Default explorer spawn is
+  unchanged.
+
+## 0.3.0-dev.14
+
+Status: hardening candidate; not release-qualified.
+
+- `worker_cancel` accepts `mode=interrupt` to stop the current provider
+  attempt without terminal cancellation when the provider session can be
+  preserved. Missing session preservation falls back to cancel. Cancel
+  without a mode stays terminal.
+
+## 0.3.0-dev.13
+
+Status: hardening candidate; not release-qualified.
+
+- `worker_wait` can wait for any of 2–16 owned workers via `ids` without a
+  new tool name or provider launch. Timeout is an empty no-change result.
+  Single-worker `id` wait stays compatible.
+
+## 0.3.0-dev.12
+
+Status: hardening candidate; not release-qualified.
+
+- A second failed adversarial-review repair still fail-closes with `E_SCHEMA`
+  and no pass verdict. Public error details now keep the validation reason
+  and any sanitized findings so `status`/`result` are not a dead-end.
+
+## 0.3.0-dev.11
+
+Status: hardening candidate; not release-qualified.
+
+- Deep-research isolation now ignores the real user home and host extension
+  roots, and contamination failures name the loaded capability class without
+  private paths.
+
+## 0.3.0-dev.10
+
+Status: hardening candidate; not release-qualified.
+
+- Public job summaries no longer stop mid-path. When the 160-character budget
+  is exceeded, the host keeps the last complete sentence or identifier
+  boundary and appends an ellipsis. If nothing complete fits, the public
+  summary is only the ellipsis. The durable worker-report summary is
+  unchanged.
+
 ## 0.3.0-dev.9
 
 Status: hardening candidate; not release-qualified.
