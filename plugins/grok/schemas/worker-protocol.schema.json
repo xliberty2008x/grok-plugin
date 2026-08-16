@@ -681,7 +681,8 @@
           "type": "string",
           "enum": [
             "task.accepted", "plan.updated", "activity.started", "activity.completed",
-            "checkpoint", "blocked", "final.report", "cancellation.requested"
+            "checkpoint", "blocked", "final.report", "cancellation.requested",
+            "interruption.requested"
           ]
         },
         "at": { "$ref": "#/$defs/isoDateTime" },
@@ -752,7 +753,7 @@
         "kind": { "type": ["string", "null"], "maxLength": 128 },
         "jobClass": { "type": ["string", "null"], "maxLength": 128 },
         "write": { "type": "boolean" },
-        "status": { "type": "string", "enum": ["queued", "running", "completed", "failed", "cancelled", "unknown"] },
+        "status": { "type": "string", "enum": ["queued", "running", "interrupted", "completed", "failed", "cancelled", "unknown"] },
         "phase": { "type": ["string", "null"], "maxLength": 128 },
         "summary": { "type": ["string", "null"], "maxLength": 2000 },
         "progress": { "type": ["string", "null"], "maxLength": 2000 },
@@ -1159,7 +1160,7 @@
         "kind": { "type": ["string", "null"], "maxLength": 128 },
         "jobClass": { "type": ["string", "null"], "maxLength": 128 },
         "write": { "type": "boolean" },
-        "status": { "type": "string", "enum": ["queued", "running", "completed", "failed", "cancelled", "unknown"] },
+        "status": { "type": "string", "enum": ["queued", "running", "interrupted", "completed", "failed", "cancelled", "unknown"] },
         "phase": { "type": ["string", "null"], "maxLength": 128 },
         "summary": { "type": ["string", "null"], "maxLength": 2000 },
         "progress": { "type": ["string", "null"], "maxLength": 2000 },

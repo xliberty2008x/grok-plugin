@@ -949,3 +949,68 @@ test("WorkerService does not expose or forward caller process signaling authorit
   assert.equal(cancelled.receipt.terminalRecordCommittedAt, null);
   assert.equal(tryReadJob(fixture.root, fixture.workerId, fixture.env).status, "running");
 });
+
+function sessionFixture(label) {
+  const fixture = activeFixture(label);
+  updateJob(fixture.root, fixture.workerId, (job) => ({
+    ...job,
+    grokSessionId: `sess-${label}`
+  }), fixture.env);
+  return fixture;
+}
+
+test("interrupt stops the attempt without terminal cancellation and replays one receipt", () => {
+  const fixture = sessionFixture("interrupt-0001");
+  const service = createWorkerService({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    env: fixture.env
+  });
+  const first = service.cancel({
+    id: fixture.workerId,
+    idempotencyKey: "interrupt-active-0001",
+    mode: "interrupt"
+  });
+  const current = tryReadJob(fixture.root, fixture.workerId, fixture.env);
+  assert.equal(first.replayed, false);
+  assert.equal(first.receipt.status, "accepted");
+  assert.equal(first.receipt.sessionPreserved, true);
+  assert.equal(current.status, "interrupted");
+  assert.notEqual(current.status, "cancelled");
+  assert.equal(current.grokSessionId, "sess-interrupt-0001");
+  assert.equal(
+    current.lifecycleEvents.some((event) => event.type === "interruption.requested"),
+    true
+  );
+  const replayed = service.cancel({
+    id: fixture.workerId,
+    idempotencyKey: "interrupt-active-0001",
+    mode: "interrupt"
+  });
+  assert.equal(replayed.replayed, true);
+  assert.equal(replayed.receipt.receiptId, first.receipt.receiptId);
+  const cancelled = service.cancel({
+    id: fixture.workerId,
+    idempotencyKey: "cancel-after-interrupt-0001"
+  });
+  assert.equal(cancelled.receipt.status === "accepted" || cancelled.receipt.status === "already_terminal", true);
+  const afterCancel = tryReadJob(fixture.root, fixture.workerId, fixture.env);
+  assert.equal(afterCancel.phase, "cancellation-requested");
+});
+
+test("interrupt without a preserved session falls back to terminal cancel", () => {
+  const fixture = activeFixture("interrupt-fallback-0001");
+  const service = createWorkerService({
+    root: fixture.root,
+    principal: principal(fixture.root),
+    env: fixture.env
+  });
+  const result = service.cancel({
+    id: fixture.workerId,
+    idempotencyKey: "interrupt-fallback-0001",
+    mode: "interrupt"
+  });
+  assert.equal(result.fallback, "cancel");
+  const current = tryReadJob(fixture.root, fixture.workerId, fixture.env);
+  assert.notEqual(current.status, "interrupted");
+});

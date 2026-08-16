@@ -20,7 +20,9 @@ import {
 } from "./worker-authority.mjs";
 import {
   cancelWorker,
-  projectCancellationReceipt
+  interruptWorker,
+  projectCancellationReceipt,
+  projectInterruptReceipt
 } from "./worker-mutation-cancellation.mjs";
 import { providerLaunchState } from "./worker-mutation-dispatch-contract.mjs";
 import { spawnReadOnlyWorker } from "./worker-mutation-spawn.mjs";
@@ -133,6 +135,55 @@ function assertWaitMs(value) {
     throw new CompanionError("E_USAGE", `Worker wait must be an integer from 0 to ${MAX_WORKER_WAIT_MS} milliseconds.`);
   }
   return timeoutMs;
+}
+
+function cancelOrInterruptOwned({
+  id,
+  idempotencyKey,
+  mode = "cancel",
+  root,
+  principal,
+  env
+}) {
+  if (!id) throw new CompanionError("E_USAGE", "id is required for cancel.");
+  if (!idempotencyKey) {
+    throw new CompanionError("E_USAGE", "idempotencyKey is required for cancel.");
+  }
+  if (mode === "interrupt") {
+    const result = interruptWorker({
+      root,
+      principal,
+      workerId: id,
+      idempotencyKey,
+      env
+    });
+    if (result.fallback === "cancel") {
+      return {
+        receipt: {
+          ...projectCancellationReceipt(result.receipt),
+          sessionPreserved: false
+        },
+        replayed: result.replayed,
+        fallback: "cancel"
+      };
+    }
+    return {
+      receipt: projectInterruptReceipt(result.receipt),
+      replayed: result.replayed,
+      fallback: null
+    };
+  }
+  if (mode != null && mode !== "cancel") {
+    throw new CompanionError("E_USAGE", "mode must be cancel or interrupt.");
+  }
+  const { receipt, replayed } = cancelWorker({
+    root,
+    principal,
+    workerId: id,
+    idempotencyKey,
+    env
+  });
+  return { receipt: projectCancellationReceipt(receipt), replayed };
 }
 
 export function createWorkerService({
@@ -780,19 +831,8 @@ export function createWorkerService({
       });
     },
 
-    cancel({ id, idempotencyKey } = {}) {
-      if (!id) throw new CompanionError("E_USAGE", "id is required for cancel.");
-      if (!idempotencyKey) {
-        throw new CompanionError("E_USAGE", "idempotencyKey is required for cancel.");
-      }
-      const { receipt, replayed } = cancelWorker({
-        root,
-        principal,
-        workerId: id,
-        idempotencyKey,
-        env
-      });
-      return { receipt: projectCancellationReceipt(receipt), replayed };
+    cancel(args) {
+      return cancelOrInterruptOwned({ ...args, root, principal, env });
     },
 
     send({ id, message, idempotencyKey } = {}) {
@@ -853,6 +893,9 @@ export function createWorkerService({
           "The installed provider capability changed before follow-up admission."
         );
       }
+      const parent = ownedJob(id);
+      const sessionReused = parent.status === "interrupted"
+        && parent.result?.interrupt?.sessionPreserved === true;
       const admitted = followupWorker({
         root,
         principal,
@@ -881,7 +924,8 @@ export function createWorkerService({
         ...admitted,
         handle: admitted.handle,
         providerLaunchState: launchState,
-        providerLaunched: launch?.providerLaunched === true
+        providerLaunched: launch?.providerLaunched === true,
+        sessionReused
       };
     }
   });

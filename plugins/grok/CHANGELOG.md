@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0-dev.14
+
+Status: hardening candidate; not release-qualified.
+
+- `worker_cancel` accepts `mode=interrupt` to stop the current provider
+  attempt without terminal cancellation when the provider session can be
+  preserved. Missing session preservation falls back to cancel. Cancel
+  without a mode stays terminal.
+
 ## 0.3.0-dev.13
 
 Status: hardening candidate; not release-qualified.

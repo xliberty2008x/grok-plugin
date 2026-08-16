@@ -89,7 +89,7 @@ export const PUBLIC_WORKER_ERROR_CODES = Object.freeze([
 /** Re-export retention bound so adapters share one constant with append paths. */
 export { MAX_LIFECYCLE_EVENTS };
 
-const ACTIVE_WORKER_STATUSES = new Set(["queued", "running"]);
+const ACTIVE_WORKER_STATUSES = new Set(["queued", "running", "interrupted"]);
 const PUBLIC_WORKER_STATUSES = new Set(["queued", "running", "completed", "failed", "cancelled", "unknown"]);
 const PUBLIC_LIFECYCLE_EVENT_TYPES = new Set(LIFECYCLE_EVENT_TYPES);
 const PUBLIC_WORKER_ERROR_CODE_SET = new Set(PUBLIC_WORKER_ERROR_CODES);

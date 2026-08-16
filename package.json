@@ -1,6 +1,6 @@
 {
   "name": "grok-plugin",
-  "version": "0.3.0-dev.13",
+  "version": "0.3.0-dev.14",
   "private": true,
   "type": "module",
   "description": "Claude Code and Codex companion plugin for the official Grok Build CLI",
