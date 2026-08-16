@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import { validInstalledPublicError, validateContextIncompleteTerminalProjection } from "./installed-context-incomplete-contract.mjs";
-
 const MAX_JSON_BYTES = 1024 * 1024;
 const MAX_JSON_DEPTH = 32;
 const MAX_JSON_NODES = 16_384;
@@ -282,7 +281,10 @@ const WORKER_HANDLE_KEYS = new Set([
   "profileId",
   "model",
   "effort",
+  "name",
   "parentWorkerId",
+  "contextMode",
+  "contextInheritanceDigest",
   "lineageWorkerId",
   "eventCursor",
   "taskEnvelopeId",
@@ -317,7 +319,10 @@ const WORKER_SNAPSHOT_KEYS = new Set([
   "profileId",
   "model",
   "effort",
+  "name",
   "parentWorkerId",
+  "contextMode",
+  "contextInheritanceDigest",
   "lineageWorkerId",
   "eventCursor",
   "taskEnvelopeId",
@@ -633,7 +638,6 @@ const PRIVATE_PROJECTION_FIELDS = new Set([
   "rawProviderMessage",
   "rawProviderMessages"
 ]);
-
 const SCENARIO_COUNTS = Object.freeze({
   "authenticated-completion": Object.freeze({
     spawnInvocationCount: 1,
@@ -711,19 +715,15 @@ export class InstalledWorkerMcpContractError extends Error {
     this.stack = `${this.name}: ${this.message}`;
   }
 }
-
 function fail(code) {
   throw new InstalledWorkerMcpContractError(code);
 }
-
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
-
 function byteLength(value) {
   return Buffer.byteLength(value, "utf8");
 }
-
 function boundedString(value, maximumBytes = MAX_STRING_BYTES) {
   return (
     typeof value === "string"
