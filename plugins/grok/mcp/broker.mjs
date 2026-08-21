@@ -7,6 +7,11 @@ import {
 } from "../scripts/lib/worker-authority.mjs";
 import { MAX_WORKER_WAIT_MS, createWorkerService } from "../scripts/lib/worker-service.mjs";
 import {
+  WORKER_CHANGE_NOTIFICATION_CAPABILITY,
+  clientAcceptsWorkerChangeNotifications,
+  workerChangeNotification
+} from "../scripts/lib/worker-mcp-notifications.mjs";
+import {
   MCP_CAPABILITY_CONTRACT_VERSION,
   ORDERED_TURN_BOUNDARY_MAILBOX_PROVIDER_CAPABILITY,
   ROOT_READ_PROVIDER_CAPABILITY,
@@ -26,6 +31,10 @@ import {
 
 export const MCP_SERVER_NAME = "grok-worker-broker";
 export const MCP_SERVER_VERSION = MCP_CAPABILITY_CONTRACT_VERSION;
+export const MCP_SERVER_EXPERIMENTAL_CAPABILITIES = Object.freeze({
+  ...CODEX_MCP_EXPERIMENTAL_CAPABILITIES,
+  [WORKER_CHANGE_NOTIFICATION_CAPABILITY]: Object.freeze({})
+});
 
 /** Fail-closed supported MCP protocol versions. */
 export const SUPPORTED_MCP_PROTOCOL_VERSIONS = Object.freeze([
@@ -186,8 +195,8 @@ export const WORKER_SPAWN_TOOL = deepFreeze({
       },
       contextMode: { type: "string", enum: ["none", "all", "recent"] },
       inheritTurns: { type: "integer", minimum: 1, maximum: 32 },
-      contextDigest: { type: "string", minLength: 64, maxLength: 64 },
-      name: { type: "string", minLength: 1, maxLength: 64 },
+      contextDigest: { type: "string", minLength: 64, maxLength: 64, pattern: "^[a-f0-9]{64}$" },
+      name: { type: "string", minLength: 1, maxLength: 64, pattern: "^[\\w .:@/+\\-]{1,64}$" },
       parentId: WORKER_ID_SCHEMA,
       model: { type: "string", minLength: 1, maxLength: 128 },
       effort: { type: "string", minLength: 1, maxLength: 32 }
@@ -217,11 +226,11 @@ export const WORKER_DECIDE_HOST_ACTION_TOOL = deepFreeze({
 export const WORKER_FOLLOWUP_TOOL = deepFreeze({
   name: "worker_followup",
   title: "Continue a Grok worker session",
-  description: "Idempotently commit one grant-bound read-only continuation in the exact provider session of an owned terminal Grok worker.",
+  description: "Idempotently continue an owned worker: grant-bound follow-up after a host-action grant, or resume an interrupted worker with a preserved session when grantId is omitted.",
   inputSchema: {
     type: "object",
     additionalProperties: false,
-    required: ["id", "grantId", "message", "idempotencyKey"],
+    required: ["id", "message", "idempotencyKey"],
     properties: {
       id: WORKER_ID_SCHEMA,
       grantId: { type: "string", minLength: 1, maxLength: 256 },
@@ -698,6 +707,22 @@ export function negotiateMcpProtocolVersion(requested) {
   return requested;
 }
 
+function emitWorkerChange(options, worker) {
+  if (typeof options.emitNotification !== "function") return;
+  const notification = workerChangeNotification(worker);
+  if (notification) options.emitNotification(notification);
+}
+
+function spawnToolResult(spawned) {
+  return toolResult({
+    worker: spawned.handle,
+    replayed: spawned.replayed,
+    spawnSuccessDefinition: spawned.spawnSuccessDefinition,
+    providerLaunchState: spawned.providerLaunchState,
+    providerLaunched: spawned.providerLaunched
+  });
+}
+
 async function handleWorkerWait(service, args) {
   if (Array.isArray(args.ids) === Boolean(args.id)) {
     throw new CompanionError("E_USAGE", "Use exactly one of id or ids.");
@@ -782,6 +807,7 @@ export async function callWorkerTool(params, options = {}) {
       providerLaunchBindingDigest: runtime.providerLaunchBindingDigest,
       validateProviderCapability: () => currentProviderCapabilityDigest(runtime, options),
       allowUnboundDispatch: false,
+      deferProviderLaunch: name === "worker_spawn",
       maintain: () => reconcileWorkers({
         root: authority.root,
         principal: authority,
@@ -872,13 +898,8 @@ export async function callWorkerTool(params, options = {}) {
         model: args.model,
         effort: args.effort
       });
-      return toolResult({
-        worker: spawned.handle,
-        replayed: spawned.replayed,
-        spawnSuccessDefinition: spawned.spawnSuccessDefinition,
-        providerLaunchState: spawned.providerLaunchState,
-        providerLaunched: spawned.providerLaunched
-      });
+      emitWorkerChange(options, spawned.handle);
+      return spawnToolResult(spawned);
     }
     if (name === "worker_spawn_write") {
       const spawned = service.spawnWriteVertical({
@@ -886,13 +907,7 @@ export async function callWorkerTool(params, options = {}) {
         objective: args.objective,
         idempotencyKey: args.idempotencyKey
       });
-      return toolResult({
-        worker: spawned.handle,
-        replayed: spawned.replayed,
-        spawnSuccessDefinition: spawned.spawnSuccessDefinition,
-        providerLaunchState: spawned.providerLaunchState,
-        providerLaunched: spawned.providerLaunched
-      });
+      return spawnToolResult(spawned);
     }
     if (name === "worker_decide_host_action") {
       const decided = service.decideRoleAdmission({
@@ -930,6 +945,7 @@ export async function callWorkerTool(params, options = {}) {
         message: args.message,
         idempotencyKey: args.idempotencyKey
       });
+      emitWorkerChange(options, followed.handle);
       return toolResult({
         worker: followed.handle,
         replayed: followed.replayed,
@@ -956,6 +972,7 @@ export async function callWorkerTool(params, options = {}) {
         idempotencyKey: args.idempotencyKey,
         mode: args.mode
       });
+      try { emitWorkerChange(options, service.get(args.id)); } catch { /* already authorized */ }
       return toolResult({
         receipt: cancelled.receipt,
         replayed: cancelled.replayed,
@@ -978,6 +995,9 @@ export async function handleMcpRequest(message, options = {}) {
     try {
       const protocolVersion = negotiateMcpProtocolVersion(params?.protocolVersion);
       const capability = codexMetadataCapabilityMatrix(params?._meta || {});
+      if (options.session && clientAcceptsWorkerChangeNotifications(params)) {
+        options.session.notifyWorkers = true;
+      }
       return {
         jsonrpc: "2.0",
         id,
@@ -985,7 +1005,7 @@ export async function handleMcpRequest(message, options = {}) {
           protocolVersion,
           capabilities: {
             tools: { listChanged: false },
-            experimental: CODEX_MCP_EXPERIMENTAL_CAPABILITIES
+            experimental: MCP_SERVER_EXPERIMENTAL_CAPABILITIES
           },
           serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
           instructions: "Task-owned Grok worker broker (structured list/get/events/wait/result/cancel, plus read-only spawn, exact grant-bound same-session follow-up, and ordered active-worker send only when advertised). Grok workers are external, not native host subagents. Accepted mailbox messages are not reported as delivered until the provider-owned pump records a terminal outcome. Host verification is not trusted or promoted by this MCP surface.",

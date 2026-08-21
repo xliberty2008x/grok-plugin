@@ -95,6 +95,7 @@ import {
 import {
   admitWriteWorkerPlan
 } from "./worker-mutation-write-admission.mjs";
+import { attestHostTranscriptSelection } from "./worker-host-transcript.mjs";
 
 
 const {
@@ -117,7 +118,19 @@ function resolveAdmissionContext(root, manifest, metadataPolicy = null) {
   return assertContextMetadataComplete(accepted, { contextPhase: "admission" });
 }
 
-export function prepareReadOnlyWorkerAdmission({ root, principal, envelope, contextManifest, idempotencyKey, roleId, write, env, allowWriteSpawn, writeLifecycleCapabilityDigest, providerCapabilityDigest, providerLaunchBinding, providerLaunchBindingDigest, providerLaunch }) {
+function spawnOrchestration(publicSpawn, transcript = null) {
+  const mode = publicSpawn?.contextMode || null;
+  const inherited = mode && mode !== "none";
+  return {
+    name: publicSpawn?.name || null,
+    parentId: publicSpawn?.parentId || null,
+    contextMode: mode,
+    inheritTurns: inherited ? publicSpawn.inheritTurns ?? null : null,
+    contextDigest: inherited ? (transcript?.digest || publicSpawn.contextDigest || null) : null
+  };
+}
+
+export function prepareReadOnlyWorkerAdmission({ root, principal, envelope, contextManifest, idempotencyKey, roleId, write, env, allowWriteSpawn, writeLifecycleCapabilityDigest, providerCapabilityDigest, providerLaunchBinding, providerLaunchBindingDigest, providerLaunch, publicSpawn = null }) {
   assertIdempotencyKey(idempotencyKey);
   if (!principal?.threadId) {
     throw new CompanionError("E_AUTH_REQUIRED", "Trusted Codex task identity is unavailable.");
@@ -198,8 +211,34 @@ export function prepareReadOnlyWorkerAdmission({ root, principal, envelope, cont
       "TaskEnvelope context identity does not match the trusted execution workspace."
     );
   }
+  const transcript = attestHostTranscriptSelection({
+    principal,
+    publicSpawn,
+    env
+  });
+  const mergedFacts = [
+    ...(Array.isArray(validatedEnvelope.context?.facts) ? validatedEnvelope.context.facts : []),
+    ...transcript.facts
+  ];
   const boundEnvelope = bindTaskEnvelopeContext(
-    validatedEnvelope,
+    buildTaskEnvelope({
+      userRequest: validatedEnvelope.userRequest,
+      objective: validatedEnvelope.objective,
+      mode: validatedEnvelope.mode,
+      scope: validatedEnvelope.scope,
+      context: {
+        ...validatedEnvelope.context,
+        facts: mergedFacts
+      },
+      nonGoals: validatedEnvelope.nonGoals,
+      acceptanceCriteria: validatedEnvelope.acceptanceCriteria,
+      requiredVerification: validatedEnvelope.requiredVerification,
+      ...(Object.hasOwn(validatedEnvelope, "verificationGeneratedPaths")
+        ? { verificationGeneratedPaths: validatedEnvelope.verificationGeneratedPaths }
+        : {}),
+      expectedReturnFormat: validatedEnvelope.expectedReturnFormat,
+      contextManifestId: acceptedContextManifest.manifestId
+    }),
     acceptedContextManifest.manifestId
   );
   const profile = profileFor("task", Boolean(write));
@@ -245,7 +284,8 @@ export function prepareReadOnlyWorkerAdmission({ root, principal, envelope, cont
     },
     ...(admittedProviderBinding
       ? { providerLaunchBindingDigest }
-      : {})
+      : {}),
+    orchestration: spawnOrchestration(publicSpawn, transcript)
   });
   return {
     validatedEnvelope,
@@ -262,7 +302,8 @@ export function prepareReadOnlyWorkerAdmission({ root, principal, envelope, cont
     keyDigest,
     requestOwner,
     spawnDigest,
-    admittedProviderBinding
+    admittedProviderBinding,
+    transcript
   };
 }
 
@@ -273,25 +314,26 @@ function assertOwnedSpawnParent(root, principal, publicSpawn, env) {
   assertMutationOwnership(parent, principal);
 }
 
-function publicSpawnRequestFields(publicSpawn) {
+function publicSpawnRequestFields(publicSpawn, transcript = null) {
+  const mode = publicSpawn?.contextMode || null;
   return {
     displayName: publicSpawn?.name || null,
     resumeJobId: publicSpawn?.parentId || null,
-    contextInheritance: publicSpawn?.contextMode
+    contextInheritance: mode
       ? {
-        mode: publicSpawn.contextMode,
-        digest: publicSpawn.contextDigest,
-        inheritTurns: publicSpawn.inheritTurns
+        mode,
+        digest: transcript?.digest || publicSpawn.contextDigest || null,
+        inheritTurns: publicSpawn.inheritTurns ?? null
       }
       : null
   };
 }
 
 export function spawnReadOnlyWorker({ root, principal, envelope, contextManifest = null, idempotencyKey, roleId = "explorer", write = false, env = process.env, allowWriteSpawn = false, writeLifecycleCapabilityDigest = null, providerCapabilityDigest = null, providerLaunchBinding = null, providerLaunchBindingDigest = null, providerLaunch = undefined, publicSpawn = null } = {}) {
-  const prepared = prepareReadOnlyWorkerAdmission({ root, principal, envelope, contextManifest, idempotencyKey, roleId, write, env, allowWriteSpawn, writeLifecycleCapabilityDigest, providerCapabilityDigest, providerLaunchBinding, providerLaunchBindingDigest, providerLaunch });
+  const prepared = prepareReadOnlyWorkerAdmission({ root, principal, envelope, contextManifest, idempotencyKey, roleId, write, env, allowWriteSpawn, writeLifecycleCapabilityDigest, providerCapabilityDigest, providerLaunchBinding, providerLaunchBindingDigest, providerLaunch, publicSpawn });
   if (prepared.writeAdmission) return prepared.writeAdmission;
   assertOwnedSpawnParent(root, principal, publicSpawn, env);
-  const { validatedEnvelope, role, controlWorkspaceId, executionRoot, acceptedContextManifest, boundEnvelope, profile, contextPacket, runtimeRolePolicy, providerPromptDigest, contextBindingDigest, keyDigest, requestOwner, spawnDigest, admittedProviderBinding } = prepared;
+  const { validatedEnvelope, role, controlWorkspaceId, executionRoot, acceptedContextManifest, boundEnvelope, profile, contextPacket, runtimeRolePolicy, providerPromptDigest, contextBindingDigest, keyDigest, requestOwner, spawnDigest, admittedProviderBinding, transcript } = prepared;
   const admitted = withWorkspaceStateTransaction(root, (transaction) => {
     const digestOwners = transaction.listJobs().filter((candidate) => (
       candidate.request?.spawn?.idempotencyKeyDigest === keyDigest
@@ -326,7 +368,8 @@ export function spawnReadOnlyWorker({ root, principal, envelope, contextManifest
         write,
         ...(admittedProviderBinding
           ? { providerLaunchBindingDigest }
-          : {})
+          : {}),
+        publicSpawn
       });
       if (record.requestDigest !== replayRequestDigest) {
         idempotencyConflict("idempotencyKey was reused with a different spawn owner or request.");
@@ -394,7 +437,8 @@ export function spawnReadOnlyWorker({ root, principal, envelope, contextManifest
         write,
         ...(admittedProviderBinding
           ? { providerLaunchBindingDigest }
-          : {})
+          : {}),
+        publicSpawn
       });
       if (orphan.request?.spawn?.requestDigest !== replayRequestDigest) {
         idempotencyConflict("idempotencyKey was reused with a different spawn owner or request.");
@@ -467,7 +511,7 @@ export function spawnReadOnlyWorker({ root, principal, envelope, contextManifest
           ? boundEnvelope.objective
           : null,
         roleId: role.id,
-        ...publicSpawnRequestFields(publicSpawn),
+        ...publicSpawnRequestFields(publicSpawn, transcript),
         spawn: {
           executionRoot,
           idempotencyKeyDigest: keyDigest,
@@ -527,6 +571,7 @@ export function spawnReadOnlyWorker({ root, principal, envelope, contextManifest
     handle: admitted.handle,
     replayed: admitted.replayed,
     spawnSuccessDefinition: SPAWN_SUCCESS_DEFINITION,
+    providerLaunchState: "pending",
     providerLaunched: false
   };
 }

@@ -51,7 +51,8 @@ export function requestDigest({
   roleId,
   write,
   contextBinding = undefined,
-  providerLaunchBindingDigest = undefined
+  providerLaunchBindingDigest = undefined,
+  orchestration = undefined
 }) {
   return stableDigest({
     owner: spawnRequestOwner(principal),
@@ -64,6 +65,7 @@ export function requestDigest({
     ...(contextBinding === undefined ? {} : { contextBinding }),
     ...(providerLaunchBindingDigest === undefined
       ? {}
-      : { providerLaunchBindingDigest })
+      : { providerLaunchBindingDigest }),
+    ...(orchestration === undefined ? {} : { orchestration })
   });
 }

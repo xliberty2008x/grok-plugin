@@ -45,8 +45,8 @@ const PARENT_FINGERPRINT_FIELDS = Object.freeze([
 ].sort());
 
 function git(cwd, args, { allowFailure = false, encoding = "utf8" } = {}) {
-  const run = spawnSync("git", args, { cwd, encoding, shell: false, maxBuffer: 32 * 1024 * 1024 });
-  if (run.error || (!allowFailure && run.status !== 0)) {
+  const run = spawnSync("git", ["-c", "extensions.worktreeConfig=false", ...args], { cwd, encoding, shell: false, maxBuffer: 32 * 1024 * 1024, timeout: 15_000 });
+  if (run.error || run.signal === "SIGTERM" || (!allowFailure && run.status !== 0)) {
     throw new CompanionError("E_GIT_REQUIRED", `Git command failed: git ${args.join(" ")}`, {
       stderr: String(run.stderr || "").trim()
     });

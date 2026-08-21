@@ -730,7 +730,7 @@ export async function qualify(
     || broker.MCP_SERVER_VERSION
       !== providerCapability.MCP_CAPABILITY_CONTRACT_VERSION
     || !sameJson(
-      authority.CODEX_MCP_EXPERIMENTAL_CAPABILITIES,
+      broker.MCP_SERVER_EXPERIMENTAL_CAPABILITIES,
       EXPECTED_EXPERIMENTAL_CAPABILITIES
     )
   ) {

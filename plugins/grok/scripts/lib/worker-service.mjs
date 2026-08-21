@@ -220,7 +220,8 @@ export function createWorkerService({
   runRemoveEffect = runOfficialRemoveEffect,
   captureContext = captureContextManifest,
   maintain = null,
-  maintenanceIntervalMs = 250
+  maintenanceIntervalMs = 250,
+  deferProviderLaunch = false
 }) {
   assertServicePrincipal(principal);
   if (typeof root !== "string" || !root) {
@@ -769,27 +770,14 @@ export function createWorkerService({
         providerLaunchBindingDigest,
         publicSpawn
       });
-      if (write) {
-        return {
-          ...admitted,
-          handle: admitted.handle,
-          // Preserve the durable admission/replay state reported by the
-          // mutation boundary. A terminal replay still performs no launch,
-          // but its verified-ready provisioning chain must not be masked as
-          // an unprovisioned admission.
-          providerLaunchState: admitted.providerLaunchState,
-          providerLaunched: false
-        };
-      }
-      // Admission is intentionally durable before provider launch. Revalidate
-      // once more at that exact boundary: if readiness changed while the job
-      // was being committed, preserve the pending outbox for a later valid
-      // worker_wait/supervisor pass and report that no provider was started.
-      // Keep admitted.handle as the stable transaction-time snapshot even when
-      // dispatch advances the private job synchronously; launch observation is
-      // reported only via providerLaunchState / providerLaunched.
-      const mayLaunch = typeof providerCapabilityDigest !== "string"
-        || currentCapabilityDigest() === providerCapabilityDigest;
+      // MCP worker_spawn sets deferProviderLaunch so JSON-RPC returns at
+      // durable admission. Supervisor / worker_wait still launch pending
+      // dispatches. Write admission never starts a provider here.
+      // Keep this branch cap-neutral with the pre-defer launch path.
+      // Provider start remains a wait/supervisor concern, not spawn RPC.
+      const mayLaunch = !write && !deferProviderLaunch
+        && (typeof providerCapabilityDigest !== "string"
+          || currentCapabilityDigest() === providerCapabilityDigest);
       const launch = mayLaunch
         ? dispatchWorker({
           root,
@@ -799,6 +787,7 @@ export function createWorkerService({
         })
         : null;
       const launchState = launch?.providerLaunchState
+        || admitted.providerLaunchState
         || providerLaunchState(readJob(root, admitted.handle.id, env));
       return {
         ...admitted,
@@ -909,6 +898,17 @@ export function createWorkerService({
         providerLaunchBinding,
         providerLaunchBindingDigest
       });
+      if (!grantId) {
+        const launchState = admitted.providerLaunchState
+          || providerLaunchState(readJob(root, admitted.handle.id, env));
+        return {
+          ...admitted,
+          handle: admitted.handle,
+          providerLaunchState: launchState,
+          providerLaunched: false,
+          sessionReused
+        };
+      }
       const mayLaunch = typeof providerCapabilityDigest !== "string"
         || currentCapabilityDigest() === providerCapabilityDigest;
       const launch = mayLaunch

@@ -3,13 +3,17 @@
 import readline from "node:readline";
 
 import { handleMcpRequest } from "./broker.mjs";
-import { startWorkerDispatchSupervisor } from "../scripts/lib/worker-dispatch-supervisor.mjs";
+import {
+  drainAuthorizedPendingDispatches,
+  startWorkerDispatchSupervisor
+} from "../scripts/lib/worker-dispatch-supervisor.mjs";
 
 function send(message) {
   if (message) process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
 const supervisor = startWorkerDispatchSupervisor({ env: process.env });
+const session = { notifyWorkers: false };
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 let stopping = false;
 const stop = () => {
@@ -35,7 +39,13 @@ lines.on("line", async (line) => {
     return;
   }
   try {
-    send(await handleMcpRequest(message));
+    send(await handleMcpRequest(message, {
+      session,
+      emitNotification: session.notifyWorkers ? send : undefined
+    }));
+    if (message?.method === "tools/call" && message?.params?.name === "worker_spawn") {
+      void drainAuthorizedPendingDispatches({ env: process.env }).catch(() => {});
+    }
   } catch {
     send({ jsonrpc: "2.0", id: message?.id ?? null, error: { code: -32603, message: "Internal error." } });
   }

@@ -329,6 +329,7 @@ async function callTool(root, name, args, options) {
   const result = await rawTool(root, name, args, options);
   assert.equal(result?.isError, undefined, JSON.stringify(result));
   assert.equal(result?.structuredContent?.ok, true, JSON.stringify(result));
+  if (name === "worker_spawn" && result.structuredContent?.replayed !== true && result.structuredContent?.worker?.id) await rawTool(root, "worker_wait", { id: result.structuredContent.worker.id, timeoutMs: 0 }, options);
   return result.structuredContent;
 }
 
@@ -1040,7 +1041,6 @@ test("bound provider guard registration rejects a provider from another linked w
   assert.equal(loadProviderGuard(root, workerId), null);
   assert.equal(processGroupGone(providerIdentity), false);
 });
-
 test("MCP spawn runs one fake provider, replays idempotently, waits, returns a private-safe result, and leaks no process", { skip: process.platform === "win32" }, async (t) => {
   const poison = installFakeGrok(tempDir("fake-grok-mcp-poison-"), {
     taskText: taskReport("POISON_PROVIDER_MUST_NOT_RUN")
@@ -2002,7 +2002,7 @@ test("MCP launch fails durably and terminates the controller when its birth toke
     idempotencyKey: "mcp-runtime-null-token-0001",
     userRequest: "Fail before controller identity publication"
   }, options);
-  assert.equal(spawned.providerLaunchState, "failed");
+  assert.equal(spawned.providerLaunchState, "pending");
   assert.equal(spawned.providerLaunched, false);
   assert.equal(spawned.worker.status, "queued");
   assert.equal(spawned.worker.phase, "accepted");

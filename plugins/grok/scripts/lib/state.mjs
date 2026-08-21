@@ -962,11 +962,11 @@ export function withWorkspaceStateTransaction(root, action, env = process.env) {
     updateJob(id, mutator) {
       return updateJob(root, id, mutator, env);
     },
-    requestCancel(id, nonce) {
-      return requestCancelUnlocked(root, id, nonce, env);
-    },
-    isCancelRequested(id, expectedNonce) {
-      return isCancelRequested(root, id, expectedNonce, env);
+    requestCancel(id, nonce) { return requestCancelUnlocked(root, id, nonce, env); },
+    isCancelRequested(id, expectedNonce) { return isCancelRequested(root, id, expectedNonce, env); },
+    clearCancel(id) {
+      try { fs.unlinkSync(cancelFile(root, id, env)); }
+      catch (error) { if (error?.code !== "ENOENT") throw error; }
     }
   })), env);
 }

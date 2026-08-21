@@ -90,7 +90,7 @@ export const PUBLIC_WORKER_ERROR_CODES = Object.freeze([
 export { MAX_LIFECYCLE_EVENTS };
 
 const ACTIVE_WORKER_STATUSES = new Set(["queued", "running", "interrupted"]);
-const PUBLIC_WORKER_STATUSES = new Set(["queued", "running", "completed", "failed", "cancelled", "unknown"]);
+const PUBLIC_WORKER_STATUSES = new Set(["queued", "running", "interrupted", "completed", "failed", "cancelled", "unknown"]);
 const PUBLIC_LIFECYCLE_EVENT_TYPES = new Set(LIFECYCLE_EVENT_TYPES);
 const PUBLIC_WORKER_ERROR_CODE_SET = new Set(PUBLIC_WORKER_ERROR_CODES);
 const FOREGROUND_PUBLIC_ERROR_CODE_SET = new Set([

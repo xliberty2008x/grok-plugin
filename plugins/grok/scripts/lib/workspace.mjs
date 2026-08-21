@@ -34,15 +34,25 @@ export function gitSubprocessEnv(baseEnv = process.env) {
   return env;
 }
 
-export function git(cwd, args, { allowFailure = false, encoding = "utf8", maxBuffer = 8 * 1024 * 1024 } = {}) {
-  const run = spawnSync("git", args, {
+export function git(cwd, args, {
+  allowFailure = false,
+  encoding = "utf8",
+  maxBuffer = 8 * 1024 * 1024,
+  timeout = 15_000
+} = {}) {
+  const run = spawnSync("git", ["-c", "extensions.worktreeConfig=false", ...args], {
     cwd,
     encoding,
     maxBuffer,
+    timeout,
     shell: false,
     env: gitSubprocessEnv()
   });
-  if (run.error || (!allowFailure && run.status !== 0)) throw new CompanionError("E_GIT_REQUIRED", `Git command failed: git ${args.join(" ")}`, { stderr: String(run.stderr ?? "").trim() });
+  if (run.error || run.signal === "SIGTERM" || (!allowFailure && run.status !== 0)) {
+    throw new CompanionError("E_GIT_REQUIRED", `Git command failed: git ${args.join(" ")}`, {
+      stderr: String(run.stderr ?? "").trim()
+    });
+  }
   return run;
 }
 
