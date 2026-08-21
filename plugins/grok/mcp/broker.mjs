@@ -31,6 +31,10 @@ import {
 
 export const MCP_SERVER_NAME = "grok-worker-broker";
 export const MCP_SERVER_VERSION = MCP_CAPABILITY_CONTRACT_VERSION;
+export const MCP_SERVER_EXPERIMENTAL_CAPABILITIES = Object.freeze({
+  ...CODEX_MCP_EXPERIMENTAL_CAPABILITIES,
+  [WORKER_CHANGE_NOTIFICATION_CAPABILITY]: Object.freeze({})
+});
 
 /** Fail-closed supported MCP protocol versions. */
 export const SUPPORTED_MCP_PROTOCOL_VERSIONS = Object.freeze([
@@ -1001,10 +1005,7 @@ export async function handleMcpRequest(message, options = {}) {
           protocolVersion,
           capabilities: {
             tools: { listChanged: false },
-            experimental: {
-              ...CODEX_MCP_EXPERIMENTAL_CAPABILITIES,
-              [WORKER_CHANGE_NOTIFICATION_CAPABILITY]: {}
-            }
+            experimental: MCP_SERVER_EXPERIMENTAL_CAPABILITIES
           },
           serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
           instructions: "Task-owned Grok worker broker (structured list/get/events/wait/result/cancel, plus read-only spawn, exact grant-bound same-session follow-up, and ordered active-worker send only when advertised). Grok workers are external, not native host subagents. Accepted mailbox messages are not reported as delivered until the provider-owned pump records a terminal outcome. Host verification is not trusted or promoted by this MCP surface.",

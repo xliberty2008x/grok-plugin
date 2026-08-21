@@ -5,7 +5,7 @@ import test from "node:test";
 import {
   createMcpBrokerRuntime,
   handleMcpRequest,
-  WORKER_TOOLS
+  MCP_SERVER_EXPERIMENTAL_CAPABILITIES, WORKER_TOOLS
 } from "../plugins/grok/mcp/broker.mjs";
 import {
   CODEX_MCP_EXPERIMENTAL_CAPABILITIES,
@@ -200,7 +200,7 @@ function initializeFixture() {
     protocolVersion: "2025-11-25",
     capabilities: {
       tools: { listChanged: false },
-      experimental: clone(CODEX_MCP_EXPERIMENTAL_CAPABILITIES)
+      experimental: clone(MCP_SERVER_EXPERIMENTAL_CAPABILITIES)
     },
     serverInfo: { name: "grok-worker-broker", version: "1.3.0" },
     instructions: "External worker broker; host verification is not promoted.",
@@ -222,7 +222,7 @@ function initializeExpectations() {
     capabilityDigest: capabilityFixture().capabilityDigest,
     providerLaunchBindingDigest:
       capabilityFixture().providerLaunchBindingDigest,
-    experimentalCapabilities: clone(CODEX_MCP_EXPERIMENTAL_CAPABILITIES),
+    experimentalCapabilities: clone(MCP_SERVER_EXPERIMENTAL_CAPABILITIES),
     capabilityMatrix: clone(EXPECTED_CAPABILITY_MATRIX)
   };
 }

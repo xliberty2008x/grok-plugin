@@ -13,7 +13,8 @@ export const MARKETPLACE_ID = "grok-companion";
 export const PROTOCOL_VERSION = "2025-11-25";
 export const RUNNER_VERSION = "1";
 export const EXPECTED_EXPERIMENTAL_CAPABILITIES = Object.freeze({
-  "codex/sandbox-state-meta": Object.freeze({})
+  "codex/sandbox-state-meta": Object.freeze({}),
+  "grok/worker-change-notifications": Object.freeze({})
 });
 export const HELP = "Usage: GROK_E2E=1 GROK_INSTALLED_WORKER_MCP_E2E=1 GROK_E2E_CANCEL=1 npm run test:installed-worker-mcp\n";
 export const WRITE_SMOKE_HELP = "Usage: GROK_E2E=1 GROK_INSTALLED_WORKER_MCP_E2E=1 GROK_E2E_CANCEL=1 GROK_WORKER_WRITE_E2E=1 npm run test:installed-worker-mcp -- --write-smoke\n";

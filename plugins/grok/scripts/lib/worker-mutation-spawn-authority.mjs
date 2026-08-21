@@ -224,13 +224,17 @@ export function storedSpawnReplayRequestDigest({
     ...(providerLaunchBindingDigest === undefined
       ? {}
       : { providerLaunchBindingDigest }),
-    orchestration: {
-      name: publicSpawn?.name || null,
-      parentId: publicSpawn?.parentId || null,
-      contextMode: publicSpawn?.contextMode || null,
-      inheritTurns: publicSpawn?.inheritTurns ?? null,
-      contextDigest: publicSpawn?.contextDigest || null
-    }
+    ...(write
+      ? {}
+      : {
+          orchestration: {
+            name: publicSpawn?.name || null,
+            parentId: publicSpawn?.parentId || null,
+            contextMode: publicSpawn?.contextMode || null,
+            inheritTurns: publicSpawn?.inheritTurns ?? null,
+            contextDigest: publicSpawn?.contextDigest || null
+          }
+        })
   });
 }
 
@@ -908,7 +912,7 @@ export function assertDurableSpawnRequestBinding(job, env = process.env, {
     ...(Object.hasOwn(spawn, "providerLaunchBindingDigest")
       ? { providerLaunchBindingDigest: spawn.providerLaunchBindingDigest }
       : {}),
-    ...(spawn.ownershipMode === SPAWN_OWNERSHIP_MODE
+    ...(spawn.ownershipMode === SPAWN_OWNERSHIP_MODE && job.write !== true
       ? {
           orchestration: {
             name: job.request?.displayName || null,
