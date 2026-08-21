@@ -1,6 +1,6 @@
 {
   "name": "grok",
-  "version": "0.3.0-dev.16",
+  "version": "0.3.0-dev.17",
   "description": "Delegate coding tasks, read-only reviews, and first-class Grok /deep-research to the official Grok Build CLI from Codex.",
   "author": {
     "name": "grok-plugin community maintainers"

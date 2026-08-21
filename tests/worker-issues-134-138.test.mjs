@@ -368,7 +368,7 @@ test("interrupted workers project public interrupted and resume without a grant"
   assert.notEqual(job.request.envelope.userRequest, "Original prompt must not replay");
 });
 
-test("worker change notifications are ownership-filtered and omit transcript text", async () => {
+test("MCP wait emits a bounded notification when an owned worker becomes terminal", async () => {
   const marker = "SECRET_TRANSCRIPT_SHOULD_NOT_NOTIFY";
   const handle = {
     id: "task-aaaaaaaaaaaaaaaa",
@@ -391,34 +391,52 @@ test("worker change notifications are ownership-filtered and omit transcript tex
   );
   assert.equal(clientAcceptsWorkerChangeNotifications({ capabilities: {} }), false);
 
+  const root = initRepo();
+  const { env } = envFor(root);
   const notes = [];
+  const options = {
+    runtime: createMcpBrokerRuntime({ providerCapabilityReceipt: SPAWN_RECEIPT }),
+    readProviderCapabilityReceipt: () => SPAWN_RECEIPT,
+    resolveAuthority: () => principal(root),
+    env,
+    emitNotification: (note) => notes.push(note)
+  };
   const spawned = await callWorkerTool({
     name: "worker_spawn",
     arguments: {
-      idempotencyKey: "notify-spawn-0001",
-      userRequest: "notify spawn"
+      idempotencyKey: "notify-wait-terminal-0001",
+      userRequest: marker
     }
-  }, {
-    runtime: createMcpBrokerRuntime({ providerCapabilityReceipt: SPAWN_RECEIPT }),
-    readProviderCapabilityReceipt: () => SPAWN_RECEIPT,
-    resolveAuthority: () => principal(initRepo()),
-    emitNotification: (note) => notes.push(note),
-    createService: () => ({
-      spawn() {
-        return {
-          handle: { id: "task-bbbbbbbbbbbbbbbb", status: "queued", phase: "accepted", terminal: false },
-          replayed: false,
-          spawnSuccessDefinition: "durable-job-commit",
-          providerLaunchState: "pending",
-          providerLaunched: false
-        };
-      }
-    })
-  });
+  }, options);
   assert.equal(spawned.isError, undefined);
-  assert.equal(notes.length, 1);
-  assert.equal(notes[0].method, WORKER_CHANGE_NOTIFICATION_METHOD);
-  assert.equal(notes[0].params.workerId, "task-bbbbbbbbbbbbbbbb");
+  const workerId = spawned.structuredContent.worker.id;
+  assert.ok(notes.some((note) => (
+    note.method === WORKER_CHANGE_NOTIFICATION_METHOD
+    && note.params.workerId === workerId
+    && note.params.terminal !== true
+  )));
+
+  const cancelled = await callWorkerTool({
+    name: "worker_cancel",
+    arguments: {
+      id: workerId,
+      idempotencyKey: "notify-wait-terminal-cancel-0001"
+    }
+  }, options);
+  assert.equal(cancelled.structuredContent.ok, true);
+  notes.length = 0;
+  const waited = await callWorkerTool({
+    name: "worker_wait",
+    arguments: { id: workerId, timeoutMs: 0 }
+  }, options);
+  assert.equal(waited.isError, undefined);
+  assert.equal(waited.structuredContent.stream.terminal, true);
+  const terminalNotes = notes.filter((note) => note.method === WORKER_CHANGE_NOTIFICATION_METHOD);
+  assert.ok(terminalNotes.length >= 1);
+  assert.equal(terminalNotes[0].params.workerId, workerId);
+  assert.equal(terminalNotes[0].params.terminal, true);
+  assert.ok(["cancelled", "failed", "completed"].includes(terminalNotes[0].params.status));
+  assert.equal(JSON.stringify(terminalNotes[0].params).includes(marker), false);
 });
 
 test("initialize records client notification support on the session", async () => {

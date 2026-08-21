@@ -188,7 +188,8 @@ export async function drainAuthorizedPendingDispatches({
   launchWorker = launchCommittedWorker,
   clock = () => Date.now(),
   maxLaunches = DEFAULT_MAX_LAUNCHES,
-  scanLimits = null
+  scanLimits = null,
+  notifyWorker = null
 } = {}) {
   if (!Number.isSafeInteger(maxLaunches) || maxLaunches < 1 || maxLaunches > 64) {
     throw new CompanionError("E_USAGE", "Worker recovery launch budget is invalid.");
@@ -235,8 +236,12 @@ export async function drainAuthorizedPendingDispatches({
         principal: launch.principal,
         env
       });
-      if (result?.claimed === true) launched += 1;
-      else reconcileOnly += 1;
+      if (result?.claimed === true) {
+        launched += 1;
+        if (typeof notifyWorker === "function") {
+          try { notifyWorker(launch); } catch { /* MCP stdout stays protocol-only. */ }
+        }
+      } else reconcileOnly += 1;
     } catch {
       reconcileOnly += 1;
     }
@@ -256,7 +261,8 @@ export function startWorkerDispatchSupervisor({
   retryDelayMs = DEFAULT_RETRY_DELAY_MS,
   maxRuns = DEFAULT_MAX_RUNS,
   setTimer = setTimeout,
-  clearTimer = clearTimeout
+  clearTimer = clearTimeout,
+  notifyWorker = null
 } = {}) {
   if (!Number.isSafeInteger(retryDelayMs) || retryDelayMs < 1 || retryDelayMs > 60_000
     || !Number.isSafeInteger(maxRuns) || maxRuns < 1 || maxRuns > 16) {
@@ -278,7 +284,7 @@ export function startWorkerDispatchSupervisor({
     }
     running = true;
     runs += 1;
-    try { await drain({ env }); }
+    try { await drain({ env, ...(typeof notifyWorker === "function" ? { notifyWorker } : {}) }); }
     catch { /* Startup recovery never writes diagnostics to MCP stdout. */ }
     finally {
       running = false;

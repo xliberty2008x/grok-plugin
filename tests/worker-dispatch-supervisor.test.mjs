@@ -265,16 +265,21 @@ test("startup drain launches one capability-bound pending job and restart does n
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].job.id, state.workerId);
   const calls = [];
+  const notified = [];
   const options = {
     env: state.env,
     readCapability: () => receipt(),
-    launchWorker: claimOnly(calls)
+    launchWorker: claimOnly(calls),
+    notifyWorker: (launch) => notified.push(launch)
   };
   const first = await drainAuthorizedPendingDispatches(options);
   const restarted = await drainAuthorizedPendingDispatches(options);
   assert.equal(first.launched, 1);
   assert.equal(restarted.launched, 0);
   assert.equal(calls.filter((entry) => entry.claimed).length, 1);
+  assert.equal(notified.length, 1);
+  assert.equal(notified[0].workerId, state.workerId);
+  assert.equal(notified[0].root, state.root);
   assert.deepEqual(calls[0].principal, {
     hostKind: "codex",
     threadId: THREAD_ID,
