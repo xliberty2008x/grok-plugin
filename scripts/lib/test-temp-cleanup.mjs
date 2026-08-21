@@ -13,14 +13,12 @@ import {
   processStartToken,
   validateTestTempManifest
 } from "./test-temp.mjs";
-
 const {
   canonicalContainedPath,
   gitConfigSemantics,
   inspectContainedGitMetadata,
   normalizeDarwinSystemPath
 } = gitContainment;
-
 export const DEFAULT_TEST_TEMP_MAX_AGE_MS = 60 * 60_000;
 export const TEST_TEMP_SIZE_SCAN_ENTRY_BUDGET = 10_000;
 export const TEST_TEMP_SNAPSHOT_REFRESH_MS = 10_000;
@@ -128,6 +126,7 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "grok-hook-env-",
   "grok-hook-home-",
   "grok-host-action-data-",
+  "grok-host-transcript-",
   "grok-import-guard-",
   "grok-import-signal-injection-",
   "grok-installed-codex-home-",
@@ -136,6 +135,7 @@ export const LEGACY_TEST_TEMP_PREFIXES = Object.freeze([
   "grok-installed-worker-mcp-",
   "grok-installed-worker-runner-test-",
   "grok-issue34-real-vertical-",
+  "grok-issues-134-138-data-",
   "grok-legacy-outside-",
   "grok-mailbox-data-",
   "grok-managed-data-",

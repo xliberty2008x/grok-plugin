@@ -96,6 +96,7 @@ import {
 } from "./worker-mutation-idempotency.mjs";
 import {
   SHA256_HEX,
+  SPAWN_OWNERSHIP_MODE,
   digestKey,
   isPlainRecord,
   stableDigest
@@ -907,13 +908,17 @@ export function assertDurableSpawnRequestBinding(job, env = process.env, {
     ...(Object.hasOwn(spawn, "providerLaunchBindingDigest")
       ? { providerLaunchBindingDigest: spawn.providerLaunchBindingDigest }
       : {}),
-    orchestration: {
-      name: job.request?.displayName || null,
-      parentId: job.request?.resumeJobId || null,
-      contextMode: job.request?.contextInheritance?.mode || null,
-      inheritTurns: job.request?.contextInheritance?.inheritTurns ?? null,
-      contextDigest: job.request?.contextInheritance?.digest || null
-    }
+    ...(spawn.ownershipMode === SPAWN_OWNERSHIP_MODE
+      ? {
+          orchestration: {
+            name: job.request?.displayName || null,
+            parentId: job.request?.resumeJobId || null,
+            contextMode: job.request?.contextInheritance?.mode || null,
+            inheritTurns: job.request?.contextInheritance?.inheritTurns ?? null,
+            contextDigest: job.request?.contextInheritance?.digest || null
+          }
+        }
+      : {})
   });
   if (spawn.requestDigest !== recomputedRequestDigest) {
     spawnIdempotencyStateError("Durable worker spawn request no longer matches its admitted binding.");
