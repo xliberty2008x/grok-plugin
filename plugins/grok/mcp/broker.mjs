@@ -713,6 +713,13 @@ function emitWorkerChange(options, worker) {
   if (notification) options.emitNotification(notification);
 }
 
+function emitWaitWorkerChanges(options, service, streams) {
+  for (const stream of streams) {
+    if (!stream?.workerId || !(stream.events?.length || stream.terminal)) continue;
+    try { emitWorkerChange(options, service.get(stream.workerId)); } catch { /* already authorized */ }
+  }
+}
+
 function spawnToolResult(spawned) {
   return toolResult({
     worker: spawned.handle,
@@ -723,7 +730,7 @@ function spawnToolResult(spawned) {
   });
 }
 
-async function handleWorkerWait(service, args) {
+async function handleWorkerWait(service, args, options) {
   if (Array.isArray(args.ids) === Boolean(args.id)) {
     throw new CompanionError("E_USAGE", "Use exactly one of id or ids.");
   }
@@ -731,18 +738,22 @@ async function handleWorkerWait(service, args) {
     if (args.cursor !== undefined) {
       throw new CompanionError("E_USAGE", "ids uses cursors, not cursor.");
     }
-    return toolResult(await service.waitAny(args.ids, {
+    const result = await service.waitAny(args.ids, {
       cursors: args.cursors ?? null,
       timeoutMs: args.timeoutMs
-    }));
+    });
+    emitWaitWorkerChanges(options, service, result.streams || []);
+    return toolResult(result);
   }
   if (args.cursors !== undefined) {
     throw new CompanionError("E_USAGE", "cursors is not valid for a single-worker wait.");
   }
-  return toolResult({ stream: await service.wait(args.id, {
+  const stream = await service.wait(args.id, {
     cursor: args.cursor ?? null,
     timeoutMs: args.timeoutMs
-  }) });
+  });
+  emitWaitWorkerChanges(options, service, [{ ...stream, workerId: args.id }]);
+  return toolResult({ stream });
 }
 
 export async function callWorkerTool(params, options = {}) {
@@ -819,7 +830,7 @@ export async function callWorkerTool(params, options = {}) {
     if (name === "worker_events_after") {
       return toolResult({ stream: service.eventsAfter(args.id, args.cursor ?? null) });
     }
-    if (name === "worker_wait") return await handleWorkerWait(service, args);
+    if (name === "worker_wait") return await handleWorkerWait(service, args, options);
     if (name === "worker_result") {
       const worker = service.result(args.id);
       const artifact = service.artifactMetadata(args.id);

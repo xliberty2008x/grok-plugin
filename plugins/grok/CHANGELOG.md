@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0-dev.17
+
+Status: hardening candidate; not release-qualified.
+
+- `notifications/grok/worker_changed` is emitted from shipped `worker_wait`
+  (and wait-any) when an owned worker advances or becomes terminal, and from
+  the dispatch supervisor after a claimed launch. Spawn/follow-up/cancel
+  replies still notify; wait-any remains the recovery fallback.
+
 ## 0.3.0-dev.16
 
 Status: hardening candidate; not release-qualified.

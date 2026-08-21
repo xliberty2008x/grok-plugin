@@ -3,17 +3,35 @@
 import readline from "node:readline";
 
 import { handleMcpRequest } from "./broker.mjs";
+import { tryReadJob } from "../scripts/lib/state.mjs";
 import {
   drainAuthorizedPendingDispatches,
   startWorkerDispatchSupervisor
 } from "../scripts/lib/worker-dispatch-supervisor.mjs";
+import { workerChangeNotification } from "../scripts/lib/worker-mcp-notifications.mjs";
+import { projectWorkerHandle } from "../scripts/lib/worker-protocol.mjs";
 
 function send(message) {
   if (message) process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
-const supervisor = startWorkerDispatchSupervisor({ env: process.env });
 const session = { notifyWorkers: false };
+function notifyLaunchedWorker(launch) {
+  if (!session.notifyWorkers || !launch?.root || !launch?.workerId) return;
+  try {
+    const note = workerChangeNotification(
+      projectWorkerHandle(tryReadJob(launch.root, launch.workerId, process.env), {
+        trustHostAuthority: false
+      })
+    );
+    if (note) send(note);
+  } catch { /* Recovery never writes diagnostics to MCP stdout. */ }
+}
+
+const supervisor = startWorkerDispatchSupervisor({
+  env: process.env,
+  notifyWorker: notifyLaunchedWorker
+});
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 let stopping = false;
 const stop = () => {
@@ -44,7 +62,10 @@ lines.on("line", async (line) => {
       emitNotification: session.notifyWorkers ? send : undefined
     }));
     if (message?.method === "tools/call" && message?.params?.name === "worker_spawn") {
-      void drainAuthorizedPendingDispatches({ env: process.env }).catch(() => {});
+      void drainAuthorizedPendingDispatches({
+        env: process.env,
+        notifyWorker: notifyLaunchedWorker
+      }).catch(() => {});
     }
   } catch {
     send({ jsonrpc: "2.0", id: message?.id ?? null, error: { code: -32603, message: "Internal error." } });
