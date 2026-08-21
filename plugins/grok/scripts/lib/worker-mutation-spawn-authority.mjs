@@ -185,7 +185,8 @@ export function storedSpawnReplayRequestDigest({
   envelope,
   roleId,
   write,
-  providerLaunchBindingDigest = undefined
+  providerLaunchBindingDigest = undefined,
+  publicSpawn = null
 }) {
   const storedContextManifest = assertContextManifestIntegrity(
     job?.request?.contextManifest
@@ -221,7 +222,14 @@ export function storedSpawnReplayRequestDigest({
       : {}),
     ...(providerLaunchBindingDigest === undefined
       ? {}
-      : { providerLaunchBindingDigest })
+      : { providerLaunchBindingDigest }),
+    orchestration: {
+      name: publicSpawn?.name || null,
+      parentId: publicSpawn?.parentId || null,
+      contextMode: publicSpawn?.contextMode || null,
+      inheritTurns: publicSpawn?.inheritTurns ?? null,
+      contextDigest: publicSpawn?.contextDigest || null
+    }
   });
 }
 
@@ -898,7 +906,14 @@ export function assertDurableSpawnRequestBinding(job, env = process.env, {
     ...(contextBinding ? { contextBinding } : {}),
     ...(Object.hasOwn(spawn, "providerLaunchBindingDigest")
       ? { providerLaunchBindingDigest: spawn.providerLaunchBindingDigest }
-      : {})
+      : {}),
+    orchestration: {
+      name: job.request?.displayName || null,
+      parentId: job.request?.resumeJobId || null,
+      contextMode: job.request?.contextInheritance?.mode || null,
+      inheritTurns: job.request?.contextInheritance?.inheritTurns ?? null,
+      contextDigest: job.request?.contextInheritance?.digest || null
+    }
   });
   if (spawn.requestDigest !== recomputedRequestDigest) {
     spawnIdempotencyStateError("Durable worker spawn request no longer matches its admitted binding.");

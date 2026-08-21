@@ -1,9 +1,11 @@
 /** Issue #56 worker-mutation followup domain. */
+import crypto from "node:crypto";
 import { CompanionError, asErrorPayload } from "./errors.mjs";
 import {
   assertProviderLaunchBinding,
   providerLaunchBindingDigest as digestProviderLaunchBinding
 } from "./provider-executable-pin.mjs";
+import { processGroupGone } from "./process-control.mjs";
 import {
   generateId,
   isCancelRequested,
@@ -66,6 +68,7 @@ import {
   followupIdempotencyRecord,
   followupRequestBody,
   followupStateError,
+  interruptedFollowupParent,
   normalizeFollowupIdempotencyRecord,
   resolveParentAdmission
 } from "./worker-mutation-followup-contract.mjs";
@@ -79,6 +82,7 @@ import {
   FOLLOWUP_SPAWN_OWNERSHIP_MODE,
   SHA256_HEX,
   SPAWN_SUCCESS_DEFINITION,
+  assertMutationOwnership,
   digestKey,
   ownershipHost,
   stableDigest
@@ -397,4 +401,149 @@ export function spawnGrantedFollowupWorker({ root, principal, workerId, grantId,
     return { committed, replayed: false };
   }, env);
   return publishGrantedFollowupAdmission({ admitted, root, idempotencyKey, env });
+}
+
+function assertPriorAttemptStopped(job) {
+  for (const identity of [job.controllerProcess, job.workerProcess, job.providerProcess]) {
+    if (!identity) continue;
+    if (!processGroupGone(identity)) {
+      throw new CompanionError(
+        "E_PROCESS_IDENTITY",
+        "Prior provider attempt is still running."
+      );
+    }
+  }
+}
+
+export function resumeInterruptedWorker({
+  root,
+  principal,
+  workerId,
+  message,
+  idempotencyKey,
+  env = process.env,
+  providerCapabilityDigest = null,
+  providerLaunchBinding = null,
+  providerLaunchBindingDigest = null
+} = {}) {
+  assertIdempotencyKey(idempotencyKey);
+  if (typeof workerId !== "string" || !workerId) {
+    throw new CompanionError("E_USAGE", "workerId is required for follow-up.");
+  }
+  if (typeof message !== "string" || !message.trim() || message.length > 16000) {
+    throw new CompanionError("E_USAGE", "message must be a non-empty string of at most 16000 characters.");
+  }
+  const parentProbe = tryReadJob(root, workerId, env);
+  if (!parentProbe) throw new CompanionError("E_JOB_NOT_FOUND", "Worker was not found.");
+  assertMutationOwnership(parentProbe, principal);
+  const keyDigest = digestKey(idempotencyKey);
+  const messageDigest = digestKey(message);
+  const admitted = withWorkspaceStateTransaction(root, (transaction) => {
+    const existing = readIdempotency(root, "resume", idempotencyKey, env);
+    if (existing) {
+      if (existing.workerId !== workerId
+        || existing.ownerThreadId !== principal.threadId
+        || existing.messageDigest !== messageDigest) {
+        idempotencyConflict("idempotencyKey was reused with a different resume owner or request.");
+      }
+      const committed = transaction.readJob(existing.workerId);
+      return { committed, replayed: true };
+    }
+    const parent = transaction.readJob(workerId);
+    if (!interruptedFollowupParent(parent)) {
+      throw new CompanionError(
+        "E_CAPABILITY",
+        "Follow-up without grantId requires an interrupted worker with a preserved provider session."
+      );
+    }
+    assertPriorAttemptStopped(parent);
+    transaction.clearCancel(workerId);
+    const createdAt = now();
+    const envelope = bindTaskEnvelopeContext(
+      buildTaskEnvelope({
+        userRequest: message,
+        objective: message,
+        mode: "read",
+        contextManifestId: parent.request?.contextManifest?.manifestId
+      }),
+      parent.request?.contextManifest?.manifestId
+    );
+    const role = materializeRole("explorer");
+    const runtimeRolePolicy = buildRuntimeRolePolicy({ role, profile: parent.profile });
+    const contextPacket = buildContextPacket({
+      mode: "explicit-envelope",
+      envelope,
+      facts: [],
+      constraints: []
+    });
+    const providerPrompt = composeProviderPrompt(envelope, {
+      root: parent.request.spawn.executionRoot,
+      contextManifest: parent.request.contextManifest,
+      contextPacket,
+      runtimeRolePolicy
+    });
+    const providerPromptDigest = crypto.createHash("sha256").update(providerPrompt).digest("hex");
+    const committed = transaction.updateJob(workerId, (job) => {
+      const next = {
+        ...job,
+        status: "queued",
+        phase: "accepted",
+        progress: "Interrupted worker resumed; provider not started by broker follow-up.",
+        updatedAt: createdAt,
+        completedAt: null,
+        error: null,
+        controllerProcess: null,
+        workerProcess: null,
+        providerProcess: null,
+        request: {
+          ...job.request,
+          envelope,
+          contextPacket,
+          runtimeRolePolicy,
+          providerPromptDigest,
+          resumeMessageDigest: messageDigest,
+          spawn: {
+            ...job.request.spawn,
+            providerLaunchPending: true,
+            providerLaunchInFlight: false,
+            providerLaunchOutcome: "pending",
+            dispatch: createDispatchOutbox({ createdAt })
+          }
+        },
+        result: {
+          ...(job.result || {}),
+          interrupt: {
+            ...(job.result?.interrupt || {}),
+            resumedAt: createdAt
+          }
+        },
+        lifecycleEvents: appendLifecycleEvent(
+          job.lifecycleEvents || [],
+          "task.accepted",
+          "Interrupted worker resumed without replaying the original prompt.",
+          { resumeIdempotencyKeyDigest: keyDigest }
+        )
+      };
+      next.workerAuthorization = createWorkerAuthorization({
+        job: next,
+        principal,
+        issuedAt: createdAt
+      });
+      return next;
+    });
+    writeIdempotency(root, "resume", idempotencyKey, {
+      workerId,
+      ownerThreadId: principal.threadId,
+      messageDigest,
+      keyDigest
+    }, env);
+    return { committed, replayed: false };
+  }, env);
+  return {
+    handle: projectWorkerHandle(admitted.committed, { trustHostAuthority: false }),
+    replayed: admitted.replayed,
+    spawnSuccessDefinition: SPAWN_SUCCESS_DEFINITION,
+    providerLaunched: false,
+    providerLaunchState: "pending"
+  };
 }

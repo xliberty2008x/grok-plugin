@@ -29,7 +29,10 @@ import {
   assertMutationOwnership,
   cancellationNonce
 } from "./worker-mutation-primitives.mjs";
-import { spawnGrantedFollowupWorker } from "./worker-mutation-followup.mjs";
+import {
+  resumeInterruptedWorker,
+  spawnGrantedFollowupWorker
+} from "./worker-mutation-followup.mjs";
 import {
   MAILBOX_MESSAGE_SCHEMA_VERSION,
   MAX_MAILBOX_MESSAGE_LENGTH,
@@ -404,6 +407,9 @@ export function followupWorker(options = {}) {
       "E_USAGE",
       "Follow-up accepts only workerId, grantId, message, and idempotencyKey."
     );
+  }
+  if (!options.grantId) {
+    return resumeInterruptedWorker(options);
   }
   return spawnGrantedFollowupWorker(options);
 }

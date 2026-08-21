@@ -4,7 +4,7 @@
   "changeClass": "breaking",
   "targetVersion": "0.3.0",
   "stage": "development",
-  "preRelease": "dev.15",
+  "preRelease": "dev.16",
   "supportedHosts": [
     "codex",
     "claude-code"

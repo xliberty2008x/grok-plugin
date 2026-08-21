@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0-dev.16
+
+Status: hardening candidate; not release-qualified.
+
+- `worker_spawn` over MCP returns at durable admission (`providerLaunchState`)
+  without waiting for provider/controller start. Supervisor and `worker_wait`
+  still launch pending dispatches. Git capture uses a bounded
+  `extensions.worktreeConfig=false` subprocess.
+- Spawn idempotency binds `name`, `parentId`, `contextMode`, `inheritTurns`,
+  and `contextDigest`. Advertised spawn schema matches runtime name/digest
+  rules. Host transcript modes `none`/`all`/`recent` materialize and
+  digest-verify selected Codex turns into provider facts; public events expose
+  only mode/digest.
+- Interrupted workers project public `status:"interrupted"`. `worker_followup`
+  without `grantId` resumes a preserved session without replaying the original
+  prompt; same idempotency key replays. Impossible preservation still uses
+  `fallback:"cancel"`.
+- When the client advertises `grok/worker-change-notifications`, the MCP
+  server emits bounded `notifications/grok/worker_changed` events. `worker_wait`
+  remains the recovery fallback.
+
 ## 0.3.0-dev.15
 
 Status: hardening candidate; not release-qualified.
