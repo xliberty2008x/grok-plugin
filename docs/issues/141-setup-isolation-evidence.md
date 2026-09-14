@@ -63,8 +63,12 @@ OCR v1.12.1 was installed and its delegation preview/rule commands ran against
 `b69775de007949ff741c39d6fd3d782067d06a69`. All 19 reviewable files were reviewed,
 with zero skipped and no actionable findings; four excluded Markdown files
 were additionally inspected. That review applies to that earlier head only.
-Cursor subsequently requested the follow-up changes recorded in PR #142;
-fresh review of the revised head remains required.
+Cursor subsequently requested the follow-up changes recorded in PR #142.
+OCR delegation then reviewed `0db0f2bfd4216ff027e92aa8c47fa01d43724af0`:
+24 of 24 reviewable files, zero skipped, no actionable findings; seven excluded
+Markdown files were additionally inspected. These are historical review records,
+not approval of later commits. PR #142 records subsequent reviews with their
+exact commit IDs; merge readiness requires a fresh review of the final head.
 
 ## Local validation
 
