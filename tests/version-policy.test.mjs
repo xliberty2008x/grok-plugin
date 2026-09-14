@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -203,4 +203,65 @@ test("hosted PR validation fails closed when the version base cannot be resolved
     pluginByteShipBaseErrors({ githubBaseRefSet: true, baseResolved: false }).join(" "),
     /Could not resolve version base/
   );
+});
+
+function shippedAcpClientFiles() {
+  const pluginRoot = path.join(ROOT, "plugins/grok");
+  return fs.readdirSync(pluginRoot, { recursive: true })
+    .filter((file) => /\.(?:mjs|cjs|js)$/.test(file)
+      && /clientInfo\s*:/.test(fs.readFileSync(path.join(pluginRoot, file), "utf8")))
+    .map((file) => `plugins/grok/${file.split(path.sep).join("/")}`).sort();
+}
+
+function versionFixture() {
+  const root = tempDir();
+  for (const relative of ["scripts", "plugins", ".agents", ".claude-plugin", "package.json", "package-lock.json", "release-plan.json", "README.md", "SPEC.md", "PLAN.md"]) {
+    fs.cpSync(path.join(ROOT, relative), path.join(root, relative), { recursive: true });
+  }
+  fs.cpSync(path.join(ROOT, "node_modules/acorn"), path.join(root, "node_modules/acorn"), { recursive: true });
+  return root;
+}
+
+function checkFixtureVersions(root) {
+  const env = { ...process.env };
+  delete env.GITHUB_BASE_REF;
+  delete env.GROK_VERSION_BASE_REF;
+  return spawnSync(process.execPath, ["scripts/validate.mjs", "--versions-only", "--json"], {
+    cwd: root, env, encoding: "utf8", timeout: 15000
+  });
+}
+
+test("every shipped ACP client advertises the synchronized package version", () => {
+  const version = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
+  const files = shippedAcpClientFiles();
+  assert.ok(files.length >= 2);
+  for (const file of files) {
+    const source = fs.readFileSync(path.join(ROOT, file), "utf8");
+    const matches = [...source.matchAll(/clientInfo\s*:\s*\{[^}]*?version\s*:\s*["']([^"']+)["']/g)];
+    assert.ok(matches.length, `${file} must expose a versioned clientInfo`);
+    for (const match of matches) assert.equal(match[1], version, file);
+  }
+});
+
+test("version validation rejects each stale shipped ACP client and bump repairs it", () => {
+  const root = versionFixture();
+  const version = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version;
+  // Normalize the fixture first; exercise stale versions independently below.
+  execFileSync(process.execPath, ["scripts/bump-version.mjs", version], { cwd: root });
+  for (const file of shippedAcpClientFiles()) {
+    const target = path.join(root, file);
+    const original = fs.readFileSync(target, "utf8");
+    fs.writeFileSync(target, original.replace(/(clientInfo\s*:\s*\{[^}]*?version\s*:\s*["'])[^"']+(["'])/g, "$10.0.0-stale$2"));
+    const stale = checkFixtureVersions(root);
+    assert.equal(stale.status, 1, `${file}: ${stale.stdout} ${stale.stderr}`);
+    assert.ok(stale.stdout.includes(file), stale.stdout);
+    assert.match(stale.stdout, /ACP clientInfo version/);
+    const dryRun = execFileSync(process.execPath, ["scripts/bump-version.mjs", version, "--dry-run"], { cwd: root, encoding: "utf8" });
+    assert.ok(dryRun.includes(`would update: ${file}`), dryRun);
+    assert.match(fs.readFileSync(target, "utf8"), /0\.0\.0-stale/);
+    execFileSync(process.execPath, ["scripts/bump-version.mjs", version], { cwd: root });
+    assert.equal(fs.readFileSync(target, "utf8"), original, file);
+    const repaired = checkFixtureVersions(root);
+    assert.equal(repaired.status, 0, `${file}: ${repaired.stdout} ${repaired.stderr}`);
+  }
 });

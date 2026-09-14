@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { activeVersionForPlan, validateReleasePlan } from "./lib/version-policy.mjs";
+import { ACP_CLIENT_INFO_FILES, activeVersionForPlan, validateReleasePlan } from "./lib/version-policy.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const [nextVersion, ...flags] = process.argv.slice(2);
@@ -84,11 +84,14 @@ if (!/^Grok Companion for Claude Code and Codex \d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)
 }
 notice = notice.replace(/^Grok Companion for Claude Code and Codex \d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\./m, `Grok Companion for Claude Code and Codex ${nextVersion}.`);
 
-const providerRuntimePath = "plugins/grok/scripts/lib/provider-acp-runtime.mjs";
-let providerRuntime = fs.readFileSync(file(providerRuntimePath), "utf8");
-const clientVersionPattern = /(clientInfo\s*:\s*\{[\s\S]{0,300}?version\s*:\s*["'])[^"']+(["'])/;
-if (!clientVersionPattern.test(providerRuntime)) throw new Error("Could not find ACP clientInfo version.");
-providerRuntime = providerRuntime.replace(clientVersionPattern, `$1${nextVersion}$2`);
+const clientVersionPattern = /(clientInfo\s*:\s*\{[^}]*?version\s*:\s*["'])[^"']+(["'])/g;
+const acpClientUpdates = ACP_CLIENT_INFO_FILES.map((relative) => {
+  const source = fs.readFileSync(file(relative), "utf8");
+  if (![...source.matchAll(clientVersionPattern)].length) {
+    throw new Error(`Could not find ACP clientInfo version in ${relative}.`);
+  }
+  return [relative, source.replace(clientVersionPattern, (_, prefix, quote) => `${prefix}${nextVersion}${quote}`)];
+});
 
 const updates = [
   ["package.json", serializeJson(packageJson)],
@@ -99,7 +102,7 @@ const updates = [
   ["plugins/grok/.codex-plugin/plugin.json", serializeJson(codexPluginManifest)],
   [changelogPath, changelog],
   [noticePath, notice],
-  [providerRuntimePath, providerRuntime]
+  ...acpClientUpdates
 ];
 
 const changed = updates.filter(([relative, contents]) => atomicWrite(relative, contents)).map(([relative]) => relative);

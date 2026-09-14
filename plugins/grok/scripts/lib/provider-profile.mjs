@@ -5,7 +5,6 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { CompanionError } from "./errors.mjs";
-import { redactText } from "./redact.mjs";
 import {
   atomicPrivateFile,
   privateDirectory
@@ -23,11 +22,11 @@ const PLUGIN_ROOT = path.resolve(
 );
 
 export function inspectIsolation(binary, root, environment) {
-  const inspect = spawnSync(binary, ["inspect", "--json"], { cwd: root, encoding: "utf8", shell: false, timeout: 30000, env: environment.env });
-  if (inspect.status !== 0 || inspect.error) throw new CompanionError("E_CAPABILITY", "Grok could not validate the isolated provider environment.", { diagnostic: redactText(inspect.error?.message || inspect.stderr || inspect.stdout, environment.knownSecrets).slice(-2000) });
+  const inspect = spawnSync(binary, ["inspect", "--json"], { cwd: fs.realpathSync(root), encoding: "utf8", shell: false, timeout: 30000, env: environment.env });
+  if (inspect.status !== 0 || inspect.error) throw new CompanionError("E_CAPABILITY", "Grok could not validate the isolated provider environment.", { probe: "isolated-extensions", status: inspect.status });
   let value;
   try { value = JSON.parse(inspect.stdout); }
-  catch { throw new CompanionError("E_CAPABILITY", "Grok inspect returned malformed JSON for the isolated provider environment."); }
+  catch { throw new CompanionError("E_CAPABILITY", "Grok inspect returned malformed JSON for the isolated provider environment.", { probe: "isolated-extensions" }); }
   const nonBuiltinAgents = (value.agents || []).filter((agent) => agent?.source?.type !== "builtin");
   const bundledSkillRoots = [
     path.join(environment.grokHome, "skills"),
@@ -57,7 +56,7 @@ export function inspectIsolation(binary, root, environment) {
     throw new CompanionError(
       "E_CAPABILITY",
       `The isolated provider environment loaded external ${contamination.join(", ")}.`,
-      { contamination }
+      { probe: "isolated-extensions", contamination }
     );
   }
   return value;

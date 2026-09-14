@@ -8,6 +8,11 @@ const CHANGE_CLASSES = new Set(["patch", "feature", "breaking"]);
 const STAGES = new Set(["development", "release_candidate", "release"]);
 const PLUGIN_BYTE_ROOT = "plugins/grok";
 
+export const ACP_CLIENT_INFO_FILES = Object.freeze([
+  "plugins/grok/scripts/lib/provider-acp-runtime.mjs",
+  "plugins/grok/scripts/lib/worker-owner-controller.mjs"
+]);
+
 export const BURNED_ACTIVE_VERSIONS = Object.freeze(["0.3.0-dev.2"]);
 
 export function isPluginBytePath(relativePath) {

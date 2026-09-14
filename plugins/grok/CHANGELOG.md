@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0-dev.18
+
+Status: hardening candidate; not release-qualified.
+
+- Fix setup and review native project-skill isolation while retaining fail-closed external-extension checks.
+- Return nonzero for setup not-ready results and report sanitized pinned version, probe identity and remediation.
+
 ## 0.3.0-dev.17
 
 Status: hardening candidate; not release-qualified.

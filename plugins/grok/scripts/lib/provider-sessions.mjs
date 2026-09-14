@@ -358,19 +358,19 @@ export async function probe(root, stateDir, {
   const helpText = `${help.stdout || ""}\n${help.stderr || ""}`;
   const requiredFlags = ["--prompt-file", "--json-schema", "--tools", "--disallowed-tools", "--sandbox"];
   const missingFlags = requiredFlags.filter((flag) => !helpText.includes(flag));
-  if (help.status !== 0 || missingFlags.length) throw new CompanionError("E_CAPABILITY", "Grok does not advertise the required headless review flags.", { missing: missingFlags });
+  if (help.status !== 0 || missingFlags.length) throw new CompanionError("E_CAPABILITY", "Grok does not advertise the required headless review flags.", { probe: "headless-flags", missing: missingFlags });
   const agentHelp = spawnSync(binary, ["agent", "--help"], { encoding: "utf8", shell: false, timeout: 15000, env: childEnvironment() });
   const agentHelpText = `${agentHelp.stdout || ""}\n${agentHelp.stderr || ""}`;
   const requiredAgentFlags = ["--agent-profile", "--no-leader", "--leader-socket"];
   const missingAgentFlags = requiredAgentFlags.filter((flag) => !agentHelpText.includes(flag));
-  if (agentHelp.status !== 0 || missingAgentFlags.length) throw new CompanionError("E_CAPABILITY", "Grok does not advertise the required isolated ACP agent flags.", { missing: missingAgentFlags });
+  if (agentHelp.status !== 0 || missingAgentFlags.length) throw new CompanionError("E_CAPABILITY", "Grok does not advertise the required isolated ACP agent flags.", { probe: "acp-flags", missing: missingAgentFlags });
   const auth = spawnSync(binary, ["models"], { encoding: "utf8", shell: false, timeout: 30000, env: childEnvironment() });
   if (auth.status !== 0) throw new CompanionError("E_AUTH_REQUIRED", `Grok authentication is unavailable or expired. Run \`grok login\`, then retry ${hostCommand("setup")}.`, { diagnostic: redactText(auth.stderr || auth.stdout).slice(-2000) });
   const marker = `setup-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
   const isolation = reviewEnvironment(
     stateDir,
     marker,
-    { providerExecutableBinary: binary }
+    { root, providerExecutableBinary: binary }
   );
   let provider = null;
   let failedProviderProcess = null;

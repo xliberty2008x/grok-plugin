@@ -15,6 +15,7 @@ import {
   validateDeterministicTestShards
 } from "./lib/deterministic-test-shards.mjs";
 import {
+  ACP_CLIENT_INFO_FILES,
   activeVersionForPlan,
   collectChangedPathsFromGitReports,
   inspectPluginByteShip,
@@ -354,14 +355,15 @@ function versionChecks() {
     problem(`Plugin NOTICE does not identify release ${version}.`, "plugins/grok/NOTICE");
   }
 
-  const providerRuntime = readText(
-    "plugins/grok/scripts/lib/provider-acp-runtime.mjs"
-  );
-  const clientVersion = providerRuntime?.match(
-    /clientInfo\s*:\s*\{[\s\S]{0,300}?version\s*:\s*["']([^"']+)["']/
-  )?.[1];
-  if (clientVersion !== version) {
-    problem(`ACP clientInfo version (${clientVersion ?? "missing"}) does not match package version ${version}.`, "plugins/grok/scripts/lib/provider-acp-runtime.mjs");
+  for (const file of ACP_CLIENT_INFO_FILES) {
+    const source = readText(file);
+    const versions = [...(source || "").matchAll(/clientInfo\s*:\s*\{[^}]*?version\s*:\s*["']([^"']+)["']/g)];
+    if (!versions.length) problem("ACP clientInfo version is missing.", file);
+    for (const [, clientVersion] of versions) {
+      if (clientVersion !== version) {
+        problem(`ACP clientInfo version (${clientVersion}) does not match package version ${version}.`, file);
+      }
+    }
   }
 }
 

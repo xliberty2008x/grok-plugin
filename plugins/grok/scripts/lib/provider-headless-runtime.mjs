@@ -95,7 +95,7 @@ export async function runHeadless({ root, profile, prompt, model, effort, stateD
   const marker = safeMarker(jobMarker), isolation = reviewEnvironment(
     stateDir,
     marker,
-    { providerExecutableBinary: binary }
+    { root, providerExecutableBinary: binary }
   );
   const leaderSocket = path.join(stateDir, `leader-${marker}-${process.pid}-${Date.now()}.sock`);
   // Prefer anonymous fd 3 prompts locally. On CI (GitHub Actions sets CI=true), sandbox
