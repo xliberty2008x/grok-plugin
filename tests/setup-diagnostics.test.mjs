@@ -7,8 +7,8 @@ import { installPinnedFakeCompanion } from "./pinned-fake-grok.mjs";
 import { initRepo, runCompanion, tempDir, testEnvironment } from "./helpers.mjs";
 
 function setupFixture(t, config = {}) {
-  const fake = installFakeGrok(tempDir("grok-setup-diagnostics-"), config);
-  const pluginData = tempDir("grok-setup-diagnostics-data-");
+  const fake = installFakeGrok(tempDir(), config);
+  const pluginData = tempDir();
   const env = testEnvironment({ fake, pluginData });
   for (const key of ["GROK_COMPANION_CHILD", "GROK_COMPANION_JOB_MARKER", "GROK_AGENT", "GROK_LEADER_SOCKET"]) delete env[key];
   const pinned = installPinnedFakeCompanion(fake, env);

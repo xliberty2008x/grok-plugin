@@ -745,6 +745,7 @@ async function main() {
       inspectValue = { hooks: [], plugins: [], mcpServers: [], agents: [], ...inspectValue,
         skills: [...(inspectValue?.skills || []), ...skills] };
     }
+    appendLog(effective, { event: "inspect-inventory", skills: inspectValue?.skills || [] });
     process.stdout.write(`${JSON.stringify(inspectValue ?? { hooks: [], skills: [], plugins: [], mcpServers: [], agents: [{ name: "explore", source: { type: "builtin" } }] })}\n`);
     return;
   }

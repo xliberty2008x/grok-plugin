@@ -58,9 +58,13 @@ readiness exit status and sanitized diagnostics have focused coverage. These
 are supporting deterministic/installed-wrapper fixture results, not a real
 Grok provider lifecycle.
 
-The requested open-code-review-delegate skill is available, but `ocr` was not
-found in PATH or checked local binary locations. Its preview/rule workflow
-requires the CLI before it can be reported as completed.
+OCR was initially unavailable. After the user authorized installation, official
+OCR v1.12.1 was installed and its delegation preview/rule commands ran against
+`b69775de007949ff741c39d6fd3d782067d06a69`. All 19 reviewable files were reviewed,
+with zero skipped and no actionable findings; four excluded Markdown files
+were additionally inspected. That review applies to that earlier head only.
+Cursor subsequently requested the follow-up changes recorded in PR #142;
+fresh review of the revised head remains required.
 
 ## Local validation
 
@@ -70,3 +74,18 @@ requires the CLI before it can be reported as completed.
 - `node --test tests/deterministic-sharding.test.mjs tests/version-policy.test.mjs`: 17/17 passed.
 - Fresh native Codex review: no actionable introduced correctness/security findings in all ten scoped runtime/test files; its independent new-suite run passed 8/8.
 - Full deterministic repository qualification and hosted CI were not run.
+
+## Cursor follow-up
+
+Cursor requested changes on `b69775de` after that local review. The follow-up
+clarifies stdout forwarding on nonzero setup exits in both host facades,
+synchronizes the owner-controller ACP version and adds it to bump/validation
+coverage, and aligns review-home subagent/LSP configuration with task homes.
+The bundled-skill regression now checks the actual fixture inspection inventory.
+The changelog qualification status and the version-policy pointer were corrected.
+
+Both hosted shard-3 failures on the earlier head came from the exact legacy
+temp-prefix inventory test. New fixtures now use the existing default temp
+namespace; cleanup allowlists and safety checks were not relaxed. The exact
+failing test passes locally after this change. New-head hosted checks and Cursor
+review are required before merging; real installed qualification remains pending.

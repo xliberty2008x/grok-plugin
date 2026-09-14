@@ -513,7 +513,8 @@ export function reviewEnvironment(
   // Native .grok/.agents discovery is independent of cross-client flags.
   // Grok's ignore filter uses canonical path prefixes, retaining bundled
   // skills in this private home while excluding the inspected project.
-  if (root) atomicPrivateFile(path.join(grokHome, "config.toml"), `[skills]\nignore = [${JSON.stringify(fs.realpathSync(root))}]\n`);
+  const skillsConfig = root ? `[skills]\nignore = [${JSON.stringify(fs.realpathSync(root))}]\n\n` : "";
+  atomicPrivateFile(path.join(grokHome, "config.toml"), `${skillsConfig}[subagents]\nenabled = false\n\n[features]\nlsp_tools = false\n`);
   const authPath = process.env.GROK_AUTH_PATH || path.join(os.homedir(), ".grok", "auth.json");
   const extra = { HOME: home, USERPROFILE: home, GROK_HOME: grokHome, GROK_FOLDER_TRUST: "1" };
   const knownSecrets = [];
