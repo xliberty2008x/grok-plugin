@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { parseArgs } from "./args.mjs";
-import { CompanionError, asErrorPayload } from "./errors.mjs";
+import { CompanionError, asErrorPayload, exitCodeFor } from "./errors.mjs";
 import { assertWorkingTreeTargetBound, collectContext, resolveTarget } from "./git-review.mjs";
 import { probe } from "./provider-sessions.mjs";
 import { profileFor, sameSecurityProfile } from "./profiles.mjs";
@@ -38,11 +38,15 @@ async function handleSetup(raw) {
   const root = workspaceRoot(options.cwd ? path.resolve(options.cwd) : process.cwd(), false);
   if (options["disable-review-gate"]) setConfig(root, { stopReviewGate: false });
   let runtime;
+  let pinnedVersion;
   try {
     // A setup attempt revokes any older readiness assertion before probing.
     // A crash or failed probe therefore cannot leave stale spawn capability.
     clearProviderCapabilityReceipt();
     const pinned = publishProviderExecutablePin();
+    // Retain only the validated, path-free release version for failed probes.
+    const version = pinned.executableIdentity?.version;
+    if (typeof version === "string" && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.test(version)) pinnedVersion = version;
     const probed = await probe(root, stateDir(root), {
       providerExecutableBinding: pinned.binding
     });
@@ -58,7 +62,7 @@ async function handleSetup(raw) {
     };
   } catch (error) {
     try { clearProviderCapabilityReceipt(); } catch {}
-    runtime = { ready: false, error: asErrorPayload(error) };
+    runtime = { ready: false, ...(pinnedVersion ? { version: pinnedVersion } : {}), error: asErrorPayload(error) };
   }
   if (options["enable-review-gate"] && !runtime.error) setConfig(root, { stopReviewGate: true });
   const storageReadonlyNextStep = currentHost().kind === "codex"
@@ -77,12 +81,15 @@ async function handleSetup(raw) {
             : runtime.error.code === "E_PROCESS_IDENTITY"
               ? ["Restore the active managed link and executable bytes to a stable state, then retry setup."]
               : runtime.error.code === "E_CAPABILITY"
-                ? ["The exact pinned Grok binary is present but did not satisfy a required runtime capability; review the reported probe failure."]
+                ? runtime.error.details?.probe === "isolated-extensions"
+                  ? ["Setup could not establish an isolated extension inventory. Verify that the active Grok version excludes external plugins, skills, hooks, agents, and MCP servers under isolated extension configuration, then retry setup; do not disable the isolation check."]
+                  : ["The exact pinned Grok binary is present but did not satisfy a required runtime capability; review the reported probe failure."]
                 : runtime.error.code === "E_STORAGE_READONLY"
                   ? [storageReadonlyNextStep]
                   : ["Review the reported prerequisite or platform limitation before retrying."];
   const result = { ready: !runtime.error, grok: runtime, config: config(root), disclosure: "Grok/xAI may process task prompts, selected repository content, provider-tool output, and imported Claude Code or privacy-filtered Codex transcript context. Each task lineage uses a private Grok home under this workspace's plugin state; its sanitized cached credential is removed before the task prompt is sent, while provider session data may remain for explicit resume. Imported sessions remain under ~/.grok/sessions. Each headless review uses a private per-job home and removes it on completion or verified crash recovery.", nextSteps };
-  out(options.json ? result : [`Grok Companion: ${result.ready ? "ready" : "not ready"}`, result.disclosure, ...(result.grok.version ? [`Grok ${result.grok.version}; ACP v${result.grok.protocolVersion}`, `Models: ${result.grok.models.map((x) => x.id).join(", ")}`] : [result.grok.error?.message]), `Stop gate: ${result.config.stopReviewGate ? "enabled" : "disabled"}`, ...result.nextSteps].join("\n"), options.json);
+  out(options.json ? result : [`Grok Companion: ${result.ready ? "ready" : "not ready"}`, result.disclosure, ...(result.ready ? [`Grok ${result.grok.version}; ACP v${result.grok.protocolVersion}`, `Models: ${result.grok.models.map((x) => x.id).join(", ")}`] : [...(result.grok.version ? [`Grok ${result.grok.version}`] : []), `${result.grok.error.code}: ${result.grok.error.message}`, ...(result.grok.error.details?.probe ? [`Probe: ${result.grok.error.details.probe}`] : [])]), `Stop gate: ${result.config.stopReviewGate ? "enabled" : "disabled"}`, ...result.nextSteps].join("\n"), options.json);
+  if (!result.ready) process.exitCode = exitCodeFor(runtime.error);
 }
 
 async function handleReview(command, raw) {

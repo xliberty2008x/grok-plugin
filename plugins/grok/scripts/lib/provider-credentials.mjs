@@ -501,6 +501,7 @@ export function reviewEnvironment(
   jobMarker,
   {
     includeCredential = true,
+    root = null,
     providerExecutableBinary = null
   } = {}
 ) {
@@ -509,6 +510,10 @@ export function reviewEnvironment(
   const sentinel = path.join(home, "sandbox-enforcement-sentinel"), profile = `companion_${crypto.createHash("sha256").update(marker).digest("hex").slice(0, 20)}`;
   if (!fs.existsSync(sentinel)) fs.writeFileSync(sentinel, "Review sandbox enforcement sentinel.\n", { mode: 0o600, flag: "wx" });
   fs.writeFileSync(path.join(grokHome, "sandbox.toml"), `[profiles.${profile}]\nextends = "strict"\ndeny = [${JSON.stringify(sentinel)}]\n`, { mode: 0o600 });
+  // Native .grok/.agents discovery is independent of cross-client flags.
+  // Grok's ignore filter uses canonical path prefixes, retaining bundled
+  // skills in this private home while excluding the inspected project.
+  if (root) atomicPrivateFile(path.join(grokHome, "config.toml"), `[skills]\nignore = [${JSON.stringify(fs.realpathSync(root))}]\n`);
   const authPath = process.env.GROK_AUTH_PATH || path.join(os.homedir(), ".grok", "auth.json");
   const extra = { HOME: home, USERPROFILE: home, GROK_HOME: grokHome, GROK_FOLDER_TRUST: "1" };
   const knownSecrets = [];

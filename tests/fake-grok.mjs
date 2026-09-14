@@ -733,6 +733,18 @@ async function main() {
       }
       inspectValue = { hooks: [], skills: skills.map(([name, skill]) => ({ name, source: { type: "bundled", path: skill } })), plugins: [], mcpServers: [], agents: [{ name: "explore", source: { type: "builtin" } }] };
     }
+    if (effective.inspectProjectSkillPaths) {
+      // Donor filter_skills uses canonical path prefixes, not globs.
+      const configPath = path.join(process.env.GROK_HOME, "config.toml");
+      const text = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
+      const ignored = JSON.parse(text.match(/^ignore = (\[.*\])$/m)?.[1] || "[]");
+      const skills = effective.inspectProjectSkillPaths.filter((skill) => {
+        const actual = fs.realpathSync(skill);
+        return !ignored.some((root) => actual === root || actual.startsWith(`${root}${path.sep}`));
+      }).map((skill) => ({ name: "private-project-skill", source: { type: "project", path: skill } }));
+      inspectValue = { hooks: [], plugins: [], mcpServers: [], agents: [], ...inspectValue,
+        skills: [...(inspectValue?.skills || []), ...skills] };
+    }
     process.stdout.write(`${JSON.stringify(inspectValue ?? { hooks: [], skills: [], plugins: [], mcpServers: [], agents: [{ name: "explore", source: { type: "builtin" } }] })}\n`);
     return;
   }

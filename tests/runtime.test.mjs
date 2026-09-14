@@ -52,8 +52,8 @@ import {
   writeCodexSessionMetadata
 } from "../plugins/grok/scripts/lib/host.mjs";
 
-function parseJson(result) {
-  assert.equal(result.status, 0, `command failed\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
+function parseJson(result, success = true) {
+  assert.equal(result.status === 0, success, `unexpected command status ${result.status}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
   return JSON.parse(result.stdout);
 }
 
@@ -171,7 +171,7 @@ test("setup validates headless isolation before enabling the stop gate", (t) => 
       env: failedPinned.env,
       companionScript: failedPinned.companionScript
     }
-  ));
+  ), false);
   assert.equal(failed.ready, false);
   assert.equal(failed.grok.error.code, "E_CAPABILITY");
   assert.equal(failed.config.stopReviewGate, false);
@@ -222,7 +222,7 @@ test("setup E_STORAGE_READONLY guidance separates managed command approval from 
   const result = parseJson(runCompanion(
     ["setup", "--json"],
     { cwd: root, env, companionScript: pinned.codexCompanionScript }
-  ));
+  ), false);
 
   const injectionEvents = fs.readFileSync(injectionLog, "utf8").trim().split(/\r?\n/u).map(JSON.parse);
   assert.equal(result.ready, false, `storage injection did not fire: ${JSON.stringify(injectionEvents)}`);
@@ -259,7 +259,7 @@ test("setup E_STORAGE_READONLY guidance separates managed command approval from 
   const claudeResult = parseJson(runCompanion(
     ["setup", "--json"],
     { cwd: claudeRoot, env: claudeEnv, companionScript: claudePinned.companionScript }
-  ));
+  ), false);
   const claudeInjectionEvents = fs.readFileSync(claudeInjectionLog, "utf8").trim().split(/\r?\n/u).map(JSON.parse);
   assert.equal(claudeResult.ready, false, `storage injection did not fire: ${JSON.stringify(claudeInjectionEvents)}`);
   assert.equal(claudeInjectionEvents.filter((event) => event.event === "injected").length, 1);
@@ -311,7 +311,7 @@ test("a failed setup attempt revokes the previously published provider capabilit
       env: failedPinned.env,
       companionScript: failedPinned.companionScript
     }
-  ));
+  ), false);
   assert.equal(failed.ready, false);
   assert.equal(failed.grok.error.code, "E_CAPABILITY");
   assert.equal(fs.existsSync(receipt), false);
@@ -531,7 +531,7 @@ test("Codex receipt recovery stops on setup failure and keeps non-receipt E_CAPA
     cwd: stopRoot,
     env: brokenPinned.env,
     companionScript: brokenPinned.codexCompanionScript
-  }));
+  }), false);
   assert.equal(failedSetup.ready, false);
   assert.equal(failedSetup.grok.error.code, "E_CAPABILITY");
   // Non-receipt capability failure from setup is not the exact receipt prerequisite message.
